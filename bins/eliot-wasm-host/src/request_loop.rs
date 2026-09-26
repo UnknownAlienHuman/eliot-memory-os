@@ -34,21 +34,24 @@
 //! Two more disciplines close the loop's edges:
 //!
 //! - **External control is real intake, not self-talk.** An installed
-//!   [`KernelControlReader`] polls the owner-staged control-request file on
-//!   every tick — including while guest work is pending — and admits what
-//!   it yields through the same frame shape, parse, and binding validation
-//!   the delivery-set path uses, so one admission path serves both sources.
-//!   Only an identity-matching Cancel/Reconcile/Shutdown is consumed;
-//!   anything else is left for its own delivery. A Cancel/Shutdown admitted
-//!   while a command is outstanding interrupts the guest through the stored
-//!   engine handle instead of queueing behind the bound-1 slot; Reconcile
-//!   stays staged until the worker is idle.
+//!   [`KernelControlReader`] polls the owner-published replayable control
+//!   spool on every tick — including while guest work is pending — and admits
+//!   what it yields through the same frame shape, parse, and binding
+//!   validation the delivery-set path uses, so one admission path serves both
+//!   sources. A delivery is acknowledged only after admission plus successful
+//!   worker enqueue, by staging an ack beside its exact generation/sequence
+//!   name; deliveries are never deleted by the child, and anything
+//!   unadmittable stays in place as typed evidence for the owner.
+//!   An admitted Cancel/Shutdown interrupts pending guest work without
+//!   consuming its owner delivery; Reconcile waits for the idle path.
 //! - **Emission and cleanup are bounded.** Each result event is validated
 //!   and gets a bounded caller wait on stdout; a caller timeout retains
 //!   the helper for tracked termination and never reuses the contended
 //!   stream while it runs, and the staged set is consumed only while it
 //!   still names the served generation, so a replacement staged mid-run is
-//!   never deleted.
+//!   never deleted. Control spool files and acks are owner-reclaimed;
+//!   cleanup deletes none of them, so a stale operation can never remove
+//!   a newer control.
 //!
 //! The experimental describe path and the one-shot guest-child protocol are
 //! separate modes reachable only through their own CLI branches; the
@@ -65,6 +68,7 @@ use std::sync::mpsc::{
 };
 use std::time::Duration;
 
+use eliot_contracts::sha256_hex;
 use eliot_wasm_runtime::lifecycle::InFlightDisposition;
 use eliot_wasm_runtime::{
     EngineBinding, GuestInterruptHandle, InvocationRequest, InvocationResult, Sha256Digest,
@@ -78,8 +82,13 @@ use crate::dispatch_drive::{
     evaluate_seated_verdicts,
 };
 use crate::dispatch_material::{
-    MaterialError, ValidatedDispatchMaterial, WASM_HOST_CONTROL_FILE_NAME, admitted_material_path,
-    consume_staged, read_staged_bytes,
+    ControlAckPhase, ControlFileClass, ExpectedControlBinding, MaterialError,
+    ValidatedDispatchMaterial, WASM_CONTROL_ACK_WIRE_ID, WASM_CONTROL_ACK_WIRE_VERSION,
+    WASM_CONTROL_MAX_DETAIL_BYTES, WASM_CONTROL_SPOOL_MAX_DELIVERIES, WASM_CONTROL_SPOOL_SCAN_CAP,
+    WASM_HOST_CONTROL_FILE_NAME, WasmControlAck, WasmControlDelivery, WasmControlKind,
+    admitted_material_path, control_ack_name, control_delivery_name, join_control_delivery,
+    parse_control_delivery, parse_control_name, read_control_bytes, retire_legacy_control,
+    stage_control_bytes,
 };
 use crate::parent_authority::edge_now_ms;
 use crate::parent_runtime::{AdmittedRuntime, build_admitted_runtime};
@@ -241,6 +250,9 @@ pub struct AdmittedBinding {
     invocation_id: String,
     request_digest: String,
     grant_digest: String,
+    generation: u64,
+    work_scope: String,
+    authority_epoch_json: String,
     component_id: String,
     artifact_digest: String,
     input_digest: String,
@@ -264,6 +276,9 @@ impl AdmittedBinding {
             invocation_id: request.invocation_id.as_str().to_owned(),
             request_digest: request.request_digest().as_str().to_owned(),
             grant_digest: material.grant.grant_digest.as_str().to_owned(),
+            generation: material.generation,
+            work_scope: material.work.work_scope.clone(),
+            authority_epoch_json: material.authority_epoch_json.clone(),
             component_id: ceilings.component_id.clone(),
             artifact_digest: ceilings.artifact_digest.as_str().to_owned(),
             input_digest: ceilings.input_digest.as_str().to_owned(),
@@ -1071,6 +1086,8 @@ pub trait WasmHostRequestChannel {
     /// never exhaustion: the loop keeps serving the delivery set and polls
     /// again on its next tick, including while guest work is pending. The
     /// default has no external source and always reports nothing pending.
+    /// Polling never acknowledges or retires anything: the staged delivery
+    /// stays replayable until it is confirmed after worker enqueue.
     ///
     /// # Errors
     ///
@@ -1081,11 +1098,9 @@ pub trait WasmHostRequestChannel {
     }
 
     /// Non-blocking poll for one staged Cancel/Shutdown naming this
-    /// operation (#2568 A3). Unlike [`Self::poll_control`], this runs before
-    /// the single-gate intake check, so an admitted Cancel/Shutdown
-    /// interrupts outstanding guest work instead of queueing behind the
-    /// bound-1 slot. Reconcile is never urgent: it stays staged for the idle
-    /// path exactly as before. The default has no external source.
+    /// operation (#2568 A3). This runs before the single-gate intake check.
+    /// Polling leaves the owner delivery unacknowledged and replayable;
+    /// Reconcile stays staged for the idle path.
     ///
     /// # Errors
     ///
@@ -1093,6 +1108,34 @@ pub trait WasmHostRequestChannel {
     /// fails in a way the loop must not ignore.
     fn poll_control_urgent(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
         Ok(None)
+    }
+
+    /// Confirms that the last polled control delivery for `operation` was
+    /// admitted and enqueued to the worker owner. The default has no
+    /// external source and confirms nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ChannelUnavailable`] when the acknowledgement
+    /// cannot be staged.
+    fn confirm_control_enqueued(&mut self, _operation: &str) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Confirms that the exact worker outcome of the accepted control for
+    /// `operation` was observed, carrying the outcome digest when the loop
+    /// reports one. The default has no external source and confirms nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ChannelUnavailable`] when the acknowledgement
+    /// cannot be staged.
+    fn confirm_control_completed(
+        &mut self,
+        _operation: &str,
+        _outcome_digest: Option<&str>,
+    ) -> Result<(), LoopError> {
+        Ok(())
     }
 
     /// Publishes one correlated result frame: the one stdout emission
@@ -1110,115 +1153,627 @@ pub trait WasmHostRequestChannel {
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError>;
 }
 
+/// Maps an owner control kind onto the loop's closed operation vocabulary.
+fn control_operation(kind: WasmControlKind) -> &'static str {
+    match kind {
+        WasmControlKind::Cancel => OP_CANCEL,
+        WasmControlKind::Reconcile => OP_RECONCILE,
+        WasmControlKind::Shutdown => OP_SHUTDOWN,
+    }
+}
+
+/// One polled-but-unconfirmed control delivery: validated and yielded to the
+/// loop, but not yet admitted and enqueued, so still unacknowledged and
+/// fully replayable.
+#[derive(Clone, Debug)]
+enum PendingControl {
+    /// A versioned spool delivery at its exact generation/sequence slot.
+    Spool {
+        /// Owner control kind.
+        kind: WasmControlKind,
+        /// Delivery generation (equals the running generation).
+        generation: u64,
+        /// Owner sequence.
+        sequence: u64,
+        /// Replay key of the validated delivery.
+        replay_key: String,
+        /// Digest of the validated delivery.
+        delivery_digest: String,
+    },
+    /// The legacy fixed file, joined under the serialized owner rule.
+    Legacy {
+        /// Control kind parsed from the staged frame.
+        kind: WasmControlKind,
+        /// Digest of the admitted bytes; retirement deletes only these.
+        digest: String,
+    },
+}
+
+impl PendingControl {
+    /// Returns the owner control kind of the pending delivery.
+    fn kind(&self) -> WasmControlKind {
+        match self {
+            Self::Spool { kind, .. } | Self::Legacy { kind, .. } => *kind,
+        }
+    }
+
+    /// Returns the loop operation of the pending delivery.
+    fn operation(&self) -> &'static str {
+        control_operation(self.kind())
+    }
+}
+
+/// One enqueue-confirmed spool delivery whose exact worker outcome is still
+/// open. At most one exists: the single-gate intake admits nothing new while
+/// a command is outstanding.
+#[derive(Clone, Debug)]
+struct AcceptedControl {
+    /// Owner control kind.
+    kind: WasmControlKind,
+    /// Delivery generation.
+    generation: u64,
+    /// Owner sequence.
+    sequence: u64,
+    /// Replay key of the accepted delivery.
+    replay_key: String,
+    /// Digest of the accepted delivery.
+    delivery_digest: String,
+}
+
+/// Bounded control-file reads per poll: at most one spool row of deliveries
+/// plus their acks and predecessor links. The walk stops when the budget is
+/// spent and resumes on the next tick, so a foreign-filled directory degrades
+/// admission instead of growing work without bound.
+const CONTROL_POLL_READ_BUDGET: usize = WASM_CONTROL_SPOOL_MAX_DELIVERIES * 3;
+
+/// Resolution of one delivery's ack slot.
+#[derive(Clone, Debug)]
+enum AckSlot {
+    /// Skip the delivery: terminal evidence, garbage, or our own still-open
+    /// acceptance already occupies the slot.
+    Skip,
+    /// The slot is free: the delivery may validate and refuse into it.
+    Free,
+    /// A prior incarnation left the slot openly accepted: the delivery may
+    /// be re-offered for UNKNOWN recovery when its bytes still match.
+    Reoffer(WasmControlAck),
+}
+
 /// Installed Kernel control reader: the external control intake of the
 /// ordinary loop.
 ///
-/// The owner stages the delivery set as files beside the installation; a
-/// Kernel Cancel/Reconcile/Shutdown for the running operation stages the
-/// same way, as one [`WasmHostRequestFrame`] JSON document at the
-/// loader-derived control path. The loop polls this reader on every tick —
-/// including while guest work is pending — and admits what it yields
+/// One spool slot address: (generation, sequence).
+type ControlSlot = (u64, u64);
+/// Bounded spool slot listing collected by one directory scan.
+type ControlSlotList = Vec<ControlSlot>;
+
+/// The owner publishes Cancel/Reconcile/Shutdown for the running operation
+/// as versioned deliveries in a generation-specific immutable spool colocated
+/// with the delivery set, one exact `generation-sequence` name per delivery
+/// plus the child-staged ack beside it. The loop polls this reader on every
+/// tick — including while guest work is pending — and admits what it yields
 /// through the same frame shape, parse, and binding validation the
 /// delivery-set path uses, so one admission path serves both sources.
 ///
-/// Fail-closed per frame: an absent, unreadable, oversize, malformed, or
-/// foreign control file yields nothing and is left in place — ownership of
-/// an unidentifiable file can never be established, and unauthenticated
-/// input must neither act nor abort the admitted operation. Only a
-/// well-formed frame naming this exact operation is consumed and returned.
-/// `Invoke` is never admitted externally: the one admitted invoke comes
-/// from the delivery set only, so a second execution path cannot open
-/// through the control file.
+/// Validate-then-admit-then-enqueue-then-ack: polling validates and stages
+/// terminal refusals, but a delivery is acknowledged only after the loop
+/// confirms admission plus successful worker enqueue. Queue-full,
+/// disconnected, admission failure, and crash leave the original staged
+/// delivery replayable with its typed disposition — never falsely accepted.
+/// Deliveries are never deleted by the child; the owner reclaims its own
+/// stream. In-memory state is bounded (one pending slot, one accepted slot,
+/// capped scan buffers), and every poll does bounded directory/file work,
+/// so intake holds no unbounded queue and a poisoned file cannot wedge it.
+///
+/// The legacy fixed file joins only while the versioned spool holds no
+/// delivery or ack for this generation — the sequenced stream always wins —
+/// and retires only after admission plus successful worker enqueue, by
+/// exact-name byte-verified delete.
 pub struct KernelControlReader {
-    path: PathBuf,
-    identity: WasmHostControl,
+    /// Loader-derived install directory holding the delivery set and spool.
+    directory: PathBuf,
+    /// Exact legacy fixed-file path inside `directory`.
+    legacy_path: PathBuf,
+    /// Full admitted binding: derived control frames reuse it.
+    admitted: AdmittedBinding,
+    /// Exact operation binding every delivery must join.
+    binding: ExpectedControlBinding,
+    /// One polled-but-unconfirmed delivery, if the loop holds a yield.
+    pending: Option<PendingControl>,
+    /// One enqueue-confirmed delivery with its outcome still open, if any.
+    accepted: Option<AcceptedControl>,
+    /// Whether the legacy file was consumed this run.
+    legacy_consumed: bool,
+    /// Whether any same-generation spool delivery or ack was observed this
+    /// run: the versioned stream permanently closes the legacy join, even if
+    /// the owner reclaims its terminal files mid-run.
+    versioned_seen: bool,
+    /// Directory cursor retained across polls so unrelated names cannot
+    /// consume every scan budget before this operation's control slots.
+    scan_entries: Option<std::fs::ReadDir>,
+    scan_deliveries: ControlSlotList,
+    scan_acks: ControlSlotList,
 }
 
 impl KernelControlReader {
-    /// Pins the reader to the loader-derived control path and the exact
-    /// admitted operation identity it may consume control for.
+    /// Pins the reader to the loader-derived install directory and the exact
+    /// admitted operation binding every delivery must join. A generation of
+    /// zero or an unparseable authority epoch fails closed inside the join:
+    /// every delivery refuses or skips, and the loop still serves the
+    /// delivery set.
     #[must_use]
-    pub fn new(binding: &AdmittedBinding, path: PathBuf) -> Self {
+    pub fn new(binding: &AdmittedBinding, directory: PathBuf) -> Self {
+        let authority_epoch =
+            serde_json::from_str(&binding.authority_epoch_json).unwrap_or(serde_json::Value::Null);
         Self {
-            path,
-            identity: WasmHostControl {
+            legacy_path: directory.join(WASM_HOST_CONTROL_FILE_NAME),
+            directory,
+            admitted: binding.clone(),
+            binding: ExpectedControlBinding {
                 operation_id: binding.operation_id.clone(),
                 invocation_id: binding.invocation_id.clone(),
-                request_digest: binding.request_digest.clone(),
+                claim_id: binding.claim_id.clone(),
+                generation: binding.generation,
+                grant_digest: binding.grant_digest.clone(),
+                work_scope: binding.work_scope.clone(),
+                authority_epoch,
             },
+            pending: None,
+            accepted: None,
+            legacy_consumed: false,
+            versioned_seen: false,
+            scan_entries: None,
+            scan_deliveries: Vec::new(),
+            scan_acks: Vec::new(),
         }
     }
 
-    /// Returns one staged control frame naming this operation, consuming
-    /// it, or `None` when nothing admittable is staged. Never fails the
-    /// loop: every control-file fault degrades to nothing pending.
-    fn poll(&self) -> Option<WasmHostRequestFrame> {
-        let Ok(bytes) = read_staged_bytes(&self.path) else {
-            return None;
-        };
-        let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
-            return None;
-        };
-        match WasmHostRequestFrame::parse(&frame) {
-            Ok(WasmHostRequest::Cancel(control) | WasmHostRequest::Reconcile(control))
-                if control == self.identity =>
+    /// Returns one staged control frame for this operation, or `None` when
+    /// nothing admittable is staged. Never fails the loop and never
+    /// acknowledges or retires anything: every fault degrades to nothing
+    /// pending, and the staged delivery stays replayable until the loop
+    /// confirms it after worker enqueue.
+    fn poll(&mut self) -> Option<WasmHostRequestFrame> {
+        // A previous yield that was never confirmed was never enqueued: its
+        // delivery is still staged and unacknowledged, so dropping the slot
+        // re-discovers it below rather than losing it.
+        self.pending = None;
+        let (deliveries, acks) = self.scan_spool()?;
+        if deliveries
+            .iter()
+            .chain(acks.iter())
+            .any(|(generation, _)| *generation == self.binding.generation)
+        {
+            self.versioned_seen = true;
+        }
+        if let Some(frame) = self.poll_spool(&deliveries, &acks) {
+            return Some(frame);
+        }
+        self.poll_legacy(&deliveries, &acks)
+    }
+
+    /// Lists this generation's delivery and ack slots in bounded steps over
+    /// the loader-derived directory. A cursor survives between polls, so
+    /// unrelated names cannot permanently hide a later control delivery.
+    /// No file is read during enumeration.
+    fn scan_spool(&mut self) -> Option<(ControlSlotList, ControlSlotList)> {
+        if self.scan_entries.is_none() {
+            self.scan_entries = std::fs::read_dir(&self.directory).ok();
+            if self.scan_entries.is_none() {
+                return Some((Vec::new(), Vec::new()));
+            }
+        }
+        for _ in 0..WASM_CONTROL_SPOOL_SCAN_CAP {
+            let Some(entry) = self.scan_entries.as_mut().and_then(Iterator::next) else {
+                self.scan_entries = None;
+                let mut deliveries = std::mem::take(&mut self.scan_deliveries);
+                let acks = std::mem::take(&mut self.scan_acks);
+                deliveries.sort_by_key(|(_, sequence)| *sequence);
+                return Some((deliveries, acks));
+            };
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some((generation, sequence, class)) = parse_control_name(&name) else {
+                continue;
+            };
+            if generation != self.binding.generation {
+                continue;
+            }
+            match class {
+                ControlFileClass::Delivery => {
+                    if self.scan_deliveries.len() < WASM_CONTROL_SPOOL_SCAN_CAP {
+                        self.scan_deliveries.push((generation, sequence));
+                    }
+                }
+                ControlFileClass::Ack => {
+                    if self.scan_acks.len() < WASM_CONTROL_SPOOL_SCAN_CAP {
+                        self.scan_acks.push((generation, sequence));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Walks the staged deliveries lowest-first and yields the first
+    /// admittable one. Terminal acks make exact replays idempotent skips;
+    /// changed same-sequence content conflicts by leaving both files for the
+    /// owner; our-generation refusals stage one typed refused ack each;
+    /// foreign generations are skipped without touching their slots, which
+    /// belong to their own stream.
+    fn poll_spool(
+        &mut self,
+        deliveries: &[ControlSlot],
+        acks: &[ControlSlot],
+    ) -> Option<WasmHostRequestFrame> {
+        let mut reads = 0usize;
+        for &(generation, sequence) in deliveries {
+            let slot = self.open_ack(generation, sequence, acks, &mut reads);
+            if matches!(slot, AckSlot::Skip) {
+                continue;
+            }
+            let slot_taken = matches!(slot, AckSlot::Reoffer(_));
+            if reads >= CONTROL_POLL_READ_BUDGET {
+                return None;
+            }
+            reads += 1;
+            let path = self
+                .directory
+                .join(control_delivery_name(generation, sequence));
+            let Ok(bytes) = read_control_bytes(&path) else {
+                continue;
+            };
+            let Ok(delivery) = parse_control_delivery(&bytes) else {
+                // Malformed: no identity to bind an ack to, so the file
+                // itself stays as the bounded evidence and the walk moves
+                // on — a poisoned file cannot wedge intake.
+                continue;
+            };
+            // A re-offered open delivery must still carry its accepted
+            // bytes: changed same-sequence content is an identity conflict,
+            // left as the two mismatching files for the owner, never
+            // re-acknowledged over the taken slot.
+            if let AckSlot::Reoffer(ack) = &slot
+                && ack.delivery_digest != delivery.delivery_digest
             {
-                consume_staged(&self.path);
-                Some(frame)
+                continue;
             }
-            Ok(WasmHostRequest::Shutdown) if self.controls_this_operation(&frame) => {
-                consume_staged(&self.path);
-                Some(frame)
+            let identity = &delivery.identity;
+            if identity.generation != generation || identity.owner_sequence != sequence {
+                self.refuse_slot(generation, sequence, &delivery, "control-slot", slot_taken);
+                continue;
             }
-            Ok(WasmHostRequest::Invoke(_)) if self.controls_this_operation(&frame) => {
-                // Names this operation but is never externally admittable:
-                // consume so it cannot spin the poll, and yield nothing.
-                consume_staged(&self.path);
-                None
+            if identity.generation != self.binding.generation {
+                // Foreign generation: never admit, never act, and never
+                // stage into its slot — a concurrent replacement stream
+                // owns it. Skipping is the refusal; the file stays.
+                continue;
             }
-            Ok(_) | Err(_) => None,
+            if let Err(refusal) = join_control_delivery(&delivery, &self.binding, edge_now_ms()) {
+                self.refuse_slot(generation, sequence, &delivery, refusal.field, slot_taken);
+                continue;
+            }
+            if !self.check_previous(generation, sequence, &delivery, &mut reads) {
+                self.refuse_slot(
+                    generation,
+                    sequence,
+                    &delivery,
+                    "control-previous",
+                    slot_taken,
+                );
+                continue;
+            }
+            let kind = identity.control_kind;
+            self.pending = Some(PendingControl::Spool {
+                kind,
+                generation,
+                sequence,
+                replay_key: identity.replay_key.clone(),
+                delivery_digest: delivery.delivery_digest.clone(),
+            });
+            return Some(WasmHostRequestFrame::control(
+                control_operation(kind),
+                &self.admitted,
+            ));
+        }
+        None
+    }
+
+    /// Resolves the ack slot for one delivery.
+    fn open_ack(
+        &self,
+        generation: u64,
+        sequence: u64,
+        acks: &[(u64, u64)],
+        reads: &mut usize,
+    ) -> AckSlot {
+        if !acks.contains(&(generation, sequence)) {
+            return AckSlot::Free;
+        }
+        if *reads >= CONTROL_POLL_READ_BUDGET {
+            return AckSlot::Skip;
+        }
+        *reads += 1;
+        let path = self.directory.join(control_ack_name(generation, sequence));
+        let Ok(bytes) = read_control_bytes(&path) else {
+            return AckSlot::Skip;
+        };
+        let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
+            return AckSlot::Skip;
+        };
+        if ack.wire_id != WASM_CONTROL_ACK_WIRE_ID
+            || ack.wire_version != WASM_CONTROL_ACK_WIRE_VERSION
+            || ack.generation != generation
+            || ack.owner_sequence != sequence
+            || ack
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.len() > WASM_CONTROL_MAX_DETAIL_BYTES)
+        {
+            return AckSlot::Skip;
+        }
+        match ack.phase {
+            ControlAckPhase::Completed | ControlAckPhase::Refused => AckSlot::Skip,
+            ControlAckPhase::Enqueued => {
+                let mine = self.accepted.as_ref().is_some_and(|accepted| {
+                    accepted.generation == generation && accepted.sequence == sequence
+                });
+                if mine {
+                    AckSlot::Skip
+                } else {
+                    AckSlot::Reoffer(ack)
+                }
+            }
         }
     }
 
-    /// Returns one staged Cancel/Shutdown naming this operation, consuming
-    /// it, or `None` when nothing urgent is staged (#2568 A3). A staged
-    /// Reconcile is left in place for the idle path — it observes a finished
-    /// attempt, so it never preempts outstanding work. Every other fault
-    /// degrades exactly as [`Self::poll`]: only a well-formed urgent frame
-    /// naming this exact operation is consumed and returned.
-    fn poll_urgent(&self) -> Option<WasmHostRequestFrame> {
-        let Ok(bytes) = read_staged_bytes(&self.path) else {
+    /// Checks the previous-delivery link: sequence zero must open the stream,
+    /// and a later sequence must chain to its retained predecessor. A retired
+    /// predecessor (no ack to check against) cannot wedge the stream: the
+    /// delivery is accepted without the link.
+    fn check_previous(
+        &self,
+        generation: u64,
+        sequence: u64,
+        delivery: &WasmControlDelivery,
+        reads: &mut usize,
+    ) -> bool {
+        let previous = delivery.identity.previous_delivery_digest.as_ref();
+        if sequence == 0 {
+            return previous.is_none();
+        }
+        if *reads >= CONTROL_POLL_READ_BUDGET {
+            return false;
+        }
+        *reads += 1;
+        let path = self
+            .directory
+            .join(control_ack_name(generation, sequence - 1));
+        let Ok(bytes) = read_control_bytes(&path) else {
+            return true;
+        };
+        let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
+            return true;
+        };
+        previous.is_some_and(|digest| *digest == ack.delivery_digest)
+    }
+
+    /// Stages one typed refused ack at an exact free slot. Best-effort: a
+    /// staging failure leaves the delivery unacknowledged for the next poll,
+    /// and polling never fails the loop. A taken slot is never overwritten.
+    fn refuse_slot(
+        &self,
+        generation: u64,
+        sequence: u64,
+        delivery: &WasmControlDelivery,
+        field: &'static str,
+        slot_taken: bool,
+    ) {
+        if slot_taken {
+            return;
+        }
+        let ack = WasmControlAck {
+            wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+            replay_key: delivery.identity.replay_key.clone(),
+            operation_id: delivery.identity.operation_id.clone(),
+            generation,
+            owner_sequence: sequence,
+            delivery_digest: delivery.delivery_digest.clone(),
+            phase: ControlAckPhase::Refused,
+            detail: Some(field.to_owned()),
+            outcome_digest: None,
+        };
+        let _ = self.stage_ack(generation, sequence, &ack);
+    }
+
+    /// Polls the legacy fixed file under the serialized owner rule: only
+    /// while no versioned delivery or ack for this generation was ever
+    /// observed, only for the exact running operation and grant, and never
+    /// for `Invoke`. Unjoinable content stays in place as owner evidence.
+    fn poll_legacy(
+        &mut self,
+        deliveries: &[(u64, u64)],
+        acks: &[(u64, u64)],
+    ) -> Option<WasmHostRequestFrame> {
+        if self.legacy_consumed || self.versioned_seen {
+            return None;
+        }
+        let versioned_staged = deliveries
+            .iter()
+            .chain(acks.iter())
+            .any(|(generation, _)| *generation == self.binding.generation);
+        if versioned_staged {
+            self.versioned_seen = true;
+            return None;
+        }
+        let Ok(bytes) = read_control_bytes(&self.legacy_path) else {
             return None;
         };
         let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
             return None;
         };
-        match WasmHostRequestFrame::parse(&frame) {
-            Ok(WasmHostRequest::Cancel(control)) if control == self.identity => {
-                consume_staged(&self.path);
-                Some(frame)
+        if frame.grant_digest != self.admitted.grant_digest {
+            return None;
+        }
+        let expected = WasmHostControl {
+            operation_id: self.admitted.operation_id.clone(),
+            invocation_id: self.admitted.invocation_id.clone(),
+            request_digest: self.admitted.request_digest.clone(),
+        };
+        let kind = match WasmHostRequestFrame::parse(&frame) {
+            Ok(WasmHostRequest::Cancel(control)) if control == expected => WasmControlKind::Cancel,
+            Ok(WasmHostRequest::Reconcile(control)) if control == expected => {
+                WasmControlKind::Reconcile
             }
             Ok(WasmHostRequest::Shutdown) if self.controls_this_operation(&frame) => {
-                consume_staged(&self.path);
-                Some(frame)
+                WasmControlKind::Shutdown
             }
-            Ok(WasmHostRequest::Invoke(_)) if self.controls_this_operation(&frame) => {
-                // Names this operation but is never externally admittable:
-                // consume so it cannot spin the poll, and yield nothing.
-                consume_staged(&self.path);
-                None
-            }
-            Ok(_) | Err(_) => None,
+            Ok(_) | Err(_) => return None,
+        };
+        self.pending = Some(PendingControl::Legacy {
+            kind,
+            digest: sha256_hex(&bytes),
+        });
+        Some(frame)
+    }
+
+    /// Offers the first ordered control only when it can interrupt pending
+    /// guest work. Reconcile remains staged and unacknowledged until idle;
+    /// Cancel/Shutdown also remain unacknowledged until their owner action
+    /// reaches the worker. No fixed or versioned control file is consumed.
+    fn poll_urgent(&mut self) -> Option<WasmHostRequestFrame> {
+        let frame = self.poll()?;
+        if matches!(
+            self.pending.as_ref().map(PendingControl::kind),
+            Some(WasmControlKind::Cancel | WasmControlKind::Shutdown)
+        ) {
+            Some(frame)
+        } else {
+            self.pending = None;
+            None
         }
     }
 
-    /// Pins a Shutdown or Invoke frame to this operation. Those parses
-    /// carry their identity as plain fields, so the external path checks
-    /// them here: parse alone authenticates nothing.
+    /// Confirms admission plus successful worker enqueue for the pending
+    /// delivery of `operation`: a spool delivery stages its `enqueued` ack at
+    /// the exact slot, a legacy delivery retires by exact-name byte-verified
+    /// delete. Any other operation — or no pending delivery — is a no-op, so
+    /// internal commands confirm nothing.
+    fn confirm_enqueued(&mut self, operation: &str) -> Result<(), LoopError> {
+        let Some(pending) = self.pending.clone() else {
+            return Ok(());
+        };
+        if pending.operation() != operation {
+            return Ok(());
+        }
+        match pending {
+            PendingControl::Spool {
+                kind,
+                generation,
+                sequence,
+                replay_key,
+                delivery_digest,
+            } => {
+                let ack = WasmControlAck {
+                    wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+                    wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+                    replay_key: replay_key.clone(),
+                    operation_id: self.binding.operation_id.clone(),
+                    generation,
+                    owner_sequence: sequence,
+                    delivery_digest: delivery_digest.clone(),
+                    phase: ControlAckPhase::Enqueued,
+                    detail: None,
+                    outcome_digest: None,
+                };
+                self.stage_ack(generation, sequence, &ack)?;
+                self.accepted = Some(AcceptedControl {
+                    kind,
+                    generation,
+                    sequence,
+                    replay_key,
+                    delivery_digest,
+                });
+            }
+            PendingControl::Legacy { digest, .. } => {
+                // Best-effort: the file itself remains as visible evidence
+                // when retirement fails, so the run continues and a restart
+                // re-offers the same bytes under at-least-once delivery.
+                let _ = retire_legacy_control(&self.legacy_path, &digest);
+                self.legacy_consumed = true;
+            }
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    /// Confirms the exact observed worker outcome of the accepted delivery
+    /// for `operation` by staging its `completed` ack over the exact slot.
+    /// Any other operation — including internal commands and legacy
+    /// deliveries, which carry no ack slot — is a no-op.
+    fn confirm_completed(
+        &mut self,
+        operation: &str,
+        outcome_digest: Option<&str>,
+    ) -> Result<(), LoopError> {
+        let Some(accepted) = self.accepted.clone() else {
+            return Ok(());
+        };
+        if control_operation(accepted.kind) != operation {
+            return Ok(());
+        }
+        let outcome_digest = outcome_digest
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .map(str::to_owned);
+        let ack = WasmControlAck {
+            wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+            replay_key: accepted.replay_key.clone(),
+            operation_id: self.binding.operation_id.clone(),
+            generation: accepted.generation,
+            owner_sequence: accepted.sequence,
+            delivery_digest: accepted.delivery_digest.clone(),
+            phase: ControlAckPhase::Completed,
+            detail: None,
+            outcome_digest,
+        };
+        self.stage_ack(accepted.generation, accepted.sequence, &ack)?;
+        self.accepted = None;
+        Ok(())
+    }
+
+    /// Stages one ack at its exact generation/sequence name.
+    fn stage_ack(
+        &self,
+        generation: u64,
+        sequence: u64,
+        ack: &WasmControlAck,
+    ) -> Result<(), LoopError> {
+        let bytes = serde_json::to_vec(ack).map_err(|_| LoopError::ChannelUnavailable)?;
+        stage_control_bytes(
+            &self.directory.join(control_ack_name(generation, sequence)),
+            &bytes,
+        )
+        .map_err(|_| LoopError::ChannelUnavailable)
+    }
+
+    /// Pins a legacy Shutdown frame to this operation. The parse carries its
+    /// identity as plain fields, so the external path checks them here: parse
+    /// alone authenticates nothing.
     fn controls_this_operation(&self, frame: &WasmHostRequestFrame) -> bool {
-        frame.operation_id == self.identity.operation_id
-            && frame.invocation_id == self.identity.invocation_id
-            && frame.request_digest == self.identity.request_digest
+        frame.operation_id == self.admitted.operation_id
+            && frame.invocation_id == self.admitted.invocation_id
+            && frame.request_digest == self.admitted.request_digest
     }
 }
 
@@ -1328,16 +1883,34 @@ impl WasmHostRequestChannel for DeliverySetChannel {
     }
 
     fn poll_control(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
-        match self.control.as_ref() {
+        match self.control.as_mut() {
             Some(reader) => Ok(reader.poll()),
             None => Ok(None),
         }
     }
 
     fn poll_control_urgent(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
-        match self.control.as_ref() {
+        match self.control.as_mut() {
             Some(reader) => Ok(reader.poll_urgent()),
             None => Ok(None),
+        }
+    }
+
+    fn confirm_control_enqueued(&mut self, operation: &str) -> Result<(), LoopError> {
+        match self.control.as_mut() {
+            Some(reader) => reader.confirm_enqueued(operation),
+            None => Ok(()),
+        }
+    }
+
+    fn confirm_control_completed(
+        &mut self,
+        operation: &str,
+        outcome_digest: Option<&str>,
+    ) -> Result<(), LoopError> {
+        match self.control.as_mut() {
+            Some(reader) => reader.confirm_completed(operation, outcome_digest),
+            None => Ok(()),
         }
     }
 
@@ -1427,7 +2000,9 @@ fn command_name(command: WorkerCommand) -> &'static str {
 
 /// Operation a result event answers for one observed worker command. A
 /// Shutdown outcome never projects a frame (the loop returns `None` for
-/// it); the arm exists so the mapping stays total.
+/// it); the arm exists so the mapping stays total. The same vocabulary
+/// keys control confirmation: `Execute` never carries an external
+/// delivery, so confirming it is always a no-op.
 fn command_operation(command: WorkerCommand) -> &'static str {
     match command {
         WorkerCommand::Execute => OP_INVOKE,
@@ -1767,6 +2342,10 @@ impl BoundedRequestLoop {
             }
             WasmHostRequest::Cancel(control) => {
                 check_control(&self.binding, control)?;
+                // Admission only validates and queues: the follow-up is
+                // spent by `send` after the worker accepts the enqueue, so
+                // a full/disconnected channel never advances containment
+                // truthfully owed to an accepted command.
                 self.queued = Some(WorkerCommand::Cancel);
             }
             WasmHostRequest::Reconcile(control) => {
@@ -1903,7 +2482,11 @@ impl BoundedRequestLoop {
         self.queue_control(OP_CANCEL)
     }
 
-    /// Hands the queued command to the tracked worker.
+    /// Hands the queued command to the tracked worker. Containment and
+    /// reconciliation state advances only here, after the worker accepts the
+    /// enqueue: a refused send leaves the follow-up unspent and the command
+    /// queued, so the delivery stays replayable and the drain still owes it
+    /// its exact outcome.
     fn send(
         &mut self,
         command: WorkerCommand,
@@ -2056,8 +2639,8 @@ pub fn run_request_loop(
     let binding = AdmittedBinding::from_material(material, &runtime.invocation);
     let request_frame = WasmHostRequestFrame::admitted_invoke(&binding);
     let mut channel = DeliverySetChannel::new(request_frame);
-    if let Some(path) = kernel_control_path() {
-        channel = channel.with_kernel_control(KernelControlReader::new(&binding, path));
+    if let Some(directory) = kernel_control_dir() {
+        channel = channel.with_kernel_control(KernelControlReader::new(&binding, directory));
     }
     let mut state = BoundedRequestLoop::new(
         binding,
@@ -2073,6 +2656,17 @@ pub fn run_request_loop(
         &worker.outcomes,
         &worker.handle,
     );
+    drain_and_shutdown_request_worker(&mut state, &mut channel, worker, outcome)
+}
+
+/// Drains accepted work, shuts down and joins the worker, then returns the
+/// exact terminal result of the ordinary request loop.
+fn drain_and_shutdown_request_worker(
+    state: &mut BoundedRequestLoop,
+    channel: &mut DeliverySetChannel,
+    worker: EngineWorker,
+    outcome: Result<(), LoopError>,
+) -> Result<WasmHostResultFrame, LoopError> {
     // Join-after-drain (#2785 trigger 1): intake returns on close or
     // exhaustion with a command possibly outstanding, so keep polling
     // outcomes until the worker idles and only then shut down and join.
@@ -2081,17 +2675,21 @@ pub fn run_request_loop(
     // channel and the join never returns.
     state.begin_drain();
     let drained = drain_outstanding(
-        &mut state,
-        &mut channel,
+        state,
+        channel,
         &worker.commands,
         &worker.outcomes,
         &worker.handle,
     );
-    let (shutdown_sent, shutdown_error) = enqueue_typed_shutdown(&mut state, &worker.commands);
+    let (shutdown_sent, shutdown_error) = enqueue_typed_shutdown(state, &worker.commands);
+    let mut confirm_error: Option<LoopError> = None;
+    if shutdown_sent && let Err(error) = channel.confirm_control_enqueued(OP_SHUTDOWN) {
+        confirm_error = Some(error);
+    }
     let shutdown_drained = if shutdown_sent {
         drain_outstanding(
-            &mut state,
-            &mut channel,
+            state,
+            channel,
             &worker.commands,
             &worker.outcomes,
             &worker.handle,
@@ -2107,7 +2705,7 @@ pub fn run_request_loop(
         drop(worker.commands);
     }
     let termination_drain =
-        drain_until_worker_exit(&mut state, &mut channel, &worker.outcomes, &worker.handle);
+        drain_until_worker_exit(state, channel, &worker.outcomes, &worker.handle);
     let shutdown_observed = shutdown_sent
         && state.lifecycle.outstanding != Some(WorkerCommand::Shutdown)
         && state.shutdown_request_won.is_some();
@@ -2122,13 +2720,7 @@ pub fn run_request_loop(
     // `JoinHandle::join` is called only after the worker owner confirms
     // termination. The wait also drains any late bounded outcome before the
     // handle can be joined.
-    while !worker.handle.is_finished() {
-        std::thread::yield_now();
-    }
-    let joined = worker.handle.join().is_ok();
-    if joined {
-        state.mark_shutdown();
-    }
+    let joined = join_shutdown_worker(state, channel, worker.handle, &mut confirm_error);
     if let Some(error) = shutdown_error {
         return Err(error);
     }
@@ -2153,42 +2745,90 @@ pub fn run_request_loop(
         let error = LoopError::WorkerTerminatedWithoutOutcome {
             command: "shutdown",
         };
-        state.publish_lost_response(&mut channel, error);
+        state.publish_lost_response(channel, error);
         return Err(error);
     }
     if !joined {
         return Err(LoopError::ChannelUnavailable);
     }
+    // A Shutdown ack that could not be staged fails the loop honestly: the
+    // delivery stays unacknowledged and the owner must reconcile it, rather
+    // than the child reporting success it cannot prove.
+    if let Some(error) = confirm_error {
+        return Err(error);
+    }
     state.published().cloned().ok_or(denied("no-request"))
 }
 
-/// Derives the Kernel control-request path from the loader path only —
-/// never from argv, stdin, or environment. `None` when the loader path is
-/// unavailable, in which case the loop serves the delivery set with no
-/// external control source.
-fn kernel_control_path() -> Option<PathBuf> {
-    admitted_material_path().and_then(|path| {
-        path.parent()
-            .map(|directory| directory.join(WASM_HOST_CONTROL_FILE_NAME))
-    })
+/// Joins the terminated worker and confirms its observed Shutdown outcome.
+fn join_shutdown_worker(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    handle: std::thread::JoinHandle<()>,
+    confirm_error: &mut Option<LoopError>,
+) -> bool {
+    while !handle.is_finished() {
+        std::thread::yield_now();
+    }
+    let joined = handle.join().is_ok();
+    if joined {
+        state.mark_shutdown();
+        // Termination observed: the accepted Shutdown's exact outcome is the
+        // joined worker (its reply stays unread by #2785 design), so the
+        // delivery completes here with no outcome digest.
+        if let Err(error) = channel.confirm_control_completed(OP_SHUTDOWN, None)
+            && confirm_error.is_none()
+        {
+            *confirm_error = Some(error);
+        }
+    }
+    joined
+}
+
+/// Derives the Kernel control spool directory from the loader path only —
+/// never from argv, stdin, or environment: the install directory holding the
+/// delivery set. `None` when the loader path is unavailable, in which case
+/// the loop serves the delivery set with no external control source.
+fn kernel_control_dir() -> Option<PathBuf> {
+    admitted_material_path().and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// What one external-control intake step admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalIntake {
+    /// Nothing was staged.
+    None,
+    /// A Cancel/Reconcile was admitted and queued: the caller enqueues it
+    /// and confirms the delivery only after the worker accepts it.
+    Command(WorkerCommand),
+    /// A Shutdown was admitted: admission is closed and the drain is
+    /// entered, and the delivery is confirmed after the worker accepts the
+    /// tracked shutdown in the join tail.
+    Shutdown,
 }
 
 /// Admits one externally staged Kernel control frame through the same
-/// admission path internal control uses. Returns whether a frame was
-/// admitted; the caller then applies the loop's normal send/close handling
-/// and continues its tick without pulling a new delivery request.
+/// admission path internal control uses. The caller enqueues the admitted
+/// command through the loop's normal send handling and continues its tick
+/// without pulling a new delivery request; a Shutdown instead closes
+/// admission and enters the drain. Admission failure records the exact
+/// denial and leaves the staged delivery replayable — nothing is
+/// acknowledged or retired here.
 fn admit_external_control(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
-) -> Result<bool, LoopError> {
+) -> Result<ExternalIntake, LoopError> {
     let Some(frame) = channel.poll_control()? else {
-        return Ok(false);
+        return Ok(ExternalIntake::None);
     };
     if let Err(error) = state.admit(&frame) {
         state.denial = Some(error);
         return Err(error);
     }
-    Ok(true)
+    match state.queued {
+        Some(command) => Ok(ExternalIntake::Command(command)),
+        None => Ok(ExternalIntake::Shutdown),
+    }
 }
 
 /// Admits one staged urgent Cancel/Shutdown through the same admission path
@@ -2236,11 +2876,14 @@ fn drive_loop(
         // invoke is pulled, never after it executed. Intake is provably
         // open here (nothing outstanding or queued), so no second command
         // stacks behind an outstanding one.
-        if admit_external_control(state, channel)? {
-            if let Some(command) = state.queued {
+        match admit_external_control(state, channel)? {
+            ExternalIntake::Command(command) => {
                 state.send(command, commands)?;
+                channel.confirm_control_enqueued(command_operation(command))?;
+                continue;
             }
-            continue;
+            ExternalIntake::Shutdown => continue,
+            ExternalIntake::None => {}
         }
         let Some(frame) = channel.next_frame()? else {
             state.begin_drain();
@@ -2268,7 +2911,10 @@ fn drive_loop(
             break;
         }
         if let Some(command) = state.queued {
+            // Delivery-set demand carries no external delivery: the confirm
+            // is a no-op by construction, kept so every send site confirms.
             state.send(command, commands)?;
+            channel.confirm_control_enqueued(command_operation(command))?;
         }
     }
     Ok(())
@@ -2334,6 +2980,7 @@ fn poll_pending(
             admit_external_control(state, channel)?;
             if let Some(command) = state.queued {
                 state.send(command, commands)?;
+                channel.confirm_control_enqueued(command_operation(command))?;
             }
             Ok(())
         }
@@ -2359,12 +3006,21 @@ fn consume_worker_outcome(
     if state.lifecycle.outstanding != Some(outcome.command) {
         return Err(denied("uncorrelated-outcome"));
     }
+    let command = outcome.command;
     state.lifecycle.outstanding = None;
     if let Some(frame) = state.on_outcome(outcome) {
+        // The exact outcome is observed here: complete the accepted
+        // control before publishing, so the ack is durable ahead of
+        // the best-effort emission the drain may still record.
+        let digest = serde_json::to_vec(&frame)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        channel.confirm_control_completed(command_operation(command), digest.as_deref())?;
         channel.publish(&frame)?;
     }
     if let Some(command) = state.queued {
         state.send(command, commands)?;
+        channel.confirm_control_enqueued(command_operation(command))?;
     }
     Ok(())
 }
@@ -2398,7 +3054,10 @@ fn drain_outstanding(
                 result => result?,
             }
         } else if let Some(command) = state.queued {
+            // A retried external send confirms its still-pending delivery;
+            // internal follow-ups confirm nothing.
             state.send(command, commands)?;
+            channel.confirm_control_enqueued(command_operation(command))?;
         }
         state.tick();
     }
@@ -2612,7 +3271,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                         edge_now_ms(),
                     );
                 }
-                let reclamation = consume_delivery_set(&material, &claim);
+                let reclamation = consume_delivery_set(&claim);
                 // Bounded residual only: a partial reclamation never
                 // overwrites the primary result; retained files stay for
                 // maintenance under the exact claimed identity.
@@ -2672,7 +3331,6 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
 /// environment. Returns the typed claimed reclamation; a partial outcome is
 /// a bounded residual, never a primary-result overwrite.
 fn consume_delivery_set(
-    material: &ValidatedDispatchMaterial,
     claim: &crate::dispatch_material::DeliveryClaim,
 ) -> crate::dispatch_material::ClaimedReclamation {
     use crate::dispatch_material::admitted_material_path;
@@ -2683,33 +3341,7 @@ fn consume_delivery_set(
             claimed: claim.identity().clone(),
         };
     };
-    let reclamation = crate::dispatch_material::reclaim_claimed_delivery(claim, &directory);
-    // Control retire is claim-pinned, not a fixed-name delete: the fixed
-    // control name is only a locator — it is renamed aside under the exact
-    // claimed operation identity and only aside bytes that prove they name
-    // this operation are deleted. A foreign or malformed control is
-    // restored (or left when a successor owns the name) for its own
-    // delivery. Control ownership is (operation, grant) by protocol, so a
-    // late same-operation control retires with its operation; the live
-    // poll read-then-consume path above is unchanged and out of scope here.
-    let _control = crate::dispatch_material::reclaim_claimed_file(
-        &directory,
-        WASM_HOST_CONTROL_FILE_NAME,
-        claim.identity(),
-        |bytes| control_bytes_name_operation(bytes, material),
-    );
-    reclamation
-}
-
-/// Returns whether staged control bytes name the served operation. Any
-/// shape or identity mismatch answers no: ownership of an unidentifiable
-/// file can never be established.
-fn control_bytes_name_operation(bytes: &[u8], material: &ValidatedDispatchMaterial) -> bool {
-    let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(bytes) else {
-        return false;
-    };
-    frame.operation_id == material.operation_id
-        && frame.grant_digest == material.grant.grant_digest.as_str()
+    crate::dispatch_material::reclaim_claimed_delivery(claim, &directory)
 }
 
 /// Reads the owner-staged delivery set beside this installation,

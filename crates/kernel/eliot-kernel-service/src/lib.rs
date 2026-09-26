@@ -62,6 +62,7 @@ mod user_automation_runtime_handoff;
 mod user_automation_store;
 #[cfg(test)]
 mod user_automation_store_tests;
+mod wasm_control;
 mod wasm_dispatch;
 mod write_coordinator;
 
@@ -261,6 +262,19 @@ pub use user_automation_runtime_handoff::{
 pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,
     UserAutomationOwnerReadProvenance, UserAutomationOwnerSnapshot,
+};
+pub use wasm_control::{
+    ControlAckPhase, ControlDeliveryIdentity, ControlDisposition, ControlDispositionRecord,
+    WASM_CONTROL_ACK_WIRE_ID, WASM_CONTROL_ACK_WIRE_VERSION, WASM_CONTROL_DELIVERY_WIRE_ID,
+    WASM_CONTROL_DELIVERY_WIRE_VERSION, WASM_CONTROL_DISPOSITION_WIRE_ID,
+    WASM_CONTROL_DISPOSITION_WIRE_VERSION, WASM_CONTROL_FILE_PREFIX, WASM_CONTROL_GRANT_WINDOW_MS,
+    WASM_CONTROL_HEAD_WIRE_ID, WASM_CONTROL_HEAD_WIRE_VERSION, WASM_CONTROL_KIND_CANCEL,
+    WASM_CONTROL_KIND_RECONCILE, WASM_CONTROL_KIND_SHUTDOWN, WASM_CONTROL_MAX_DETAIL_BYTES,
+    WASM_CONTROL_MAX_FILE_BYTES, WASM_CONTROL_REPLAY_KEY_DOMAIN, WASM_CONTROL_SPOOL_MAX_DELIVERIES,
+    WASM_CONTROL_SPOOL_RESERVE_SLOTS, WASM_CONTROL_SPOOL_SCAN_CAP, WasmControlAck,
+    WasmControlDelivery, WasmControlDeliveryStatus, WasmControlError, WasmControlKind,
+    WasmControlPublishInputs, WasmControlPublishReceipt, WasmControlSpoolStatus,
+    note_wasm_control_supervised_end, publish_wasm_control_delivery, reconcile_wasm_control_spool,
 };
 pub use wasm_dispatch::{
     DeliveryReclaimOutcome, JoinDeny, MAX_DELIVERY_PAYLOAD_BYTES, MAX_DELIVERY_SLOTS,
