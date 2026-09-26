@@ -19,7 +19,7 @@ use crate::{
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
     McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection, canonical_tool_schemas,
-    decode_protected_request_bytes, validate_proof_ceiling,
+    decode_protected_request_bytes, reject_duplicate_keys, validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -2018,6 +2018,7 @@ impl WireRejection {
 /// exactly one frame per line, and a batch has no single correlation to
 /// preserve.
 pub fn decode_wire_request(text: &str) -> Result<WireRequest, WireEnvelopeError> {
+    reject_duplicate_keys(text.as_bytes()).map_err(|_| WireEnvelopeError::parse())?;
     let value: Value = serde_json::from_str(text).map_err(|_| WireEnvelopeError::parse())?;
     if value.is_array() {
         return Err(WireEnvelopeError::invalid_request(
