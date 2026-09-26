@@ -3142,6 +3142,23 @@ pub enum OrdinaryDriveError {
         /// Served claim identity.
         claim_id: String,
     },
+    /// Local served-marker read failed for an exact claimed delivery.
+    /// The marker failure is not interpreted as absence, and the set stays
+    /// staged for recovery without starting guest execution.
+    ServedMarkerRead {
+        /// Exact staged identity whose execution was withheld.
+        identity: Box<crate::dispatch_material::StagedDeliveryIdentity>,
+        /// Typed reason the served marker could not be read.
+        error: crate::dispatch_material::ServedMarkerReadError,
+    },
+    /// Local served-marker persistence failed after result publication.
+    /// The claimed staging set is retained and reclamation is not attempted.
+    ServedMarkerWrite {
+        /// Exact staged identity whose material remains retained.
+        identity: Box<crate::dispatch_material::StagedDeliveryIdentity>,
+        /// OS error kind from the failed atomic marker write.
+        kind: std::io::ErrorKind,
+    },
     /// The delivery set, installation binding, permit, or admitted world
     /// failed closed before the loop could start.
     Drive(DriveError),
@@ -3154,6 +3171,12 @@ impl fmt::Display for OrdinaryDriveError {
         match self {
             Self::NoDeliverySet => formatter.write_str("ORDINARY_NO_ADMITTED_DELIVERY_SET"),
             Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
+            Self::ServedMarkerRead { error, .. } => {
+                write!(formatter, "ORDINARY_{error}")
+            }
+            Self::ServedMarkerWrite { kind, .. } => {
+                write!(formatter, "ORDINARY_SERVED_MARKER_WRITE_FAILED:{kind:?}")
+            }
             Self::Drive(error) => write!(formatter, "{error}"),
             Self::Loop(error) => write!(formatter, "{error}"),
         }
@@ -3197,14 +3220,27 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // The claim arrives with the material from one claim-first read:
         // the pre-read envelope identity selected this operation before
         // the payload files were trusted, so the claim below is that
-        // selection — never a copy derived after the fact. Durable served
-        // state extends in-memory retention across restart: a staged set
-        // the marker names is terminal-unacknowledged (a crash between
-        // publish and reclaim), so it replays below instead of
-        // re-executing.
-        let served_marker = crate::dispatch_material::admitted_material_path()
+        // selection — never a copy derived after the fact. A readable local
+        // served marker can carry this identity into restart classification:
+        // a staged set it names is terminal-unacknowledged (a crash between
+        // publish and reclaim), so it replays below instead of re-executing.
+        // The local file is neither an owner acknowledgement nor a guarantee
+        // of power-loss durability.
+        let Some(directory) = crate::dispatch_material::admitted_material_path()
             .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-            .and_then(|directory| crate::dispatch_material::read_served_marker(&directory));
+        else {
+            return Err(OrdinaryDriveError::ServedMarkerRead {
+                identity: Box::new(claim.identity().clone()),
+                error: crate::dispatch_material::ServedMarkerReadError::PathUnavailable,
+            });
+        };
+        let served_marker =
+            crate::dispatch_material::read_served_marker(&directory).map_err(|error| {
+                OrdinaryDriveError::ServedMarkerRead {
+                    identity: Box::new(claim.identity().clone()),
+                    error,
+                }
+            })?;
         match crate::dispatch_material::classify_staged_delivery(
             &material,
             served.as_ref(),
@@ -3242,20 +3278,22 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // path, not a second execution.
         match frame {
             Ok(ok_frame) => {
-                // Durable served marker (#2786 step 7): after the terminal
-                // outcome published, before reclaim. A crash between the two
-                // leaves staged bytes plus this marker, so restart replays
-                // instead of re-executing. Best-effort: the serve already
-                // happened exactly once.
-                if let Some(directory) = crate::dispatch_material::admitted_material_path()
-                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-                {
-                    let _ = crate::dispatch_material::write_served_marker(
-                        &directory,
-                        claim.identity(),
-                        edge_now_ms(),
-                    );
-                }
+                // The local served-marker write must succeed after the
+                // terminal outcome publishes and before this process reclaims
+                // the set. Its file sync does not establish parent-directory
+                // or power-loss durability and is not an owner acknowledgement.
+                // A failed write retains this exact claimed set and stops this
+                // drive. If failure occurs before a partial is created,
+                // cross-restart ambiguity remains for owner reconciliation.
+                crate::dispatch_material::write_served_marker(
+                    &directory,
+                    claim.identity(),
+                    edge_now_ms(),
+                )
+                .map_err(|error| OrdinaryDriveError::ServedMarkerWrite {
+                    identity: Box::new(claim.identity().clone()),
+                    kind: error.kind(),
+                })?;
                 let reclamation = consume_delivery_set(&claim);
                 // Bounded residual only: a partial reclamation never
                 // overwrites the primary result; retained files stay for

@@ -51,13 +51,13 @@ pub const WASM_HOST_GUEST_INPUT_FILE_NAME: &str = "eliot-wasm-host.guest-input.b
 /// exact-name byte-verified delete. Anything it cannot join stays in place
 /// for its owner.
 pub const WASM_HOST_CONTROL_FILE_NAME: &str = "eliot-wasm-host.control-request.json";
-/// Durable served marker (#2786 step 7): written atomically after a terminal
-/// outcome publishes, removed only when its own identity fully reclaims. A
-/// crash between publish and reclaim leaves staged bytes plus this marker,
-/// so restart classifies terminal-unacknowledged as replay instead of
-/// re-executing. Single fixed name, overwritten by every serve: no
-/// accumulation is possible, and a stale marker (naming a replaced set)
-/// never matches the staged identity.
+/// Locally written served marker (#2786 step 7): written after a terminal
+/// outcome publishes and removed only when its own identity fully reclaims.
+/// A readable marker can support restart classification while it remains
+/// present. This local file write is not an owner acknowledgement and does
+/// not claim power-loss durability. Single fixed name, overwritten by every
+/// serve: no accumulation is possible, and a stale marker (naming a replaced
+/// set) never matches the staged identity.
 pub const WASM_HOST_SERVED_FILE_NAME: &str = "eliot-wasm-host.served.json";
 /// Material envelope wire identity, matched exactly with the publisher.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
@@ -1545,7 +1545,7 @@ pub fn reclaim_claimed_delivery(
     if reclamation_gone(&artifact)
         && reclamation_gone(&input)
         && reclamation_gone(&material)
-        && let Some(mark) = read_served_marker(install_dir)
+        && let Ok(Some(mark)) = read_served_marker(install_dir)
         && mark.names(claim.identity())
     {
         let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_FILE_NAME));
@@ -1577,9 +1577,9 @@ pub enum StagedDeliveryState {
 /// Classifies staged material against served retention. Same identity — or
 /// the same grant digest under any differing generation/operation/digests —
 /// is a replay of spent one-shot authority, never a fresh execution. The
-/// durable marker extends the same rule across restart: a staged set the
-/// marker names is terminal-unacknowledged (a crash between publish and
-/// reclaim), so it replays instead of re-executing.
+/// local marker extends the same rule across restart when the file remains
+/// readable: a staged set named by the marker is terminal-unacknowledged (a
+/// crash between publish and reclaim), so it replays instead of re-executing.
 #[must_use]
 pub fn classify_staged_delivery(
     material: &ValidatedDispatchMaterial,
@@ -1602,9 +1602,10 @@ pub fn classify_staged_delivery(
     }
 }
 
-/// Durable served record: the identity this drive served to a published
+/// Local served record: the identity this drive associated with a published
 /// terminal outcome. Decisions match on identity only; `served_at_unix_ms`
-/// is informational (wall-clock at write, never a derivation input).
+/// is informational (wall-clock at write, never a derivation input). The
+/// record is not an owner acknowledgement or a power-loss durability proof.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServedDeliveryMarker {
@@ -1643,24 +1644,113 @@ impl ServedDeliveryMarker {
     }
 }
 
-/// Reads the durable served marker, if any. Absent, oversize, or
-/// unparseable answers `None`: an unreadable marker must not wedge
-/// execution; the staged-identity behavior is the fallback. Bounded read:
-/// a legitimate marker is a few hundred bytes.
-#[must_use]
-pub fn read_served_marker(install_dir: &std::path::Path) -> Option<ServedDeliveryMarker> {
-    let bytes = std::fs::read(install_dir.join(WASM_HOST_SERVED_FILE_NAME)).ok()?;
-    if bytes.len() > 4096 {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
+/// Why a local served marker could not be read. Only a genuinely absent
+/// marker is compatible with first service of a legacy fixed-name set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServedMarkerReadError {
+    /// The installation directory could not be derived for this claimed set.
+    PathUnavailable,
+    /// A current or legacy atomic marker write left a staged partial record.
+    WriteInProgress,
+    /// The marker path could not be read for an I/O reason other than absence.
+    Unreadable(std::io::ErrorKind),
+    /// The marker exceeded the bounded allocation limit.
+    TooLarge,
+    /// The marker bytes were not a valid closed marker record.
+    Malformed,
 }
 
-/// Writes the served marker atomically (process-scoped partial, flushed,
-/// then renamed): the reader never observes partial JSON. Best-effort
-/// durability signal: the serve already happened exactly once, so callers
-/// proceed on failure — without a marker only crash-recovery replay is
-/// lost, never the correctness of this serve.
+impl std::fmt::Display for ServedMarkerReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PathUnavailable => formatter.write_str("SERVED_MARKER_PATH_UNAVAILABLE"),
+            Self::WriteInProgress => formatter.write_str("SERVED_MARKER_WRITE_IN_PROGRESS"),
+            Self::Unreadable(kind) => write!(formatter, "SERVED_MARKER_UNREADABLE:{kind:?}"),
+            Self::TooLarge => formatter.write_str("SERVED_MARKER_TOO_LARGE"),
+            Self::Malformed => formatter.write_str("SERVED_MARKER_MALFORMED"),
+        }
+    }
+}
+
+impl std::error::Error for ServedMarkerReadError {}
+
+/// Reads the local served marker, distinguishing true absence from
+/// unreadable, oversized, and malformed evidence. Bounded read: a legitimate
+/// marker is a few hundred bytes. Partial-name discovery streams the
+/// installation directory with constant memory and propagates enumeration
+/// errors; true absence is returned only when neither writer's partial name
+/// is present.
+pub fn read_served_marker(
+    install_dir: &std::path::Path,
+) -> Result<Option<ServedDeliveryMarker>, ServedMarkerReadError> {
+    match std::fs::metadata(install_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(ServedMarkerReadError::PathUnavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ServedMarkerReadError::PathUnavailable);
+        }
+        Err(error) => return Err(ServedMarkerReadError::Unreadable(error.kind())),
+    }
+    let partial = install_dir.join(format!(".{WASM_HOST_SERVED_FILE_NAME}.partial"));
+    match std::fs::symlink_metadata(&partial) {
+        Ok(_) => return Err(ServedMarkerReadError::WriteInProgress),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ServedMarkerReadError::Unreadable(error.kind())),
+    }
+    if has_legacy_served_partial(install_dir)? {
+        return Err(ServedMarkerReadError::WriteInProgress);
+    }
+    let marker_path = install_dir.join(WASM_HOST_SERVED_FILE_NAME);
+    let mut file = match std::fs::File::open(&marker_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ServedMarkerReadError::Unreadable(error.kind())),
+    };
+    let mut bounded = std::io::Read::take(&mut file, 4097);
+    let mut bytes = Vec::with_capacity(4097);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .map_err(|error| ServedMarkerReadError::Unreadable(error.kind()))?;
+    if bytes.len() > 4096 {
+        return Err(ServedMarkerReadError::TooLarge);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| ServedMarkerReadError::Malformed)
+}
+
+/// Discovers partial names emitted by the former PID-suffixed writer.
+/// Enumerates one directory entry at a time so memory use does not grow with
+/// directory size. Any enumeration failure is a marker-read failure; it is
+/// never converted into evidence that no partial exists.
+fn has_legacy_served_partial(install_dir: &std::path::Path) -> Result<bool, ServedMarkerReadError> {
+    let entries = std::fs::read_dir(install_dir)
+        .map_err(|error| ServedMarkerReadError::Unreadable(error.kind()))?;
+    let prefix = format!(".{WASM_HOST_SERVED_FILE_NAME}.");
+    for entry in entries {
+        let entry = entry.map_err(|error| ServedMarkerReadError::Unreadable(error.kind()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(process_id) = name
+            .strip_prefix(&prefix)
+            .and_then(|candidate| candidate.strip_suffix(".partial"))
+        else {
+            continue;
+        };
+        if !process_id.is_empty() && process_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Writes the served marker to a local file through a fixed partial name,
+/// flushes and syncs the file, then renames it. This is not an owner ack and
+/// does not claim power-loss durability because the parent directory is not
+/// synced. The reader never treats a leftover current or legacy partial as
+/// marker absence. Callers must retain the claimed staging set and fail
+/// closed if this write fails.
 pub fn write_served_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
@@ -1669,14 +1759,13 @@ pub fn write_served_marker(
     let marker = ServedDeliveryMarker::from_identity(identity, served_at_unix_ms);
     let bytes =
         serde_json::to_vec(&marker).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let partial = install_dir.join(format!(
-        ".{}.{}.partial",
-        WASM_HOST_SERVED_FILE_NAME,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&partial);
-    std::fs::write(&partial, &bytes)?;
-    std::fs::File::open(&partial)?.sync_all()?;
+    let partial = install_dir.join(format!(".{WASM_HOST_SERVED_FILE_NAME}.partial"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
+    file.sync_all()?;
     std::fs::rename(&partial, install_dir.join(WASM_HOST_SERVED_FILE_NAME))?;
     Ok(())
 }
