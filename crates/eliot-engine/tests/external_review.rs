@@ -4,9 +4,9 @@ use eliot_engine::{
     AgentSessionService, ExternalProviderRegistryService, ExternalReviewBridgeService,
     ExternalReviewGate, ExternalReviewGateContext, ExternalReviewJobService,
     ExternalReviewNormalizer, ExternalReviewPacketBuilder, ExternalReviewTaintPolicy,
-    WorkClaimRequest, WorkCreateRequest, WorkLeaseService, WorkQueueService, WorkState,
-    WriteAdmissionService, WriterActor, WriterConfig, default_lease_ttl_minutes,
-    default_work_scope, external_review_request,
+    ValidatedExternalReviewDocument, WorkClaimRequest, WorkCreateRequest, WorkLeaseService,
+    WorkQueueService, WorkState, WriteAdmissionService, WriterActor, WriterConfig,
+    default_lease_ttl_minutes, default_work_scope, external_review_request,
 };
 use eliot_store::{BlobStore, CanonicalStore, ControlWal};
 use eliot_types::{
@@ -22,6 +22,15 @@ use std::path::{Path, PathBuf};
 use tokio::time::{Duration, sleep};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The internal-only construction path for the pre-existing hand-written
+/// fixtures. These literals are not provider bytes and prove nothing about a raw
+/// external ingress.
+fn fixture(value: &serde_json::Value) -> TestResult<ValidatedExternalReviewDocument> {
+    Ok(ValidatedExternalReviewDocument::internal_constructed(
+        value,
+    )?)
+}
 
 #[test]
 fn external_provider_profiles_created() {
@@ -298,7 +307,8 @@ async fn mock_provider_output_captured_to_blob() -> TestResult {
 fn malformed_result_rejected() {
     let request = request();
     let job = ExternalReviewJobService.create_job(&request);
-    let outcome = ExternalReviewNormalizer.normalize(&request, &job, &json!({ "bad": true }));
+    let raw = fixture(&json!({ "bad": true })).expect("fixture");
+    let outcome = ExternalReviewNormalizer.normalize(&request, &job, &raw);
 
     assert_eq!(
         outcome.receipt.status,
@@ -310,11 +320,9 @@ fn malformed_result_rejected() {
 fn authority_violating_result_rejected() {
     let request = request();
     let job = ExternalReviewJobService.create_job(&request);
-    let outcome = ExternalReviewNormalizer.normalize(
-        &request,
-        &job,
-        &json!({ "candidate_only": false, "forbidden_actions": ["write_truth"] }),
-    );
+    let raw = fixture(&json!({ "candidate_only": false, "forbidden_actions": ["write_truth"] }))
+        .expect("fixture");
+    let outcome = ExternalReviewNormalizer.normalize(&request, &job, &raw);
 
     assert_eq!(
         outcome.receipt.status,
@@ -326,21 +334,19 @@ fn authority_violating_result_rejected() {
 fn missing_evidence_citation_rejected() {
     let request = request();
     let job = ExternalReviewJobService.create_job(&request);
-    let outcome = ExternalReviewNormalizer.normalize(
-        &request,
-        &job,
-        &json!({
-            "candidate_only": true,
-            "findings": [{
-                "finding_id": "missing",
-                "title": "missing",
-                "detail": "missing",
-                "severity": "low",
-                "claim_status": "candidate",
-                "citations": []
-            }]
-        }),
-    );
+    let raw = fixture(&json!({
+        "candidate_only": true,
+        "findings": [{
+            "finding_id": "missing",
+            "title": "missing",
+            "detail": "missing",
+            "severity": "low",
+            "claim_status": "candidate",
+            "citations": []
+        }]
+    }))
+    .expect("fixture");
+    let outcome = ExternalReviewNormalizer.normalize(&request, &job, &raw);
 
     assert_eq!(
         outcome.receipt.status,
@@ -352,27 +358,25 @@ fn missing_evidence_citation_rejected() {
 fn verified_claim_status_rejected() {
     let request = request();
     let job = ExternalReviewJobService.create_job(&request);
-    let outcome = ExternalReviewNormalizer.normalize(
-        &request,
-        &job,
-        &json!({
-            "candidate_only": true,
-            "findings": [{
-                "finding_id": "verified",
-                "title": "verified",
-                "detail": "verified",
-                "severity": "low",
-                "claim_status": "verified",
-                "citations": [{
-                    "citation_id": "citation",
-                    "evidence_ref": "codecortex:latest",
-                    "file": "crates/eliot-app/src/mcp_stdio.rs",
-                    "line": 1,
-                    "status": "cited"
-                }]
+    let raw = fixture(&json!({
+        "candidate_only": true,
+        "findings": [{
+            "finding_id": "verified",
+            "title": "verified",
+            "detail": "verified",
+            "severity": "low",
+            "claim_status": "verified",
+            "citations": [{
+                "citation_id": "citation",
+                "evidence_ref": "codecortex:latest",
+                "file": "crates/eliot-app/src/mcp_stdio.rs",
+                "line": 1,
+                "status": "cited"
             }]
-        }),
-    );
+        }]
+    }))
+    .expect("fixture");
+    let outcome = ExternalReviewNormalizer.normalize(&request, &job, &raw);
 
     assert_eq!(
         outcome.receipt.status,
@@ -502,6 +506,7 @@ fn proposed_change_to_candidate_diff_only() {
             "candidate_diff_ref": null
         }]
     });
+    let raw = fixture(&raw).expect("fixture");
     let job = ExternalReviewJobService.create_job(&request);
     let result = ExternalReviewNormalizer
         .normalize(&request, &job, &raw)
@@ -576,7 +581,7 @@ fn the_external_review_gate_admits_no_direct_provider_call() -> TestResult {
 async fn run_mock_job() -> TestResult<(
     OwnedTestRoot,
     eliot_types::ExternalReviewJob,
-    serde_json::Value,
+    ValidatedExternalReviewDocument,
 )> {
     let root = test_root("mock-job")?;
     let blob_store = BlobStore::open(&BlobStoreConfig {
