@@ -557,9 +557,24 @@ impl KernelComposition {
                 observe_frame("kernel.frame_validated", "success");
                 observe_frame("kernel.frame_admitted", "success");
                 observe_frame("kernel.frame_dispatched", outcome);
+                observe_frame("kernel.frame_cleanup", "complete");
             }
             Err(error) => {
                 observe_frame("kernel.frame_decode_reject", "fenced");
+                if matches!(
+                    error,
+                    TransportError::Protocol(_)
+                        | TransportError::Io(_)
+                        | TransportError::UnknownOutcome
+                        | TransportError::Timeout
+                ) {
+                    // F-LOG-KERNEL-1 (#897 T10): failed frame input observed
+                    // without payload at the dispatch boundary. Static
+                    // event/outcome only; transport-level partial/zero/EOF at
+                    // `receive_frame` never reaches this seam (the driver
+                    // fences first) and needs a revised explicit assignment.
+                    observe_frame("kernel.frame_input_unknown", "unknown");
+                }
                 if matches!(error, TransportError::Cancelled) {
                     // F-LOG-KERNEL-1 (#897 W2): cancellation observed as the
                     // dispatch disposition, distinct from the cancellation
@@ -568,6 +583,7 @@ impl KernelComposition {
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+                observe_frame("kernel.frame_cleanup", "fenced");
             }
         }
         result
@@ -1519,7 +1535,18 @@ impl KernelComposition {
             .execute_doctor_request_inner(session, request_id, operation, &payload, control)
             .await;
         match &result {
-            Ok(_) => observe_frame("kernel.frame_doctor_execute", "success"),
+            Ok(_) => {
+                observe_frame("kernel.frame_doctor_execute", "success");
+                if control {
+                    // F-LOG-KERNEL-1 (#897 T18): the control frame's
+                    // cancellation was admitted by the typed cancellation
+                    // owner (`admit_doctor_repair_cancellation`), so the
+                    // requested cancellation is observed as effected here.
+                    // Production-reachable via the driver control arm. Info
+                    // only; this wrapper owns the single terminal.
+                    observe_frame("kernel.frame_cancel_observed", "cancelled");
+                }
+            }
             Err(error) => {
                 observe_frame("kernel.frame_doctor_execute", "fenced");
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
@@ -1819,7 +1846,18 @@ impl KernelComposition {
             .execute_testd_request_inner(session, request_id, operation, &payload, control)
             .await;
         match &result {
-            Ok(_) => observe_frame("kernel.frame_testd_execute", "success"),
+            Ok(_) => {
+                observe_frame("kernel.frame_testd_execute", "success");
+                if control {
+                    // F-LOG-KERNEL-1 (#897 T18): the control frame's
+                    // cancellation was admitted by the typed cancellation
+                    // owner (`admit_testd_cancellation`), so the requested
+                    // cancellation is observed as effected here.
+                    // Production-reachable via the driver control arm. Info
+                    // only; this wrapper owns the single terminal.
+                    observe_frame("kernel.frame_cancel_observed", "cancelled");
+                }
+            }
             Err(error) => {
                 observe_frame("kernel.frame_testd_execute", "fenced");
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));

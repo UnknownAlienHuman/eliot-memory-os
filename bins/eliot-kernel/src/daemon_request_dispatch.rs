@@ -1428,13 +1428,17 @@ impl KernelComposition {
                 observe_daemon_request("kernel.daemon_request_admitted", "success");
                 observe_daemon_operation(trusted_daemon_operation(operation), "dispatched");
                 observe_daemon_request("kernel.daemon_response_prepared", "success");
-                // F-LOG-KERNEL-1 (#897 W3): the reply value is prepared here
-                // and handed to the front-door driver transport boundary. The
-                // only delivery witness is the driver-owned `send_checked`
-                // write (`front_door_driver.rs`, outside #897 scope), so
-                // delivery stays `unknown` at this boundary: a prepared
-                // response is not a delivered response.
-                observe_daemon_request("kernel.daemon_response_delivered", "unknown");
+                // F-LOG-KERNEL-1 (#897 W3): prepared, delivered and unknown
+                // are three independent records. `delivered` marks the reply
+                // value delivered to the immediate caller at this dispatch
+                // boundary (the transport handoff), never the wire write: the
+                // only wire-delivery witness is the driver-owned
+                // `send_checked` write (`front_door_driver.rs`, outside #897
+                // scope), so the post-handoff transport outcome stays
+                // `unknown` at this boundary.
+                observe_daemon_request("kernel.daemon_response_delivered", "success");
+                observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                observe_daemon_request("kernel.daemon_request_cleanup", "complete");
             }
             Err(error) => {
                 observe_daemon_request("kernel.daemon_request_validated", "fenced");
@@ -1447,6 +1451,7 @@ impl KernelComposition {
                     observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
                 }
                 super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+                observe_daemon_request("kernel.daemon_request_cleanup", "fenced");
             }
         }
         result
@@ -1812,6 +1817,11 @@ impl KernelComposition {
                         // A retained terminal result never takes this path:
                         // exact replay stays idempotent across the deadline.
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -1921,6 +1931,11 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -1996,6 +2011,11 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -2046,6 +2066,11 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -2112,6 +2137,11 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -2174,6 +2204,11 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -2221,7 +2256,17 @@ impl KernelComposition {
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let cancel = self.cancel_host_request(&envelope);
                 match &cancel {
-                    Ok(_) => observe_daemon_request("kernel.daemon_cancel_requested", "success"),
+                    Ok(_) => {
+                        observe_daemon_request("kernel.daemon_cancel_requested", "success");
+                        // F-LOG-KERNEL-1 (#897 T18): the typed cancellation
+                        // owner admitted the cancellation, so the requested
+                        // cancellation is observed as effected here. This is
+                        // the production-reachable observation half of the
+                        // request/observed pair; the `Cancelled` terminal
+                        // disposition below stays for the error path. Info
+                        // only; the observed wrapper owns the terminal.
+                        observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
+                    }
                     Err(_) => observe_daemon_request("kernel.daemon_cancel_requested", "fenced"),
                 }
                 let (receipt, record) = cancel?;
@@ -3107,8 +3152,14 @@ impl KernelComposition {
             Box::pin(gateway.execute_user_automation_operation(request.clone(), runtime.as_ref()))
                 .await
                 .map_err(|_error| {
-                    super::kernel_diagnostics::observe_terminal_error(
-                        "daemon_user_automation_operator_store",
+                    // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+                    // observation only. The single designated terminal for
+                    // this failed operation is emitted by
+                    // `execute_daemon_request_observed`; a second terminal
+                    // here would inflate one store failure into two.
+                    observe_daemon_request(
+                        "kernel.daemon_user_automation_operator_store",
+                        "fenced",
                     );
                     TransportError::SessionFenced
                 })?;
@@ -3119,14 +3170,27 @@ impl KernelComposition {
         // compile fails closed instead of projecting a guessed occurrence.
         let occurrences =
             Self::user_automation_inspection_occurrences(&transition).map_err(|_error| {
-                super::kernel_diagnostics::observe_terminal_error(
-                    "daemon_user_automation_occurrence_projection",
+                // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+                // observation only; `execute_daemon_request_observed` owns
+                // the single designated terminal for this failed operation.
+                observe_daemon_request(
+                    "kernel.daemon_user_automation_occurrence_projection",
+                    "fenced",
                 );
                 TransportError::SessionFenced
             })?;
         let recovery = transition.recovery();
+        let known = transition.is_known();
+        if !known {
+            // F-LOG-KERNEL-1 (#897 T19): the store transition reports an
+            // unknown wake/execution outcome after possible work. The
+            // response body carries `"status": "unknown"` below; this record
+            // keeps the diagnostic stream honest alongside it. Observation
+            // only; the response value is unchanged.
+            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+        }
         Ok(serde_json::json!({
-            "status": if transition.is_known() { "known" } else { "unknown" },
+            "status": if known { "known" } else { "unknown" },
             "value": {
                 "identity": transition.identity,
                 "state_fence": transition.state_fence,
