@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+#[cfg(windows)]
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::{
@@ -28,15 +30,25 @@ use super::host_durable_persistence::ordering;
 // (#984 still open).
 //
 // Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never Store
-// payloads, digests treated as secrets, paths, or arbitrary error text — so
-// bounding limits size, not sensitivity (I15.4). These primitives own no
-// terminal: a single terminal per failed recovery operation is enforced by
-// the outermost `HostComposition` recovery boundary in
-// `host_composition_store_recovery.rs`, while these phases correlate by stage
-// order only. Exact-record replay is observed as readback, never as a second
-// commit; conflicts are observed as preserved, never adopted. Sink outcome
-// never alters result/order/status/cleanup.
+// the semantic owner. The boundary label is a frozen literal; record-bound
+// observations additionally project the CURRENT nonsecret identities of the
+// live request, pending identity, inner binding, or receipt
+// (`StoreRecoveryPersistObservation`): operation, request id, mutation and
+// request digests, Host epoch and lineage, inner rebind digest, receipt
+// digest and Store fence, plus the durable-side key where a mismatch names
+// it and the fence-set count/summary where a projection names it. Still
+// never carried: Store payloads, process identities, raw paths, or arbitrary
+// error text — so bounding limits size, not sensitivity (I15.4).
+// Stale/foreign/conflict reasons stay in the frozen labels. These primitives
+// own no terminal: a single terminal per failed recovery operation is
+// enforced by the outermost `HostComposition` recovery boundary in
+// `host_composition_store_recovery.rs`, while these phases correlate by
+// stage order only. Exact-record replay is observed as readback, never as a
+// second commit; conflicts are observed as preserved, never adopted. Sink
+// outcome never alters result/order/status/cleanup. Three pre-subject marks
+// (`projection requested`, `pending load requested`, `cleanup-completed
+// requested`) keep frozen labels only: no validated record identity exists
+// yet at those boundaries.
 #[cfg(windows)]
 fn store_recovery_note_event_log_unavailable() {
     let _ = crate::windows_event_log::event_log_sink_status();
@@ -49,6 +61,256 @@ fn store_recovery_persist_observe(detail: &str) {
         crate::host_diagnostics::EntrypointStage::Startup,
         detail,
     );
+}
+
+/// Stable diagnostic label for one runtime-control operation (F-LOG-HOST-2
+/// W1). A 1:1 mapping in this file's hyphenated label vocabulary, never
+/// `Debug`: diagnostics project owner vocabulary without formatting type
+/// internals.
+#[cfg(windows)]
+fn store_persist_operation_label(operation: &HostRuntimeControlOperation) -> &'static str {
+    match operation {
+        HostRuntimeControlOperation::RestartKernel => "restart-kernel",
+        HostRuntimeControlOperation::ReconcileKernelRestart => "reconcile-kernel-restart",
+        HostRuntimeControlOperation::RecoverStore => "recover-store",
+        HostRuntimeControlOperation::ReconcileStoreRecovery => "reconcile-store-recovery",
+        HostRuntimeControlOperation::DeliverReactiveContext => "deliver-reactive-context",
+        HostRuntimeControlOperation::AdmitUserAutomationOccurrence => {
+            "admit-user-automation-occurrence"
+        }
+        HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+            "cancel-user-automation-pending-wakes"
+        }
+    }
+}
+
+/// Current nonsecret identities bound to one Store persistence observation
+/// (F-LOG-HOST-2 W1). Every field projects a fact the semantic owner already
+/// produced for the live request, pending identity, inner binding, or
+/// receipt; see the observation-only contract above for the exact
+/// carried/forbidden sets. Absent keys are omitted from the record, never
+/// rendered as a placeholder value.
+#[cfg(windows)]
+struct StoreRecoveryPersistObservation<'a> {
+    label: &'static str,
+    operation: Option<&'static str>,
+    request_id: Option<&'a str>,
+    mutation: Option<&'a str>,
+    request: Option<&'a str>,
+    epoch: Option<String>,
+    lineage: Option<&'a str>,
+    receipt: Option<&'a str>,
+    fence: Option<&'a str>,
+    inner: Option<&'a str>,
+    durable: Option<&'a str>,
+    count: Option<String>,
+    summary: Option<String>,
+}
+
+#[cfg(windows)]
+impl<'a> StoreRecoveryPersistObservation<'a> {
+    /// Binds the live request identities: operation, request id, mutation
+    /// and request digests.
+    fn for_request(label: &'static str, request: &'a HostRuntimeControlRequest) -> Self {
+        Self {
+            label,
+            operation: Some(store_persist_operation_label(&request.operation)),
+            request_id: Some(request.request_id.as_str()),
+            mutation: Some(request.mutation_digest.as_str()),
+            request: Some(request.request_digest.as_str()),
+            epoch: None,
+            lineage: None,
+            receipt: None,
+            fence: None,
+            inner: None,
+            durable: None,
+            count: None,
+            summary: None,
+        }
+    }
+
+    /// Binds the durable pending identity: operation, request id, mutation
+    /// and request digests, Host epoch and lineage.
+    fn for_identity(label: &'static str, identity: &'a StoreRecoveryPendingIdentity) -> Self {
+        Self {
+            label,
+            operation: Some(store_persist_operation_label(&identity.operation)),
+            request_id: Some(identity.request_id.as_str()),
+            mutation: Some(identity.mutation_digest.as_str()),
+            request: Some(identity.request_digest.as_str()),
+            epoch: Some(identity.host_epoch.to_string()),
+            lineage: Some(identity.host_lineage.as_str()),
+            receipt: None,
+            fence: None,
+            inner: None,
+            durable: None,
+            count: None,
+            summary: None,
+        }
+    }
+
+    /// Binds the live request plus the durable-side mutation key it was
+    /// validated against, so a mismatch names both sides.
+    fn for_identity_request(
+        label: &'static str,
+        identity: &'a StoreRecoveryPendingIdentity,
+        request: &'a HostRuntimeControlRequest,
+    ) -> Self {
+        let mut observation = Self::for_request(label, request);
+        observation.epoch = Some(identity.host_epoch.to_string());
+        observation.lineage = Some(identity.host_lineage.as_str());
+        observation.durable = Some(identity.mutation_digest.as_str());
+        observation
+    }
+
+    /// Binds the mutation key where only the record key is in scope.
+    fn for_mutation(label: &'static str, mutation: &'a str) -> Self {
+        Self {
+            label,
+            operation: None,
+            request_id: None,
+            mutation: Some(mutation),
+            request: None,
+            epoch: None,
+            lineage: None,
+            receipt: None,
+            fence: None,
+            inner: None,
+            durable: None,
+            count: None,
+            summary: None,
+        }
+    }
+
+    /// Binds the durable receipt identities: mutation and request digests,
+    /// receipt digest, and Store fence.
+    fn for_receipt(label: &'static str, receipt: &'a HostStoreRecoveryReceipt) -> Self {
+        Self {
+            label,
+            operation: None,
+            request_id: None,
+            mutation: Some(receipt.external_control_mutation_digest.as_str()),
+            request: Some(receipt.request_digest.as_str()),
+            epoch: None,
+            lineage: None,
+            receipt: Some(receipt.receipt_digest.as_str()),
+            fence: Some(receipt.store_fence.as_str()),
+            inner: None,
+            durable: None,
+            count: None,
+            summary: None,
+        }
+    }
+
+    /// Binds the live reconcile request plus the durable receipt it
+    /// rebinds: the live mutation/request keys name the new request, the
+    /// durable key names the receipt's mutation, and receipt/fence name the
+    /// rebound authority.
+    fn for_rebind(
+        label: &'static str,
+        receipt: &'a HostStoreRecoveryReceipt,
+        request: &'a HostRuntimeControlRequest,
+    ) -> Self {
+        let mut observation = Self::for_request(label, request);
+        observation.durable = Some(receipt.external_control_mutation_digest.as_str());
+        observation.receipt = Some(receipt.receipt_digest.as_str());
+        observation.fence = Some(receipt.store_fence.as_str());
+        observation
+    }
+
+    /// Binds the live request plus the canonical inner rebind request
+    /// digest of the bound handoff.
+    fn for_inner(
+        label: &'static str,
+        request: &'a HostRuntimeControlRequest,
+        binding: &'a StoreRecoveryInnerBinding,
+    ) -> Self {
+        let mut observation = Self::for_request(label, request);
+        observation.inner = Some(binding.store_rebind_request_digest.as_str());
+        observation
+    }
+
+    /// Binds the projected fence set: count plus a domain-separated SHA-256
+    /// over the sorted mutation digests. Pure hashing over already-loaded
+    /// digests: any set change alters the summary while the record stays
+    /// bounded.
+    fn for_fences(label: &'static str, fences: &'a [StoreRecoveryReopenFence]) -> Self {
+        let mut hasher = Sha256::new();
+        for fence in fences {
+            hasher.update(fence.mutation_digest.as_bytes());
+            hasher.update([0]);
+        }
+        let summary = format!("{:x}", hasher.finalize());
+        Self {
+            label,
+            operation: None,
+            request_id: None,
+            mutation: None,
+            request: None,
+            epoch: None,
+            lineage: None,
+            receipt: None,
+            fence: None,
+            inner: None,
+            durable: None,
+            count: Some(fences.len().to_string()),
+            summary: Some(summary),
+        }
+    }
+
+    /// Binds the committed inner record identities: canonical request
+    /// digest, Store fence, and operation id.
+    fn for_committed(label: &'static str, record: &'a StoreRebindRecord) -> Self {
+        Self {
+            label,
+            operation: None,
+            request_id: None,
+            mutation: None,
+            request: None,
+            epoch: None,
+            lineage: None,
+            receipt: None,
+            fence: Some(record.store_fence.as_str()),
+            inner: Some(record.request_digest.as_str()),
+            durable: Some(record.operation_id.as_str()),
+            count: None,
+            summary: None,
+        }
+    }
+}
+
+/// Emits one identity-bound Store persistence observation through the #889
+/// facade.
+///
+/// The frozen boundary label stays first so label-prefix consumers keep
+/// matching; the current identities follow as `k=v` pairs. Length stays
+/// under the facade's detail bound for pinned handle shapes, and any longer
+/// input is cut by that bound with its truncation honesty record.
+#[cfg(windows)]
+fn store_recovery_persist_observe_bound(observation: &StoreRecoveryPersistObservation) {
+    let mut detail = String::from(observation.label);
+    for (key, value) in [
+        ("op", observation.operation),
+        ("req_id", observation.request_id),
+        ("mutation", observation.mutation),
+        ("req", observation.request),
+        ("epoch", observation.epoch.as_deref()),
+        ("lineage", observation.lineage),
+        ("receipt", observation.receipt),
+        ("fence", observation.fence),
+        ("inner", observation.inner),
+        ("durable", observation.durable),
+        ("count", observation.count.as_deref()),
+        ("summary", observation.summary.as_deref()),
+    ] {
+        if let Some(text) = value {
+            detail.push(' ');
+            detail.push_str(key);
+            detail.push('=');
+            detail.push_str(text);
+        }
+    }
+    store_recovery_persist_observe(&detail);
 }
 
 #[cfg(test)]
@@ -112,7 +374,8 @@ pub(super) fn load_durable_store_recoveries(
     const MAX_STORE_RECOVERY_RECORDS: usize = 1024;
     // F-LOG-HOST-2 (#893): Store projection boundary. The projected fences
     // are startup evidence only; terminals stay with the outermost recovery
-    // boundary.
+    // boundary. The requested mark stays frozen: no validated fence identity
+    // exists before the projection runs.
     store_recovery_persist_observe("host.store-recovery projection requested");
     let mut pending_records = std::collections::HashMap::new();
     let mut termination_records = std::collections::HashMap::new();
@@ -272,7 +535,10 @@ pub(super) fn load_durable_store_recoveries(
     fences.sort_by(|left, right| left.mutation_digest.cmp(&right.mutation_digest));
     // F-LOG-HOST-2 (#893): projection admitted; receipts on disk were
     // shape-checked only and never adopted as authority here.
-    store_recovery_persist_observe("host.store-recovery projection admitted");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_fences(
+        "host.store-recovery projection admitted",
+        &fences,
+    ));
     Ok(fences)
 }
 
@@ -326,8 +592,12 @@ impl StoreRecoveryPendingIdentity {
         if request.mutation_digest.as_str() != self.mutation_digest {
             // F-LOG-HOST-2 (#893): stale/mismatched mutation preserved as
             // Unknown by the caller, never adopted.
-            store_recovery_persist_observe(
-                "host.store-recovery intent mutation mismatch preserved",
+            store_recovery_persist_observe_bound(
+                &StoreRecoveryPersistObservation::for_identity_request(
+                    "host.store-recovery intent mutation mismatch preserved",
+                    self,
+                    request,
+                ),
             );
             return Err(HostError::RecoveryRequired(
                 "Store recovery request mutation does not match the durable intent".to_owned(),
@@ -338,8 +608,12 @@ impl StoreRecoveryPendingIdentity {
                 if request != &self.recover_request()? {
                     // F-LOG-HOST-2 (#893): changed same-operation content
                     // remains a conflict, never a replay.
-                    store_recovery_persist_observe(
-                        "host.store-recovery intent replay mismatch preserved",
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_identity_request(
+                            "host.store-recovery intent replay mismatch preserved",
+                            self,
+                            request,
+                        ),
                     );
                     return Err(HostError::RecoveryRequired(
                         "RecoverStore replay does not match the exact durable request".to_owned(),
@@ -350,8 +624,12 @@ impl StoreRecoveryPendingIdentity {
             _ => {
                 // F-LOG-HOST-2 (#893): another operation cannot query this
                 // durable intent; preserved, never adopted.
-                store_recovery_persist_observe(
-                    "host.store-recovery intent operation mismatch preserved",
+                store_recovery_persist_observe_bound(
+                    &StoreRecoveryPersistObservation::for_identity_request(
+                        "host.store-recovery intent operation mismatch preserved",
+                        self,
+                        request,
+                    ),
                 );
                 return Err(HostError::RecoveryRequired(
                     "Store recovery durable intent was queried by another operation".to_owned(),
@@ -490,7 +768,9 @@ pub(super) fn read_store_recovery_pending_identity(
 ) -> Result<Option<StoreRecoveryPendingIdentity>, HostError> {
     const MAX_PENDING_BYTES: u64 = 16 * 1024;
     // F-LOG-HOST-2 (#893): pending-identity load boundary; loaded versus
-    // absent stay distinct, failures stay with the outermost terminal.
+    // absent stay distinct, failures stay with the outermost terminal. The
+    // requested mark stays frozen: the filename-derived key is unvalidated
+    // at emission and unvalidated path text never enters a record.
     store_recovery_persist_observe("host.store-recovery pending load requested");
     let expected_mutation_digest = path
         .file_name()
@@ -506,7 +786,10 @@ pub(super) fn read_store_recovery_pending_identity(
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            store_recovery_persist_observe("host.store-recovery pending absent");
+            store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_mutation(
+                "host.store-recovery pending absent",
+                expected_mutation_digest,
+            ));
             return Ok(None);
         }
         Err(error) => {
@@ -526,7 +809,10 @@ pub(super) fn read_store_recovery_pending_identity(
         "store recovery pending record",
     )?;
     let identity = store_recovery_pending_identity_from_bytes(&bytes, expected_mutation_digest)?;
-    store_recovery_persist_observe("host.store-recovery pending loaded");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_identity(
+        "host.store-recovery pending loaded",
+        &identity,
+    ));
     Ok(Some(identity))
 }
 
@@ -536,6 +822,10 @@ fn sync_store_recovery_dir(dir: &Path) -> Result<(), HostError> {
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the no-replace publication checks the retained record, the racy creation, and the exact readback before reporting created versus replay"
+)]
 pub(super) fn persist_store_recovery_pending(
     host_state_root: &Path,
     request: &HostRuntimeControlRequest,
@@ -543,7 +833,10 @@ pub(super) fn persist_store_recovery_pending(
 ) -> Result<StoreRecoveryPendingPublication, HostError> {
     // F-LOG-HOST-2 (#893): pending persist boundary. Created versus exact
     // replay stay distinct; conflicts are preserved, never adopted.
-    store_recovery_persist_observe("host.store-recovery pending persist requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+        "host.store-recovery pending persist requested",
+        request,
+    ));
     request.validate().map_err(HostError::RecoveryRequired)?;
     if request.operation != HostRuntimeControlOperation::RecoverStore {
         return Err(HostError::RecoveryRequired(
@@ -566,12 +859,18 @@ pub(super) fn persist_store_recovery_pending(
             sync_store_recovery_dir(&dir)?;
             // F-LOG-HOST-2 (#893): exact-record replay is a readback, never
             // a duplicate commit.
-            store_recovery_persist_observe("host.store-recovery pending replay readback");
+            store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+                "host.store-recovery pending replay readback",
+                request,
+            ));
             return Ok(StoreRecoveryPendingPublication::Replay);
         }
         // F-LOG-HOST-2 (#893): changed same-operation content remains a
         // conflict; the retained record is preserved.
-        store_recovery_persist_observe("host.store-recovery pending conflict preserved");
+        store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+            "host.store-recovery pending conflict preserved",
+            request,
+        ));
         return Err(HostError::RecoveryRequired(
             "store recovery pending record conflicts with the requested operation".to_owned(),
         ));
@@ -615,13 +914,21 @@ pub(super) fn persist_store_recovery_pending(
                     sync_store_recovery_dir(&dir)?;
                     // F-LOG-HOST-2 (#893): exact-record replay is a readback,
                     // never a duplicate commit.
-                    store_recovery_persist_observe("host.store-recovery pending replay readback");
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_request(
+                            "host.store-recovery pending replay readback",
+                            request,
+                        ),
+                    );
                     Ok(StoreRecoveryPendingPublication::Replay)
                 } else {
                     // F-LOG-HOST-2 (#893): a conflicting winner is preserved;
                     // this attempt stays Unknown.
-                    store_recovery_persist_observe(
-                        "host.store-recovery pending conflict preserved",
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_request(
+                            "host.store-recovery pending conflict preserved",
+                            request,
+                        ),
                     );
                     Err(HostError::RecoveryRequired(
                         "store recovery pending record conflicts with the requested operation"
@@ -665,10 +972,20 @@ pub(super) fn persist_store_recovery_pending(
             // distinct; replay is a readback, never a duplicate commit.
             match value {
                 StoreRecoveryPendingPublication::Created => {
-                    store_recovery_persist_observe("host.store-recovery pending persisted");
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_request(
+                            "host.store-recovery pending persisted",
+                            request,
+                        ),
+                    );
                 }
                 StoreRecoveryPendingPublication::Replay => {
-                    store_recovery_persist_observe("host.store-recovery pending replay readback");
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_request(
+                            "host.store-recovery pending replay readback",
+                            request,
+                        ),
+                    );
                 }
             }
             Ok(value)
@@ -690,7 +1007,10 @@ pub(super) fn persist_store_recovery_termination_evidence(
 ) -> Result<(), HostError> {
     // F-LOG-HOST-2 (#893): termination persist boundary. Exact replay is a
     // readback; conflicts are preserved, never adopted.
-    store_recovery_persist_observe("host.store-recovery termination persist requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+        "host.store-recovery termination persist requested",
+        request,
+    ));
     request.validate().map_err(HostError::RecoveryRequired)?;
     if request.operation != HostRuntimeControlOperation::RecoverStore {
         return Err(HostError::RecoveryRequired(
@@ -742,12 +1062,18 @@ pub(super) fn persist_store_recovery_termination_evidence(
             sync_store_recovery_dir(&dir)?;
             // F-LOG-HOST-2 (#893): exact-record replay is a readback, never
             // a duplicate commit.
-            store_recovery_persist_observe("host.store-recovery termination replay readback");
+            store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+                "host.store-recovery termination replay readback",
+                request,
+            ));
             return Ok(());
         }
         // F-LOG-HOST-2 (#893): conflicting termination evidence is preserved;
         // this attempt stays Unknown.
-        store_recovery_persist_observe("host.store-recovery termination conflict preserved");
+        store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+            "host.store-recovery termination conflict preserved",
+            request,
+        ));
         return Err(HostError::RecoveryRequired(
             "Store termination evidence conflicts with the requested operation".to_owned(),
         ));
@@ -795,15 +1121,21 @@ pub(super) fn persist_store_recovery_termination_evidence(
                     sync_store_recovery_dir(&dir)?;
                     // F-LOG-HOST-2 (#893): exact-record replay is a readback,
                     // never a duplicate commit.
-                    store_recovery_persist_observe(
-                        "host.store-recovery termination replay readback",
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_request(
+                            "host.store-recovery termination replay readback",
+                            request,
+                        ),
                     );
                     Ok(())
                 } else {
                     // F-LOG-HOST-2 (#893): a conflicting winner is preserved;
                     // this attempt stays Unknown.
-                    store_recovery_persist_observe(
-                        "host.store-recovery termination conflict preserved",
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_request(
+                            "host.store-recovery termination conflict preserved",
+                            request,
+                        ),
                     );
                     Err(HostError::RecoveryRequired(
                         "Store termination evidence conflicts with the requested operation"
@@ -841,7 +1173,10 @@ pub(super) fn persist_store_recovery_termination_evidence(
     sync_after_cleanup?;
     // F-LOG-HOST-2 (#893): termination evidence persisted; cleanup observed
     // by the checked cleanup seam only after the receipt is durable.
-    store_recovery_persist_observe("host.store-recovery termination persisted");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+        "host.store-recovery termination persisted",
+        request,
+    ));
     Ok(())
 }
 
@@ -858,7 +1193,10 @@ pub(super) fn persist_store_recovery_inner_binding(
 ) -> Result<(), HostError> {
     // F-LOG-HOST-2 (#893): inner-binding persist boundary. Exact replay is a
     // readback; conflicts are preserved, never adopted.
-    store_recovery_persist_observe("host.store-recovery inner persist requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_request(
+        "host.store-recovery inner persist requested",
+        request,
+    ));
     request.validate().map_err(HostError::RecoveryRequired)?;
     if request.operation != HostRuntimeControlOperation::RecoverStore {
         return Err(HostError::RecoveryRequired(
@@ -927,12 +1265,20 @@ pub(super) fn persist_store_recovery_inner_binding(
             sync_store_recovery_dir(&dir)?;
             // F-LOG-HOST-2 (#893): exact-record replay is a readback, never
             // a duplicate commit.
-            store_recovery_persist_observe("host.store-recovery inner replay readback");
+            store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_inner(
+                "host.store-recovery inner replay readback",
+                request,
+                &binding,
+            ));
             Ok(())
         } else {
             // F-LOG-HOST-2 (#893): a conflicting retained binding is
             // preserved; this attempt stays Unknown.
-            store_recovery_persist_observe("host.store-recovery inner conflict preserved");
+            store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_inner(
+                "host.store-recovery inner conflict preserved",
+                request,
+                &binding,
+            ));
             Err(HostError::RecoveryRequired(
                 "Store recovery inner binding conflicts with retained identity".to_owned(),
             ))
@@ -981,12 +1327,24 @@ pub(super) fn persist_store_recovery_inner_binding(
                     sync_store_recovery_dir(&dir)?;
                     // F-LOG-HOST-2 (#893): exact-record replay is a readback,
                     // never a duplicate commit.
-                    store_recovery_persist_observe("host.store-recovery inner replay readback");
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_inner(
+                            "host.store-recovery inner replay readback",
+                            request,
+                            &binding,
+                        ),
+                    );
                     Ok(())
                 } else {
                     // F-LOG-HOST-2 (#893): a conflicting winner is preserved;
                     // this attempt stays Unknown.
-                    store_recovery_persist_observe("host.store-recovery inner conflict preserved");
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_inner(
+                            "host.store-recovery inner conflict preserved",
+                            request,
+                            &binding,
+                        ),
+                    );
                     Err(HostError::RecoveryRequired(
                         "Store recovery inner binding conflicts with retained identity".to_owned(),
                     ))
@@ -1024,7 +1382,11 @@ pub(super) fn persist_store_recovery_inner_binding(
     ordering::record("store_inner_publication_complete");
     // F-LOG-HOST-2 (#893): inner binding persisted against the exact durable
     // intent and termination evidence.
-    store_recovery_persist_observe("host.store-recovery inner persisted");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_inner(
+        "host.store-recovery inner persisted",
+        request,
+        &binding,
+    ));
     Ok(())
 }
 
@@ -1035,7 +1397,10 @@ pub(super) fn read_store_recovery_receipt(
 ) -> Result<Option<HostStoreRecoveryReceipt>, HostError> {
     // F-LOG-HOST-2 (#893): receipt load/compare boundary; loaded versus
     // absent stay distinct, failures stay with the outermost terminal.
-    store_recovery_persist_observe("host.store-recovery receipt load requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_mutation(
+        "host.store-recovery receipt load requested",
+        mutation_digest,
+    ));
     if !valid_sha256_text(mutation_digest) {
         return Err(HostError::RecoveryRequired(
             "Store recovery receipt path is not a lowercase sha256 mutation".to_owned(),
@@ -1045,7 +1410,10 @@ pub(super) fn read_store_recovery_receipt(
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            store_recovery_persist_observe("host.store-recovery receipt absent");
+            store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_mutation(
+                "host.store-recovery receipt absent",
+                mutation_digest,
+            ));
             return Ok(None);
         }
         Err(error) => {
@@ -1069,18 +1437,28 @@ pub(super) fn read_store_recovery_receipt(
             "Store recovery receipt is bound to another mutation".to_owned(),
         ));
     }
-    store_recovery_persist_observe("host.store-recovery receipt loaded");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_receipt(
+        "host.store-recovery receipt loaded",
+        &receipt,
+    ));
     Ok(Some(receipt))
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the no-replace publication checks the retained receipt, the racy creation, and the exact readback before restoring the durable authority"
+)]
 pub(super) fn persist_store_recovery_receipt(
     host_state_root: &Path,
     receipt: &HostStoreRecoveryReceipt,
 ) -> Result<(), HostError> {
     // F-LOG-HOST-2 (#893): receipt persist/restore boundary. Exact replay is
     // a readback; a conflicting winner is preserved, never replaced.
-    store_recovery_persist_observe("host.store-recovery receipt persist requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_receipt(
+        "host.store-recovery receipt persist requested",
+        receipt,
+    ));
     receipt.validate().map_err(HostError::RecoveryRequired)?;
     let dir = store_recovery_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
@@ -1098,12 +1476,18 @@ pub(super) fn persist_store_recovery_receipt(
             sync_store_recovery_dir(&dir)?;
             // F-LOG-HOST-2 (#893): exact-record replay is a readback, never
             // a duplicate commit.
-            store_recovery_persist_observe("host.store-recovery receipt replay readback");
+            store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_receipt(
+                "host.store-recovery receipt replay readback",
+                receipt,
+            ));
             return Ok(());
         }
         // F-LOG-HOST-2 (#893): a conflicting durable receipt is preserved;
         // the reconstructed authority stays Unknown.
-        store_recovery_persist_observe("host.store-recovery receipt conflict preserved");
+        store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_receipt(
+            "host.store-recovery receipt conflict preserved",
+            receipt,
+        ));
         return Err(HostError::RecoveryRequired(
             "existing Store recovery receipt conflicts with reconstructed authority".to_owned(),
         ));
@@ -1154,13 +1538,21 @@ pub(super) fn persist_store_recovery_receipt(
                     sync_store_recovery_dir(&dir)?;
                     // F-LOG-HOST-2 (#893): exact-record replay is a readback,
                     // never a duplicate commit.
-                    store_recovery_persist_observe("host.store-recovery receipt replay readback");
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_receipt(
+                            "host.store-recovery receipt replay readback",
+                            receipt,
+                        ),
+                    );
                     Ok(())
                 } else {
                     // F-LOG-HOST-2 (#893): a conflicting winner is preserved;
                     // this attempt stays Unknown.
-                    store_recovery_persist_observe(
-                        "host.store-recovery receipt conflict preserved",
+                    store_recovery_persist_observe_bound(
+                        &StoreRecoveryPersistObservation::for_receipt(
+                            "host.store-recovery receipt conflict preserved",
+                            receipt,
+                        ),
                     );
                     Err(HostError::RecoveryRequired(
                         "existing Store recovery receipt conflicts with reconstructed authority"
@@ -1207,7 +1599,10 @@ pub(super) fn persist_store_recovery_receipt(
     ordering::record("store_receipt_publication_complete");
     // F-LOG-HOST-2 (#893): receipt restored as the durable authority; the
     // checked cleanup seam removes supporting evidence only after this return.
-    store_recovery_persist_observe("host.store-recovery receipt persisted");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_receipt(
+        "host.store-recovery receipt persisted",
+        receipt,
+    ));
     Ok(())
 }
 
@@ -1219,7 +1614,10 @@ pub(super) fn cleanup_store_recovery_supporting_evidence_for(
     // F-LOG-HOST-2 (#893): supporting-evidence cleanup boundary. Removal
     // commits only after the durable receipt readback above; cleanup failure
     // is a distinct non-success owned by the caller's terminal.
-    store_recovery_persist_observe("host.store-recovery cleanup requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_mutation(
+        "host.store-recovery cleanup requested",
+        mutation_digest,
+    ));
     if !valid_sha256_text(mutation_digest) {
         return Err(HostError::RecoveryRequired(
             "Store recovery resolution mutation is not a lowercase sha256".to_owned(),
@@ -1265,7 +1663,10 @@ pub(super) fn cleanup_store_recovery_supporting_evidence_for(
     ordering::record("cleanup_for_dir_sync_success");
     // F-LOG-HOST-2 (#893): supporting evidence removed with the receipt left
     // durable; absence of this record means cleanup did not complete.
-    store_recovery_persist_observe("host.store-recovery cleanup removed");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_receipt(
+        "host.store-recovery cleanup removed",
+        &receipt,
+    ));
     Ok(())
 }
 
@@ -1274,11 +1675,12 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
     host_state_root: &Path,
 ) -> Result<(), HostError> {
     // F-LOG-HOST-2 (#893): completed-evidence sweep boundary; only fenced
-    // intents with a durable receipt lose their supporting evidence.
+    // intents with a durable receipt lose their supporting evidence. The
+    // requested mark stays frozen: a sweep names no single record identity.
     store_recovery_persist_observe("host.store-recovery cleanup-completed requested");
     let fences = load_durable_store_recoveries(host_state_root)?;
     let dir = store_recovery_store_dir(host_state_root);
-    for fence in fences {
+    for fence in &fences {
         if !store_recovery_receipt_path(host_state_root, &fence.mutation_digest).exists() {
             continue;
         }
@@ -1308,7 +1710,10 @@ pub(super) fn cleanup_completed_store_recovery_supporting_evidence(
     ordering::record("cleanup_completed_dir_sync_success");
     // F-LOG-HOST-2 (#893): completed sweep committed; absence of this record
     // means the sweep did not complete.
-    store_recovery_persist_observe("host.store-recovery cleanup-completed removed");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_fences(
+        "host.store-recovery cleanup-completed removed",
+        &fences,
+    ));
     Ok(())
 }
 
@@ -1324,9 +1729,15 @@ pub(super) fn has_store_recovery_pending(
     let present = read_store_recovery_pending_identity(&path)?
         .is_some_and(|identity| identity.mutation_digest == digest);
     if present {
-        store_recovery_persist_observe("host.store-recovery pending present");
+        store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_mutation(
+            "host.store-recovery pending present",
+            digest,
+        ));
     } else {
-        store_recovery_persist_observe("host.store-recovery pending absent");
+        store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_mutation(
+            "host.store-recovery pending absent",
+            digest,
+        ));
     }
     Ok(present)
 }
@@ -1339,11 +1750,19 @@ pub(super) fn rebind_store_recovery_receipt(
     // F-LOG-HOST-2 (#893): receipt rebind boundary. An exact rebind is a
     // response-loss readback for the new request identity, never a duplicate
     // commit; a mismatched mutation stays a preserved conflict.
-    store_recovery_persist_observe("host.store-recovery rebind requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_rebind(
+        "host.store-recovery rebind requested",
+        receipt,
+        request,
+    ));
     if request.operation != HostRuntimeControlOperation::ReconcileStoreRecovery
         || receipt.external_control_mutation_digest != request.mutation_digest
     {
-        store_recovery_persist_observe("host.store-recovery rebind conflict preserved");
+        store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_rebind(
+            "host.store-recovery rebind conflict preserved",
+            receipt,
+            request,
+        ));
         return Err(HostError::RecoveryRequired(
             "store recovery receipt is not bound to the requested mutation".to_owned(),
         ));
@@ -1352,7 +1771,11 @@ pub(super) fn rebind_store_recovery_receipt(
     rebound.request_digest = request.request_digest.clone();
     rebound.receipt_digest = rebound.computed_digest().map_err(HostError::Platform)?;
     rebound.validate().map_err(HostError::Platform)?;
-    store_recovery_persist_observe("host.store-recovery rebind readback");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_rebind(
+        "host.store-recovery rebind readback",
+        &rebound,
+        request,
+    ));
     Ok(rebound)
 }
 
@@ -1365,7 +1788,10 @@ pub(super) fn committed_store_rebind_receipt(
     // F-LOG-HOST-2 (#893): committed-inner readback boundary. Rebuilding the
     // inner receipt from the durable committed record is a readback, never a
     // new inner commit; substitution stays a typed failure.
-    store_recovery_persist_observe("host.store-recovery committed rebind requested");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_committed(
+        "host.store-recovery committed rebind requested",
+        record,
+    ));
     requirement
         .validate()
         .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
@@ -1439,7 +1865,10 @@ pub(super) fn committed_store_rebind_receipt(
     inner
         .validate()
         .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-    store_recovery_persist_observe("host.store-recovery committed rebind readback");
+    store_recovery_persist_observe_bound(&StoreRecoveryPersistObservation::for_committed(
+        "host.store-recovery committed rebind readback",
+        record,
+    ));
     Ok(inner)
 }
 
