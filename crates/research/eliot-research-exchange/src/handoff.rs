@@ -43,6 +43,15 @@ pub enum HandoffError {
     InvalidTerminal,
     /// A cited handle has no delivered source snapshot behind it: a summary
     /// without raw lineage never replaces evidence.
+    ///
+    /// This is also the owner of the *completeness* of a delivered source, and
+    /// specifically of a blank `SourceSnapshot::locator`. A locator with no
+    /// content in it is not a reference the I21.7 firewall can admit or refuse —
+    /// `ResearchEvidenceBundle::validate_against` asks the classifier about a
+    /// locator only when the locator carries a reference, precisely so that this
+    /// check can still name it. It answers a blank `title`, a blank `locator` and
+    /// a blank `coverage` together, because they are one fact about one snapshot:
+    /// the lineage behind the citation is not there.
     #[error("handoff citation has no delivered source lineage")]
     MissingSourceLineage,
     /// The handoff widens the admitted disclosure class.
@@ -461,6 +470,20 @@ fn seal_preimage(
 /// so degradation omissions cannot be silently dropped, and binds the frozen
 /// manifest digest and revision. Source statements enter the seal only as
 /// digests: instruction-like content stays inert data.
+///
+/// This function owns the delivered-lineage completeness of a cited source, and
+/// both of the decisions behind [`HandoffError::MissingSourceLineage`] are made
+/// here and only here: the cited handle must have a delivered snapshot behind it,
+/// and that snapshot's `title`, `locator` and `coverage` must each carry
+/// content. The reference firewall this seal runs first
+/// (`ResearchEvidenceBundle::validate_against`) is deliberately not asked about a
+/// blank locator: it gates the *references* a bundle delivers, and a locator with
+/// no content in it is not one — its source handle is still gated, its digest and
+/// capture time are still re-proved, and the empty string is not a URL, an
+/// internal identity or a handle that any allowlist could admit. Answering it
+/// there would replace the diagnosis #1764 introduced — a summary without raw
+/// lineage — with a classification reason about a field the caller left empty,
+/// and would make this branch unreachable.
 pub fn seal_handoff(
     bundle: &ResearchEvidenceBundle,
     request: &ResearchQueryRequest,
@@ -488,6 +511,11 @@ pub fn seal_handoff(
                 .iter()
                 .find(|source| source.source_handle == citation.source_handle)
                 .ok_or(HandoffError::MissingSourceLineage)?;
+            // One fact about one snapshot, so one check: a cited source that
+            // cannot say what it is, where it came from or what it covers has no
+            // raw lineage, whatever else it carries. A blank locator reaches this
+            // branch as itself — the bundle validation above does not classify a
+            // field with no content in it.
             if snapshot.title.trim().is_empty()
                 || snapshot.locator.trim().is_empty()
                 || snapshot.coverage.trim().is_empty()
