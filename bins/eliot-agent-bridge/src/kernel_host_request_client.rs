@@ -888,14 +888,83 @@ impl KernelHostRequestClient {
         }
     }
 
+    /// Resolves the exact parent operation after a cancellation result and
+    /// maps that owner's current state, never the cancellation-intent state.
+    /// This deliberately bypasses the replay cache: only a fresh operation-
+    /// handle resolve on the admitted transport can establish disposition.
+    fn resolve_cancellation_parent_disposition(
+        &mut self,
+        parent: &ParentLink,
+        facts: &TransportFacts,
+        session_id: &str,
+    ) -> Result<HostCancellationPortOutcome, PortFailure> {
+        let unknown = || unknown_cancel_outcome(&parent.handle);
+        if facts.session.as_deref() != Some(session_id) {
+            return Err(unknown());
+        }
+        let digest = parse_operation_handle(&parent.handle).map_err(|_| unknown())?;
+        let logical_key = logical_host_request_key(
+            LOGICAL_KIND_INVOCATION,
+            session_id,
+            parent.request_base.as_str(),
+            None,
+            None,
+            None,
+            parent.capability.as_str(),
+            parent.payload_digest.as_str(),
+        )
+        .map_err(|_| unknown())?;
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_request_label(&digest),
+            Some(parent.handle.as_str()),
+            facts,
+            session_id,
+            RESOLVE_HANDLE_CAPABILITY_FILLER,
+            RESOLVE_HANDLE_PAYLOAD_FILLER,
+            unix_ms().map_err(|_| unknown())?,
+        )
+        .map_err(|_| unknown())?;
+        let query = resolve_handle_query(parent.handle.as_str());
+        let frame =
+            host_request_resolve_frame(&query, &resolve_envelope, facts).map_err(|_| unknown())?;
+        let outcome = match self.exchange(&frame) {
+            Ok(reply) => decode_resolve_reply(
+                &reply,
+                &resolve_envelope,
+                &ResolveQuery::OperationHandle {
+                    handle: parent.handle.clone(),
+                },
+            ),
+            Err(_) => LogicalOwnerOutcome::Unavailable,
+        };
+        let LogicalOwnerOutcome::Resolved(record) = outcome else {
+            return Err(unknown());
+        };
+        if record.operation_id != parent.handle
+            || record.request_digest.as_deref() != Some(digest.as_str())
+            || record.kind.as_deref() != Some("INVOCATION")
+            || record.session_ref.as_deref() != Some(session_id)
+            || record.request_id.as_deref() != Some(parent.request_base.as_str())
+            || record.parent_operation_id.is_some()
+            || record.task_ref.is_some()
+            || record.scope_ref.is_some()
+            || record.capability_ref.as_deref() != Some(parent.capability.as_str())
+            || record.payload_digest.as_deref() != Some(parent.payload_digest.as_str())
+        {
+            return Err(unknown());
+        }
+        verify_resolved_key_commitment(&record, &logical_key).map_err(|_| unknown())?;
+        map_parent_cancellation_disposition(record.state, parent.handle.as_str())
+    }
+
     /// Resolves one cancellation's retained intent after an unknown
     /// delivery (issue #2571).
     ///
     /// The cancellation's own logical identity — its correlation bound to
-    /// the original parent — is looked up before any probe: a staged
-    /// intent whose acknowledgement was lost returns its retained outcome
-    /// instead of generating another effectful cancellation from a fresh
-    /// timestamp. An authoritatively absent intent falls back to the
+    /// the original parent — is looked up before any probe. A staged intent
+    /// whose acknowledgement was lost is reconciled without another cancel;
+    /// its state is not the target disposition, so a fresh exact parent
+    /// resolve follows. An authoritatively absent intent falls back to the
     /// observation-only parent probe; a conflicting intent is an
     /// idempotency conflict for the caller to re-issue under a new
     /// correlation; an unavailable owner stays the explicit limitation.
@@ -943,7 +1012,7 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::Resolved(record) => {
                 verify_resolved_key_commitment(&record, &logical_key)
                     .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
-                map_cancel_record_state(record.state)
+                self.resolve_cancellation_parent_disposition(parent, facts, session_id)
             }
             LogicalOwnerOutcome::Absent => {
                 self.probe_confirms_parent(facts, session_id, parent, cancel_envelope, now_ms)
@@ -2179,35 +2248,29 @@ fn submit_outcome_for_resolved(
     }
 }
 
-/// Maps one cancellation record state to the cancellation outcome
-/// (issue #2571).
+/// Maps one exact parent operation's durable owner state to its cancellation
+/// disposition (issue #2571).
 ///
-/// Shared by the fresh-cancel decode and the retained-intent resolve:
-/// requested/observed states (including a received result on the parent)
-/// settle as acceptance of the cancellation intent, expiry stays a
-/// timeout, and terminal states stay terminal. Cancellation requested,
-/// cancellation observed, and unresolved prior effects therefore stay
-/// separate outcomes instead of collapsing into a fresh effect.
-fn map_cancel_record_state(
+/// Only an owner-observed `CANCELLED` parent proves cancellation. A completed
+/// or otherwise terminal parent is already terminal; every nonterminal or
+/// unresolved state remains an exact-handle unknown outcome.
+fn map_parent_cancellation_disposition(
     state: HostRequestRecordState,
+    operation_handle: &str,
 ) -> Result<HostCancellationPortOutcome, PortFailure> {
     match state {
-        HostRequestRecordState::Expired => Err(PortFailure::DeadlineExceeded),
+        HostRequestRecordState::Cancelled => Ok(HostCancellationPortOutcome::Accepted),
+        HostRequestRecordState::ResultReceived
+        | HostRequestRecordState::Terminal
+        | HostRequestRecordState::Conflicted
+        | HostRequestRecordState::Expired => Ok(HostCancellationPortOutcome::AlreadyTerminal),
         HostRequestRecordState::Requested
         | HostRequestRecordState::Admitted
         | HostRequestRecordState::Routed
         | HostRequestRecordState::Submitted
         | HostRequestRecordState::PossiblyEffected
         | HostRequestRecordState::Unknown
-        | HostRequestRecordState::Reconciling
-        | HostRequestRecordState::ResultReceived
-        | HostRequestRecordState::Cancelled => Ok(HostCancellationPortOutcome::Accepted),
-        HostRequestRecordState::Conflicted | HostRequestRecordState::Terminal => {
-            Err(PortFailure::TransportBindingRejected {
-                reason: "cancellation record is already terminal; reconcile the exact operation"
-                    .to_owned(),
-            })
-        }
+        | HostRequestRecordState::Reconciling => Err(unknown_cancel_outcome(operation_handle)),
     }
 }
 
@@ -2354,7 +2417,9 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             );
         };
         match decode_admitted_reply(&reply, &envelope) {
-            Some((_, record)) => map_cancel_record_state(record.state),
+            Some((_, _intent_record)) => {
+                self.resolve_cancellation_parent_disposition(&parent, &facts, &session)
+            }
             None => self.resolve_retained_cancellation(
                 &parent,
                 cancel_correlation.as_str(),
