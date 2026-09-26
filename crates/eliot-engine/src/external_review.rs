@@ -14,12 +14,129 @@ use eliot_types::{
     ExternalReviewJob, ExternalReviewJobStatus, ExternalReviewNormalizationReceipt,
     ExternalReviewPacket, ExternalReviewRequest, ExternalReviewResult, ExternalReviewResultStatus,
     ExternalReviewRole, ExternalUncertainty, ExternalVerifierSuggestion, LifecycleStatus,
-    MailboxMessage, ProjectId, SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand,
-    Visibility, WorkLease, WorktreeLease, WriteId, WriteReceiptRef,
+    MailboxMessage, ProjectId, SemanticCommand, StrictJsonError, TaintClass, TaskId,
+    ToolObservationRecordCommand, Visibility, WorkLease, WorktreeLease, WriteId, WriteReceiptRef,
+    strict_json_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+
+/// Lexical byte ceiling for one external-review raw provider document.
+///
+/// `serde_json::Map` is a `BTreeMap` in this workspace, so raw bytes must cross a
+/// duplicate-rejecting decode (`eliot_types::strict_json_value`, owned by #2985)
+/// before any `Value` exists, and a `Value` handed to
+/// [`ExternalReviewNormalizer::normalize`] without that gate can only come from a
+/// trusted in-process constructor. Bounding those bytes therefore bounds the
+/// largest input that has to be retained, decoded and re-validated.
+///
+/// The value is deliberately independent of `request.budget.max_output_bytes`,
+/// because that budget is per-request provider policy while this is a decoder
+/// safety bound. It must nevertheless stay above the largest document the
+/// existing mock path can legitimately produce, so that
+/// `ExternalReviewJobService::run_mock_job` keeps normalizing every fixture it
+/// normalizes today. The widest of those is the `mock-large-output` provider,
+/// which appends a padding string of `request.budget.max_output_bytes + 512`; at
+/// the default budget (`ExternalProviderLimits::default().max_raw_output_bytes`,
+/// 32 KiB, which `ExternalReviewBudget::default` forwards to
+/// `max_output_bytes`) that document is 33 280 bytes, leaving roughly 1 MiB of
+/// headroom. A request would need a budget above ~1,087 KiB before that fixture
+/// newly rejected. Real provider output is a small candidate document, so a
+/// bound in the low megabytes keeps `mock-large-output` a size-stress fixture
+/// that still normalizes, while a genuinely multi-megabyte document becomes a
+/// bounded rejection rather than an unbounded decode.
+const MAX_RAW_EXTERNAL_REVIEW_BYTES: usize = 1024 * 1024 + 64 * 1024;
+
+/// One lexically validated external-review raw provider document.
+///
+/// The exact bytes and the duplicate-clean `Value` decoded from *those same
+/// bytes* are bound to one value, so a `Value` cannot reach
+/// [`ExternalReviewNormalizer::normalize`] except through one of the two named
+/// constructors below. It owns no schema, authority, scoring or persistence:
+/// it only records which bytes the normalizer read.
+#[derive(Clone, Debug)]
+pub struct ValidatedExternalReviewDocument {
+    origin: ExternalReviewDocumentOrigin,
+    bytes: Vec<u8>,
+    value: Value,
+}
+
+impl ValidatedExternalReviewDocument {
+    /// The exact bytes that were lexically validated.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The duplicate-clean value decoded from exactly [`Self::bytes`].
+    #[must_use]
+    pub const fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// Which construction path produced this document.
+    #[must_use]
+    pub const fn origin(&self) -> ExternalReviewDocumentOrigin {
+        self.origin
+    }
+}
+
+/// How a [`ValidatedExternalReviewDocument`] came into existence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalReviewDocumentOrigin {
+    /// The document was decoded once from exact provider bytes through
+    /// `eliot_types::strict_json_value`. This is the only construction that is
+    /// evidence that the external bytes themselves preserve lexical integrity.
+    StrictProviderBytes,
+    /// The document was encoded from an already-constructed in-process value.
+    ///
+    /// No provider bytes ever existed at this call site, so a duplicate member
+    /// was already collapsed before this value was built. Such a document can
+    /// never be cited as proof that a raw external ingress is closed.
+    InternalConstructed,
+}
+
+impl ValidatedExternalReviewDocument {
+    /// Binds one exact provider byte string to the duplicate-clean value decoded
+    /// from those same bytes.
+    ///
+    /// A duplicate object member at any depth, malformed or trailing input, or a
+    /// document above [`MAX_RAW_EXTERNAL_REVIEW_BYTES`] is one bounded, redacted
+    /// rejection. No input byte, offset or member value is returned or echoed.
+    pub fn strict_from_provider_bytes(bytes: &[u8]) -> Result<Self, StrictJsonError> {
+        let value = strict_json_value(bytes, MAX_RAW_EXTERNAL_REVIEW_BYTES)?;
+        Ok(Self {
+            origin: ExternalReviewDocumentOrigin::StrictProviderBytes,
+            bytes: bytes.to_vec(),
+            value,
+        })
+    }
+
+    /// Binds a trusted, already-constructed in-process value to a self-consistent
+    /// canonical encoding of that same value.
+    ///
+    /// This exists for callers that never hold provider JSON bytes (a fixture, or
+    /// a value built from truncated redacted provider *text*). The re-decode is a
+    /// structural sanity check on a serialization this code just produced; it
+    /// cannot recover a duplicate that was already collapsed into `value`, and
+    /// the resulting document is [`ExternalReviewDocumentOrigin::InternalConstructed`]
+    /// so that no caller or reader can mistake it for raw-byte evidence.
+    pub fn internal_constructed(value: &Value) -> Result<Self, EngineError> {
+        let bytes = serde_json::to_vec(value)?;
+        let strict = strict_json_value(&bytes, MAX_RAW_EXTERNAL_REVIEW_BYTES).map_err(|error| {
+            rejected(
+                "external-review-document",
+                &format!("constructed external review document is not strict JSON: {error}"),
+            )
+        })?;
+        Ok(Self {
+            origin: ExternalReviewDocumentOrigin::InternalConstructed,
+            bytes,
+            value: strict,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExternalProviderRegistryReport {
@@ -340,7 +457,7 @@ impl ExternalReviewJobService {
         packet: &ExternalReviewPacket,
         supervisor: &AdapterSupervisor,
         blob_store: &BlobStore,
-    ) -> Result<(ExternalReviewJob, Value), EngineError> {
+    ) -> Result<(ExternalReviewJob, ValidatedExternalReviewDocument), EngineError> {
         let job = self.create_job(request);
         self.run_mock_job(request, provider, packet, job, supervisor, blob_store)
             .await
@@ -354,7 +471,7 @@ impl ExternalReviewJobService {
         queued_job: ExternalReviewJob,
         supervisor: &AdapterSupervisor,
         blob_store: &BlobStore,
-    ) -> Result<(ExternalReviewJob, Value), EngineError> {
+    ) -> Result<(ExternalReviewJob, ValidatedExternalReviewDocument), EngineError> {
         if provider.kind != ExternalProviderKind::Mock {
             return Err(rejected(
                 "external-review-job-service",
@@ -404,9 +521,23 @@ impl ExternalReviewJobService {
         let adapter_result = supervisor
             .execute("test-echo", adapter_request.clone(), Some(blob_store))
             .await?;
-        let raw_output = mock_raw_output(request, provider, packet);
-        let raw_output_bytes = serde_json::to_vec(&raw_output)?;
-        let raw_output_blob_ref = Some(blob_store.put_bytes(&raw_output_bytes)?);
+        // The byte string is the source of truth: serialize first, then decode
+        // exactly those bytes through the shared duplicate-rejecting decoder, and
+        // retain those same bytes as the raw evidence. Before this inversion the
+        // retained evidence was a re-serialization of an already-collapsed
+        // `Value`, so a duplicate member could never be observed here.
+        let raw_output_bytes = serde_json::to_vec(&mock_raw_output(request, provider, packet))?;
+        let raw_output =
+            ValidatedExternalReviewDocument::strict_from_provider_bytes(&raw_output_bytes)
+                .map_err(|error| {
+                    rejected(
+                        "external-review-job-service",
+                        &format!(
+                            "mock external review raw output failed strict JSON decode: {error}"
+                        ),
+                    )
+                })?;
+        let raw_output_blob_ref = Some(blob_store.put_bytes(raw_output.bytes())?);
         let job = ExternalReviewJob {
             job_id: queued_job.job_id,
             request_id: request.request_id.clone(),
@@ -431,7 +562,7 @@ impl ExternalReviewNormalizer {
         &self,
         request: &ExternalReviewRequest,
         job: &ExternalReviewJob,
-        raw_output: &Value,
+        raw_output: &ValidatedExternalReviewDocument,
     ) -> ExternalReviewNormalizationOutcome {
         let rejected =
             |status: ExternalReviewResultStatus, reason: &str| ExternalReviewNormalizationOutcome {
@@ -444,6 +575,12 @@ impl ExternalReviewNormalizer {
                 ),
                 result: None,
             };
+        // The document is bound to the exact bytes it was decoded from, so the
+        // value below is duplicate-clean by construction. The four
+        // `serde_json::from_value` sites that follow still apply the T07 DTO
+        // shape/alias contract to that value; they no longer need to, and cannot,
+        // recover a lexical duplicate, because the gate above already did.
+        let raw_output = raw_output.value();
 
         if raw_output.get("candidate_only") == Some(&Value::Bool(false))
             || raw_output.get("forbidden_actions").is_some()

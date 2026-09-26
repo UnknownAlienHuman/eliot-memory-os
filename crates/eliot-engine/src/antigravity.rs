@@ -2,7 +2,7 @@ use crate::work::WorkState;
 use crate::worktree::{CandidateDiffCaptureInput, CandidateDiffService, WorktreeCleanupService};
 use crate::{
     EngineError, ExternalReviewNormalizer, ProviderCallReservationOwner, ProviderInvocationJournal,
-    ProviderOutputSpool, work_lease_is_active,
+    ProviderOutputSpool, ValidatedExternalReviewDocument, work_lease_is_active,
 };
 use eliot_types::{
     AntigravityArgvPolicy, AntigravityAuthCheck, AntigravityAuthCheckMethod, AntigravityAuthStatus,
@@ -3007,6 +3007,12 @@ impl AntigravityTextOutputNormalizer {
             created_at: OffsetDateTime::now_utc(),
             completed_at: Some(OffsetDateTime::now_utc()),
         };
+        // This site has no provider JSON bytes: the literal below is assembled
+        // in-process from truncated, already-redacted Antigravity *text* (the
+        // retained raw evidence is `blob_ref("antigravity/raw-output.txt", ..)`).
+        // `internal_constructed` is therefore the honest path, and it marks the
+        // resulting document `InternalConstructed` so this normalization can
+        // never be cited as proof that a raw external byte ingress is closed.
         let raw = json!({
             "candidate_only": true,
             "findings": [{
@@ -3031,6 +3037,23 @@ impl AntigravityTextOutputNormalizer {
             "verifier_suggestions": [],
             "uncertainties": []
         });
+        let Ok(raw) = ValidatedExternalReviewDocument::internal_constructed(&raw) else {
+            return AntigravityNormalizedResult {
+                result_id: new_id("antigravity-result"),
+                request_id: request.request_id.clone(),
+                run_id,
+                candidate_only: true,
+                taint: TaintClass::ExternalAgent,
+                external_review_result: None,
+                rejected: true,
+                rejection_reasons: vec![
+                    "Antigravity candidate document is not a valid external review document"
+                        .to_owned(),
+                ],
+                write_receipt: None,
+                created_at: OffsetDateTime::now_utc(),
+            };
+        };
         let outcome = ExternalReviewNormalizer.normalize(&external_request, &job, &raw);
         let rejected = outcome.result.is_none();
         AntigravityNormalizedResult {
