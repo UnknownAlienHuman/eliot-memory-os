@@ -32,6 +32,10 @@ pub enum ResearchContractError {
     InvalidFence,
     #[error("citation references a source outside the allowed manifest")]
     CitationNotAllowed,
+    #[error("delivered reference handle is outside the allowed manifest")]
+    ReferenceNotAdmitted,
+    #[error("delivered locator URL is not an admitted url handle")]
+    UrlNotAdmitted,
     #[error("citation precision exceeds the declared source anchor")]
     UnsupportedPrecision,
     #[error("bundle disposition is incompatible with its evidence")]
@@ -65,6 +69,35 @@ fn texts(values: &[String], field: &'static str) -> Result<(), ResearchContractE
     Ok(())
 }
 
+/// Validates an allowlist whose empty value is honest and fail-closed: a run
+/// that admits no URL, no tool definition, no verifier or no expansion route
+/// admits none of them, and an empty list is therefore valid rather than
+/// missing. A non-empty list may still not repeat an identity.
+fn optional_texts(values: &[String], field: &'static str) -> Result<(), ResearchContractError> {
+    for value in values {
+        text(value, field)?;
+    }
+    let mut seen = BTreeSet::new();
+    if values.iter().any(|value| !seen.insert(value)) {
+        return Err(ResearchContractError::DuplicateIdentity { field });
+    }
+    Ok(())
+}
+
+/// Disclosure breadth, narrowest first.
+///
+/// A manifest's disclosure class may be narrower than the request that carries
+/// it and never wider, so the comparison needs an explicit breadth: `Private`
+/// is the narrowest class and `Public` the widest.
+const fn disclosure_breadth(class: DisclosureClass) -> u8 {
+    match class {
+        DisclosureClass::Private => 0,
+        DisclosureClass::ProjectBound => 1,
+        DisclosureClass::ExportableRedacted => 2,
+        DisclosureClass::Public => 3,
+    }
+}
+
 fn digest(value: &str, field: &'static str) -> Result<(), ResearchContractError> {
     if value.len() != 64
         || value
@@ -75,6 +108,17 @@ fn digest(value: &str, field: &'static str) -> Result<(), ResearchContractError>
     } else {
         Ok(())
     }
+}
+
+/// Whether a delivered locator presents an absolute external URL.
+///
+/// The check is deliberately structural and never parses: a locator carrying a
+/// scheme separator is treated as an unadmitted external reference unless the
+/// manifest names it, and anything else is treated as an opaque store handle.
+/// A locator this crate cannot recognise as a URL is therefore never refused
+/// here on a guess.
+fn is_absolute_locator(locator: &str) -> bool {
+    locator.contains("://")
 }
 
 #[derive(
@@ -186,16 +230,90 @@ impl CoverageGap {
     }
 }
 
+/// Run-bound reference allowlist for one Researcher / research-exchange job.
+///
+/// # Ownership decision (issue #1764, audit follow-up)
+///
+/// This type is the canonical `AllowedReferenceManifest` **for the Researcher
+/// and research-exchange job contract**. It is the run-bound input allowlist
+/// I21.7 requires, it is the type the issue's declared owner crates consume,
+/// and it is the type the live path carries: `ResearchQueryRequest::allowed_references`
+/// and `InquiryObservation::reference_manifest` are both this type, and its
+/// digest is bound into the profile, coverage receipt, evidence freeze and
+/// terminal inquiry record.
+///
+/// `eliot_dreamer_contracts::grounding::AllowedReferenceManifest` is **not** a
+/// duplicate of this type and is deliberately not merged into it. It is the
+/// Dreamer grounding ledger's *evaluated preimage* — a different artifact with a
+/// different shape (`references: BTreeMap<ArtifactId, AuthorizedReference>`,
+/// `source_snapshot`, `coverage_receipts`, `dependence_groups`) and a different
+/// consumer set. At the time of writing it has ~30 live call sites across
+/// `bins/eliot-dreamer`, `crates/smart/eliot-dreamer-bundle`,
+/// `crates/smart/eliot-dreamer-claim-grounding` and their tests, and its crate
+/// is outside this issue's declared owner scope. The two are the ledger side
+/// and the job-contract side of one I21.7 concept. Do not "fix" this a third
+/// time by deleting either definition.
+///
+/// # What the manifest must carry (I21.7)
+///
+/// Every field below is inside the digest preimage (see [`Self::canonical_digest`]),
+/// so a field that can change what a citation is allowed to say cannot be
+/// supplied by a caller. A reference outside this allowlist is unsupported text:
+/// it can never become a citable source, a supported citation, a support
+/// relation or an evidence edge.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AllowedReferenceManifest {
+    /// Run identity this allowlist is bound to.
     pub run_id: String,
+    /// I21.7: the exact run/job/root context revision this allowlist was
+    /// derived from. A citation admitted under one root context revision is not
+    /// a citation under another, so the revision is part of the identity.
+    pub root_context_revision: String,
+    /// The State Fence this allowlist is bound to.
     pub state_fence: StateFence,
+    /// Allowed source-record handles.
     pub source_handles: Vec<String>,
+    /// Allowed evidence handles.
     pub evidence_handles: Vec<String>,
+    /// Allowed artifact handles.
     pub artifact_handles: Vec<String>,
+    /// I21.7: allowed URL handles.
+    ///
+    /// A URL is never authority. An empty list is the honest fail-closed value:
+    /// a run that admits no URL admits no locator URL, and any absolute URL a
+    /// bridge presents is then untrusted text.
+    #[serde(default)]
+    pub url_handles: Vec<String>,
+    /// I21.7: allowed tool-definition refs a cited support relation may rest on.
+    ///
+    /// Empty is the honest fail-closed value: a run that admits no tool
+    /// definition admits no tool-derived citation.
+    #[serde(default)]
+    pub tool_refs: Vec<String>,
+    /// I21.7: allowed verifier refs a cited support relation may rest on.
+    ///
+    /// Empty is the honest fail-closed value: a run that admits no verifier
+    /// admits no verifier-dependent citation.
+    #[serde(default)]
+    pub verifier_refs: Vec<String>,
+    /// Highest anchor/coordinate precision any citation may claim.
     pub allowed_anchor_precision: AnchorPrecision,
+    /// I21.7: the scope class this allowlist is scoped to.
+    pub scope_class: String,
+    /// I21.7: the disclosure class this allowlist is bound to. A manifest may
+    /// never be wider than the request that carries it.
+    pub disclosure: DisclosureClass,
+    /// I21.7: the retention class this allowlist is bound to.
+    pub retention_class: String,
+    /// Stale or revoked entries. A listed handle is refused even when it is also
+    /// allowed, and a stale entry is never removed by widening.
     pub stale_or_revoked_handles: Vec<String>,
+    /// I21.7: the routes this manifest may be expanded onto. An empty list means
+    /// the manifest travels nowhere else, which is the fail-closed reading.
+    #[serde(default)]
+    pub expansion_routes: Vec<String>,
+    /// Canonical digest over every field above.
     pub digest: String,
 }
 
@@ -220,8 +338,20 @@ impl AnchorPrecision {
 }
 
 impl AllowedReferenceManifest {
+    /// Validates the allowlist and re-proves its digest.
+    ///
+    /// The digest is computed over every field that can change what a citation
+    /// is allowed to say, so a manifest whose content was widened after it was
+    /// sealed is refused here instead of being published as a bound allowlist.
+    /// This is reached on the live path through
+    /// `ResearchQueryRequest::validate`, so a caller cannot present a manifest
+    /// whose digest is unrelated to its own content.
     pub fn validate(&self) -> Result<(), ResearchContractError> {
         text(&self.run_id, "manifest.run_id")?;
+        text(
+            &self.root_context_revision,
+            "manifest.root_context_revision",
+        )?;
         self.state_fence
             .validate()
             .map_err(|_| ResearchContractError::InvalidFence)?;
@@ -231,20 +361,106 @@ impl AllowedReferenceManifest {
                 texts(values, "manifest.handles")?;
             }
         }
+        for (values, field) in [
+            (&self.url_handles, "manifest.url_handles"),
+            (&self.tool_refs, "manifest.tool_refs"),
+            (&self.verifier_refs, "manifest.verifier_refs"),
+            (&self.expansion_routes, "manifest.expansion_routes"),
+        ] {
+            optional_texts(values, field)?;
+        }
+        text(&self.scope_class, "manifest.scope_class")?;
+        text(&self.retention_class, "manifest.retention_class")?;
         for value in &self.stale_or_revoked_handles {
             text(value, "manifest.stale_or_revoked_handles")?;
         }
-        digest(&self.digest, "manifest.digest")
+        if self
+            .stale_or_revoked_handles
+            .iter()
+            .any(|stale| self.allowed_handles().any(|allowed| allowed == stale))
+        {
+            // A handle cannot be both admitted and revoked: the pair would make
+            // `allows` depend on evaluation order rather than on the allowlist.
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        digest(&self.digest, "manifest.digest")?;
+        if self.canonical_digest()? != self.digest {
+            return Err(ResearchContractError::InvalidDigest {
+                field: "manifest.digest",
+            });
+        }
+        Ok(())
     }
-    #[must_use]
-    pub fn allows(&self, handle: &str) -> bool {
-        (self
-            .source_handles
+
+    /// Seals this allowlist by computing its digest over its own content.
+    ///
+    /// This is the only way to produce a manifest that validates: a caller
+    /// supplies content and never supplies the digest.
+    pub fn seal(mut self) -> Result<Self, ResearchContractError> {
+        self.digest = String::new();
+        self.digest = self.canonical_digest()?;
+        Ok(self)
+    }
+
+    /// Canonical digest over the whole allowlist shape.
+    ///
+    /// The stored digest is excluded from its own preimage, and every other
+    /// field is inside it: identity (`run_id`, `root_context_revision`,
+    /// `state_fence`), every allowlist, the precision ceiling, the scope /
+    /// disclosure / retention classes, the stale-or-revoked set, the expansion
+    /// routes, and the contract version that gave the shape its meaning.
+    pub fn canonical_digest(&self) -> Result<String, ResearchContractError> {
+        let mut shape = self.clone();
+        shape.digest = String::new();
+        let bytes =
+            canonical_json_bytes(&shape).map_err(|_| ResearchContractError::Unencodable {
+                field: "allowed_reference_manifest",
+            })?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Every handle this manifest admits, in its declared order.
+    fn allowed_handles(&self) -> impl Iterator<Item = &str> {
+        self.source_handles
             .iter()
             .chain(&self.evidence_handles)
-            .chain(&self.artifact_handles))
-        .any(|candidate| candidate == handle)
+            .chain(&self.artifact_handles)
+            .chain(&self.url_handles)
+            .map(String::as_str)
+    }
+
+    /// Whether this manifest admits `handle` as a citable reference.
+    ///
+    /// URL handles are admitted here on purpose: I21.7 lists URL handles beside
+    /// source/evidence/artifact handles, so a URL that the manifest lists is a
+    /// reference and a URL it does not list is not. A handle this manifest
+    /// admits but also lists as stale or revoked is never admitted.
+    #[must_use]
+    pub fn allows(&self, handle: &str) -> bool {
+        self.allowed_handles().any(|candidate| candidate == handle)
             && !self.stale_or_revoked_handles.iter().any(|x| x == handle)
+    }
+
+    /// Whether this manifest admits `url` as a locator URL.
+    ///
+    /// A URL outside this list is not an authority and not a source: it is
+    /// untrusted text that may only be retained as an untrusted candidate.
+    #[must_use]
+    pub fn admits_url(&self, url: &str) -> bool {
+        self.url_handles.iter().any(|candidate| candidate == url)
+            && !self.stale_or_revoked_handles.iter().any(|x| x == url)
+    }
+
+    /// Whether this manifest may be expanded onto `route`.
+    ///
+    /// I21.7 lists expansion routes as manifest content, and a result packed for
+    /// another route travels on one: an empty list means the result travels
+    /// nowhere else, which is the fail-closed reading.
+    #[must_use]
+    pub fn permits_expansion(&self, route: &str) -> bool {
+        self.expansion_routes
+            .iter()
+            .any(|candidate| candidate == route)
     }
 }
 
@@ -293,6 +509,9 @@ impl ResearchQueryRequest {
             .map_err(|_| ResearchContractError::InvalidFence)?;
         self.allowed_references.validate()?;
         if self.allowed_references.state_fence != self.state_fence
+            || disclosure_breadth(self.allowed_references.disclosure)
+                > disclosure_breadth(self.disclosure)
+            || self.allowed_references.retention_class != self.retention
             || self.budget_units == 0
             || self.deadline_ms <= 0
             || self.source_classes.is_empty()
@@ -419,6 +638,32 @@ impl ResearchEvidenceBundle {
                 .captured_at
                 .validate()
                 .map_err(|_| ResearchContractError::InvalidDisposition)?;
+            // I21.7 reference firewall, before candidate promotion: a delivered
+            // source snapshot is itself a reference. Only a handle the manifest
+            // admits may become an evidence edge, so a source identity a bridge
+            // mints cannot enter the bundle at all — not as evidence, and not as
+            // an exportable source.
+            if !request.allowed_references.allows(&source.source_handle) {
+                return Err(ResearchContractError::ReferenceNotAdmitted);
+            }
+            // I21.7: "It cannot mint a valid citation, URL, source ID, line
+            // range, artifact handle or support relation through prose." A
+            // syntactically valid locator URL the manifest does not list is
+            // exactly that, so it is refused here rather than delivered.
+            if is_absolute_locator(&source.locator)
+                && !request.allowed_references.admits_url(&source.locator)
+            {
+                return Err(ResearchContractError::UrlNotAdmitted);
+            }
+        }
+        for handle in &self.artifact_handles {
+            text(handle, "bundle.artifact_handles")?;
+            // The artifact handle is a reference identity of its own, and I21.7
+            // lists it beside source/evidence/URL handles. An artifact handle
+            // the manifest does not admit never reaches an export.
+            if !request.allowed_references.allows(handle) {
+                return Err(ResearchContractError::ReferenceNotAdmitted);
+            }
         }
         for claim in &self.claims {
             text(&claim.claim_id, "claim.claim_id")?;

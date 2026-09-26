@@ -295,6 +295,16 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         Ok(job.clone())
     }
 
+    /// Closes one job with a delivered evidence bundle.
+    ///
+    /// This is the I21.7 pre-promotion firewall: the delivered bundle is
+    /// validated against the admitted request, so every citation must be a
+    /// manifest-admitted handle at a permitted anchor precision with delivered
+    /// source lineage behind it, every delivered source handle must itself be
+    /// admitted, every absolute locator URL must be an admitted URL handle, and
+    /// every delivered artifact handle must be admitted. A bundle that fails
+    /// any of these is refused and never becomes this job's result, so it can
+    /// produce no evidence edge and no supported citation.
     pub fn import_bundle(
         &mut self,
         bundle: ResearchEvidenceBundle,
@@ -363,6 +373,20 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         Ok(job.clone())
     }
 
+    /// Exports one completed job's result to another route.
+    ///
+    /// I21.7: "Reference validation occurs before candidate promotion and again
+    /// when a result is packed into a shared packet or exported to another
+    /// route." This is that second validation point, so the export boundary does
+    /// not trust the promotion boundary: it re-proves the admitted manifest
+    /// (including its digest over its own content), refuses a job whose State
+    /// Fence moved, re-runs the full pre-promotion firewall over the delivered
+    /// bundle, requires every exported source handle to still be admitted
+    /// by that manifest, and requires the export's return channel to be an
+    /// admitted expansion route. A result admitted under one manifest can never
+    /// be exported against another, a stale or revoked handle can never leave,
+    /// an unadmitted handle can never be named in an export, and a result can
+    /// never be routed somewhere the manifest does not admit.
     pub fn export(
         &self,
         job_id: &str,
@@ -378,12 +402,25 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         {
             return Err(ExchangeError::ExportDenied);
         }
+        let manifest = &job.request.allowed_references;
+        manifest.validate()?;
+        if job.request.state_fence != job.state_fence {
+            return Err(ExchangeError::StaleFence);
+        }
+        if !manifest.permits_expansion(&export.return_channel) {
+            return Err(ExchangeError::ExportDenied);
+        }
         let result = job.result.as_ref().ok_or(ExchangeError::ExportDenied)?;
+        // The pre-promotion firewall, re-run at the export boundary: citation
+        // membership, anchor precision, delivered source lineage, URL locators
+        // and artifact handles are all re-checked against this manifest.
+        result.validate_against(&job.request)?;
         if export.source_handles.iter().any(|h| {
             !result
                 .sources
                 .iter()
                 .any(|source| &source.source_handle == h)
+                || !manifest.allows(h)
         }) {
             return Err(ExchangeError::ExportDenied);
         }

@@ -1498,6 +1498,10 @@ pub fn assess_absence(
 /// Structured precision kinds for already-structured claim/reference records.
 /// No prose is parsed: assertions arrive structured and are checked against
 /// structured support.
+///
+/// The set is closed: an assertion kind that is not one of these is not a
+/// precision this crate can check, and an unchecked kind is never reported as
+/// supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrecisionKind {
     /// Quantified numeric assertion with unit and denominator.
@@ -1508,6 +1512,14 @@ pub enum PrecisionKind {
     Version,
     /// Causal mechanism assertion.
     Causal,
+    /// Coordinate/anchor assertion: the claimed anchor precision of a citation.
+    ///
+    /// I21.7: "A source that supports a file-level or document-level claim does
+    /// not automatically support a symbol, line, causal mechanism or
+    /// population-wide statement." The coordinate form of that rule is this
+    /// kind: a citation may not claim an anchor finer than the support it
+    /// actually carries.
+    Coordinate,
 }
 
 /// One structured precision assertion: what a claim asserts and what the
@@ -1539,6 +1551,26 @@ pub struct UnsupportedPrecisionItem {
     pub risk: String,
     /// Required probe or narrower wording.
     pub required_probe: String,
+}
+
+/// Coordinate/anchor precision rank on the I21.7 ladder, coarsest first.
+///
+/// The wire spellings are the ones the exchange contract's
+/// `AnchorPrecision` uses, and the order is that type's weakest-first order:
+/// `source` is the coarsest anchor and `byte_range` the finest. A spelling this
+/// function does not know has no rank, and an unknown rank is never treated as
+/// coarse enough to admit a fine anchor.
+fn coordinate_rank(name: &str) -> Option<u8> {
+    match name {
+        "source" => Some(0),
+        "document" => Some(1),
+        "page" => Some(2),
+        "section" => Some(3),
+        "paragraph" => Some(4),
+        "line" => Some(5),
+        "byte_range" => Some(6),
+        _ => None,
+    }
 }
 
 fn decimal_scale(value: &str) -> Option<usize> {
@@ -1656,6 +1688,15 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             .supported
             .split('|')
             .any(|mechanism| mechanism.trim() == assertion.asserted.trim()),
+        PrecisionKind::Coordinate => match (
+            coordinate_rank(assertion.asserted.trim()),
+            coordinate_rank(assertion.supported.trim()),
+        ) {
+            // An unrecognised coordinate spelling is never treated as supported:
+            // an unknown rank fails closed rather than falling back to equality.
+            (Some(asserted_rank), Some(supported_rank)) => asserted_rank <= supported_rank,
+            _ => false,
+        },
     };
     if supported {
         Ok(())
@@ -1676,6 +1717,10 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             PrecisionKind::Causal => (
                 "false causal mechanism without evidenced mechanism",
                 "name only evidenced mechanisms or declare correlation",
+            ),
+            PrecisionKind::Coordinate => (
+                "a citation at an anchor finer than the admitted support would be unbacked text",
+                "narrow the anchor to the supported precision or admit a source that supports it",
             ),
         };
         Err(UnsupportedPrecisionItem {
@@ -1755,6 +1800,15 @@ pub struct ClaimVerdict {
     pub outcome: ClaimOutcome,
     /// Typed residue lines (sorted for stability).
     pub residue: Vec<String>,
+    /// The over-precise assertions of this claim, as typed items.
+    ///
+    /// I21.7 requires the `UnsupportedPrecisionItem` to be *recorded*, not only
+    /// rendered: a verdict that keeps the item's asserted coordinate, highest
+    /// supported precision, basis, false-precision risk and required probe as
+    /// one `String` loses the structure a downstream consumer needs to tell a
+    /// false line anchor from a false causal mechanism. The rendered
+    /// [`Self::residue`] line is still produced, so nothing is lost.
+    pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
     /// Preserved counterevidence identities.
     pub counterevidence: Vec<String>,
     /// Preserved unknown references.
@@ -1763,6 +1817,24 @@ pub struct ClaimVerdict {
     pub grade_ceiling: Option<u8>,
     /// Evidence handles behind the verdict, sorted.
     pub evidence_map: Vec<String>,
+}
+
+impl ClaimVerdict {
+    /// The wire spellings of the typed over-precision residue, in the item order
+    /// the audit produced them. A binding that hashes this verdict can name the
+    /// typed items without depending on their rendered prose.
+    #[must_use]
+    pub fn unsupported_precision_lines(&self) -> Vec<String> {
+        self.unsupported_precision
+            .iter()
+            .map(|item| {
+                format!(
+                    "unsupported_precision:{}|{}|{}|{}",
+                    item.asserted, item.highest_supported, item.basis, item.required_probe
+                )
+            })
+            .collect()
+    }
 }
 
 /// The frozen evidence portfolio under audit: inquiry identity, vetted source
@@ -2098,6 +2170,7 @@ pub fn audit_claim(
     let mut residue: Vec<String> = Vec::new();
     let mut supporting: Vec<&SourceRecord> = Vec::new();
     let mut evidence_map: Vec<String> = Vec::new();
+    let mut unsupported_precision: Vec<UnsupportedPrecisionItem> = Vec::new();
     let mut stale_hit = false;
     if claim.material && claim.citations.is_empty() {
         residue.push("claim: material claim records no citations".to_owned());
@@ -2143,6 +2216,10 @@ pub fn audit_claim(
     }
     for assertion in &claim.precision {
         if let Err(item) = check_precision(assertion) {
+            // The typed item is retained, not only its rendering: I21.7 records
+            // the over-precise assertion itself so a consumer can tell a false
+            // line anchor from a false causal mechanism.
+            unsupported_precision.push(item.clone());
             residue.push(format!(
                 "claim: unsupported precision asserted {} supports {}",
                 item.asserted, item.highest_supported
@@ -2154,7 +2231,7 @@ pub fn audit_claim(
     let outside = residue
         .iter()
         .any(|r| r.contains("outside frozen manifest"));
-    let precision_gap = residue.iter().any(|r| r.contains("unsupported precision"));
+    let precision_gap = !unsupported_precision.is_empty();
     let lineage_gap = residue
         .iter()
         .any(|r| r.contains("no authoritative lineage") || r.contains("outside claim domain"));
@@ -2191,6 +2268,7 @@ pub fn audit_claim(
         claim_id: claim.claim_id.clone(),
         outcome,
         residue,
+        unsupported_precision,
         counterevidence: counter_sorted,
         unknowns: unknowns_sorted,
         grade_ceiling,

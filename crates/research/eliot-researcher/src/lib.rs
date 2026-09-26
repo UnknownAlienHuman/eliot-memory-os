@@ -16,22 +16,24 @@ pub mod source_admissibility;
 use eliot_contracts::StateFence;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, GovernedExchange, ResearchBridge};
 use eliot_research_exchange_api::{
-    AllowedReferenceManifest, AnchorPrecision, DisclosureClass, ResearchQueryRequest, SourceClass,
+    AllowedReferenceManifest, AnchorPrecision, DisclosureClass, ResearchContractError,
+    ResearchQueryRequest, SourceClass,
 };
 
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
 // reaching into a module path for a vocabulary it must match on.
 pub use inquiry_governance::{
-    AcquisitionOutcome, BlindedField, CandidateEvidence, CounterSearchStatus, CoverageGoal,
-    CoverageReceipt, DenominatorKind, EvidenceFreeze, EvidenceGrade, EvidenceSetPrecision,
-    GovernorInquiryAdmissionRequest, HypothesisPolicy, IndependenceBlindingPolicy,
-    IndependenceDimension, IndependenceProfile, InquiryError, InquiryGovernance, InquiryHorizon,
-    InquiryLane, InquiryObservation, InquiryOutputContract, InquiryProtocol,
-    InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures, InquiryStopRule,
-    InquiryTerminalRecord, InquiryUncertainty, MissingSourceClass, PreservedNextProbe,
-    PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind, SourcePortfolio,
-    SpecialistDiscoverability, StopRuleKind, StreamEvidence, VerifierStrength,
+    AcquisitionOutcome, BlindedField, CandidateEvidence, ClaimAuditRecord, CounterSearchStatus,
+    CoverageGoal, CoverageReceipt, DenominatorKind, EvidenceFreeze, EvidenceGrade,
+    EvidenceSetPrecision, GovernorInquiryAdmissionRequest, HypothesisPolicy,
+    IndependenceBlindingPolicy, IndependenceDimension, IndependenceProfile, InquiryError,
+    InquiryGovernance, InquiryHorizon, InquiryLane, InquiryObservation, InquiryOutputContract,
+    InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
+    InquiryStopRule, InquiryTerminalRecord, InquiryUncertainty, MissingSourceClass,
+    PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind,
+    SourcePortfolio, SpecialistDiscoverability, StopRuleKind, StreamEvidence, UnadmittedReference,
+    UnadmittedReferenceKind, VerifierStrength,
 };
 pub use inquiry_lanes::{
     AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,
@@ -129,21 +131,49 @@ impl<B: ResearchBridge> Researcher<B> {
     }
 }
 
-#[must_use]
+/// Opens a run-bound reference allowlist over one inquiry.
+///
+/// I21.7: the digest is **not** a parameter. The allowlist is sealed over its own
+/// content here, so every field that can change what a citation is allowed to
+/// say is inside the digest preimage and a caller cannot present a digest that
+/// disagrees with the handles, precision ceiling, classes and State Fence the
+/// manifest actually carries.
+///
+/// The derived fields are the weakest values that keep the manifest honest: a
+/// document-level anchor precision, an explicit root context revision, the
+/// narrowest-but-one disclosure class, an explicit retention class, and no
+/// admitted URL, tool definition, verifier or expansion route. A run that
+/// admits none of those admits none of them.
+///
+/// # Errors
+///
+/// Returns [`ResearchContractError`] when the sealed content cannot be encoded
+/// into its canonical preimage.
 pub fn manifest(
     run_id: impl Into<String>,
     fence: StateFence,
     sources: Vec<String>,
-    digest: impl Into<String>,
-) -> AllowedReferenceManifest {
+    root_context_revision: impl Into<String>,
+    scope_class: impl Into<String>,
+    retention_class: impl Into<String>,
+) -> Result<AllowedReferenceManifest, ResearchContractError> {
     AllowedReferenceManifest {
         run_id: run_id.into(),
+        root_context_revision: root_context_revision.into(),
         state_fence: fence,
         source_handles: sources,
         evidence_handles: Vec::new(),
         artifact_handles: Vec::new(),
-        allowed_anchor_precision: AnchorPrecision::Section,
+        url_handles: Vec::new(),
+        tool_refs: Vec::new(),
+        verifier_refs: Vec::new(),
+        allowed_anchor_precision: AnchorPrecision::Document,
+        scope_class: scope_class.into(),
+        disclosure: DisclosureClass::ProjectBound,
+        retention_class: retention_class.into(),
         stale_or_revoked_handles: Vec::new(),
-        digest: digest.into(),
+        expansion_routes: Vec::new(),
+        digest: String::new(),
     }
+    .seal()
 }
