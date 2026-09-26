@@ -1612,8 +1612,8 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'unsigned-build-evidence (retained explicitly by #1719 step 1-prime: Codex/OpenCode/Desktop plus the legacy-Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
             gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
-            entrypoint_disposition = 'retained-legacy-entrypoint (#1858: once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack, every legacy entrypoint on this binary refuses with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt for every host alike (daemon run, service run, hook, mcp stdio including codex/opencode/claude-desktop); flag absent preserves the legacy path)'
-            cutover_behavior = 'refuse-with-code on every gated entrypoint and host once flagged (no daemon auto-launch, no store start, no ControlWal/WriterActor); legacy path preserved while the flag is absent'
+            entrypoint_disposition = 'retained-legacy-entrypoint (#1858: with ELIOT_CLAUDE_FRONT_DOOR=agent-bridge, every non-stdio command arm refuses with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus canonical-route receipt before its handler (including daemon/service/hook, writer smoke, maintenance run, and import execute); mcp stdio emits that receipt to stderr and redirects to the approved Bridge on every host; flag absent preserves the legacy path)'
+            cutover_behavior = 'every non-stdio command arm refuses with code before its handler once flagged; mcp stdio writes a stderr redirect receipt and delegates to Bridge, returning child status on success and structured ERROR on resolution/launch failure; no legacy store or writer starts; legacy path preserved while the flag is absent'
         }
     }
     if ($FrontDoorBridge) {
@@ -2526,7 +2526,7 @@ $plan = [ordered]@{
         bridge_path = [string]$frontDoorBridgePlan.path
         bridge_provisioned = [bool]$frontDoorBridgePlan.provisioned
         other_hosts = if ($legacyGovernorPresent) {
-            'flag-gated (codex/opencode/claude-desktop refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy entries only while the flag is absent)'
+            'flag-gated (codex/opencode/claude-desktop non-stdio command entries refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus canonical-route receipt before their handlers; mcp stdio on all hosts writes a stderr redirect receipt and delegates to the approved Bridge; legacy entries only while the flag is absent)'
         }
         else {
             'retired (no legacy entrypoint exists on any host and the Claude legacy path is unavailable; canonical route: eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence))'
@@ -2894,7 +2894,7 @@ try {
             legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(
                 [ordered]@{
                     entrypoint = 'eliot-governor.exe mcp stdio --host <any> --instance default'
-                    behavior = 'refuse-with-code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt on every host edge (claude, codex, opencode, claude-desktop) once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy path otherwise'
+                    behavior = 'redirect-to-approved-Bridge on every host edge (claude, codex, opencode, claude-desktop) once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack: write LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER and canonical route receipt to stderr, then delegate; successful delegation exits with child status, resolution/launch failure emits structured ERROR after the redirect receipt; legacy path otherwise'
                     canonical_route = 'eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)'
                 }
                 [ordered]@{
@@ -2927,11 +2927,21 @@ try {
                     }
                 )
             }
-            observed_behavior = if ($legacyGovernorPresent) {
-                'once the flag selects the new stack, invoking daemon run, service run, hook, or mcp stdio on any host returns a structured ERROR object with the stable cutover code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER and canonical_route and never auto-launches the daemon, starts a store, or constructs a ControlWal/WriterActor; flag absent preserves the legacy path; no invocation creates an alternate writer'
+            source_declared_behavior = if ($legacyGovernorPresent) {
+                'source-derived from crates/eliot-app/src/main.rs::dispatch_command: once the flag selects the new stack, every non-stdio command arm returns a structured cutover refusal before its handler (including daemon/service/hook, writer smoke, maintenance run, and import execute); mcp stdio on every host writes LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus canonical_route to stderr and delegates to the approved Bridge; successful delegation exits with child status, while bridge resolution/launch failure emits structured ERROR after the redirect receipt; no legacy handler starts a daemon/store or constructs ControlWal/WriterActor; flag absent preserves the legacy path'
             }
             else {
-                'the legacy crate is absent, or retirement is forced: no legacy entrypoint exists on any host and the Claude legacy path is unavailable; stage with -ClaudeCodeFrontDoor agent-bridge to provision the new stack'
+                'source-derived disposition: the legacy crate is absent, or retirement is forced; no legacy entrypoint exists on any host and the Claude legacy path is unavailable; stage with -ClaudeCodeFrontDoor agent-bridge to provision the new stack'
+            }
+            source_behavior_evidence = [ordered]@{
+                status = 'SOURCE_DECLARED'
+                source = 'crates/eliot-app/src/main.rs::dispatch_command'
+                runtime_execution = 'NOT_PERFORMED'
+            }
+            observed_behavior = 'Installed runtime observation was NOT_PERFORMED by the release builder; see source_declared_behavior for source behavior.'
+            installed_runtime_observation = [ordered]@{
+                status = 'NOT_PERFORMED'
+                detail = 'No installed Windows release invocation was performed by the release builder.'
             }
         }
         operator_schema_version = $verifiedOperator.schema_version
