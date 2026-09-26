@@ -171,6 +171,34 @@ impl KernelContextReadClient {
             | NamedReadOperation::GetCapabilityEvidenceState => {
                 Self::check_reconstruction_capability(request)
             }
+            // #2857: the reconstruction closure's FIRST read. Without this arm
+            // the seven-role route reached `GovernorContextInputs::reconstruct`
+            // and failed closed at `scope_heads` on every request, because
+            // `GetScopeRevisionView` fell through to the `UnknownOperation`
+            // arm below. The store catalogue declares it
+            // (`operation_catalogue.rs`: `requires_scope_id: true`,
+            // `scope_kind: SCOPE_KIND_SCOPE`, no declared parameters — the
+            // closure it returns IS the scope view), and the Governor builds it
+            // with an empty parameter map, so this gate states the catalogue's
+            // own shape: an exact scope, the caller's fence, and no selector to
+            // widen. It is the same closure discipline the reconstruction itself
+            // enforces, not a second consistency algorithm.
+            NamedReadOperation::GetScopeRevisionView => {
+                if request.scope_id.is_none() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetScopeRevisionView requires an exact scope",
+                    });
+                }
+                if !request.parameters.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameters",
+                        reason: "GetScopeRevisionView declares no selectors; the scope view is the closure",
+                    });
+                }
+                request.validate()?;
+                Ok(())
+            }
             NamedReadOperation::GetExperienceBankRange
             | NamedReadOperation::GetAgentFeedbackRange => {
                 Self::check_experience_range_capability(request)

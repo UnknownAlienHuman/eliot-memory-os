@@ -15,8 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
 use eliot_governor::{
     CompositionError, CompositionReadiness, FinishAttemptError, GovernorActivationOutcome,
-    GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
-    KernelGenerationSnapshotProvider, QueueLimits,
+    GovernorComposition, GovernorLaunchConfig, KernelGenerationPort, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -189,8 +188,11 @@ pub use freshness_admission::{
     evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
 };
 pub use governor_local_read::{
-    answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
-    serve_admitted_local_read,
+    CONTEXT_RECONSTRUCTION_QUERY_MODE, ContextReconstructionBinding, ContextReconstructionOutcome,
+    ContextReconstructionRefusal, answer_evidence_query, answer_projection_inputs,
+    context_reconstruction_request, context_reconstruction_result_body,
+    forward_admitted_local_read, is_context_reconstruction_query, project_context_reconstruction,
+    reconstruct_context_inputs, serve_admitted_local_read, serve_context_reconstruction,
 };
 pub use governor_observe_serve::{
     ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
@@ -2209,49 +2211,6 @@ impl DaemonComposition {
             .install_admitted_work_scope_owner(owner)
             .map_err(DaemonError::Composition)?;
         Ok((receipt, snapshot))
-    }
-
-    /// Borrows the Governor reconstruction read composition over the retained
-    /// owners plus daemon-held Kernel and read clients (T11.3).
-    ///
-    /// Mirrors [`Self::epistemic_composition`]: readiness is checked first,
-    /// then the exact admitted fence is snapshotted from the retained Kernel
-    /// client, and a fresh [`ReconstructionReadComposition`] is borrowed over
-    /// the caller-held [`DaemonKernelClient`] and [`KernelContextReadClient`]
-    /// with the task-bound scope. The composition retains no client and no
-    /// thread — the caller (the single daemon runtime holding both the
-    /// concrete client and this composition, as with
-    /// [`Self::note_owner_session_binding`]) passes the already-connected
-    /// clients per call, so a Governor refresh surfaces as an exact fence
-    /// mismatch instead of silent divergence. No `composition.rs` change is
-    /// involved: this uses only the retained snapshot fence plus the two
-    /// borrowed clients.
-    ///
-    /// Wiring decision (mirroring `context_read_client` §4.1): post-`start`
-    /// attach-style accessor, not a `start()` signature change — `start()`
-    /// keeps its exact `(config, kernel: Arc<dyn KernelGenerationPort>,
-    /// authority_activation)` contour.
-    pub fn reconstruction_composition<'a>(
-        &'a self,
-        kernel: &'a Arc<DaemonKernelClient>,
-        reads: &'a KernelContextReadClient,
-        scope: eliot_store_api::ScopeId,
-    ) -> Result<
-        ReconstructionReadComposition<'a, DaemonKernelClient, KernelContextReadClient>,
-        DaemonError,
-    > {
-        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
-            return Err(DaemonError::Composition(
-                eliot_governor::CompositionError::NotReady,
-            ));
-        }
-        let admitted_fence = kernel.snapshot().state_fence();
-        Ok(ReconstructionReadComposition::borrow(
-            kernel.as_ref(),
-            reads,
-            admitted_fence,
-            scope,
-        ))
     }
 
     /// Stops the one daemon owner and releases protected handles together.
