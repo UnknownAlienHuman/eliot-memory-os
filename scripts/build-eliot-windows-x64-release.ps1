@@ -11,7 +11,7 @@ param(
     [switch]$SkipBuild,
     [switch]$PlanOnly,
     [ValidateSet('legacy', 'agent-bridge')]
-    [string]$ClaudeCodeFrontDoor = 'legacy',
+    [string]$ClaudeCodeFrontDoor,
     [switch]$PlanRetiredGovernor,
     [Alias('VerifyBundle')]
     [string]$BuilderVerifyBundle
@@ -2949,7 +2949,6 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
-$frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
 # Issue #2892: resolve the typed governor disposition before planning. Only
 # Retained (exact legacy identity, no accepted receipt) and Retired
 # (accepted owner receipt verified for the exact source commit with the
@@ -2969,6 +2968,21 @@ if ([string]$governorDisposition.Kind -ceq 'RetirementCandidate') {
 }
 $legacyGovernorPresent = [string]$governorDisposition.Kind -ceq 'Retained'
 $governorEvidence = $governorDisposition.Evidence
+# Preserve the legacy default while the source is retained. When the typed
+# resolver admits retirement, or when PlanOnly is explicitly sketching that
+# layout, an omitted front-door selection provisions the Bridge so the plan
+# matches the stage path. PSBoundParameters distinguishes omission from an
+# explicit legacy request; retirement never silently rewrites that request.
+$retiredLayoutSelected = $PlanRetiredGovernor -or [string]$governorDisposition.Kind -ceq 'Retired'
+$claudeCodeFrontDoorExplicit = $PSBoundParameters.ContainsKey('ClaudeCodeFrontDoor')
+if ($retiredLayoutSelected -and $claudeCodeFrontDoorExplicit -and $ClaudeCodeFrontDoor -ceq 'legacy') {
+    $retiredLayoutReason = if ($PlanRetiredGovernor) { 'the -PlanRetiredGovernor simulation' } else { 'the accepted retired governor layout' }
+    throw "Claude Code front-door selection 'legacy' cannot be used with $retiredLayoutReason; select agent-bridge or omit -ClaudeCodeFrontDoor"
+}
+if (-not $claudeCodeFrontDoorExplicit) {
+    $ClaudeCodeFrontDoor = if ($retiredLayoutSelected) { 'agent-bridge' } else { 'legacy' }
+}
+$frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $surrealCatalog = Get-VerifiedSurrealCatalog $repo $sourceCommit
 $projectLocalSurreal = $null
