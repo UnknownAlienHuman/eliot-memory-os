@@ -1418,6 +1418,9 @@ pub struct RecoveredStreamFacts {
     stream_id: String,
     durable_cursor: u64,
     acked_cursor: u64,
+    expected_revision: u64,
+    expected_incarnation: u64,
+    retention_floor: u64,
     contiguous_durable_frontier: u64,
     highest_observed_sequence: u64,
     events: Vec<RecoveredEventFact>,
@@ -1430,14 +1433,22 @@ impl RecoveredStreamFacts {
     /// Checks one wire-decoded stream page and derives its accounting.
     /// Events must arrive strictly increasing with nonzero sequences above
     /// the acked base and without duplicate identities; `acked` must not
-    /// exceed the contiguous durable cursor; a continuation must name the
-    /// page's last sequence and stay within the durable cursor; a complete
-    /// page carries no continuation.
+    /// exceed the contiguous durable cursor; the retention floor must not
+    /// exceed the acked base (the owner never compacts served material);
+    /// a continuation must name the page's last sequence and stay within
+    /// the durable cursor; a complete page carries no continuation. The
+    /// expected owner revision/incarnation binds the page to the retained
+    /// view it was read from; later pages under a changed view mark the
+    /// walk moved instead of stitching silently.
     #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
     pub fn checked(
         stream_id: String,
         durable_cursor: u64,
         acked_cursor: u64,
+        expected_revision: u64,
+        expected_incarnation: u64,
+        retention_floor: u64,
         events: Vec<RecoveredEventFact>,
         gaps: Vec<RecoveredGapFact>,
         page_continuation: Option<u64>,
@@ -1454,6 +1465,12 @@ impl RecoveredStreamFacts {
             return Err(BridgeError::InvalidContract {
                 field: "recovered_stream.acked_cursor",
                 reason: "acknowledged cursor must not exceed the contiguous durable cursor",
+            });
+        }
+        if retention_floor > acked_cursor {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_stream.retention_floor",
+                reason: "retention floor must not exceed the acknowledged base",
             });
         }
         Self::check_event_run(&stream_id, acked_cursor, &events)?;
@@ -1475,6 +1492,9 @@ impl RecoveredStreamFacts {
             stream_id,
             durable_cursor,
             acked_cursor,
+            expected_revision,
+            expected_incarnation,
+            retention_floor,
             contiguous_durable_frontier: contiguous,
             highest_observed_sequence: highest,
             events,
@@ -1611,6 +1631,18 @@ impl RecoveredStreamFacts {
 
     pub const fn acked_cursor(&self) -> u64 {
         self.acked_cursor
+    }
+
+    pub const fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+
+    pub const fn expected_incarnation(&self) -> u64 {
+        self.expected_incarnation
+    }
+
+    pub const fn retention_floor(&self) -> u64 {
+        self.retention_floor
     }
 
     pub const fn contiguous_durable_frontier(&self) -> u64 {
@@ -1964,6 +1996,8 @@ struct ActiveAttach {
 struct RecoveryStreamProgress {
     acked_base: u64,
     acked_high: u64,
+    expected_revision: u64,
+    expected_incarnation: u64,
     durable_cursor: u64,
     contiguous_frontier: u64,
     highest_observed: u64,
@@ -2202,16 +2236,21 @@ impl AgentBridgeCore {
         self.attach_view().ok_or(BridgeError::NotAttached)
     }
 
+    /// Reconciles event ownership/cursors/pages through the forwarding
+    /// port and imports the checked window.
+    ///
+    /// An unreconciled external attach holds the forwarding gate until the
+    /// declared window completes; a managed attach (or an already
+    /// reconciled one) takes the same read as an opportunistic inventory
+    /// that imports facts without touching the gate. Recovery-only reads
+    /// stay reachable through `recover_next_page` while the gate is held,
+    /// so the gate cannot block the walk that satisfies it.
     pub fn reconcile_external(&mut self) -> Result<AttachView, BridgeError> {
         self.ensure_contracts()?;
-        let binding = {
+        let (binding, was_gated) = {
             let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
-            if active.blind_interval.is_none() || !active.reconciliation_required {
-                return Err(BridgeError::InvalidTransition(
-                    "only an unreconciled external attach accepts a reconciliation result",
-                ));
-            }
-            active.binding.clone()
+            let was_gated = active.blind_interval.is_some() && active.reconciliation_required;
+            (active.binding.clone(), was_gated)
         };
         let outcome = self.forwarder()?.reconcile_external(&binding)?;
         let permit = match outcome {
@@ -2222,7 +2261,7 @@ impl AgentBridgeCore {
             }
         };
         let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
-        if active.blind_interval.is_none() || !active.reconciliation_required {
+        if was_gated && (active.blind_interval.is_none() || !active.reconciliation_required) {
             return Err(BridgeError::InvalidTransition(
                 "external attach changed during reconciliation",
             ));
@@ -2245,10 +2284,10 @@ impl AgentBridgeCore {
         if let Some(window) = permit.window {
             let disposition =
                 Self::apply_recovery_window(&active.binding, &mut active.recovery, &window)?;
-            if disposition == RecoveryDisposition::Complete {
+            if was_gated && disposition == RecoveryDisposition::Complete {
                 active.reconciliation_required = false;
             }
-        } else {
+        } else if was_gated {
             active.reconciliation_required = false;
         }
         self.attach_view().ok_or(BridgeError::NotAttached)
@@ -2489,6 +2528,8 @@ impl AgentBridgeCore {
             .or_insert_with(|| RecoveryStreamProgress {
                 acked_base: facts.acked_cursor,
                 acked_high: facts.acked_cursor,
+                expected_revision: facts.expected_revision,
+                expected_incarnation: facts.expected_incarnation,
                 durable_cursor: facts.acked_cursor,
                 contiguous_frontier: facts.acked_cursor,
                 highest_observed: facts.acked_cursor,
@@ -2502,6 +2543,28 @@ impl AgentBridgeCore {
         }
         if facts.durable_cursor < progress.durable_cursor
             || facts.acked_cursor < progress.acked_high
+        {
+            progress.page_complete = false;
+            if window.incomplete_reason.is_none() {
+                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
+            }
+            return;
+        }
+        // The retained view the walk is bound to must not change under it:
+        // a new owner revision/incarnation means required material moved,
+        // and a retention floor at or past the walk's required page start
+        // means required material may already be compacted. Both hold the
+        // gate with an explicit reason instead of stitching silently.
+        if facts.expected_revision != progress.expected_revision
+            || facts.expected_incarnation != progress.expected_incarnation
+        {
+            progress.page_complete = false;
+            if window.incomplete_reason.is_none() {
+                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
+            }
+            return;
+        }
+        if facts.retention_floor >= progress.next_after && progress.next_after > progress.acked_base
         {
             progress.page_complete = false;
             if window.incomplete_reason.is_none() {

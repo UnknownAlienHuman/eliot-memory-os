@@ -11,8 +11,8 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveryDisposition,
-    RecoveryView, SessionId,
+    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveredPendingView,
+    RecoveryDisposition, RecoveryView, SessionId,
 };
 use eliot_contracts::EpochId;
 use eliot_mcp::{
@@ -364,6 +364,7 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
     },
     Reconciled {
+        pending: RecoveryPendingProjection,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
@@ -495,6 +496,71 @@ struct RecoveryStreamProjection {
     page_complete: bool,
 }
 
+/// Bound on pending-obligation entries carried by one `Reconciled` frame.
+/// The walk's pending set can exceed a hot response, so the frame carries
+/// the first entries plus the exact total: the recovery driver pages the
+/// remainder through `RecoverNextPage` reads, never through a higher
+/// ceiling.
+const MAX_RECONCILED_PENDING_ENTRIES: usize = 128;
+
+/// One recovered-but-unforwarded obligation inside a `Reconciled` frame.
+///
+/// Digest-only by construction: the owner page carries metadata, not the
+/// original payload, so no envelope is fabricated here. The recovery
+/// driver redelivers through the retained source/artifact owner.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPendingEntry {
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    phase: String,
+    envelope_digest: String,
+}
+
+/// Bounded projection of the walk's pending obligations for the
+/// `Reconciled` frame (issue #2732).
+///
+/// `total` counts every recovered obligation without local acknowledgement
+/// cover; `entries` carries the first bounded slice; `truncated` marks a
+/// remainder the driver collects through further bounded reads.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPendingProjection {
+    total: usize,
+    truncated: bool,
+    entries: Vec<RecoveryPendingEntry>,
+}
+
+/// Shapes one reconciled window into its typed response frame.
+///
+/// Drains the live pending-obligation view through its real production
+/// caller: every recovered owner receipt the bridge has not yet covered
+/// with its own acknowledgement reaches the recovery driver here, bounded
+/// above, instead of living only as aggregate counts.
+fn reconciled_response(pending: Vec<RecoveredPendingView>) -> Response {
+    let total = pending.len();
+    let truncated = total > MAX_RECONCILED_PENDING_ENTRIES;
+    let entries = pending
+        .into_iter()
+        .take(MAX_RECONCILED_PENDING_ENTRIES)
+        .map(|view| RecoveryPendingEntry {
+            stream_id: view.stream_id().to_owned(),
+            event_id: view.event_id().to_owned(),
+            sequence: view.sequence(),
+            phase: view.phase().to_string(),
+            envelope_digest: view.envelope_digest().to_owned(),
+        })
+        .collect();
+    Response::Reconciled {
+        pending: RecoveryPendingProjection {
+            total,
+            truncated,
+            entries,
+        },
+        bootstrap: None,
+    }
+}
 /// Shapes one imported recovery page into its typed response frame.
 ///
 /// The disposition is projected losslessly: `complete` carries no reason,
@@ -901,7 +967,7 @@ fn main() {
             }) => handle_reactive_record_disposition(&mut runner, &item_id, disposition),
             Ok(Request::ReactiveSnapshot) => handle_reactive_snapshot(&runner),
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
-                Ok(_) => Response::Reconciled { bootstrap: None },
+                Ok(_) => reconciled_response(runner.recovered_pending()),
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
@@ -1059,7 +1125,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::ReactiveAdmitted { bootstrap, .. }
         | Response::ReactiveRecorded { bootstrap, .. }
         | Response::ReactiveLedger { bootstrap, .. }
-        | Response::Reconciled { bootstrap }
+        | Response::Reconciled { bootstrap, .. }
         | Response::RecoveryPage { bootstrap, .. }
         | Response::Stopped { bootstrap, .. } => bootstrap,
         Response::Bootstrap { .. }

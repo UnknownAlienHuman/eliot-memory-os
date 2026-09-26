@@ -184,6 +184,12 @@ const MAX_BRIDGE_EVENT_ENVELOPE_BYTES: usize = 256 * 1024;
 /// Maximum rows served by one bridge-event pending page. Restart enumeration
 /// walks pages with continuations; nothing materializes an unbounded page.
 const MAX_BRIDGE_EVENT_PAGE: usize = 128;
+/// Maximum stream owner rows enumerated by one bridge-event reconcile
+/// answer. The enumeration itself stays bounded: stream-list coverage needs
+/// its own bounded continuation, not an unbounded outer collection. Hitting
+/// the bound reports `stream_list_complete: false` with the exact resume
+/// token instead of a silently complete inventory.
+const MAX_BRIDGE_RECOVERY_STREAMS: usize = 1024;
 /// Maximum handoff rows repaired by one recovery entry per stream namespace
 /// (issue #2731, item 3): the bounded owner-recovery driver restores at most
 /// this many missing handoffs, then reports its continuation flag so the next
@@ -6636,27 +6642,8 @@ impl RedbRecoveryStore {
         database: &Database,
         namespace: &str,
     ) -> Result<(u64, u64), OrsError> {
-        crate::model::validate_digest(namespace, "owner_namespace")?;
         let read = database.begin_read().map_err(storage)?;
-        let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
-        let row: Option<BridgeEventCursorRow> = cursors
-            .get(namespace)
-            .map_err(storage)?
-            .map(|value| decode(value.value()))
-            .transpose()?;
-        match row {
-            Some(row) => {
-                row.validate()?;
-                if row.owner_namespace != namespace {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "bridge_event_cursor",
-                        reason: "checked cursor row carries a foreign owner namespace".to_owned(),
-                    });
-                }
-                Ok((row.last_durable_sequence, row.last_acked_sequence))
-            }
-            None => Ok((0, 0)),
-        }
+        Self::bridge_cursors_snapshot_in(&read, namespace)
     }
 
     /// Advances the durable cursor over the contiguous staged frontier of
@@ -9440,6 +9427,161 @@ impl RedbRecoveryStore {
         }))
     }
 
+    /// Reads the per-namespace durable/acked cursors from one held read
+    /// snapshot. Single-snapshot core of [`Self::bridge_cursors_for_checked`]
+    /// for the owner reconcile enumeration (issue #2732, item 2): every
+    /// page's identities, records, cursors and gaps come from the same
+    /// snapshot, never a silently stitched view.
+    fn bridge_cursors_snapshot_in(
+        read: &redb::ReadTransaction,
+        namespace: &str,
+    ) -> Result<(u64, u64), OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let row: Option<BridgeEventCursorRow> = cursors
+            .get(namespace)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                if row.owner_namespace != namespace {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_cursor",
+                        reason: "checked cursor row carries a foreign owner namespace".to_owned(),
+                    });
+                }
+                Ok((row.last_durable_sequence, row.last_acked_sequence))
+            }
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// Reads the staging observation metadata of one owner namespace from
+    /// one held read snapshot. Single-snapshot core of the former
+    /// per-namespace provenance reader.
+    fn bridge_cursor_provenance_snapshot_in(
+        read: &redb::ReadTransaction,
+        namespace: &str,
+    ) -> Result<(String, u64), OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let row: Option<BridgeEventCursorRow> = cursors
+            .get(namespace)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                Ok((row.last_staging_connection, row.last_producer_generation))
+            }
+            None => Ok((String::new(), 0)),
+        }
+    }
+
+    /// Reads the recorded gaps of one owner namespace from one held read
+    /// snapshot, oldest first. Single-snapshot core of the former
+    /// per-namespace gap reader.
+    fn bridge_scoped_gaps_snapshot_in(
+        read: &redb::ReadTransaction,
+        namespace: &str,
+    ) -> Result<Vec<serde_json::Value>, OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+        let mut rows: Vec<BridgeEventGapRow> = Vec::new();
+        for entry in gaps.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let row: BridgeEventGapRow = decode(value.value())?;
+            row.validate()?;
+            if row.owner_namespace == namespace {
+                rows.push(row);
+            }
+        }
+        rows.sort_by_key(|row| (row.start_sequence, row.gap_id.clone()));
+        Ok(rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "gap_id": row.gap_id,
+                    "start_sequence": row.start_sequence,
+                    "end_sequence": row.end_sequence,
+                    "reason_ref": row.reason_ref,
+                })
+            })
+            .collect())
+    }
+
+    /// Serves one bounded pending page from one held read snapshot for an
+    /// already-resolved owner row: the row's own revision/incarnation from
+    /// the same snapshot is the access check, so the page cannot stitch a
+    /// cursor from one view onto records from another. `after_sequence`
+    /// resumes after the previous page (the acked cursor for the first
+    /// page); unknown streams are never served here.
+    fn bridge_event_pending_page_snapshot_in(
+        read: &redb::ReadTransaction,
+        owner: &BridgeStreamOwnerRow,
+        after_sequence: u64,
+        page_limit: usize,
+    ) -> Result<serde_json::Value, OrsError> {
+        if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let access = Self::check_bridge_stream_access(
+            owner,
+            owner.revision,
+            owner.incarnation,
+            BridgeStreamRight::ReadRecover,
+        )?;
+        if page_limit == 0 || page_limit > MAX_BRIDGE_EVENT_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let (durable, acked) = Self::bridge_cursors_snapshot_in(read, &access.namespace)?;
+        let mut rows: Vec<BridgeEventRow> = Vec::new();
+        {
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            for entry in records.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace == access.namespace && row.sequence > after_sequence {
+                    rows.push(row);
+                }
+            }
+        }
+        rows.sort_by_key(|row| row.sequence);
+        let continuation = if rows.len() > page_limit {
+            rows.truncate(page_limit);
+            rows.last().map(|row| row.sequence)
+        } else {
+            None
+        };
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "event_id": row.event_id,
+                    "sequence": row.sequence,
+                    "phase": row.phase,
+                    "disposition": "accepted",
+                    "envelope_sha256": row.envelope_sha256,
+                    "producer_id": row.producer_id,
+                    "producer_generation": row.producer_generation,
+                    "staging_connection": row.staging_connection,
+                    "covered_by_durable_cursor": row.sequence <= durable,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "stream_id": owner.local_stream,
+            "durable_cursor": durable,
+            "acked_cursor": acked,
+            "items": items,
+            "continuation": continuation,
+        }))
+    }
+
     /// Reconciles event ownership and cursors for one proven presenter
     /// (issue #2729, items 2, 4-6).
     ///
@@ -9448,7 +9590,7 @@ impl RedbRecoveryStore {
     /// retained owner binding matches the presenter's lineage and
     /// principal — never the last-staging connection, never bare
     /// generation ordering. Each covered stream reports its cursors, its
-    /// pending first page, and its scoped gaps; unscoped gaps report under
+    /// pending page, and its scoped gaps; unscoped gaps report under
     /// the presenter's reporter-occurrence namespaces only. Legacy
     /// ownerless rows stay preserved but unlisted; when any record, cursor,
     /// gap, or handoff row exists outside the proven scope (legacy or
@@ -9457,10 +9599,26 @@ impl RedbRecoveryStore {
     /// nonzero for wire discipline but never filters: generation ordering
     /// is not an ownership grant, and recovery of an old stream needs no
     /// new-generation permission.
+    ///
+    /// Single-snapshot read (issue #2732, item 2): the owner enumeration
+    /// and every stream's cursors, page records, scoped gaps and staging
+    /// provenance come from one held read transaction, never a silently
+    /// stitched view across independent transactions. Each page carries
+    /// its expected owner revision/incarnation and retention floor, so the
+    /// consumer binds subsequent pages to the declared retained view.
+    ///
+    /// Bounded continuation: `recovery` names one stream page to resume
+    /// (`local_stream_id`, predecessor sequence, event budget) instead of
+    /// the acked cursor; all other streams serve their first pages. The
+    /// stream enumeration itself is bounded at
+    /// [`MAX_BRIDGE_RECOVERY_STREAMS`]: hitting the bound reports
+    /// `stream_list_complete: false` with the exact resume token instead
+    /// of a silently complete inventory.
     pub fn reconcile_bridge_events_for_owner(
         &self,
         presenter: &serde_json::Value,
         live_generation: u64,
+        recovery: Option<(&str, u64, usize)>,
     ) -> Result<serde_json::Value, OrsError> {
         let (lineage, principal) = Self::bridge_owner_presenter_from(presenter)?;
         if live_generation == 0 {
@@ -9468,6 +9626,11 @@ impl RedbRecoveryStore {
                 field: "live_generation",
                 reason: "live producer generation must be nonzero",
             });
+        }
+        if recovery.is_some_and(|(_, _, event_limit)| {
+            event_limit == 0 || event_limit > MAX_BRIDGE_EVENT_PAGE
+        }) {
+            return Err(OrsError::InvalidCursorLimit);
         }
         let read = self.database.begin_read().map_err(storage)?;
         let mut namespaces: Vec<BridgeStreamOwnerRow> = Vec::new();
@@ -9488,24 +9651,48 @@ impl RedbRecoveryStore {
             }
         }
         namespaces.sort_by(|left, right| left.local_stream.cmp(&right.local_stream));
-        drop(read);
-        let mut covered = Vec::with_capacity(namespaces.len());
-        for owner in &namespaces {
-            let (durable, acked) =
-                Self::bridge_cursors_for_checked(&self.database, &owner.namespace)?;
-            let page = self.bridge_event_pending_page_checked(
-                &owner.namespace,
-                acked,
-                MAX_BRIDGE_EVENT_PAGE,
+        let stream_list_complete = namespaces.len() <= MAX_BRIDGE_RECOVERY_STREAMS;
+        let stream_list_continuation = if stream_list_complete {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(namespaces[MAX_BRIDGE_RECOVERY_STREAMS].local_stream.clone())
+        };
+        let served = if stream_list_complete {
+            &namespaces[..]
+        } else {
+            &namespaces[..MAX_BRIDGE_RECOVERY_STREAMS]
+        };
+        let mut covered = Vec::with_capacity(served.len());
+        for owner in served {
+            let (durable, acked) = Self::bridge_cursors_snapshot_in(&read, &owner.namespace)?;
+            let (after_sequence, event_limit) = match recovery {
+                Some((stream_id, after, limit)) if stream_id == owner.local_stream => {
+                    (after, limit)
+                }
+                _ => (acked, MAX_BRIDGE_EVENT_PAGE),
+            };
+            let page = Self::bridge_event_pending_page_snapshot_in(
+                &read,
+                owner,
+                after_sequence,
+                event_limit,
             )?;
-            let gaps = self.bridge_scoped_gaps_for_checked(&owner.namespace)?;
+            let gaps = Self::bridge_scoped_gaps_snapshot_in(&read, &owner.namespace)?;
             let (stager, generation) =
-                Self::bridge_cursor_provenance_for(&self.database, &owner.namespace)?;
+                Self::bridge_cursor_provenance_snapshot_in(&read, &owner.namespace)?;
+            let retention_floor = acked.saturating_sub(RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM);
+            // Capacity accounting stays best-effort per stream (not window
+            // material): the walk's required identities, records, cursors
+            // and gaps above are single-snapshot; capacity only sizes
+            // backpressure against pending versus retained evidence.
             let capacity = Self::bridge_capacity_accounting_for(&self.database, &owner.namespace)?;
             covered.push(json!({
                 "stream_id": owner.local_stream,
                 "durable_cursor": durable,
                 "acked_cursor": acked,
+                "expected_revision": owner.revision,
+                "expected_incarnation": owner.incarnation,
+                "retention_floor": retention_floor,
                 "last_staging_connection": stager,
                 "last_producer_generation": generation,
                 "pending_first_page": page,
@@ -9515,12 +9702,18 @@ impl RedbRecoveryStore {
         }
         let mut unscoped_gaps = Vec::new();
         for owner in &gap_namespaces {
-            unscoped_gaps.extend(self.bridge_scoped_gaps_for_checked(&owner.namespace)?);
+            unscoped_gaps.extend(Self::bridge_scoped_gaps_snapshot_in(
+                &read,
+                &owner.namespace,
+            )?);
         }
+        drop(read);
         let unproven_scope_present =
             self.bridge_unproven_scope_present(&namespaces, &gap_namespaces)?;
         Ok(json!({
             "streams": covered,
+            "stream_list_complete": stream_list_complete,
+            "stream_list_continuation": stream_list_continuation,
             "unscoped_gaps": unscoped_gaps,
             "unproven_scope_present": unproven_scope_present,
         }))
@@ -9635,63 +9828,6 @@ impl RedbRecoveryStore {
             "owner_bytes": owner_bytes,
             "total_bytes": total_bytes,
         }))
-    }
-
-    /// Reads the recorded gaps of one owner namespace, oldest first
-    /// (issue #2729). Scoped gaps ride their stream's visibility;
-    /// unscoped gaps are selected by the reporter-occurrence namespace.
-    /// Legacy ownerless rows are never served here.
-    fn bridge_scoped_gaps_for_checked(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<serde_json::Value>, OrsError> {
-        crate::model::validate_digest(namespace, "owner_namespace")?;
-        let read = self.database.begin_read().map_err(storage)?;
-        let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
-        let mut rows: Vec<BridgeEventGapRow> = Vec::new();
-        for entry in gaps.iter().map_err(storage)? {
-            let (_, value) = entry.map_err(storage)?;
-            let row: BridgeEventGapRow = decode(value.value())?;
-            row.validate()?;
-            if row.owner_namespace == namespace {
-                rows.push(row);
-            }
-        }
-        rows.sort_by_key(|row| (row.start_sequence, row.gap_id.clone()));
-        Ok(rows
-            .iter()
-            .map(|row| {
-                json!({
-                    "gap_id": row.gap_id,
-                    "start_sequence": row.start_sequence,
-                    "end_sequence": row.end_sequence,
-                    "reason_ref": row.reason_ref,
-                })
-            })
-            .collect())
-    }
-
-    /// Reads the staging observation metadata of one owner namespace
-    /// (issue #2729). Reported for coverage only; never scope material.
-    fn bridge_cursor_provenance_for(
-        database: &Database,
-        namespace: &str,
-    ) -> Result<(String, u64), OrsError> {
-        crate::model::validate_digest(namespace, "owner_namespace")?;
-        let read = database.begin_read().map_err(storage)?;
-        let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
-        let row: Option<BridgeEventCursorRow> = cursors
-            .get(namespace)
-            .map_err(storage)?
-            .map(|value| decode(value.value()))
-            .transpose()?;
-        match row {
-            Some(row) => {
-                row.validate()?;
-                Ok((row.last_staging_connection, row.last_producer_generation))
-            }
-            None => Ok((String::new(), 0)),
-        }
     }
 
     /// Reports whether any bridge-event row exists outside the proven
