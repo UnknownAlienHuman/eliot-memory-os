@@ -128,6 +128,450 @@ impl SpecialCase {
             Self::FinishServiceAdversarial => SelfChangeSurface::FinishService,
         }
     }
+
+    /// Verifies typed special-case evidence with this case's mechanic.
+    ///
+    /// Each arm calls the real check: the executor arm re-checks the
+    /// outer-guardian digest half over the exact evidence bytes, the parser
+    /// arm replays the bound corpus, the selection arm requires zero false
+    /// negatives with lane coverage, and the finish arm requires every
+    /// forged and partial proof rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::UnexpectedSpecialCase`] when the evidence
+    /// belongs to another case, or the mechanic's typed error on divergence.
+    pub fn verify(&self, evidence: &SpecialCaseEvidence) -> Result<(), SelfChangeError> {
+        match (self, evidence) {
+            (Self::ExecutorOuterGuardian, SpecialCaseEvidence::ExecutorOuterGuardian(record)) => {
+                verify_outer_guardian_record(record)
+            }
+            (Self::ParserReplay, SpecialCaseEvidence::ParserReplay(record)) => {
+                verify_parser_replay(record)
+            }
+            (Self::SelectionSentinel, SpecialCaseEvidence::SelectionSentinel(record)) => {
+                verify_selection_sentinel(record)
+            }
+            (
+                Self::FinishServiceAdversarial,
+                SpecialCaseEvidence::FinishServiceAdversarial(record),
+            ) => verify_finish_adversarial(record),
+            (_, mismatched) => Err(SelfChangeError::UnexpectedSpecialCase {
+                observed: mismatched.case(),
+            }),
+        }
+    }
+}
+
+/// Typed evidence admitted by [`SpecialCase::verify`], one variant per case.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecialCaseEvidence {
+    /// Outer guardian scenario evidence for a `ProcessExecutor` change.
+    ExecutorOuterGuardian(OuterGuardianRecord),
+    /// Old-corpus replay for a parser change.
+    ParserReplay(ParserReplayRecord),
+    /// Historical escapes plus sentinel lanes for a selection change.
+    SelectionSentinel(SelectionSentinelRecord),
+    /// Forged/partial-proof suite for a `FinishService` change.
+    FinishServiceAdversarial(AdversarialSuiteRecord),
+}
+
+impl SpecialCaseEvidence {
+    /// The special case this evidence belongs to.
+    #[must_use]
+    pub const fn case(&self) -> SpecialCase {
+        match self {
+            Self::ExecutorOuterGuardian(_) => SpecialCase::ExecutorOuterGuardian,
+            Self::ParserReplay(_) => SpecialCase::ParserReplay,
+            Self::SelectionSentinel(_) => SpecialCase::SelectionSentinel,
+            Self::FinishServiceAdversarial(_) => SpecialCase::FinishServiceAdversarial,
+        }
+    }
+}
+
+/// Verifier-side admission record for one outer guardian scenario.
+///
+/// The existing mechanic (`eliot-process-executor` `verify_outer_guardian`)
+/// proves the scenario worktree absent-or-empty from the machine; that
+/// filesystem proof runs at the Kernel composition root, which owns both
+/// crates, because this module performs no filesystem effects. The root runs
+/// the existing verify, then presents the exact evidence bytes plus the
+/// observed cleanup outcome here, where [`verify_outer_guardian_record`]
+/// re-checks the digest half and admits only an attested cleaned tree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OuterGuardianRecord {
+    /// The exact scenario evidence bytes, re-hashed on verify.
+    pub evidence_bytes: Vec<u8>,
+    /// The expected digest the recomputed value must equal.
+    pub expected_evidence: EvidenceDigest,
+    /// Whether the existing `verify_outer_guardian` observed the scenario
+    /// worktree absent or emptied.
+    pub tree_cleaned: bool,
+}
+
+/// Re-checks one outer guardian scenario admission.
+///
+/// Recomputes the SHA-256 digest over the exact evidence bytes and requires
+/// the attested cleaned tree observed by the existing
+/// `verify_outer_guardian` at the composition root.
+///
+/// # Errors
+///
+/// Returns [`SelfChangeError::GuardianEvidenceMismatch`] on digest drift or
+/// [`SelfChangeError::GuardianTreeNotCleaned`] without the attested cleanup.
+pub fn verify_outer_guardian_record(record: &OuterGuardianRecord) -> Result<(), SelfChangeError> {
+    let observed = eliot_contracts::sha256_hex(&record.evidence_bytes);
+    if observed != record.expected_evidence.as_str() {
+        return Err(SelfChangeError::GuardianEvidenceMismatch);
+    }
+    if !record.tree_cleaned {
+        return Err(SelfChangeError::GuardianTreeNotCleaned);
+    }
+    Ok(())
+}
+
+/// One parser output side: raw capture plus normalized meaning.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParserOutput {
+    /// Raw capture bytes emitted by the parser.
+    pub raw_capture: Vec<u8>,
+    /// Normalized meaning extracted from the raw capture.
+    pub normalized_meaning: String,
+}
+
+/// Old-corpus replay through old and candidate parsers (I18.31 W2).
+///
+/// Outputs pair item by item in corpus order: `old_output[i]` and
+/// `candidate_output[i]` parsed the same corpus item.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParserReplayRecord {
+    /// Digest binding the replayed old raw corpus.
+    pub corpus: EvidenceDigest,
+    /// Old-parser outputs in corpus order.
+    pub old_output: Vec<ParserOutput>,
+    /// Candidate-parser outputs in corpus order.
+    pub candidate_output: Vec<ParserOutput>,
+}
+
+impl ParserReplayRecord {
+    /// Records one replay. Outputs must pair item by item over a non-empty
+    /// corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::ParserCorpusEmpty`] for an empty corpus or
+    /// [`SelfChangeError::ParserReplayLengthMismatch`] when the sides do not
+    /// pair.
+    pub fn new(
+        corpus: EvidenceDigest,
+        old_output: Vec<ParserOutput>,
+        candidate_output: Vec<ParserOutput>,
+    ) -> Result<Self, SelfChangeError> {
+        if old_output.is_empty() {
+            return Err(SelfChangeError::ParserCorpusEmpty);
+        }
+        if old_output.len() != candidate_output.len() {
+            return Err(SelfChangeError::ParserReplayLengthMismatch {
+                old: old_output.len(),
+                candidate: candidate_output.len(),
+            });
+        }
+        Ok(Self {
+            corpus,
+            old_output,
+            candidate_output,
+        })
+    }
+}
+
+/// Verifies one parser replay.
+///
+/// The old outputs re-hash to the bound corpus digest (corpus-scoped: no
+/// item added, dropped, or swapped passes), then every paired item must
+/// match on [`ComparisonAxis::RawCapture`] and
+/// [`ComparisonAxis::NormalizedMeaning`].
+///
+/// # Errors
+///
+/// Returns [`SelfChangeError::ParserCorpusEmpty`],
+/// [`SelfChangeError::ParserReplayLengthMismatch`],
+/// [`SelfChangeError::ParserCorpusMismatch`], or
+/// [`SelfChangeError::ParserReplayDiverged`].
+pub fn verify_parser_replay(record: &ParserReplayRecord) -> Result<(), SelfChangeError> {
+    if record.old_output.is_empty() {
+        return Err(SelfChangeError::ParserCorpusEmpty);
+    }
+    if record.old_output.len() != record.candidate_output.len() {
+        return Err(SelfChangeError::ParserReplayLengthMismatch {
+            old: record.old_output.len(),
+            candidate: record.candidate_output.len(),
+        });
+    }
+    let mut bound = Vec::new();
+    for output in &record.old_output {
+        bound.extend_from_slice(&output.raw_capture.len().to_be_bytes());
+        bound.extend_from_slice(&output.raw_capture);
+    }
+    if eliot_contracts::sha256_hex(&bound) != record.corpus.as_str() {
+        return Err(SelfChangeError::ParserCorpusMismatch);
+    }
+    for (index, pair) in record
+        .old_output
+        .iter()
+        .zip(record.candidate_output.iter())
+        .enumerate()
+    {
+        let (old, candidate) = pair;
+        let mut axes = Vec::new();
+        if old.raw_capture != candidate.raw_capture {
+            axes.push(ComparisonAxis::RawCapture);
+        }
+        if old.normalized_meaning != candidate.normalized_meaning {
+            axes.push(ComparisonAxis::NormalizedMeaning);
+        }
+        if !axes.is_empty() {
+            return Err(SelfChangeError::ParserReplayDiverged { index, axes });
+        }
+    }
+    Ok(())
+}
+
+/// Selection outcome for one sentinel case.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionOutcome {
+    /// The candidate selection picked the case.
+    Selected,
+    /// The candidate selection dropped the case: a false negative.
+    Missed,
+}
+
+/// One historical escape or sentinel-lane probe with its outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SentinelCase {
+    /// Stable case identity.
+    pub case_id: String,
+    /// Sentinel lane the case probes.
+    pub lane: String,
+    /// Whether this case escaped selection historically.
+    pub historical_escape: bool,
+    /// Outcome under the candidate selection.
+    pub outcome: SelectionOutcome,
+}
+
+impl SentinelCase {
+    /// Declares one sentinel case. Identity and lane must be text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::InvalidText`] for a blank case id or lane.
+    pub fn new(
+        case_id: impl Into<String>,
+        lane: impl Into<String>,
+        historical_escape: bool,
+        outcome: SelectionOutcome,
+    ) -> Result<Self, SelfChangeError> {
+        let case_id = case_id.into();
+        if case_id.trim().is_empty() || case_id.chars().any(char::is_control) {
+            return Err(SelfChangeError::InvalidText { field: "case_id" });
+        }
+        let lane = lane.into();
+        if lane.trim().is_empty() || lane.chars().any(char::is_control) {
+            return Err(SelfChangeError::InvalidText { field: "lane" });
+        }
+        Ok(Self {
+            case_id,
+            lane,
+            historical_escape,
+            outcome,
+        })
+    }
+
+    /// Whether the candidate selection missed this must-select case.
+    #[must_use]
+    pub const fn is_false_negative(&self) -> bool {
+        matches!(self.outcome, SelectionOutcome::Missed)
+    }
+}
+
+/// Historical escapes plus sentinel lanes for a selection/impact change.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SelectionSentinelRecord {
+    /// Lanes that must each hold at least one case.
+    pub required_lanes: Vec<String>,
+    /// Historical escapes and sentinel-lane probes with outcomes.
+    pub cases: Vec<SentinelCase>,
+}
+
+impl SelectionSentinelRecord {
+    /// Records one sentinel run. At least one lane is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::SelectionNoSentinelLanes`] without lanes
+    /// or [`SelfChangeError::InvalidText`] for a blank lane.
+    pub fn new(
+        required_lanes: Vec<String>,
+        cases: Vec<SentinelCase>,
+    ) -> Result<Self, SelfChangeError> {
+        if required_lanes.is_empty() {
+            return Err(SelfChangeError::SelectionNoSentinelLanes);
+        }
+        for lane in &required_lanes {
+            if lane.trim().is_empty() || lane.chars().any(char::is_control) {
+                return Err(SelfChangeError::InvalidText { field: "lane" });
+            }
+        }
+        Ok(Self {
+            required_lanes,
+            cases,
+        })
+    }
+}
+
+/// Verifies one selection sentinel record: every required lane must hold at
+/// least one case, and every case must be selected — zero false negatives.
+/// Historical escapes carry no weaker rule: any miss fails closed.
+///
+/// # Errors
+///
+/// Returns [`SelfChangeError::SelectionNoSentinelLanes`],
+/// [`SelfChangeError::SelectionLaneUncovered`], or
+/// [`SelfChangeError::SelectionFalseNegative`].
+pub fn verify_selection_sentinel(record: &SelectionSentinelRecord) -> Result<(), SelfChangeError> {
+    if record.required_lanes.is_empty() {
+        return Err(SelfChangeError::SelectionNoSentinelLanes);
+    }
+    for lane in &record.required_lanes {
+        if !record.cases.iter().any(|case| &case.lane == lane) {
+            return Err(SelfChangeError::SelectionLaneUncovered { lane: lane.clone() });
+        }
+    }
+    for case in &record.cases {
+        if case.is_false_negative() {
+            return Err(SelfChangeError::SelectionFalseNegative {
+                case: case.case_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Proof strength of one adversarial suite case.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdversarialProof {
+    /// Forged proof: the front door must reject it.
+    Forged,
+    /// Partial proof: the front door must reject it.
+    Partial,
+}
+
+/// Last-known-good public front-door verdict for one suite case.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontDoorVerdict {
+    /// The front door admitted the case.
+    Admitted,
+    /// The front door rejected the case.
+    Rejected,
+}
+
+/// One forged/partial-proof case with its front-door verdict.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdversarialCase {
+    /// Stable case identity.
+    pub case_id: String,
+    /// Proof strength under attack.
+    pub proof: AdversarialProof,
+    /// Verdict from the last-known-good public front door.
+    pub verdict: FrontDoorVerdict,
+}
+
+impl AdversarialCase {
+    /// Declares one adversarial case. Identity must be text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::InvalidText`] for a blank case id.
+    pub fn new(
+        case_id: impl Into<String>,
+        proof: AdversarialProof,
+        verdict: FrontDoorVerdict,
+    ) -> Result<Self, SelfChangeError> {
+        let case_id = case_id.into();
+        if case_id.trim().is_empty() || case_id.chars().any(char::is_control) {
+            return Err(SelfChangeError::InvalidText { field: "case_id" });
+        }
+        Ok(Self {
+            case_id,
+            proof,
+            verdict,
+        })
+    }
+}
+
+/// Forged/partial-proof adversarial suite through the last-known-good public
+/// front door (I18.31 W2).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdversarialSuiteRecord {
+    /// Suite cases with their front-door verdicts.
+    pub cases: Vec<AdversarialCase>,
+}
+
+impl AdversarialSuiteRecord {
+    /// Records one suite run. The suite must hold at least one case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::AdversarialSuiteEmpty`] for an empty suite.
+    pub fn new(cases: Vec<AdversarialCase>) -> Result<Self, SelfChangeError> {
+        if cases.is_empty() {
+            return Err(SelfChangeError::AdversarialSuiteEmpty);
+        }
+        Ok(Self { cases })
+    }
+}
+
+/// Verifies one adversarial suite: the suite must hold at least one forged
+/// case, and the front door must reject every forged and every partial case
+/// — all forged rejected, no partial admitted.
+///
+/// # Errors
+///
+/// Returns [`SelfChangeError::AdversarialSuiteEmpty`],
+/// [`SelfChangeError::AdversarialNoForgedCase`],
+/// [`SelfChangeError::AdversarialForgedAdmitted`], or
+/// [`SelfChangeError::AdversarialPartialAdmitted`].
+pub fn verify_finish_adversarial(record: &AdversarialSuiteRecord) -> Result<(), SelfChangeError> {
+    if record.cases.is_empty() {
+        return Err(SelfChangeError::AdversarialSuiteEmpty);
+    }
+    if !record
+        .cases
+        .iter()
+        .any(|case| matches!(case.proof, AdversarialProof::Forged))
+    {
+        return Err(SelfChangeError::AdversarialNoForgedCase);
+    }
+    for case in &record.cases {
+        if matches!(case.verdict, FrontDoorVerdict::Admitted) {
+            match case.proof {
+                AdversarialProof::Forged => {
+                    return Err(SelfChangeError::AdversarialForgedAdmitted {
+                        case: case.case_id.clone(),
+                    });
+                }
+                AdversarialProof::Partial => {
+                    return Err(SelfChangeError::AdversarialPartialAdmitted {
+                        case: case.case_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The five I18.31 bootstrap phases, in cutover order.
@@ -614,6 +1058,67 @@ pub enum SelfChangeError {
     /// Special-case evidence was already recorded.
     #[error("special case evidence is already recorded")]
     DuplicateSpecialCase,
+    /// The recomputed guardian evidence digest differs from the expected value.
+    #[error("guardian evidence digest does not match the expected value")]
+    GuardianEvidenceMismatch,
+    /// The outer guardian did not observe a cleaned scenario worktree.
+    #[error("guardian scenario worktree is not attested cleaned")]
+    GuardianTreeNotCleaned,
+    /// A parser replay names an empty old corpus.
+    #[error("parser replay corpus is empty")]
+    ParserCorpusEmpty,
+    /// Old and candidate parser outputs do not pair item by item.
+    #[error("parser replay pairs {old} old outputs with {candidate} candidate outputs")]
+    ParserReplayLengthMismatch {
+        /// Old-parser output count.
+        old: usize,
+        /// Candidate-parser output count.
+        candidate: usize,
+    },
+    /// The old parser outputs do not re-hash to the bound corpus digest.
+    #[error("parser replay outputs do not match the bound corpus digest")]
+    ParserCorpusMismatch,
+    /// One replayed item diverges between old and candidate parsers.
+    #[error("parser replay item {index} diverges")]
+    ParserReplayDiverged {
+        /// The diverging corpus item index.
+        index: usize,
+        /// The diverging axes.
+        axes: Vec<ComparisonAxis>,
+    },
+    /// A selection sentinel record names no required lanes.
+    #[error("selection sentinel record names no required lanes")]
+    SelectionNoSentinelLanes,
+    /// A required sentinel lane holds no case.
+    #[error("sentinel lane {lane} holds no case")]
+    SelectionLaneUncovered {
+        /// The uncovered lane.
+        lane: String,
+    },
+    /// The candidate selection missed a must-select case.
+    #[error("selection missed must-select case {case}")]
+    SelectionFalseNegative {
+        /// The missed case.
+        case: String,
+    },
+    /// A finish adversarial suite holds no case.
+    #[error("finish adversarial suite is empty")]
+    AdversarialSuiteEmpty,
+    /// A finish adversarial suite holds no forged case.
+    #[error("finish adversarial suite holds no forged case")]
+    AdversarialNoForgedCase,
+    /// The front door admitted a forged proof.
+    #[error("front door admitted forged case {case}")]
+    AdversarialForgedAdmitted {
+        /// The admitted forged case.
+        case: String,
+    },
+    /// The front door admitted a partial proof.
+    #[error("front door admitted partial-proof case {case}")]
+    AdversarialPartialAdmitted {
+        /// The admitted partial-proof case.
+        case: String,
+    },
     /// A text field is blank or carries control characters.
     #[error("{field} must be non-blank and free of control characters")]
     InvalidText {

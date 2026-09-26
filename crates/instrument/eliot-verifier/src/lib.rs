@@ -24,9 +24,13 @@ use time::OffsetDateTime;
 pub mod self_change;
 
 pub use self_change::{
-    AxisVerdicts, BootstrapPhase, CanaryRecord, ComparisonAxis, ConflictArbiter, EvidenceDigest,
-    GenerationReceipt, OracleConflict, OracleResolution, SelfChangeBootstrap, SelfChangeError,
-    SelfChangeSurface, ShadowComparisonRecord, SpecialCase, verdict_with_bootstrap,
+    AdversarialCase, AdversarialProof, AdversarialSuiteRecord, AxisVerdicts, BootstrapPhase,
+    CanaryRecord, ComparisonAxis, ConflictArbiter, EvidenceDigest, FrontDoorVerdict,
+    GenerationReceipt, OracleConflict, OracleResolution, OuterGuardianRecord, ParserOutput,
+    ParserReplayRecord, SelectionOutcome, SelectionSentinelRecord, SelfChangeBootstrap,
+    SelfChangeError, SelfChangeSurface, SentinelCase, ShadowComparisonRecord, SpecialCase,
+    SpecialCaseEvidence, verdict_with_bootstrap, verify_finish_adversarial,
+    verify_outer_guardian_record, verify_parser_replay, verify_selection_sentinel,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.instrument.verifier";
