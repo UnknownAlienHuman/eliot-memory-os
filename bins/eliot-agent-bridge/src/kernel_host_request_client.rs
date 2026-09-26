@@ -2155,11 +2155,21 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // The owner resolved the logical key to its durable winner:
             // return the original handle/state/result with current
             // response correlation. No second dispatch occurs, including
-            // when the first admission acknowledgement was lost.
+            // when the first admission acknowledgement was lost. The
+            // stored result is verified against the record's own staged
+            // occurrence (the original admission, echoed by the owner and
+            // pinned by the key commitment) — never against the
+            // presenting correlation, so a legacy bare-occurrence row
+            // recovered through the compat probe verifies exactly as a
+            // natively staged row does (issue #2765 W4).
             InvocationPreparation::Recovered(record, logical_key) => {
+                let occurrence = record
+                    .request_id
+                    .clone()
+                    .unwrap_or_else(|| correlation.clone());
                 return submit_outcome_for_resolved(
                     &record,
-                    correlation.as_str(),
+                    occurrence.as_str(),
                     request.tool.canonical_name(),
                     logical_key.as_str(),
                 );
