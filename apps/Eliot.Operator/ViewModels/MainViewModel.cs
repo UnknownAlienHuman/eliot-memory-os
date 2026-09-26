@@ -597,7 +597,20 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Unknown outcome — reconcile, do not resubmit",
-                $"{action}: {unknown.OperationId} may have executed; use Reconcile before any retry.",
+                $"{action}: {unknown.OperationId} may have executed at stage {unknown.Stage} ({unknown.Message}); use Reconcile before any retry.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorCleanupIncompleteException cleanup)
+        {
+            // The owner side is settled: only the local teardown of the
+            // transport that carried it was limited. That is NOT an unknown
+            // owner result, so the record is never promoted to possibly
+            // executed, and it is never compacted either.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Owner answered — transport cleanup incomplete",
+                $"{action}: {cleanup.OperationId} was answered by the Governor, but the local transport cleanup was limited at stage {cleanup.Stage} ({cleanup.Message}). The record stays reconcilable under the same operation identity.",
                 OperatorBannerSeverity.Warning);
         }
         catch (OperatorRestartRequiredException restart)
@@ -607,6 +620,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
             SetBanner(
                 "Restart required",
                 $"{action}: {restart.Message} Obtain a fresh broker handoff; the pending operation is retained.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorNotAttemptedException notSent)
+        {
+            // Proven never sent. A FIRST send records exactly that under the
+            // identity it already minted. A recovery send of an older retained
+            // operation is different: failing before the new send says nothing
+            // about the previous execution, so that record keeps its unknown
+            // phase. Neither case clears the journal or mints a new identity.
+            var notSentPhase = NotSentPhase(pending);
+            ReplacePending(pending.OperationId, notSentPhase);
+            RefreshPendingState();
+            SetBanner(
+                notSentPhase == OperatorOperationPhase.NotAttempted
+                    ? "Command not sent"
+                    : "Reconciliation not sent — earlier execution still unknown",
+                notSentPhase == OperatorOperationPhase.NotAttempted
+                    ? $"{action}: {notSent.OperationId} was not attempted; it failed at stage {notSent.Stage} ({notSent.Message}). No owner effect is possible for this attempt and the retained record is kept under the same identity."
+                    : $"{action}: {notSent.OperationId} was not re-sent; it failed at stage {notSent.Stage} ({notSent.Message}). That says nothing about the earlier attempt, which stays reconcilable under the same identity.",
                 OperatorBannerSeverity.Warning);
         }
         catch (Exception error)
@@ -915,7 +947,20 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Unknown outcome — reconcile, do not resubmit",
-                $"{action}: {unknown.OperationId} may have executed; use Reconcile before any retry.",
+                $"{action}: {unknown.OperationId} may have executed at stage {unknown.Stage} ({unknown.Message}); use Reconcile before any retry.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorCleanupIncompleteException cleanup)
+        {
+            // The owner side is settled and only the local teardown of the
+            // transport that carried it was limited. That is distinct from an
+            // unknown owner result, so the record is never promoted to possibly
+            // executed, and it is never compacted either.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Owner answered — transport cleanup incomplete",
+                $"{action}: {cleanup.OperationId} was answered by the Governor, but the local transport cleanup was limited at stage {cleanup.Stage} ({cleanup.Message}); the retained operation stays reconcilable under the same identity.",
                 OperatorBannerSeverity.Warning);
         }
         catch (OperatorRestartRequiredException restart)
@@ -925,6 +970,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
             SetBanner(
                 "Restart required",
                 $"{action}: {restart.Message} Obtain a fresh broker handoff; the pending operation is retained.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorNotAttemptedException notSent)
+        {
+            // Proven never sent. A FIRST send records exactly that, under the
+            // identity it already minted. A RECONCILIATION of an older retained
+            // operation is different: failing before the new send says nothing
+            // about the previous execution, so that record keeps its unknown
+            // phase and nothing is cleared.
+            var notSentPhase = NotSentPhase(pending);
+            ReplacePending(pending.OperationId, notSentPhase);
+            RefreshPendingState();
+            SetBanner(
+                notSentPhase == OperatorOperationPhase.NotAttempted
+                    ? "Command not sent"
+                    : "Reconciliation not sent — earlier execution still unknown",
+                notSentPhase == OperatorOperationPhase.NotAttempted
+                    ? $"{action}: {notSent.OperationId} was not attempted; it failed at stage {notSent.Stage} ({notSent.Message}). No owner effect is possible for this attempt and the retained record is kept under the same identity."
+                    : $"{action}: {notSent.OperationId} was not re-sent; it failed at stage {notSent.Stage} ({notSent.Message}). That says nothing about the earlier attempt, which stays reconcilable under the same identity.",
                 OperatorBannerSeverity.Warning);
         }
         catch (OperationCanceledException)
@@ -1044,6 +1108,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
         return (accepted, executed, staleFence, outcome, receiptId);
     }
+
+    /// The phase a proven-never-sent attempt may record.
+    ///
+    /// `NotAttempted` is truthful only for a record that has never claimed to
+    /// have reached the owner. A record carried over a process boundary, and a
+    /// recovery send of it, already claim that uncertainty: a failure before
+    /// the new send says nothing about the previous execution, so those stay
+    /// `UnknownReconciling` and are never compacted.
+    private static OperatorOperationPhase NotSentPhase(OperatorPendingOperation pending) =>
+        pending.Phase is OperatorOperationPhase.Created or OperatorOperationPhase.Submitted
+            ? OperatorOperationPhase.NotAttempted
+            : OperatorOperationPhase.UnknownReconciling;
 
     private bool ReplacePending(string operationId, OperatorOperationPhase phase)
     {
