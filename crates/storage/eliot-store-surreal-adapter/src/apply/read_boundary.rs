@@ -1882,14 +1882,154 @@ async fn automation_current_payload(
     }))
 }
 
+/// One automation denominator page under the single shared slicing rule.
+struct AutomationPageSlice<T> {
+    /// The eligible rows actually returned, in denominator order.
+    rows: Vec<T>,
+    /// Exactly when an additional eligible row exists beyond `rows`.
+    truncated: bool,
+    /// Identity of the last returned row, never the probe row.
+    last_row_id: Option<String>,
+}
+
+/// Applies the single automation page-slicing rule to one eligible row set.
+///
+/// `eligible` is the ordered, already-filtered denominator prefix for this
+/// page: the exact revision/occurrence selector and the admission fence are
+/// applied before the rule sees a row, so the probe is always an additional
+/// **eligible** row. A foreign or stale row the page would otherwise discard
+/// can therefore never decide coverage.
+///
+/// The rule inspects at most the bound plus one eligible row and returns at
+/// most the bound. `truncated` is set exactly when an eligible row exists
+/// beyond the returned slice, so the exact one-over case — a bound-sized page
+/// with one further eligible row — is `TRUNCATED` with exactly one
+/// continuation, and only a page with no further eligible row is `COMPLETE`.
+/// `last_row_id` is the identity of the last row actually returned, so a
+/// continuation is never minted from the probe row or from a row that
+/// truncation removed.
+fn automation_page_slice<T>(
+    eligible: Vec<T>,
+    limit: usize,
+    row_id: impl Fn(&T) -> &str,
+) -> AutomationPageSlice<T> {
+    let truncated = eligible.len() > limit;
+    let mut rows = eligible;
+    rows.truncate(limit);
+    let last_row_id = rows.last().map(|row| row_id(row).to_owned());
+    AutomationPageSlice {
+        rows,
+        truncated,
+        last_row_id,
+    }
+}
+
+/// Whether one automation page must read another bounded batch.
+///
+/// This contour fetches rows before the admission fence is applied, so a full
+/// batch of raw rows is not exhaustion of the eligible denominator: the page
+/// keeps reading until it either holds the one-over eligible probe row the
+/// shared slicing rule needs, or the store returns a short batch, which is the
+/// only observation that proves no further row exists at this point.
+fn automation_page_needs_batch(eligible: usize, limit: usize, fetched: usize) -> bool {
+    eligible <= limit && fetched > limit
+}
+
+/// Collects the eligible revision rows one page may inspect.
+///
+/// Every batch is read at the bound plus one row and resumes strictly after the
+/// last raw row the previous batch returned, so no row is skipped or re-served
+/// even when several batches are needed to reach the one-over eligible probe.
+async fn automation_eligible_revisions(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    state_fence: &StateFence,
+    limit: usize,
+    after_revision: Option<&str>,
+) -> Result<Vec<super::surreal_automation::StoredAutomationRevision>, AdapterError> {
+    let mut eligible = Vec::new();
+    let mut after = after_revision.map(str::to_owned);
+    loop {
+        let batch = match after.as_deref() {
+            None => {
+                super::surreal_automation::read_revisions_for_read(
+                    db,
+                    config,
+                    automation_id,
+                    limit + 1,
+                )
+                .await?
+            }
+            Some(after_revision) => {
+                read_revisions_after(db, config, automation_id, after_revision, limit + 1).await?
+            }
+        };
+        for row in &batch {
+            if row.state_fence == *state_fence && eligible.len() < limit + 1 {
+                eligible.push(row.clone());
+            }
+        }
+        if !automation_page_needs_batch(eligible.len(), limit, batch.len()) {
+            return Ok(eligible);
+        }
+        after = batch.last().map(|row| row.revision.clone());
+    }
+}
+
+/// Collects the eligible invocation rows one page may inspect.
+///
+/// Same bounded batch discipline as the revision denominator: every batch is
+/// read at the bound plus one row and resumes strictly after the last raw row
+/// the previous batch returned.
+async fn automation_eligible_invocations(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    state_fence: &StateFence,
+    limit: usize,
+    after_occurrence_id: Option<&str>,
+) -> Result<Vec<super::surreal_automation::StoredAutomationInvocation>, AdapterError> {
+    let mut eligible = Vec::new();
+    let mut after = after_occurrence_id.map(str::to_owned);
+    loop {
+        let batch = match after.as_deref() {
+            None => {
+                super::surreal_automation::read_invocations_for_read(
+                    db,
+                    config,
+                    automation_id,
+                    limit + 1,
+                )
+                .await?
+            }
+            Some(after_occurrence_id) => {
+                read_invocations_after(db, config, automation_id, after_occurrence_id, limit + 1)
+                    .await?
+            }
+        };
+        for row in &batch {
+            if row.state_fence == *state_fence && eligible.len() < limit + 1 {
+                eligible.push(row.clone());
+            }
+        }
+        if !automation_page_needs_batch(eligible.len(), limit, batch.len()) {
+            return Ok(eligible);
+        }
+        after = batch.last().map(|row| row.occurrence_id.clone());
+    }
+}
+
 /// Projects the bounded revision set for one automation.
 ///
-/// The page bound plus one probe row decides owner-proven coverage: the owner
-/// reads one row past the bound and, only when that probe row is absent,
+/// The bound plus one eligible probe row decides owner-proven coverage: the
+/// owner reads one row past the bound and, only when that probe row is absent,
 /// reports `COMPLETE`. A page that merely happens to be shorter than the
 /// bound is never completeness.
 ///
-/// A verified continuation resumes strictly after the exclusive last revision
+/// An exact immutable-revision read addresses one immutable row and never
+/// widens into a bounded page, so it carries no pagination semantics. A
+/// verified continuation resumes strictly after the exclusive last revision
 /// identity the owner minted, on the same total `revision` ordering the first
 /// page used, so the two pages partition the denominator.
 async fn automation_history_payload(
@@ -1901,14 +2041,10 @@ async fn automation_history_payload(
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let exact_revision = decoded.requested_revision.as_deref();
-    let mut truncated;
-    let rows = if let Some(cursor) = decoded.cursor.as_ref() {
-        truncated = false;
-        read_revisions_after(db, config, &automation_id, &cursor.after_row_id, limit + 1).await?
-    } else if let Some(requested_revision) = exact_revision {
-        truncated = false;
-        super::surreal_automation::read_revision_for_read(
+    let eligible = match decoded.requested_revision.as_deref() {
+        // An exact row is still fence-gated: the admission fence is part of
+        // what makes a row eligible on every read, paged or exact.
+        Some(requested_revision) => super::surreal_automation::read_revision_for_read(
             db,
             config,
             &automation_id,
@@ -1916,60 +2052,52 @@ async fn automation_history_payload(
         )
         .await?
         .into_iter()
-        .collect()
-    } else {
-        // Fetch covers the page bound plus one probe row: the row scan is
-        // O(table) like every other range read on this contour, and the probe
-        // decides coverage without a second query.
-        let rows = super::surreal_automation::read_revisions_for_read(
-            db,
-            config,
-            &automation_id,
-            limit + 1,
-        )
-        .await?;
-        truncated = rows.len() > limit;
-        rows
+        .filter(|row| row.state_fence == *state_fence)
+        .collect(),
+        None => {
+            // Fetch covers the page bound plus one probe row: the row scan is
+            // O(table) like every other range read on this contour, and the
+            // probe decides coverage without a second query.
+            automation_eligible_revisions(
+                db,
+                config,
+                &automation_id,
+                state_fence,
+                limit,
+                decoded
+                    .cursor
+                    .as_ref()
+                    .map(|cursor| cursor.after_row_id.as_str()),
+            )
+            .await?
+        }
     };
-    let mut revisions = Vec::new();
-    let mut last_row_id: Option<String> = None;
-    for row in rows {
-        if row.state_fence != *state_fence {
-            continue;
-        }
-        if revisions.len() > limit {
-            truncated = true;
-            break;
-        }
-        last_row_id = Some(row.revision.clone());
-        revisions.push(json!({
-            "automation_id": row.automation_id,
-            "revision": row.revision,
-            "revision_json": row.revision_json,
-        }));
-    }
-    if truncated {
-        revisions.pop();
-        last_row_id = revisions
-            .last()
-            .and_then(|row| row.get("revision"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-    }
-    let returned = revisions.len();
+    let page = automation_page_slice(eligible, limit, |row| row.revision.as_str());
+    let returned = page.rows.len();
     let revision = projection_len(returned)?;
-    let mut completeness = automation_page_completeness(read_heads, returned, truncated)?;
-    if truncated {
+    let mut completeness = automation_page_completeness(read_heads, returned, page.truncated)?;
+    if page.truncated {
         completeness = automation_page_with_continuation(
             completeness,
             eliot_store_api::AUTOMATION_QUERY_HISTORY,
             &automation_id,
             read_heads,
             state_fence,
-            last_row_id.as_deref(),
+            page.last_row_id.as_deref(),
             decoded.max_records,
         )?;
     }
+    let revisions: Vec<Value> = page
+        .rows
+        .iter()
+        .map(|row| {
+            json!({
+                "automation_id": row.automation_id,
+                "revision": row.revision,
+                "revision_json": row.revision_json,
+            })
+        })
+        .collect();
     Ok(json!({
         "revisions": revisions,
         "revision": revision,
@@ -2076,13 +2204,16 @@ fn automation_page_with_continuation(
 
 /// Projects the bounded invocation set for one automation.
 ///
-/// Same owner-proven coverage rule as the revision page: the bound plus one
-/// probe row is what turns an unknown remainder into a `COMPLETE` proof.
+/// Same owner-proven coverage rule as the revision page, through the same
+/// shared slicing helper: the bound plus one **eligible** probe row is what
+/// turns an unknown remainder into a `COMPLETE` proof, and a foreign-fence row
+/// in the probe position is not a probe.
 ///
-/// A verified continuation resumes strictly after the exclusive last row
-/// identity the owner minted, on the same total `occurrence_id` ordering the
-/// first page used, so the two pages partition the denominator instead of
-/// overlapping or leaving a gap.
+/// An exact occurrence read addresses one retained row and never widens into a
+/// bounded page, so it carries no pagination semantics. A verified continuation
+/// resumes strictly after the exclusive last row identity the owner minted, on
+/// the same total `occurrence_id` ordering the first page used, so the two
+/// pages partition the denominator instead of overlapping or leaving a gap.
 async fn automation_invocations_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -2092,14 +2223,10 @@ async fn automation_invocations_payload(
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let exact_occurrence = decoded.requested_occurrence_id.as_deref();
-    let mut truncated;
-    let rows = if let Some(cursor) = decoded.cursor.as_ref() {
-        truncated = false;
-        read_invocations_after(db, config, &automation_id, &cursor.after_row_id, limit + 1).await?
-    } else if let Some(occurrence_id) = exact_occurrence {
-        truncated = false;
-        super::surreal_automation::read_invocation_for_read(
+    let eligible = match decoded.requested_occurrence_id.as_deref() {
+        // An exact row is still fence-gated: the admission fence is part of
+        // what makes a row eligible on every read, paged or exact.
+        Some(occurrence_id) => super::surreal_automation::read_invocation_for_read(
             db,
             config,
             &automation_id,
@@ -2107,64 +2234,49 @@ async fn automation_invocations_payload(
         )
         .await?
         .into_iter()
-        .collect()
-    } else {
-        let rows = super::surreal_automation::read_invocations_for_read(
-            db,
-            config,
-            &automation_id,
-            limit + 1,
-        )
-        .await?;
-        truncated = rows.len() > limit;
-        rows
+        .filter(|row| row.state_fence == *state_fence)
+        .collect(),
+        None => {
+            automation_eligible_invocations(
+                db,
+                config,
+                &automation_id,
+                state_fence,
+                limit,
+                decoded
+                    .cursor
+                    .as_ref()
+                    .map(|cursor| cursor.after_row_id.as_str()),
+            )
+            .await?
+        }
     };
-    let mut invocations = Vec::new();
-    let mut last_row_id: Option<String> = None;
-    for row in rows {
-        if row.state_fence != *state_fence {
-            continue;
-        }
-        if decoded
-            .requested_occurrence_id
-            .as_deref()
-            .is_some_and(|occurrence_id| row.occurrence_id != occurrence_id)
-        {
-            continue;
-        }
-        if invocations.len() > limit {
-            truncated = true;
-            break;
-        }
-        last_row_id = Some(row.occurrence_id.clone());
-        invocations.push(json!({
-            "occurrence_id": row.occurrence_id,
-            "automation_id": row.automation_id,
-            "invocation_json": row.invocation_json,
-        }));
-    }
-    if truncated {
-        invocations.pop();
-        last_row_id = invocations
-            .last()
-            .and_then(|row| row.get("occurrence_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-    }
-    let returned = invocations.len();
+    let page = automation_page_slice(eligible, limit, |row| row.occurrence_id.as_str());
+    let returned = page.rows.len();
     let revision = projection_len(returned)?;
-    let mut completeness = automation_page_completeness(read_heads, returned, truncated)?;
-    if truncated {
+    let mut completeness = automation_page_completeness(read_heads, returned, page.truncated)?;
+    if page.truncated {
         completeness = automation_page_with_continuation(
             completeness,
             eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
             &automation_id,
             read_heads,
             state_fence,
-            last_row_id.as_deref(),
+            page.last_row_id.as_deref(),
             decoded.max_records,
         )?;
     }
+    let invocations: Vec<Value> = page
+        .rows
+        .iter()
+        .map(|row| {
+            json!({
+                "occurrence_id": row.occurrence_id,
+                "automation_id": row.automation_id,
+                "invocation_json": row.invocation_json,
+            })
+        })
+        .collect();
     Ok(json!({
         "invocations": invocations,
         "revision": revision,
