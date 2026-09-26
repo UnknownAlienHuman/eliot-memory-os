@@ -98,11 +98,11 @@ pub const WASM_HOST_RESULT_WIRE_ID: &str = "eliot.wasm.host-result";
 /// Result-event wire version (#2787). Independent of the request constant:
 /// the result family is its own versioned contract, so a request-shape
 /// revision never silently re-versions emitted results and a result-shape
-/// revision never admits foreign requests. Version 1 is the one schema
-/// [`WasmHostResultFrame`] serializes; every stdout object carrying
-/// [`WASM_HOST_RESULT_WIRE_ID`] satisfies it, and consumers reject any other
-/// version. (Prior emissions carried the request constant by defect.)
-pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 1;
+/// revision never admits foreign requests. Version 2 adds the required
+/// bounded `observation_predecessors` field; this producer no longer emits
+/// version 1. Consumers must reject every other version. (Prior emissions
+/// carried the request constant by defect.)
+pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 2;
 /// Closed observation phase: the frame observes guest execution.
 pub const RESULT_PHASE_EXECUTE: &str = "execute";
 /// Closed observation phase: the frame observes containment of an uncertain
@@ -494,11 +494,12 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
 ///   refusal);
 /// - one nonterminal `Unknown` execution event followed by one terminal
 ///   containment/reconciliation event carrying its own command/phase
-///   identity, with the original uncertainty preserved, never rewritten;
+///   identity and an ordered reference to the prior observation, with the
+///   original uncertainty preserved, never rewritten;
 /// - a publication failure surfaces through the loop error and the retained
 ///   observation, never as an ad hoc fallback object.
 ///
-/// Consumers reject mixed versions, duplicate terminal events, sequence
+/// Consumers must reject mixed versions, duplicate terminal events, sequence
 /// gaps, and contradictory identities. Absence stays absence per I5.16:
 /// `None` serializes absent, measured zero stays numeric zero, Booleans stay
 /// Booleans, and no formatting helper feeds stringified values back into
@@ -524,6 +525,10 @@ pub struct WasmHostResultFrame {
     pub worker_command: Option<String>,
     /// Bounded event sequence number within the operation, from 0, gapless.
     pub sequence: u64,
+    /// Complete ordered prefix of prior observation sequence numbers used by
+    /// this event. The first event has no predecessors; each follow-up names
+    /// every retained event before it, bounded by `sequence`.
+    pub observation_predecessors: Vec<u64>,
     /// Whether this event closes the operation's result stream.
     pub terminal: bool,
     /// Operation this frame answers.
@@ -677,6 +682,7 @@ fn project_result(
         phase: command_phase(command).to_owned(),
         worker_command: Some(command_name(command).to_owned()),
         sequence: 0,
+        observation_predecessors: Vec::new(),
         terminal: false,
         operation: command_operation(command).to_owned(),
         claim_id: binding.claim_id.clone(),
@@ -771,9 +777,25 @@ fn invalid(field: &'static str) -> LoopError {
     LoopError::ResultInvalid { field }
 }
 
+fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    let predecessor_count = u64::try_from(frame.observation_predecessors.len())
+        .map_err(|_| invalid("observation-predecessors"))?;
+    if predecessor_count != frame.sequence {
+        return Err(invalid("observation-predecessors"));
+    }
+    for (index, predecessor) in frame.observation_predecessors.iter().enumerate() {
+        let expected = u64::try_from(index).map_err(|_| invalid("observation-predecessors"))?;
+        if *predecessor != expected {
+            return Err(invalid("observation-predecessors"));
+        }
+    }
+    Ok(())
+}
+
 /// Validates one result frame's internal consistency before emission
 /// (#2787 step 5): wire identity/version, closed operation/phase/command
-/// vocabulary and their agreement, sequence bound, output
+/// vocabulary and their agreement, sequence bound and complete ordered
+/// predecessor prefix, output
 /// digest/length/hex agreement and omission semantics, and engine-evidence
 /// bindings. A frame that cannot prove itself is never emitted; a refusal
 /// carries its exact phase with no invented engine, usage, or output
@@ -789,6 +811,7 @@ fn validate_frame(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
     if frame.sequence >= MAX_RESULT_SEQUENCE {
         return Err(invalid("sequence-bound"));
     }
+    validate_observation_predecessors(frame)?;
     let operation_known = matches!(
         frame.operation.as_str(),
         OP_INVOKE | OP_CANCEL | OP_RECONCILE | OP_SHUTDOWN
@@ -932,6 +955,7 @@ fn denial_frame(
         phase: phase.to_owned(),
         worker_command: worker_command.map(|command| command_name(command).to_owned()),
         sequence: 0,
+        observation_predecessors: Vec::new(),
         terminal: false,
         operation: operation.to_owned(),
         claim_id: binding.claim_id.clone(),
@@ -1648,22 +1672,24 @@ impl BoundedRequestLoop {
         // Control outcomes never masquerade as Invoke results.
         let command = outcome.command;
         let mut frame = match outcome.result {
-            Ok(result) => {
-                let projected = project_result(&self.binding, &self.engine, command, &result);
-                enforce_frame_budget(projected, self.binding.max_output_bytes)
-            }
-            Err(code) => {
-                let denial = denial_frame(
-                    &self.binding,
-                    command_operation(command),
-                    command_phase(command),
-                    Some(command),
-                    code.as_str(),
-                );
-                enforce_frame_budget(denial, self.binding.max_output_bytes)
-            }
+            Ok(result) => project_result(&self.binding, &self.engine, command, &result),
+            Err(code) => denial_frame(
+                &self.binding,
+                command_operation(command),
+                command_phase(command),
+                Some(command),
+                code.as_str(),
+            ),
         };
         frame.sequence = self.next_sequence;
+        frame.observation_predecessors = self
+            .retained
+            .get(&frame.request_digest)
+            .into_iter()
+            .flatten()
+            .map(|previous| previous.sequence)
+            .collect();
+        frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.lifecycle.one_shot_spent = true;
         if frame.disposition == UNCERTAIN_DISPOSITION {
