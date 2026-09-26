@@ -147,6 +147,22 @@ impl CaptureBudgets {
         Ok(())
     }
 
+    /// Checks the elapsed admitted duration against the frozen ceiling.
+    ///
+    /// `max_duration_ms` is a ceiling on the admitted operation, not a shape
+    /// field: a capture that has already spent it cannot be completed inside
+    /// the authorisation the caller granted, so the honest outcome is the typed
+    /// [`KernelCaptureError::Cancelled`] rather than a silent overrun of the
+    /// Control Reserve. I5.16 keeps incomplete coverage explicit, and A13.9
+    /// requires a durable job to carry a budget — a budget nobody reads is not
+    /// a bound.
+    pub fn check_duration(&self, elapsed_ms: u64) -> Result<(), KernelCaptureError> {
+        if elapsed_ms > self.max_duration_ms {
+            return Err(KernelCaptureError::Cancelled);
+        }
+        Ok(())
+    }
+
     /// Checks per-owner item counts against the per-owner page ceiling and
     /// their saturating sum against the cumulative work ceiling.
     pub fn check_work_items(&self, per_owner_items: &[u64]) -> Result<(), KernelCaptureError> {
