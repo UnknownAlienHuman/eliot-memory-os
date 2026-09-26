@@ -16,7 +16,7 @@ normative_pair_ref = "docs/normative-pair.toml"
 [work_unit]
 cell_id = "surface.agent-bridge-kernel-host-request-port"
 causal_property = "One validated inert host invocation or cancellation is bound by the trusted Kernel to exact principal, Session, WorkScope, task, fence, deadline and operation identity, then returns a result correlated to the original host request without accepting authority from the host."
-old_path_discriminator = "The binary already parses typed Invoke and Cancel requests and calls HostRequestGateway, but composes UnavailableKernelHostRequestPort; every request returns a typed PlanGap for kernel.host-request.bind-dispatch or kernel.host-request.cancel."
+old_path_discriminator = "Pre-cutover path, superseded by cutover 666526cf: the binary parsed typed Invoke/Cancel and called HostRequestGateway but composed UnavailableKernelHostRequestPort, so every request returned a typed PlanGap for kernel.host-request.bind-dispatch or kernel.host-request.cancel. Production now composes the real shared-transport KernelHostRequestClient via kernel_ports_with_declaration called from main; UnavailableKernelHostRequestPort is #[cfg(test)]-only."
 result = "finite implementation allocation for parent #77; no live Edge or Product claim"
 
 [documentation]
@@ -36,11 +36,11 @@ decision_anchors = ["ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-LIFE-01", "ARCH-OBS-01"
 bridge_binary = "bins/eliot-agent-bridge/src/main.rs"
 host_gateway = "crates/surfaces/eliot-mcp/src/host_gateway.rs"
 confirmed_facts = [
-  "The public Request enum contains Attach, Invoke, Cancel, ForwardHook, ForwardEvent, ReconcileExternal, Status and Stop.",
+  "The public Request enum contains Attach, Invoke, Cancel, DryRunInvoke, DryRunCancel, ForwardHook, ForwardEvent, ReactiveAdmit, ReactiveRecordUse, ReactiveRecordUseByHandle, ReactiveRecordDisposition, ReactiveSnapshot, ReconcileExternal, Bootstrap, Reconnect, Detach, Status and Stop.",
   "Raw ForwardFrame is absent from the production request surface and an inline regression test rejects it.",
   "HostInvocationRequest, HostCancellationRequest, HostRequestGateway and KernelHostRequestPort already exist and must be reused.",
-  "The production binary constructs UnavailableKernelHostRequestPort.",
-  "Invoke and Cancel currently return correlated typed REJECTED outcomes with missing Kernel capabilities; no real Kernel operation is reached.",
+  "Since cutover 666526cf the production binary constructs the real shared-transport KernelHostRequestClient via bins/eliot-agent-bridge/src/lib.rs::kernel_ports_with_declaration called from main; UnavailableKernelHostRequestPort in bins/eliot-agent-bridge/src/main.rs is #[cfg(test)]-gated at definition and impl and reaches no production path.",
+  "Invoke and Cancel dispatch through the composed real port with Kernel-owned identity binding via handle_invocation/handle_cancellation; typed REJECTED PlanGap outcomes for missing Kernel capabilities now come only from the #[cfg(test)]-only Unavailable fixture inside mod tests.",
   "Bounded stdin acquisition is a separate source owner under issue #977 and must not be reimplemented here.",
 ]
 
