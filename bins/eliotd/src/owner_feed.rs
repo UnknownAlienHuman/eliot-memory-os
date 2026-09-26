@@ -49,6 +49,11 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm. A refusal is never read as an
 /// empty link set: the durable reason is surfaced and the pass degrades.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+/// Wire reason the Kernel links arm answers when ORS holds no committed
+/// closure state for the root: `StoreError::ReceiptNotFound` renders
+/// exactly so, and the dispatch arm forwards it verbatim. Only this reason
+/// is ever tolerated, and only on first bind (see below).
+const RECEIPT_NOT_FOUND_REASON: &str = "receipt not found";
 /// The only canonical second-phase payload shape this daemon build accepts.
 const GRANT_CLOSURE_LINKS_VERSION: u32 = 1;
 /// Only an acknowledged `bound` receipt counts as published.
@@ -103,6 +108,16 @@ struct GrantClosureCanonicalLinkWire {
 /// that has not completed yet - and never as a completed receipt. A refusal, a
 /// transport failure, a disagreement between two roots, or an unusable
 /// identity fails the pass closed; none of them degrades to an empty map.
+///
+/// First-bind exception: a missing-watermark refusal (`receipt not found`)
+/// for a root is tolerated while the Kernel retains no bound owner yet
+/// (proven through the `query_owner_bundle` readback, never through
+/// process-local state). A fresh ORS holds no committed closure state, so
+/// this read runs before the revision initialize that notes the watermark;
+/// without the exception the pass aborts before the first publish and the
+/// first bind is unreachable. Any other refusal, any refusal once an owner
+/// is bound, and any transport or decode failure still fails the pass
+/// closed.
 async fn read_canonical_closure_receipts(
     kernel: &Arc<DaemonKernelClient>,
     origin_refs: &[String],
@@ -110,6 +125,9 @@ async fn read_canonical_closure_receipts(
 ) -> Result<BTreeMap<String, ReceiptIdentity>, CompositionError> {
     let state_fence = kernel.snapshot().state_fence();
     let mut canonical_receipts: BTreeMap<String, ReceiptIdentity> = BTreeMap::new();
+    // Lazily proven at most once per pass: only a missing-watermark refusal
+    // pays for the readback, and the healthy path never does.
+    let mut first_bind: Option<bool> = None;
     for origin_ref in origin_refs {
         let value = kernel
             .transact_async(
@@ -137,6 +155,26 @@ async fn read_canonical_closure_receipts(
                     .and_then(|value| value.get("reason"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unspecified durable refusal");
+                if reason == RECEIPT_NOT_FOUND_REASON {
+                    let pending = match first_bind {
+                        Some(pending) => pending,
+                        None => {
+                            let pending = owner_first_bind_pending(kernel).await?;
+                            first_bind = Some(pending);
+                            pending
+                        }
+                    };
+                    if pending {
+                        // First bind: ORS durably holds no committed
+                        // closure state for this root yet, and the Kernel
+                        // retains no bound owner to contradict that. The
+                        // root contributes no links; the revision
+                        // initialize inside the feed exchange notes the
+                        // watermark before the history read, so later
+                        // passes serve links instead of refusing.
+                        continue;
+                    }
+                }
                 return Err(CompositionError::Recovery(format!(
                     "Kernel refused the durable canonical closure link read for {origin_ref}: {reason}"
                 )));
@@ -183,6 +221,21 @@ async fn read_canonical_closure_receipts(
         }
     }
     Ok(canonical_receipts)
+}
+
+/// Reports whether the Kernel retains no bound P-07 owner yet, through the
+/// existing `query_owner_bundle` readback (`#2100` first-bind gate).
+///
+/// The readback is Kernel-side state, so the answer survives daemon
+/// restarts where [`OwnerFeedTrigger::last_published_revision`] cannot. A
+/// readback failure refuses (fail closed): tolerance applies only on a
+/// proven-unbound owner, never on an unknown one.
+async fn owner_first_bind_pending(kernel: &Arc<DaemonKernelClient>) -> Result<bool, CompositionError> {
+    let readback = kernel
+        .query_owner_bundle_readback()
+        .await
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    Ok(readback.is_none())
 }
 
 /// Reports whether one canonical receipt identity is complete and bounded
@@ -358,7 +411,11 @@ impl OwnerFeedTrigger {
 /// the Kernel already committed reaches the owner boundary instead of being
 /// dropped on the way to `eliotd`. A lineage with no completed second phase
 /// contributes no link and nothing is claimed reconciled; a refusal or an
-/// unreadable identity fails the pass instead of degrading to no links.
+/// unreadable identity fails the pass instead of degrading to no links. A
+/// missing-watermark refusal is tolerated only on first bind (the Kernel
+/// retains no bound owner yet, proven through its readback): the revision
+/// initialize inside the exchange notes the watermark before the history
+/// read, so the tolerated root converges to served links on later passes.
 ///
 /// Returns `Ok(None)` when nothing needed publishing, `Ok(Some(revision))`
 /// when the Kernel readback proved the publish at that revision, and `Err`
