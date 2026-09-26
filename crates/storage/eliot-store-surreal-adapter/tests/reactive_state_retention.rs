@@ -182,7 +182,12 @@ fn transition_with(
         transition_class: TransitionClass::ReactiveState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: "c".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this helper).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: manifest_digest,
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation,
             parameters,
@@ -198,6 +203,10 @@ fn transition_with(
     let view = CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]);
     transition.identity.canonical_request_hash =
         canonical_request_hash(&view).expect("hash computes");
+    // Issue #18: the admission digest covers the canonical hash, so bind
+    // after the hash is final.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     (ctx, transition)
 }
 

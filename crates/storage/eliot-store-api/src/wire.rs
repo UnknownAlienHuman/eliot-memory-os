@@ -1280,7 +1280,7 @@ mod tests {
     fn apply_parts(params: BTreeMap<String, Value>) -> (crate::RequestMeta, PreparedTransition) {
         let fence = test_fence();
         let context = test_context(&fence);
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-authority").expect("operation id"),
                 idempotency_key: "idem-authority".to_owned(),
@@ -1293,8 +1293,12 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: wire-format fixture binds no source revisions.
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: params,
@@ -1307,6 +1311,7 @@ mod tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        crate::bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
         (context, transition)
     }
 

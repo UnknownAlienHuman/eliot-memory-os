@@ -124,7 +124,7 @@ fn context_for(tag: &str) -> RequestMeta {
 
 fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
     let operation_id = format!("op-994-kr-{tag}");
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id.clone()).expect("994-kr operation id"),
             idempotency_key: format!("idem-994-kr-{tag}"),
@@ -142,6 +142,9 @@ fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: OperationManifestDigest::new(format!("manifest-994-kr-{tag}"))
             .expect("994-kr manifest digest"),
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([(
@@ -156,7 +159,12 @@ fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    // Issue #18: the hash seal below re-binds after covering the sealed
+    // hash; no source revisions are bound until the expected heads exist.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("994-kr digests bind");
+    transition
 }
 
 /// Seals the canonical request hash over the exact values about to be bound,
@@ -170,6 +178,13 @@ fn seal(
     let view = CanonicalRequestView::from_apply(context, transition, revision, ordering);
     transition.identity.canonical_request_hash =
         canonical_request_hash(&view).expect("994-kr request hashes");
+    // Issue #18: re-bind after the hash seal above, which the admission
+    // digest covers, binding the exact expected revision heads sealed over.
+    eliot_store_api::bind_issue18_digests(
+        transition,
+        eliot_store_api::render_semantic_source_revisions(revision),
+    )
+    .expect("994-kr digests bind");
 }
 
 fn heads_for(
@@ -339,11 +354,15 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
         envelope: None,
     };
+    eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
     receipt.envelope = Some(envelope_for(
         &request.context,
         transition,

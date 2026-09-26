@@ -55,9 +55,7 @@ pub use product_command::{
     BackupCreateArgs, BackupCreatePreview, RestorePreview, parse_backup_class,
     preview_backup_create, preview_restore,
 };
-pub use product_run::{
-    IssueReport, RestoreEpochSpec, RestoreRunReport, issue_backup, run_restore,
-};
+pub use product_run::{IssueReport, RestoreEpochSpec, RestoreRunReport, issue_backup, run_restore};
 pub use restore_runner::{
     FileRestoreJournal, FileRestoreTarget, RunnerOutcome, execute_isolated_restore,
 };
@@ -3616,6 +3614,10 @@ mod backup_verify_tests_948 {
                 "manifest-{operation}"
             ))
             .expect("manifest digest"),
+            // Issue #18: standalone fixture
+            semantic_source_revisions: Vec::new(),
+            admission_digest: "f".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

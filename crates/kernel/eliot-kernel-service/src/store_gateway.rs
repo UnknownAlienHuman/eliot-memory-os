@@ -1241,6 +1241,9 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: set_digest,
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1260,6 +1263,10 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
         )
         .unwrap_or_else(|_| unreachable!());
+        // Issue #18: bind after the hash seal above, which the admission
+        // digest covers; no source revisions are bound here.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .unwrap_or_else(|_| unreachable!());
         admit_prepared_transition(&context, &transition, &[], &[])
             .unwrap_or_else(|_| unreachable!());
 
@@ -1285,6 +1292,10 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &unsupported, &[], &[]),
         )
         .unwrap_or_else(|_| unreachable!());
+        // Issue #18: re-bind after the manifest/hash mutation above so the
+        // unsupported plan still reaches the catalogue recovery check.
+        eliot_store_api::bind_issue18_digests(&mut unsupported, Vec::new())
+            .unwrap_or_else(|_| unreachable!());
         let error = match admit_prepared_transition(&context, &unsupported, &[], &[]) {
             Err(error) => error,
             Ok(()) => unreachable!("unsupported manifest must fail"),
@@ -2122,7 +2133,7 @@ mod live_surreal_evidence_pack_e2e {
     ) -> PreparedTransition {
         let entries = generated_operation_manifests().expect("operation catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
-        PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new(format!("op-t11-live-{tag}"))
                     .expect("operation identity"),
@@ -2137,6 +2148,9 @@ mod live_surreal_evidence_pack_e2e {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: set_digest.as_str().to_owned(),
             operation_manifest_digest: set_digest,
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -2148,7 +2162,11 @@ mod live_surreal_evidence_pack_e2e {
             },
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        // Issue #18: the live capture binds no source revisions.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
+        transition
     }
 
     fn verification_intent() -> QueryIntent {

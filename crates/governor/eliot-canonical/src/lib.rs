@@ -542,7 +542,7 @@ impl CanonicalWriteEnvelope {
     /// contract consumed by Kernel and the canonical store.
     pub fn prepare(&self) -> Result<PreparedTransition, CanonicalError> {
         self.validate()?;
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: self.operation_id.clone(),
                 idempotency_key: self.idempotency_key.clone(),
@@ -559,12 +559,23 @@ impl CanonicalWriteEnvelope {
             transition_class: self.transition_class,
             requested_effect_ceiling: self.requested_effect_ceiling,
             admission_contract_set_digest: self.admission_contract_set_digest.clone(),
+            // Issue #18: production admission binds the exact semantic source
+            // revisions; the digests are derived by `bind_issue18_digests`.
+            semantic_source_revisions: eliot_store_api::render_semantic_source_revisions(
+                &self.expected_revision_heads,
+            ),
+            admission_digest: String::new(),
             operation_manifest_digest: self.operation_manifest_digest.clone(),
+            mutation_plan_digest: String::new(),
             named_operations: self.semantic_commands.clone(),
             event_projection_relation_intents: self.event_projection_relation_intents.clone(),
             security: self.security.clone(),
             required_proof_and_approval_refs: self.required_proof_and_approval_refs.clone(),
         };
+        eliot_store_api::bind_issue18_digests(
+            &mut transition,
+            eliot_store_api::render_semantic_source_revisions(&self.expected_revision_heads),
+        )?;
         transition.validate()?;
         Ok(transition)
     }
@@ -918,10 +929,7 @@ impl FinishEvidence {
                 reason: "must be non-zero",
             });
         }
-        unique(
-            self.artifact_refs.iter(),
-            "finish.evidence.artifact_refs",
-        )?;
+        unique(self.artifact_refs.iter(), "finish.evidence.artifact_refs")?;
         for reference in &self.artifact_refs {
             text(reference, "finish.evidence.artifact_ref")?;
         }

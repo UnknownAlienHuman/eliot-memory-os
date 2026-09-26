@@ -186,7 +186,12 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: this helper binds no semantic source revisions; digests
+        // are derived by `bind_issue18_digests` below.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: set_digest(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -203,6 +208,8 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
     )
     .expect("request hash");
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     (ctx, transition)
 }
 
@@ -547,6 +554,13 @@ fn reserved_inputs(
         &CanonicalRequestView::from_apply(&ctx, &transition, &revision, &ordering),
     )
     .expect("request hash");
+    // Issue #18: the recomputed hash covers the revision/ordering heads, so
+    // the admission digest is rebound over the rendered source revisions.
+    eliot_store_api::bind_issue18_digests(
+        &mut transition,
+        eliot_store_api::render_semantic_source_revisions(&revision),
+    )
+    .expect("fixture digests bind");
     let now_ms = i64::try_from(unix_ms_now()).expect("wall clock fits");
     let seed = ReservationSeed {
         reservation_id: format!("reservation-994-{operation}"),
@@ -964,6 +978,10 @@ async fn reference_versus_surreal_equivalence() {
             .find(|candidate| {
                 let mut probe = admitted("op-994-probe", "scope-994-a", "probe").1;
                 probe.operation_manifest_digest = candidate.digest.clone();
+                // Issue #18: the manifest mutation above invalidates the bound
+                // digests, so they are rebound before the manifest check.
+                eliot_store_api::bind_issue18_digests(&mut probe, Vec::new())
+                    .expect("fixture digests bind");
                 probe.validate_against_manifest(candidate).is_ok()
             })
             .expect("capture entry")
@@ -978,6 +996,10 @@ async fn reference_versus_surreal_equivalence() {
             &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
         )
         .expect("request hash");
+        // Issue #18: the manifest/hash mutation above invalidates the bound
+        // digests, so they are rebound before the reference commit.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
         let receipt = memory
             .apply_transaction(&ctx, transition.clone(), &[], &[])
             .unwrap_or_else(|error| panic!("reference commit {operation} failed: {error:?}"));
@@ -1353,10 +1375,7 @@ async fn precommit_crash_hook_stays_unknown_without_provider_effect() {
         .reconcile(ApiOperationId::new("op-994-fault-pre").expect("operation"))
         .await
         .expect("reconcile");
-    assert!(
-        absent.is_none(),
-        "crashed write left no provider effect"
-    );
+    assert!(absent.is_none(), "crashed write left no provider effect");
     // Unknown is never retried blindly: the same reserved inputs are refused
     // while the faulted attempt's ORS reservation stands.
     let (ctx_dup, transition_dup, rev_dup, ord_dup, seed_dup) =

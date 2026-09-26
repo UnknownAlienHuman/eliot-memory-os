@@ -16,7 +16,7 @@ use eliot_contracts::{
 use eliot_store_api::{
     CONTRACT_VERSION, CanonicalRequestView, EffectClass, EventProjectionRelationIntents,
     NamedOperationManifest, OperationId, OrderingScopeId, PreparedTransition, RequestMeta, ScopeId,
-    StateFence, StoreError, TransitionClass, canonical_request_hash,
+    StateFence, StoreError, TransitionClass, bind_issue18_digests, canonical_request_hash,
 };
 use eliot_store_memory::MemoryStore;
 use serde_json::{Value, json};
@@ -102,7 +102,12 @@ fn transition(
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "a".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this helper).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: manifest()?.digest,
+        mutation_plan_digest: String::new(),
         named_operations: vec![eliot_store_api::NamedMutationRequest {
             operation: eliot_store_api::NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
@@ -118,6 +123,9 @@ fn transition(
     let ctx = request_meta(fence)?;
     let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
     prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+    // Issue #18: the admission digest covers the canonical hash, so bind
+    // after the hash is final.
+    bind_issue18_digests(&mut prepared, Vec::new())?;
     Ok(prepared)
 }
 
@@ -133,6 +141,8 @@ fn transition_with_subject(
     let ctx = request_meta(fence)?;
     let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
     prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+    // Issue #18: parameters and hash changed post-construction, rebind.
+    bind_issue18_digests(&mut prepared, Vec::new())?;
     Ok(prepared)
 }
 

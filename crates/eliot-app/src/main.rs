@@ -7,6 +7,7 @@ mod cognitive_runner;
 mod commands;
 mod config;
 mod delegation_runtime;
+mod disposition;
 mod dogfood;
 mod host_runtime;
 mod mcp_stdio;
@@ -2040,6 +2041,22 @@ fn main() -> Result<()> {
                     Some(runtime_instance::DEFAULT_INSTANCE_NAME.to_owned()),
                 ),
             };
+            // Facade disposition guard (#18 W-Work8/W-Work9/W-Work10): the
+            // inventory is linked into the binary so it cannot drift from
+            // the shipped facade.
+            let _ = disposition::current_consumer_inventory();
+            // Literal false = this package must stay out of root
+            // default-members per Cargo.toml:216-223; flip to a build-time
+            // fact when available.
+            // Empty current-symbol list = no new owner symbols registered in
+            // this binary; adding an owner symbol here without extending the
+            // deny list fails review.
+            if let Err(err) = disposition::default_members_guard(false)
+                .and(disposition::assert_no_new_ownership(&[]))
+            {
+                eprintln!("facade disposition guard rejected startup: {err}");
+                std::process::exit(1);
+            }
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;

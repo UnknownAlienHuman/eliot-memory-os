@@ -884,7 +884,7 @@ fn mutation_transition_for(
             let command = payload
                 .command()
                 .map_err(LifecyclePersistError::from_store)?;
-            let transition = PreparedTransition {
+            let mut transition = PreparedTransition {
                 identity: input.identity.clone(),
                 state_fence: bindings.fence.clone(),
                 scope_id: ScopeId::new(payload.candidate.scope.as_str()).map_err(|_| {
@@ -898,7 +898,10 @@ fn mutation_transition_for(
                 transition_class: TransitionClass::Epistemic,
                 requested_effect_ceiling: TransitionClass::Epistemic.maximum_effect(),
                 admission_contract_set_digest: bindings.admission_digest.clone(),
+                semantic_source_revisions: Vec::new(),
+                admission_digest: String::new(),
                 operation_manifest_digest: bindings.manifest_digest.clone(),
+                mutation_plan_digest: String::new(),
                 named_operations: vec![command],
                 event_projection_relation_intents: EventProjectionRelationIntents {
                     event_ids: Vec::new(),
@@ -908,6 +911,11 @@ fn mutation_transition_for(
                 security: SecurityContext::default(),
                 required_proof_and_approval_refs: input.proof_refs.clone(),
             };
+            // Issue #18: the persist legs dispatch with no expected revision
+            // heads, so no source revisions are bound; the plan and admission
+            // digests still derive from the exact admitted transition.
+            eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+                .map_err(LifecyclePersistError::from_store)?;
             transition
                 .validate()
                 .map_err(LifecyclePersistError::from_store)?;
@@ -955,7 +963,7 @@ fn transition_for(
     bindings: &TransitionBindings,
     spec: TransitionSpec,
 ) -> Result<PreparedTransition, LifecyclePersistError> {
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: identity.clone(),
         state_fence: bindings.fence.clone(),
         scope_id: bindings.scope.clone(),
@@ -964,7 +972,10 @@ fn transition_for(
         transition_class: spec.class,
         requested_effect_ceiling: spec.ceiling,
         admission_contract_set_digest: bindings.admission_digest.clone(),
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: bindings.manifest_digest.clone(),
+        mutation_plan_digest: String::new(),
         named_operations: spec.commands,
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: spec.events,
@@ -974,6 +985,11 @@ fn transition_for(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: spec.proof_refs,
     };
+    // Issue #18: the persist legs dispatch with no expected revision heads,
+    // so no source revisions are bound; the plan and admission digests still
+    // derive from the exact admitted transition.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .map_err(LifecyclePersistError::from_store)?;
     transition
         .validate()
         .map_err(LifecyclePersistError::from_store)?;

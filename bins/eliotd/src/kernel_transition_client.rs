@@ -281,7 +281,7 @@ mod tests {
     fn transition(fence: &StateFence) -> PreparedTransition {
         let entries = generated_operation_manifests().expect("catalogue");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
-        PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-daemon-1").expect("operation id"),
                 idempotency_key: "idem-daemon-1".to_owned(),
@@ -294,7 +294,12 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
+            // Issue #18: the daemon test helper binds no semantic source
+            // revisions; digests are derived by `bind_issue18_digests`.
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: set_digest,
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -309,7 +314,10 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
+        transition
     }
 
     fn ordering_head(fence: &StateFence) -> OrderingHeadExpectation {
@@ -333,6 +341,10 @@ mod tests {
             &CanonicalRequestView::from_apply(&identity.request.metadata, &transition, &[], &heads),
         )
         .expect("admission hash");
+        // Issue #18: the staged plan binds no semantic source revisions; the
+        // admission digest is rebound over the final transported hash.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
         // Exact admitted terms pass with the initiating source preserved:
         // the adapter never rewrites it to the daemon transport peer.
         check_identity_binding(&identity, &transition, &[], &heads).expect("exact binding");
@@ -375,6 +387,8 @@ mod tests {
             &CanonicalRequestView::from_apply(&identity.request.metadata, &transition, &[], &heads),
         )
         .expect("admission hash");
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
         check_identity_binding(&identity, &transition, &[], &heads).expect("admitted plan");
         // Widened effect ceiling after staging is rejected.
         let mut widened = transition.clone();
@@ -412,6 +426,10 @@ mod tests {
                 &heads,
             ))
             .expect("recomputed hash");
+        // Issue #18: rebind over the recomputed hash so the refusal names the
+        // unsupported manifest (recovery), never a stale digest binding.
+        eliot_store_api::bind_issue18_digests(&mut unsupported, Vec::new())
+            .expect("fixture digests bind");
         let error = match check_identity_binding(&identity, &unsupported, &[], &heads) {
             Err(error) => error,
             Ok(()) => unreachable!("unsupported manifest must fail"),

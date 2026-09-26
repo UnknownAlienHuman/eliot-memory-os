@@ -1385,11 +1385,15 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             error_code: None,
             resubmission: eliot_store_api::Resubmission::None,
             committed_at: Some(format!("commit-sequence-{0:016}", 1)),
             envelope: None,
         };
+        eliot_store_api::bind_issue18_receipt(&mut receipt, &transition);
         assert_eq!(context.state_fence, transition.state_fence);
         assert_eq!(context.state_fence, receipt.state_fence);
         assert_eq!(receipt.operation_id, transition.identity.operation_id);
@@ -1443,6 +1447,9 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
                 .expect("manifest digest"),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1476,6 +1483,12 @@ mod tests {
         );
         transition.identity.canonical_request_hash =
             canonical_request_hash(&view).expect("apply digest computes");
+        // Issue #18: bind the exact expected revision heads sealed above.
+        eliot_store_api::bind_issue18_digests(
+            &mut transition,
+            eliot_store_api::render_semantic_source_revisions(&revision_heads),
+        )
+        .expect("fixture digests bind");
         transition.validate().expect("apply transition");
         (context, transition, revision_heads, ordering_heads)
     }
@@ -1496,11 +1509,15 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
             envelope: None,
         };
+        eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
         // The wire requires the store-owned reconciliation envelope, issued
         // exactly as an adapter would after deriving the receipt.
         receipt.envelope = Some(
@@ -2058,7 +2075,7 @@ mod tests {
 
     fn reserved_request(fence: &StateFence) -> ReservedWriteRequest {
         let context = context_for(fence, "reserved-request-1", "source-991-k");
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-991-k1").expect("operation id"),
                 idempotency_key: "idem-991-k1".to_owned(),
@@ -2073,6 +2090,9 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-991-k1")
                 .expect("manifest digest"),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!("observation-991-k1"))]),
@@ -2085,6 +2105,10 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        // Issue #18: the expected heads are attached to the request below,
+        // so this transition binds no source revisions.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
         let admission = WriteAdmissionProjection::bind(
             &transition,
             WriteAdmissionParams {
@@ -2154,11 +2178,15 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
             envelope: None,
         };
+        eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
         receipt.envelope = Some(
             eliot_store_api::issue_store_receipt_envelope(
                 &request.context,

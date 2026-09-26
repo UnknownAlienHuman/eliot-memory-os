@@ -1021,7 +1021,7 @@ fn capture_plans_persist_full_recoverable_evidence_without_authority() {
         test_epoch(1),
         eliot_contracts::ResourceGeneration::genesis(),
     );
-    let transition = eliot_store_api::PreparedTransition {
+    let mut transition = eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-evidence-write").expect("operation"),
             idempotency_key: "idem-evidence-write".to_owned(),
@@ -1034,7 +1034,12 @@ fn capture_plans_persist_full_recoverable_evidence_without_authority() {
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this fixture).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!("evidence-alpha"))]),
@@ -1047,6 +1052,9 @@ fn capture_plans_persist_full_recoverable_evidence_without_authority() {
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    // Issue #18: bind the derived digests (empty heads in this fixture).
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     // Legacy path (no authority): exactly one recoverable record with the
     // full parameters and canonical bytes that decode back to them.
     let legacy = plan_apply(&transition, &[], &[], 1, 1).expect("legacy plan applies");
@@ -1105,7 +1113,7 @@ fn non_capture_transitions_persist_no_evidence() {
         test_epoch(1),
         eliot_contracts::ResourceGeneration::genesis(),
     );
-    let transition = eliot_store_api::PreparedTransition {
+    let mut transition = eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-audit-write").expect("operation"),
             idempotency_key: "idem-audit-write".to_owned(),
@@ -1118,7 +1126,12 @@ fn non_capture_transitions_persist_no_evidence() {
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this fixture).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::AppendAuditEvent,
             parameters: BTreeMap::from([
@@ -1138,6 +1151,9 @@ fn non_capture_transitions_persist_no_evidence() {
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    // Issue #18: bind the derived digests (empty heads in this fixture).
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     let plan = plan_apply(&transition, &[], &[], 1, 1).expect("audit plan applies");
     assert!(
         plan.evidence_records.is_empty(),

@@ -12,11 +12,11 @@ use std::collections::BTreeMap;
 use eliot_contracts::{EpochId, EpochLineageId, OperationId, ResourceGeneration};
 use eliot_store_api::{
     CommitId, ERASURE_STATE_IRREVERSIBLE_CONSTRAINT, EffectClass, ErasureAdmissionRequest,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest, OperationIdentity,
-    OperationManifestDigest, OrderingScopeId, Resubmission, ScopeId, SecurityContext, StoreError,
-    TransitionClass, WriteReceipt, WriteReceiptStatus, admit_erasure_transition,
-    decode_erasure_surfaces, encode_erasure_surfaces, generated_operation_manifests,
-    operation_manifest_set_digest,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OperationIdentity, OperationManifestDigest, OrderingScopeId, Resubmission, ScopeId,
+    SecurityContext, StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    admit_erasure_transition, decode_erasure_surfaces, encode_erasure_surfaces,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -218,6 +218,10 @@ fn restore_probe_receipt(operation: &str, class: TransitionClass) -> WriteReceip
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: OperationManifestDigest::new("e".repeat(64)).unwrap(),
+        // Issue #18: restore-probe fixture carries fixture digests.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: "f".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{operation}")),

@@ -253,6 +253,32 @@ pub enum DaemonError {
     Lifecycle(String),
 }
 
+/// Exact mismatch between presented revision heads/fence and the daemon's
+/// cached view (issue #18 W-Work6 + A5).
+///
+/// Caches/read models are revision/fence keyed and rebuildable. They cannot
+/// make state fresh, preserve authority after generation loss, or act as
+/// unreceipted writes: any mismatch fails closed with one of these variants,
+/// never with invented freshness.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum RevisionFenceMismatch {
+    /// The cache was never built; an explicit refresh must run first. A
+    /// cache that was never built cannot authorize.
+    #[error("daemon revision/fence cache was never built; explicit refresh required")]
+    NeverBuilt,
+    /// The cached view is stale or degraded; drop this composition and
+    /// re-run authenticated connect+start. A stale/degraded cache can never
+    /// satisfy a freshness/authority check.
+    #[error("daemon cached view is stale/degraded; reconnect and refresh required")]
+    StaleView,
+    /// The presented revision heads do not exactly match the cached view.
+    #[error("revision heads do not exactly match the daemon cached view")]
+    HeadMismatch,
+    /// The presented state fence does not exactly match the cached view.
+    #[error("state fence does not exactly match the daemon cached view")]
+    FenceMismatch,
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -308,6 +334,14 @@ pub struct DaemonComposition {
     /// already durable. The dependent view is stale/pending until the caller
     /// drops this composition and re-runs authenticated connect+start.
     view_stale: bool,
+    /// Revision/fence-keyed cache of the daemon's dependent view (issue #18
+    /// W-Work6 + A5).
+    ///
+    /// Rebuildable only: refreshed from the live Kernel snapshot on the
+    /// post-commit path, never a source of freshness or authority. `None`
+    /// until the first successful refresh, so a cache that was never built
+    /// cannot authorize (see [`DaemonComposition::require_revision_fence_match`]).
+    cached_revision_fence: Option<(Vec<String>, StateFence)>,
     /// Owner receipts for experience-bank/feedback records this composition
     /// already committed, keyed by deterministic idempotency key (P1-1,
     /// issue #1942).
@@ -404,6 +438,7 @@ impl DaemonComposition {
             state_root: config.state_root,
             started: true,
             view_stale: false,
+            cached_revision_fence: None,
             committed_experience: BTreeMap::new(),
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
@@ -413,6 +448,34 @@ impl DaemonComposition {
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
         })
+    }
+
+    /// Requires the presented revision heads and state fence to exactly
+    /// match the daemon's cached view (issue #18 W-Work6 + A5).
+    ///
+    /// The cache is revision/fence keyed and rebuildable only: `None` (never
+    /// built) or a stale/degraded view always fails, and any head or fence
+    /// drift fails. Success confirms the presented values equal the cached
+    /// view; it never makes state fresh, never preserves authority after
+    /// generation loss, and never acts as an unreceipted write.
+    pub fn require_revision_fence_match(
+        &self,
+        source_revision_heads: &[String],
+        state_fence: &StateFence,
+    ) -> Result<(), RevisionFenceMismatch> {
+        if self.view_stale {
+            return Err(RevisionFenceMismatch::StaleView);
+        }
+        let Some((cached_heads, cached_fence)) = &self.cached_revision_fence else {
+            return Err(RevisionFenceMismatch::NeverBuilt);
+        };
+        if cached_heads.as_slice() != source_revision_heads {
+            return Err(RevisionFenceMismatch::HeadMismatch);
+        }
+        if cached_fence != state_fence {
+            return Err(RevisionFenceMismatch::FenceMismatch);
+        }
+        Ok(())
     }
 
     /// Commits one Canonical-admitted transition under the exact admitted
@@ -445,6 +508,12 @@ impl DaemonComposition {
         // handoff (prepared envelope submitted) and the commitment (validated
         // owner receipt) stay distinguishable in the sink.
         let _span = tracing::info_span!("eliotd.canonical_commit").entered();
+        let presented_heads: Vec<String> = envelope
+            .expected_revision_heads
+            .iter()
+            .map(|head| format!("{}@{}", head.key, head.expected_revision))
+            .collect();
+        let presented_fence = envelope.request.state_fence.clone();
         let receipt = self
             .governor
             .commit_canonical(identity, envelope)
@@ -452,6 +521,22 @@ impl DaemonComposition {
             .map_err(DaemonError::Composition)?;
         if self.governor.refresh_from_kernel().is_err() {
             self.view_stale = true;
+        } else {
+            // Rebuild the revision/fence-keyed cache from the fresh view:
+            // heads stay exactly as presented, the fence is observed live,
+            // never invented. The gate below then proves the presented write
+            // still matches the rebuilt view; on mismatch the refresh fails
+            // (stale) rather than proceeding as if fresh.
+            self.cached_revision_fence = Some((
+                presented_heads.clone(),
+                self.governor.kernel_snapshot().state_fence(),
+            ));
+            if self
+                .require_revision_fence_match(&presented_heads, &presented_fence)
+                .is_err()
+            {
+                self.view_stale = true;
+            }
         }
         Ok(receipt)
     }

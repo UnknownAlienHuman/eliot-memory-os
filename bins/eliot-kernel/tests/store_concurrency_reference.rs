@@ -127,7 +127,7 @@ fn ctx_for(operation: &str, fence: &StateFence) -> RequestMeta {
 fn admitting_manifest() -> NamedOperationManifest {
     let entries = generated_operation_manifests().expect("generated catalogue");
     assert!(!entries.is_empty(), "catalogue must be non-empty");
-    let probe = PreparedTransition {
+    let mut probe = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-994-probe").expect("operation"),
             idempotency_key: "idem-994-probe".to_owned(),
@@ -140,7 +140,12 @@ fn admitting_manifest() -> NamedOperationManifest {
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: the probe binds no semantic source revisions; digests
+        // are derived by `bind_issue18_digests` and rebound per candidate.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: entries[0].digest.clone(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), serde_json::json!("probe"))]),
@@ -153,11 +158,16 @@ fn admitting_manifest() -> NamedOperationManifest {
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut probe, Vec::new()).expect("fixture digests bind");
     entries
         .into_iter()
         .find(|entry| {
             let mut candidate = probe.clone();
             candidate.operation_manifest_digest = entry.digest.clone();
+            // Issue #18: the manifest mutation above invalidates the bound
+            // digests, so they are rebound before the manifest check.
+            eliot_store_api::bind_issue18_digests(&mut candidate, Vec::new())
+                .expect("fixture digests bind");
             candidate.validate_against_manifest(entry).is_ok()
         })
         .expect("one generated entry must admit CaptureObservation")
@@ -200,7 +210,12 @@ fn build_transition(
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: the admission binds the exact transported revision heads;
+        // digests are derived by `bind_issue18_digests` below.
+        semantic_source_revisions: eliot_store_api::render_semantic_source_revisions(revisions),
+        admission_digest: String::new(),
         operation_manifest_digest: manifest.digest.clone(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), serde_json::json!(subject))]),
@@ -217,6 +232,11 @@ fn build_transition(
         &CanonicalRequestView::from_apply(ctx, &transition, revisions, orderings),
     )
     .expect("request hash");
+    eliot_store_api::bind_issue18_digests(
+        &mut transition,
+        eliot_store_api::render_semantic_source_revisions(revisions),
+    )
+    .expect("fixture digests bind");
     transition
 }
 

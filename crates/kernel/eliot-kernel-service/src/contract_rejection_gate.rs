@@ -387,7 +387,7 @@ mod tests {
     }
 
     fn transition(op: &str, idem: &str, hash: &str) -> PreparedTransition {
-        PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new(op).expect("op"),
                 idempotency_key: idem.to_owned(),
@@ -400,8 +400,11 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "c".repeat(64),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-gate")
                 .expect("manifest"),
+            mutation_plan_digest: String::new(),
             named_operations: Vec::new(),
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: Vec::new(),
@@ -410,7 +413,11 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        // Issue #18: the gate recheck binds no source revisions.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
+        transition
     }
 
     #[test]

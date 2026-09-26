@@ -68,7 +68,10 @@
       "purge_entry": null,
       "selection_integrity": null
     },
-    "required_proof_and_approval_refs": []
+    "required_proof_and_approval_refs": [],
+    "semantic_source_revisions": [],
+    "mutation_plan_digest": "cd3207fea3533719d0445bc2cd73c9501dea5bb0a1cdd6195dbf13260f744ab6",
+    "admission_digest": "f9d5ead627fff7346ac32ac4f5cdca5b3f42277dbbda44a9fab7255177e8a22c"
   },
   "admission": {
     "contract_version": 1,
@@ -77,8 +80,8 @@
     "operation_id": "op-991-1",
     "idempotency_key": "idem-991-1",
     "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "prepared_transition_digest": "8a6a2ab9b3b0b0552eb833ea42fcc13c332335c05e09e30b2692b33517e11c04",
-    "reservation_token_digest": "751493c7a1ca64de108306db7363b42986149a98fa26b134b5cfd11480d12f02",
+    "prepared_transition_digest": "995950b13829980d1f6cd92973392e2999c2726338227e816f61aa9601b6ac31",
+    "reservation_token_digest": "76b94d2630ff26fafb2f31de3d4f1aac5ac4119c3ef331d4038becb4adae59dd",
     "scopes": [
       {
         "scope": "scope-991-1",

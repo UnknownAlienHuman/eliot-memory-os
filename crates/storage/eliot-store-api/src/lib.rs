@@ -118,7 +118,8 @@ pub use user_automation_state::{
 };
 
 pub use request_hash::{
-    CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, canonical_request_bytes, canonical_request_hash,
+    CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, admission_digest_hex, canonical_request_bytes,
+    canonical_request_hash, mutation_plan_digest_hex, verify_admission_digest,
     verify_canonical_request_hash,
 };
 
@@ -1488,6 +1489,111 @@ impl OperationIdentity {
     }
 }
 
+/// Canonical snake_case name of a transition class as bound inside the
+/// admission-decision digest (issue #18).
+///
+/// Spelled explicitly rather than through serde so the digest input cannot
+/// shift with serialization attributes. The spellings match the
+/// `snake_case` serde encoding of [`TransitionClass`].
+fn transition_class_name(class: TransitionClass) -> &'static str {
+    match class {
+        TransitionClass::CaptureCandidate => "capture_candidate",
+        TransitionClass::Epistemic => "epistemic",
+        TransitionClass::TaskControl => "task_control",
+        TransitionClass::LifecyclePolicy => "lifecycle_policy",
+        TransitionClass::RecoverySchema => "recovery_schema",
+        TransitionClass::Erasure => "erasure",
+        TransitionClass::NotificationState => "notification_state",
+        TransitionClass::ReactiveState => "reactive_state",
+        TransitionClass::UserAutomation => "user_automation",
+    }
+}
+
+/// Canonical bytes of the ordered named-operation plan (issue #18).
+///
+/// Execution order is significant and is preserved verbatim: plan commands
+/// resolve in order against the catalogue and are never reordered.
+fn mutation_plan_bytes(operations: &Vec<NamedMutationRequest>) -> Result<Vec<u8>, StoreError> {
+    canonical_json_bytes(operations).map_err(|error| StoreError::Serialization(error.to_string()))
+}
+
+/// Deterministic digest over the exact ordered operation plan (issue #18).
+///
+/// Distinct from `operation_manifest_digest`, which digests the catalogue
+/// manifest entry authorizing the plan.
+fn expected_mutation_plan_digest(
+    operations: &Vec<NamedMutationRequest>,
+) -> Result<String, StoreError> {
+    Ok(mutation_plan_digest_hex(&mutation_plan_bytes(operations)?))
+}
+
+/// Canonical bytes of the state fence bound into the admission digest.
+fn admission_fence_bytes(fence: &StateFence) -> Result<Vec<u8>, StoreError> {
+    canonical_json_bytes(fence).map_err(|error| StoreError::Serialization(error.to_string()))
+}
+
+/// Deterministic admission-decision digest for a prepared transition
+/// (issue #18).
+///
+/// Distinct from `admission_contract_set_digest`, which is the contract-set
+/// input to admission: this digest binds the admission decision itself over
+/// the canonical request hash, the exact bound semantic source revisions,
+/// the mutation plan digest, the transition class, the manifest digest and
+/// the fence bytes (see [`admission_digest_hex`] for the byte layout).
+/// The stored `mutation_plan_digest` is consumed here; callers must verify
+/// it against [`expected_mutation_plan_digest`] first.
+fn expected_admission_digest(transition: &PreparedTransition) -> Result<String, StoreError> {
+    Ok(admission_digest_hex(
+        &transition.identity.canonical_request_hash,
+        &transition.semantic_source_revisions,
+        &transition.mutation_plan_digest,
+        transition_class_name(transition.transition_class),
+        transition.operation_manifest_digest.as_str(),
+        &admission_fence_bytes(&transition.state_fence)?,
+    ))
+}
+
+fn bound_transition_digest(value: &str) -> String {
+    value.chars().take(MAX_DIGEST_DETAIL_CHARS).collect()
+}
+
+/// Renders exact semantic source revision bindings as stable `key@revision`
+/// strings, sorted for determinism (issue #18).
+pub fn render_semantic_source_revisions(heads: &[RevisionHeadExpectation]) -> Vec<String> {
+    let mut rendered: Vec<String> = heads
+        .iter()
+        .map(|head| format!("{}@{}", head.key, head.expected_revision))
+        .collect();
+    rendered.sort();
+    rendered
+}
+
+/// Binds the three issue-#18 admission digests on a prepared transition.
+///
+/// Records the given semantic source revisions, derives the mutation-plan
+/// digest from the exact ordered `named_operations`, then derives the
+/// admission-decision digest over the canonical request hash, revisions,
+/// plan digest, class, manifest digest and fence. Fails when canonical
+/// encoding fails; the transition is left partially bound on error.
+pub fn bind_issue18_digests(
+    transition: &mut PreparedTransition,
+    semantic_source_revisions: Vec<String>,
+) -> Result<(), StoreError> {
+    transition.semantic_source_revisions = semantic_source_revisions;
+    transition.mutation_plan_digest = expected_mutation_plan_digest(&transition.named_operations)?;
+    transition.admission_digest = expected_admission_digest(transition)?;
+    Ok(())
+}
+
+/// Mirrors a transition's three issue-#18 bindings onto its `WriteReceipt`
+/// so admission digest, semantic revisions and MutationPlan digest stay
+/// identical across daemon, Kernel, store commit and receipt.
+pub fn bind_issue18_receipt(receipt: &mut WriteReceipt, transition: &PreparedTransition) {
+    receipt.semantic_source_revisions = transition.semantic_source_revisions.clone();
+    receipt.admission_digest = transition.admission_digest.clone();
+    receipt.mutation_plan_digest = transition.mutation_plan_digest.clone();
+}
+
 /// Immutable plan emitted by semantic admission and mechanically checked by
 /// Kernel/store.  The store never constructs this from an untyped request.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1501,7 +1607,22 @@ pub struct PreparedTransition {
     pub transition_class: TransitionClass,
     pub requested_effect_ceiling: EffectClass,
     pub admission_contract_set_digest: String,
+    /// Exact semantic source revision heads bound at admission (issue #18).
+    ///
+    /// Revision expectations travel separately in
+    /// [`CanonicalRequestView::expected_revision_heads`]; this field records
+    /// the source revision heads the admission decision was bound against.
+    pub semantic_source_revisions: Vec<String>,
+    /// Admission-decision digest (issue #18), distinct from
+    /// `admission_contract_set_digest` (the contract-set input). Recomputed
+    /// by [`expected_admission_digest`].
+    pub admission_digest: String,
     pub operation_manifest_digest: OperationManifestDigest,
+    /// Deterministic digest over the exact ordered `named_operations` plan
+    /// (issue #18), distinct from `operation_manifest_digest` which digests
+    /// the authorizing catalogue manifest. Recomputed by
+    /// [`expected_mutation_plan_digest`].
+    pub mutation_plan_digest: String,
     pub named_operations: Vec<NamedMutationRequest>,
     pub event_projection_relation_intents: EventProjectionRelationIntents,
     pub security: SecurityContext,
@@ -1572,6 +1693,30 @@ impl PreparedTransition {
                 return Err(StoreError::TransitionClassExceeded);
             }
         }
+        // Issue #18: the stored plan and admission digests must reproduce
+        // exactly. The plan digest is checked first because the admission
+        // digest consumes the stored plan digest as an input.
+        for revision in &self.semantic_source_revisions {
+            validate_text(revision, "semantic_source_revisions")?;
+        }
+        validate_digest(&self.mutation_plan_digest, "mutation_plan_digest")?;
+        let observed_plan = expected_mutation_plan_digest(&self.named_operations)?;
+        if observed_plan != self.mutation_plan_digest {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: bound_transition_digest(&self.mutation_plan_digest),
+                observed: bound_transition_digest(&observed_plan),
+            });
+        }
+        validate_digest(&self.admission_digest, "admission_digest")?;
+        verify_admission_digest(
+            &self.admission_digest,
+            &self.identity.canonical_request_hash,
+            &self.semantic_source_revisions,
+            &self.mutation_plan_digest,
+            transition_class_name(self.transition_class),
+            self.operation_manifest_digest.as_str(),
+            &admission_fence_bytes(&self.state_fence)?,
+        )?;
         self.security.validate(&self.state_fence)
     }
 
@@ -1636,6 +1781,19 @@ pub fn genesis_transition(
 ) -> Result<PreparedTransition, StoreError> {
     request.validate_for_context(context)?;
     let manifest = genesis_manifest()?;
+    // Genesis binds no semantic source revisions and an empty ordered plan;
+    // both digests are derived, never defaulted.
+    let named_operations: Vec<NamedMutationRequest> = Vec::new();
+    let semantic_source_revisions: Vec<String> = Vec::new();
+    let mutation_plan_digest = expected_mutation_plan_digest(&named_operations)?;
+    let admission_digest = admission_digest_hex(
+        &request.canonical_request_hash,
+        &semantic_source_revisions,
+        &mutation_plan_digest,
+        transition_class_name(TransitionClass::RecoverySchema),
+        manifest.digest.as_str(),
+        &admission_fence_bytes(&request.state_fence)?,
+    );
     let transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: request.operation_id.clone(),
@@ -1649,8 +1807,11 @@ pub fn genesis_transition(
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: manifest.digest.as_str().to_owned(),
+        semantic_source_revisions,
+        admission_digest,
         operation_manifest_digest: manifest.digest.clone(),
-        named_operations: Vec::new(),
+        mutation_plan_digest,
+        named_operations,
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: Vec::new(),
             projection_kinds: Vec::new(),
@@ -1862,6 +2023,15 @@ pub struct WriteReceipt {
     pub projection_refs: Vec<ProjectionPublicationId>,
     pub outbox_refs: Vec<OutboxId>,
     pub operation_manifest_digest: OperationManifestDigest,
+    /// Exact semantic source revision heads bound at admission (issue #18).
+    /// Mirrors [`PreparedTransition::semantic_source_revisions`].
+    pub semantic_source_revisions: Vec<String>,
+    /// Admission-decision digest (issue #18). Mirrors
+    /// [`PreparedTransition::admission_digest`].
+    pub admission_digest: String,
+    /// Ordered operation-plan digest (issue #18). Mirrors
+    /// [`PreparedTransition::mutation_plan_digest`].
+    pub mutation_plan_digest: String,
     pub error_code: Option<ErrorCode>,
     pub resubmission: Resubmission,
     pub committed_at: Option<String>,
@@ -1873,6 +2043,11 @@ impl WriteReceipt {
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_text(&self.idempotency_key, "idempotency_key")?;
         validate_digest(&self.canonical_request_hash, "canonical_request_hash")?;
+        for revision in &self.semantic_source_revisions {
+            validate_text(revision, "semantic_source_revisions")?;
+        }
+        validate_digest(&self.admission_digest, "admission_digest")?;
+        validate_digest(&self.mutation_plan_digest, "mutation_plan_digest")?;
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
@@ -2116,6 +2291,9 @@ fn validate_receipt_inputs(
         && receipt.canonical_request_hash == transition.identity.canonical_request_hash
         && receipt.transition_class == transition.transition_class
         && receipt.operation_manifest_digest == transition.operation_manifest_digest
+        && receipt.semantic_source_revisions == transition.semantic_source_revisions
+        && receipt.admission_digest == transition.admission_digest
+        && receipt.mutation_plan_digest == transition.mutation_plan_digest
         && receipt.status == WriteReceiptStatus::Committed
         && receipt.commit_id.is_some()
         && receipt.committed_at.as_deref() == Some(expected_committed_at.as_str())
@@ -2833,7 +3011,10 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: "a".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            mutation_plan_digest: "b".repeat(64),
             named_operations: vec![
                 NamedMutationRequest {
                     operation: NamedMutationOperation::CaptureObservation,
@@ -3095,6 +3276,9 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest,
+            semantic_source_revisions: transition.semantic_source_revisions.clone(),
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
@@ -3344,6 +3528,9 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest")?,
+            semantic_source_revisions: Vec::new(),
+            admission_digest: "a".repeat(64),
+            mutation_plan_digest: "b".repeat(64),
             error_code: Some(ErrorCode::Conflict),
             resubmission: Resubmission::None,
             committed_at: None,

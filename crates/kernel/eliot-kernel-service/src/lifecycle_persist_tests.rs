@@ -401,7 +401,7 @@ impl FakeStore {
             },
             &transition.state_fence,
         );
-        WriteReceipt {
+        let mut receipt = WriteReceipt {
             operation_id: transition.identity.operation_id.clone(),
             idempotency_key: transition.identity.idempotency_key.clone(),
             canonical_request_hash: transition.identity.canonical_request_hash.clone(),
@@ -419,11 +419,16 @@ impl FakeStore {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: manifest,
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
             envelope: Some(envelope),
-        }
+        };
+        eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
+        receipt
     }
 }
 
@@ -585,6 +590,10 @@ fn committed_receipt(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: manifest,
+        // Issue #18: standalone fixture with no transition in scope.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: "f".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),

@@ -167,7 +167,7 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
     let ordering = eliot_store_api::OrderingScopeId::new("scope-one")
         .map_err(|error| format!("ordering: {error}"))?;
 
-    let empty_revision = eliot_store_api::PreparedTransition {
+    let mut empty_revision = eliot_store_api::PreparedTransition {
         identity: eliot_store_api::OperationIdentity {
             operation_id,
             idempotency_key: "retry-1".to_owned(),
@@ -180,7 +180,12 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
         transition_class: eliot_store_api::TransitionClass::Epistemic,
         requested_effect_ceiling: eliot_store_api::EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: the admitted revision binds no semantic source revisions
+        // here; digests are derived by `bind_issue18_digests` below.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: set_digest.clone(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![eliot_store_api::NamedMutationRequest {
             operation: NamedMutationOperation::ApplyEpistemicRevision,
             parameters: BTreeMap::new(),
@@ -193,6 +198,8 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
         security: eliot_store_api::SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut empty_revision, Vec::new())
+        .map_err(|error| format!("digests: {error}"))?;
     assert!(
         matches!(
             empty_revision.validate_against_catalogue(&entries),
@@ -210,6 +217,10 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
         operation: NamedMutationOperation::RecordAuthorityRevocation,
         parameters: BTreeMap::new(),
     }];
+    // Issue #18: the class/plan mutation above invalidates the bound digests,
+    // so they are rebound before the catalogue check.
+    eliot_store_api::bind_issue18_digests(&mut revocation, Vec::new())
+        .map_err(|error| format!("digests: {error}"))?;
     assert_eq!(
         revocation.validate_against_catalogue(&entries),
         Err(StoreError::UnknownOperation),

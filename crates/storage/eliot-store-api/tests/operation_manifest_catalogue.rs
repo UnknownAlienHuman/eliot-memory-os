@@ -389,7 +389,7 @@ fn entry_binding_change_moves_set_digest() {
 fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::PreparedTransition {
     let mut parameters = BTreeMap::new();
     parameters.insert("subject".to_owned(), json!("observation-1"));
-    eliot_store_api::PreparedTransition {
+    let mut plan = eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("operation-1").unwrap(),
             idempotency_key: "retry-1".to_owned(),
@@ -402,7 +402,11 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: catalogue-profile fixture binds no source revisions.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: set_digest.clone(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters,
@@ -414,7 +418,9 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut plan, Vec::new()).expect("fixture digests bind");
+    plan
 }
 
 fn audit_params() -> BTreeMap<String, Value> {
@@ -434,6 +440,8 @@ fn audit_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepared
         operation: NamedMutationOperation::AppendAuditEvent,
         parameters: audit_params(),
     }];
+    // Issue #18: re-bind after replacing the plan operations.
+    eliot_store_api::bind_issue18_digests(&mut plan, Vec::new()).expect("fixture digests bind");
     plan
 }
 
@@ -456,6 +464,8 @@ fn lifecycle_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prep
         operation: NamedMutationOperation::ApplyLifecyclePolicy,
         parameters: lifecycle_params(),
     }];
+    // Issue #18: re-bind after replacing the plan operations.
+    eliot_store_api::bind_issue18_digests(&mut plan, Vec::new()).expect("fixture digests bind");
     plan
 }
 
@@ -488,6 +498,8 @@ fn recovery_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         operation: NamedMutationOperation::ReconcileRecovery,
         parameters: recovery_params(),
     }];
+    // Issue #18: re-bind after replacing the plan operations.
+    eliot_store_api::bind_issue18_digests(&mut plan, Vec::new()).expect("fixture digests bind");
     plan
 }
 
@@ -510,6 +522,8 @@ fn task_state_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Pre
         operation: NamedMutationOperation::UpdateTaskState,
         parameters: task_state_params(),
     }];
+    // Issue #18: re-bind after replacing the plan operations.
+    eliot_store_api::bind_issue18_digests(&mut plan, Vec::new()).expect("fixture digests bind");
     plan
 }
 
@@ -661,9 +675,7 @@ fn update_task_state_passes_whole_path() {
     // The proposing shape omits the predecessor `from` and still passes:
     // the optional field is absent, never defaulted.
     let mut proposing = task_state_plan(&set_digest);
-    proposing.named_operations[0]
-        .parameters
-        .remove("from");
+    proposing.named_operations[0].parameters.remove("from");
     assert!(proposing.validate_against_catalogue(&entries).is_ok());
 
     // A missing required task-control field fails closed.

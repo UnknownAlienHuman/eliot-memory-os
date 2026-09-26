@@ -423,6 +423,9 @@ async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: 
         requested_effect_ceiling: eliot_receipts::EffectClass::ReversibleMutation,
         admission_contract_set_digest: "c".repeat(64),
         operation_manifest_digest: manifest_digest,
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::ApplyUserAutomationState,
             parameters,
@@ -438,6 +441,10 @@ async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: 
     let view = CanonicalRequestView::from_apply(&context, &transition, &[], &[]);
     transition.identity.canonical_request_hash =
         canonical_request_hash(&view).expect("hash computes");
+    // Issue #18: re-bind after the hash seal above, which the admission
+    // digest covers; the apply below carries no expected revision heads.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     let receipt = eliot_store_api::CanonicalStoreClient::apply_prepared(
         store,
         &context,

@@ -188,6 +188,91 @@ pub fn verify_canonical_request_hash(
     }
 }
 
+/// Computes the MutationPlan digest for issue #18 (lowercase SHA-256 hex).
+///
+/// Callers pass the canonical encoding of the ordered named-operation plan
+/// (execution order significant; never reordered here). The digest is
+/// `SHA-256(canonical_ops_bytes)` rendered as lowercase hex.
+pub fn mutation_plan_digest_hex(canonical_ops_bytes: &[u8]) -> String {
+    sha256_hex(canonical_ops_bytes)
+}
+
+/// Computes the admission digest for issue #18 (lowercase SHA-256 hex).
+///
+/// Byte layout (exact, in order):
+/// ```text
+/// canonical_request_hash (UTF-8)
+/// "\n"
+/// sorted semantic_source_revisions joined with "\n" (UTF-8; empty when none)
+/// "\n"
+/// mutation_plan_digest (UTF-8 hex)
+/// "\n"
+/// transition_class (UTF-8)
+/// "\n"
+/// operation_manifest_digest (UTF-8 hex)
+/// "\n"
+/// state_fence_bytes (raw)
+/// ```
+/// Revisions are sorted lexicographically before joining so producer emission
+/// order cannot fork the digest. No trailing newline is appended after the
+/// fence bytes.
+pub fn admission_digest_hex(
+    canonical_request_hash: &str,
+    semantic_source_revisions: &[String],
+    mutation_plan_digest: &str,
+    transition_class: &str,
+    operation_manifest_digest: &str,
+    state_fence_bytes: &[u8],
+) -> String {
+    let mut sorted_revisions = semantic_source_revisions.to_vec();
+    sorted_revisions.sort();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(canonical_request_hash.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(sorted_revisions.join("\n").as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(mutation_plan_digest.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(transition_class.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(operation_manifest_digest.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(state_fence_bytes);
+    sha256_hex(&bytes)
+}
+
+/// Recomputes the admission digest and rejects divergence with the typed mismatch error.
+///
+/// Both digests in the error are secret-free (hex digests only) and bounded
+/// to [`MAX_DIGEST_DETAIL_CHARS`] characters each.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_admission_digest(
+    expected_hex: &str,
+    canonical_request_hash: &str,
+    semantic_source_revisions: &[String],
+    mutation_plan_digest: &str,
+    transition_class: &str,
+    operation_manifest_digest: &str,
+    state_fence_bytes: &[u8],
+) -> Result<(), StoreError> {
+    let observed = admission_digest_hex(
+        canonical_request_hash,
+        semantic_source_revisions,
+        mutation_plan_digest,
+        transition_class,
+        operation_manifest_digest,
+        state_fence_bytes,
+    );
+    if observed == expected_hex {
+        Ok(())
+    } else {
+        Err(StoreError::TransitionDigestMismatch {
+            expected: bound_digest(expected_hex),
+            observed: bound_digest(&observed),
+        })
+    }
+}
+
 fn bound_digest(value: &str) -> String {
     value.chars().take(MAX_DIGEST_DETAIL_CHARS).collect()
 }
@@ -433,7 +518,7 @@ mod tests {
     #[test]
     fn from_apply_rebinds_context_and_expected_heads() {
         let view = golden_view();
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: view.operation_id.clone(),
                 idempotency_key: view.idempotency_key.clone(),
@@ -446,12 +531,17 @@ mod tests {
             transition_class: view.transition_class,
             requested_effect_ceiling: view.requested_effect_ceiling,
             admission_contract_set_digest: view.admission_contract_set_digest.clone(),
+            // Issue #18: hash-fixture transition binds no source revisions.
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: view.operation_manifest_digest.clone(),
+            mutation_plan_digest: String::new(),
             named_operations: view.semantic_commands.clone(),
             event_projection_relation_intents: view.event_projection_relation_intents.clone(),
             security: view.security.clone(),
             required_proof_and_approval_refs: view.required_proof_and_approval_refs.clone(),
         };
+        crate::bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
         let rebuilt = CanonicalRequestView::from_apply(
             &view.request,
             &transition,

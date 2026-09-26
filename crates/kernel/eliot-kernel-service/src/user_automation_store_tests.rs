@@ -183,11 +183,15 @@ impl FakeStore {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some(format!("commit-sequence-{sequence:016}")),
             envelope: None,
         };
+        eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
         receipt.envelope = Some(
             eliot_store_api::issue_store_receipt_envelope(ctx, transition, &receipt, sequence)
                 .expect("envelope issues"),

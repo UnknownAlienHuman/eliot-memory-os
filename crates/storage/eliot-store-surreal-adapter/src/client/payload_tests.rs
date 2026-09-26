@@ -14,8 +14,9 @@ use eliot_store_api::{
     ExactJsonBytes, NamedMutationOperation, NamedMutationRequest, NamedReadOperation,
     NamedReadRequest, OperationId, OperationIdentity, OrderingScopeId, PayloadSource,
     PreparedTransition, ReadConsistency, RequestMeta, RevisionKey, ScopeId, SecurityContext,
-    StateFence, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_request_hash,
-    generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
+    StateFence, TransitionClass, WriteReceipt, WriteReceiptStatus, bind_issue18_digests,
+    canonical_request_hash, generated_operation_manifests, operation_manifest_set_digest,
+    sha256_hex,
 };
 use serde_json::Map;
 
@@ -244,10 +245,15 @@ fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransiti
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "a".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this helper).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: operation_manifest_set_digest(
             &generated_operation_manifests().expect("catalogue"),
         )
         .expect("manifest digest"),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: authority.decode_object_parameters().expect("parameters"),
@@ -264,6 +270,9 @@ fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransiti
         &CanonicalRequestView::from_apply(ctx, &transition, &[], &[]),
     )
     .expect("request hash");
+    // Issue #18: the admission digest covers the canonical hash, so bind
+    // after the hash is final.
+    bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
     transition
 }
 

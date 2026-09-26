@@ -15,8 +15,9 @@ use eliot_store_api::{
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
     RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, canonical_request_hash, issue_store_receipt_envelope, sha256_hex,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    bind_issue18_receipt, canonical_json_bytes, canonical_request_hash,
+    issue_store_receipt_envelope, sha256_hex, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use serde_json::Value;
 
@@ -488,11 +489,15 @@ pub(crate) fn build_receipt(
             .map(|record| record.outbox_id.clone())
             .collect(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(plan.committed_at.clone()),
         envelope: None,
     };
+    bind_issue18_receipt(&mut receipt, transition);
     receipt.envelope = Some(issue_store_receipt_envelope(
         ctx,
         transition,
@@ -614,11 +619,15 @@ pub(crate) fn build_receipt_with_expected_heads(
             .map(|record| record.outbox_id.clone())
             .collect(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(plan.committed_at.clone()),
         envelope: None,
     };
+    bind_issue18_receipt(&mut receipt, transition);
     receipt.envelope = Some(issue_store_receipt_envelope(
         ctx,
         transition,
@@ -824,7 +833,7 @@ mod tests {
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
         OperationId, OperationIdentity, OperationManifestDigest, OrderingScopeId, ReceiptEnvelope,
-        ScopeId, SecurityContext, StateFence, TransitionClass,
+        ScopeId, SecurityContext, StateFence, TransitionClass, bind_issue18_digests,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -857,7 +866,7 @@ mod tests {
             },
         };
         let operation = "op-envelope";
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new(operation).map_err(StoreError::Foundation)?,
                 idempotency_key: format!("idem-{operation}"),
@@ -870,7 +879,12 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this fixture).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
@@ -883,6 +897,8 @@ mod tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        // Issue #18: bind the derived digests (empty heads in this fixture).
+        bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
         Ok((context, transition))
     }
 
@@ -1002,6 +1018,9 @@ mod tests {
         );
         // Exact binds recomputed and validates.
         transition.identity.canonical_request_hash = recomputed.clone();
+        // Issue #18: the hash moved post-construction, so rebind the digests
+        // to keep the transition self-consistent.
+        bind_issue18_digests(&mut transition, Vec::new())?;
         let plan = plan_apply(&transition, &[], &[], 1, 1)?;
         let receipt = build_receipt_with_expected_heads(&context, &transition, &plan, &[], &[])?;
         assert_eq!(receipt.canonical_request_hash, recomputed);

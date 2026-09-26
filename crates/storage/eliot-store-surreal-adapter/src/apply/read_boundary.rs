@@ -2522,10 +2522,10 @@ mod admitted_read_tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            SecurityContext, TransitionClass,
+            SecurityContext, TransitionClass, bind_issue18_digests,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -2538,8 +2538,13 @@ mod admitted_read_tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -2551,7 +2556,10 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        // Issue #18: bind the derived digests (empty heads in this helper).
+        bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
+        transition
     }
 
     /// Plans one capture through the real planner and renders its durable
@@ -3041,10 +3049,10 @@ mod admitted_read_tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            SecurityContext, TransitionClass,
+            SecurityContext, TransitionClass, bind_issue18_digests,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -3057,8 +3065,13 @@ mod admitted_read_tests {
             transition_class: TransitionClass::TaskControl,
             requested_effect_ceiling: EffectClass::ReversibleMutation,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::UpdateTaskState,
                 parameters: BTreeMap::from([
@@ -3079,7 +3092,10 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        // Issue #18: bind the derived digests (empty heads in this helper).
+        bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
+        transition
     }
 
     /// Recovery transition shape awaiting operation-aware persistence (see
@@ -3095,7 +3111,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -3108,8 +3124,13 @@ mod admitted_read_tests {
             transition_class: TransitionClass::RecoverySchema,
             requested_effect_ceiling: EffectClass::ReversibleMutation,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ReconcileRecovery,
                 parameters: BTreeMap::from([
@@ -3138,7 +3159,11 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        // Issue #18: bind the derived digests (empty heads in this helper).
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
+        transition
     }
 
     fn lifecycle_transition(
@@ -3151,7 +3176,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -3164,8 +3189,13 @@ mod admitted_read_tests {
             transition_class: TransitionClass::LifecyclePolicy,
             requested_effect_ceiling: EffectClass::ReversibleMutation,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ApplyLifecyclePolicy,
                 parameters: BTreeMap::from([
@@ -3184,7 +3214,11 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        // Issue #18: bind the derived digests (empty heads in this helper).
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
+        transition
     }
 
     /// Plans one transition through the real planner with its real payload
@@ -3829,6 +3863,10 @@ mod real_scope_tests {
                     &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
                 )
                 .expect("request hash");
+                // Issue #18: scope, manifest, and hash changed
+                // post-construction, so rebind the digests.
+                eliot_store_api::bind_issue18_digests(&mut capture, Vec::new())
+                    .expect("fixture digests bind");
                 let receipt = harness
                     .adapter()
                     .apply_prepared(&ctx, capture.clone(), vec![], vec![])

@@ -44,8 +44,8 @@
   "committed_at": "commit-sequence-0000000000000001",
   "envelope": {
     "identity": {
-      "receipt_id": "receipt-40d6d166b1d2f35db126eab059e6e702e35008d3f5ca70cbf8855d6765cdc748",
-      "canonical_sha256": "40d6d166b1d2f35db126eab059e6e702e35008d3f5ca70cbf8855d6765cdc748"
+      "receipt_id": "receipt-7b69d939e14b304ab08fb493d54b21c0c2645ea1b032dc8333f65c7d8b1bd172",
+      "canonical_sha256": "7b69d939e14b304ab08fb493d54b21c0c2645ea1b032dc8333f65c7d8b1bd172"
     },
     "core": {
       "contract": {
@@ -165,7 +165,7 @@
       "artifacts": [
         {
           "artifact_id": "store-transition:op-991-k1",
-          "sha256": "ab94b2fc85515acb60899a88b2c1aa6c50e7db7c6903e6760495fd27a413eced",
+          "sha256": "d232f3618b64e00ae6c896643f4b6d7c66f6900aef57b4c9ef9df61101dd64ed",
           "role": "OPERATION",
           "source_revision": "manifest-991-k1"
         },
@@ -184,5 +184,8 @@
         "proof": "CANDIDATE_ARTIFACT"
       }
     }
-  }
+  },
+  "semantic_source_revisions": [],
+  "mutation_plan_digest": "9033e7bfdc20de7263977195f0c60f40e89fa152e4d13a7cf580e5c6d2430cfb",
+  "admission_digest": "deb025c92f8195e8a39e04f2ab156a307620fa2e3469e9b65db5fe2cf2d64038"
 }

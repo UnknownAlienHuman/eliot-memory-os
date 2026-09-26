@@ -144,7 +144,12 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this helper).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -164,6 +169,10 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
     )
     .expect("request hash");
+    // Issue #18: manifest and hash changed post-construction, so bind the
+    // derived digests after they are final.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     (ctx, transition)
 }
 
@@ -181,6 +190,10 @@ fn admitted_under(
         &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
     )
     .expect("request hash");
+    // Issue #18: fence and hash changed post-construction, so rebind the
+    // digests to keep the transition self-consistent.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     (ctx, transition)
 }
 
@@ -657,6 +670,10 @@ async fn changed_same_operation_content_conflicts_without_mutation() {
         &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
     )
     .expect("request hash");
+    // Issue #18: key and hash changed post-construction, so rebind the
+    // digests; the identity gate (not a digest mismatch) must fail here.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     let conflict =
         CanonicalStoreClient::apply_prepared(harness.adapter(), &ctx, transition, vec![], vec![])
             .await;
@@ -671,6 +688,10 @@ async fn changed_same_operation_content_conflicts_without_mutation() {
         &CanonicalRequestView::from_apply(&ctx_y, &transition_y, &[], &[]),
     )
     .expect("request hash");
+    // Issue #18: key and hash changed post-construction, so rebind the
+    // digests; the identity gate (not a digest mismatch) must fail here.
+    eliot_store_api::bind_issue18_digests(&mut transition_y, Vec::new())
+        .expect("fixture digests bind");
     let conflict_y = CanonicalStoreClient::apply_prepared(
         harness.adapter(),
         &ctx_y,

@@ -643,7 +643,7 @@ fn build_notification_transition(
             reason: "notification ordering scope identity is invalid",
         }
     })?;
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: request.operation.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: scope,
@@ -652,7 +652,10 @@ fn build_notification_transition(
         transition_class: TransitionClass::NotificationState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: admission_digest,
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: manifest_digest.clone(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![notification_mutation_request(parameters)],
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: Vec::new(),
@@ -662,6 +665,11 @@ fn build_notification_transition(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    // Issue #18: notification writes dispatch with no expected revision
+    // heads, so no source revisions are bound; the plan and admission
+    // digests still derive from the exact admitted transition.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .map_err(NotificationServiceError::from_store)?;
     transition
         .validate()
         .map_err(NotificationServiceError::from_store)?;

@@ -502,7 +502,7 @@ mod tests {
                     .map_err(|error| KernelPortError::Contract(error.to_string()))?
                     + 1;
                 let operation_id = transition.identity.operation_id.clone();
-                let candidate = WriteReceipt {
+                let mut candidate = WriteReceipt {
                     operation_id: operation_id.clone(),
                     idempotency_key: transition.identity.idempotency_key.clone(),
                     canonical_request_hash: hash.clone(),
@@ -520,11 +520,17 @@ mod tests {
                     projection_refs: Vec::new(),
                     outbox_refs: Vec::new(),
                     operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    // Issue #18: receipt mirrors the transition's bound
+                    // digests; values are rebound below before validation.
+                    semantic_source_revisions: Vec::new(),
+                    admission_digest: String::new(),
+                    mutation_plan_digest: String::new(),
                     error_code: None,
                     resubmission: Resubmission::None,
                     committed_at: Some(format!("commit-sequence-{sequence:016}")),
                     envelope: None,
                 };
+                eliot_store_api::bind_issue18_receipt(&mut candidate, &transition);
                 candidate
                     .validate()
                     .map_err(|error| KernelPortError::Contract(error.to_string()))?;

@@ -12,8 +12,8 @@ use crate::schema;
 use eliot_store_api::{
     CommitId, MAX_DIGEST_DETAIL_CHARS, RecoveryRecord, RecoveryRecordKey, RequestMeta,
     Resubmission, StoreError, StoreGenesisRequest, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
-    validate_genesis_receipt_envelope,
+    WriteReceiptStatus, bind_issue18_receipt, genesis_manifest, genesis_transition,
+    is_genesis_fence, issue_genesis_receipt_envelope, validate_genesis_receipt_envelope,
 };
 
 use super::receipt_reconciliation::read_receipt_by_operation;
@@ -277,6 +277,9 @@ pub(super) fn genesis_receipt(
     // bind the receipt to the recomputed digest (never a blind copy).
     let recomputed = verify_genesis_canonical_hash(request)?;
     let manifest = genesis_manifest().map_err(AdapterError::Store)?;
+    // Issue #18: the receipt mirrors the derived genesis transition so the
+    // stored revision bindings and both digests reproduce exactly.
+    let genesis = genesis_transition(context, request).map_err(AdapterError::Store)?;
     let mut receipt = WriteReceipt {
         operation_id: request.operation_id.clone(),
         idempotency_key: request.idempotency_key.clone(),
@@ -292,11 +295,15 @@ pub(super) fn genesis_receipt(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: manifest.digest,
+        semantic_source_revisions: genesis.semantic_source_revisions.clone(),
+        admission_digest: genesis.admission_digest.clone(),
+        mutation_plan_digest: genesis.mutation_plan_digest.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
         envelope: None,
     };
+    bind_issue18_receipt(&mut receipt, &genesis);
     receipt.envelope = Some(issue_genesis_receipt_envelope(
         context,
         request,

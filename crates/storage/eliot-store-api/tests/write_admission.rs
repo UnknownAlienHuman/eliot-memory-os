@@ -64,7 +64,7 @@ fn context() -> RequestMeta {
 }
 
 fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransition {
-    eliot_store_api::PreparedTransition {
+    let mut transition = eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-admit-1").unwrap(),
             idempotency_key: "idem-admit-1".to_owned(),
@@ -80,7 +80,11 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: admission-profile fixture binds no source revisions.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: OperationManifestDigest::new("manifest-admit-1").unwrap(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!("observation-admit-1"))]),
@@ -92,7 +96,10 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
+    transition
 }
 
 fn transition() -> eliot_store_api::PreparedTransition {
@@ -1041,6 +1048,10 @@ impl StubClient {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-stub").unwrap(),
+            // Issue #18: standalone rejection stub carries fixture digests.
+            semantic_source_revisions: Vec::new(),
+            admission_digest: "f".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
             error_code: Some(ErrorCode::Conflict),
             resubmission: Resubmission::None,
             committed_at: None,

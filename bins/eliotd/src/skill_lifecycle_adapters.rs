@@ -836,6 +836,11 @@ mod tests {
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-test-1")
                 .expect("manifest digest"),
+            // Issue #18: standalone fixture carries no transition; digest
+            // format placeholders satisfy `WriteReceipt::validate`.
+            semantic_source_revisions: Vec::new(),
+            admission_digest: "f".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

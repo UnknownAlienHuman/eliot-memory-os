@@ -61,7 +61,7 @@ fn context() -> RequestMeta {
 }
 
 fn transition() -> PreparedTransition {
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-991-1").unwrap(),
             idempotency_key: "idem-991-1".to_owned(),
@@ -74,7 +74,11 @@ fn transition() -> PreparedTransition {
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: wire-profile fixture binds no source revisions.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: OperationManifestDigest::new("manifest-991-1").unwrap(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!("observation-991-1"))]),
@@ -86,7 +90,10 @@ fn transition() -> PreparedTransition {
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
+    transition
 }
 
 fn scope_binding() -> ReservedScopeBinding {
@@ -188,11 +195,16 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        // Issue #18: receipt mirrors the transition's bound digests.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
         envelope: None,
     };
+    eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
     receipt.envelope =
         Some(issue_store_receipt_envelope(&request.context, transition, &receipt, 1).unwrap());
     receipt.validate().unwrap();

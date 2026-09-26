@@ -957,7 +957,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 .map_err(|error| StoreError::Serialization(error.to_string()))?,
         );
         let automation_id = automation_scope(&request.intent.operation);
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: request.identity.clone(),
             state_fence: request.context.state_fence.clone(),
             scope_id: ScopeId::new(USER_AUTOMATION_SCOPE)?,
@@ -966,7 +966,10 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             transition_class: TransitionClass::UserAutomation,
             requested_effect_ceiling: TransitionClass::UserAutomation.maximum_effect(),
             admission_contract_set_digest: admission_digest,
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: manifest_digest.clone(),
+            mutation_plan_digest: String::new(),
             named_operations: vec![operation],
             event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {
                 event_ids: Vec::new(),
@@ -976,6 +979,10 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        // Issue #18: automation writes dispatch with no expected revision
+        // heads, so no source revisions are bound; the plan and admission
+        // digests still derive from the exact admitted transition.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())?;
         transition.validate()?;
         Ok((transition, manifest_digest))
     }

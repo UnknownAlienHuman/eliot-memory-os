@@ -58,7 +58,7 @@ fn transition(
 ) -> PreparedTransition {
     let entries = eliot_store_api::generated_operation_manifests().expect("catalogue");
     let set_digest = eliot_store_api::operation_manifest_set_digest(&entries).expect("set digest");
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-1929-1").expect("operation id"),
             idempotency_key: "idem-1929-1".to_owned(),
@@ -71,7 +71,12 @@ fn transition(
         transition_class: class,
         requested_effect_ceiling: ceiling,
         admission_contract_set_digest: "b".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this helper).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: set_digest,
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation,
             parameters: params,
@@ -83,7 +88,11 @@ fn transition(
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: refs,
-    }
+    };
+    // Issue #18: bind the derived digests (empty heads in this helper).
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
+    transition
 }
 
 fn capture(task: Option<&str>, refs: Vec<String>) -> PreparedTransition {

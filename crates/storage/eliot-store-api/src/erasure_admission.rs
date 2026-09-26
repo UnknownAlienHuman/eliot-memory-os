@@ -28,7 +28,7 @@ use serde_json::Value;
 use super::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationIdentity, OperationManifestDigest, OrderingScopeId, PreparedTransition, ScopeId,
-    SecurityContext, StoreError, TransitionClass,
+    SecurityContext, StoreError, TransitionClass, bind_issue18_digests,
 };
 use eliot_contracts::StateFence;
 
@@ -196,10 +196,7 @@ pub fn admit_erasure_transition(
         ERASURE_PARAM_SUBJECT.to_owned(),
         Value::String(request.subject.clone()),
     );
-    parameters.insert(
-        ERASURE_PARAM_SURFACES.to_owned(),
-        Value::String(surfaces),
-    );
+    parameters.insert(ERASURE_PARAM_SURFACES.to_owned(), Value::String(surfaces));
     parameters.insert(
         ERASURE_PARAM_REASON.to_owned(),
         Value::String(request.reason.clone()),
@@ -212,7 +209,7 @@ pub fn admit_erasure_transition(
         ERASURE_PARAM_OPERATION_ID.to_owned(),
         Value::String(request.identity.operation_id.to_string()),
     );
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: request.identity.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: request.scope_id.clone(),
@@ -221,7 +218,12 @@ pub fn admit_erasure_transition(
         transition_class: TransitionClass::Erasure,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: request.admission_contract_set_digest.clone(),
+        // Issue #18: erasure admission consults no source revision heads; the
+        // fence-scoped destructive target is bound explicitly as an empty set.
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: request.operation_manifest_digest.clone(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::ApplyErasure,
             parameters,
@@ -230,6 +232,7 @@ pub fn admit_erasure_transition(
         security: request.security.clone(),
         required_proof_and_approval_refs: request.approval_refs.clone(),
     };
+    bind_issue18_digests(&mut transition, Vec::new())?;
     transition.validate()?;
     Ok(transition)
 }

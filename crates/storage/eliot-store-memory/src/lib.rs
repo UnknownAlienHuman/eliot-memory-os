@@ -38,13 +38,14 @@ use eliot_store_api::{
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
+    bind_issue18_receipt, canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
-    decode_resource_content, generated_operation_manifests, genesis_manifest, is_genesis_fence,
-    issue_genesis_receipt_envelope, issue_store_receipt_envelope, named_mutation_operation_name,
-    sha256_hex, validate_automation_read_params, validate_genesis_receipt_envelope,
-    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
+    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
+    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
+    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -2305,11 +2306,15 @@ fn transaction_receipt(
             .map(|record| record.outbox_id.clone())
             .collect(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{:016}", plan.commit_sequence)),
         envelope: None,
     };
+    bind_issue18_receipt(&mut receipt, transition);
     receipt.envelope = Some(issue_store_receipt_envelope(
         ctx,
         transition,
@@ -3443,6 +3448,9 @@ fn genesis_receipt(
     // Bind the receipt to the recomputed digest, never a blind copy.
     let recomputed = verify_genesis_canonical_hash(request)?;
     let manifest = genesis_manifest()?;
+    // Issue #18: the receipt mirrors the derived genesis transition so the
+    // stored revision bindings and both digests reproduce exactly.
+    let genesis = genesis_transition(context, request)?;
     let mut receipt = WriteReceipt {
         operation_id: request.operation_id.clone(),
         idempotency_key: request.idempotency_key.clone(),
@@ -3458,11 +3466,15 @@ fn genesis_receipt(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: manifest.digest,
+        semantic_source_revisions: genesis.semantic_source_revisions.clone(),
+        admission_digest: genesis.admission_digest.clone(),
+        mutation_plan_digest: genesis.mutation_plan_digest.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
         envelope: None,
     };
+    bind_issue18_receipt(&mut receipt, &genesis);
     receipt.envelope = Some(issue_genesis_receipt_envelope(
         context,
         request,
@@ -3999,7 +4011,7 @@ mod tests {
     };
     use eliot_store_api::{
         EffectClass, NamedOperationManifest, StoreGenesisRequest, StoreRecoveryRequest,
-        TransitionClass,
+        TransitionClass, bind_issue18_digests, render_semantic_source_revisions,
     };
     use std::num::NonZeroU64;
 
@@ -4123,7 +4135,12 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: manifest()?.digest,
+            mutation_plan_digest: String::new(),
             named_operations: vec![eliot_store_api::NamedMutationRequest {
                 operation: eliot_store_api::NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
@@ -4139,6 +4156,9 @@ mod tests {
         let ctx = metadata(state_fence)?;
         let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        // Issue #18: the admission digest covers the canonical hash, so bind
+        // after the hash is final (empty heads in this helper).
+        bind_issue18_digests(&mut prepared, Vec::new())?;
         Ok(prepared)
     }
 
@@ -4161,6 +4181,10 @@ mod tests {
             expected_ordering_heads,
         );
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        // Issue #18: rebind for the exact heads under test so the revision
+        // gate (not a digest mismatch) is what fails downstream.
+        let revisions = render_semantic_source_revisions(expected_revision_heads);
+        bind_issue18_digests(&mut prepared, revisions)?;
         Ok(prepared)
     }
 
@@ -4924,6 +4948,9 @@ mod tests {
         // Force the idempotency-key collision while keeping the fork's own
         // digest self-consistent: reuse the original idempotency key.
         forked.identity.idempotency_key = format!("idem-op-tamper");
+        // Issue #18: parameters and hash changed, so rebind the digests; the
+        // fork must stay self-consistent to reach the identity gate.
+        bind_issue18_digests(&mut forked, Vec::new())?;
         let conflict = store
             .apply_transaction(&ctx, forked, &[], &[])
             .expect_err("same-key fork must conflict");
@@ -4972,6 +4999,8 @@ mod tests {
             .insert("subject".to_owned(), json!(subject));
         let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        // Issue #18: parameters and hash changed post-construction, rebind.
+        bind_issue18_digests(&mut prepared, Vec::new())?;
         Ok(prepared)
     }
 
@@ -5031,6 +5060,8 @@ mod tests {
             capture.identity.canonical_request_hash = canonical_request_hash(
                 &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
             )?;
+            // Issue #18: scope change moved the hash, so rebind the digests.
+            bind_issue18_digests(&mut capture, Vec::new())?;
             store.apply_transaction(&ctx, capture.clone(), &[], &[])?;
             // Exact replay must not add an observation or shift its identity.
             store.apply_transaction(&ctx, capture, &[], &[])?;
@@ -5551,6 +5582,9 @@ mod tests {
         let mut prepared = eliot_store_api::admit_erasure_transition(&request)?;
         let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        // Issue #18: the admission digest covers the canonical hash, so
+        // rebind after the hash is rebound (erasure binds no source heads).
+        bind_issue18_digests(&mut prepared, Vec::new())?;
         Ok(prepared)
     }
 
@@ -5560,6 +5594,9 @@ mod tests {
     ) -> Result<(), StoreError> {
         let view = CanonicalRequestView::from_apply(ctx, transition, &[], &[]);
         transition.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        // Issue #18: keep the bound digests consistent with the rebound hash
+        // so the intended gate (not a digest mismatch) fails downstream.
+        bind_issue18_digests(&mut *transition, Vec::new())?;
         Ok(())
     }
 
@@ -5809,7 +5846,12 @@ mod tests {
             transition_class: class,
             requested_effect_ceiling: effect,
             admission_contract_set_digest: "a".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: manifest_digest,
+            mutation_plan_digest: String::new(),
             named_operations: vec![eliot_store_api::NamedMutationRequest {
                 operation: mutation,
                 parameters,
@@ -5824,6 +5866,9 @@ mod tests {
         };
         let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        // Issue #18: the admission digest covers the canonical hash, so bind
+        // after the hash is final.
+        bind_issue18_digests(&mut prepared, Vec::new())?;
         Ok(prepared)
     }
 

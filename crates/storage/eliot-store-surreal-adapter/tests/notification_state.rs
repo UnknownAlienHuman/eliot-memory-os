@@ -33,15 +33,15 @@ use eliot_kernel_core::ResolutionAuthorization;
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_receipts::{
-    ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
-    ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding,
+    ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
+    ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding,
     WorkScopeBinding, WorkScopeId, contract_identity,
 };
 use eliot_store_api::{
-    CanonicalRequestView, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OrderingScopeId, PreparedTransition, RequestMeta, ScopeId,
-    SecurityContext, StoreError, TransitionClass, canonical_request_hash,
-    generated_operation_manifests, operation_manifest_set_digest,
+    CanonicalRequestView, NamedMutationOperation, NamedMutationRequest, OperationIdentity,
+    OrderingScopeId, PreparedTransition, RequestMeta, ScopeId, SecurityContext, StoreError,
+    TransitionClass, canonical_request_hash, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 use eliot_store_api::{EventProjectionRelationIntents, NOTIFY_PARAM_AUTHORIZATION_JSON};
 use eliot_store_api::{
@@ -215,7 +215,12 @@ fn transition_with(
         transition_class: TransitionClass::NotificationState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: "c".repeat(64),
+        // Issue #18: placeholder bindings, derived below via
+        // `bind_issue18_digests` (empty heads in this helper).
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
         operation_manifest_digest: manifest_digest,
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation,
             parameters,
@@ -231,6 +236,10 @@ fn transition_with(
     let view = CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]);
     transition.identity.canonical_request_hash =
         canonical_request_hash(&view).expect("hash computes");
+    // Issue #18: the admission digest covers the canonical hash, so bind
+    // after the hash is final.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+        .expect("fixture digests bind");
     (ctx, transition)
 }
 
@@ -512,7 +521,8 @@ async fn read_payload(harness: &Harness, scope: Option<String>, include_resolved
 
 #[tokio::test]
 async fn upsert_persists_and_reads_back_with_atomic_outbox() {
-    let harness = Harness::fresh("upsert").await;    let receipt = apply(
+    let harness = Harness::fresh("upsert").await;
+    let receipt = apply(
         &harness,
         "live-upsert-1",
         NamedMutationOperation::ApplyNotificationState,

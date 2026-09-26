@@ -348,7 +348,7 @@ fn transition_for_with(
         requested_effect_ceiling,
         "992 fixture class and ceiling agree through the production mapping"
     );
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id).unwrap(),
             idempotency_key,
@@ -365,6 +365,9 @@ fn transition_for_with(
         requested_effect_ceiling,
         admission_contract_set_digest: fixture.admission_contract_set_digest.clone(),
         operation_manifest_digest: OperationManifestDigest::new(manifest).unwrap(),
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([(
@@ -379,7 +382,11 @@ fn transition_for_with(
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    // Issue #18: the hash seal below re-binds after covering the sealed
+    // hash; no source revisions are bound until the expected heads exist.
+    eliot_store_api::bind_issue18_digests(&mut transition, Vec::new()).expect("992 digests bind");
+    transition
 }
 
 /// Seals the canonical request hash over the exact values about to be bound,
@@ -392,6 +399,13 @@ fn seal(
 ) {
     let view = CanonicalRequestView::from_apply(context, transition, revision, ordering);
     transition.identity.canonical_request_hash = canonical_request_hash(&view).unwrap();
+    // Issue #18: re-bind after the hash seal above, which the admission
+    // digest covers, binding the exact expected revision heads sealed over.
+    eliot_store_api::bind_issue18_digests(
+        transition,
+        eliot_store_api::render_semantic_source_revisions(revision),
+    )
+    .expect("992 digests bind");
 }
 
 fn heads_for(
@@ -831,11 +845,15 @@ fn receipt_with_envelope(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
         error_code,
         resubmission: Resubmission::None,
         committed_at,
         envelope: None,
     };
+    eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
     receipt.envelope = Some(envelope_for(
         &request.context,
         transition,
@@ -3654,11 +3672,15 @@ fn startup_receipt(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        semantic_source_revisions: Vec::new(),
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
         envelope: None,
     };
+    eliot_store_api::bind_issue18_receipt(&mut receipt, transition);
     receipt.envelope = Some(
         eliot_store_api::issue_store_receipt_envelope(context, transition, &receipt, 1)
             .expect("startup envelope issues"),

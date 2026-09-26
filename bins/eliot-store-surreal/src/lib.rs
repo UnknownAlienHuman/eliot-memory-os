@@ -89,9 +89,9 @@ use request_dispatch::map_recovery_dispatch_result;
 use request_dispatch::{map_composition_error, map_genesis_dispatch_result};
 mod canonical_event;
 pub use canonical_event::{
-    CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority, FencedProjectionPublication,
-    OrderingLink, ProjectionRebuildPlan, SemanticWritePath, ordering_link_hash,
-    request_projection_rebuild, request_rebuild_from_semantic_write,
+    CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority,
+    FencedProjectionPublication, OrderingLink, ProjectionRebuildPlan, SemanticWritePath,
+    ordering_link_hash, request_projection_rebuild, request_rebuild_from_semantic_write,
 };
 mod connection_manager;
 pub use connection_manager::{
@@ -1120,8 +1120,8 @@ mod tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            ScopeId, SecurityContext, TransitionClass, canonical_request_hash,
-            operation_manifest_set_digest,
+            ScopeId, SecurityContext, TransitionClass, bind_issue18_digests,
+            canonical_request_hash, operation_manifest_set_digest,
         };
 
         let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
@@ -1141,7 +1141,12 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this test).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: set_digest,
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1161,6 +1166,10 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
         )
         .expect("admission hash");
+        // Issue #18: the admission digest covers the canonical hash, so bind
+        // after the hash is final. Negative clones below must stay stale so
+        // the gate rejects them.
+        bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
         admit_prepared_for_execution(&context, &transition, &[], &[]).expect("admitted plan");
 
         let mut widened = transition.clone();
@@ -1193,6 +1202,9 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &unsupported, &[], &[]),
         )
         .expect("recomputed hash");
+        // Issue #18: manifest and hash changed, so rebind the digests; the
+        // catalogue gate (not a digest mismatch) must refuse here.
+        bind_issue18_digests(&mut unsupported, Vec::new()).expect("fixture digests bind");
         let error = match admit_prepared_for_execution(&context, &unsupported, &[], &[]) {
             Err(error) => error,
             Ok(()) => unreachable!("unsupported manifest must not execute"),
@@ -2178,9 +2190,9 @@ mod tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            ScopeId, SecurityContext, TransitionClass,
+            ScopeId, SecurityContext, TransitionClass, bind_issue18_digests,
         };
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-bridge").expect("operation id"),
                 idempotency_key: "idem-bridge".to_owned(),
@@ -2193,8 +2205,13 @@ mod tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: std::collections::BTreeMap::from([(
@@ -2209,7 +2226,10 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        // Issue #18: bind the derived digests (empty heads in this helper).
+        bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
+        transition
     }
 
     #[test]
@@ -2247,9 +2267,9 @@ mod tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            ScopeId, SecurityContext, TransitionClass,
+            ScopeId, SecurityContext, TransitionClass, bind_issue18_digests,
         };
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-erasure-bridge").expect("operation id"),
                 idempotency_key: "idem-erasure-bridge".to_owned(),
@@ -2262,8 +2282,13 @@ mod tests {
             transition_class: TransitionClass::Erasure,
             requested_effect_ceiling: EffectClass::ReversibleMutation,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this helper).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ApplyErasure,
                 parameters: std::collections::BTreeMap::from([
@@ -2290,7 +2315,10 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: vec!["approval-user-1".to_owned()],
-        }
+        };
+        // Issue #18: bind the derived digests (empty heads in this helper).
+        bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
+        transition
     }
 
     #[test]

@@ -214,7 +214,7 @@ mod idempotency_tests {
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
         OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext,
-        TransitionClass,
+        TransitionClass, bind_issue18_digests,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -243,7 +243,7 @@ mod idempotency_tests {
             state_fence: fence.clone(),
             clock: eliot_contracts::ClockReading::default(),
         };
-        let transition = eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new("op-idem").expect("operation"),
                 idempotency_key: "idem-key".to_owned(),
@@ -256,8 +256,13 @@ mod idempotency_tests {
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
+            // Issue #18: placeholder bindings, derived below via
+            // `bind_issue18_digests` (empty heads in this fixture).
+            semantic_source_revisions: Vec::new(),
+            admission_digest: String::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-idem")
                 .expect("manifest digest"),
+            mutation_plan_digest: String::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!("op-idem"))]),
@@ -270,6 +275,8 @@ mod idempotency_tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        // Issue #18: bind the derived digests (empty heads in this fixture).
+        bind_issue18_digests(&mut transition, Vec::new()).expect("fixture digests bind");
         (context, transition)
     }
 
@@ -366,6 +373,10 @@ mod idempotency_tests {
             "legacy placeholder is never the real digest"
         );
         transition.identity.canonical_request_hash = recomputed.clone();
+        // Issue #18: the hash moved post-construction, so rebind the digests
+        // to keep the transition self-consistent.
+        eliot_store_api::bind_issue18_digests(&mut transition, Vec::new())
+            .expect("fixture digests bind");
         let plan = plan_apply(&transition, &[], &[], 1, 1).expect("plan applies");
         let receipt = build_receipt_with_expected_heads(&context, &transition, &plan, &[], &[])
             .expect("receipt binds recomputed");
@@ -427,6 +438,10 @@ mod idempotency_tests {
         let forked_view = CanonicalRequestView::from_apply(&context, &forked, &[], &[]);
         forked.identity.canonical_request_hash =
             canonical_request_hash(&forked_view).expect("forked digest");
+        // Issue #18: parameters and hash changed, so rebind the digests to
+        // keep the fork self-consistent for its own bytes.
+        eliot_store_api::bind_issue18_digests(&mut forked, Vec::new())
+            .expect("fixture digests bind");
         assert_ne!(
             forked.identity.canonical_request_hash, recomputed,
             "fork binds a different recomputed digest"
