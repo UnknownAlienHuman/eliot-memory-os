@@ -118,6 +118,21 @@ jobs:
         run: |
           dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore
 
+      - name: Dependency policy evidence
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          python scripts/verify-dependency-policy.py --root . --profile offline-source --sbom-out .eliot/dependency-policy-artifacts/sbom.json --license-report-out .eliot/dependency-policy-artifacts/licenses.json --advisory-report-out .eliot/dependency-policy-artifacts/advisories.json
+          $depExit = $LASTEXITCODE
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Dependency policy evidence (non-blocking until #1225)'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('- verifier exit: ' + $depExit)
+          if (Test-Path .eliot/dependency-policy-artifacts/sbom.json) {
+            $sbom = Get-Content .eliot/dependency-policy-artifacts/sbom.json -Raw | ConvertFrom-Json
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ('- receipt status: ' + $sbom.status + '; ceiling: ' + $sbom.proof_ceiling + '; digest: ' + $sbom.receipt_digest)
+          } else {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- receipt artifact missing: verifier did not produce output'
+          }
+
       - name: Record source-candidate ceiling and manifest
         shell: pwsh
         run: |

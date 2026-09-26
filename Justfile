@@ -91,6 +91,9 @@ dependency-policy:
 dependency-policy-advisories:
     python scripts/verify-dependency-policy.py --root . --profile current-advisories
 
+dependency-policy-artifacts:
+    python scripts/verify-dependency-policy.py --root . --profile offline-source --sbom-out .eliot/dependency-policy-artifacts/sbom.json --license-report-out .eliot/dependency-policy-artifacts/licenses.json --advisory-report-out .eliot/dependency-policy-artifacts/advisories.json
+
 opencode-plugin:
     Get-Content -Raw integrations/opencode/plugins/eliot.js | node --input-type=module --check
     node --test integrations/opencode/tests/eliot-plugin.test.mjs
