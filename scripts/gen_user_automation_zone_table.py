@@ -18,6 +18,14 @@ unresolvable `Link`, every coverage violation and every disagreement against the
 independent Node.js ICU oracle is a non-zero exit with a named reason, so the
 committed table can never silently diverge from the release it claims to carry.
 
+The unit of the offset column is **seconds**, because that is what a `Zone` record
+carries and what the Node.js ICU oracle returns. The rendered header declares that
+unit explicitly, as `# offset_unit seconds`, and the Kernel refuses a table whose
+header does not carry exactly that token: a consumer therefore never has to guess
+the unit of the second column, and never has to infer it from the magnitude of a
+sample value. An undeclared unit is precisely how this table's seconds were once
+read as minutes by the Kernel that consumes it (#2882).
+
 Usage:
 
     python scripts/gen_user_automation_zone_table.py \
@@ -44,6 +52,15 @@ from dataclasses import dataclass, field
 
 #: Format tag written into the table header; the Kernel refuses any other one.
 TABLE_FORMAT = "eliot.user-automation.zone-table.v1"
+
+#: Unit of the offset column of every body line, written into the table header as
+#: `# offset_unit seconds`; the Kernel refuses a table that does not declare
+#: exactly this token. The table is written in seconds because that is the unit a
+#: `Zone` record carries and the unit the Node.js ICU oracle answers in. The
+#: Kernel converts to its own canonical internal unit once, at the parse boundary,
+#: and refuses any offset that is not a whole number of that unit, so this token
+#: is the only place the wire unit is decided.
+TABLE_OFFSET_UNIT = "seconds"
 
 #: The tzdata source files of the default `zcode` `TDATA` build, minus
 #: `factory`. `factory` is excluded deliberately: it declares the single
@@ -820,12 +837,20 @@ def render_table(
     omission is a reviewable, machine-readable decision rather than a silent
     one, and so a schedule naming a withheld zone is refused as unknown rather
     than resolved from a guess.
+
+    The header also declares the unit of the offset column, exactly once. The
+    emitted table is re-read here to prove the declaration is present and
+    unambiguous, because the Kernel requires that token before it will read a
+    single offset, and a missing or repeated declaration would either refuse
+    every lookup or leave the required token ambiguous.
     """
     zones = sorted(timelines)
     transition_count = sum(len(timelines[zone]) - 1 for zone in zones)
     reasons = sorted(set(withheld.values()))
+    unit_declaration = f"# offset_unit {TABLE_OFFSET_UNIT}"
     lines = [
         f"# format {TABLE_FORMAT}",
+        unit_declaration,
         f"# release {release}",
         "# source_files " + " ".join(TZDATA_FILES),
         "# refused_source_files " + " ".join(REFUSED_TZDATA_FILES),
@@ -845,6 +870,11 @@ def render_table(
         names = sorted(n for n, r in withheld.items() if r == reason)
         lines.append(f"# withheld {reason} {len(names)} " + " ".join(names))
     lines.append(f"# withheld_total {len(withheld)}")
+    declared = [line for line in lines if line.startswith("# offset_unit")]
+    assert declared == [unit_declaration], (
+        f"the rendered table must declare its offset unit exactly once as "
+        f"{unit_declaration!r}, found {declared!r}"
+    )
     for zone in zones:
         lines.append(f"Z {zone}")
         for at, offset in timelines[zone]:
@@ -878,7 +908,7 @@ function formatter(zone) {
   }
   return f;
 }
-function offsetMinutes(f, epochMs) {
+function offsetSeconds(f, epochMs) {
   const parts = {};
   for (const p of f.formatToParts(new Date(epochMs))) parts[p.type] = p.value;
   const asUtc = Date.UTC(
@@ -896,7 +926,7 @@ rl.on('line', (line) => {
     process.stdout.write(JSON.stringify({ resolved: false, offsets: [] }) + '\n');
     return;
   }
-  const offsets = request.points.map((p) => offsetMinutes(f, p * 1000));
+  const offsets = request.points.map((p) => offsetSeconds(f, p * 1000));
   process.stdout.write(JSON.stringify({ resolved: true, offsets }) + '\n');
 });
 process.stdout.write(JSON.stringify({
@@ -1118,6 +1148,32 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
 
+    # The table is written in seconds, and the Kernel's own canonical internal
+    # unit is minutes, so a zone whose pinned timeline carries an offset that is
+    # not a whole number of minutes cannot be answered by the Kernel without
+    # truncating it. The Kernel refuses such a zone rather than truncating, so the
+    # generator names them here: an operator reading this output learns from the
+    # generator which zones the pinned release can express in the canonical unit.
+    sub_minute = sorted(
+        name
+        for name, timeline in admitted.items()
+        if any(offset % 60 != 0 for _at, offset in timeline)
+    )
+    if ISSUE_EVIDENCE_ZONE in sub_minute:
+        print(
+            f"refused: {ISSUE_EVIDENCE_ZONE} carries a sub-minute offset, so the "
+            f"Kernel cannot answer it in its canonical unit without truncating",
+            file=sys.stderr,
+        )
+        return 7
+    if sub_minute:
+        print(
+            "SUB-MINUTE-ZONE: these admitted zones carry a UTC offset that is not "
+            "a whole number of minutes, so the Kernel refuses them by name and "
+            "never truncates the offset: " + " ".join(sub_minute),
+            file=sys.stderr,
+        )
+
     payload = render_table(
         args.release,
         admitted,
@@ -1130,8 +1186,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"wrote {args.out} bytes={len(payload)} "
         f"sha256={hashlib.sha256(payload).hexdigest()} "
+        f"offset_unit={TABLE_OFFSET_UNIT} "
         f"zones={len(admitted)} transitions={transition_total} "
-        f"withheld={len(withheld)}"
+        f"withheld={len(withheld)} "
+        f"sub_minute_zones={len(sub_minute)}"
     )
     return 0
 

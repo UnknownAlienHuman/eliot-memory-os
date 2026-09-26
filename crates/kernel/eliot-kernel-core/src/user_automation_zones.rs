@@ -29,6 +29,27 @@
 //! The table bytes are verified once against [`PINNED_ZONE_TABLE_SHA256`] with
 //! [`eliot_contracts::sha256_hex`]; a mismatch makes every lookup in this module
 //! fail closed rather than answer from bytes that are not the pinned release.
+//!
+//! # One canonical offset unit
+//!
+//! The table's offset column is written in **seconds**, which is the unit the
+//! `IANA` release and the generator's independent oracle both produce. That wire
+//! unit is not assumed here: the header must declare it as
+//! [`ZONE_TABLE_OFFSET_UNIT`], and a table that does not carry exactly that token
+//! is refused before a single offset is read. A data file whose unit is left to be
+//! inferred from the magnitude of a sample value is how one release's seconds
+//! were read as another release's minutes, which refused valid occurrences and
+//! computed candidate instants with a 60x error.
+//!
+//! [`offset_seconds_to_minutes`] is the single place the wire unit is converted,
+//! and it converts exactly once, at the parse boundary. Everything above this
+//! module boundary — [`ZoneTransition`], [`LocalClockReality`],
+//! [`offset_minutes_at`] and the occurrence record they are compared against —
+//! holds **minutes**, so multiplying an offset by [`SECONDS_PER_MINUTE`] to reach
+//! an instant is correct as written. The conversion is exact or it is a refusal:
+//! a pinned offset that is not a whole number of minutes (`Africa/Monrovia` was
+//! `-0:44:30` until 1972) is never truncated, and the zone that carries it is
+//! refused by name instead.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -43,13 +64,21 @@ const PINNED_ZONE_TABLE: &str = include_str!("user_automation_zone_table.tzd");
 /// Regenerating the table changes this constant, which is a deliberate, visible
 /// act: a database update can never silently rewrite an existing revision.
 const PINNED_ZONE_TABLE_SHA256: &str =
-    "edd104d125063e5d6fb31e02adb0fd2dc8f0d268886f0274e7488a926b4a17a6";
+    "f702c1d3e98a530500ff22d2ff88a3a0e222512449ead590947602d11bf9630b";
 
 /// The only zone database release this build admits.
 pub(crate) const PINNED_ZONE_DATABASE_RELEASE: &str = "2026c";
 
 /// Format tag the table header must carry.
 pub(crate) const ZONE_TABLE_FORMAT: &str = "eliot.user-automation.zone-table.v1";
+
+/// The only offset unit the table header may declare.
+///
+/// The table stores its offset column in seconds, and says so in its own header.
+/// This module requires that declaration and refuses a table without it, so the
+/// wire unit is decided by the data rather than assumed by the consumer. Changing
+/// this token without regenerating the table makes every lookup fail closed.
+const ZONE_TABLE_OFFSET_UNIT: &str = "seconds";
 
 /// Inclusive first instant of the admitted window: `1970-01-01T00:00:00Z`.
 pub(crate) const ZONE_TABLE_WINDOW_START_SECONDS: i64 = 0;
@@ -65,8 +94,23 @@ pub(crate) const ZONE_TABLE_START_SECONDS: i64 = -172_800;
 /// Exclusive last instant the stored offset timeline covers.
 pub(crate) const ZONE_TABLE_END_EXCLUSIVE_SECONDS: i64 = 4_102_617_600;
 
-/// Seconds in one civil minute, used to move between an offset and an instant.
+/// Seconds in one civil minute, used to move between a canonical offset in
+/// minutes and an instant, and to divide the table's wire-denominated offset.
 const SECONDS_PER_MINUTE: i64 = 60;
+
+/// One pinned offset that the canonical internal unit cannot represent exactly,
+/// with the zone that carries it.
+///
+/// The refusal names both the zone and the raw second value it actually carries,
+/// so the operator is told which zone is unanswerable and what the exact value
+/// was, rather than being handed a silently truncated minute count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SubMinuteOffset {
+    /// The zone whose pinned timeline carries the unconvertible offset.
+    pub zone: &'static str,
+    /// The offset exactly as the table states it, in the table's declared unit.
+    pub offset_seconds: i32,
+}
 
 /// Why the pinned zone table could not answer a question.
 ///
@@ -76,7 +120,9 @@ const SECONDS_PER_MINUTE: i64 = 60;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ZoneTableError {
     /// The embedded table bytes are not the pinned digest, or are not readable as
-    /// the pinned format. Every lookup fails closed.
+    /// the pinned format. Every lookup fails closed. This is also the refusal for
+    /// a table whose header does not declare the pinned offset unit: a table that
+    /// does not say which unit its offsets are in is not read on assumption.
     Integrity,
     /// The zone is not a member of the pinned table. A withheld zone, a zone the
     /// pinned release does not define, and an invented spelling are all this.
@@ -84,6 +130,15 @@ pub(crate) enum ZoneTableError {
     /// The instant, or an instant the question needs, is outside the table's
     /// coverage. Nothing is extrapolated.
     OutsideCoverage,
+    /// The zone's pinned timeline carries a UTC offset that is not a whole number
+    /// of canonical minutes, so answering it would mean truncating the offset.
+    ///
+    /// The pinned release applies `Africa/Monrovia` at `-0:44:30` until 1972. That
+    /// offset is real and it is carried in the table, but minutes cannot hold it,
+    /// so the zone is refused by name rather than answered from a rounded value.
+    /// Refusing is the same direction this module always fails: no lookup in this
+    /// table returns a value the pinned release does not apply.
+    SubMinuteOffset(SubMinuteOffset),
 }
 
 /// The two offsets and the instant of one real transition in a named zone.
@@ -137,8 +192,20 @@ pub(crate) enum LocalClockReality {
 
 /// One zone's closed offset timeline: the offset at [`ZONE_TABLE_START_SECONDS`]
 /// followed by one entry per instant where the offset changes.
+///
+/// Every offset in `events` is in canonical minutes, converted once from the
+/// table's declared wire unit. A zone that carries an offset minutes cannot hold
+/// exactly records that raw second value in `sub_minute_offset_seconds` and keeps
+/// no event derived from it, so its timeline is never partially converted and a
+/// truncation can never reach a lookup.
 struct ZoneTimeline {
     name: &'static str,
+    sub_minute_offset_seconds: Option<i32>,
+    /// The instant of the most recent line of this zone, whether or not that line
+    /// became an event. This is the parse cursor that keeps the strictly
+    /// ascending rule applying to every line of every zone, including the lines of
+    /// a zone that is already known to be refused.
+    last_line_instant_seconds: Option<i64>,
     events: Vec<(i64, i32)>,
 }
 
@@ -148,59 +215,107 @@ struct ZoneTable {
     zones: Vec<ZoneTimeline>,
 }
 
+/// The `#` header fields this module requires the table to declare.
+///
+/// Every field is optional while the header is being read and required by
+/// [`TableHeader::require_pinned_identity`] and the body cross-checks once it is
+/// complete, so a table that omits a declaration is refused rather than read on
+/// assumption. A header field this module does not require, such as the withheld
+/// zone record, is ignored.
+#[derive(Default)]
+struct TableHeader {
+    format: Option<String>,
+    offset_unit: Option<String>,
+    release: Option<String>,
+    zone_count: Option<usize>,
+    transition_count: Option<usize>,
+    window: Option<(i64, i64)>,
+    coverage: Option<(i64, i64)>,
+}
+
+impl TableHeader {
+    /// Reads one `#` header line, refusing a declared value that is not a number
+    /// of the shape the field requires.
+    fn read(&mut self, declared: &str) -> Result<(), ZoneTableError> {
+        let mut words = declared.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("format"), Some(value)) => self.format = Some(value.to_owned()),
+            (Some("offset_unit"), Some(value)) => self.offset_unit = Some(value.to_owned()),
+            (Some("release"), Some(value)) => self.release = Some(value.to_owned()),
+            (Some("zone_count"), Some(value)) => self.zone_count = Some(parse_count(value)?),
+            (Some("transition_count"), Some(value)) => {
+                self.transition_count = Some(parse_count(value)?);
+            }
+            (Some("window_start_seconds"), Some(value)) => {
+                let start = parse_i64(value)?;
+                self.window = Some((
+                    start,
+                    self.window
+                        .map_or(ZONE_TABLE_WINDOW_END_EXCLUSIVE_SECONDS, |w| w.1),
+                ));
+            }
+            (Some("window_end_exclusive_seconds"), Some(value)) => {
+                let end = parse_i64(value)?;
+                self.window = Some((
+                    self.window.map_or(ZONE_TABLE_WINDOW_START_SECONDS, |w| w.0),
+                    end,
+                ));
+            }
+            (Some("table_start_seconds"), Some(value)) => {
+                let start = parse_i64(value)?;
+                self.coverage = Some((
+                    start,
+                    self.coverage
+                        .map_or(ZONE_TABLE_END_EXCLUSIVE_SECONDS, |c| c.1),
+                ));
+            }
+            (Some("table_end_exclusive_seconds"), Some(value)) => {
+                let end = parse_i64(value)?;
+                self.coverage =
+                    Some((self.coverage.map_or(ZONE_TABLE_START_SECONDS, |c| c.0), end));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Requires the declared format, offset unit and release to be exactly the
+    /// pinned ones.
+    ///
+    /// The offset unit is required because it is what the body is read in. A table
+    /// that does not declare one leaves this `None`, and the whole table is refused
+    /// before a single offset is interpreted, because the alternative is reading the
+    /// second column in an assumed unit.
+    fn require_pinned_identity(&self) -> Result<(), ZoneTableError> {
+        if self.format.as_deref() != Some(ZONE_TABLE_FORMAT)
+            || self.offset_unit.as_deref() != Some(ZONE_TABLE_OFFSET_UNIT)
+            || self.release.as_deref() != Some(PINNED_ZONE_DATABASE_RELEASE)
+        {
+            return Err(ZoneTableError::Integrity);
+        }
+        Ok(())
+    }
+}
+
 /// The table is parsed and its bytes verified exactly once per process.
 static PINNED_ZONE_TABLE_STATE: OnceLock<Result<ZoneTable, ZoneTableError>> = OnceLock::new();
 
 impl ZoneTable {
     /// Parses the embedded bytes, refusing anything that is not the pinned
-    /// format, the pinned release, or structurally inconsistent.
+    /// format, the pinned release, the pinned offset unit, or structurally
+    /// inconsistent.
+    ///
+    /// Every declared header number is re-derived from the body and compared, so
+    /// a header that describes a different table than the one below it is refused
+    /// rather than trusted.
     fn parse(bytes: &'static str) -> Result<Self, ZoneTableError> {
-        let mut format = None;
-        let mut release = None;
-        let mut zone_count: Option<usize> = None;
-        let mut transition_count: Option<usize> = None;
-        let mut window: Option<(i64, i64)> = None;
-        let mut coverage: Option<(i64, i64)> = None;
+        let mut header = TableHeader::default();
         let mut zones: Vec<ZoneTimeline> = Vec::new();
         let mut transitions = 0usize;
 
         for line in bytes.lines() {
-            if let Some(header) = line.strip_prefix('#') {
-                let mut words = header.split_whitespace();
-                match (words.next(), words.next()) {
-                    (Some("format"), Some(value)) => format = Some(value.to_owned()),
-                    (Some("release"), Some(value)) => release = Some(value.to_owned()),
-                    (Some("zone_count"), Some(value)) => {
-                        zone_count = Some(parse_count(value)?);
-                    }
-                    (Some("transition_count"), Some(value)) => {
-                        transition_count = Some(parse_count(value)?);
-                    }
-                    (Some("window_start_seconds"), Some(value)) => {
-                        let start = parse_i64(value)?;
-                        window = Some((
-                            start,
-                            window.map_or(ZONE_TABLE_WINDOW_END_EXCLUSIVE_SECONDS, |w| w.1),
-                        ));
-                    }
-                    (Some("window_end_exclusive_seconds"), Some(value)) => {
-                        let end = parse_i64(value)?;
-                        window =
-                            Some((window.map_or(ZONE_TABLE_WINDOW_START_SECONDS, |w| w.0), end));
-                    }
-                    (Some("table_start_seconds"), Some(value)) => {
-                        let start = parse_i64(value)?;
-                        coverage = Some((
-                            start,
-                            coverage.map_or(ZONE_TABLE_END_EXCLUSIVE_SECONDS, |c| c.1),
-                        ));
-                    }
-                    (Some("table_end_exclusive_seconds"), Some(value)) => {
-                        let end = parse_i64(value)?;
-                        coverage = Some((coverage.map_or(ZONE_TABLE_START_SECONDS, |c| c.0), end));
-                    }
-                    _ => {}
-                }
+            if let Some(declared) = line.strip_prefix('#') {
+                header.read(declared)?;
                 continue;
             }
             if line.is_empty() {
@@ -212,43 +327,29 @@ impl ZoneTable {
                 }
                 zones.push(ZoneTimeline {
                     name,
+                    sub_minute_offset_seconds: None,
+                    last_line_instant_seconds: None,
                     events: Vec::new(),
                 });
                 continue;
             }
             let current = zones.last_mut().ok_or(ZoneTableError::Integrity)?;
-            let (instant, offset) = line.split_once(' ').ok_or(ZoneTableError::Integrity)?;
-            let instant = parse_i64(instant)?;
-            let offset = parse_i32(offset)?;
-            if !(ZONE_TABLE_START_SECONDS..ZONE_TABLE_END_EXCLUSIVE_SECONDS).contains(&instant) {
-                return Err(ZoneTableError::Integrity);
+            if Self::read_offset_line(current, line)? {
+                transitions += 1;
             }
-            if current
-                .events
-                .last()
-                .is_some_and(|(previous, _)| *previous >= instant)
-            {
-                return Err(ZoneTableError::Integrity);
-            }
-            current.events.push((instant, offset));
-            transitions += 1;
         }
 
-        if format.as_deref() != Some(ZONE_TABLE_FORMAT)
-            || release.as_deref() != Some(PINNED_ZONE_DATABASE_RELEASE)
-        {
-            return Err(ZoneTableError::Integrity);
-        }
-        if window
+        header.require_pinned_identity()?;
+        if header.window
             != Some((
                 ZONE_TABLE_WINDOW_START_SECONDS,
                 ZONE_TABLE_WINDOW_END_EXCLUSIVE_SECONDS,
             ))
-            || coverage != Some((ZONE_TABLE_START_SECONDS, ZONE_TABLE_END_EXCLUSIVE_SECONDS))
+            || header.coverage != Some((ZONE_TABLE_START_SECONDS, ZONE_TABLE_END_EXCLUSIVE_SECONDS))
         {
             return Err(ZoneTableError::Integrity);
         }
-        if zone_count != Some(zones.len()) || transition_count != Some(transitions) {
+        if header.zone_count != Some(zones.len()) || header.transition_count != Some(transitions) {
             return Err(ZoneTableError::Integrity);
         }
         if !Self::is_structurally_sound(&zones) {
@@ -257,24 +358,84 @@ impl ZoneTable {
         Ok(Self { zones })
     }
 
+    /// Reads one body line into the zone it belongs to, and returns whether that
+    /// line is a transition rather than the zone's rooting offset.
+    ///
+    /// The header counts transitions, and the offset a zone carries at the coverage
+    /// start is the state the zone starts in rather than a change of offset. So the
+    /// first line of a zone is that rooting offset and is not a transition; every
+    /// later line is one. The rooting offset is still required, by
+    /// [`Self::is_structurally_sound`], which checks that the first event of every
+    /// answered zone is rooted at the coverage start.
+    ///
+    /// This is also the one place the wire unit is converted. The conversion is
+    /// exact or it is a refusal: a zone that carries an unconvertible offset keeps
+    /// the raw second value, stops accumulating events, and is refused by name at
+    /// lookup, so its timeline is never half converted and no truncation can reach
+    /// a caller.
+    fn read_offset_line(zone: &mut ZoneTimeline, line: &str) -> Result<bool, ZoneTableError> {
+        let (instant, offset) = line.split_once(' ').ok_or(ZoneTableError::Integrity)?;
+        let instant = parse_i64(instant)?;
+        let offset_seconds = parse_offset_seconds(offset)?;
+        if !(ZONE_TABLE_START_SECONDS..ZONE_TABLE_END_EXCLUSIVE_SECONDS).contains(&instant) {
+            return Err(ZoneTableError::Integrity);
+        }
+        if zone
+            .last_line_instant_seconds
+            .is_some_and(|previous| previous >= instant)
+        {
+            return Err(ZoneTableError::Integrity);
+        }
+        let is_rooting_offset = zone.last_line_instant_seconds.is_none();
+        zone.last_line_instant_seconds = Some(instant);
+        if let Some(minutes) = offset_seconds_to_minutes(offset_seconds) {
+            if zone.sub_minute_offset_seconds.is_none() {
+                zone.events.push((instant, minutes));
+            }
+        } else if zone.sub_minute_offset_seconds.is_none() {
+            zone.sub_minute_offset_seconds = Some(offset_seconds);
+        }
+        Ok(!is_rooting_offset)
+    }
+
     /// Returns whether every zone is non-empty, rooted at the coverage start, and
     /// the zone names are strictly ascending, so a lookup is a binary search.
+    ///
+    /// A zone carrying a sub-minute offset is exempt from the non-empty and
+    /// rooted conditions, because its timeline is deliberately not accumulated
+    /// at all. Its instants are still range- and order-checked per line while the
+    /// table is parsed, and the name ordering every zone is subject to is what
+    /// keeps the refusal addressable.
     fn is_structurally_sound(zones: &[ZoneTimeline]) -> bool {
-        zones
-            .iter()
-            .all(|zone| !zone.events.is_empty() && zone.events[0].0 == ZONE_TABLE_START_SECONDS)
-            && !zones.windows(2).any(|pair| pair[0].name >= pair[1].name)
+        zones.iter().all(|zone| {
+            zone.sub_minute_offset_seconds.is_some()
+                || (!zone.events.is_empty() && zone.events[0].0 == ZONE_TABLE_START_SECONDS)
+        }) && !zones.windows(2).any(|pair| pair[0].name >= pair[1].name)
     }
 
-    /// Returns the closed timeline of one named zone.
+    /// Returns the closed timeline of one named zone, in canonical minutes.
+    ///
+    /// A zone the pinned table carries but whose canonical timeline cannot be
+    /// built is refused here, by name and with the raw second value it actually
+    /// carries. That refusal is deliberately distinct from
+    /// [`ZoneTableError::UnknownZone`]: the zone exists in the pinned release, and
+    /// reporting it as absent would hide a real zone behind a spelling error.
     fn timeline(&self, zone: &str) -> Result<&[(i64, i32)], ZoneTableError> {
-        self.zones
+        let index = self
+            .zones
             .binary_search_by(|candidate| candidate.name.cmp(zone))
-            .map(|index| self.zones[index].events.as_slice())
-            .map_err(|_| ZoneTableError::UnknownZone)
+            .map_err(|_| ZoneTableError::UnknownZone)?;
+        let found = &self.zones[index];
+        if let Some(offset_seconds) = found.sub_minute_offset_seconds {
+            return Err(ZoneTableError::SubMinuteOffset(SubMinuteOffset {
+                zone: found.name,
+                offset_seconds,
+            }));
+        }
+        Ok(found.events.as_slice())
     }
 
-    /// Returns the offset in force at `instant_seconds`.
+    /// Returns the offset in force at `instant_seconds`, in canonical minutes.
     fn offset_at(&self, zone: &str, instant_seconds: i64) -> Result<i32, ZoneTableError> {
         if !(ZONE_TABLE_START_SECONDS..ZONE_TABLE_END_EXCLUSIVE_SECONDS).contains(&instant_seconds)
         {
@@ -301,6 +462,9 @@ impl ZoneTable {
 /// clock is unreachable from either side of it, which is the shared shape of a
 /// fold and a gap: the clock resolves through the offset before the transition,
 /// through the offset after it, or through neither.
+///
+/// `events` is in canonical minutes, so each offset reaches an instant through
+/// [`SECONDS_PER_MINUTE`].
 fn bracketing_transition(events: &[(i64, i32)], local_unix_seconds: i64) -> Option<ZoneTransition> {
     for (index, (instant, post)) in events.iter().enumerate().skip(1) {
         let pre = events[index - 1].1;
@@ -337,9 +501,26 @@ fn parse_i64(value: &str) -> Result<i64, ZoneTableError> {
     value.parse::<i64>().map_err(|_| ZoneTableError::Integrity)
 }
 
-/// Parses a signed decimal minute offset from the table body.
-fn parse_i32(value: &str) -> Result<i32, ZoneTableError> {
+/// Parses one offset exactly as the table states it, in its declared unit.
+fn parse_offset_seconds(value: &str) -> Result<i32, ZoneTableError> {
     value.parse::<i32>().map_err(|_| ZoneTableError::Integrity)
+}
+
+/// Converts one table offset from the table's declared wire unit into the
+/// canonical internal unit, or returns `None` when it does not divide exactly.
+///
+/// This is the only place the wire unit is converted, and it is called only from
+/// the parse boundary. Dividing is not a rounding rule here: a non-zero remainder
+/// is `None`, so the pinned `Africa/Monrovia` `-0:44:30` reaches no lookup as
+/// `-44` or `-45`. Truncating it would put the same unit defect one layer down,
+/// where a zone's answers would silently disagree with the release the table
+/// claims to carry.
+fn offset_seconds_to_minutes(offset_seconds: i32) -> Option<i32> {
+    let seconds = i64::from(offset_seconds);
+    if seconds % SECONDS_PER_MINUTE != 0 {
+        return None;
+    }
+    i32::try_from(seconds / SECONDS_PER_MINUTE).ok()
 }
 
 /// Returns the verified table, verifying the embedded bytes on first use.
@@ -370,12 +551,20 @@ fn pinned_table() -> Result<&'static ZoneTable, ZoneTableError> {
 ///
 /// This is the whole of zone admission. A name the pinned release does not
 /// define, a withheld zone, and a spelled pair that resembles a real one are all
-/// absent here, so all of them are refused identically.
+/// absent here, so all of them are refused identically. A zone the pinned release
+/// does define but whose canonical timeline cannot be built is absent here for a
+/// different and separately reported reason, and is refused too.
 pub(crate) fn is_pinned_zone(zone: &str) -> bool {
     pinned_table().is_ok_and(|table| table.timeline(zone).is_ok())
 }
 
-/// Returns the offset in force in `zone` at `instant_seconds`.
+/// Returns the offset in force in `zone` at `instant_seconds`, in minutes east of
+/// UTC.
+///
+/// The table stores that offset in seconds; the conversion to minutes happened
+/// once, while the table was parsed. The value returned here is therefore the same
+/// unit as [`crate::user_automation::NormalizedOccurrence::offset_minutes`], and
+/// multiplying it by 60 reaches the instant it applies at.
 pub(crate) fn offset_minutes_at(zone: &str, instant_seconds: i64) -> Result<i32, ZoneTableError> {
     pinned_table()?.offset_at(zone, instant_seconds)
 }
@@ -385,7 +574,10 @@ pub(crate) fn offset_minutes_at(zone: &str, instant_seconds: i64) -> Result<i32,
 /// `local_unix_seconds` is the local wall clock read as if it were UTC, which is
 /// the same reading the occurrence record's local field already gives. The
 /// distinct offsets the zone actually uses are tried against it, so the answer
-/// is exact rather than a search for one transition.
+/// is exact rather than a search for one transition. Those offsets are in
+/// canonical minutes, so each candidate instant is
+/// `local_unix_seconds - offset * SECONDS_PER_MINUTE`: the arithmetic below is
+/// minutes in, seconds out, with no unit smuggled through it.
 pub(crate) fn classify_local_clock(
     zone: &str,
     local_unix_seconds: i64,

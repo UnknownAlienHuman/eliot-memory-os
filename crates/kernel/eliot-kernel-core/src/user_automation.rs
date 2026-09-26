@@ -120,6 +120,14 @@ pub enum UserAutomationError {
     /// define, a zone whose expansion could not be proven against an independent
     /// implementation, and a spelled pair that merely resembles a real one are
     /// all refused here. No zone is ever resolved from its spelling.
+    ///
+    /// A zone the pinned release does define, but whose pinned offsets cannot be
+    /// stated exactly in this contract's canonical offset unit, is refused here as
+    /// well rather than answered from a truncated offset. `Africa/Monrovia` is
+    /// the one such zone in this release: it applied `-0:44:30` until 1972, and
+    /// minutes cannot hold that value. The zone is reported here because from this
+    /// boundary the two cases are the same answer: this contract has no
+    /// minute-valued zone evidence to offer for it.
     #[error("normalized occurrence names a zone the pinned zone table does not carry: {0}")]
     UnknownZone(&'static str),
     /// The pinned zone database revision is not the one this build carries.
@@ -1074,7 +1082,8 @@ fn map_zone_error(
 ) -> UserAutomationError {
     match error {
         user_automation_zones::ZoneTableError::Integrity => UserAutomationError::ZoneTableIntegrity,
-        user_automation_zones::ZoneTableError::UnknownZone => {
+        user_automation_zones::ZoneTableError::UnknownZone
+        | user_automation_zones::ZoneTableError::SubMinuteOffset(_) => {
             UserAutomationError::UnknownZone(field)
         }
         user_automation_zones::ZoneTableError::OutsideCoverage => {
@@ -1094,7 +1103,10 @@ fn map_zone_error(
 /// the names an independent implementation of the same data confirmed. So a
 /// spelled pair that names no database zone is refused, and so is a name that
 /// merely resembles one: `America/Nowhere_City` and `Foo/Bar` are absent for
-/// exactly the same reason as each other.
+/// exactly the same reason as each other. A zone the release does define, but
+/// whose pinned offsets this contract's canonical offset unit cannot state
+/// exactly, is absent too, and is refused rather than answered from a truncated
+/// offset.
 fn is_canonical_zone_identity(zone: &str) -> bool {
     !zone.is_empty()
         && zone.len() <= MAX_ZONE_IDENTITY_BYTES
