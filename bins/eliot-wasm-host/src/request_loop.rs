@@ -947,6 +947,18 @@ enum FollowUp {
     Reconciled,
 }
 
+/// Explicit loop phase (#2785): intake runs only while `Running`; close or
+/// exhaustion moves to `Draining`, an idled worker to `Drained`, and the
+/// joined worker to `ShutDown`. Admission open/closed stays the existing
+/// `LifecycleFlags.closed` bit plus the published/denial terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopPhase {
+    Running,
+    Draining,
+    Drained,
+    ShutDown,
+}
+
 /// Bounded lifecycle flags of the loop. Grouped so no single struct carries
 /// an unbounded set of independent booleans.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -986,6 +998,7 @@ pub struct BoundedRequestLoop {
     queued: Option<WorkerCommand>,
     /// Retained frame to republish when a request is an exact replay.
     replay: Option<WasmHostResultFrame>,
+    phase: LoopPhase,
     lifecycle: LifecycleFlags,
     published: Option<WasmHostResultFrame>,
     denial: Option<LoopError>,
@@ -1004,6 +1017,7 @@ impl BoundedRequestLoop {
             retained: BTreeMap::new(),
             queued: None,
             replay: None,
+            phase: LoopPhase::Running,
             lifecycle: LifecycleFlags {
                 in_flight: false,
                 closed: false,
@@ -1032,6 +1046,30 @@ impl BoundedRequestLoop {
         self.published.is_none() && self.denial.is_none() && !self.lifecycle.closed
     }
 
+    /// Moves `Running` to `Draining`. Idempotent: every close path calls it,
+    /// so a second close is a no-op rather than a second transition.
+    fn begin_drain(&mut self) {
+        if self.phase == LoopPhase::Running {
+            self.phase = LoopPhase::Draining;
+        }
+    }
+
+    /// Moves `Draining` to `Drained` once the worker idled with nothing
+    /// queued. Idempotent over already-terminal phases.
+    fn mark_drained(&mut self) {
+        if self.phase == LoopPhase::Draining {
+            self.phase = LoopPhase::Drained;
+        }
+    }
+
+    /// Moves `Drained` to `ShutDown` once the worker handle joined.
+    /// Idempotent over already-terminal phases.
+    fn mark_shutdown(&mut self) {
+        if self.phase == LoopPhase::Drained {
+            self.phase = LoopPhase::ShutDown;
+        }
+    }
+
     /// Control phase: refresh the observed clock and close admission on a
     /// revoked or expired binding. A trap in one bounded instance never
     /// reaches this state; it is classified and the loop keeps its contract.
@@ -1039,6 +1077,7 @@ impl BoundedRequestLoop {
         self.live.observe(edge_now_ms());
         if !self.live.is_live() {
             self.lifecycle.closed = true;
+            self.begin_drain();
         }
     }
 
@@ -1079,7 +1118,10 @@ impl BoundedRequestLoop {
                 self.lifecycle.follow_up = FollowUp::Reconciled;
                 self.queued = Some(WorkerCommand::Reconcile);
             }
-            WasmHostRequest::Shutdown => self.lifecycle.closed = true,
+            WasmHostRequest::Shutdown => {
+                self.lifecycle.closed = true;
+                self.begin_drain();
+            }
         }
         Ok(())
     }
@@ -1205,10 +1247,13 @@ pub fn run_request_loop(
     let outcome = drive_loop(&mut state, &mut channel, &worker.commands, &worker.outcomes);
     // Typed shutdown: close admission, ask the worker to stop, and join it so
     // no guest work is left untracked.
+    state.begin_drain();
+    state.mark_drained();
     state.live.revoke();
     let _ = worker.commands.try_send(WorkerCommand::Shutdown);
     drop(worker.commands);
     let _ = worker.handle.join();
+    state.mark_shutdown();
     if let Some(error) = state.denial() {
         // The loop recorded the exact admission denial; report that stable
         // field rather than the transport symptom that surfaced it.
@@ -1271,6 +1316,7 @@ fn drive_loop(
             continue;
         }
         let Some(frame) = channel.next_frame()? else {
+            state.begin_drain();
             break;
         };
         if let Err(error) = state.admit(&frame) {
@@ -1278,12 +1324,14 @@ fn drive_loop(
             // transport-level refusal, so the receipt names the field that
             // actually broke the binding.
             state.denial = Some(error);
+            state.begin_drain();
             return Err(error);
         }
         if let Some(replay) = state.replay.clone() {
             state.replay = None;
             state.published = Some(replay.clone());
             channel.publish(&replay)?;
+            state.begin_drain();
             break;
         }
         if let Some(command) = state.queued {
