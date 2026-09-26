@@ -337,6 +337,9 @@ pub struct ProviderExecutionReceipt {
     pub raw: RawProviderEvidence,
     /// Cancellation receipt, retained when cancellation was actually issued.
     pub cancellation: Option<CancellationEvidence>,
+    /// What the Kernel owner answered when this process asked about the
+    /// operation's terminal classification by its stable identity.
+    pub reconciliation: ReconciliationEvidence,
     /// Retained executor evidence records (transport hash + redaction).
     pub evidence_records: Vec<ProviderEvidenceRecord>,
     /// Whether the provider `job_id` is provider-local correlation only.
@@ -364,7 +367,9 @@ impl std::fmt::Display for ProviderExecutionReceipt {
              stdout_sha256={} stdout_bytes={} stdout_omission={} stderr_sha256={} \
              stderr_bytes={} stderr_omission={} exit={:?} exit_code={} \
              descendants_complete={} cancelled={} cancel_status={} \
-             no_effect_proven={} evidence_records={} provider_job_ref={} \
+             no_effect_proven={} reconciliation_attempts={} \
+             owner_confirmed={} cancellation_unconfirmed={} reconciliation={} \
+             evidence_records={} provider_job_ref={} \
              candidate_sha256={} candidate_only={}",
             self.operation_id,
             self.exchange_id,
@@ -401,6 +406,14 @@ impl std::fmt::Display for ProviderExecutionReceipt {
             self.cancellation
                 .as_ref()
                 .is_some_and(|receipt| receipt.no_effect_proven),
+            self.reconciliation.attempts.len(),
+            self.reconciliation.owner_confirmed(),
+            self.reconciliation.leaves_cancellation_unconfirmed(
+                self.cancellation
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.no_effect_proven),
+            ),
+            self.reconciliation.summary(),
             self.evidence_records.len(),
             self.provider_job_ref.as_deref().unwrap_or("none"),
             self.candidate_sha256.as_deref().unwrap_or("none"),
@@ -416,6 +429,160 @@ fn omission_name(omission: Option<StreamOmission>) -> &'static str {
         Some(StreamOmission::NoHandle) => "no_handle",
         Some(StreamOmission::IncompleteCapture) => "incomplete_capture",
         Some(StreamOmission::TruncatedAtCeiling) => "truncated_at_ceiling",
+    }
+}
+
+/// One control operation this process actually sent to the Kernel owner, and
+/// the owner's own typed answer to it.
+///
+/// Issue #24 requires an unknown provider outcome to be reconciled "by stable
+/// operation identity" and to stay explicit when it cannot be. Before this
+/// fragment existed the provider asserted `UNKNOWN_OUTCOME` locally and never
+/// consulted the owner that holds the operation, so a receipt could not
+/// distinguish "the owner says the outcome is unreconcilable" from "nobody
+/// asked". Each attempt therefore carries the owner's own sealed disposition
+/// verbatim.
+///
+/// A transport failure is recorded as a transport failure and is never
+/// laundered into a disposition the owner did not issue, and a non-success
+/// disposition is never promoted into a completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerReconciliationAttempt {
+    /// The control operation actually sent (`status`/`cancel`/`reconcile`).
+    pub control_operation: &'static str,
+    /// The owner's typed disposition, when the owner answered at all.
+    pub disposition: Option<eliot_kernel_service::ResearchProviderDisposition>,
+    /// The exact owner-issued reason code carried by that disposition.
+    pub reason_code: Option<String>,
+    /// Digest of the sealed owner receipt the client re-verified.
+    pub receipt_sha256: Option<String>,
+    /// Typed transport refusal when the owner could not be reached.
+    pub transport_failure: Option<String>,
+}
+
+impl OwnerReconciliationAttempt {
+    /// Records the owner's sealed answer to one served control operation.
+    #[must_use]
+    pub fn answered(
+        control_operation: &'static str,
+        receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
+    ) -> Self {
+        Self {
+            control_operation,
+            disposition: Some(receipt.disposition),
+            reason_code: Some(receipt.reason_code.clone()),
+            receipt_sha256: Some(receipt.receipt_digest.clone()),
+            transport_failure: None,
+        }
+    }
+
+    /// Records that the control operation never reached the owner.
+    ///
+    /// `detail` is the typed client error text. It is evidence that the
+    /// reconciliation was attempted and unreachable, never a substitute
+    /// disposition.
+    #[must_use]
+    pub fn untransportable(control_operation: &'static str, detail: String) -> Self {
+        Self {
+            control_operation,
+            disposition: None,
+            reason_code: None,
+            receipt_sha256: None,
+            transport_failure: Some(detail),
+        }
+    }
+
+    /// Whether the owner served this attempt with a verified receipt.
+    #[must_use]
+    pub fn is_owner_answered(&self) -> bool {
+        self.disposition.is_some() && self.transport_failure.is_none()
+    }
+}
+
+/// Every owner reconciliation this run performed for one admitted operation.
+///
+/// An empty vector is itself evidence: it records that the operation reached a
+/// positive terminal outcome and no reconciliation was required. It is not the
+/// same as a vector whose every entry failed to reach the owner.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReconciliationEvidence {
+    /// Control operations the owner served, in attempt order.
+    pub attempts: Vec<OwnerReconciliationAttempt>,
+}
+
+impl ReconciliationEvidence {
+    /// Records that no reconciliation was required for a settled operation.
+    #[must_use]
+    pub const fn not_required() -> Self {
+        Self {
+            attempts: Vec::new(),
+        }
+    }
+
+    /// Whether the owner confirmed any terminal classification at all.
+    ///
+    /// `false` means the terminal outcome rests on local evidence only, which
+    /// is why the receipt keeps an explicit unknown rather than a completion.
+    #[must_use]
+    pub fn owner_confirmed(&self) -> bool {
+        self.attempts.iter().any(OwnerReconciliationAttempt::is_owner_answered)
+    }
+
+    /// Returns the owner's disposition for one control operation, if served.
+    #[must_use]
+    pub fn disposition_of(
+        &self,
+        control_operation: &'static str,
+    ) -> Option<eliot_kernel_service::ResearchProviderDisposition> {
+        self.attempts
+            .iter()
+            .find(|attempt| attempt.control_operation == control_operation)
+            .and_then(|attempt| attempt.disposition)
+    }
+
+    /// Whether a cancellation was issued whose no-effect could not be proven
+    /// and whose owner confirmation is absent.
+    ///
+    /// This is the only condition under which the research-provider vocabulary's
+    /// own `CANCELLATION_UNCONFIRMED` reason code is correct. Using it for a
+    /// plain unknown outcome would collapse two different states into one code.
+    #[must_use]
+    pub fn leaves_cancellation_unconfirmed(&self, no_effect_proven: bool) -> bool {
+        !no_effect_proven
+            && !self
+                .disposition_of(eliot_kernel_service::RESEARCH_PROVIDER_CANCEL_OPERATION)
+                .is_some_and(|disposition| disposition.admits())
+    }
+
+    /// Renders the attempts as a bounded, secret-free summary.
+    ///
+    /// The provider receipt is this process's product, so a reader of it must be
+    /// able to tell "the owner declined to classify this" from "the owner was
+    /// never reached" without joining against anything else. Only the control
+    /// operation, the owner's own disposition or transport refusal, and the
+    /// owner-issued reason code appear; no receipt body, provider prose or
+    /// credential is ever projected.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        if self.attempts.is_empty() {
+            return "none".to_owned();
+        }
+        self.attempts
+            .iter()
+            .map(|attempt| {
+                let reason = attempt.reason_code.as_deref().unwrap_or("none");
+                match (attempt.disposition, attempt.transport_failure.as_deref()) {
+                    (Some(disposition), _) => {
+                        format!("{}:{disposition:?}:{reason}", attempt.control_operation)
+                    }
+                    (None, Some(detail)) => {
+                        format!("{}:unreached:{detail}", attempt.control_operation)
+                    }
+                    (None, None) => format!("{}:unanswered:{reason}", attempt.control_operation),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 

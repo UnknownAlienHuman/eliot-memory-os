@@ -25,9 +25,12 @@ use eliot_kernel_service::{RESEARCH_PROVIDER_DISPATCH_OPERATION, ResearchProvide
 use eliot_mod_research::admission::ProviderAdmission;
 use eliot_mod_research::dispatch_authority::{AdmittedRequestPort, ProviderEvidenceRecorder};
 use eliot_mod_research::dispatched_material::{AdmittedOperation, read_admitted_material};
-use eliot_mod_research::evidence::{CancellationEvidence, ProviderExecutionReceipt};
+use eliot_mod_research::evidence::{
+    CancellationEvidence, OwnerReconciliationAttempt, ProviderExecutionReceipt,
+    ReconciliationEvidence,
+};
 use eliot_mod_research::execution::ProviderBridge;
-use eliot_mod_research::kernel_client::ResearchKernelClient;
+use eliot_mod_research::kernel_client::{ResearchKernelClient, ResearchKernelClientError};
 use eliot_mod_research::{
     BridgeIdentity, RESEARCH_SOURCE_UNAVAILABLE, RawProviderEvidence, ResearchDispatchAuthority,
     SubmissionRecord, compose_admitted, project_admitted_inquiry,
@@ -164,6 +167,9 @@ fn run() -> Result<String, Failure> {
             eliot_mod_research::ProviderOutcome::Completed,
             eliot_kernel_service::REASON_RUNTIME_FAILED,
             records,
+            // A positive terminal outcome needs no owner reconciliation, and the
+            // empty attempt list records that fact rather than hiding it.
+            ReconciliationEvidence::not_required(),
         );
         report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
         return Ok(receipt.to_string());
@@ -172,7 +178,34 @@ fn run() -> Result<String, Failure> {
     // materialized before the failure, and the cancellation receipt. A failure
     // that never reached the executor is still an acquisition gap, never a
     // Researcher semantic failure.
+    //
+    // A non-success terminal state is reconciled against the owner that holds
+    // the operation before it is reported, so the receipt distinguishes an
+    // owner-attested classification from a local guess.
     let failure = bridge.last_failure();
+    let outcome =
+        failure.map_or(eliot_mod_research::ProviderOutcome::Unknown, |terminal| {
+            terminal.outcome
+        });
+    let reconciliation = reconcile_with_owner(
+        &client,
+        &admitted,
+        bridge.last_cancellation(),
+        outcome,
+    );
+    let no_effect_proven = bridge
+        .last_cancellation()
+        .is_some_and(|receipt| receipt.no_effect_proven);
+    let reason_code = if reconciliation.leaves_cancellation_unconfirmed(no_effect_proven) {
+        // The provider's own vocabulary names this state and nothing else
+        // produced it: a cancellation whose no-effect is unproven and which the
+        // owner did not confirm is not the same fact as a plain unknown.
+        eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED
+    } else {
+        failure.map_or(eliot_kernel_service::REASON_UNKNOWN_OUTCOME, |terminal| {
+            terminal.reason_code
+        })
+    };
     let receipt = terminal_receipt(
         &admitted,
         &client_receipt,
@@ -182,13 +215,10 @@ fn run() -> Result<String, Failure> {
         bridge.last_submission(),
         bridge.last_provider_job_ref().cloned(),
         None,
-        failure.map_or(eliot_mod_research::ProviderOutcome::Unknown, |terminal| {
-            terminal.outcome
-        }),
-        failure.map_or(eliot_kernel_service::REASON_UNKNOWN_OUTCOME, |terminal| {
-            terminal.reason_code
-        }),
+        outcome,
+        reason_code,
         records,
+        reconciliation,
     );
     report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
     Err(Failure::Degraded(Box::new(receipt)))
@@ -302,6 +332,85 @@ fn admit(
     .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))
 }
 
+/// Asks the Kernel owner what it still holds for this operation, and records
+/// exactly what it answered.
+///
+/// This process reached a terminal state it cannot classify on its own evidence
+/// alone. Issue #24 requires that outcome to be reconciled "by stable
+/// operation identity" against the owner rather than asserted locally, and that
+/// a cancellation whose effect is unproven stays `CANCELLATION_UNCONFIRMED`
+/// instead of decaying into a generic unknown. The owner is asked through the
+/// existing authenticated Kernel client; no new wire, port or side door is
+/// introduced, and the owner's closed disposition vocabulary is preserved
+/// verbatim.
+///
+/// Three questions are asked, each only where it is meaningful:
+/// - `status` always, because it is the owner's answer to "do you still hold
+///   this operation, and what class is it in";
+/// - `cancel` only when a cancellation was actually issued and its receipt
+///   could not prove no effect, so a fresh control request never manufactures a
+///   cancellation that the run did not perform;
+/// - `reconcile` only while the local outcome is still unknown, because that is
+///   the only state the owner is being asked to reconcile.
+///
+/// A control operation the owner does not serve is answered honestly as
+/// `Unavailable`/`CAPABILITY_UNAVAILABLE` and recorded as such: an absent
+/// confirmation lowers a claim, it never raises one. Transport failures are
+/// recorded as transport failures and never rendered as a disposition.
+fn reconcile_with_owner(
+    client: &ResearchKernelClient,
+    admitted: &AdmittedOperation,
+    cancellation: Option<&CancellationEvidence>,
+    outcome: eliot_mod_research::ProviderOutcome,
+) -> ReconciliationEvidence {
+    let mut attempts = Vec::new();
+    let dispatch = &admitted.dispatch;
+
+    ask_control_operation(
+        &mut attempts,
+        client,
+        eliot_kernel_service::RESEARCH_PROVIDER_STATUS_OPERATION,
+        |client| client.status(dispatch),
+    );
+    if cancellation.is_some_and(|receipt| !receipt.no_effect_proven) {
+        ask_control_operation(
+            &mut attempts,
+            client,
+            eliot_kernel_service::RESEARCH_PROVIDER_CANCEL_OPERATION,
+            |client| client.cancel(dispatch),
+        );
+    }
+    if outcome == eliot_mod_research::ProviderOutcome::Unknown {
+        ask_control_operation(
+            &mut attempts,
+            client,
+            eliot_kernel_service::RESEARCH_PROVIDER_RECONCILE_OPERATION,
+            |client| client.reconcile(dispatch),
+        );
+    }
+    ReconciliationEvidence { attempts }
+}
+
+/// Sends one control operation and records the owner's answer verbatim.
+///
+/// The owner's disposition is never rewritten and a transport refusal never
+/// becomes a disposition, so the receipt can always be read as "this is what
+/// the owner said, or that it was never reached".
+fn ask_control_operation(
+    attempts: &mut Vec<OwnerReconciliationAttempt>,
+    client: &ResearchKernelClient,
+    operation: &'static str,
+    send: impl FnOnce(&ResearchKernelClient) -> Result<
+        eliot_kernel_service::ResearchProviderDispatchReceipt,
+        ResearchKernelClientError,
+    >,
+) {
+    attempts.push(match send(client) {
+        Ok(receipt) => OwnerReconciliationAttempt::answered(operation, &receipt),
+        Err(error) => OwnerReconciliationAttempt::untransportable(operation, error.to_string()),
+    });
+}
+
 /// Builds the terminal receipt for one bounded operation.
 #[allow(clippy::too_many_arguments)]
 fn terminal_receipt(
@@ -316,6 +425,7 @@ fn terminal_receipt(
     outcome: eliot_mod_research::ProviderOutcome,
     reason_code: &'static str,
     records: Vec<eliot_mod_research::ProviderEvidenceRecord>,
+    reconciliation: ReconciliationEvidence,
 ) -> ProviderExecutionReceipt {
     let dispatch = &admitted.dispatch;
     ProviderExecutionReceipt {
@@ -348,6 +458,7 @@ fn terminal_receipt(
             )
         }),
         cancellation,
+        reconciliation,
         evidence_records: records,
         provider_job_ref: provider_job_ref.or(job_id),
         candidate_sha256: None,
