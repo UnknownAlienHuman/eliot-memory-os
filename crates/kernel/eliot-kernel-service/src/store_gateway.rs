@@ -229,10 +229,10 @@ fn retained_terminal_evidence(
 /// preserving the outcome it actually recorded.
 fn dreamer_dispositioned(
     idempotency_key: &str,
-    record: UnknownCommitRecord,
+    record: &UnknownCommitRecord,
 ) -> Result<DreamerCommitUncertain, String> {
     let (outcome, evidence_receipt_digest) =
-        retained_terminal_evidence(idempotency_key, &record).map_err(|error| error.to_string())?;
+        retained_terminal_evidence(idempotency_key, record).map_err(|error| error.to_string())?;
     Ok(DreamerCommitUncertain::AlreadyDispositioned {
         idempotency_key: idempotency_key.to_owned(),
         outcome,
@@ -1400,10 +1400,10 @@ impl KernelStoreGateway {
         // when the local scope vector is empty (#2763). A permitted read and
         // the exact receipt lookup stay available: I14.24 keeps read-only
         // inspection and independent noncanonical work alive.
-        if effect == DreamerOperationEffect::Mutation {
-            if let Some(limitation) = self.pause_observation_limitation() {
-                return Err(limitation);
-            }
+        if effect == DreamerOperationEffect::Mutation
+            && let Some(limitation) = self.pause_observation_limitation()
+        {
+            return Err(limitation);
         }
 
         // Retained state is classified before new-send admission (#2764).
@@ -1771,46 +1771,66 @@ impl KernelStoreGateway {
                 },
             }));
         }
-        match classify_commit_receipt(&receipt) {
-            // A proven noncommit that the Store's own resubmission policy
-            // still allows under this identical identity. The record stays
-            // open, so it keeps owning the retry; the caller re-enters normal
-            // admission and the other-key pause check for one bounded send.
-            // A record that is already terminal cannot legally reopen, so
-            // that case never reaches here.
-            CommitRecoveryClass::KnownRollback => {
-                debug_assert!(record.is_open());
-                Ok(DreamerRetainedOutcome::SameIdentityRetryPermitted)
-            }
-            _ => {
-                let disposition = self.commit_dreamer_disposition(
+        // A proven noncommit that the Store's own resubmission policy
+        // still allows under this identical identity. The record stays
+        // open, so it keeps owning the retry; the caller re-enters normal
+        // admission and the other-key pause check for one bounded send.
+        // A record that is already terminal cannot legally reopen, so
+        // that case never reaches here.
+        if matches!(
+            classify_commit_receipt(&receipt),
+            CommitRecoveryClass::KnownRollback
+        ) {
+            debug_assert!(record.is_open());
+            Ok(DreamerRetainedOutcome::SameIdentityRetryPermitted)
+        } else {
+            Ok(DreamerRetainedOutcome::Settled(
+                self.commit_retained_disposition(
                     identity,
                     ordering_scopes,
                     outcome,
                     &evidence_receipt_digest,
-                );
-                // Converted at this typed seam for the same reason as the
-                // same-identity settle path above: the disposition path renders
-                // its own typed variant, and that exact rendering becomes the
-                // cause here rather than a blanket string-to-typed collapse.
-                if let Err(error) = disposition {
-                    return Err(CommitRecoveryError::OrsUnavailable {
-                        detail: format!(
-                            "the retained operation {key} reached receipt evidence, but its \
-                             durable disposition could not be recorded: {error}; the record stays \
-                             open and its Ordering Scopes stay paused"
-                        ),
-                    });
-                }
-                Ok(DreamerRetainedOutcome::Settled(
-                    DreamerCommitUncertain::Reconciled {
-                        idempotency_key: key.to_owned(),
-                        evidence_receipt_digest,
-                        outcome,
-                    },
-                ))
-            }
+                    key,
+                )?,
+            ))
         }
+    }
+
+    /// Commits the durable disposition for a retained operation that has now
+    /// reached receipt evidence, and reports the reconciled result.
+    ///
+    /// The disposition path renders its own typed variant to text, so the
+    /// conversion at this typed seam is made here, visibly, with that exact
+    /// rendering becoming the cause, rather than through a blanket
+    /// string-to-typed collapse.
+    fn commit_retained_disposition(
+        &self,
+        identity: &OperationIdentity,
+        ordering_scopes: &[String],
+        outcome: UnknownCommitOutcome,
+        evidence_receipt_digest: &str,
+        key: &str,
+    ) -> Result<DreamerCommitUncertain, CommitRecoveryError> {
+        let disposition = self.commit_dreamer_disposition(
+            identity,
+            ordering_scopes,
+            outcome,
+            evidence_receipt_digest,
+        );
+        if let Err(error) = disposition {
+            return Err(CommitRecoveryError::OrsUnavailable {
+                detail: format!(
+                    "the retained operation {key} reached receipt evidence, but its \
+                     durable disposition could not be recorded: {error}; the record stays \
+                     open and its Ordering Scopes stay paused"
+                ),
+            });
+        }
+        Ok(DreamerCommitUncertain::Reconciled {
+            idempotency_key: key.to_owned(),
+            evidence_receipt_digest: evidence_receipt_digest.to_owned(),
+            outcome,
+        })
     }
 
     /// Reconciles one proven Dreamer commit into the durable ORS record
@@ -1885,7 +1905,7 @@ impl KernelStoreGateway {
                             refresh_limitation: detail,
                         })
                     }
-                    _ => dreamer_dispositioned(key, record),
+                    _ => dreamer_dispositioned(key, &record),
                 };
             }
         }
@@ -2015,7 +2035,7 @@ impl KernelStoreGateway {
                 // A resolved record never reopens: the earlier evidence-backed
                 // disposition stands, so this leg neither restages the record nor
                 // pauses an Ordering Scope for a key that is already closed.
-                return dreamer_dispositioned(key, record);
+                return dreamer_dispositioned(key, &record);
             }
         }
         let record =

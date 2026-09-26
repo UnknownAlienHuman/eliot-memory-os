@@ -303,7 +303,9 @@ impl PauseLedgerBinding {
     fn of_owner(ors: Option<&RedbRecoveryStore>, revision: u64) -> Self {
         Self {
             owner: match ors {
-                Some(store) => format!("ors:{:p}", store as *const RedbRecoveryStore),
+                Some(store) => {
+                    format!("ors:{:p}", std::ptr::from_ref::<RedbRecoveryStore>(store))
+                }
                 None => "ors:absent".to_owned(),
             },
             revision,
