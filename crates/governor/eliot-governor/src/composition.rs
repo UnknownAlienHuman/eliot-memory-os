@@ -37,7 +37,8 @@ use crate::{
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
     IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError,
+    IntroductionStatus, P07AuthorityPort, P07PortError, RootTransitionActivationReceipt,
+    RootTransitionActivationRequest,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -3985,6 +3986,11 @@ pub(crate) fn evaluate_testd_verification_current(
 pub enum AuthorityActionReceipt {
     /// A validated Kernel activation receipt.
     Activation(AuthorityActivationReceipt),
+    /// A validated Kernel root-transition activation receipt. The record is
+    /// boxed because it carries the whole committed transition evidence,
+    /// which is far larger than the other two terminal receipts; the box is a
+    /// representation choice only and changes no field or proof.
+    RootTransitionActivation(Box<RootTransitionActivationReceipt>),
     /// A validated Kernel revocation receipt.
     Revocation(AuthorityRevocationReceipt),
     /// The three durable phases of one reconciled grant revocation. A grant
@@ -6013,6 +6019,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             PresentedAuthorityRequest::IntroductionRevocation(request) => self
                 .revoke_introduction(&request)
                 .map(AuthorityActionReceipt::Revocation),
+            PresentedAuthorityRequest::RootTransition(request) => self
+                .activate_root_transition(&request)
+                .map(|receipt| AuthorityActionReceipt::RootTransitionActivation(Box::new(receipt))),
         }
     }
 
@@ -6050,6 +6059,44 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         };
         let retained = self.retain_presentation(presented)?;
         retained.note_activated(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Presents one exact root-transition activation to the retained P-07 port
+    /// and records `Pending -> Active` only after the exact transition receipt
+    /// validates `Committed` against the retained request.
+    ///
+    /// Fail-closed behavior:
+    /// - Without a retained port, or when the composition is not ready, no
+    ///   crossing is presented.
+    /// - A second presentation on an already-recorded active identity fails
+    ///   closed instead of minting a second transition.
+    /// - An `UnknownOutcome` retains the exact request with its owner snapshot
+    ///   until exact reconciliation; the crossing stays unadmitted, never
+    ///   active.
+    /// - A receipt bound to another snapshot or epoch, a receipt that
+    ///   disagrees with the retained bytes, or a non-committed disposition
+    ///   leaves the retained state untouched.
+    pub fn activate_root_transition(
+        &mut self,
+        request: &RootTransitionActivationRequest,
+    ) -> Result<RootTransitionActivationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::RootTransition(Box::new(request.clone()));
+        self.require_admissible_transition(&presented)?;
+        let receipt = match port.activate_root_transition(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        let retained = self.retain_presentation(presented)?;
+        retained.note_transition_activated(&receipt)?;
         Ok(receipt)
     }
 
@@ -6321,6 +6368,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.recovered_grant_status(&request.grant_id) != Some(GrantStatus::PendingActivation) {
             return Err(CompositionError::Authority(P07PortError::InvalidBinding));
         }
+        if let Some(retained) = self
+            .authority_presentations
+            .get(presented.ledger_key().as_str())
+            && matches!(retained.state(), AuthorityPresentationState::Active { .. })
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        Ok(())
+    }
+
+    /// Resolves the transition identity for an activation presentation: an
+    /// already-recorded active identity fails closed before any transport is
+    /// touched, so a lost acknowledgement can reconcile but never mint a
+    /// second transition.
+    fn require_admissible_transition(
+        &self,
+        presented: &PresentedAuthorityRequest,
+    ) -> Result<(), CompositionError> {
+        let PresentedAuthorityRequest::RootTransition(_) = presented else {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        };
         if let Some(retained) = self
             .authority_presentations
             .get(presented.ledger_key().as_str())

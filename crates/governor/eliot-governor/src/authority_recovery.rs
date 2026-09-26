@@ -15,11 +15,12 @@
 use super::CompositionError;
 use crate::owner_closure_provider::AdmittedHydrationsSnapshot;
 use eliot_authority::{
-    EffectAuthorizer, EffectAuthorizerRecoverySnapshot, GRANT_GRAPH_RECOVERY_SCHEMA,
-    GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot, GrantRevocationRequest,
-    GrantStatus, IntroductionActivationRequest, IntroductionRevocationRequest, IntroductionStatus,
-    LEGACY_GRANT_GRAPH_RECOVERY_VERSION, P07PortError, RevocationHistoryEvidence, SnapshotId,
-    SuppressedGrant,
+    AuthorityError, EffectAuthorizer, EffectAuthorizerRecoverySnapshot,
+    GRANT_GRAPH_RECOVERY_SCHEMA, GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot,
+    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
+    IntroductionRevocationRequest, IntroductionStatus, LEGACY_GRANT_GRAPH_RECOVERY_VERSION,
+    P07PortError, RevocationHistoryEvidence, RootTransitionActivationReceipt,
+    RootTransitionActivationRequest, SnapshotId, SuppressedGrant,
 };
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_receipts::AuthorityBinding;
@@ -715,6 +716,10 @@ pub enum PresentedAuthorityRequest {
     GrantRevocation(GrantRevocationRequest),
     IntroductionActivation(IntroductionActivationRequest),
     IntroductionRevocation(IntroductionRevocationRequest),
+    /// Boxed because the transition request carries the whole bound
+    /// operation; the box is a representation choice only and changes no
+    /// field or proof.
+    RootTransition(Box<RootTransitionActivationRequest>),
 }
 
 impl PresentedAuthorityRequest {
@@ -726,6 +731,7 @@ impl PresentedAuthorityRequest {
             Self::GrantRevocation(request) => &request.snapshot_id,
             Self::IntroductionActivation(request) => &request.snapshot_id,
             Self::IntroductionRevocation(request) => &request.snapshot_id,
+            Self::RootTransition(request) => request.snapshot_id(),
         }
     }
 
@@ -737,11 +743,12 @@ impl PresentedAuthorityRequest {
             Self::GrantRevocation(request) => &request.binding,
             Self::IntroductionActivation(request) => &request.binding,
             Self::IntroductionRevocation(request) => &request.binding,
+            Self::RootTransition(request) => request.binding(),
         }
     }
 
     /// Returns the retention-ledger key, namespacing grants from introductions
-    /// so one identity can never alias the other family.
+    /// from transitions so one identity can never alias another family.
     #[must_use]
     pub fn ledger_key(&self) -> String {
         match self {
@@ -753,6 +760,7 @@ impl PresentedAuthorityRequest {
             Self::IntroductionRevocation(request) => {
                 format!("introduction:{}", request.introduction_id)
             }
+            Self::RootTransition(request) => request.ledger_key(),
         }
     }
 
@@ -877,6 +885,37 @@ impl RetainedAuthorityRequest {
         }
     }
 
+    /// Records a validated transition activation receipt for the exact retained
+    /// transition. Only a `Committed` receipt whose every committed field
+    /// agrees with the retained request moves the presentation to `Active`; a
+    /// receipt bound to another snapshot or epoch, a receipt that disagrees
+    /// with the retained bytes, or a second activation on a recorded identity
+    /// fails closed without touching the retained state.
+    pub fn note_transition_activated(
+        &mut self,
+        receipt: &RootTransitionActivationReceipt,
+    ) -> Result<(), CompositionError> {
+        let PresentedAuthorityRequest::RootTransition(request) = &self.request else {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        };
+        self.check_receipt_binding(
+            receipt.kernel_activation.snapshot_id.as_str(),
+            &receipt.kernel_activation.authority_epoch,
+        )?;
+        receipt
+            .validate(request)
+            .map_err(|error| CompositionError::Authority(map_transition_receipt_error(&error)))?;
+        match self.state {
+            AuthorityPresentationState::Pending | AuthorityPresentationState::UnknownOutcome => {
+                self.state = AuthorityPresentationState::Active {
+                    activation_id: receipt.kernel_activation.activation_id.clone(),
+                };
+                Ok(())
+            }
+            _ => Err(CompositionError::Authority(P07PortError::InvalidBinding)),
+        }
+    }
+
     /// Records that Kernel revoked first while canonical reconciliation did
     /// not complete. This wipes any live reading and strictly blocks effects;
     /// it never reports an active right.
@@ -945,5 +984,19 @@ impl RetainedAuthorityRequest {
             return Err(CompositionError::Authority(P07PortError::InvalidBinding));
         }
         Ok(())
+    }
+}
+
+/// Maps a refused transition receipt onto the typed P-07 vocabulary.
+///
+/// A receipt that does not commit the exact presented operation is an identity
+/// conflict, never a silent success: the caller re-serves fresh state instead
+/// of retrying the same operation under a new request. This mirrors the daemon
+/// adapter's `map_transition_validation_error` at the same boundary.
+fn map_transition_receipt_error(error: &AuthorityError) -> P07PortError {
+    match error {
+        AuthorityError::IdentityConflict => P07PortError::IdentityConflict,
+        AuthorityError::P07Unavailable => P07PortError::Unavailable,
+        _ => P07PortError::InvalidBinding,
     }
 }
