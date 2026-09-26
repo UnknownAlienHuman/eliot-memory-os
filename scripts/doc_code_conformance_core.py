@@ -255,11 +255,25 @@ def workflow_findings(
 ) -> tuple[list[Finding], dict[str, int]]:
     section = cfg["workflows"]
     directory = root / norm(str(section["directory"]))
-    allowed = set(strings(section["allowed_events"], "workflows.allowed_events"))
+    allowed_default = set(strings(section["allowed_events"], "workflows.allowed_events"))
+    # Closed per-workflow exceptions (accepted issue #3004): each entry names
+    # one workflow file whose exact allowed event set differs from the
+    # dispatch-only default. Unknown exception shapes fail closed.
+    allowed_by_file: dict[str, set[str]] = {}
+    raw_exceptions = section.get("exceptions", [])
+    if not isinstance(raw_exceptions, list):
+        raise AuditError("workflows.exceptions must be an array")
+    for entry in raw_exceptions:
+        if not isinstance(entry, dict) or not str(entry.get("file", "")).strip():
+            raise AuditError("workflows.exceptions entries need a non-empty file")
+        allowed_by_file[str(entry["file"]).strip()] = set(
+            strings(entry.get("allowed_events"), "workflows.exceptions.allowed_events")
+        )
     workflows = sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])
     findings: list[Finding] = []
     for path in workflows:
         events = workflow_events(text(path))
+        allowed = allowed_by_file.get(path.name, allowed_default)
         if events != allowed:
             findings.append(
                 Finding(
@@ -842,6 +856,40 @@ def self_test() -> None:
             "`ci.yml` and `policy.yml` use `workflow_dispatch` only.\n",
             encoding="utf-8",
         )
+
+        # Per-workflow trigger policy (accepted issue #3004): a non-exception
+        # workflow with an automatic trigger fails, while a declared ci.yml
+        # exception accepts exactly its event set and nothing wider.
+        other = root / ".github/workflows/policy.yml"
+        original_other = text(other)
+        other.write_text("on:\n  workflow_dispatch:\n  push:\n", encoding="utf-8")
+        expect(root, cfg, "DCC-002")
+        other.write_text(original_other, encoding="utf-8")
+
+        ci_workflow = root / ".github/workflows/ci.yml"
+        original_ci = text(ci_workflow)
+        cfg["workflows"]["exceptions"] = [
+            {
+                "file": "ci.yml",
+                "allowed_events": ["workflow_dispatch", "pull_request", "push"],
+            }
+        ]
+        ci_workflow.write_text(
+            "on:\n  workflow_dispatch:\n  pull_request:\n  push:\n", encoding="utf-8"
+        )
+        exception_findings = [
+            item for item in audit(root, cfg)[0] if item.finding_id == "DCC-002"
+        ]
+        if exception_findings:
+            raise AuditError(
+                f"declared ci.yml exception rejected its event set: {exception_findings}"
+            )
+        ci_workflow.write_text(
+            "on:\n  workflow_dispatch:\n  pull_request_target:\n", encoding="utf-8"
+        )
+        expect(root, cfg, "DCC-002")
+        ci_workflow.write_text(original_ci, encoding="utf-8")
+        del cfg["workflows"]["exceptions"]
 
         source = root / "crates/x/src/lib.rs"
         source.write_text(

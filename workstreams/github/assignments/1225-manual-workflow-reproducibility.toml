@@ -40,7 +40,7 @@ anchors = ["ARCH-MOD-03", "ARCH-GROUND-01", "ARCH-FIN-01", "ARCH-SEC-01", "ARCH-
 
 [current_source]
 confirmed = [
-  "ci.yml, repository-policy.yml and source-candidate.yml use workflow_dispatch only; this must remain.",
+  "repository-policy.yml, source-candidate.yml and integration.yml use workflow_dispatch only; this must remain. ci.yml carries the single accepted automatic exception (issue #3004: pull_request to main, push to main, manual rerun); #1225 retains immutable Action/dependency/input and general workflow reproducibility ownership over it.",
   "Third-party actions use mutable actions/checkout@v4 and actions/cache@v4 references.",
   "requirements-verification.txt pins only top-level jsonschema and not the complete distribution/hash closure.",
   "Operator builds without checked NuGet lock state or dotnet restore --locked-mode.",
@@ -59,7 +59,8 @@ primary_paths = [
   "the #13 registry/disposition consumer used by repository policy",
 ]
 forbidden = [
-  "automatic push, pull_request, schedule, release or merge triggers",
+  "automatic triggers on any workflow except the single accepted ci.yml exception (issue #3004)",
+  "pull_request_target, schedule, release, merge_group, workflow_call or repository_dispatch triggers on any workflow",
   "broad write permissions",
   "mutable third-party Action references",
   "secret-bearing logs, caches or artifacts",
@@ -101,12 +102,12 @@ what = "Execute the existing Operator checks honestly and add policy self-tests.
 how = [
   "Coordinate with #1137 to convert tests/Eliot.Operator.Tests to a standard discoverable project or invoke it explicitly with dotnet run and require its terminal success.",
   "Reject zero discovered/executed Operator checks; build-only output cannot count as test evidence.",
-  "Reject automatic triggers, mutable Action refs, unapproved owners, overbroad permissions, unlocked dependencies, stale legacy assertions and secret interpolation.",
+  "Reject non-exception automatic triggers, mutable Action refs, unapproved owners, overbroad permissions, unlocked dependencies, stale legacy assertions and secret interpolation.",
 ]
 
 [acceptance]
 criteria = [
-  "All repository workflows remain workflow_dispatch only.",
+  "Every repository workflow except ci.yml remains workflow_dispatch only; ci.yml carries the single accepted #3004 automatic exception with pull_request/push scoped to main.",
   "Every third-party Action uses an approved full commit SHA and mutable refs fail verification.",
   "Python dependency resolution is fully version/hash locked.",
   ".NET restore uses checked lock state and --locked-mode and fails on graph drift.",
@@ -118,7 +119,7 @@ criteria = [
   "Each run binds source, workflow, Actions, Python, NuGet, Cargo, toolchain and selected test/check identities.",
   "Success remains source/repository evidence only and cannot create runtime, Store, release or Product status.",
   "Permissions remain minimal and secrets are absent from arguments, summaries, caches and artifacts.",
-  "Static self-tests fail automatic triggers, mutable refs, overbroad permissions, unlocked inputs, zero test execution and stale legacy assertions.",
+  "Static self-tests fail non-exception automatic triggers, mutable refs, overbroad permissions, unlocked inputs, zero test execution where execution is claimed, and stale legacy assertions.",
 ]
 
 [verification]

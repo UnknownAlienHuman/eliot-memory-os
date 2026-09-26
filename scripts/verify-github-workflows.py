@@ -2,14 +2,21 @@
 """Verify GitHub workflows, pinned action inputs, dependency locks, and test execution.
 
 Enforces that:
-1. All workflows remain manual-only (workflow_dispatch only). Automatic triggers are rejected.
+1. Triggers follow a closed per-workflow policy (accepted issue #3004): every
+   workflow is workflow_dispatch-only except ci.yml, the sole automatic
+   compile-only merge check (workflow_dispatch, main-scoped pull_request and
+   push). pull_request_target, schedules, releases, merge queue and every
+   other automatic trigger are rejected on every workflow.
 2. Every third-party Action reference is pinned to a full 40-character commit SHA.
 3. Top-level permissions remain minimal (contents: read); broad write-all is rejected.
 4. Python verification dependencies are fully version- and hash-locked with --hash=sha256.
 5. NuGet dependencies for Eliot.Operator and the Eliot.Operator.Tests harness
    are locked with RestorePackagesWithLockFile and checked-in
    packages.lock.json files, so locked-mode restore fails on drift.
-6. Operator workflows execute the test harness (tests/Eliot.Operator.Tests) with nonzero execution.
+6. Operator coverage is classified by workflow/profile class (issue #3004):
+   MergeCompile workflows restore/build both Operator projects through the
+   shared profile with zero execution and no execution claim; every other
+   workflow that builds Eliot.Operator executes tests/Eliot.Operator.Tests.
 7. Workflow names indicate manual invocation and state bounded proof ceilings.
 8. Referenced local scripts exist on disk.
 9. Workflow pip installs consume only the hash-locked
@@ -30,6 +37,21 @@ from typing import Any
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 ACTION_REF_RE = re.compile(r"^\s*-\s*uses:\s*([^\s#]+)")
 PERMISSION_WRITE_ALL_RE = re.compile(r"^\s*permissions:\s*(?:write-all|read-all)", re.MULTILINE)
+
+# Closed per-workflow trigger policy (accepted issue #3004). Default: every
+# repository workflow is manual-only. ci.yml is the sole exception: the
+# automatic compile-only merge check.
+DEFAULT_ALLOWED_EVENTS = {"workflow_dispatch"}
+WORKFLOW_EVENT_EXCEPTIONS = {
+    "ci.yml": {"workflow_dispatch", "pull_request", "push"},
+}
+# ci.yml exception scoping: automatic events are main-only, and PR activity
+# must cover every open/update/reopen/ready transition (an absent types key
+# keeps the GitHub default, which covers them).
+CI_MAIN_BRANCHES = ["main"]
+CI_REQUIRED_PR_TYPES = {"opened", "synchronize", "reopened", "ready_for_review"}
+# Compile-only workflow/profile class marker (issue #3004 item 8).
+COMPILE_ONLY_PROFILE_MARKER = "-Profile MergeCompile"
 
 
 @dataclass(frozen=True)
@@ -69,6 +91,44 @@ def parse_workflow_events(content: str) -> set[str]:
     return set()
 
 
+def event_scalar_list(content: str, event: str, key: str) -> list[str] | None:
+    """Values under `key:` inside one top-level event block.
+
+    Returns None when the event is absent, [] when the event is present
+    without the key, otherwise the listed values (flow or block style).
+    """
+    lines = content.splitlines()
+    values: list[str] | None = None
+    in_list = False
+    for line in lines:
+        if values is None:
+            if re.match(rf"^  {re.escape(event)}:\s*(#.*)?$", line):
+                values = []
+            continue
+        if re.match(r"^  [A-Za-z_][A-Za-z0-9_-]*:\s*(#.*)?$", line):
+            break
+        if line.strip() and line == line.lstrip():
+            break
+        key_match = re.match(rf"^    {re.escape(key)}:\s*(.*)$", line)
+        if key_match:
+            tail = key_match.group(1).split("#", 1)[0].strip()
+            if tail.startswith("["):
+                return [
+                    item.strip(" '\"")
+                    for item in tail.strip("[]").split(",")
+                    if item.strip()
+                ]
+            in_list = True
+            continue
+        if in_list:
+            item_match = re.match(r"^      -\s*(\S+)", line)
+            if item_match:
+                values.append(item_match.group(1).strip("'\""))
+            elif line.strip() and not line.startswith("      ") and not line.strip().startswith("#"):
+                in_list = False
+    return values
+
+
 def check_workflows(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     workflows_dir = root / ".github" / "workflows"
@@ -91,20 +151,48 @@ def check_workflows(root: Path) -> list[Finding]:
 
         lines = content.splitlines()
 
-        # 1. Event trigger check: only workflow_dispatch allowed
+        # 1. Event trigger check: closed per-workflow policy (issue #3004).
+        # Default is workflow_dispatch-only; ci.yml is the sole automatic
+        # exception with main-scoped pull_request/push.
         events = parse_workflow_events(content)
+        allowed_events = WORKFLOW_EVENT_EXCEPTIONS.get(wf_path.name, DEFAULT_ALLOWED_EVENTS)
         if not events:
             findings.append(Finding("GWF-001", rel_path, 1, "missing 'on:' event trigger section"))
-        elif events != {"workflow_dispatch"}:
-            invalid = sorted(events - {"workflow_dispatch"})
+        elif events != allowed_events:
+            invalid = sorted(events - allowed_events)
             findings.append(
                 Finding(
                     "GWF-001",
                     rel_path,
                     1,
-                    f"unauthorized workflow triggers {invalid}; only workflow_dispatch is allowed",
+                    f"unauthorized workflow triggers {invalid} for {wf_path.name}; only {sorted(allowed_events)} allowed",
                 )
             )
+        if wf_path.name in WORKFLOW_EVENT_EXCEPTIONS:
+            for scoped_event in ("pull_request", "push"):
+                if scoped_event in events:
+                    branches = event_scalar_list(content, scoped_event, "branches")
+                    if branches != CI_MAIN_BRANCHES:
+                        findings.append(
+                            Finding(
+                                "GWF-001",
+                                rel_path,
+                                1,
+                                f"{wf_path.name} {scoped_event} must target branches {CI_MAIN_BRANCHES}",
+                            )
+                        )
+            pr_types = event_scalar_list(content, "pull_request", "types")
+            if pr_types is not None and pr_types:
+                missing_types = sorted(CI_REQUIRED_PR_TYPES - set(pr_types))
+                if missing_types:
+                    findings.append(
+                        Finding(
+                            "GWF-001",
+                            rel_path,
+                            1,
+                            f"{wf_path.name} pull_request types miss required activity {missing_types}",
+                        )
+                    )
 
         # 2. Action pin check: third-party actions must use full 40-char SHA
         for line_no, line in enumerate(lines, start=1):
@@ -147,13 +235,84 @@ def check_workflows(root: Path) -> list[Finding]:
                 )
             )
 
-        # 4. Operator execution check: build-only Operator is forbidden
+        # 4. Operator coverage check, classified by workflow/profile class
+        # (issue #3004 item 8). Compile-only MergeCompile workflows restore
+        # and build both Operator projects through the shared profile with
+        # zero execution and no execution claim. Every other workflow that
+        # builds Eliot.Operator must execute the harness (unchanged rule).
         has_operator_build = "apps/Eliot.Operator/Eliot.Operator.csproj" in content
         has_operator_test = (
             "tests/Eliot.Operator.Tests" in content
             or "Eliot.Operator.Tests.csproj" in content
         )
-        if has_operator_build and not has_operator_test:
+        # Closed compile-only class: ci.yml is the single workflow that may
+        # invoke the MergeCompile profile. repository-policy.yml names the
+        # profile only inside its own checker prose (not an invocation) and
+        # is exempt; any other file carrying the marker is rejected.
+        invokes_mergecompile = COMPILE_ONLY_PROFILE_MARKER in content
+        is_compile_only = wf_path.name == "ci.yml" and invokes_mergecompile
+        if invokes_mergecompile and wf_path.name not in ("ci.yml", "repository-policy.yml"):
+            findings.append(
+                Finding(
+                    "GWF-006",
+                    rel_path,
+                    1,
+                    f"only ci.yml may invoke {COMPILE_ONLY_PROFILE_MARKER}",
+                )
+            )
+        if is_compile_only:
+            if re.search(r"dotnet\s+(run|test|vstest)\b", content):
+                findings.append(
+                    Finding(
+                        "GWF-006",
+                        rel_path,
+                        1,
+                        "compile-only MergeCompile workflow must not execute dotnet run/test",
+                    )
+                )
+            if "Operator tests: executed" in content:
+                findings.append(
+                    Finding(
+                        "GWF-006",
+                        rel_path,
+                        1,
+                        "compile-only MergeCompile workflow must not claim Operator test execution",
+                    )
+                )
+            verify_ps1 = root / "scripts" / "verify.ps1"
+            if verify_ps1.is_file():
+                try:
+                    verify_text = verify_ps1.read_text(encoding="utf-8")
+                except Exception as exc:
+                    findings.append(
+                        Finding("GWF-006", rel_path, 1, f"cannot read scripts/verify.ps1: {exc}")
+                    )
+                    verify_text = ""
+                for need in (
+                    "dotnet restore",
+                    "dotnet build",
+                    "apps/Eliot.Operator/Eliot.Operator.csproj",
+                    "tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj",
+                ):
+                    if need not in verify_text:
+                        findings.append(
+                            Finding(
+                                "GWF-006",
+                                rel_path,
+                                1,
+                                f"MergeCompile profile lacks required Operator coverage: {need}",
+                            )
+                        )
+                if re.search(r"dotnet\s+(run|test|vstest)\b", verify_text):
+                    findings.append(
+                        Finding(
+                            "GWF-006",
+                            rel_path,
+                            1,
+                            "verify.ps1 must not execute dotnet run/test in the compile-only class",
+                        )
+                    )
+        elif has_operator_build and not has_operator_test:
             findings.append(
                 Finding(
                     "GWF-006",
@@ -163,11 +322,23 @@ def check_workflows(root: Path) -> list[Finding]:
                 )
             )
 
-        # 5. Workflow naming: must indicate manual invocation
+        # 5. Workflow naming: manual workflows must indicate manual
+        # invocation; ci.yml (the automatic exception) must instead state
+        # its compile-only ceiling.
         for line_no, line in enumerate(lines, start=1):
             if line.startswith("name:"):
                 wf_name = line.split(":", 1)[1].strip()
-                if "pull request integration" in wf_name.lower() and "manual" not in wf_name.lower():
+                if wf_path.name == "ci.yml":
+                    if "compile" not in wf_name.lower():
+                        findings.append(
+                            Finding(
+                                "GWF-007",
+                                rel_path,
+                                line_no,
+                                f"workflow name '{wf_name}' is the automatic ci.yml exception but does not state its compile-only ceiling",
+                            )
+                        )
+                elif "pull request integration" in wf_name.lower() and "manual" not in wf_name.lower():
                     findings.append(
                         Finding(
                             "GWF-007",
@@ -360,24 +531,51 @@ def verify_all(root: Path) -> list[Finding]:
 def run_self_tests() -> int:
     import tempfile
 
+    # (name, filename, workflow yaml, expected finding or None for clean[, extra files]).
+    # Negative fixtures stay on test.yml (default dispatch-only policy); the
+    # ci.yml exception and the compile-only Operator class get their own cases.
+    ci_triggers = (
+        "on:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n"
+        "    types: [opened, synchronize, reopened, ready_for_review]\n  push:\n    branches: [main]\n"
+    )
+    ci_prefix = "name: Automatic PR Merge Compile Gate\n" + ci_triggers + "permissions:\n  contents: read\n"
     test_cases = [
-        ("trigger_push", "on:\n  push:\n    branches: [main]\n", "GWF-001"),
-        ("trigger_pr", "on:\n  pull_request:\n", "GWF-001"),
-        ("mutable_action", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n", "GWF-002"),
-        ("write_all_perms", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions: write-all\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n", "GWF-003"),
-        ("build_only_operator", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj\n", "GWF-006"),
+        ("trigger_push", "test.yml", "on:\n  push:\n    branches: [main]\n", "GWF-001"),
+        ("trigger_pr", "test.yml", "on:\n  pull_request:\n", "GWF-001"),
+        ("mutable_action", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n", "GWF-002"),
+        ("write_all_perms", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions: write-all\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n", "GWF-003"),
+        ("build_only_operator", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj\n", "GWF-006"),
+        ("ci_exception_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None),
+        ("ci_pr_target_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request_target:\n    branches: [main]\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
+        ("ci_unscoped_push_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n  push:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
+        ("other_workflow_push_rejected", "policy.yml", "name: Manual Policy Gate\non:\n  workflow_dispatch:\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
+        ("mergecompile_dotnet_run_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n      - run: dotnet test tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n", "GWF-006"),
+        ("mergecompile_claim_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests\"\n", "GWF-006"),
+        ("mergecompile_clean_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None, {"scripts/verify.ps1": "# stub profile owner\ndotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode\ndotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode\ndotnet build apps/Eliot.Operator/Eliot.Operator.csproj\ndotnet build tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n"}),
+        ("mergecompile_elsewhere_rejected", "extra.yml", "name: Manual Extra Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n", "GWF-006"),
+        ("policy_checker_exempt", "repository-policy.yml", "name: Manual Repository Policy Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"asserts -Profile MergeCompile wiring\"\n", None),
     ]
 
-    for name, wf_yaml, expected_code in test_cases:
+    for case in test_cases:
+        name, filename, wf_yaml, expected_code = case[:4]
+        extra_files = case[4] if len(case) > 4 else {}
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_root = Path(tmpdir)
             wf_dir = tmp_root / ".github" / "workflows"
             wf_dir.mkdir(parents=True)
-            (wf_dir / "test.yml").write_text(wf_yaml, encoding="utf-8")
+            (wf_dir / filename).write_text(wf_yaml, encoding="utf-8")
+            for rel_extra, body_extra in extra_files.items():
+                extra_path = tmp_root / rel_extra
+                extra_path.parent.mkdir(parents=True, exist_ok=True)
+                extra_path.write_text(body_extra, encoding="utf-8")
 
             findings = check_workflows(tmp_root)
             codes = {f.code for f in findings}
-            if expected_code not in codes:
+            if expected_code is None:
+                if findings:
+                    print(f"SELF_TEST_FAILURE in {name}: expected clean, got {findings}", file=sys.stderr)
+                    return 1
+            elif expected_code not in codes:
                 print(f"SELF_TEST_FAILURE in {name}: expected finding {expected_code}, got {codes}", file=sys.stderr)
                 return 1
 
@@ -482,7 +680,7 @@ def run_self_tests() -> int:
             print(f"SELF_TEST_FAILURE: hash-locked pip install produced unexpected findings: {findings}", file=sys.stderr)
             return 1
 
-    print("GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS (12/12 cases verified)")
+    print("GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS (21/21 cases verified)")
     return 0
 
 

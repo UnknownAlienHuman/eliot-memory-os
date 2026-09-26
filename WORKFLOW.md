@@ -180,3 +180,11 @@ workspace test/Clippy/build gate is a separately invoked source-candidate or
 release operation, not a tax on every local change. A green check is not product
 acceptance: source, build, runtime, store, and Product Proof remain separate
 evidence dimensions.
+
+The required automatic check is `.github/workflows/ci.yml` (accepted issue
+#3004): it runs the closed `MergeCompile` profile owned by
+`scripts/verify.ps1` for every pull request targeting `main` and
+diagnostically for every pushed `main` commit. Its proof ceiling is
+`MERGE_COMPILE_SOURCE_ONLY`: compile-only with zero test execution and no
+lint-cleanliness claim. It never substitutes for manual `Review`,
+source-candidate, release, runtime, store, or Product acceptance.

@@ -15,6 +15,14 @@ suites) and read-only PowerShell AST queries via `pwsh -NoProfile -Command`.
 PyYAML is deliberately NOT used: it is absent from the pinned
 scripts/requirements-verification.txt and pulling an unpinned tool would
 violate the assignment. No workspace build or full Review runs here.
+
+Policy migration (accepted issue #3004): triggers follow a closed
+per-workflow rule (ci.yml is the sole automatic workflow with
+workflow_dispatch/pull_request/push; every other workflow stays
+workflow_dispatch-only) and the closed profile set is
+Quick|Review|MergeCompile with ci.yml invoking MergeCompile. Cases 750/1,
+750/3, 750/6, 750/8, 750/27, 750/32 and 750/33 assert the migrated
+contracts; all other cases are unchanged.
 """
 
 from __future__ import annotations
@@ -63,12 +71,18 @@ parse_workflow_events = vgw.parse_workflow_events
 # --------------------------------------------------------------------------
 
 ALLOWED_TRIGGER = "workflow_dispatch"
-FORBIDDEN_TRIGGER_CLASSES = [
-    "push", "pull_request", "pull_request_target", "merge_group", "schedule",
+# Closed per-workflow exception (accepted issue #3004): ci.yml is the sole
+# automatic workflow.
+CI_EXCEPTION_FILE = "ci.yml"
+CI_EXCEPTION_TRIGGERS = {"workflow_dispatch", "pull_request", "push"}
+FORBIDDEN_EVERYWHERE = [
+    "pull_request_target", "merge_group", "schedule",
     "workflow_run", "repository_dispatch", "workflow_call", "release",
     "issue", "discussion", "branch", "tag", "package", "page-build",
     "status", "watch",
 ]
+# Automatic triggers rejected on every non-exception workflow.
+FORBIDDEN_DEFAULT_TRIGGERS = ["push", "pull_request"]
 
 REVIEW_TAIL = [
     "cargo-metadata",
@@ -121,9 +135,23 @@ def fixture(name: str) -> pathlib.Path:
 
 
 def validate_trigger_events(events: set[str]) -> list[str]:
-    """Every event outside workflow_dispatch is a violation; empty is too."""
+    """Default-file rule: every event outside workflow_dispatch is a violation; empty is too."""
     if not events:
         return ["missing 'on:' event trigger section"]
+    return [f"unauthorized trigger '{name}'" for name in sorted(events)
+            if name != ALLOWED_TRIGGER]
+
+
+def validate_workflow_triggers(filename: str, events: set[str]) -> list[str]:
+    """Closed per-workflow rule (issue #3004): ci.yml carries the single
+    accepted automatic set; every other file keeps the dispatch-only default."""
+    if not events:
+        return ["missing 'on:' event trigger section"]
+    if filename == CI_EXCEPTION_FILE:
+        if events != CI_EXCEPTION_TRIGGERS:
+            return [f"ci.yml triggers {sorted(events)} are not the accepted "
+                    f"{sorted(CI_EXCEPTION_TRIGGERS)} set"]
+        return []
     return [f"unauthorized trigger '{name}'" for name in sorted(events)
             if name != ALLOWED_TRIGGER]
 
@@ -285,7 +313,7 @@ BYPASS_PATTERNS = [
     ("warning downgrade", re.compile(r"--cap-lints\s+warn|-[Aa]\s+warnings\b")),
     ("hidden retry", re.compile(r"max-retries|retry:\s*[1-9]|until:.*cargo")),
 ]
-UNQUALIFIED_VERIFY_RE = re.compile(r"verify\.ps1(?!\s+-Profile\s+(Quick|Review)\b)")
+UNQUALIFIED_VERIFY_RE = re.compile(r"verify\.ps1(?!\s+-Profile\s+(Quick|Review|MergeCompile)\b)")
 WEAKER_PROFILE_RE = re.compile(r"-Profile\s+Quick[\s\S]{0,600}REVIEW\s*:\s*PASS", re.I)
 
 
@@ -489,10 +517,12 @@ class TestVerificationProfile(unittest.TestCase):
 
     # -- triggers ------------------------------------------------------
     def test_750_01_ci_dispatch_only(self) -> None:
-        # WORK_UNIT_CASE: 750/1
+        # WORK_UNIT_CASE: 750/1 — migrated by #3004: ci.yml is the sole
+        # automatic exception with the accepted closed event set.
         events = parse_workflow_events(read_text(CI_YML))
-        self.assertEqual(events, {ALLOWED_TRIGGER},
-                         f"ci.yml events {events} are not dispatch-only")
+        self.assertEqual(events, CI_EXCEPTION_TRIGGERS,
+                         f"ci.yml events {events} are not the accepted automatic set")
+        self.assertEqual(validate_workflow_triggers("ci.yml", events), [])
 
     def test_750_02_policy_dispatch_only(self) -> None:
         # WORK_UNIT_CASE: 750/2
@@ -501,17 +531,34 @@ class TestVerificationProfile(unittest.TestCase):
                          f"repository-policy.yml events {events} are not dispatch-only")
 
     def test_750_03_forbidden_trigger_classes_rejected(self) -> None:
-        # WORK_UNIT_CASE: 750/3
-        for trigger in FORBIDDEN_TRIGGER_CLASSES:
+        # WORK_UNIT_CASE: 750/3 — migrated by #3004: per-workflow rule.
+        for trigger in FORBIDDEN_EVERYWHERE:
             with self.subTest(trigger=trigger):
                 events = parse_workflow_events(f"on:\n  {trigger}:\n")
                 self.assertTrue(validate_trigger_events(events),
                                 f"forbidden trigger '{trigger}' was not rejected")
-        for path in (CI_YML, POLICY_YML):
-            self.assertEqual(validate_trigger_events(parse_workflow_events(read_text(path))), [])
+        # pull_request_target/schedule/release-class triggers are rejected
+        # even on the exception file: only the accepted set validates there.
+        for trigger in FORBIDDEN_EVERYWHERE:
+            with self.subTest(trigger=trigger, policy="ci-exception"):
+                self.assertTrue(
+                    validate_workflow_triggers("ci.yml", CI_EXCEPTION_TRIGGERS | {trigger}),
+                    f"forbidden trigger '{trigger}' was accepted on ci.yml")
+        # Default files reject every automatic trigger, including the ones
+        # the exception file alone may carry.
+        for trigger in FORBIDDEN_DEFAULT_TRIGGERS:
+            with self.subTest(trigger=trigger, policy="default"):
+                self.assertTrue(
+                    validate_workflow_triggers("policy.yml", {ALLOWED_TRIGGER, trigger}),
+                    f"automatic trigger '{trigger}' was accepted on a default workflow")
+        self.assertEqual(
+            validate_workflow_triggers("ci.yml", parse_workflow_events(read_text(CI_YML))), [])
+        for path in (POLICY_YML, CANDIDATE_YML):
+            self.assertEqual(
+                validate_workflow_triggers(path.name, parse_workflow_events(read_text(path))), [])
         # Any other automatic trigger, present or future, is rejected too.
-        self.assertTrue(validate_trigger_events({"workflow_dispatch", "some_future_auto"}))
-        self.assertTrue(validate_trigger_events(parse_workflow_events(
+        self.assertTrue(validate_workflow_triggers("policy.yml", {"workflow_dispatch", "some_future_auto"}))
+        self.assertTrue(validate_workflow_triggers("other.yml", parse_workflow_events(
             read_text(fixture("forbidden-push.yml")))))
 
     def test_750_04_indirect_reusable_bypass_rejected(self) -> None:
@@ -544,8 +591,8 @@ class TestVerificationProfile(unittest.TestCase):
         self.assertEqual(table["errors"], 0)
         params = {p["name"]: set(p.get("validateset") or []) for p in table["params"]}
         self.assertIn("Profile", params, "verify.ps1 exposes no -Profile parameter")
-        self.assertEqual(params["Profile"], {"Quick", "Review"},
-                         "Profile is not the closed Quick|Review set")
+        self.assertEqual(params["Profile"], {"Quick", "Review", "MergeCompile"},
+                         "Profile is not the closed Quick|Review|MergeCompile set")
         probe = subprocess.run(
             ["pwsh", "-NoProfile", "-File", str(VERIFY_PS1), "-Profile", "Bogus", "-List"],
             cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=120)
@@ -570,22 +617,34 @@ class TestVerificationProfile(unittest.TestCase):
         self.assertNotIn("-Profile Quick", verify_body)
 
     def test_750_08_manual_ci_invokes_review_once(self) -> None:
-        # WORK_UNIT_CASE: 750/8 — FAILS ON BASE BY DESIGN (unqualified path; WRITER-A).
+        # WORK_UNIT_CASE: 750/8 — migrated by #3004: ci.yml is the automatic
+        # compile-only check and invokes MergeCompile exactly once. (The
+        # pre-migration Review count had drifted: main's ci.yml carried two
+        # "verify.ps1 -Profile Review" occurrences against a == 1 assertion.)
         body = read_text(CI_YML)
-        self.assertEqual(body.count("verify.ps1 -Profile Review"), 1,
-                         "manual ci.yml does not invoke Review exactly once")
-        # Correction: the summary manifest names the sole gate-definition
-        # owner (scripts/verify.ps1) without invoking it; only the `run:`
-        # line is an invocation. Require exactly one invocation (above) plus
-        # the one owner mention — a crude `== 1` on the short substring
-        # conflates a non-invocation mention with an invocation. Extra
-        # invocations (Quick/unqualified) would raise this count past 2.
-        self.assertEqual(body.count("verify.ps1"), 2,
-                         "manual ci.yml has extra verify.ps1 invocations")
+        self.assertEqual(body.count("verify.ps1 -Profile MergeCompile"), 1,
+                         "automatic ci.yml does not invoke MergeCompile exactly once")
+        # Five closed reference roles, exactly one line each: the `run:`
+        # invocation, the hashFiles cache-identity binding, the Get-FileHash
+        # receipt digest, the manifest owner mention (no -Profile flag),
+        # and the inputs digest line. Extra invocations (Review/Quick/
+        # unqualified) would raise the total past 5 or break a role.
         hits = [ln for ln in body.splitlines() if "verify.ps1" in ln]
-        self.assertEqual(len(hits), 2)
+        self.assertEqual(len(hits), 5,
+                         "automatic ci.yml verify.ps1 references are not the closed five")
+        roles = ("run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile",
+                 "hashFiles", "Get-FileHash scripts/verify.ps1",
+                 "gate-definition owner scripts/verify.ps1", "verify.ps1=$profileHash")
+        for line in hits:
+            with self.subTest(line=line.strip()[:60]):
+                self.assertTrue(any(role in line for role in roles),
+                                "verify.ps1 reference outside the closed roles")
         self.assertTrue(any(ln.strip().startswith("run:") for ln in hits),
                         "no run: invocation line carries verify.ps1")
+        self.assertNotIn("-Profile Review", body,
+                         "automatic ci.yml selects the Review profile")
+        self.assertNotIn("-Profile Quick", body,
+                         "automatic ci.yml selects the Quick profile")
 
     def test_750_09_exact_review_order(self) -> None:
         # WORK_UNIT_CASE: 750/9 — FAILS ON BASE BY DESIGN (no Review profile; WRITER-A
@@ -862,8 +921,8 @@ class TestVerificationProfile(unittest.TestCase):
         summary = "\n".join(ln for ln in body.splitlines() if "GITHUB_STEP_SUMMARY" in ln)
         self.assertRegex(summary, r"[Ss]ource\s*(SHA|sha)",
                           "summary does not bind the source identity")
-        self.assertRegex(summary, r"[Pp]rofile\s*:\s*Review",
-                          "summary does not bind the Review profile")
+        self.assertRegex(summary, r"[Pp]rofile\s*:\s*MergeCompile",
+                          "summary does not bind the MergeCompile profile")
         # Correction: a literal package count (e.g. `128`) is forbidden — it
         # rots on the next admission since admissions invalidate evidence
         # (issue #750). Assert denominator BINDING instead: the summary must
@@ -945,8 +1004,9 @@ class TestVerificationProfile(unittest.TestCase):
 
     def test_750_32_actual_manual_ci_evidence(self) -> None:
         # WORK_UNIT_CASE: 750/32 — SKIP BY DESIGN until a manual dispatch exists.
+        # Migrated by #3004: dispatched ci.yml runs MergeCompile, not Review.
         receipt = self._require_live_receipt(CI_RECEIPT_ENV, CI_RECEIPT_DEFAULT)
-        self.assertEqual(receipt.get("profile"), "Review")
+        self.assertEqual(receipt.get("profile"), "MergeCompile")
         self.assertIn(receipt.get("invocation"), {"manual-ci", "workflow-dispatch", "ci"})
         verdict, problems = validate_receipt(receipt)
         self.assertEqual(verdict, "COMPLETE", problems)
@@ -963,6 +1023,12 @@ class TestVerificationProfile(unittest.TestCase):
         except unittest.SkipTest as exc:
             self.skipTest(f"INCOMPLETE: dispatched receipt missing ({exc})")
             raise  # pragma: no cover
+        # Migrated by #3004: direct Review and dispatched MergeCompile
+        # receipts are different profiles and never comparable gate-wise.
+        if direct.get("profile") != dispatched.get("profile"):
+            self.skipTest(
+                f"INCOMPLETE: cross-profile receipts not comparable "
+                f"({direct.get('profile')} vs {dispatched.get('profile')})")
         direct_gates = [normalize_gate(g["name"]) for g in direct["gates"]]
         dispatched_gates = [normalize_gate(g["name"]) for g in dispatched["gates"]]
         self.assertEqual(direct_gates, dispatched_gates,

@@ -16,6 +16,13 @@ exists and an offline no-run build otherwise (lockless libraries).
 This verifier discovers those crates from the tree rather than a hand-written
 list, and runs fmt, clippy and the tests for each one. It does not admit any
 crate to the workspace and does not change any admission decision.
+
+Closed `--mode compile` (accepted issue #3004, selected only by the
+`MergeCompile` verification profile) keeps the same runtime discovery but
+compiles every discovered target without executing any test binary: fmt check,
+bounded clippy with normal warning semantics (no `-D warnings` oracle), and
+`cargo test --no-run --all-targets` with the existing locked/offline per-crate
+distinction. A mode named compile never calls the execution path.
 """
 
 from __future__ import annotations
@@ -55,6 +62,21 @@ def exclude_norun_steps(crate: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
     if (crate / "Cargo.lock").is_file():
         return (("test-no-run", ("cargo", "test", "--manifest-path", "{manifest}", "--locked", "--no-run", "--all-targets")),)
     return (("test-no-run", ("cargo", "test", "--manifest-path", "{manifest}", "--offline", "--no-run", "--all-targets")),)
+
+
+def compile_steps(crate: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    # Compile-only cohort for `--mode compile` (issue #3004): same runtime
+    # discovery as the normal path, but fmt check, bounded clippy with normal
+    # warning semantics (deliberately no `-D warnings` Review oracle), and a
+    # no-run test-target build. The locked/offline flag keeps the existing
+    # per-crate rule from exclude_norun_steps (Cargo.lock present -> --locked,
+    # lockless library -> --offline). No step here executes a test binary.
+    flag = "--locked" if (crate / "Cargo.lock").is_file() else "--offline"
+    return (
+        ("fmt", ("cargo", "fmt", "--manifest-path", "{manifest}", "--", "--check")),
+        ("clippy", ("cargo", "clippy", "--manifest-path", "{manifest}", "--all-targets", "--no-deps")),
+        ("test-no-run", ("cargo", "test", "--manifest-path", "{manifest}", flag, "--no-run", "--all-targets")),
+    )
 
 
 def workspace_paths(root: Path) -> tuple[set[str], set[str]]:
@@ -124,6 +146,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--list", action="store_true", help="print the discovered crates and exit")
+    parser.add_argument(
+        "--mode",
+        choices=("full", "compile"),
+        default="full",
+        help="full: fmt, clippy -D warnings and executed tests (default); "
+        "compile: closed compile-only mode for the MergeCompile profile, never executes a test binary",
+    )
     args = parser.parse_args()
     root = args.root.resolve()
 
@@ -140,16 +169,22 @@ def main() -> int:
         return 0
 
     failures: list[str] = []
-    for crate in crates:
-        failures.extend(run_crate_steps(root, crate, STEPS))
-    for crate in excluded:
-        failures.extend(run_crate_steps(root, crate, exclude_norun_steps(crate)))
+    if args.mode == "compile":
+        for crate in crates:
+            failures.extend(run_crate_steps(root, crate, compile_steps(crate)))
+        for crate in excluded:
+            failures.extend(run_crate_steps(root, crate, exclude_norun_steps(crate)))
+    else:
+        for crate in crates:
+            failures.extend(run_crate_steps(root, crate, STEPS))
+        for crate in excluded:
+            failures.extend(run_crate_steps(root, crate, exclude_norun_steps(crate)))
 
     total = len(crates) + len(excluded)
     if failures:
-        print(f"STANDALONE_CRATES: FAIL crates={total} failures={len(failures)}")
+        print(f"STANDALONE_CRATES: FAIL crates={total} mode={args.mode} failures={len(failures)}")
         return 1
-    print(f"STANDALONE_CRATES: PASS crates={total} steps={len(STEPS)} exclude_norun={len(excluded)}")
+    print(f"STANDALONE_CRATES: PASS crates={total} mode={args.mode} steps={len(STEPS)} exclude_norun={len(excluded)}")
     return 0
 
 
