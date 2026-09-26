@@ -123,6 +123,30 @@ pub const BACKUP_STATE_BLOCKED: &str = "blocked";
 /// may already have reached the Kernel, so the only safe next action is
 /// same-operation reconciliation.
 pub const BACKUP_STATE_UNKNOWN: &str = "unknown";
+/// Bounded outcome state of a capture owner that cancelled, carrying the
+/// owner's unconfirmed cleanup state.
+///
+/// This state is NOT [`BACKUP_STATE_INVALID`] and never was intended to be
+/// reached through it. A cancellation is not a request-shape failure: before
+/// issue #963 the Kernel reported one through its `invalid` envelope with a
+/// `backup.class`/`backup.verify` field, so this surface set a missing
+/// obligation of "invalid field: …", the owner cleanup state was dropped
+/// entirely, and an operator could not tell an owner cancellation from a
+/// malformed class token. A cancellation now has its own wire status and its
+/// own state, so the owner cleanup state survives into both projections.
+///
+/// The proven lifecycle level never advances past [`BackupStage::Requested`]
+/// here: a cancelled capture proves no verification level, and I5.13 keeps
+/// backup existence from being recovery proof in any case.
+///
+/// The same limit as on the Kernel side, stated here so neither projection can
+/// be read as a claim about an observed event: no production capture owner can
+/// currently emit a cancellation (`KernelBackupCapture::verify_only` returns
+/// only `Complete` or `Incomplete`), so this arm decodes a state the Kernel
+/// does not yet produce. It is a correct mapping of the published vocabulary,
+/// not a repaired incident.
+pub const BACKUP_STATE_CANCELLED: &str = "cancelled";
+
 /// Bounded outcome state of a structurally valid archive that carries no
 /// retained capture provenance.
 ///
@@ -134,6 +158,57 @@ pub const BACKUP_STATE_UNKNOWN: &str = "unknown";
 /// the owner accepted [`BACKUP_LEVEL_PROVENANCE_BOUND`] or
 /// [`BACKUP_LEVEL_CLASS_QUALIFIED`].
 pub const BACKUP_STATE_CANDIDATE: &str = "candidate";
+
+/// Closed owner-cleanup-state vocabulary this surface accepts from a
+/// cancellation reply.
+///
+/// The single member is the only cleanup answer that currently exists, and it
+/// is a NEGATIVE fact rather than a clean bill of health: both cancellation
+/// carriers in the Kernel capture owner (`CaptureState::Cancelled` and
+/// `KernelCaptureError::Cancelled`) are unit variants that carry no cleanup
+/// evidence at all, so the truthful report is that cleanup was not supplied and
+/// is therefore UNCONFIRMED. A value outside this array is a typed result
+/// mismatch, never success: this surface will not accept a cleanup claim it
+/// cannot name, and it will not invent a `clean` value for an owner that never
+/// sent one. A second member becomes available only when an owner actually
+/// supplies cleanup evidence.
+pub const BACKUP_OWNER_CLEANUP_STATES: [&str; 1] = [BACKUP_OWNER_CLEANUP_NOT_SUPPLIED];
+
+/// The one owner cleanup state a cancellation can carry today: the owner
+/// reported a cancellation and supplied no cleanup evidence.
+///
+/// Mirrors the Kernel's own literal for the same fact, for the same reason
+/// [`BACKUP_CREATE_MISSING_OWNER`] mirrors its refusal: the Kernel route states
+/// it in its reply and this surface states it here, and a drift between the two
+/// is refused here rather than silently accepted. It is deliberately not a
+/// "clean" spelling - an operator must not read it as proof the capture target
+/// was torn down.
+pub const BACKUP_OWNER_CLEANUP_NOT_SUPPLIED: &str = "not-supplied";
+
+/// Closed cancellation reason-code vocabulary this surface accepts from a
+/// cancellation reply.
+///
+/// The single member is `CANCELLATION_UNCONFIRMED` from the additive reason-code
+/// registry documented in
+/// `docs/architecture/I07-20-agent-facing-error-contract.md` (route/integration
+/// group), which I7.20 states is a projection rather than a control enum that
+/// every surface must exhaustively match. This array is therefore the set of
+/// cancellation causes this route can BOUND AND NAME, not a mirror of the whole
+/// registry: a cancellation carrying any other code is a typed result mismatch
+/// here rather than a silently accepted cause, and no code is invented locally.
+/// A future cancellation cause is added to the I7.20 document first and to this
+/// array second.
+pub const BACKUP_CANCELLATION_REASON_CODES: [&str; 1] = [BACKUP_REASON_CANCELLATION_UNCONFIRMED];
+
+/// The exact I7.20 reason code a cancellation carries when the owner supplied
+/// no cleanup evidence.
+///
+/// Mirrors the Kernel's own literal for the same cause, for the same reason
+/// [`BACKUP_CREATE_MISSING_OWNER`] mirrors its refusal. It names an UNCONFIRMED
+/// cleanup rather than a failed one, because no cleanup failure was observed:
+/// the owner reported a cancellation and said nothing about cleanup, so
+/// claiming cleanup failed would invent an observation the owner never made.
+pub const BACKUP_REASON_CANCELLATION_UNCONFIRMED: &str = "CANCELLATION_UNCONFIRMED";
 
 /// Owner verification level: the exact submitted bytes decode, validate and
 /// relate internally as one archive.
@@ -474,12 +549,19 @@ pub fn parse_backup_restore_test(
 /// stable operation identity, the effect class and proof ceiling actually
 /// achieved, the proven backup lifecycle level, the owner's verification
 /// level, class ceiling, capture receipt and archived-fence relation (or an
-/// explicit absence where the routed command proves none), the gates the
-/// Kernel proved, the missing or failed obligations, and the one safe next
+/// explicit absence where the routed command proves none), the cancellation
+/// reason code and the owner cleanup state a cancellation carried, the gates
+/// the Kernel proved, the missing or failed obligations, and the one safe next
 /// reconciliation action. Archive bytes, key material, secrets, and
 /// archived user data are structurally absent: a successful transport or
 /// exit is not capture or restore proof, so a refused, blocked, invalid,
-/// or unproven outcome never reports a proven level.
+/// cancelled, or unproven outcome never reports a proven level.
+///
+/// The bounded outcome states this type admits are exactly
+/// [`BACKUP_STATE_VERIFIED`], [`BACKUP_STATE_CANDIDATE`],
+/// [`BACKUP_STATE_INVALID`], [`BACKUP_STATE_REFUSED`],
+/// [`BACKUP_STATE_BLOCKED`] and [`BACKUP_STATE_CANCELLED`]. Any other state is
+/// a typed result mismatch rather than a locally invented one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupOperationOutcome {
@@ -487,13 +569,16 @@ pub struct BackupOperationOutcome {
     pub operation: String,
     /// Bounded outcome state: one of [`BACKUP_STATE_VERIFIED`],
     /// [`BACKUP_STATE_CANDIDATE`], [`BACKUP_STATE_INVALID`],
-    /// [`BACKUP_STATE_REFUSED`], or [`BACKUP_STATE_BLOCKED`].
+    /// [`BACKUP_STATE_REFUSED`], [`BACKUP_STATE_BLOCKED`], or
+    /// [`BACKUP_STATE_CANCELLED`].
     ///
     /// `verified` is reserved for an owner-accepted
     /// [`BACKUP_LEVEL_PROVENANCE_BOUND`] or [`BACKUP_LEVEL_CLASS_QUALIFIED`]
     /// level, because backup existence is not recovery proof (I5.13); a
     /// structurally valid archive with no retained capture provenance is
-    /// [`BACKUP_STATE_CANDIDATE`].
+    /// [`BACKUP_STATE_CANDIDATE`], and a capture the owner cancelled is
+    /// [`BACKUP_STATE_CANCELLED`] rather than a field-shape
+    /// [`BACKUP_STATE_INVALID`].
     pub state: String,
     /// Requested archive class exactly as the operator typed it, or
     /// `null` when the routed command declares no class. Never a
@@ -550,6 +635,29 @@ pub struct BackupOperationOutcome {
     /// historical instead of being reported as corrupt for an older
     /// generation, and nothing here is inferred or defaulted.
     pub target_compatibility: Option<String>,
+    /// Exact reason code a cancelled owner answered with, or `null` when this
+    /// outcome is not [`BACKUP_STATE_CANCELLED`].
+    ///
+    /// This is the capture owner's own cause as the Kernel relayed it, echoed
+    /// under a closed check: never inferred here from the state, never
+    /// defaulted onto a generic "failed", and never renamed. `null` means the
+    /// routed command reported no cancellation - an outcome that is not
+    /// `cancelled` has no cancellation reason code, and absence is reported
+    /// explicitly rather than filled in.
+    pub cancellation_reason_code: Option<String>,
+    /// Owner cleanup state a cancelled owner reported, or `null` when this
+    /// outcome is not [`BACKUP_STATE_CANCELLED`].
+    ///
+    /// This is the owner's own cleanup answer, echoed under the closed
+    /// [`BACKUP_OWNER_CLEANUP_STATES`] check, and it is retained rather than
+    /// dropped so a cancellation stays distinguishable from a malformed
+    /// request. It is never inferred from the reason text and never defaulted
+    /// to a clean value: an owner that supplied no cleanup evidence reports
+    /// [`BACKUP_OWNER_CLEANUP_NOT_SUPPLIED`], which means cleanup is
+    /// UNCONFIRMED, not that the target was torn down. `null` means the routed
+    /// command proved no cancellation at all. Bounded owned text: no archive
+    /// bytes, no key material, no secret and no archived user data.
+    pub owner_cleanup_state: Option<String>,
     /// Gates the Kernel proved, in pass order; empty when the command
     /// proves no rehearsal gate.
     pub gates_passed: Vec<String>,
@@ -622,8 +730,9 @@ pub fn backup_unknown_outcome(
 /// identity, the effect class and proof ceiling, the proven lifecycle
 /// level, the owner's verification level, class ceiling, capture receipt and
 /// target-compatibility relation when the routed command proved them, the
-/// gates, the missing obligations, the reason, and the one next
-/// reconciliation action. An owner answer that is absent prints no line at
+/// cancellation reason code and owner cleanup state when it reported a
+/// cancellation, the gates, the missing obligations, the reason, and the one
+/// next reconciliation action. An owner answer that is absent prints no line at
 /// all, never an empty or invented value, so silence stays distinguishable
 /// from a proven answer. It never prints archive bytes, key material,
 /// secrets, or archived user data.
@@ -685,6 +794,17 @@ pub fn render_backup_outcome_human(outcome: &BackupOperationOutcome) -> String {
     }
     if let Some(compatibility) = &outcome.target_compatibility {
         let _ = writeln!(lines, "target_compatibility: {compatibility}");
+    }
+    // The cancellation's own two answers print only when the routed command
+    // reported a cancellation. An absent reason code or owner cleanup state
+    // stays silent rather than printing an empty, `unknown` or invented value,
+    // and the cleanup line is deliberately the owner's own `not-supplied`
+    // spelling: this renderer must never restate it as a clean target.
+    if let Some(reason_code) = &outcome.cancellation_reason_code {
+        let _ = writeln!(lines, "cancellation_reason_code: {reason_code}");
+    }
+    if let Some(cleanup_state) = &outcome.owner_cleanup_state {
+        let _ = writeln!(lines, "owner_cleanup_state: {cleanup_state}");
     }
     if outcome.gates_passed.is_empty() {
         let _ = writeln!(lines, "gates_passed: none");
@@ -764,8 +884,11 @@ fn envelope_idempotency(
 /// [`BACKUP_LEVEL_CLASS_QUALIFIED`] level, and reports a
 /// [`BACKUP_LEVEL_STRUCTURAL_CANDIDATE`] archive as
 /// [`BACKUP_STATE_CANDIDATE`] instead of promoting it, because backup
-/// existence is not recovery proof (I5.13). Any other status is a typed
-/// result mismatch, never success.
+/// existence is not recovery proof (I5.13). [`BACKUP_STATE_CANCELLED`] is a
+/// refusal-shaped status, not a success one, and it is admitted here so an
+/// owner cancellation decodes as its own typed outcome instead of arriving as
+/// a malformed field. Any other status is a typed result mismatch, never
+/// success.
 const BACKUP_WIRE_OK: &str = "ok";
 
 fn envelope_status(response: &Value) -> Result<&str, BackupClientError> {
@@ -775,7 +898,11 @@ fn envelope_status(response: &Value) -> Result<&str, BackupClientError> {
         .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
     if !matches!(
         status,
-        BACKUP_WIRE_OK | BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED | BACKUP_STATE_BLOCKED
+        BACKUP_WIRE_OK
+            | BACKUP_STATE_INVALID
+            | BACKUP_STATE_REFUSED
+            | BACKUP_STATE_BLOCKED
+            | BACKUP_STATE_CANCELLED
     ) {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
@@ -1073,6 +1200,11 @@ pub fn backup_create(
         class_ceiling: None,
         capture_receipt: None,
         target_compatibility: None,
+        // A `plan_gap` refusal is not a cancellation: the create reply carries
+        // no cancellation reason code and no owner cleanup state, so both stay
+        // explicitly absent rather than being borrowed from the refusal.
+        cancellation_reason_code: None,
+        owner_cleanup_state: None,
         gates_passed: Vec::new(),
         missing_obligations: vec![missing_owner],
         next_reconciliation: next_action(state, BACKUP_CREATE_OPERATION, &operation_id),
@@ -1101,7 +1233,11 @@ pub fn backup_create(
 /// [`BackupStage::Requested`], because a self-consistent decode of
 /// caller-supplied bytes is an untrusted candidate and not recovery proof. A
 /// `plan_gap` refusal keeps the outcome incomplete instead of being promoted
-/// to a verified archive.
+/// to a verified archive, and a `cancelled` reply keeps the owner's own
+/// cancellation reason code and owner cleanup state, so a cancellation is
+/// reported as a cancellation - never as a field-shape
+/// [`BACKUP_STATE_INVALID`] whose cleanup state was dropped, and never as an
+/// archive that may simply be captured again.
 pub fn backup_verify(
     client: &mut KernelClient,
     request: &CommandRequest,
@@ -1151,12 +1287,17 @@ pub fn backup_verify(
         proof_ceiling,
         proof_level: BackupStage::Requested,
         // The owner's verification evidence is unknown until its level
-        // decodes, and no other status proves any of it: a refused, invalid
-        // or blocked reply reports all four as explicitly absent.
+        // decodes, and no other status proves any of it: a refused, invalid,
+        // cancelled or blocked reply reports all four as explicitly absent.
         verification_level: None,
         class_ceiling: None,
         capture_receipt: None,
         target_compatibility: None,
+        // Undecided until a `cancelled` reply carries the owner's own two
+        // answers. Every other status reports both as explicitly absent, so a
+        // non-cancellation never borrows a cleanup fact.
+        cancellation_reason_code: None,
+        owner_cleanup_state: None,
         gates_passed: Vec::new(),
         missing_obligations: Vec::new(),
         next_reconciliation: next_action(state, BACKUP_VERIFY_OPERATION, &operation_id),
@@ -1211,6 +1352,13 @@ pub fn backup_verify(
             envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
             let _ = envelope_text(&response, "field")?;
             outcome.missing_obligations = vec![format!("invalid field: {}", outcome.reason)];
+        }
+        BACKUP_STATE_CANCELLED => {
+            // A cancellation is the owner's own answer, not a malformed field,
+            // so it projects here instead of falling into the `invalid` arm
+            // above, which reported it as a caller mistake and dropped the
+            // owner's cleanup state.
+            apply_cancellation(&mut outcome, &response, &operation_id)?;
         }
         BACKUP_STATE_REFUSED => {
             if envelope_text(&response, "code")? != "plan_gap" {
@@ -1304,6 +1452,96 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
     })
 }
 
+/// One decoded cancellation answer, with every vocabulary closed.
+///
+/// The same shape and the same discipline as [`VerifyEvidence`]: every field
+/// is the owner's own answer, read once here so the state decision downstream
+/// cannot be reached with a half-decoded reply, and the two vocabulary-checked
+/// answers are checked against closed sets this surface declares. Nothing is
+/// derived from the reason text, inferred from the state, or defaulted.
+struct CancellationEvidence<'a> {
+    /// Exact cause the owner answered with, from
+    /// [`BACKUP_CANCELLATION_REASON_CODES`].
+    reason_code: &'a str,
+    /// Owner's own cleanup state, from [`BACKUP_OWNER_CLEANUP_STATES`].
+    owner_cleanup_state: &'a str,
+    /// Owner's own bounded reason, kept verbatim rather than rewritten.
+    reason: &'a str,
+}
+
+/// The one real obligation a cancelled capture leaves outstanding.
+///
+/// The owner cancelled and supplied no cleanup evidence, so what is missing is an
+/// OWNER-SUPPLIED CLEANUP CONFIRMATION for this exact operation. It is
+/// deliberately not phrased as an invalid field — a cancellation is not a caller
+/// mistake — and deliberately not phrased as a re-capture: a second capture is
+/// never a safe next action, so this names the same operation identity the
+/// request carried and a retry reconciles rather than repeats.
+fn cancellation_obligation(operation_id: &str) -> String {
+    format!(
+        "owner-supplied cleanup confirmation for the cancelled capture of operation {operation_id} (the owner supplied none: cleanup is unconfirmed, so the target must not be treated as clean)"
+    )
+}
+
+/// Decodes and closed-checks the fields a cancellation reply must answer.
+///
+/// A reply missing a field, or answering with a value outside its closed set,
+/// is a typed result mismatch rather than a partially trusted cancellation:
+/// this surface will not relay a cleanup claim it cannot name, and it will not
+/// substitute a clean one for a missing one. This is what keeps the owner
+/// cleanup state RETAINED (issue #963) instead of dropped — before it, the same
+/// owner answer arrived through the `invalid` envelope, where only `reason` and
+/// `field` were read and the cleanup state was lost entirely.
+fn cancellation_evidence(response: &Value) -> Result<CancellationEvidence<'_>, BackupClientError> {
+    let reason_code = envelope_text(response, "code")?;
+    if !BACKUP_CANCELLATION_REASON_CODES.contains(&reason_code) {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
+    let owner_cleanup_state = envelope_text(response, "owner_cleanup_state")?;
+    if !BACKUP_OWNER_CLEANUP_STATES.contains(&owner_cleanup_state) {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
+    Ok(CancellationEvidence {
+        reason_code,
+        owner_cleanup_state,
+        reason: envelope_text(response, "reason")?,
+    })
+}
+
+/// Projects one decoded cancellation reply onto its outcome.
+///
+/// This owns the whole cancellation projection, so the state dispatch in
+/// [`backup_verify`] decides nothing about it and the owner cleanup state has
+/// exactly one place it can be written. What it writes: the owner's own reason
+/// code and owner cleanup state, carried verbatim from the closed-checked
+/// reply; the owner's own bounded reason, kept rather than rewritten; the
+/// missing obligation naming the cleanup confirmation that is actually
+/// outstanding; and `next_reconciliation` from the same [`next_action`] helper
+/// every other state uses, so the same operation identity is named and a second
+/// capture is still never proposed.
+///
+/// What it deliberately does NOT touch matters as much: `state` keeps the
+/// reply's own `cancelled` spelling, and `proof_level` plus the four
+/// verification-evidence fields stay `BackupStage::Requested` and explicitly
+/// absent, so a cancelled capture can never be reported as a proven archive and
+/// I5.13's "backup existence is not recovery proof" is not weakened by a
+/// cancellation. A reply failing either closed check is a typed result
+/// mismatch, and the outcome is left untouched rather than half-projected.
+fn apply_cancellation(
+    outcome: &mut BackupOperationOutcome,
+    response: &Value,
+    operation_id: &str,
+) -> Result<(), BackupClientError> {
+    let evidence = cancellation_evidence(response)?;
+    outcome.cancellation_reason_code = Some(evidence.reason_code.to_owned());
+    outcome.owner_cleanup_state = Some(evidence.owner_cleanup_state.to_owned());
+    evidence.reason.clone_into(&mut outcome.reason);
+    outcome.missing_obligations = vec![cancellation_obligation(operation_id)];
+    outcome.next_reconciliation =
+        next_action(&outcome.state, BACKUP_VERIFY_OPERATION, operation_id);
+    Ok(())
+}
+
 /// Routes one isolated restore-test command through the correlated Kernel
 /// front door.
 ///
@@ -1379,6 +1617,12 @@ pub fn backup_restore_test(
         class_ceiling: None,
         capture_receipt: None,
         target_compatibility: None,
+        // A rehearsal is not a capture and is never answered with a
+        // cancellation, so it carries no cancellation reason code and no owner
+        // cleanup state. Both stay explicitly absent rather than borrowed from
+        // the blocked rehearsal's own reason.
+        cancellation_reason_code: None,
+        owner_cleanup_state: None,
         gates_passed: Vec::new(),
         missing_obligations: Vec::new(),
         next_reconciliation: next_action(state, BACKUP_RESTORE_TEST_OPERATION, &operation_id),
