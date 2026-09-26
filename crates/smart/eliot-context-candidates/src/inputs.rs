@@ -22,10 +22,17 @@
 //!
 //! Every record uses `deny_unknown_fields`: an unknown current field or an
 //! unknown variant is rejected at the boundary, never absorbed.
+//!
+//! CC-004 (issue #41) adds the typed alternative for the three Governor
+//! slots: [`CanonicalProjectionInput`] carries one validated
+//! [`CanonicalProjectionSet`](eliot_context_contracts::CanonicalProjectionSet)
+//! plus supplied measurements, collected mechanically by the mapper. The
+//! opaque path stays for owners that supply opaque snapshots.
 
 use eliot_context_contracts::{
-    AtomAvailability, AuthorityClass, ContextBinding, ContextError, ContextRecipe, MeasurementRef,
-    PrivacyClass, ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
+    AtomAvailability, AuthorityClass, CanonicalProjectionSet, ContextBinding, ContextError,
+    ContextRecipe, MeasurementRef, PrivacyClass, ProofBinding, ProviderId, ProviderRole,
+    SemanticRole, SourceSnapshot,
 };
 use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId};
 use eliot_cue_contracts::{ActivationResult, Completeness};
@@ -406,6 +413,54 @@ impl OpaqueProjection {
         }
         for handle in &self.frontier {
             check_text(handle, "projection.frontier")?;
+        }
+        Ok(())
+    }
+}
+
+/// Hard ceiling on supplied measurements carried by one canonical input.
+///
+/// The typed set holds at most 1 goal plus 64 commitments plus 2 continuity
+/// texts plus 1 safety note plus 64 triggers plus 64 affordances (196
+/// members); the ceiling keeps a malformed input bounded before measurement
+/// alignment.
+pub const MAX_CANONICAL_MEASUREMENTS: usize = 256;
+
+/// Typed CC-004 canonical projections plus supplied measurements.
+///
+/// This is the mechanical alternative to the three opaque Governor slots
+/// (task frame, negative memory, affordance): one validated
+/// [`CanonicalProjectionSet`] whose every text maps to exactly one whole
+/// member verbatim, with measurements aligned by
+/// [`CanonicalMember`](crate::CanonicalMember) identity. No canonical state
+/// is retrieved and no role prose is invented: a missing projection is a
+/// missing input (the caller keeps the opaque path for that slot), never
+/// filler.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionInput {
+    /// Validated task/continuity/safety/affordance projections under one
+    /// shared binding; must equal the request binding at collection.
+    pub set: CanonicalProjectionSet,
+    /// Supplied measurements keyed by derived member identity.
+    pub measurements: Vec<MemberMeasurement>,
+}
+
+impl CanonicalProjectionInput {
+    /// Validate the set shape and every supplied measurement shape.
+    ///
+    /// Binding equality with the request and measurement alignment are
+    /// checked at collection and derivation, which see the request and the
+    /// set.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.set.validate()?;
+        if self.measurements.len() > MAX_CANONICAL_MEASUREMENTS {
+            return Err(ContextError::Bounds {
+                field: "canonical.measurements",
+            });
+        }
+        for entry in &self.measurements {
+            entry.measurement.validate()?;
         }
         Ok(())
     }

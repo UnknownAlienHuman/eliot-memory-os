@@ -14,17 +14,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_context_contracts::{
-    AtomAvailability, AuthorityClass, ContextError, CriticalAttentionMember, MeasurementRef,
-    PrivacyClass, ProofBinding, SourceSnapshot,
+    AtomAvailability, AuthorityClass, CANONICAL_PROJECTIONS_SCHEMA_VERSION, ContextError,
+    CriticalAttentionMember, MeasurementRef, PrivacyClass, ProofBinding, ProviderId,
+    SourceSnapshot,
 };
 use eliot_contracts::{ArtifactId, SourceId, canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::TargetHandle;
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, Currentness, SourceAssurance};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope};
 
-use crate::inputs::{AttentionInput, CueInput, EpistemicInput, EvidenceInput, MemberMeasurement};
+use crate::inputs::{
+    AttentionInput, CanonicalProjectionInput, CueInput, EpistemicInput, EvidenceInput,
+    MemberMeasurement,
+};
 use crate::vocabulary::{
-    PROVIDER_ATTENTION, PROVIDER_CUE, PROVIDER_EPISTEMIC, PROVIDER_EVIDENCE, kind_rule,
+    PROVIDER_AFFORDANCE, PROVIDER_ATTENTION, PROVIDER_CUE, PROVIDER_EPISTEMIC, PROVIDER_EVIDENCE,
+    PROVIDER_NEGATIVE_MEMORY, PROVIDER_TASK_FRAME, kind_rule,
 };
 
 /// One normalized whole member ready for mapping.
@@ -118,6 +123,60 @@ pub fn envelope_member_id(envelope: &EvidenceEnvelope) -> Result<ArtifactId, Con
 pub fn assurance_member_id(assurance: &SourceAssurance) -> Result<ArtifactId, ContextError> {
     ArtifactId::new(format!("assurance-{}", assurance.integrity_digest))
         .map_err(|_| ContextError::InvalidField("assurance.member"))
+}
+
+/// One mechanical member of a canonical projection set: a single verbatim
+/// projection text.
+///
+/// Singletons (goal, plan state, continuity note, safety note) carry no
+/// index; repeated entries (commitments, triggers, affordances) carry their
+/// declaration index. Callers align supplied measurements with
+/// [`member_id`](Self::member_id).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalMember {
+    /// Task goal text.
+    TaskGoal,
+    /// One task commitment by declaration index.
+    TaskCommitment(usize),
+    /// Continuity plan-state text.
+    ContinuityPlan,
+    /// Continuity note text.
+    ContinuityNote,
+    /// Safety note text.
+    SafetyNote,
+    /// One exact negative-memory trigger by declaration index.
+    SafetyTrigger(usize),
+    /// One authorized affordance by declaration index.
+    Affordance(usize),
+}
+
+impl CanonicalMember {
+    /// Deterministic member identity: stable per field path and index, so
+    /// callers can align supplied measurements without guessing.
+    pub fn member_id(self) -> Result<ArtifactId, ContextError> {
+        let slug = match self {
+            Self::TaskGoal => "canonical-task-goal".to_owned(),
+            Self::TaskCommitment(index) => format!("canonical-task-commitment-{index:04}"),
+            Self::ContinuityPlan => "canonical-continuity-plan".to_owned(),
+            Self::ContinuityNote => "canonical-continuity-note".to_owned(),
+            Self::SafetyNote => "canonical-safety-note".to_owned(),
+            Self::SafetyTrigger(index) => format!("canonical-safety-trigger-{index:04}"),
+            Self::Affordance(index) => format!("canonical-affordance-{index:04}"),
+        };
+        ArtifactId::new(slug).map_err(|_| ContextError::InvalidField("canonical.member"))
+    }
+
+    /// Closed member kind for this field under its slot map.
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::TaskGoal | Self::ContinuityPlan => "objective",
+            Self::TaskCommitment(_) => "constraint",
+            Self::ContinuityNote => "boundary",
+            Self::SafetyNote => "invariant",
+            Self::SafetyTrigger(_) => "trigger",
+            Self::Affordance(_) => "capability",
+        }
+    }
 }
 
 /// Canonical content bytes of any bound value.
@@ -656,5 +715,159 @@ fn derive_payload_member(
         } else {
             base_state
         },
+    })
+}
+
+/// Whole members derived mechanically from one canonical projection set.
+///
+/// Members are grouped by destination slot: task, negative memory,
+/// affordance. Continuity texts travel with the task slot; every text is
+/// verbatim, whole and lossless.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalDerivedMembers {
+    /// Task-slot members: goal, commitments, plan state, continuity note.
+    pub task: Vec<NormalizedMember>,
+    /// Negative-slot members: safety note plus exact triggers.
+    pub negative: Vec<NormalizedMember>,
+    /// Affordance-slot members: one per authorized affordance.
+    pub affordance: Vec<NormalizedMember>,
+}
+
+/// Derive whole members from the typed CC-004 projection set.
+///
+/// Each projection text becomes exactly one [`NormalizedMember`] whose
+/// content is the verbatim text: nothing is split, summarized, truncated or
+/// rewritten. Source lineage is mechanical (slot provider, member identity,
+/// contract-version revision, exact content digest); proof stays at the
+/// observation ceiling. A missing measurement or a surplus measurement fails
+/// closed; the caller supplies measurements, never guesses them.
+pub fn derive_canonical_projections(
+    input: &CanonicalProjectionInput,
+    task_provider: &ProviderId,
+    negative_provider: &ProviderId,
+    affordance_provider: &ProviderId,
+    base_state: AtomAvailability,
+) -> Result<CanonicalDerivedMembers, ContextError> {
+    input.set.validate()?;
+    let mut measurements = index_measurements(&input.measurements)?;
+    let set = &input.set;
+    let mut task = Vec::with_capacity(set.task.commitments.len().saturating_add(3));
+    task.push(derive_canonical_member(
+        CanonicalMember::TaskGoal,
+        &set.task.goal,
+        PROVIDER_TASK_FRAME,
+        task_provider,
+        &mut measurements,
+        base_state,
+    )?);
+    for (index, commitment) in set.task.commitments.iter().enumerate() {
+        task.push(derive_canonical_member(
+            CanonicalMember::TaskCommitment(index),
+            commitment,
+            PROVIDER_TASK_FRAME,
+            task_provider,
+            &mut measurements,
+            base_state,
+        )?);
+    }
+    task.push(derive_canonical_member(
+        CanonicalMember::ContinuityPlan,
+        &set.continuity.plan_state,
+        PROVIDER_TASK_FRAME,
+        task_provider,
+        &mut measurements,
+        base_state,
+    )?);
+    task.push(derive_canonical_member(
+        CanonicalMember::ContinuityNote,
+        &set.continuity.continuity_note,
+        PROVIDER_TASK_FRAME,
+        task_provider,
+        &mut measurements,
+        base_state,
+    )?);
+    let mut negative =
+        Vec::with_capacity(set.safety.negative_memory_triggers.len().saturating_add(1));
+    negative.push(derive_canonical_member(
+        CanonicalMember::SafetyNote,
+        &set.safety.safety_note,
+        PROVIDER_NEGATIVE_MEMORY,
+        negative_provider,
+        &mut measurements,
+        base_state,
+    )?);
+    for (index, trigger) in set.safety.negative_memory_triggers.iter().enumerate() {
+        negative.push(derive_canonical_member(
+            CanonicalMember::SafetyTrigger(index),
+            trigger,
+            PROVIDER_NEGATIVE_MEMORY,
+            negative_provider,
+            &mut measurements,
+            base_state,
+        )?);
+    }
+    let mut affordance = Vec::with_capacity(set.affordance.affordances.len());
+    for (index, entry) in set.affordance.affordances.iter().enumerate() {
+        affordance.push(derive_canonical_member(
+            CanonicalMember::Affordance(index),
+            entry,
+            PROVIDER_AFFORDANCE,
+            affordance_provider,
+            &mut measurements,
+            base_state,
+        )?);
+    }
+    if !measurements.is_empty() {
+        return Err(ContextError::DenominatorMismatch);
+    }
+    Ok(CanonicalDerivedMembers {
+        task,
+        negative,
+        affordance,
+    })
+}
+
+/// Derive one whole member from one verbatim projection text.
+fn derive_canonical_member(
+    field: CanonicalMember,
+    text: &str,
+    provider_label: &'static str,
+    provider: &ProviderId,
+    measurements: &mut BTreeMap<ArtifactId, MeasurementRef>,
+    base_state: AtomAvailability,
+) -> Result<NormalizedMember, ContextError> {
+    let kind = field.kind();
+    let rule =
+        kind_rule(provider_label, kind).ok_or(ContextError::InvalidField("canonical.kind"))?;
+    let member_id = field.member_id()?;
+    let measurement = take_measurement(measurements, &member_id)?;
+    let content = text.to_owned();
+    let content_sha = sha256_hex(content.as_bytes());
+    Ok(NormalizedMember {
+        member_id: member_id.clone(),
+        kind: kind.to_owned(),
+        content,
+        content_sha: content_sha.clone(),
+        source: SourceSnapshot {
+            source_id: SourceId::new(provider.as_str())
+                .map_err(|_| ContextError::InvalidField("canonical.source"))?,
+            owner: provider.clone(),
+            snapshot_id: member_id.clone(),
+            revision: format!("canonical-projections-v{CANONICAL_PROJECTIONS_SCHEMA_VERSION}"),
+            content_sha256: content_sha,
+            predecessor: None,
+        },
+        measurement,
+        dependencies: Vec::new(),
+        protected: rule.required_protected,
+        privacy: PrivacyClass::Public,
+        authority: rule.authority,
+        status: rule.status,
+        assertability: rule.assertability,
+        proof: ProofBinding {
+            evidence_id: member_id,
+            ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        truthful_state: base_state,
     })
 }
