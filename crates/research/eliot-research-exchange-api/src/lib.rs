@@ -147,25 +147,51 @@ fn digest(value: &str, field: &'static str) -> Result<(), ResearchContractError>
 /// together with [`CONTRACT_VERSION`] — see
 /// [`AllowedReferenceManifest::canonical_digest`].
 ///
-/// `absolute-locator/1` is the superseded semantics: its double-colon guard
+/// `absolute-locator/2` is the superseded revision immediately before this one,
+/// and its two defects are why the constant moves rather than staying at `2`:
+///
+/// - it folded a delivered scheme with `to_ascii_lowercase` before matching it
+///   against an internal scheme, so `ELIOT://…` and `PROVIDER-ARTIFACT:…` were
+///   classified as the canonical internal URIs they are not. That is a strict
+///   superset of the owner this recogniser mirrors — `parse_uri` matches
+///   `URI_SCHEME = "eliot://"` case-sensitively and refuses `ELIOT://…` — so
+///   under `absolute-locator/2` a value the owner refused was classified
+///   internal and admitted with no `url_handles` entry. An internally owned
+///   scheme is now matched case-exactly, and a case variant is refused by name
+///   (see `is_internal_scheme_case_variant`);
+/// - its delivered-locator gate asked [`classify_locator`] about a *blank*
+///   locator, so a delivered source with no locator content was refused as
+///   `LocatorNotClassifiable { reason: "BLANK" }` inside
+///   [`ResearchEvidenceBundle::validate_against`] before the handoff seal could
+///   report #1764's `HandoffError::MissingSourceLineage` for it. A blank locator
+///   is a missing-lineage diagnosis owned by that seal, not a classification
+///   verdict, so `validate_against` asks about the locator only when the locator
+///   carries a reference.
+///
+/// Both change what a locator means, so a manifest sealed under
+/// `absolute-locator/2` needs a re-sealed manifest like one sealed under
+/// `absolute-locator/1`, not a grandfathered admission.
+///
+/// `absolute-locator/1` is the first superseded semantics: its double-colon guard
 /// tested the scheme-separator colon itself, and for every value its scheme
 /// scan returned that byte is by construction that same colon, so the guard
 /// matched every valid scheme and the branch that could distinguish an internal
 /// scheme from an external one was unreachable. Under `absolute-locator/1` no
 /// locator URL was ever gated by `url_handles`. Because the classifier version is
-/// in the preimage, a manifest sealed under `absolute-locator/1` cannot
-/// re-verify its own digest after this upgrade:
+/// in the preimage, a manifest sealed under a superseded `absolute-locator/1` or
+/// `absolute-locator/2` cannot re-verify its own digest:
 /// [`AllowedReferenceManifest::validate`] refuses it, and every record that
 /// embeds the manifest digest therefore needs a re-sealed manifest instead of
-/// silently grandfathering a locator admitted by the broken classifier.
+/// silently grandfathering a locator admitted by a broken classifier.
 ///
 /// The version also covers *which* schemes count as internally owned — see
-/// `owned_scheme` — and the `name::id` grammar in `is_opaque_handle_namespace`.
-/// Adding or removing an owned scheme, changing the grammar one is recognised
+/// `owned_scheme` — the case an owned scheme is matched in, and the `name::id`
+/// grammar in `is_opaque_handle_namespace`. Adding or removing an owned scheme,
+/// matching one in a different case, changing the grammar one is recognised
 /// under, or changing a segment rule of the namespaced form changes what a
 /// locator means, so it requires this constant to be bumped and the affected
 /// manifests re-sealed. It is a classifier change, not a refactor.
-pub const LOCATOR_CLASSIFIER: &str = "absolute-locator/2";
+pub const LOCATOR_CLASSIFIER: &str = "absolute-locator/3";
 
 /// Scheme of the `eliot://` internal locator family, which is the scheme of the
 /// `ResourceUri` family in
@@ -175,6 +201,11 @@ pub const LOCATOR_CLASSIFIER: &str = "absolute-locator/2";
 /// grammar in this repository, and `parse_bridge_resource_identity` records which
 /// two others exist and why mirroring one of the three still fails closed against
 /// the rest.
+///
+/// This is the exact spelling, compared byte for byte. The owner matches
+/// `URI_SCHEME = "eliot://"` with `raw.strip_prefix`, which is case-sensitive,
+/// so a locator whose scheme differs only in case is a spelling that owner
+/// refuses rather than a canonical form of it, and it is compared as such.
 const BRIDGE_RESOURCE_SCHEME: &str = "eliot";
 
 /// Maximum bytes one locator may carry before it is no longer classifiable.
@@ -248,10 +279,15 @@ pub enum LocatorAmbiguity {
     /// A `name::id` spelling whose namespace or identifier carries a character
     /// outside the portable canonical segment set.
     MalformedNamespacedHandleNonPortableSegment,
-    /// The scheme is a recognised internal one — or a case variant of one — and
-    /// the remainder is not a canonical form of it: not one of the ten I7.18
-    /// resource forms for `eliot://`, and not the owning grammar of a scheme in
-    /// `owned_scheme`.
+    /// The scheme is a recognised internal one and the remainder is not a
+    /// canonical form of it: not one of the ten I7.18 resource forms for
+    /// `eliot://`, and not the owning grammar of a scheme in `owned_scheme`.
+    ///
+    /// Also the reason for a case variant of a recognised internal scheme, whose
+    /// owner accepts exactly one spelling and therefore refuses this one before
+    /// the remainder is even read: `ELIOT://evidence/abc` is
+    /// `NonCanonicalInternalForm` whether or not its remainder would have been
+    /// canonical.
     NonCanonicalInternalForm,
 }
 
@@ -366,20 +402,27 @@ pub enum LocatorClass {
     /// does not need one, but classification is not admission: see
     /// [`InternalLocatorIdentity`].
     InternalUri {
-        /// The scheme of the owning canonical family.
+        /// The scheme of the owning canonical family, in the spelling that owner
+        /// accepts. A case variant of it is never this class, so this value is
+        /// always a spelling its owner can stand behind.
         canonical_scheme: String,
         /// The typed identity the canonical form carries.
         parsed_identity: InternalLocatorIdentity,
     },
     /// A syntactically valid absolute URI this contract does not own.
     ///
-    /// Every scheme this contract does not own is here, including `http`,
-    /// `https`, `ws`, `wss`, `tcp`, `urn`, `mailto`, `data`, `file`, a
-    /// single-letter Windows-drive scheme (`C:\…` is formally a URI with scheme
-    /// `C`) and every future scheme. Fail-closed by construction: a scheme this
-    /// crate cannot classify requires an exact `url_handles` entry through
-    /// [`AllowedReferenceManifest::admits_url`] instead of being admitted on a
-    /// guess.
+    /// Every scheme this contract does not own under its exact spelling is here,
+    /// including `http`, `https`, `ws`, `wss`, `tcp`, `urn`, `mailto`, `data`,
+    /// `file`, a single-letter Windows-drive scheme (`C:\…` is formally a URI
+    /// with scheme `C`) and every future scheme. Fail-closed by construction: a
+    /// scheme this crate cannot classify requires an exact `url_handles` entry
+    /// through [`AllowedReferenceManifest::admits_url`] instead of being admitted
+    /// on a guess.
+    ///
+    /// A case variant of a scheme this contract *does* own is not here: the owner
+    /// of that scheme refuses the spelling, so it is
+    /// [`LocatorAmbiguity::NonCanonicalInternalForm`] rather than a URL an exact
+    /// `url_handles` entry could admit.
     ExternalUri {
         /// The exact original locator text, byte for byte. Never normalised: an
         /// allowlist widened by case, path or query folding is not this
@@ -403,9 +446,10 @@ pub enum LocatorClass {
 /// carries no scheme token and stays an opaque handle.
 ///
 /// The token is returned exactly as written and is never case-folded here.
-/// [`classify_locator`] folds it once, and only to decide which owner claims the
-/// scheme: a fold that does not equal an owner's canonical spelling is refused
-/// rather than trusted, so no spelling an owner rejects can be matched to one it
+/// [`classify_locator`] matches an internally owned scheme against that exact
+/// spelling, the way the owner of the scheme matches it, and folds the token
+/// only to *refuse* a case variant: a fold never stands in for an owner's
+/// canonical spelling, so no spelling an owner rejects can be matched to one it
 /// accepts.
 fn scheme_token(locator: &str, colon: usize) -> Option<&str> {
     let scheme = locator.get(..colon)?;
@@ -541,15 +585,20 @@ fn namespaced_handle_grammar(namespace: &str, identifier: &str) -> Result<(), Lo
 /// other two grammars accept and this one does not is
 /// [`LocatorAmbiguity::NonCanonicalInternalForm`] and never admitted, so a value
 /// that is opaque under a looser owner cannot slip through as internal here.
-/// There is no value this accepts that the mirrored owner refuses.
+/// There is no value this accepts that the mirrored owner refuses, and the
+/// reason is that the recogniser is only ever reached for the exact scheme
+/// spelling: [`classify_locator`] matches `eliot` case-exactly before calling it,
+/// so every value that reaches this function literally begins `eliot://` — the
+/// same prefix `parse_uri` strips, with the same case, and the same remaining
+/// `//`.
 ///
 /// A case-folded scheme such as `ELIOT://…` also lands on
-/// [`LocatorAmbiguity::NonCanonicalInternalForm`], because
-/// [`classify_locator`] folds the scheme and then requires the fold to equal a
-/// recognised owner, so a case variant of an internal scheme is refused rather
-/// than falling through to the external reading. That is deliberate: the owner
-/// refuses `ELIOT://…` too, and letting it become an `ExternalUri` would let an
-/// unlisted spelling of an internal scheme be admitted through `url_handles`.
+/// [`LocatorAmbiguity::NonCanonicalInternalForm`], because [`classify_locator`]
+/// matches an owned scheme case-exactly and then names a case variant of one as
+/// non-canonical instead of letting it fall through to the external reading.
+/// That is deliberate: the owner refuses `ELIOT://…` too, and letting it become
+/// an `ExternalUri` would let an unlisted spelling of an internal scheme be
+/// admitted through `url_handles`.
 fn parse_bridge_resource_identity(rest: &str) -> Option<InternalLocatorIdentity> {
     let path = rest.strip_prefix("//")?;
     if path.bytes().any(|byte| byte.is_ascii_whitespace()) {
@@ -620,7 +669,14 @@ enum OwnedScheme {
 /// This is an exhaustive `match` rather than a `const` slice so the compiler
 /// forces a decision for every scheme that reaches it, and so each owner citation
 /// sits next to the grammar that owner owns. A scheme with no arm is
-/// [`OwnedScheme::NotOwned`] and fails closed as [`LocatorClass::ExternalUri`].
+/// [`OwnedScheme::NotOwned`], and the caller reads that as
+/// [`LocatorClass::ExternalUri`] unless the spelling is a case variant of an
+/// owned scheme, which is refused by name instead — see
+/// `is_internal_scheme_case_variant`.
+///
+/// The match is on the exact spelling, for the same reason the bridge family
+/// is: an owner mints one spelling, and a scheme that differs from it only in
+/// case is not a spelling that owner can produce or accept.
 ///
 /// # The one member: `provider-artifact`
 ///
@@ -684,6 +740,39 @@ fn owned_scheme(scheme: &str, opaque: &str) -> OwnedScheme {
     }
 }
 
+/// Whether `scheme` is an internally owned scheme spelled in a case its owner
+/// does not accept.
+///
+/// Both owners accept exactly one spelling, and this is the question that keeps
+/// the recogniser a mirror rather than a superset of them. It is asked only of a
+/// spelling the case-exact matches in [`classify_locator`] have already missed,
+/// so `true` means "this is one of ours, misspelt", never "this is ours".
+///
+/// The question is asked of the folded spelling through the same two owners the
+/// classifier consults, which is what keeps the owned-scheme set spelled exactly
+/// once: [`owned_scheme`] for the schemes it names, and
+/// [`BRIDGE_RESOURCE_SCHEME`] for the `eliot://` family. Each owner refuses the
+/// folded-spelling variant itself, so the honest verdict for `ELIOT://…` and
+/// `PROVIDER-ARTIFACT:…` is [`LocatorAmbiguity::NonCanonicalInternalForm`] and
+/// never [`LocatorClass::ExternalUri`] — a case variant of an internal scheme
+/// must not become a value an exact `url_handles` entry can admit.
+///
+/// The remainder is passed through unchanged and does not change the answer: an
+/// owner rejects the spelling before it reads the opaque part, so this function
+/// answers `true` for `PROVIDER-ARTIFACT:<64 hex>` exactly as it does for
+/// `PROVIDER-ARTIFACT:not-a-digest`, and the classifier refuses both.
+fn is_internal_scheme_case_variant(scheme: &str, opaque: &str) -> bool {
+    let folded = scheme.to_ascii_lowercase();
+    if folded == BRIDGE_RESOURCE_SCHEME {
+        return true;
+    }
+    // The folded spelling answers a question about the scheme alone: an arm that
+    // matched it returns `Owned` for a remainder that owner accepts and
+    // `NonCanonical` for one it does not, so only `NotOwned` means no owner
+    // claims the scheme at all.
+    !matches!(owned_scheme(&folded, opaque), OwnedScheme::NotOwned)
+}
+
 /// Classifies one locator reference structurally. Never resolves or fetches.
 ///
 /// The decision is made in one place and both reference boundaries read it, in
@@ -700,13 +789,12 @@ fn owned_scheme(scheme: &str, opaque: &str) -> OwnedScheme {
 /// - a scheme separator with nothing after it (`urn:`, `C:`) —
 ///   [`LocatorClass::MalformedOrAmbiguous`] with
 ///   [`LocatorAmbiguity::EmptyAfterSchemeSeparator`];
-/// - a recognised internal scheme in a canonical form, whether the mirrored
-///   `eliot://` family or a scheme a named owner mints internally —
-///   [`LocatorClass::InternalUri`];
-/// - a case variant of a recognised internal scheme used wrongly, or any other
-///   recognised internal scheme in a non-canonical form —
-///   [`LocatorClass::MalformedOrAmbiguous`] with
-///   [`LocatorAmbiguity::NonCanonicalInternalForm`];
+/// - a recognised internal scheme in a canonical form, matched under its exact
+///   spelling, whether the mirrored `eliot://` family or a scheme a named owner
+///   mints internally — [`LocatorClass::InternalUri`];
+/// - a case variant of a recognised internal scheme, or a recognised internal
+///   scheme in a non-canonical form — [`LocatorClass::MalformedOrAmbiguous`]
+///   with [`LocatorAmbiguity::NonCanonicalInternalForm`];
 /// - any other valid scheme — [`LocatorClass::ExternalUri`].
 ///
 /// The `::` test sits above the scheme-token test on purpose. A `::` spelling is
@@ -776,6 +864,18 @@ fn owned_scheme(scheme: &str, opaque: &str) -> OwnedScheme {
 /// candidate the live research binary actually produces, so reading it as an
 /// external URI both mislabels it and sends the operator to a list that cannot
 /// admit it.
+///
+/// Ownership is matched under the owner's exact spelling, like the `eliot://`
+/// family, because that is the third property an accepted owner is recognised
+/// for: the spelling it mints is the spelling it can stand behind. A recogniser
+/// that folded the scheme would accept values the owner cannot produce, which
+/// makes it a superset of the owner it claims to reuse — the defect this
+/// classifier had under `absolute-locator/2`, where `PROVIDER-ARTIFACT:<64 hex>`
+/// was read as the owner's handle and `ELIOT://…` as a bridge resource identity.
+/// Case variants are refused by name
+/// ([`is_internal_scheme_case_variant`]) rather than admitted under the owner's
+/// name, because `url_handles` is an exact-byte allowlist and must not be able to
+/// admit a misspelling of an internal scheme as a URL.
 ///
 /// # Why the grep-derived internal scheme set shrank
 ///
@@ -861,16 +961,17 @@ pub fn classify_locator(locator: &str) -> LocatorClass {
             reason: LocatorAmbiguity::EmptyAfterSchemeSeparator,
         };
     }
-    // A recognised internal scheme is matched through a case fold, but the fold
-    // has to *equal* the canonical spelling to be treated as that owner. RFC 3986
-    // schemes are case-insensitive, so `ELIOT://…` and `PROVIDER-ARTIFACT:…` name
-    // the same schemes as their canonical spellings; the owners reject those
-    // spellings, so folding only to decide ownership — and refusing a fold that
-    // does not match exactly — keeps a case variant of an internal scheme from
-    // falling through to the external reading and being admitted through
-    // `url_handles`.
-    let canonical = scheme.to_ascii_lowercase();
-    if canonical == BRIDGE_RESOURCE_SCHEME {
+    // An internally owned scheme is matched CASE-EXACTLY, the way the owner of
+    // that scheme matches it: `parse_uri` does `raw.strip_prefix(URI_SCHEME)`
+    // with `URI_SCHEME = "eliot://"`, which is case-sensitive, so `ELIOT://…` is
+    // not a canonical spelling of that grammar at all. RFC 3986 says a scheme
+    // token is case-insensitive *for the URI it denotes*; it does not say a
+    // contract that owns a grammar has to accept every spelling of the scheme
+    // that names it, and folding here made this recogniser a strict superset of
+    // the owner it mirrors. The one case fold left in the classifier is the one
+    // inside `is_internal_scheme_case_variant`, and it exists to *refuse* a
+    // variant rather than to claim one.
+    if scheme == BRIDGE_RESOURCE_SCHEME {
         return match parse_bridge_resource_identity(opaque) {
             Some(parsed_identity) => LocatorClass::InternalUri {
                 canonical_scheme: BRIDGE_RESOURCE_SCHEME.to_owned(),
@@ -882,18 +983,27 @@ pub fn classify_locator(locator: &str) -> LocatorClass {
         };
     }
     // A scheme a named owner mints internally, recognised under that owner's
-    // grammar. A scheme with no owner arm is not owned, so it falls through to
-    // the external reading and needs an exact `url_handles` entry.
-    match owned_scheme(&canonical, opaque) {
+    // grammar and its exact spelling, so `canonical_scheme` below is the owner's
+    // own spelling rather than a fold of it. A scheme with no owner arm is not
+    // owned, so it falls through to the external reading and needs an exact
+    // `url_handles` entry — unless it is a case variant of an owned one, which
+    // the owner refuses and `url_handles` must not be able to admit.
+    match owned_scheme(scheme, opaque) {
         OwnedScheme::Owned(parsed_identity) => LocatorClass::InternalUri {
-            canonical_scheme: canonical,
+            canonical_scheme: scheme.to_owned(),
             parsed_identity,
         },
-        OwnedScheme::NonCanonical => LocatorClass::MalformedOrAmbiguous {
+        OwnedScheme::NotOwned if !is_internal_scheme_case_variant(scheme, opaque) => {
+            LocatorClass::ExternalUri {
+                exact_original: locator.to_owned(),
+            }
+        }
+        // An owner that claims this scheme and a case variant of one are the same
+        // refusal for the same reason: the spelling is not the owner's, so it is
+        // not the owner's identity either — not from the remainder, and not from
+        // the exact spelling of the scheme that names it.
+        OwnedScheme::NonCanonical | OwnedScheme::NotOwned => LocatorClass::MalformedOrAmbiguous {
             reason: LocatorAmbiguity::NonCanonicalInternalForm,
-        },
-        OwnedScheme::NotOwned => LocatorClass::ExternalUri {
-            exact_original: locator.to_owned(),
         },
     }
 }
@@ -1192,9 +1302,10 @@ impl AllowedReferenceManifest {
     /// `.canonical_encoding_version` in I5.27: what a locator string *means*
     /// depends on the classifier that reads it, so the classifier is inside the
     /// identity rather than beside it. Changing either version therefore changes
-    /// every manifest digest, and a manifest sealed under the superseded
-    /// `absolute-locator/1` semantics cannot re-verify after the upgrade — it
-    /// needs a re-sealed manifest, not a grandfathered admission.
+    /// every manifest digest, and a manifest sealed under a superseded
+    /// `absolute-locator/1` or `absolute-locator/2` semantics cannot re-verify
+    /// after the upgrade — it needs a re-sealed manifest, not a grandfathered
+    /// admission.
     pub fn canonical_digest(&self) -> Result<String, ResearchContractError> {
         let mut shape = self.clone();
         shape.digest = String::new();
@@ -1431,6 +1542,13 @@ pub struct ResearchEvidenceBundle {
 /// — its owning identity check is the delivered source-handle admission
 /// `ResearchEvidenceBundle::validate_against` applies first, and classification is
 /// not proof that the handle belongs to this run.
+///
+/// A blank locator is refused here too — [`classify_locator`] reads it as
+/// [`LocatorAmbiguity::Blank`] — but the only caller asks about a locator when
+/// the locator carries a reference, because a blank one is #1764's
+/// missing-lineage diagnosis rather than a classification verdict. Keeping the
+/// refusal here means a future caller that does ask about a blank locator still
+/// gets one.
 fn admit_locator(
     locator: &str,
     manifest: &AllowedReferenceManifest,
@@ -1538,7 +1656,26 @@ impl ResearchEvidenceBundle {
             // range, artifact handle or support relation through prose." A
             // syntactically valid locator URL the manifest does not list is
             // exactly that, so it is refused here rather than delivered.
-            admit_locator(&source.locator, &request.allowed_references)?;
+            //
+            // A locator with no content in it is not a reference at all, and
+            // this firewall admits or refuses references: the empty string is
+            // not a URL, not an internal identity and not a handle, so neither
+            // `url_handles` nor the handle allowlist above has anything to
+            // decide about it. That question is owned by #1764's delivered
+            // lineage check — `seal_handoff` in
+            // `crates/research/eliot-research-exchange/src/handoff.rs`, which
+            // answers a blank `title`, a blank `locator` and a blank `coverage`
+            // together as `HandoffError::MissingSourceLineage`. `title` and
+            // `coverage` have never been checked here, so the blank locator is
+            // the odd one out rather than the rule: asking `classify_locator`
+            // about it turned #1764's missing-lineage diagnosis into
+            // `LocatorNotClassifiable { reason: "BLANK" }` and made it
+            // unreachable through the seal, which is the regression this guard
+            // removes. The gate therefore runs for every locator that carries a
+            // reference, and a blank one stays with its owner.
+            if !source.locator.trim().is_empty() {
+                admit_locator(&source.locator, &request.allowed_references)?;
+            }
         }
         for handle in &self.artifact_handles {
             text(handle, "bundle.artifact_handles")?;
