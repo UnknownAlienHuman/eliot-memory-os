@@ -16,6 +16,9 @@ const USEFUL_EVENTS = new Set([
 ])
 const TRANSIENT_HTTP_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
 const ALLOWED_HTTP_HOSTS = new Set(["127.0.0.1", "::1", "[::1]"])
+// Bare decision strings are legacy/unverified: they describe the observation
+// ceiling only and can no longer authorize a mutating tool. The verified gate
+// path requires the versioned owner-proved response (see verifyGatePermit).
 const ALLOWED_GATE_DECISIONS = new Set(["recorded", "allow", "allowed", "pass"])
 
 const BRIDGE_ENV_KEYS = [
@@ -744,7 +747,123 @@ async function invokeLegacyProcessBridge(kind, payload, { required = false } = {
   }
 }
 
-async function invokeBridge(kind, input, output, { required = false, effectBinding = null } = {}) {
+const HOST_EVENT_RESPONSE_VERSION = "eliot.opencode.host-event-response.v1"
+
+async function hmacSha256Hex(keyText, messageText) {
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) return null
+  try {
+    const key = await subtle.importKey(
+      "raw",
+      new TextEncoder().encode(keyText),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    )
+    const signature = await subtle.sign("HMAC", key, new TextEncoder().encode(messageText))
+    return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+  } catch {
+    return null
+  }
+}
+
+function commitmentsEqual(left, right) {
+  if (typeof left !== "string" || typeof right !== "string" || left.length !== right.length) {
+    return false
+  }
+  let diff = 0
+  for (let index = 0; index < left.length; index += 1) {
+    diff |= left.charCodeAt(index) ^ right.charCodeAt(index)
+  }
+  return diff === 0
+}
+
+function responseCommitmentMessage(result) {
+  return JSON.stringify([
+    HOST_EVENT_RESPONSE_VERSION,
+    result.event_id,
+    result.effect_digest ?? null,
+    result.decision,
+    result.disposition ?? null,
+    result.reason_code ?? null,
+    result.installation_id,
+    result.bridge_generation,
+    result.authority_epoch,
+    result.state_fence,
+    result.policy_revision ?? null,
+    result.authority_revision ?? null,
+    result.expires_at_ms ?? null,
+    result.event_receipt,
+    result.decision_receipt ?? null,
+    result.replayed,
+  ])
+}
+
+async function verifyGatePermit(result, { payload, token, tool }) {
+  const unverified = (detail) =>
+    new Error(
+      `ELIOT ActionGate returned a legacy/unverified response: ${detail} (cannot authorize a mutating tool)`,
+    )
+  if (result == null || typeof result !== "object" || Array.isArray(result)) {
+    throw unverified("response is not a versioned host-event response")
+  }
+  if (result.response_version !== HOST_EVENT_RESPONSE_VERSION) {
+    throw unverified("response is not a versioned host-event response")
+  }
+  if (result.event_id !== payload.event_id || result.effect_digest !== payload.effect_digest) {
+    throw unverified("response does not bind this gate event")
+  }
+  const installationId = process.env.ELIOT_INSTALLATION_ID
+  if (installationId && result.installation_id !== installationId) {
+    throw unverified("response binds a different installation")
+  }
+  const authorityEpoch = process.env.ELIOT_AUTHORITY_EPOCH
+  if (authorityEpoch && result.authority_epoch !== authorityEpoch) {
+    throw unverified("response binds a different authority epoch")
+  }
+  const stateFence = process.env.ELIOT_STATE_FENCE
+  if (stateFence && result.state_fence !== stateFence) {
+    throw unverified("response binds a different state fence")
+  }
+  if (typeof result.response_commitment !== "string" || !result.response_commitment) {
+    throw unverified("response carries no owner proof")
+  }
+  const expected = await hmacSha256Hex(token, responseCommitmentMessage(result))
+  if (expected == null || !commitmentsEqual(expected, result.response_commitment)) {
+    throw unverified("owner proof mismatch")
+  }
+  if (result.decision === "allow") {
+    if (
+      typeof result.expires_at_ms !== "number" ||
+      !Number.isSafeInteger(result.expires_at_ms) ||
+      result.expires_at_ms <= Date.now()
+    ) {
+      throw unverified("permit is expired")
+    }
+    if (
+      typeof result.policy_revision !== "string" ||
+      !result.policy_revision ||
+      typeof result.decision_receipt !== "string" ||
+      !result.decision_receipt
+    ) {
+      throw unverified("permit carries no decision commitment")
+    }
+    return
+  }
+  if (result.decision === "deny") {
+    const reason =
+      typeof result.reason_code === "string" && result.reason_code ? result.reason_code : "POLICY_DENIED"
+    throw new Error(`ELIOT ActionGate denied mutation by tool "${tool ?? "unknown"}": ${reason}`)
+  }
+  throw new Error("ELIOT ActionGate recorded the event but issued no usable permit")
+}
+
+async function invokeBridge(
+  kind,
+  input,
+  output,
+  { required = false, effectBinding = null, verifiedGate = null } = {},
+) {
   const payload = await compactEvent(kind, input, output, effectBinding)
   let httpConfig
   try {
@@ -755,12 +874,22 @@ async function invokeBridge(kind, input, output, { required = false, effectBindi
 
   if (httpConfig) {
     try {
-      return await invokeHttpBridge(httpConfig, payload)
+      const result = await invokeHttpBridge(httpConfig, payload)
+      if (verifiedGate) {
+        await verifyGatePermit(result, { payload, token: httpConfig.token, tool: verifiedGate.tool })
+      }
+      return result
     } catch (error) {
       // Never cross-transport fail over after an HTTP attempt: the first request may
       // have reached durable admission even when its response was lost.
       return bridgeFailure(required, error.message)
     }
+  }
+  if (verifiedGate) {
+    return bridgeFailure(
+      required,
+      "ELIOT ActionGate requires a verified host-events response: the legacy process transport cannot authorize a mutating tool",
+    )
   }
   return invokeLegacyProcessBridge(kind, payload, { required })
 }
@@ -831,13 +960,8 @@ function enqueuePassive(client, kind, input, output, options = {}) {
 async function requireMutationGate(input, output, effectBinding) {
   const gateOptions = { required: true }
   gateOptions.effectBinding = effectBinding
-  const gate = await invokeBridge("tool.execute.before", input, output, gateOptions)
-  if (gate.decision === "deny") {
-    throw new Error("ELIOT ActionGate denied mutation")
-  }
-  if (!ALLOWED_GATE_DECISIONS.has(gate.decision)) {
-    throw new Error("ELIOT ActionGate returned no explicit usable decision")
-  }
+  gateOptions.verifiedGate = { tool: input?.tool }
+  await invokeBridge("tool.execute.before", input, output, gateOptions)
 }
 
 export const EliotPlugin = async ({ client } = {}) => ({

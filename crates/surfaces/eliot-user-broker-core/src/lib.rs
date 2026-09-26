@@ -2629,6 +2629,432 @@ pub enum BrokerError {
     Provider(String),
 }
 
+/// Version of the User Broker-owned `OpenCode` bridge introduction (issue #2898).
+pub const OPENCODE_BRIDGE_INTRODUCTION_VERSION: &str = "eliot.opencode.bridge-introduction.v1";
+/// Closed capability: submit host-event observations through `/v1/host-events`.
+pub const OPENCODE_BRIDGE_CAPABILITY_OBSERVATION_SUBMIT: &str = "opencode.observation.submit";
+/// Closed capability: request a pre-effect mutation-gate decision.
+pub const OPENCODE_BRIDGE_CAPABILITY_MUTATION_GATE: &str = "opencode.mutation-gate.request";
+
+/// Exact closed `OpenCode` bridge capabilities an introduction may grant.
+pub const OPENCODE_BRIDGE_CAPABILITIES: [&str; 2] = [
+    OPENCODE_BRIDGE_CAPABILITY_OBSERVATION_SUBMIT,
+    OPENCODE_BRIDGE_CAPABILITY_MUTATION_GATE,
+];
+
+/// Exact `OpenCode` process binding carried by one bridge introduction.
+///
+/// The introduction is materialized only to this process: the immutable
+/// executable digest, the broker-minted launch nonce, and the User Broker
+/// process that is its parent. A credential presented from any other process
+/// is insufficient, even when the secret itself is valid.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeProcessBinding {
+    /// Lowercase SHA-256 hex of the exact approved `OpenCode` executable.
+    pub executable_digest: String,
+    /// Broker-minted launch nonce binding this introduction to one launch.
+    pub launch_nonce: String,
+    /// Process identity of the introducing User Broker (the exact parent).
+    pub parent_broker_process_id: String,
+}
+
+impl OpenCodeProcessBinding {
+    fn validate(&self) -> Result<(), BrokerError> {
+        hex_digest(
+            &self.executable_digest,
+            "introduction.process_binding.executable_digest",
+        )?;
+        text(
+            &self.launch_nonce,
+            "introduction.process_binding.launch_nonce",
+        )?;
+        text(
+            &self.parent_broker_process_id,
+            "introduction.process_binding.parent_broker_process_id",
+        )?;
+        Ok(())
+    }
+}
+
+/// Mint parameters for [`OpenCodeBridgeIntroduction`]. Every field is
+/// broker-observed owner state; nothing is copied from `OpenCode` input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeIntroductionParams {
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub broker_generation: Generation,
+    pub bridge_generation: Generation,
+    /// Canonical pinned loopback endpoint (`http://127.0.0.1:<port>` or
+    /// `http://[::1]:<port>`, explicit non-zero port, nothing else).
+    pub endpoint: String,
+    /// Opaque owner-minted server identity digest (lowercase SHA-256 hex)
+    /// binding this introduction to one bridge incarnation.
+    pub server_identity: String,
+    /// Protected bootstrap channel (named-pipe name) when the installation
+    /// uses pipe bootstrap; `None` selects the exclusively pre-bound
+    /// listener path with bind-conflict refusal.
+    pub bootstrap_channel: Option<String>,
+    /// Opaque credential handle; raw secret material never appears here.
+    pub credential: SecretRef,
+    /// Absolute credential expiry in Unix milliseconds.
+    pub credential_expires_at: u64,
+    /// Exact closed capabilities granted (non-empty subset of
+    /// [`OPENCODE_BRIDGE_CAPABILITIES`]).
+    pub allowed_capabilities: Vec<String>,
+    pub authority_epoch: EpochId,
+    /// Live attach fence identity (the attach `FencingToken` nonce) as
+    /// observed at mint. The ingress adapter requires an exact live match,
+    /// so fence movement fails closed; the broker re-mints on rotation.
+    pub fence_id: String,
+    /// Absolute issue instant in Unix milliseconds.
+    pub issued_at: u64,
+    /// Absolute introduction expiry in Unix milliseconds.
+    pub expires_at: u64,
+    /// Broker revocation-list key; rotation/revocation invalidates the
+    /// introduction before any further request is admitted.
+    pub revocation_id: String,
+    pub process_binding: OpenCodeProcessBinding,
+}
+
+/// User Broker-owned introduction of one `OpenCode` bridge route (issue #2898,
+/// step 2).
+///
+/// This is the only admitted client-identity path for `/v1/host-events`:
+/// installation, Windows user/logon session, broker/bridge generations,
+/// endpoint and server identity, credential [`SecretRef`], allowed
+/// capabilities, issue/expiry/revocation facts, and the exact `OpenCode`
+/// process binding. `ELIOT_*` environment entries may be a materialized
+/// child projection of exactly this introduction; manually setting them is
+/// not an admitted installation path and fails the server-side join.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeBridgeIntroduction {
+    pub version: String,
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub broker_generation: Generation,
+    pub bridge_generation: Generation,
+    pub endpoint: String,
+    pub server_identity: String,
+    pub bootstrap_channel: Option<String>,
+    pub credential: SecretRef,
+    pub credential_expires_at: u64,
+    pub allowed_capabilities: Vec<String>,
+    pub authority_epoch: EpochId,
+    /// Live attach fence identity (the attach `FencingToken` nonce) as
+    /// observed at mint; the ingress adapter requires an exact live match.
+    pub fence_id: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revocation_id: String,
+    pub process_binding: OpenCodeProcessBinding,
+    /// Lowercase SHA-256 hex over the canonical mint tuple, recomputed by
+    /// [`OpenCodeBridgeIntroduction::validate`]; binds every field above.
+    pub introduction_digest: String,
+}
+
+/// Broker-observed current-session facts for the introduction probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeSessionFacts {
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub broker_generation: Generation,
+    pub bridge_generation: Generation,
+    pub launch_nonce: String,
+    pub executable_digest: String,
+}
+
+fn validate_opencode_endpoint(value: &str) -> Result<(), BrokerError> {
+    const FIELD: &str = "introduction.endpoint";
+    const PREFIX: &str = "http://";
+    let authority = value
+        .strip_prefix(PREFIX)
+        .ok_or(BrokerError::InvalidField(FIELD))?;
+    if authority.is_empty()
+        || authority.contains(['@', '?', '#', '/', ' '])
+        || authority.chars().any(char::is_control)
+    {
+        return Err(BrokerError::InvalidField(FIELD));
+    }
+    let port_text = if let Some(rest) = authority.strip_prefix("[::1]:") {
+        if rest.is_empty() {
+            return Err(BrokerError::InvalidField(FIELD));
+        }
+        rest
+    } else if let Some(rest) = authority.strip_prefix("127.0.0.1:") {
+        if rest.is_empty() {
+            return Err(BrokerError::InvalidField(FIELD));
+        }
+        rest
+    } else {
+        return Err(BrokerError::InvalidField(FIELD));
+    };
+    if !port_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BrokerError::InvalidField(FIELD));
+    }
+    let port: u16 = port_text
+        .parse()
+        .map_err(|_| BrokerError::InvalidField(FIELD))?;
+    if port == 0 {
+        return Err(BrokerError::InvalidField(FIELD));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct OpenCodeIntroductionDigest<'a> {
+    version: &'a str,
+    installation_id: &'a str,
+    windows_sid: &'a str,
+    interactive_session_id: &'a str,
+    broker_generation: u64,
+    bridge_generation: u64,
+    endpoint: &'a str,
+    server_identity: &'a str,
+    bootstrap_channel: Option<&'a str>,
+    credential_provider: &'a str,
+    credential_key: &'a str,
+    credential_expires_at: u64,
+    allowed_capabilities: &'a [String],
+    authority_epoch: &'a EpochId,
+    fence_id: &'a str,
+    issued_at: u64,
+    expires_at: u64,
+    revocation_id: &'a str,
+    executable_digest: &'a str,
+    launch_nonce: &'a str,
+    parent_broker_process_id: &'a str,
+}
+
+impl OpenCodeBridgeIntroduction {
+    fn mint_digest(params: &OpenCodeIntroductionParams) -> Result<String, BrokerError> {
+        digest(&OpenCodeIntroductionDigest {
+            version: OPENCODE_BRIDGE_INTRODUCTION_VERSION,
+            installation_id: params.installation_id.as_str(),
+            windows_sid: params.windows_sid.as_str(),
+            interactive_session_id: params.interactive_session_id.as_str(),
+            broker_generation: params.broker_generation.get(),
+            bridge_generation: params.bridge_generation.get(),
+            endpoint: params.endpoint.as_str(),
+            server_identity: params.server_identity.as_str(),
+            bootstrap_channel: params.bootstrap_channel.as_deref(),
+            credential_provider: params.credential.provider(),
+            credential_key: params.credential.key(),
+            credential_expires_at: params.credential_expires_at,
+            allowed_capabilities: params.allowed_capabilities.as_slice(),
+            authority_epoch: &params.authority_epoch,
+            fence_id: params.fence_id.as_str(),
+            issued_at: params.issued_at,
+            expires_at: params.expires_at,
+            revocation_id: params.revocation_id.as_str(),
+            executable_digest: params.process_binding.executable_digest.as_str(),
+            launch_nonce: params.process_binding.launch_nonce.as_str(),
+            parent_broker_process_id: params.process_binding.parent_broker_process_id.as_str(),
+        })
+    }
+
+    /// Mints one introduction from broker-observed owner state.
+    ///
+    /// Restart/rotation mints a new generation; the caller retires the old
+    /// introduction (revocation list + generation switch) before the new one
+    /// admits traffic, so a foreign or stale listener cannot inherit the
+    /// route.
+    pub fn mint(params: OpenCodeIntroductionParams) -> Result<Self, BrokerError> {
+        if params.broker_generation.get() == 0 || params.bridge_generation.get() == 0 {
+            return Err(BrokerError::InvalidField("introduction.generation"));
+        }
+        text(&params.installation_id, "introduction.installation_id")?;
+        text(&params.windows_sid, "introduction.windows_sid")?;
+        text(
+            &params.interactive_session_id,
+            "introduction.interactive_session_id",
+        )?;
+        validate_opencode_endpoint(&params.endpoint)?;
+        hex_digest(&params.server_identity, "introduction.server_identity")?;
+        if let Some(channel) = params.bootstrap_channel.as_deref() {
+            text(channel, "introduction.bootstrap_channel")?;
+        }
+        if params.allowed_capabilities.is_empty()
+            || params.allowed_capabilities.len() > OPENCODE_BRIDGE_CAPABILITIES.len()
+        {
+            return Err(BrokerError::InvalidField(
+                "introduction.allowed_capabilities",
+            ));
+        }
+        unique(
+            &params.allowed_capabilities,
+            "introduction.allowed_capabilities",
+        )?;
+        for capability in &params.allowed_capabilities {
+            if !OPENCODE_BRIDGE_CAPABILITIES.contains(&capability.as_str()) {
+                return Err(BrokerError::InvalidField(
+                    "introduction.allowed_capabilities",
+                ));
+            }
+        }
+        text(&params.fence_id, "introduction.fence_id")?;
+        text(&params.revocation_id, "introduction.revocation_id")?;
+        if params.issued_at == 0 || params.expires_at <= params.issued_at {
+            return Err(BrokerError::InvalidField("introduction.expires_at"));
+        }
+        if params.credential_expires_at <= params.issued_at
+            || params.credential_expires_at > params.expires_at
+        {
+            return Err(BrokerError::InvalidField(
+                "introduction.credential_expires_at",
+            ));
+        }
+        params.process_binding.validate()?;
+        let introduction_digest = Self::mint_digest(&params)?;
+        Ok(Self {
+            version: OPENCODE_BRIDGE_INTRODUCTION_VERSION.to_owned(),
+            installation_id: params.installation_id,
+            windows_sid: params.windows_sid,
+            interactive_session_id: params.interactive_session_id,
+            broker_generation: params.broker_generation,
+            bridge_generation: params.bridge_generation,
+            endpoint: params.endpoint,
+            server_identity: params.server_identity,
+            bootstrap_channel: params.bootstrap_channel,
+            credential: params.credential,
+            credential_expires_at: params.credential_expires_at,
+            allowed_capabilities: params.allowed_capabilities,
+            authority_epoch: params.authority_epoch,
+            fence_id: params.fence_id,
+            issued_at: params.issued_at,
+            expires_at: params.expires_at,
+            revocation_id: params.revocation_id,
+            process_binding: params.process_binding,
+            introduction_digest,
+        })
+    }
+
+    /// Validates version, shape, issue/expiry window, and digest binding.
+    ///
+    /// Revocation is checked by the holder against the live revocation list,
+    /// never from this value alone.
+    pub fn validate(&self, now_ms: u64) -> Result<(), BrokerError> {
+        if self.version != OPENCODE_BRIDGE_INTRODUCTION_VERSION {
+            return Err(BrokerError::InvalidField("introduction.version"));
+        }
+        if self.broker_generation.get() == 0 || self.bridge_generation.get() == 0 {
+            return Err(BrokerError::InvalidField("introduction.generation"));
+        }
+        text(&self.installation_id, "introduction.installation_id")?;
+        text(&self.windows_sid, "introduction.windows_sid")?;
+        text(
+            &self.interactive_session_id,
+            "introduction.interactive_session_id",
+        )?;
+        validate_opencode_endpoint(&self.endpoint)?;
+        hex_digest(&self.server_identity, "introduction.server_identity")?;
+        if let Some(channel) = self.bootstrap_channel.as_deref() {
+            text(channel, "introduction.bootstrap_channel")?;
+        }
+        if self.allowed_capabilities.is_empty()
+            || self.allowed_capabilities.len() > OPENCODE_BRIDGE_CAPABILITIES.len()
+        {
+            return Err(BrokerError::InvalidField(
+                "introduction.allowed_capabilities",
+            ));
+        }
+        unique(
+            &self.allowed_capabilities,
+            "introduction.allowed_capabilities",
+        )?;
+        for capability in &self.allowed_capabilities {
+            if !OPENCODE_BRIDGE_CAPABILITIES.contains(&capability.as_str()) {
+                return Err(BrokerError::InvalidField(
+                    "introduction.allowed_capabilities",
+                ));
+            }
+        }
+        text(&self.fence_id, "introduction.fence_id")?;
+        text(&self.revocation_id, "introduction.revocation_id")?;
+        if self.issued_at == 0 || self.expires_at <= self.issued_at {
+            return Err(BrokerError::InvalidField("introduction.expires_at"));
+        }
+        if self.credential_expires_at <= self.issued_at
+            || self.credential_expires_at > self.expires_at
+        {
+            return Err(BrokerError::InvalidField(
+                "introduction.credential_expires_at",
+            ));
+        }
+        if now_ms < self.issued_at || now_ms >= self.expires_at {
+            return Err(BrokerError::LeaseExpired);
+        }
+        if now_ms >= self.credential_expires_at {
+            return Err(BrokerError::LeaseExpired);
+        }
+        self.process_binding.validate()?;
+        hex_digest(
+            &self.introduction_digest,
+            "introduction.introduction_digest",
+        )?;
+        let params = OpenCodeIntroductionParams {
+            installation_id: self.installation_id.clone(),
+            windows_sid: self.windows_sid.clone(),
+            interactive_session_id: self.interactive_session_id.clone(),
+            broker_generation: self.broker_generation,
+            bridge_generation: self.bridge_generation,
+            endpoint: self.endpoint.clone(),
+            server_identity: self.server_identity.clone(),
+            bootstrap_channel: self.bootstrap_channel.clone(),
+            credential: self.credential.clone(),
+            credential_expires_at: self.credential_expires_at,
+            allowed_capabilities: self.allowed_capabilities.clone(),
+            authority_epoch: self.authority_epoch.clone(),
+            fence_id: self.fence_id.clone(),
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+            revocation_id: self.revocation_id.clone(),
+            process_binding: self.process_binding.clone(),
+        };
+        let expected = Self::mint_digest(&params)?;
+        if expected != self.introduction_digest {
+            return Err(BrokerError::GrantBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the closed capability is granted by this introduction.
+    #[must_use]
+    pub fn allows(&self, capability: &str) -> bool {
+        self.allowed_capabilities
+            .iter()
+            .any(|granted| granted == capability)
+    }
+
+    /// Probes the introduction against live broker-observed session facts.
+    ///
+    /// Every field must match exactly: installation, SID, logon session,
+    /// both generations, launch nonce, and executable digest. A valid
+    /// secret from another process, session, or generation is insufficient.
+    /// Rotation invalidates the old introduction before another request by
+    /// retiring its generation/nonce from the observed facts.
+    pub fn probe_current_session(
+        &self,
+        observed: &OpenCodeSessionFacts,
+    ) -> Result<(), BrokerError> {
+        if self.installation_id != observed.installation_id
+            || self.windows_sid != observed.windows_sid
+            || self.interactive_session_id != observed.interactive_session_id
+            || self.broker_generation != observed.broker_generation
+            || self.bridge_generation != observed.bridge_generation
+            || self.process_binding.launch_nonce != observed.launch_nonce
+            || self.process_binding.executable_digest != observed.executable_digest
+        {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {

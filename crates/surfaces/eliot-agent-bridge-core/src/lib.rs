@@ -2614,6 +2614,18 @@ impl AgentBridgeCore {
         }
     }
 
+    // Mirrors `forward_event`'s established `BridgeError` contract instead of
+    // boxing: a divergent error shape here would split one owner surface.
+    #[allow(clippy::result_large_err)]
+    pub fn forward_gap(&mut self, gap: &CoverageGap) -> Result<(), BridgeError> {
+        self.ensure_forwardable()?;
+        gap.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        let binding = self.binding()?.clone();
+        self.forwarder()?.forward_gap(&binding, gap)?;
+        Ok(())
+    }
+
     pub fn cursor(&self, stream_id: &str) -> Option<u64> {
         self.cursors.get(stream_id).copied()
     }
