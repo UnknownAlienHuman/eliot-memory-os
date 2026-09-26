@@ -198,8 +198,9 @@ enum Request {
     ReactiveSnapshot,
     ReconcileExternal {},
     /// Reads one bounded page from the imported recovery identity projection.
-    /// The opaque continuation is read-only and bound to the current owner
-    /// window, attach generation, and imported-page revision.
+    /// The encoded continuation is read-only and checked against the current
+    /// owner window, attach generation, and imported-page revision. It is
+    /// not a completeness receipt.
     RecoveryProjectionPage {
         #[serde(default)]
         cursor: Option<String>,
