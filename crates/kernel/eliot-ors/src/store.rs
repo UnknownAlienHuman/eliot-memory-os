@@ -75,10 +75,9 @@ use crate::{
     RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach,
     StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
-    SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
@@ -3495,7 +3494,7 @@ impl RedbRecoveryStore {
                         .map(|value| {
                             let winner: crate::HostRequestRecord = decode(value.value())?;
                             winner.validate()?;
-                            Ok(winner)
+                            Ok::<_, OrsError>(winner)
                         })
                         .transpose()?
                         .ok_or_else(|| OrsError::IntegrityProblem {
@@ -11063,21 +11062,21 @@ impl RedbRecoveryStore {
         let read = self
             .database
             .begin_read()
-            .map_err(|error| Self::stream_recovery_read_error(storage(error)))?;
+            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
         let table = read
             .open_table(PROCESS_STREAM_RECOVERY)
-            .map_err(|error| Self::stream_recovery_read_error(storage(error)))?;
+            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
         let mut projections = Vec::with_capacity(2);
         for stream in [ProcessStreamKind::Stdout, ProcessStreamKind::Stderr] {
             let key = Self::process_stream_recovery_key(operation_id, stream);
             let Some(value) = table
                 .get(key.as_str())
-                .map_err(|error| Self::stream_recovery_read_error(storage(error)))?
+                .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?
             else {
                 continue;
             };
-            let projection: ProcessStreamRecoveryProjection = decode(value.value())
-                .map_err(Self::stream_recovery_load_error)?;
+            let projection: ProcessStreamRecoveryProjection =
+                decode(value.value()).map_err(Self::stream_recovery_load_error)?;
             let canonical = projection
                 .record_key()
                 .map_err(Self::stream_recovery_load_error)?;
@@ -11246,12 +11245,12 @@ impl RedbRecoveryStore {
                     current: crate::CONTRACT_VERSION,
                 }
             }
-            other => Self::stream_recovery_read_error(other),
+            other => Self::stream_recovery_read_error(&other),
         }
     }
 
     /// Maps any storage or read failure onto the interrupted-read disposition.
-    fn stream_recovery_read_error(error: OrsError) -> ProcessStreamRecoveryLoadError {
+    fn stream_recovery_read_error(error: &OrsError) -> ProcessStreamRecoveryLoadError {
         ProcessStreamRecoveryLoadError::InterruptedRead {
             reason: error.to_string(),
         }

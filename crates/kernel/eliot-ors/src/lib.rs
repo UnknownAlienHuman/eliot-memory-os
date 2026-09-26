@@ -40,14 +40,14 @@ pub use doctor::*;
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
 pub use process_stream_recovery::{
-    MAX_STREAM_RECOVERY_GAPS, MAX_STREAM_RECOVERY_OMITTED_RANGES,
-    ProcessStreamRecoveryBinding, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
-    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRefusal,
-    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryWriteOutcome,
-    ProcessStreamRetirementProof, ProcessStreamSourceReadback, ProcessStreamSourceResolution,
-    ProcessStreamSourceResolver, StreamRecoveryActivation, StreamRecoveryAvailability,
-    StreamRecoveryCoverage, StreamRecoveryEvidenceScope, StreamRecoveryPreview, StreamRecoveryRange,
-    StreamRecoveryReconciliation, StreamRecoveryReconciliationState, StreamRecoverySourceFault,
+    MAX_STREAM_RECOVERY_GAPS, MAX_STREAM_RECOVERY_OMITTED_RANGES, ProcessStreamRecoveryBinding,
+    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    ProcessStreamRecoveryRefusal, ProcessStreamRecoveryRevalidation,
+    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceReadback,
+    ProcessStreamSourceResolution, ProcessStreamSourceResolver, StreamRecoveryActivation,
+    StreamRecoveryAvailability, StreamRecoveryCoverage, StreamRecoveryEvidenceScope,
+    StreamRecoveryPreview, StreamRecoveryRange, StreamRecoveryReconciliation,
+    StreamRecoveryReconciliationState, StreamRecoverySourceFault,
 };
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
@@ -68,8 +68,8 @@ pub use status::{
     observe_supervision_status, open_existing_read_only, read_current_supervision_lease_read_only,
 };
 pub use status_projection::{
-    OrsSupervisionStatusError, ProcessStreamRecoveryStatusProjection,
-    SupervisionStatusProjection, SupervisionStatusReason,
+    OrsSupervisionStatusError, ProcessStreamRecoveryStatusProjection, SupervisionStatusProjection,
+    SupervisionStatusReason,
 };
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,

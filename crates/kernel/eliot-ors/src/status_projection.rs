@@ -29,9 +29,9 @@ use eliot_process::{
 use eliot_runtime_contracts::HealthDimension;
 
 use crate::{
-    ProcessStreamRecoveryProjection, SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt,
-    StreamRecoveryActivation, StreamRecoveryAvailability, StreamRecoveryCoverage,
-    StreamRecoveryEvidenceScope, StreamRecoveryReconciliationState,
+    ProcessStreamRecoveryProjection, StreamRecoveryActivation, StreamRecoveryAvailability,
+    StreamRecoveryCoverage, StreamRecoveryEvidenceScope, StreamRecoveryReconciliationState,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +130,10 @@ impl ProcessStreamRecoveryStatusProjection {
             transport: projection.transport,
             persistence: projection.persistence,
             availability: projection.availability,
-            durable_locator: projection.source.as_ref().map(|source| source.locator().to_owned()),
+            durable_locator: projection
+                .source
+                .as_ref()
+                .map(|source| source.locator().to_owned()),
             ready_receipt_ref: projection
                 .source
                 .as_ref()

@@ -60,7 +60,9 @@ pub const MAX_STREAM_RECOVERY_GAPS: usize = 16;
 /// A single variant is deliberate: the value makes "bytes and exact coverage
 /// only, never parser/evaluator/task/finish evidence" part of the stored and
 /// projected wire rather than a prose promise that a caller could widen.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StreamRecoveryEvidenceScope {
     /// Immutable process-stream bytes and exact durable coverage, and nothing else.
@@ -68,7 +70,9 @@ pub enum StreamRecoveryEvidenceScope {
 }
 
 /// Durable activation state of one recovery projection.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StreamRecoveryActivation {
     /// The owning live operation may depend on this projection.
@@ -91,14 +95,18 @@ impl StreamRecoveryActivation {
     pub const fn permits_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Active, Self::Suspended | Self::Retired)
-                | (Self::Suspended, Self::Suspended | Self::Retired)
+            (
+                Self::Active | Self::Suspended,
+                Self::Suspended | Self::Retired
+            )
         )
     }
 }
 
 /// Reconciliation state of the owning operation, as seen from ORS.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StreamRecoveryReconciliationState {
     /// No reconciliation has started.
@@ -167,7 +175,9 @@ impl StreamRecoveryReconciliation {
 /// Unlike the accepted evidence contract's omitted-range type, the empty
 /// interval is representable here so a zero-byte complete source round-trips
 /// with exact coverage instead of degrading to "unknown".
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct StreamRecoveryRange {
     start: u64,
@@ -242,7 +252,9 @@ pub struct StreamRecoveryPreview {
 ///
 /// Missing, corrupt, revoked and purged sources stay distinguishable; none of
 /// them can be represented as complete evidence.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StreamRecoverySourceFault {
     /// The immutable object is absent, for example deleted or purged.
@@ -473,13 +485,19 @@ impl ProcessStreamRecoveryProjection {
             observed_sha256: &self.observed_sha256,
             observed_bytes: self.observed_bytes,
             persistence: self.persistence,
-            locator: self.source.as_ref().map(DurableProcessStreamSource::locator),
+            locator: self
+                .source
+                .as_ref()
+                .map(DurableProcessStreamSource::locator),
             ready_receipt_ref: self
                 .source
                 .as_ref()
                 .map(DurableProcessStreamSource::ready_receipt_ref),
             source_sha256: self.source.as_ref().map(DurableProcessStreamSource::sha256),
-            source_byte_length: self.source.as_ref().map(DurableProcessStreamSource::byte_length),
+            source_byte_length: self
+                .source
+                .as_ref()
+                .map(DurableProcessStreamSource::byte_length),
             coverage_sha256: self
                 .durable_coverage
                 .as_ref()
@@ -501,8 +519,8 @@ impl ProcessStreamRecoveryProjection {
             preview_represented_bytes: self.preview.represented_bytes,
             gaps: self.gaps.clone(),
         };
-        let bytes = serde_json::to_vec(&identity)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&identity).map_err(|error| OrsError::Encoding(error.to_string()))?;
         Ok(sha256_hex(&bytes))
     }
 
@@ -575,7 +593,10 @@ impl ProcessStreamRecoveryProjection {
         ] {
             validate_text(value.as_str(), field)?;
         }
-        validate_digest(&self.state_fence_digest, "stream_recovery_state_fence_digest")?;
+        validate_digest(
+            &self.state_fence_digest,
+            "stream_recovery_state_fence_digest",
+        )?;
         validate_digest(&self.policy_revision, "stream_recovery_policy_revision")?;
         if self.generation == 0 {
             return Err(OrsError::InvalidField {
@@ -769,10 +790,9 @@ impl ProcessStreamRecoveryProjection {
             }
             return Ok(());
         }
-        if self.preview.omitted_ranges != omitted_suffix(
-            self.preview.retained_bytes,
-            self.preview.represented_bytes,
-        )? {
+        if self.preview.omitted_ranges
+            != omitted_suffix(self.preview.retained_bytes, self.preview.represented_bytes)?
+        {
             return Err(OrsError::InvalidField {
                 field: "stream_recovery_preview_omitted_ranges",
                 reason: "a retained prefix must expose exactly the omitted suffix",
@@ -990,7 +1010,10 @@ impl ProcessStreamRecoveryProjection {
         if self.stream_contract_revision != fence.stream_contract_revision {
             return Err(ProcessStreamRecoveryRefusal::StaleStreamContractRevision);
         }
-        let locator = self.source.as_ref().map(DurableProcessStreamSource::locator);
+        let locator = self
+            .source
+            .as_ref()
+            .map(DurableProcessStreamSource::locator);
         if locator != Some(fence.locator.as_str()) {
             return Err(ProcessStreamRecoveryRefusal::LocatorIdentityMismatch);
         }
