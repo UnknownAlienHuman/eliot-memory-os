@@ -63,6 +63,11 @@ impl StoreLaunchConfig {
     pub fn validate(&self) -> Result<(), String> {
         validate_launch_text(&self.store_pipe, "store_pipe")?;
         validate_launch_text(&self.launch_nonce, "launch_nonce")?;
+        // #726: the typed namespace owner decides the legacy/current boundary
+        // first, so a recognized historical identity is routed through the
+        // owner-approved legacy mapping decision instead of being classified
+        // only by the current-namespace prefix check below.
+        refuse_legacy_pipe_namespace(&self.store_pipe)?;
         eliot_ipc::validate_pipe_name(&self.store_pipe)
             .map_err(|error| format!("invalid store_pipe: {error}"))?;
         eliot_platform_windows::NamedPipePeerExpectation::new(
@@ -197,6 +202,43 @@ impl StoreLaunchConfig {
     pub(crate) const fn store_generation(&self) -> u64 {
         self.runtime_launch.authority_generation.value()
     }
+}
+
+/// Routes a legacy `eliot-governor-<digest>` pipe identity through the typed
+/// namespace owner's legacy→current mapping decision, and refuses it when no
+/// owner-approved mapping exists.
+///
+/// Issue #726 makes `eliot-protocol`'s typed owner the single enforcement point
+/// for the complete ELIOT named-pipe namespace. A persisted Store launch config
+/// is a real producer of pipe identities, so a recognized historical identity
+/// is offered to that owner's mapping decision
+/// ([`eliot_protocol::LegacyEliotPipeName::map_to_current`], delegating to
+/// [`eliot_protocol::EliotPipeOwner::map_legacy_to_current`]) rather than being
+/// classified only by the current-namespace prefix check.
+///
+/// This runs before the current-namespace check on purpose. The exact
+/// `\\.\pipe\eliot\` prefix carries its trailing separator, so it does not
+/// match `\\.\pipe\eliot-governor-`: a legacy identity would otherwise be
+/// rejected only as an unprefixed name, with no owner decision recorded and no
+/// migration path owned.
+///
+/// Current names are unaffected. A current name is not a legacy identity, so
+/// [`eliot_protocol::LegacyEliotPipeName::parse`] reports
+/// [`eliot_protocol::EliotPipeNameError::LegacyUnsupported`] and this returns
+/// `Ok`, leaving the unchanged current-namespace acceptance and bytes to
+/// `eliot_ipc::validate_pipe_name`. A recognized legacy identity reaches the
+/// owner, which refuses it until the actual endpoint owner supplies an
+/// explicitly inventoried versioned mapping; no mapping is invented here and
+/// the two names are never both probed. Name validity is identity only — it
+/// never authenticates a peer, admits an ACL, or grants permission to connect.
+fn refuse_legacy_pipe_namespace(store_pipe: &str) -> Result<(), String> {
+    let Ok(legacy) = eliot_protocol::LegacyEliotPipeName::parse(store_pipe) else {
+        return Ok(());
+    };
+    legacy
+        .map_to_current()
+        .map(|_current| ())
+        .map_err(|error| format!("invalid store_pipe: {error}"))
 }
 
 fn expected_provider_arguments(config: &StoreLaunchConfig) -> Vec<String> {
