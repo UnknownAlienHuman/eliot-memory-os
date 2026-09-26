@@ -23,7 +23,7 @@ use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile,
+    AgentActivationResultReconcile, host_request_operation_id,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
@@ -43,8 +43,8 @@ use eliotd::testd_terminal_completion::{
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonError, DaemonKernelClient,
     DaemonStatus, LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, forward_admitted_local_read,
-    terminal_for_invalid_ticket,
+    ObserveDeferOutcome, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME,
+    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -1049,6 +1049,11 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // Sole owner of observe poll state (issue #2565). The same tick drives
+    // it independently of every other flight: a null claim backs off until
+    // the next tick, while a claimed observe pair serves through the closed
+    // vocabulary and defers through the Kernel defer leg before idling.
+    let mut observe_flight = ObserveFlight::Idle;
     // #2100: O1 owner-feed trigger state. The runtime retains one trigger
     // across passes so an unchanged provider performs no IO, while a
     // revision advance or a recovery re-presentation republishes through the
@@ -1091,6 +1096,7 @@ async fn run_loop(
                     &composition,
                     &mut flight,
                     &mut local_read_flight,
+                    &mut observe_flight,
                     &mut testd_owner_flight,
                     &mut owner_feed_flight,
                     &mut owner_feed,
@@ -1109,6 +1115,7 @@ async fn run_loop(
                     &composition,
                     &startup_readiness,
                     &mut local_read_flight,
+                    &mut observe_flight,
                     &mut testd_owner_flight,
                     &mut flight,
                 );
@@ -1135,6 +1142,9 @@ async fn run_loop(
                     &mut local_read_flight,
                     &mut startup_readiness,
                 )?;
+            }
+            observe_completion = next_observe_completion(&mut observe_flight) => {
+                settle_observe_completion(observe_completion, &mut observe_flight)?;
             }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
@@ -1265,10 +1275,12 @@ fn start_tick_work(
     composition: &SharedComposition,
     startup_readiness: &StartupReadinessProjection,
     local_read_flight: &mut LocalReadFlight,
+    observe_flight: &mut ObserveFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
     flight: &mut ActivationFlight,
 ) {
     maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
+    maybe_start_observe_poll(kernel, observe_flight);
     maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
     if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
         *flight = ActivationFlight::InFlight(ActivationFlightState {
@@ -1730,8 +1742,8 @@ fn start_activation_dispatch(
 
 /// Stage-aware shutdown drain for every already-started flight (issue
 /// #2559). No new claim starts here; already-started claim, resolve-wait,
-/// dispatch, local-read, `TestD` owner and owner-feed steps keep being polled
-/// together inside one declared finite budget.
+/// dispatch, local-read, observe, `TestD` owner and owner-feed steps keep
+/// being polled together inside one declared finite budget.
 ///
 /// A claimed/waiting ticket carries no result digest yet, so exhausting the
 /// budget while waiting or resolving settles as a clean shutdown: nothing
@@ -1739,18 +1751,23 @@ fn start_activation_dispatch(
 /// submitting result keeps its retained identity instead: an unknown
 /// acknowledgement or a budget exhausted mid-submit settles as a typed
 /// unknown carrying the original ticket/result verbatim, never a fabricated
-/// hash. Local-read, `TestD` owner and owner-feed steps always settle as plain
-/// shutdown: an un-submitted pair's attempt capability is revoked on
-/// disconnect, an already-persisted `TestD` decision exact-replays, and a
-/// pending owner-feed publication leaves dependent grants pending. Only a
-/// step failure fails closed. Dropping every flight here also releases all
-/// owned composition references before the existing final shutdown, without
-/// leaking detached work.
+/// hash. Local-read, observe, `TestD` owner and owner-feed steps always
+/// settle as plain shutdown: an un-submitted pair's attempt capability is
+/// revoked on disconnect, an already-persisted `TestD` decision
+/// exact-replays, and a pending owner-feed publication leaves dependent
+/// grants pending. Only a step failure fails closed. Dropping every flight
+/// here also releases all owned composition references before the existing
+/// final shutdown, without leaking detached work.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shutdown drain polls every flight's own borrowed state in one select; bundling them would hide which flight is outstanding"
+)]
 async fn drain_flights_on_shutdown(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     flight: &mut ActivationFlight,
     local_read_flight: &mut LocalReadFlight,
+    observe_flight: &mut ObserveFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
     owner_feed_flight: &mut OwnerFeedFlight,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
@@ -1764,6 +1781,7 @@ async fn drain_flights_on_shutdown(
     loop {
         if matches!(flight, ActivationFlight::Idle)
             && matches!(local_read_flight, LocalReadFlight::Idle)
+            && matches!(observe_flight, ObserveFlight::Idle)
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
         {
@@ -1824,7 +1842,16 @@ async fn drain_flights_on_shutdown(
                 // a capability-refused pair still settles here exactly like any
                 // other. The loop's projection is untouched by this path.
                 settle_local_read_completion(local_read_completion, local_read_flight)?;
-            }            testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
+            }
+            observe_completion = next_observe_completion(observe_flight) => {
+                // The observe drain owns no readiness state either: a
+                // deferred, settled, expired, or stale pair settles here
+                // exactly like any other. An un-submitted pair's attempt
+                // capability is revoked on disconnect, mirroring the
+                // local-read drain.
+                settle_observe_completion(observe_completion, observe_flight)?;
+            }
+            testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
             }
             owner_feed_trigger = next_owner_feed_completion(owner_feed_flight) => {
@@ -1856,6 +1883,7 @@ async fn drain_flights_on_shutdown(
                     },
                 };
                 *local_read_flight = LocalReadFlight::Idle;
+                *observe_flight = ObserveFlight::Idle;
                 *testd_owner_flight = TestdOwnerFlight::Idle;
                 *owner_feed_flight = OwnerFeedFlight::Idle;
                 return Ok(exit);
@@ -2277,6 +2305,214 @@ async fn submit_local_read_result_idempotent(
             .map_err(|error| {
                 format!("Kernel local-read result submit: {first_error}; retry: {error}")
             }),
+    }
+}
+
+/// What one settled observe poll step produced (issue #2565).
+///
+/// `Deferred` is the honest steady state while the Governor observation
+/// owner has no connected admission: the pair retired, the durable record
+/// `Routed`, no effect produced. `Settled` means the record already closed.
+/// `Expired` is the expected claim/defer race; `StaleAttempt` quarantines a
+/// superseded capability (the next claim mints the current generation anew).
+/// Every outcome idles until the next tick; only a step failure fails the
+/// daemon closed.
+enum ObservePollOutcome {
+    IdleBackoff,
+    Deferred,
+    Settled,
+    Expired,
+    StaleAttempt,
+}
+
+/// Completion of one in-flight observe step. Claim, serve, and defer share
+/// one flight branch so health and shutdown stay pollable while the step is
+/// outstanding; the step handles at most one pair per tick.
+enum ObserveCompletion {
+    Settled(Result<ObserveStep, String>),
+}
+
+/// What one settled observe step produced: its poll outcome plus the exact
+/// owner identity the serve named, so the loop's own record distinguishes
+/// which admission is still missing without reading payload bytes.
+struct ObserveStep {
+    /// The poll outcome the loop acts on.
+    outcome: ObservePollOutcome,
+    /// Served suboperation discriminator (`None` on an empty claim).
+    suboperation: Option<&'static str>,
+    /// Missing owner admission the serve named (`None` on an empty claim).
+    owner_capability: Option<&'static str>,
+    /// Residual program that owns the missing semantics (`None` on an empty claim).
+    residual_owner: Option<&'static str>,
+    /// Exact condition that resumes the deferred pair (`None` on an empty claim).
+    resume: Option<&'static str>,
+}
+
+struct ObserveFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = ObserveCompletion>>>,
+}
+
+/// Sole owner of observe poll state in `run_loop`, mirroring
+/// [`LocalReadFlight`]. `Idle` means no observe work is outstanding;
+/// `InFlight` holds the one pending poll step. No second owner and no second
+/// concurrent observe step exist.
+enum ObserveFlight {
+    Idle,
+    InFlight(ObserveFlightState),
+}
+
+/// Pure tick gate: the observe timer starts work only when the flight is
+/// idle. The in-flight step is polled in its own `select!` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObserveTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_observe_tick(flight: &ObserveFlight) -> ObserveTickDecision {
+    match flight {
+        ObserveFlight::Idle => ObserveTickDecision::StartPoll,
+        ObserveFlight::InFlight(_) => ObserveTickDecision::SkipInFlight,
+    }
+}
+
+fn start_observe_poll(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Pin<Box<dyn std::future::Future<Output = ObserveCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move { ObserveCompletion::Settled(run_observe_poll(&kernel_clone).await) })
+}
+
+/// Starts the observe poll step when its flight is idle. Checked on the same
+/// tick as the other pollers so the observe queue stays live while an
+/// activation or a local read is in flight.
+fn maybe_start_observe_poll(kernel: &Arc<DaemonKernelClient>, flight: &mut ObserveFlight) {
+    if decide_observe_tick(flight) == ObserveTickDecision::StartPoll {
+        *flight = ObserveFlight::InFlight(ObserveFlightState {
+            future: start_observe_poll(kernel),
+        });
+    }
+}
+
+/// Polls the one in-flight observe step, pending forever while idle so
+/// health and shutdown stay pollable with no step outstanding.
+async fn next_observe_completion(flight: &mut ObserveFlight) -> ObserveCompletion {
+    match flight {
+        ObserveFlight::Idle => std::future::pending::<ObserveCompletion>().await,
+        ObserveFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed observe step back to idle. Every outcome — null-poll
+/// backoff, honest deferral, settled record, the expected expiry race, or a
+/// stale attempt quarantine (the next claim mints or returns the current
+/// generation) — simply idles until the next tick; only a step failure fails
+/// the daemon closed.
+fn settle_observe_completion(
+    completion: ObserveCompletion,
+    flight: &mut ObserveFlight,
+) -> Result<(), String> {
+    match completion {
+        ObserveCompletion::Settled(Ok(step)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.observe_settled",
+                outcome = observe_outcome_name(&step.outcome),
+                suboperation = step.suboperation.unwrap_or("none"),
+                owner_capability = step.owner_capability.unwrap_or("none"),
+                residual_owner = step.residual_owner.unwrap_or("none"),
+                resume = step.resume.unwrap_or("none"),
+            );
+            *flight = ObserveFlight::Idle;
+            Ok(())
+        }
+        ObserveCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Names one settled observe poll outcome for the loop's own record.
+fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
+    match outcome {
+        ObservePollOutcome::IdleBackoff => "idle_backoff",
+        ObservePollOutcome::Deferred => "deferred",
+        ObservePollOutcome::Settled => "settled",
+        ObservePollOutcome::Expired => "expired",
+        ObservePollOutcome::StaleAttempt => "stale_attempt",
+    }
+}
+
+/// Runs one observe poll step: `semantic_observe_claim` (pair plus fenced
+/// attempt capability, or null meaning backoff), then
+/// [`serve_admitted_observe`] for the admitted pair under that attempt, then
+/// `semantic_observe_deferred` with the served deferral (deferred, settled,
+/// the expected expiry race, or the stale-attempt quarantine). Exact
+/// replays stay idempotent by Kernel contract. Any step failure fails the
+/// daemon closed — a claimed pair that cannot serve or defer is never
+/// silently discarded. A stale capability is never retried: the step settles
+/// and the next tick claims the current generation anew.
+async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, String> {
+    // #740: receipt span over the claim/serve/defer poll step. Pair
+    // presence and defer outcome are named; payload bytes never are.
+    let _span = tracing::info_span!("eliotd.observe_poll").entered();
+    let pair = kernel
+        .claim_observe_pair_async()
+        .await
+        .map_err(|error| format!("Kernel observe pair claim: {error}"))?;
+    let Some((envelope, tool, attempt)) = pair else {
+        return Ok(ObserveStep {
+            outcome: ObservePollOutcome::IdleBackoff,
+            suboperation: None,
+            owner_capability: None,
+            residual_owner: None,
+            resume: None,
+        });
+    };
+    let operation_id = host_request_operation_id(&envelope);
+    let request_digest = envelope.envelope_sha256.clone();
+    let deferral = serve_admitted_observe(&envelope, &tool, &attempt)
+        .map_err(|error| format!("daemon observe serve: {error}"))?;
+    let step = |outcome: ObservePollOutcome| ObserveStep {
+        outcome,
+        suboperation: Some(deferral.suboperation.as_str()),
+        owner_capability: Some(deferral.owner_capability),
+        residual_owner: Some(deferral.residual_owner),
+        resume: Some(deferral.resume),
+    };
+    let outcome =
+        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt)
+            .await?
+        {
+            ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
+            ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
+            ObserveDeferOutcome::Expired => ObservePollOutcome::Expired,
+            ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
+        };
+    Ok(step(outcome))
+}
+
+/// Defers one served observe pair, retrying once with byte-identical
+/// arguments when the first defer fails.
+///
+/// The retry is safe because the Kernel defer leg is idempotent — an
+/// identical defer under the same live attempt retires once and replays
+/// (`Routed` stays `Routed`), never duplicates. Only transport failures
+/// retry: `Expired`, `Settled`, and `StaleAttempt` are settled outcomes, so
+/// a quarantined capability is never resubmitted.
+async fn defer_observe_pair_idempotent(
+    kernel: &DaemonKernelClient,
+    operation_id: &str,
+    request_digest: &str,
+    attempt: &eliot_protocol::LocalReadAttempt,
+) -> Result<ObserveDeferOutcome, String> {
+    match kernel
+        .defer_observe_claim_async(operation_id, request_digest, attempt)
+        .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .defer_observe_claim_async(operation_id, request_digest, attempt)
+            .await
+            .map_err(|error| format!("Kernel observe defer: {first_error}; retry: {error}")),
     }
 }
 

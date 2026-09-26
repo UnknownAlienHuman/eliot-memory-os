@@ -438,6 +438,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_activation_reconcile" => "agent_activation_reconcile",
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        "semantic_observe_claim" => "semantic_observe_claim",
+        "semantic_observe_result" => "semantic_observe_result",
+        "semantic_observe_deferred" => "semantic_observe_deferred",
         "agent_host_request_submit" => "agent_host_request_submit",
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
@@ -1575,6 +1578,131 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            "semantic_observe_claim" => {
+                // Outbound-only eliotd observe poller for admitted
+                // `eliot.observe` pairs (issue #2565): mirrors
+                // `local_read_claim` — same session/auth/ready/fence gates
+                // via the dispatcher head and `frame_dispatch` allowlist,
+                // same single-`operation`-key payload shape, same null poll
+                // (not error) when empty. The claimed pair carries the
+                // Kernel-minted fenced attempt capability (admitted
+                // `facet_method: eliot.observe`) the daemon must present back
+                // on the submit and defer legs; no time lease is involved.
+                // Local-read pairs are never served here.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_observe_pair(session).map(|pair| match pair {
+                        Some((envelope, tool, attempt)) => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "semantic_observe_result" => {
+                // Daemon submit leg for the claimed observe pair (issue
+                // #2565): validates plus fence-checks the submitted
+                // `HostRequestResultBody` and binds it to the waiting host
+                // request through the ORS result path. Only the current
+                // fencing generation presented by the owning session persists;
+                // a late, duplicate, or revoked attempt projects as a known
+                // stale outcome (never a bound result, never a transport
+                // error). Exact replay stays idempotent (even across deadline
+                // expiry); a changed body under the same identity conflicts;
+                // an elapsed deadline is the expected race and projects as a
+                // known expired outcome so the caller retains liveness without
+                // parsing errors.
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_observe_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "semantic_observe_deferred" => {
+                // Daemon deferral leg for the claimed observe pair (issue
+                // #2565): the flight consumed the pair but the Governor
+                // observation owner has no connected admission yet, so no
+                // effect was produced and none is claimed. The presenting
+                // attempt must be the live triple; anything else quarantines
+                // as the known stale outcome. The durable record advances
+                // `Admitted -> Routed`, the queue pair retires, and the
+                // pending handle stays live with its exact resume condition
+                // (resubmit the same logical request once the owner
+                // connects). An already-terminal record settles: consult it.
+                #[cfg(windows)]
+                {
+                    let operation_id = payload
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let request_digest = payload
+                        .get("request_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let attempt_value = payload
+                        .get("attempt")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let attempt: LocalReadAttempt = serde_json::from_value(attempt_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.defer_observe_claim(session, operation_id, request_digest, &attempt)
+                    {
+                        Ok(host_request_route::ObserveDeferDisposition::Deferred(record)) => Ok(
+                            Self::deferred_observe_daemon_response(record.operation_id.as_str()),
+                        ),
+                        Ok(host_request_route::ObserveDeferDisposition::Settled(record)) => Ok(
+                            Self::settled_observe_daemon_response(record.operation_id.as_str()),
+                        ),
+                        Ok(host_request_route::ObserveDeferDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
             #[cfg(windows)]
             "agent_host_request_submit" => {
                 // Typed P-04 host-request envelopes through the same closed
@@ -1582,8 +1710,22 @@ impl KernelComposition {
                 // connection/descriptor/fence/generation/durability join; a
                 // changed binding under a known identity conflicts, an unknown
                 // parent is unknown, and an elapsed deadline times out there.
+                // Observe bytes ride this entry exactly like the bridge
+                // front-door submit arm (issue #2565): linkage before
+                // staging, retention enqueue after admission.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
+                let observe_tool = payload.get("tool").cloned();
+                if let Some(ref tool) = observe_tool
+                    && envelope.identity.capability == host_request_route::OBSERVE_CAPABILITY
+                {
+                    host_request_route::check_observe_tool_linkage(&envelope, tool)?;
+                }
                 let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
+                self.maybe_enqueue_observe_pair_for_submit(
+                    &envelope,
+                    &record,
+                    observe_tool.as_ref(),
+                );
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))
@@ -3577,6 +3719,43 @@ impl KernelComposition {
                 "operation_id": observation.operation_id,
                 "presented_generation": observation.presented_generation,
                 "current_generation": observation.current_generation,
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Typed outcome for an honestly deferred observe pair (issue #2565).
+    ///
+    /// The flight consumed the claimed pair and the durable record advanced
+    /// to `Routed`, but the Governor observation owner has no connected
+    /// admission yet: no effect was produced and none is claimed. `accepted`
+    /// records the deferral itself (pair retired, phase advanced); `deferred`
+    /// distinguishes it from a result persist, and the operation identity is
+    /// the exact resume handle the waiter keeps polling.
+    fn deferred_observe_daemon_response(operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "deferred": true,
+                "operation_id": operation_id,
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Typed outcome when a deferral arrives for an already-terminal record.
+    ///
+    /// Nothing is outstanding: the waiter path serves the stored truth, so
+    /// the daemon idles. `settled` distinguishes this from a fresh deferral;
+    /// the operation identity names the record to consult.
+    fn settled_observe_daemon_response(operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "settled": true,
+                "operation_id": operation_id,
             },
             "recovery": null,
         })

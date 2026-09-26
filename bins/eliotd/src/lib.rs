@@ -54,6 +54,7 @@ mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
+mod governor_observe_serve;
 pub mod improvement_candidate_route;
 pub mod improvement_intake;
 mod kernel_authority_client;
@@ -124,7 +125,10 @@ pub use capability_outcome::{
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
-pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
+pub use daemon_kernel_client::{
+    DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome, ObserveSubmitOutcome,
+    OwnerSessionFacts,
+};
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
 #[cfg(all(test, windows))]
@@ -132,6 +136,9 @@ pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
 };
 pub use daemon_kernel_client::{parse_local_read_claimed_pair, parse_local_read_submit_outcome};
+pub use daemon_kernel_client::{
+    parse_observe_claimed_pair, parse_observe_defer_outcome, parse_observe_submit_outcome,
+};
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub use dreamer_admission::{
     DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
@@ -170,6 +177,10 @@ pub use freshness_admission::{
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
+};
+pub use governor_observe_serve::{
+    ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
+    observe_suboperation_owner, serve_admitted_observe,
 };
 pub use improvement_candidate_route::{
     ImprovementRouteRequest, assess_improvement_repeat, improvement_operation_owners,

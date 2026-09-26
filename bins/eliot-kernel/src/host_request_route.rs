@@ -222,6 +222,25 @@ pub(crate) struct HostRequestOperationRef {
     /// time-only claim lease. Never time-expires; only explicit
     /// retire/fence transitions invalidate it.
     pub(crate) local_read_attempt: LocalReadAttemptState,
+    /// Queued observe pair for the daemon observe poller (issue #2565). Set
+    /// only for admitted `eliot.observe` invocations whose tool bytes proved
+    /// linkage: the exact envelope plus the exact retained tool bytes the
+    /// daemon flight claims and decodes. Ordinary indexed operations and
+    /// local-read pairs carry `None` and are never served to the observe
+    /// poller; observe pairs are never served to the local-read poller.
+    /// Tool bytes live in queue memory only — never persisted, never logged —
+    /// while the durable ORS record owns lifecycle state.
+    pub(crate) observe_envelope: Option<HostRequestEnvelope>,
+    pub(crate) observe_tool: Option<serde_json::Value>,
+    /// Governed attempt ownership for the queued observe pair. Reuses the
+    /// shared [`LocalReadAttemptState`] vehicle (generation, boot-unique
+    /// identity, owner session); the wire capability disambiguates through
+    /// its admitted `facet_method` (`eliot.observe`). Never time-expires;
+    /// only explicit retire/fence transitions invalidate it. Observe is a
+    /// mutating path, so — unlike the read-only local-read leg — completion
+    /// additionally advances the durable ORS phase (`Routed` on daemon
+    /// defer, `ResultReceived` on submit) before the queue pair retires.
+    pub(crate) observe_attempt: LocalReadAttemptState,
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -1385,6 +1404,9 @@ impl KernelComposition {
                 local_read_envelope: None,
                 local_read_tool: None,
                 local_read_attempt: LocalReadAttemptState::default(),
+                observe_envelope: None,
+                observe_tool: None,
+                observe_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -1498,6 +1520,9 @@ impl KernelComposition {
                 local_read_envelope: Some(envelope.clone()),
                 local_read_tool: Some(tool.clone()),
                 local_read_attempt,
+                observe_envelope: None,
+                observe_tool: None,
+                observe_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -1918,6 +1943,683 @@ impl KernelComposition {
     }
 }
 
+/// Closed capability admitted to the observe queue (issue #2565: one
+/// complete Observe path through the daemon owner).
+///
+/// Only `eliot.observe` invocations carrying their exact linked tool bytes
+/// enqueue here. Every other capability keeps its existing entry untouched:
+/// `eliot.query` rides the local-read pair above, digest-only submits stay
+/// admission-only, and a forged capability fails the linkage gate before any
+/// staging.
+pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
+
+/// Bound on queued observe pairs for the daemon observe poller.
+///
+/// Mirrors the bounded local-read queue (64): the durable ORS record owns
+/// lifecycle state, so eviction only drops daemon-leg queue memory and never
+/// fabricates admission.
+const MAX_QUEUED_OBSERVE_PAIRS: usize = 64;
+
+/// Bound on retained observe tool bytes per queued pair.
+///
+/// Tool bytes live in queue memory only — never persisted, never logged —
+/// so privacy validation precedes any durable write by construction: there
+/// is none. The ceiling keeps one pair under the transport frame budget
+/// without trusting the caller-declared size.
+const MAX_OBSERVE_TOOL_BYTES: usize = 64 * 1024;
+
+/// Process-wide monotonic salt for observe queue lifecycles.
+///
+/// Separate from the local-read salt so the two legs never share a lifecycle
+/// namespace even though they share the attempt-identity vehicle and boot
+/// nonce: a capability minted for a local-read lifecycle can never match an
+/// observe claim record and vice versa.
+static OBSERVE_ENQUEUE_SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Disposition of one daemon observe-poller deferral.
+///
+/// `Deferred` is the single honest outcome while the Governor observation
+/// owner has no connected MCP-observe admission: the queue pair is consumed
+/// and the durable ORS record advances `Admitted -> Routed`, so the pending
+/// handle stays live under the daemon owner with its exact resume condition
+/// (resubmit the same logical request once the owner connects; the
+/// status/resolve/rehydrate entries keep serving the live record meanwhile).
+/// `Settled` means the durable record already closed the operation — consult
+/// it instead of deferring. `StaleAttempt` quarantines a late, duplicate,
+/// mismatched, or revoked deferral exactly like the submit leg.
+#[derive(Clone, Debug)]
+pub(crate) enum ObserveDeferDisposition {
+    Deferred(Box<HostRequestRecord>),
+    Settled(Box<HostRequestRecord>),
+    StaleAttempt(StaleLocalReadObservation),
+}
+
+/// Validates one observe tool linkage before any staging (no IO).
+///
+/// Runs the exact shared linkage gate ([`HostRequestInvokeReadPayload`]:
+/// capability echoes the admitted tool name, canonical tool bytes digest to
+/// the admitted payload digest) plus the observe capability join and the
+/// retained-bytes bound. A changed payload digest, a forged capability, or
+/// over-bound bytes fail closed as `SessionFenced` before the caller stages
+/// anything. Pure: validation performs no IO by construction, which is the
+/// rejection-before-staging proof. The Kernel never interprets observe
+/// semantics here — only the closed linkage shape.
+pub(crate) fn check_observe_tool_linkage(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<(), TransportError> {
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    if envelope.identity.capability != OBSERVE_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    let bytes = serde_json::to_vec(tool).map_err(|_| TransportError::SessionFenced)?;
+    if bytes.is_empty() || bytes.len() > MAX_OBSERVE_TOOL_BYTES {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+impl KernelComposition {
+    /// Queues one admitted observe pair for the daemon observe poller.
+    ///
+    /// Production entry: takes its own transition guard, so the submit arms
+    /// call it after admission without holding ingress state. Best-effort
+    /// companion to admission — callers use
+    /// [`Self::maybe_enqueue_observe_pair_for_submit`] and never fail
+    /// admission on it (the ORS record is already staged above).
+    pub(crate) fn enqueue_observe_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        self.enqueue_observe_pair_under_transition(envelope, tool)
+    }
+
+    /// Enqueues the retained observe bytes for an admitted record.
+    ///
+    /// Runs after admission from the submit arms when the payload carried
+    /// linked `eliot.observe` tool bytes and the durable record carries no
+    /// result yet. Digest-only submits, other capabilities, non-Invocation
+    /// kinds, and already-resulted records never queue. Never fails the
+    /// caller: the admission receipt is already owned by then.
+    pub(crate) fn maybe_enqueue_observe_pair_for_submit(
+        &self,
+        envelope: &HostRequestEnvelope,
+        record: &HostRequestRecord,
+        tool: Option<&serde_json::Value>,
+    ) {
+        let Some(tool) = tool else {
+            return;
+        };
+        if envelope.identity.capability != OBSERVE_CAPABILITY
+            || envelope.kind != HostRequestKind::Invocation
+            || record.result_digest.is_some()
+        {
+            return;
+        }
+        if check_observe_tool_linkage(envelope, tool).is_err() {
+            return;
+        }
+        let _ = self.enqueue_observe_pair(envelope, tool);
+    }
+
+    /// Queues one linked observe pair under the held transition guard.
+    ///
+    /// Only linkage-checked `eliot.observe` pairs arrive here. An exact
+    /// replay (same operation and digest already queued) is idempotent and
+    /// never duplicates; when the bounded queue is full the oldest queued
+    /// observe pair is evicted (daemon-leg memory only — the durable ORS
+    /// record is untouched). Local-read pairs are never counted or evicted
+    /// here.
+    fn enqueue_observe_pair_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        if envelope.identity.capability != OBSERVE_CAPABILITY
+            || envelope.kind != HostRequestKind::Invocation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        check_observe_tool_linkage(envelope, tool)?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = host_request_operation_id(envelope);
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.clone())
+        });
+        if let Some(existing_connection) = existing_connection.as_deref() {
+            if existing_connection != envelope.connection_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            if index
+                .get(existing_connection)
+                .into_iter()
+                .flatten()
+                .any(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                        && candidate.observe_envelope.is_some()
+                })
+            {
+                return Ok(());
+            }
+        }
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|candidate| candidate.observe_envelope.is_some())
+            .count();
+        if queued >= MAX_QUEUED_OBSERVE_PAIRS {
+            for refs in index.values_mut() {
+                if let Some(position) = refs
+                    .iter()
+                    .position(|candidate| candidate.observe_envelope.is_some())
+                {
+                    refs.remove(position);
+                    break;
+                }
+            }
+        }
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        let observe_attempt = LocalReadAttemptState {
+            enqueue_salt: OBSERVE_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ..LocalReadAttemptState::default()
+        };
+        if let Some(candidate) = refs.iter_mut().find(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+        }) {
+            candidate.observe_envelope = Some(envelope.clone());
+            candidate.observe_tool = Some(tool.clone());
+            candidate.observe_attempt = observe_attempt;
+        } else {
+            refs.push(HostRequestOperationRef {
+                operation_id,
+                request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: None,
+                local_read_tool: None,
+                local_read_attempt: LocalReadAttemptState::default(),
+                observe_envelope: Some(envelope.clone()),
+                observe_tool: Some(tool.clone()),
+                observe_attempt,
+            });
+        }
+        Ok(())
+    }
+
+    /// Claims the next admitted observe pair for the daemon observe poller
+    /// under governed attempt ownership.
+    ///
+    /// Deterministic connection-then-fifo order, skipping expired pairs and
+    /// non-pairs. The first claim for a pair mints fencing generation 1 with
+    /// a boot-unique attempt identity bound to the presenting daemon session;
+    /// a re-claim by the same owner session returns the identical current
+    /// capability (lost-answer retry without a new identity); a claim by a
+    /// different owner reassigns the attempt (generation bump, fresh identity,
+    /// new owner), so the superseded capability can never complete. `None` is
+    /// a null poll, not an error. Pure queue memory: no store IO, so
+    /// already-resulted pairs are retired by the submit/defer legs rather
+    /// than re-checked here. Local-read pairs are never served here.
+    pub(crate) fn claim_observe_pair(
+        &self,
+        session: &Session,
+    ) -> Result<
+        Option<(
+            HostRequestEnvelope,
+            serde_json::Value,
+            eliot_protocol::LocalReadAttempt,
+        )>,
+        TransportError,
+    > {
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        // Deterministic order: `BTreeMap` iterates connections sorted, pairs
+        // stay in enqueue (fifo) order within one connection.
+        for refs in index.values_mut() {
+            for candidate in refs.iter_mut() {
+                let (Some(envelope), Some(tool)) = (
+                    candidate.observe_envelope.as_ref(),
+                    candidate.observe_tool.as_ref(),
+                ) else {
+                    continue;
+                };
+                if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    continue;
+                }
+                if envelope.identity.capability != OBSERVE_CAPABILITY {
+                    continue;
+                }
+                if !candidate.observe_attempt.is_owned_by(session) {
+                    let generation = candidate
+                        .observe_attempt
+                        .generation
+                        .checked_add(1)
+                        .ok_or(TransportError::SessionFenced)?;
+                    candidate.observe_attempt = LocalReadAttemptState {
+                        attempt_id: self.mint_local_read_attempt_id(
+                            &candidate.operation_id,
+                            candidate.observe_attempt.enqueue_salt,
+                            generation,
+                        ),
+                        generation,
+                        enqueue_salt: candidate.observe_attempt.enqueue_salt,
+                        owner_connection_id: session.connection_id.clone(),
+                        owner_launch_nonce: session.launch_nonce.clone(),
+                        owner_session_epoch: session.session_epoch,
+                    };
+                }
+                let attempt = self.local_read_attempt_capability(
+                    envelope,
+                    &candidate.operation_id,
+                    &candidate.observe_attempt,
+                )?;
+                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn live_observe_attempt_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<LocalReadAttemptState>, TransportError> {
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.observe_envelope.is_some()
+            })
+            .map(|candidate| candidate.observe_attempt.clone())
+            .filter(LocalReadAttemptState::is_live))
+    }
+
+    /// Retires one queued observe pair without failing.
+    ///
+    /// Called after a result persists (submit leg) or after the daemon flight
+    /// honestly defers the pair (defer leg advances the durable ORS phase, so
+    /// the pending handle stays live without the queue entry), so later
+    /// claims skip it. Like disconnect fencing, this never fails: every
+    /// lock/store error is contained because retirement must hold even when
+    /// the store is unavailable.
+    fn retire_observe_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.observe_envelope.is_some())
+            });
+        }
+    }
+
+    /// Submits one daemon-produced observe result for its waiting host request.
+    ///
+    /// Mirrors [`Self::submit_local_read_result`] over the observe queue:
+    /// exact replay first (canonical readback, never a new completion), then
+    /// the absolute deadline bound, then attempt currency (lease replacement,
+    /// restart, epoch rotation, and revocation project as stale before any
+    /// fence join), then the presenting daemon session fence, then
+    /// persistence through the ORS result path (which walks the mechanical
+    /// `Admitted -> Routed -> Submitted -> ResultReceived` lifecycle — no new
+    /// edge). Neither expiry nor staleness ever binds a result. A changed
+    /// body under the same identity is [`TransportError::IdentityConflict`];
+    /// an unknown operation is [`TransportError::UnknownRequest`]. The shared
+    /// governed-attempt vehicle carries the disposition; the wire capability
+    /// disambiguates through its admitted `facet_method`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the submit gate keeps replay, deadline, currency, fence, and persistence joins in one audited order"
+    )]
+    pub(crate) fn submit_observe_result(
+        &self,
+        session: &Session,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
+        body.validate().map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = OperationIdentity::new(body.operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &body.request_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if stored.operation_id.as_str() != body.operation_id
+            || stored.request_digest != body.request_sha256
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // Exact replay is idempotent even across deadline expiry: a retained
+        // terminal result never takes the expiry path, and serving it is
+        // canonical readback rather than a second completion.
+        if stored.state == HostRequestState::ResultReceived
+            && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
+            && stored.result_response.as_ref() == Some(&body.response)
+        {
+            return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
+        }
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        // Governed attempt currency: only the live (attempt_id, generation,
+        // owner) triple completes.
+        let live =
+            self.live_observe_attempt_under_transition(&body.operation_id, &body.request_sha256)?;
+        match (&body.attempt, live) {
+            (Some(attempt), Some(state))
+                if attempt.attempt_id == state.attempt_id
+                    && attempt.fencing_generation == state.generation =>
+            {
+                if !state.is_owned_by(session) {
+                    return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: body.operation_id.clone(),
+                            request_digest: body.request_sha256.clone(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::OwnerMismatch,
+                        },
+                    ));
+                }
+                if attempt.expires_at_unix_ms != stored.deadline_unix_ms
+                    || !attempt
+                        .authority_epoch
+                        .is_same_authority(&stored.authority_epoch)
+                {
+                    return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: body.operation_id.clone(),
+                            request_digest: body.request_sha256.clone(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::Superseded,
+                        },
+                    ));
+                }
+            }
+            (Some(attempt), Some(state)) => {
+                return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: body.operation_id.clone(),
+                        request_digest: body.request_sha256.clone(),
+                        presented_attempt_id: Some(attempt.attempt_id.clone()),
+                        presented_generation: Some(attempt.fencing_generation),
+                        current_generation: Some(state.generation),
+                        reason: StaleLocalReadReason::Superseded,
+                    },
+                ));
+            }
+            (presented, current) => {
+                return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: body.operation_id.clone(),
+                        request_digest: body.request_sha256.clone(),
+                        presented_attempt_id: presented
+                            .as_ref()
+                            .map(|attempt| attempt.attempt_id.clone()),
+                        presented_generation: presented
+                            .as_ref()
+                            .map(|attempt| attempt.fencing_generation),
+                        current_generation: current.map(|state| state.generation),
+                        reason: StaleLocalReadReason::Unclaimed,
+                    },
+                ));
+            }
+        }
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        let queued_envelope = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == body.operation_id
+                        && candidate.request_digest == body.request_sha256
+                })
+                .and_then(|candidate| candidate.observe_envelope.clone())
+        };
+        if let Some(envelope) = queued_envelope {
+            if !session
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+                || session.module_generation.generation != envelope.state_fence.resource_generation
+                || session.module_generation.state_fence != envelope.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        } else if !session
+            .authority_epoch
+            .is_same_authority(&stored.authority_epoch)
+            || session.module_generation.generation.value() != stored.generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let persisted = self
+            .generation_gateway
+            .ors
+            .persist_host_request_result(
+                &operation_id,
+                &body.request_sha256,
+                &body.result_digest,
+                &body.response,
+            )
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::UnknownRequest)?;
+        // The single completion consumes the attempt use budget: retire the
+        // pair so no later claim or submit can reuse this generation.
+        self.retire_observe_pair_under_transition(&body.operation_id, &body.request_sha256);
+        Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
+    }
+
+    /// Defers one claimed observe pair the daemon flight cannot execute yet.
+    ///
+    /// The presenting attempt must be the live (`attempt_id`, generation,
+    /// owner) triple: a late, duplicate, mismatched, or revoked deferral
+    /// quarantines as [`ObserveDeferDisposition::StaleAttempt`] without
+    /// touching the durable record. A terminal record settles as
+    /// [`ObserveDeferDisposition::Settled`] — the waiter path serves its
+    /// truth. Otherwise the durable ORS record advances `Admitted -> Routed`
+    /// (already-`Routed` replays idempotently; any other live state fails
+    /// closed) and the queue pair retires, so the pending handle stays live
+    /// under the daemon owner with its exact resume condition while no queue
+    /// entry spins. An exact resubmit re-enqueues through the submit arm, so
+    /// the pair becomes claimable again once the Governor observation owner
+    /// connects its admission — without ever duplicating an effect, because
+    /// no effect was produced.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the defer gate keeps terminal, deadline, currency, fence, and phase-advance joins in one audited order"
+    )]
+    pub(crate) fn defer_observe_claim(
+        &self,
+        session: &Session,
+        operation_id: &str,
+        request_digest: &str,
+        attempt: &eliot_protocol::LocalReadAttempt,
+    ) -> Result<ObserveDeferDisposition, TransportError> {
+        attempt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation = OperationIdentity::new(operation_id.to_owned())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if stored.operation_id.as_str() != operation_id || stored.request_digest != request_digest {
+            return Err(TransportError::SessionFenced);
+        }
+        if stored.state.is_terminal() {
+            return Ok(ObserveDeferDisposition::Settled(Box::new(stored)));
+        }
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        let live = self.live_observe_attempt_under_transition(operation_id, request_digest)?;
+        match live {
+            Some(state)
+                if attempt.attempt_id == state.attempt_id
+                    && attempt.fencing_generation == state.generation =>
+            {
+                if !state.is_owned_by(session) {
+                    return Ok(ObserveDeferDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: operation_id.to_owned(),
+                            request_digest: request_digest.to_owned(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::OwnerMismatch,
+                        },
+                    ));
+                }
+                if attempt.expires_at_unix_ms != stored.deadline_unix_ms
+                    || !attempt
+                        .authority_epoch
+                        .is_same_authority(&stored.authority_epoch)
+                {
+                    return Ok(ObserveDeferDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: operation_id.to_owned(),
+                            request_digest: request_digest.to_owned(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::Superseded,
+                        },
+                    ));
+                }
+            }
+            Some(state) => {
+                return Ok(ObserveDeferDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: operation_id.to_owned(),
+                        request_digest: request_digest.to_owned(),
+                        presented_attempt_id: Some(attempt.attempt_id.clone()),
+                        presented_generation: Some(attempt.fencing_generation),
+                        current_generation: Some(state.generation),
+                        reason: StaleLocalReadReason::Superseded,
+                    },
+                ));
+            }
+            None => {
+                return Ok(ObserveDeferDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: operation_id.to_owned(),
+                        request_digest: request_digest.to_owned(),
+                        presented_attempt_id: Some(attempt.attempt_id.clone()),
+                        presented_generation: Some(attempt.fencing_generation),
+                        current_generation: None,
+                        reason: StaleLocalReadReason::Unclaimed,
+                    },
+                ));
+            }
+        }
+        let queued_envelope = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == request_digest
+                })
+                .and_then(|candidate| candidate.observe_envelope.clone())
+        };
+        if let Some(envelope) = queued_envelope {
+            if !session
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+                || session.module_generation.generation != envelope.state_fence.resource_generation
+                || session.module_generation.state_fence != envelope.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        } else if !session
+            .authority_epoch
+            .is_same_authority(&stored.authority_epoch)
+            || session.module_generation.generation.value() != stored.generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let routed = match stored.state {
+            HostRequestState::Admitted => self
+                .generation_gateway
+                .ors
+                .advance_host_request(&operation, request_digest, HostRequestState::Routed, None)
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::UnknownRequest)?,
+            HostRequestState::Routed => stored,
+            _ => return Err(TransportError::SessionFenced),
+        };
+        self.retire_observe_pair_under_transition(operation_id, request_digest);
+        Ok(ObserveDeferDisposition::Deferred(Box::new(routed)))
+    }
+}
+
 /// Builds the Kernel-observed bridge process binding from retained state.
 ///
 /// Every field comes from the current admission descriptor or the retained
@@ -2160,7 +2862,24 @@ impl KernelComposition {
         }
         let value = match operation {
             AGENT_HOST_REQUEST_SUBMIT_OPERATION => {
+                // Observe bytes ride this same entry (issue #2565): when the
+                // payload carries them for the admitted `eliot.observe`
+                // capability, the pure linkage gate runs before any staging,
+                // and the retained bytes enqueue for the daemon observe
+                // flight after admission — before the acknowledgement below.
+                // Digest-only submits keep the legacy shape untouched.
+                let observe_tool = payload.get("tool").cloned();
+                if let Some(ref tool) = observe_tool
+                    && envelope.identity.capability == OBSERVE_CAPABILITY
+                {
+                    check_observe_tool_linkage(&envelope, tool)?;
+                }
                 let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
+                self.maybe_enqueue_observe_pair_for_submit(
+                    &envelope,
+                    &record,
+                    observe_tool.as_ref(),
+                );
                 host_request_admitted_response(&receipt, &record)
             }
             AGENT_HOST_REQUEST_CANCEL_OPERATION => {

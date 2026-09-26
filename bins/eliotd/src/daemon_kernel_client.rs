@@ -279,6 +279,219 @@ pub fn parse_local_read_submit_outcome(
     Err("Kernel local_read_result answer is neither accepted, expired, nor stale".to_owned())
 }
 
+/// Typed outcome of one `semantic_observe_result` submit (issue #2565).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserveSubmitOutcome {
+    /// Kernel persisted the body through the ORS result path. An exact replay
+    /// of an already-resulted operation reports here too — idempotent, even
+    /// across deadline expiry.
+    Accepted,
+    /// The absolute deadline elapsed before the body could persist. This is
+    /// the expected claim/submit race, projected as a known outcome — never
+    /// as a transport error.
+    Expired,
+    /// The presented attempt is not the current fencing generation: lease
+    /// replacement, reassignment, disconnect, restart, epoch rotation, or
+    /// revocation quarantined the submission as a noncanonical observation.
+    /// The waiter never observes the stale result; the poller idles and the
+    /// current attempt can still complete through its own bound capability.
+    /// Never a transport error, never retried with the same capability.
+    StaleAttempt,
+}
+
+/// Typed outcome of one `semantic_observe_deferred` deferral (issue #2565).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserveDeferOutcome {
+    /// Kernel retired the queue pair and advanced the durable record
+    /// `Admitted -> Routed`: the pending handle stays live with its exact
+    /// resume condition. No effect was produced and none was claimed.
+    Deferred,
+    /// The durable record already closed the operation: consult it through
+    /// the waiter path instead of deferring.
+    Settled,
+    /// The absolute deadline elapsed before the deferral could record. This
+    /// is the expected claim/defer race, projected as a known outcome.
+    Expired,
+    /// The presented attempt is not the current fencing generation. The
+    /// waiter never observes the stale deferral; the poller idles.
+    StaleAttempt,
+}
+
+/// Parses one unwrapped `semantic_observe_claim` answer value into the
+/// claimed admitted pair plus its fenced attempt capability.
+///
+/// The Kernel arm
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_claim`)
+/// answers the single-`operation`-key poll with `{"pair": {"envelope",
+/// "tool", "attempt"}}` or `{"pair": null}`. `None` is the empty-queue
+/// backoff signal, not an error — exactly like the local-read claim. The
+/// claimed envelope must already decode as admitted shape, name the
+/// `eliot.observe` capability, and bind the attempt; their closed linkage
+/// and fence binding are re-proved inside the observe flight before any
+/// submit or defer touches them. A pair without an attempt fails closed:
+/// absent authority is never invented.
+pub fn parse_observe_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
+    // #740: receipt span. Records pair presence/absence by identity; the
+    // tool payload value never enters the sink.
+    let _span = tracing::info_span!("eliotd.request_receipt").entered();
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel semantic_observe_claim answer omits the pair".to_owned())?;
+    match pair {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(_) => {
+            let envelope_value = pair.get("envelope").cloned().ok_or_else(|| {
+                "Kernel semantic_observe_claim pair omits the envelope".to_owned()
+            })?;
+            let tool = pair
+                .get("tool")
+                .cloned()
+                .ok_or_else(|| "Kernel semantic_observe_claim pair omits the tool".to_owned())?;
+            let attempt_value = pair
+                .get("attempt")
+                .cloned()
+                .ok_or_else(|| "Kernel semantic_observe_claim pair omits the attempt".to_owned())?;
+            let envelope: HostRequestEnvelope =
+                serde_json::from_value(envelope_value).map_err(|error| {
+                    format!("Kernel semantic_observe_claim pair envelope does not decode: {error}")
+                })?;
+            envelope.validate().map_err(|error| {
+                format!(
+                    "Kernel semantic_observe_claim pair envelope is not admitted shape: {error}"
+                )
+            })?;
+            if envelope.identity.capability != "eliot.observe" {
+                return Err(
+                    "Kernel semantic_observe_claim pair is not the admitted observe capability"
+                        .to_owned(),
+                );
+            }
+            let attempt: LocalReadAttempt =
+                serde_json::from_value(attempt_value).map_err(|error| {
+                    format!("Kernel semantic_observe_claim pair attempt does not decode: {error}")
+                })?;
+            attempt.validate().map_err(|error| {
+                format!("Kernel semantic_observe_claim pair attempt is not bound shape: {error}")
+            })?;
+            if attempt.operation_id != host_request_operation_id(&envelope) {
+                return Err(
+                    "Kernel semantic_observe_claim pair attempt does not bind the envelope"
+                        .to_owned(),
+                );
+            }
+            Ok(Some((envelope, tool, attempt)))
+        }
+        _ => Err(
+            "Kernel semantic_observe_claim pair is neither an admitted pair nor null".to_owned(),
+        ),
+    }
+}
+
+/// Parses one unwrapped `semantic_observe_result` answer value into the
+/// typed submit outcome.
+///
+/// The Kernel arm
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_result`)
+/// answers `{"accepted": true}` on persist (exact replays included),
+/// `{"accepted": false, "expired": true}` when the absolute deadline elapsed
+/// first, and `{"accepted": false, "stale": true, ...}` when the presented
+/// attempt is not the current fencing generation. Anything else is a contract
+/// violation, never a silent accept.
+pub fn parse_observe_submit_outcome(
+    value: &serde_json::Value,
+) -> Result<ObserveSubmitOutcome, String> {
+    // #740: submit-outcome span. Accepted/expired/stale stay distinct;
+    // anything else is a contract violation, never a silent accept.
+    let _span = tracing::info_span!("eliotd.observe_submit").entered();
+    let accepted = value
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "Kernel semantic_observe_result answer omits the accepted outcome".to_owned()
+        })?;
+    if accepted {
+        return Ok(ObserveSubmitOutcome::Accepted);
+    }
+    if value
+        .get("expired")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ObserveSubmitOutcome::Expired);
+    }
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ObserveSubmitOutcome::StaleAttempt);
+    }
+    Err("Kernel semantic_observe_result answer is neither accepted, expired, nor stale".to_owned())
+}
+
+/// Parses one unwrapped `semantic_observe_deferred` answer value into the
+/// typed defer outcome.
+///
+/// The Kernel arm
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_deferred`)
+/// answers `{"accepted": true, "deferred": true, ...}` when the pair retired
+/// and the durable record advanced to `Routed`,
+/// `{"accepted": true, "settled": true, ...}` when the record already
+/// closed, `{"accepted": false, "expired": true}` on the deadline race, and
+/// `{"accepted": false, "stale": true, ...}` on a superseded attempt.
+/// Anything else is a contract violation, never a silent accept.
+pub fn parse_observe_defer_outcome(
+    value: &serde_json::Value,
+) -> Result<ObserveDeferOutcome, String> {
+    let _span = tracing::info_span!("eliotd.observe_defer").entered();
+    let accepted = value
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            "Kernel semantic_observe_deferred answer omits the accepted outcome".to_owned()
+        })?;
+    if accepted {
+        if value
+            .get("deferred")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(ObserveDeferOutcome::Deferred);
+        }
+        if value
+            .get("settled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(ObserveDeferOutcome::Settled);
+        }
+        return Err(
+            "Kernel semantic_observe_deferred answer is accepted but neither deferred nor settled"
+                .to_owned(),
+        );
+    }
+    if value
+        .get("expired")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ObserveDeferOutcome::Expired);
+    }
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ObserveDeferOutcome::StaleAttempt);
+    }
+    Err(
+        "Kernel semantic_observe_deferred answer is neither deferred, settled, expired, nor stale"
+            .to_owned(),
+    )
+}
+
 impl DaemonKernelClient {
     #[cfg(windows)]
     pub async fn claim_agent_activation_ticket(
@@ -1044,6 +1257,92 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one queued admitted `eliot.observe` pair for the outbound-only
+    /// observe poller (issue #2565).
+    ///
+    /// Mirrors [`claim_local_read_pair_async`](Self::claim_local_read_pair_async):
+    /// the call travels as the single-`operation`-key
+    /// `"semantic_observe_claim"` payload and a null `pair` is the
+    /// empty-queue backoff signal, not an error. The claimed pair carries the
+    /// Kernel-minted fenced attempt capability, which the caller must present
+    /// back on the submit and defer legs. The claimed pair still proves its
+    /// closed linkage and fence binding inside the observe flight before any
+    /// submit or defer touches it.
+    #[cfg(windows)]
+    pub async fn claim_observe_pair_async(
+        &self,
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "semantic_observe_claim",
+                serde_json::json!({ "operation": "semantic_observe_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_observe_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Submits one daemon-produced observe result body for its waiting host
+    /// request (issue #2565).
+    ///
+    /// The body travels as the single-`result`-key
+    /// `"semantic_observe_result"` payload and is validated before any
+    /// transport is touched. Kernel persists through the ORS result path: an
+    /// exact replay stays idempotent (even across deadline expiry); an
+    /// elapsed absolute deadline is the expected race and projects as
+    /// [`ObserveSubmitOutcome::Expired`], never as a transport error.
+    #[cfg(windows)]
+    pub async fn submit_observe_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<ObserveSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "semantic_observe_result",
+                serde_json::json!({ "result": body }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_observe_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Defers one claimed observe pair the daemon flight cannot execute yet
+    /// (issue #2565).
+    ///
+    /// The presenting attempt must be the live Kernel-minted triple the claim
+    /// returned. Kernel retires the queue pair and advances the durable
+    /// record `Admitted -> Routed`, so the pending handle stays live with its
+    /// exact resume condition while no queue entry spins. No effect is
+    /// produced and none is claimed by this leg.
+    #[cfg(windows)]
+    pub async fn defer_observe_claim_async(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        attempt: &LocalReadAttempt,
+    ) -> Result<ObserveDeferOutcome, super::DaemonError> {
+        attempt
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "semantic_observe_deferred",
+                serde_json::json!({
+                    "operation_id": operation_id,
+                    "request_digest": request_digest,
+                    "attempt": attempt,
+                }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_observe_defer_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
     /// Executes one closed local read through the authenticated Kernel route.
