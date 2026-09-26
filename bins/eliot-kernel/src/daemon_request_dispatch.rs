@@ -4607,6 +4607,22 @@ impl KernelComposition {
         error: UserAutomationRuntimeError,
     ) -> serde_json::Value {
         match error {
+            // A complete negative answer from the owner: it read its own state
+            // and definitively retains no such record. This is a known outcome,
+            // not an unknown one — the same product fact the due-wake contour
+            // already models as `WakeNotRetained` — so it is reported as a
+            // definitive non-acceptance with nothing left to reconcile. It is
+            // deliberately not folded into `unavailable`, which means the owner
+            // could not answer at all.
+            UserAutomationRuntimeError::NotRetained(reason) => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": false,
+                    "outcome": "not_retained",
+                    "reason": reason,
+                },
+                "recovery": null,
+            }),
             UserAutomationRuntimeError::Unavailable(reason) => serde_json::json!({
                 "status": "unknown",
                 "value": { "outcome": "unavailable" },

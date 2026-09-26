@@ -1385,12 +1385,19 @@ impl KernelStoreGateway {
     /// wake reason, or reports a hard-coded cancellation set: the cancelled
     /// identities are exactly what the wake owner returned.
     ///
-    /// A target list the wake owner cannot prove, a denominator the owner cannot
-    /// prove, and a cancellation whose answer is absent, empty, or unknown are
-    /// all reported as an unresolved wake phase. The parent transition therefore
+    /// A target list the wake owner cannot prove is reported as an unresolved
+    /// wake phase, and so is a cancellation whose answer is absent, empty, or
+    /// unknown for a non-empty proven target set. The parent transition then
     /// yields a recovery directive instead of a known success, and the retired
     /// automation keeps its not-yet-admitted wakes as an explicit open
     /// obligation rather than as a proven absence.
+    ///
+    /// A wake owner that reads its own journal for every committed occurrence and
+    /// definitively retains no unadmitted wake is the opposite case: that is a
+    /// complete negative answer, so the phase is resolved, no cancellation is
+    /// requested, and the retirement reports a known result instead of staying
+    /// reconciling forever. Only an owner that could not answer produces an
+    /// unknown.
     async fn remove_handoff<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -1413,6 +1420,12 @@ impl KernelStoreGateway {
             automation_revision,
             UserAutomationConfigurationState::Retired,
         )?;
+        // The revision is immutable, so this deterministic recompile of its own
+        // normalized denominator is the exact set the wake walk below asks about.
+        let committed_occurrences = revision
+            .compile_occurrence_identities()
+            .map_err(|error| error.to_string())?
+            .len();
         let execution = not_applicable_execution();
         let Some(runtime) = runtime else {
             return Ok((
@@ -1438,6 +1451,26 @@ impl KernelStoreGateway {
             // compile is a canonical identity defect, not an absent owner.
             Err(error) => return Err(error.to_string()),
         };
+        if targets.is_empty() {
+            // The owner read its own journal for every committed occurrence and
+            // definitively retains no unadmitted wake for any of them. That is a
+            // complete negative answer, so the retirement is reported as resolved
+            // and no cancellation is requested: the concrete Host owner refuses
+            // an empty target list by design, and asking it to cancel nothing
+            // would be a request whose only possible answer is a refusal.
+            return Ok((
+                UserAutomationWakePhase::NotApplicable {
+                    reason: format!(
+                        "the wake owner read its own journal for all {committed_occurrences} \
+                         committed occurrence identities of retired revision {} and definitively \
+                         retains no unadmitted pending wake for any of them, so there is nothing \
+                         to cancel",
+                        revision.revision
+                    ),
+                },
+                execution,
+            ));
+        }
         // The retirement transition is replayed under the same admitted identity
         // this route already committed, so the owner view, the retirement and
         // the cancellation observe one canonical operation rather than two.
@@ -1466,6 +1499,9 @@ impl KernelStoreGateway {
                 ));
             }
         };
+        // Reached only with a NON-EMPTY proven target set. An owner that
+        // cancelled none of the targets it was handed contradicted itself, so
+        // that is an unresolved handoff rather than a proven absence.
         if removal.cancelled_wake_ids.is_empty() {
             return Ok(unresolved_retirement_phases(
                 format!(
