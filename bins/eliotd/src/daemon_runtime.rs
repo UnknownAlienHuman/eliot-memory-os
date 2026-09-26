@@ -1490,17 +1490,19 @@ fn settle_activation_completion(
             settle_activation_resolve_completion(kernel, flight, resolve_outcome)
         }
         ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
-            // #1115: a Kernel-owned deadline expiry is a completed step, not a
-            // dispatch this daemon applied. It retires the ticket exactly like
-            // an accepted dispatch — idle, no retry, no reconcile — so both
-            // settle through the same supervision note.
-            Ok(()) | Err(ActivationDispatchError::Expired) => {
+            Ok(()) => {
                 note_supervision_applied(
                     supervision_progress.as_mut(),
                     health_heartbeat_flight,
                     deferred_activity,
                     true,
                 );
+                *flight = ActivationFlight::Idle;
+                Ok(())
+            }
+            // #1115: Kernel-owned deadline expiry retires this ticket without
+            // retry, but no result was accepted and no Apply progress exists.
+            Err(ActivationDispatchError::Expired) => {
                 *flight = ActivationFlight::Idle;
                 Ok(())
             }
@@ -2398,14 +2400,24 @@ fn settle_owner_feed_completion(
 /// provider stays silent; a degraded pass emits an error record and the loop
 /// continues, retrying on a later tick. The feed never gates readiness and
 /// never fails the daemon: an unbound Kernel owner only leaves grants
-/// pending, exactly like an absent P-07 port.
+/// pending, exactly like an absent P-07 port. Only the synchronous snapshot
+/// capture holds the composition guard; Kernel reads and publication use the
+/// owned plan after that guard is released so activation can claim and resolve
+/// while the feed's sequential transport exchanges are pending.
 async fn run_owner_feed_sync(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut trigger: eliotd::OwnerFeedTrigger,
 ) -> eliotd::OwnerFeedTrigger {
-    let guard = composition.lock().await;
-    match eliotd::maintain_owner_feed(&guard, kernel, &mut trigger).await {
+    let plan = {
+        let guard = composition.lock().await;
+        eliotd::capture_owner_feed_plan(&guard)
+    };
+    let result = match plan {
+        Ok(plan) => eliotd::maintain_owner_feed(plan, kernel, &mut trigger).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(Some(revision)) => {
             tracing::info!(
                 target: "eliotd::diagnostics",

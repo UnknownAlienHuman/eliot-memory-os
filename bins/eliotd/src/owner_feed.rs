@@ -24,7 +24,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use eliot_governor::{CompositionError, KernelGenerationSnapshotProvider, OwnerPublishPort};
+use eliot_contracts::StateFence;
+use eliot_governor::{
+    AuthorityOwnerSnapshot, CompositionError, KernelGenerationSnapshotProvider, OwnerPublishPort,
+    synchronize_owner_feed_with_canonical_receipts,
+};
 use eliot_kernel_core::GovernorClosureRestore;
 use eliot_receipts::ReceiptIdentity;
 use eliot_store_api::REVOCATION_HISTORY_MAX_RECORDS;
@@ -120,10 +124,10 @@ struct GrantClosureCanonicalLinkWire {
 /// closed.
 async fn read_canonical_closure_receipts(
     kernel: &Arc<DaemonKernelClient>,
+    state_fence: &StateFence,
     origin_refs: &[String],
     bound: u32,
 ) -> Result<BTreeMap<String, ReceiptIdentity>, CompositionError> {
-    let state_fence = kernel.snapshot().state_fence();
     let mut canonical_receipts: BTreeMap<String, ReceiptIdentity> = BTreeMap::new();
     // Lazily proven at most once per pass: only a missing-watermark refusal
     // pays for the readback, and the healthy path never does.
@@ -397,36 +401,29 @@ impl OwnerFeedTrigger {
     }
 }
 
-/// Runs one O1 owner-feed maintenance pass (`#2100` production trigger).
+/// Owned inputs captured while the daemon composition lock is held briefly.
 ///
-/// Roots and the expected revision come from the live Governor authority
-/// snapshot at call time - never caller-supplied - so a stale trigger fails
-/// closed inside the feed exchange instead of publishing a partial closure.
-/// Every admitted root is synchronized through the full
-/// revision-initialize->read->decode->restore->publish->readback exchange at the
-/// catalogue history bound; the trigger records the revision only after every
-/// root binds with its readback proven.
+/// The authority snapshot, Kernel-generation fence, revision, and sorted roots
+/// stay bound together after the lock is released; no borrowed composition
+/// state crosses into transport I/O.
+#[derive(Debug)]
+pub struct OwnerFeedPlan {
+    snapshot: AuthorityOwnerSnapshot,
+    state_fence: StateFence,
+    revision: u64,
+    roots: Vec<String>,
+}
+
+/// Captures the exact Governor authority state needed by one O1 feed exchange.
 ///
-/// The pass first reads the durable canonical second phases of those roots
-/// (`R6`) and publishes them inside the owner bundle, so a second phase that
-/// the Kernel already committed reaches the owner boundary instead of being
-/// dropped on the way to `eliotd`. A lineage with no completed second phase
-/// contributes no link and nothing is claimed reconciled; a refusal or an
-/// unreadable identity fails the pass instead of degrading to no links. A
-/// missing-watermark refusal is tolerated only on first bind (the Kernel
-/// retains no bound owner yet, proven through its readback): the revision
-/// initialize inside the exchange notes the watermark before the history
-/// read, so the tolerated root converges to served links on later passes.
-///
-/// Returns `Ok(None)` when nothing needed publishing, `Ok(Some(revision))`
-/// when the Kernel readback proved the publish at that revision, and `Err`
-/// with the typed reason when the pass degraded: the daemon continues and
-/// retries on a later pass, and no partial publish is ever claimed.
-pub async fn maintain_owner_feed(
+/// This function is synchronous and performs no Kernel transport calls. The
+/// daemon should call it under the composition mutex and release that mutex
+/// before awaiting [`maintain_owner_feed`]. A zero graph revision remains a
+/// typed owner error, including when there are no roots; empty roots otherwise
+/// remain a no-op in the asynchronous pass.
+pub fn capture_owner_feed_plan(
     composition: &DaemonComposition,
-    kernel: &Arc<DaemonKernelClient>,
-    trigger: &mut OwnerFeedTrigger,
-) -> Result<Option<u64>, CompositionError> {
+) -> Result<OwnerFeedPlan, CompositionError> {
     let snapshot = composition.governor.owners().authority.snapshot()?;
     let revision = snapshot.grant_graph.revision;
     if revision == 0 {
@@ -434,10 +431,14 @@ pub async fn maintain_owner_feed(
             "owner feed live graph revision is zero".to_owned(),
         ));
     }
-    // The trigger is diagnostic only. Every pass re-presents the current
-    // bundle so a same-revision owner loss or digest change cannot be hidden
-    // by a process-local revision shortcut.
-    let roots: Vec<String> = snapshot
+    let state_fence = composition.governor.kernel_snapshot().state_fence();
+    if snapshot.state_fence != state_fence {
+        return Err(CompositionError::Recovery(
+            "owner feed authority snapshot is not bound to the composition Kernel generation"
+                .to_owned(),
+        ));
+    }
+    let roots = snapshot
         .grant_graph
         .grants
         .iter()
@@ -445,24 +446,70 @@ pub async fn maintain_owner_feed(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    if roots.is_empty() {
+    Ok(OwnerFeedPlan {
+        snapshot,
+        state_fence,
+        revision,
+        roots,
+    })
+}
+
+/// Runs one O1 owner-feed exchange (`#2100` production trigger) using a plan
+/// captured before the daemon composition mutex was released.
+///
+/// Every admitted root is synchronized through the canonical second-phase
+/// read followed by the Governor's revision-initialize->history-read->decode->
+/// restore->publish->exact-readback exchange at the catalogue history bound.
+/// A first-bind missing-watermark refusal remains tolerated only after the
+/// Kernel readback proves no owner is bound. The trigger is updated only when
+/// the Governor synchronizer returns the exact revision whose Kernel readback
+/// proved publication.
+///
+/// Returns `Ok(None)` for an empty root set, `Ok(Some(revision))` when the
+/// exact publish was proven, and `Err` with the typed reason when the pass
+/// degraded. The daemon may retry on a later pass; no partial publish is
+/// claimed.
+pub async fn maintain_owner_feed(
+    plan: OwnerFeedPlan,
+    kernel: &Arc<DaemonKernelClient>,
+    trigger: &mut OwnerFeedTrigger,
+) -> Result<Option<u64>, CompositionError> {
+    if plan.roots.is_empty() {
         return Ok(None);
     }
-    let canonical_receipts =
-        read_canonical_closure_receipts(kernel, &roots, REVOCATION_HISTORY_MAX_RECORDS).await?;
+    if kernel.snapshot().state_fence() != plan.state_fence {
+        return Err(CompositionError::Recovery(
+            "owner feed plan is bound to a different Kernel generation State Fence".to_owned(),
+        ));
+    }
+    // The trigger is diagnostic only. Every pass re-presents the captured
+    // bundle so a same-revision owner loss or digest change cannot be hidden
+    // by a process-local revision shortcut.
+    let canonical_receipts = read_canonical_closure_receipts(
+        kernel,
+        &plan.state_fence,
+        &plan.roots,
+        REVOCATION_HISTORY_MAX_RECORDS,
+    )
+    .await?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     let publish = KernelOwnerPublishPort::new(Arc::clone(kernel));
-    composition
-        .governor
-        .synchronize_kernel_owner_with_canonical_receipts(
-            &reads,
-            &publish,
-            &roots,
-            REVOCATION_HISTORY_MAX_RECORDS,
-            revision,
-            canonical_receipts,
-        )
-        .await?;
-    trigger.last_published_revision = Some(revision);
-    Ok(Some(revision))
+    let published_revision = synchronize_owner_feed_with_canonical_receipts(
+        &reads,
+        &publish,
+        plan.snapshot,
+        &plan.state_fence,
+        &plan.roots,
+        REVOCATION_HISTORY_MAX_RECORDS,
+        plan.revision,
+        canonical_receipts,
+    )
+    .await?;
+    if published_revision != plan.revision {
+        return Err(CompositionError::Recovery(
+            "owner feed readback revision disagrees with the captured plan".to_owned(),
+        ));
+    }
+    trigger.last_published_revision = Some(published_revision);
+    Ok(Some(published_revision))
 }
