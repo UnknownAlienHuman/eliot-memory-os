@@ -7,17 +7,53 @@
 //!
 //! This module is advisory-only: it never edits source, configuration, or
 //! policy, never installs artifacts, never activates a generation, never issues
-//! authority, and never emits `VERIFIED_COMPLETE`. A successful run ends at a
-//! canary handoff request string that the Kernel owner must independently
-//! authorize and execute.
+//! authority, and never emits `VERIFIED_COMPLETE`. A successful run ends at an
+//! inspectable, non-authorizing canary handoff that the Kernel owner must
+//! independently authorize and execute.
+//!
+//! # One joined input, one meaning, one commitment
+//!
+//! `run_improvement_candidate_pipeline` builds one private checked view over the
+//! seven borrowed inputs and the result mapper consumes that view instead of
+//! unchecked arguments, so two individually valid identity groups can never be
+//! mixed into a single handoff. The checked view has no public constructor and
+//! cannot be bypassed.
+//!
+//! The admission decision is mapped to its own meaning: a blocked candidate
+//! stays blocked with its typed cause, owner, and required remedy, a regression
+//! subtype needs typed pulse evidence, and this admission-only entry point
+//! never constructs an observed completed rollback. No result variant
+//! establishes execution, independence, or canary permission.
+//!
+//! The proposal commitment is a versioned, domain-separated SHA-256 over one
+//! canonical JSON envelope holding the complete normalized proposal. The
+//! pipeline computes exactly one commitment and carries it into the handoff.
+//!
+//! # Wire revision
+//!
+//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `2`. Revision `2` adds typed
+//! `cause`/`remedy` fields to the rejection and block branches, adds the
+//! `Blocked` disposition and the inspectable canary handoff, binds
+//! candidate/experiment/content-revision/run identities onto the admission
+//! evidence view, the bounded experiment plan, and the activation evidence, and
+//! replaces the free-form proposal digest string with [`ProposalCommitment`].
+//! Deserialization is fail-closed: bytes written at revision `1` no longer
+//! decode, so a stale disposition cannot be read as a current one. Historical
+//! revision-`1` FNV-1a 64-bit digests stay explicitly
+//! [`IMPROVEMENT_LEGACY_DIGEST_ALGORITHM`] observations; they are never padded,
+//! reinterpreted as SHA-256, or matched against a current proposal.
 
+use std::collections::BTreeSet;
+
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::improvement_admission::{
-    ImprovementAdmissionDecision, ImprovementAdmissionPolicy, ImprovementCandidateView,
-    ImprovementEvidenceView, admit_improvement_candidate,
+    ImprovementAdmissionDecision, ImprovementAdmissionPolicy, ImprovementBlockCause,
+    ImprovementBlockRemedy, ImprovementCandidateView, ImprovementEvidenceView,
+    ImprovementRejectCause, admit_improvement_candidate,
 };
 
 /// Governor maintenance owner for the improvement pipeline (`G-19`).
@@ -46,8 +82,50 @@ pub const OP_PROMOTE: &str = "improvement.promote";
 pub const OP_ROLLBACK: &str = "improvement.rollback";
 /// Only effect ceiling this pipeline admits.
 pub const IMPROVEMENT_EFFECT_CEILING: &str = "advisory-only";
-/// Required risk-ceiling marker proving the candidate stays bounded.
-pub const IMPROVEMENT_RISK_MARKER: &str = "bounded";
+/// The only risk-ceiling value this pipeline admits, exactly.
+///
+/// `unbounded`, any qualified form such as `bounded-until-ok`, and every other
+/// value are refused. The old substring marker is gone: `unbounded` used to
+/// satisfy it.
+pub const IMPROVEMENT_RISK_CEILING_BOUNDED: &str = "bounded";
+/// Version of the supported risk-ceiling value set admitted at this revision.
+pub const IMPROVEMENT_RISK_CEILING_ENCODING_VERSION: &str = "1";
+/// Fixed domain separator of the improvement proposal commitment.
+pub const IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN: &str = "eliot.improvement.proposal.commitment";
+/// Canonical encoding revision of the proposal commitment preimage.
+pub const IMPROVEMENT_PROPOSAL_ENCODING_VERSION: &str = "1";
+/// Hash algorithm carried with every current proposal commitment.
+pub const IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM: &str = "sha256";
+/// Identity of the retired FNV-1a 64-bit proposal digest.
+///
+/// Values produced under this identity are historical observations only. They
+/// are not padded, not reinterpreted as SHA-256, and never matched against a
+/// current proposal.
+pub const IMPROVEMENT_LEGACY_DIGEST_ALGORITHM: &str = "fnv1a-64-legacy";
+/// Wire revision of the improvement pipeline result and identity contracts.
+pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 2;
+/// Maximum members in one declared set of the committed proposal.
+///
+/// Matches the nearest existing declared-set ceiling in the repository
+/// (`eliot_observation_contracts::MAX_OBSERVATION_REFS`).
+pub const IMPROVEMENT_MAX_SET_MEMBERS: usize = 256;
+/// Maximum byte length of one committed identity or reference field.
+///
+/// Matches the nearest existing revision/reference ceiling in the repository
+/// (`eliot_observation_contracts::MAX_SOURCE_REVISION_CHARS`).
+pub const IMPROVEMENT_MAX_REFERENCE_BYTES: usize = 256;
+/// Maximum byte length of one committed prose field.
+///
+/// Matches the nearest existing bounded-text ceiling in the repository
+/// (`eliot_observation_contracts::MAX_OBSERVATION_TEXT`).
+pub const IMPROVEMENT_MAX_TEXT_BYTES: usize = 1_024;
+/// Maximum byte length of the total committed proposal content.
+///
+/// Matches the nearest existing bounded-payload ceiling in the repository
+/// (`eliot_bootstrap::normative::MAX_RECEIPT_BYTES`). The improvement route
+/// had no transport ceiling of its own, so this value is recorded as a
+/// derived ceiling rather than an unlimited default.
+pub const IMPROVEMENT_MAX_COMMITMENT_BYTES: usize = 16 * 1024;
 /// Forbidden proof claim: product-level promotion is never admitted here.
 pub const FORBIDDEN_PRODUCT_PROMOTION: &str = "product-promotion";
 /// Forbidden completion claim: this pipeline never emits completion authority.
@@ -121,6 +199,53 @@ pub struct MechanismDeclaration {
     pub declared_before_results: bool,
 }
 
+/// One resource dimension and the ceiling the admitting owner proved for it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedResourceCeiling {
+    /// Resource dimension this ceiling applies to.
+    pub dimension: String,
+    /// Owner-issued ceiling reference for that dimension.
+    pub ceiling_ref: String,
+}
+
+/// Explicit owner-backed evidence that a bounded experiment narrows the
+/// admitted contract instead of replacing it.
+///
+/// Reference strings are never ordered lexically and a nonblank replacement is
+/// never accepted on its own. A different scope, budget, or deadline reference
+/// is admitted only when this record re-establishes the exact admitted
+/// references, names the narrowed references the plan actually uses, carries the
+/// owner's evidence reference, and states each narrowing relation explicitly.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedScopeRefinement {
+    /// Admitted scope this record narrows.
+    pub admitted_scope_ref: String,
+    /// Admitted budget this record narrows.
+    pub admitted_budget_ref: String,
+    /// Admitted deadline this record narrows.
+    pub admitted_deadline_ref: String,
+    /// Narrowed scope the plan may use.
+    pub refined_scope_ref: String,
+    /// Narrowed budget the plan may use.
+    pub refined_budget_ref: String,
+    /// Narrowed deadline the plan may use.
+    pub refined_deadline_ref: String,
+    /// Each resource dimension the owner proved inside its ceiling.
+    pub resource_ceilings: Vec<AdmittedResourceCeiling>,
+    /// Owner that issued this refinement evidence.
+    pub refinement_owner_id: String,
+    /// Refinement evidence reference produced by that owner.
+    pub refinement_ref: String,
+    /// Owner states the refined scope stays inside the admitted set.
+    pub scope_within_admitted: bool,
+    /// Owner states every resource dimension stays within its ceiling.
+    pub budget_within_ceiling: bool,
+    /// Owner states the time window cannot widen.
+    pub deadline_not_widened: bool,
+}
+
 /// Bounded experiment plan executed by Testd under an independent evaluator.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -141,6 +266,9 @@ pub struct ExperimentPlan {
     pub operation_ref: String,
     /// Idempotency key this plan binds (must match the proposal).
     pub idempotency_key: String,
+    /// Owner-backed narrowing evidence, required only when the scope, budget, or
+    /// deadline reference differs from the admitted one.
+    pub scope_refinement: Option<AdmittedScopeRefinement>,
 }
 
 /// Independent activation evidence bound to one candidate and one experiment.
@@ -157,6 +285,10 @@ pub struct ActivationEvidence {
     pub verifier_passed: bool,
     /// Opaque reference to the raw measured evidence.
     pub raw_evidence_ref: String,
+    /// Exact run the verifier evaluated.
+    pub run_ref: String,
+    /// Exact content revision the verifier evaluated.
+    pub content_revision_ref: String,
     /// Must always be false; simulated runs never admit.
     pub simulated: bool,
     /// Candidate this evidence is bound to.
@@ -166,6 +298,10 @@ pub struct ActivationEvidence {
 }
 
 /// Rollback contract named before any experiment is admitted.
+///
+/// Naming a rollback, disable, reopen, expiry, or forward-repair contract proves
+/// that a repair path exists. It never proves that a rollback was requested,
+/// partially applied, or completed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackContract {
@@ -189,7 +325,8 @@ pub struct RollbackContract {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImprovementProposal {
-    /// Stable proposal identity.
+    /// Stable proposal identity. Kept separate from `candidate_id`: a proposal
+    /// identity is not necessarily the candidate identity.
     pub proposal_id: String,
     /// Improvement candidate identity.
     pub candidate_id: String,
@@ -199,7 +336,8 @@ pub struct ImprovementProposal {
     pub closure_id: String,
     /// Closure evidence digest (opaque).
     pub closure_digest: String,
-    /// Opaque evidence references supporting the proposal.
+    /// Opaque evidence references supporting the proposal. Declared set: order
+    /// is normalized, duplicates are refused.
     pub evidence_refs: Vec<String>,
     /// Capability the experiment targets.
     pub target_capability: String,
@@ -209,7 +347,7 @@ pub struct ImprovementProposal {
     pub mechanism: MechanismDeclaration,
     /// Expected advisory-only delta.
     pub expected_delta: String,
-    /// Risk ceiling; must stay bounded.
+    /// Risk ceiling; must be exactly [`IMPROVEMENT_RISK_CEILING_BOUNDED`].
     pub risk_ceiling: String,
     /// Effect ceiling; must stay advisory-only.
     pub effect_ceiling: String,
@@ -219,7 +357,8 @@ pub struct ImprovementProposal {
     pub deadline_ref: String,
     /// Privacy class of the proposal inputs.
     pub privacy_class: String,
-    /// Invalidation set covered by the rollback contract.
+    /// Invalidation set covered by the rollback contract. Declared set: order is
+    /// normalized, duplicates are refused.
     pub invalidation_set: Vec<String>,
     /// Operation this proposal binds.
     pub operation_ref: String,
@@ -237,8 +376,9 @@ impl ImprovementProposal {
     /// Validates proposal shape, ceilings, and pre-declaration.
     ///
     /// Rejects empty fields, post-hoc mechanisms, non-advisory effects,
-    /// promotion or completion claims, and unbounded risk ceilings. Returns a
-    /// [`PipelineError`] describing the first violation found.
+    /// promotion or completion claims, and every risk ceiling other than the
+    /// exact supported versioned value. Returns a [`PipelineError`] describing
+    /// the first violation found.
     pub fn validate(&self) -> Result<(), PipelineError> {
         text(&self.proposal_id, "proposal_id")?;
         text(&self.candidate_id, "candidate_id")?;
@@ -262,18 +402,7 @@ impl ImprovementProposal {
         text(&self.mechanism.hypothesis, "mechanism.hypothesis")?;
         text(&self.mechanism.causal_link, "mechanism.causal_link")?;
         text(&self.mechanism.declared_ref, "mechanism.declared_ref")?;
-        if self.evidence_refs.is_empty() {
-            return Err(PipelineError::MissingField("evidence_refs"));
-        }
-        for value in &self.evidence_refs {
-            text(value, "evidence_refs")?;
-        }
-        if self.invalidation_set.is_empty() {
-            return Err(PipelineError::MissingField("invalidation_set"));
-        }
-        for value in &self.invalidation_set {
-            text(value, "invalidation_set")?;
-        }
+        check_commitment_profile(self)?;
         if !self.mechanism.declared_before_results {
             return Err(PipelineError::MechanismNotPredeclared);
         }
@@ -298,45 +427,187 @@ impl ImprovementProposal {
                 )));
             }
         }
-        if !self.risk_ceiling.contains(IMPROVEMENT_RISK_MARKER) {
-            return Err(PipelineError::AdmissionFailed(format!(
-                "risk ceiling {:?} must contain {:?}",
-                self.risk_ceiling, IMPROVEMENT_RISK_MARKER
-            )));
+        if self.risk_ceiling != IMPROVEMENT_RISK_CEILING_BOUNDED {
+            return Err(PipelineError::UnsupportedRiskCeiling {
+                encoding_version: IMPROVEMENT_RISK_CEILING_ENCODING_VERSION,
+            });
         }
         Ok(())
     }
 }
 
+/// Canonical preimage of one improvement proposal commitment.
+///
+/// The envelope carries a fixed domain, an encoding revision, the hash
+/// algorithm identity, and the complete normalized proposal. The commitment
+/// itself is never part of this preimage, no `Debug` text is hashed, and no
+/// manually concatenated delimiter is used.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementProposalCommitmentEnvelope {
+    /// Fixed proposal domain separator.
+    pub domain: String,
+    /// Canonical encoding revision of the committed bytes.
+    pub encoding_version: String,
+    /// Hash algorithm applied to the canonical bytes.
+    pub algorithm: String,
+    /// Complete normalized proposal content.
+    pub proposal: ImprovementProposal,
+}
+
+/// Versioned, domain-separated content commitment to one complete proposal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalCommitment {
+    /// Fixed proposal domain separator.
+    pub domain: String,
+    /// Canonical encoding revision of the committed preimage.
+    pub encoding_version: String,
+    /// Hash algorithm identity.
+    pub algorithm: String,
+    /// Logical operation the committed bytes belong to.
+    pub operation_ref: String,
+    /// Idempotency namespace the committed bytes belong to.
+    pub idempotency_key: String,
+    /// Lowercase digest over the canonical preimage bytes.
+    pub digest: String,
+    /// Size of the canonical preimage in bytes, for inspection.
+    pub canonical_bytes: usize,
+}
+
+/// Inspectable, non-authorizing canary handoff for one joined run.
+///
+/// Every field is an exact identity taken from the checked records. The
+/// readable projection is a convenience, never a machine join and never a
+/// permit: `execution_authorized` is false in every construction, and
+/// `activation_owner_id` names the Kernel owner that must independently
+/// authorize and execute activation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementCanaryHandoff {
+    /// Proposal identity, kept separate from the candidate identity.
+    pub proposal_id: String,
+    /// The single commitment computed for the exact proposal bytes.
+    pub proposal_commitment: ProposalCommitment,
+    /// Candidate identity the handoff is bound to.
+    pub candidate_id: String,
+    /// Campaign the handoff is bound to.
+    pub campaign_id: String,
+    /// Closure identity the handoff is bound to.
+    pub closure_id: String,
+    /// Versioned closure commitment the handoff is bound to.
+    pub closure_digest: String,
+    /// Capability the handoff targets.
+    pub target_capability: String,
+    /// Generation the handoff observes; never activated by it.
+    pub target_generation: String,
+    /// Experiment plan identity.
+    pub experiment_id: String,
+    /// Logical operation the handoff belongs to.
+    pub operation_ref: String,
+    /// Idempotency namespace the handoff belongs to.
+    pub idempotency_key: String,
+    /// Admitted experiment scope the handoff stays inside.
+    pub experiment_scope_ref: String,
+    /// Budget the handoff stays inside.
+    pub budget_ref: String,
+    /// Deadline the handoff stays inside.
+    pub deadline_ref: String,
+    /// Independent evaluation identities.
+    pub evidence_id: String,
+    /// Competent evaluator the plan declared and the evidence names.
+    pub evidence_verifier_id: String,
+    /// Run the competent evaluator evaluated.
+    pub evidence_run_ref: String,
+    /// Content revision the competent evaluator evaluated.
+    pub evidence_content_revision_ref: String,
+    /// Raw measured evidence reference.
+    pub raw_evidence_ref: String,
+    /// Admission-review evaluator, which may differ from the experiment
+    /// evaluator while staying bound to the same candidate and experiment.
+    pub admission_evaluator_id: String,
+    /// Run the admission review observed.
+    pub admission_run_ref: String,
+    /// Content revision the admission review observed.
+    pub admission_content_revision_ref: String,
+    /// Pulse evidence the admission review relied on.
+    pub admission_pulse_ref: String,
+    /// Governor admission owner that decided.
+    pub admission_owner_id: String,
+    /// Rollback and repair bindings the handoff stays inside.
+    pub rollback_ref: String,
+    /// Disable contract reference.
+    pub disable_ref: String,
+    /// Reopen contract reference.
+    pub reopen_ref: String,
+    /// Expiry reference.
+    pub expiry_ref: String,
+    /// Forward-repair reference for incomplete rollback effects.
+    pub forward_repair_ref: String,
+    /// Rollback owner that must stay named for the run.
+    pub rollback_owner_id: String,
+    /// Invalidation targets the handoff may invalidate. This is the proposal's
+    /// admitted set, never the rollback's wider coverage.
+    pub invalidation_set: Vec<String>,
+    /// Kernel owner that must independently authorize activation.
+    pub activation_owner_id: String,
+    /// Readable projection of the handoff; never a permit.
+    pub handoff_projection: String,
+    /// Always false. No shape, digest, or match authorizes execution.
+    pub execution_authorized: bool,
+}
+
 /// Terminal disposition for one improvement candidate pipeline run.
 ///
 /// Advisory-only: no variant performs promotion, activation, canary cutover, or
-/// completion. `CanaryAdmitted` carries only a handoff request string for the
-/// Kernel owner, never a permit.
+/// completion. `CanaryAdmitted` carries only an inspectable, non-authorizing
+/// handoff for the Kernel owner, never a permit. The name of this enum does not
+/// make every advisory decision a terminal lifecycle transition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImprovementTerminalDisposition {
-    /// Candidate is rejected with a stable reason.
+    /// Candidate is rejected with a typed cause, owner, and stable reason.
     Rejected {
+        /// Owner-defined rejection cause.
+        cause: ImprovementRejectCause,
         /// Stable rejection reason naming exact evidence.
         reason: String,
+        /// Owner holding the rejected scope.
+        owner_id: String,
     },
     /// Candidate is well-formed but evidence is incomplete.
     Inconclusive {
         /// Exact missing evidence.
         missing: String,
+        /// Owner that must supply it.
+        owner_id: String,
     },
-    /// Candidate regressed the measured outcome and is rejected.
+    /// Candidate regressed the measured outcome and is rejected. Reached only
+    /// from typed pulse regression evidence.
     RegressionRejected {
+        /// Owner-defined rejection cause.
+        cause: ImprovementRejectCause,
         /// Stable regression reason naming exact evidence.
         reason: String,
+        /// Owner holding the rejected scope.
+        owner_id: String,
     },
     /// External outcome is unknown; reconciliation is required before retry.
     UnknownRequiresReconciliation {
         /// What must be reconciled before any retry.
         reason: String,
+        /// Owner holding the reconciliation debt.
+        owner_id: String,
     },
-    /// Candidate is rolled back under the named rollback contract.
+    /// Retained historical representation of an observed completed rollback.
+    ///
+    /// The admission-only pipeline in this module never constructs this
+    /// variant: it receives a rollback contract, never a rollback execution or
+    /// result receipt, and no existing owner path supplies a validated
+    /// completed-rollback result. Bytes written under this variant stay
+    /// readable so history is preserved, but they are an unqualified historical
+    /// observation and must not be presented as newly verified completed
+    /// effects.
     RolledBack {
         /// Rollback contract reference owning the repair.
         contract_ref: String,
@@ -345,11 +616,27 @@ pub enum ImprovementTerminalDisposition {
     NoProgress {
         /// Prior digest this repeats, with exact debt retained.
         reason: String,
+        /// Owner holding the repeat-review debt.
+        owner_id: String,
     },
-    /// Candidate is admitted for one bounded canary handoff request.
+    /// Candidate is blocked on a named prerequisite or revalidation. It is
+    /// neither a rejection nor an observed completed rollback.
+    Blocked {
+        /// Owner-defined block cause.
+        cause: ImprovementBlockCause,
+        /// Remedy the responsible owner must complete.
+        remedy: ImprovementBlockRemedy,
+        /// Stable block reason naming exact evidence.
+        reason: String,
+        /// Owner that must clear the block.
+        owner_id: String,
+    },
+    /// Candidate is admitted for one bounded, non-authorizing canary handoff.
     CanaryAdmitted {
-        /// Handoff request for Kernel activation; never a permit.
-        canary_permit_request: String,
+        /// Inspectable handoff the Kernel owner must authorize independently.
+        /// Boxed so the disposition stays small enough to carry alongside the
+        /// other branches.
+        handoff: Box<ImprovementCanaryHandoff>,
     },
 }
 
@@ -399,178 +686,274 @@ pub enum PipelineError {
         /// What diverged.
         detail: String,
     },
+    /// One required cross-input relation is not bound.
+    ///
+    /// `relation` names the diverging relation. It never copies proposal text.
+    #[error("improvement input relation is not bound: {relation}")]
+    UnboundRelation {
+        /// Static identity of the diverging relation.
+        relation: &'static str,
+    },
     /// The rollback contract leaves a gap before experiment.
     #[error("improvement rollback contract gap: {detail}")]
     RollbackContractGap {
         /// What is missing.
         detail: String,
     },
+    /// The declared risk ceiling is not the admitted bounded value.
+    #[error(
+        "improvement risk ceiling is not the admitted bounded value at encoding version {encoding_version}"
+    )]
+    UnsupportedRiskCeiling {
+        /// Version of the supported risk-ceiling value set.
+        encoding_version: &'static str,
+    },
+    /// A declared-set field repeats one identity the contract requires to be a set.
+    #[error("improvement declared set contains a duplicate: {0}")]
+    DuplicateSetMember(&'static str),
+    /// The admitted input profile exceeds an owner or transport ceiling.
+    #[error("improvement input profile exceeds its ceiling: {0}")]
+    InputProfileCeiling(&'static str),
+    /// The versioned proposal commitment could not be produced.
+    #[error("improvement proposal commitment failed: {0}")]
+    CommitmentFailed(&'static str),
     /// Governor admission refused or failed with the inner reason.
     #[error("improvement admission failed: {0}")]
     AdmissionFailed(String),
 }
 
-/// Returns the stable digest for one proposal.
+/// Returns the versioned content commitment for one complete proposal.
 ///
-/// Deterministic FNV-1a 64-bit hex over the proposal, mechanism, target,
-/// operation, and idempotency identities plus the sorted evidence and
-/// invalidation sets. Sorted sets keep the digest stable under input order.
-/// No `Debug` formatting is used.
-pub fn proposal_digest(proposal: &ImprovementProposal) -> String {
-    let mut evidence = proposal.evidence_refs.clone();
-    evidence.sort();
-    let mut invalidation = proposal.invalidation_set.clone();
-    invalidation.sort();
-    let mut canonical = String::new();
-    for part in [
-        proposal.proposal_id.as_str(),
-        proposal.candidate_id.as_str(),
-        proposal.campaign_id.as_str(),
-        proposal.closure_id.as_str(),
-        proposal.closure_digest.as_str(),
-        proposal.mechanism.mechanism_id.as_str(),
-        proposal.target_capability.as_str(),
-        proposal.target_generation.as_str(),
-        proposal.operation_ref.as_str(),
-        proposal.idempotency_key.as_str(),
-    ] {
-        canonical.push_str(part);
-        canonical.push('|');
-    }
-    canonical.push_str(&evidence.join(","));
-    canonical.push('|');
-    canonical.push_str(&invalidation.join(","));
-    fnv1a_hex(canonical.as_bytes())
+/// Computes a domain-separated, versioned SHA-256 over the canonical JSON
+/// envelope holding the complete normalized proposal. Only the declared sets
+/// are normalized: they get deterministic byte ordering and an explicit
+/// duplicate rejection. Reference bytes, Unicode, punctuation, and ordered
+/// prose are committed unchanged. The admitted input, count, string, and
+/// total-size profile is validated before any clone, sort, or serialization,
+/// and a serialization failure is propagated as a typed error rather than a
+/// fallback or legacy hash.
+pub fn proposal_digest(
+    proposal: &ImprovementProposal,
+) -> Result<ProposalCommitment, PipelineError> {
+    commitment_of(&canonical_proposal(proposal)?)
 }
 
-/// Reports whether a proposal repeats a prior digest without new signal.
+/// Exact-repeat and identity-conflict assessment for one proposal.
 ///
-/// Returns true exactly when the current digest equals the prior digest and no
-/// new discriminator is present.
-pub fn detect_no_progress(
-    prior_digest: &str,
+/// Integrity and semantic progress stay separate. An exact replay reproduces
+/// the complete current commitment under its original logical operation. The
+/// same operation and idempotency key with different content is an identity
+/// conflict, not the old request and not an automatic retry. A retained
+/// commitment written under another domain, encoding revision, or algorithm — a
+/// legacy FNV-1a value, for example — stays an unqualified historical
+/// observation until its owner reconciles it. A different logical operation is
+/// not progress evidence either: a new proposal identity or a different digest
+/// establishes nothing.
+pub fn assess_improvement_replay(
+    prior: &ProposalCommitment,
     proposal: &ImprovementProposal,
-    new_discriminator: bool,
-) -> bool {
-    proposal_digest(proposal) == prior_digest && !new_discriminator
+) -> Result<ImprovementReplayAssessment, PipelineError> {
+    let current = proposal_digest(proposal)?;
+    if prior.operation_ref != current.operation_ref
+        || prior.idempotency_key != current.idempotency_key
+    {
+        return Ok(ImprovementReplayAssessment::NoProgressEstablished {
+            commitment: current,
+        });
+    }
+    if prior.domain != current.domain
+        || prior.encoding_version != current.encoding_version
+        || prior.algorithm != current.algorithm
+    {
+        return Ok(ImprovementReplayAssessment::UnestablishedPrior {
+            prior_domain: prior.domain.clone(),
+            prior_encoding_version: prior.encoding_version.clone(),
+            prior_algorithm: prior.algorithm.clone(),
+        });
+    }
+    if prior.digest == current.digest {
+        return Ok(ImprovementReplayAssessment::ExactReplay {
+            commitment: current,
+        });
+    }
+    Ok(ImprovementReplayAssessment::IdentityConflict {
+        operation_ref: current.operation_ref,
+        idempotency_key: current.idempotency_key,
+    })
+}
+
+/// Outcome of comparing one current commitment with a retained prior one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub enum ImprovementReplayAssessment {
+    /// The current bytes reproduce the retained commitment under the same
+    /// logical operation. An exact replay is not progress.
+    ExactReplay {
+        /// The current commitment.
+        commitment: ProposalCommitment,
+    },
+    /// The same operation and idempotency key carry different content. This is
+    /// an identity conflict, not the old request and not an automatic retry.
+    IdentityConflict {
+        /// Conflicting logical operation.
+        operation_ref: String,
+        /// Conflicting idempotency namespace.
+        idempotency_key: String,
+    },
+    /// The retained commitment is not a current-version commitment. It stays an
+    /// unqualified historical observation and requires reconciliation or
+    /// revalidation by its owner.
+    UnestablishedPrior {
+        /// Domain the retained value was written under.
+        prior_domain: String,
+        /// Encoding revision the retained value was written under.
+        prior_encoding_version: String,
+        /// Algorithm the retained value was written under.
+        prior_algorithm: String,
+    },
+    /// A different logical operation. No progress is established here, and no
+    /// external effect is cleared.
+    NoProgressEstablished {
+        /// The current commitment.
+        commitment: ProposalCommitment,
+    },
 }
 
 /// Reconciles an unknown external activation outcome without retrying blindly.
 ///
-/// Maps `RequiresReconciliation` to the unknown-reconciliation disposition and
-/// every other decision to an inconclusive disposition naming the prior state.
+/// Exhaustive and meaning-preserving: an unresolved prior outcome stays
+/// `UnknownRequiresReconciliation`, and every other prior decision keeps its own
+/// typed cause, owner, and remedy instead of collapsing into an evidence gap. A
+/// named rollback contract still never clears an unknown external effect.
 pub fn reconcile_unknown_activation(
     prior: &ImprovementAdmissionDecision,
 ) -> ImprovementTerminalDisposition {
     match prior {
-        ImprovementAdmissionDecision::RequiresReconciliation { reason } => {
+        ImprovementAdmissionDecision::RequiresReconciliation { reason, owner_id } => {
             ImprovementTerminalDisposition::UnknownRequiresReconciliation {
                 reason: reason.clone(),
+                owner_id: owner_id.clone(),
             }
         }
-        ImprovementAdmissionDecision::AdmitForExperiment { candidate_id, .. } => {
+        ImprovementAdmissionDecision::Reject {
+            cause,
+            reason,
+            owner_id,
+        } => map_rejection(*cause, reason, owner_id),
+        ImprovementAdmissionDecision::NeedsMoreEvidence { missing, owner_id } => {
             ImprovementTerminalDisposition::Inconclusive {
-                missing: format!(
-                    "unknown-activation: prior admission for {candidate_id} reconciles before retry"
-                ),
+                missing: missing.clone(),
+                owner_id: owner_id.clone(),
             }
         }
-        ImprovementAdmissionDecision::Reject { reason, .. } => {
-            ImprovementTerminalDisposition::Inconclusive {
-                missing: format!("unknown-activation: prior rejection reconciles: {reason}"),
+        ImprovementAdmissionDecision::Blocked {
+            cause,
+            reason,
+            owner_id,
+        } => map_block(*cause, reason, owner_id),
+        ImprovementAdmissionDecision::NoProgress { reason, owner_id } => {
+            ImprovementTerminalDisposition::NoProgress {
+                reason: reason.clone(),
+                owner_id: owner_id.clone(),
             }
         }
-        ImprovementAdmissionDecision::NeedsMoreEvidence { missing, .. } => {
-            ImprovementTerminalDisposition::Inconclusive {
-                missing: format!("unknown-activation: prior evidence gap reconciles: {missing}"),
-            }
-        }
-        ImprovementAdmissionDecision::Blocked { reason, .. } => {
-            ImprovementTerminalDisposition::Inconclusive {
-                missing: format!("unknown-activation: prior block reconciles: {reason}"),
-            }
-        }
-        ImprovementAdmissionDecision::NoProgress { reason, .. } => {
-            ImprovementTerminalDisposition::Inconclusive {
-                missing: format!("unknown-activation: prior no-progress reconciles: {reason}"),
-            }
-        }
+        ImprovementAdmissionDecision::AdmitForExperiment {
+            candidate_id,
+            rollback_owner_id,
+            ..
+        } => ImprovementTerminalDisposition::Inconclusive {
+            missing: format!(
+                "unknown-activation: prior admission for {candidate_id} reconciles before retry"
+            ),
+            owner_id: rollback_owner_id.clone(),
+        },
     }
 }
 
 /// Runs the advisory-only candidate to experiment to evaluation to admission pipeline.
 ///
-/// Pure orchestrator over borrowed inputs: validates the proposal, checks that
-/// the eight operation identities are pairwise distinct, binds the experiment
-/// and evidence to the proposal, rejects simulated or dependent evidence,
-/// requires a gap-free rollback contract, then delegates the admission verdict
-/// to `improvement_admission::admit_improvement_candidate`. Never performs
-/// promotion, activation, canary cutover, authority issuance, or completion.
+/// Pure orchestrator over borrowed inputs: it builds the private checked view
+/// over the proposal, experiment, evaluation, rollback, and admission records,
+/// refuses a diverged relation before any positive path, requires a gap-free
+/// rollback contract, then delegates the admission verdict to
+/// `improvement_admission::admit_improvement_candidate` and maps that verdict
+/// through the same checked view. Never performs promotion, activation, canary
+/// cutover, authority issuance, or completion, and never reports an observed
+/// completed rollback.
 pub fn run_improvement_candidate_pipeline(
     inputs: ImprovementPipelineInputs<'_>,
 ) -> Result<ImprovementTerminalDisposition, PipelineError> {
+    let joined = join_improvement_inputs(inputs)?;
+    let decision =
+        admit_improvement_candidate(joined.candidate, joined.admission_evidence, joined.policy)
+            .map_err(|err| PipelineError::AdmissionFailed(err.to_string()))?;
+    map_decision(&decision, &joined)
+}
+
+/// One private checked view over the seven borrowed pipeline inputs.
+///
+/// The view has no public constructor and no bypass flag: the only way to hold
+/// one is to satisfy every relation check below.
+struct JoinedImprovementInputs<'a> {
+    proposal: &'a ImprovementProposal,
+    experiment: &'a ExperimentPlan,
+    evidence: &'a ActivationEvidence,
+    rollback: &'a RollbackContract,
+    candidate: &'a ImprovementCandidateView,
+    admission_evidence: &'a ImprovementEvidenceView,
+    policy: &'a ImprovementAdmissionPolicy,
+    /// The single normalized proposal whose bytes were committed.
+    normalized: ImprovementProposal,
+    /// The single commitment computed for those bytes.
+    commitment: ProposalCommitment,
+    /// Admitted scope the candidate owner proved for this candidate.
+    admitted_scope_ref: String,
+}
+
+/// Joins every input into one checked view or refuses a diverged relation.
+fn join_improvement_inputs(
+    inputs: ImprovementPipelineInputs<'_>,
+) -> Result<JoinedImprovementInputs<'_>, PipelineError> {
     inputs.proposal.validate()?;
     check_operation_identities()?;
-    if inputs.experiment.experiment_id.trim().is_empty() {
-        return Err(PipelineError::MissingField("experiment.experiment_id"));
-    }
-    if inputs.experiment.testd_owner_id.trim().is_empty() {
-        return Err(PipelineError::MissingField("experiment.testd_owner_id"));
-    }
-    if inputs.experiment.evaluator_id.trim().is_empty() {
-        return Err(PipelineError::MissingField("experiment.evaluator_id"));
-    }
-    if inputs.experiment.scope_ref.trim().is_empty() {
-        return Err(PipelineError::MissingField("experiment.scope_ref"));
-    }
-    if inputs.experiment.budget_ref.trim().is_empty() {
-        return Err(PipelineError::MissingField("experiment.budget_ref"));
-    }
-    if inputs.experiment.deadline_ref.trim().is_empty() {
-        return Err(PipelineError::MissingField("experiment.deadline_ref"));
-    }
-    if inputs.experiment.operation_ref != inputs.proposal.operation_ref
-        || inputs.experiment.idempotency_key != inputs.proposal.idempotency_key
-    {
-        return Err(PipelineError::UnboundEvidence {
-            detail: "experiment operation/idempotency must match proposal: binding-mismatch"
-                .to_string(),
-        });
-    }
-    if inputs.evidence.bound_candidate_id != inputs.proposal.candidate_id
-        || inputs.evidence.bound_experiment_id != inputs.experiment.experiment_id
-    {
-        return Err(PipelineError::UnboundEvidence {
-            detail: "evidence candidate/experiment binding must match proposal and plan: binding-mismatch"
-                .to_string(),
-        });
-    }
-    if inputs.evidence.simulated {
-        return Err(PipelineError::SimulatedEvidenceForbidden);
-    }
-    if !inputs.evidence.independent
-        || !inputs.evidence.verifier_passed
-        || inputs.evidence.raw_evidence_ref.trim().is_empty()
-    {
-        return Err(PipelineError::EvidenceNotIndependent);
-    }
-    if inputs.evidence.evidence_id.trim().is_empty() {
-        return Err(PipelineError::MissingField("evidence.evidence_id"));
-    }
-    if inputs.evidence.verifier_id.trim().is_empty() {
-        return Err(PipelineError::MissingField("evidence.verifier_id"));
-    }
-    check_rollback_contract(inputs.rollback)?;
-    let decision =
-        admit_improvement_candidate(inputs.candidate, inputs.admission_evidence, inputs.policy)
-            .map_err(|err| PipelineError::AdmissionFailed(err.to_string()))?;
-    Ok(map_decision(
-        &decision,
+    check_experiment_shape(inputs.experiment)?;
+    check_evaluation_shape(inputs.evidence)?;
+    let normalized = canonical_proposal(inputs.proposal)?;
+    let commitment = commitment_of(&normalized)?;
+    check_proposal_candidate_join(inputs.proposal, inputs.candidate)?;
+    check_proposal_experiment_join(inputs.experiment, inputs.proposal, inputs.candidate)?;
+    check_experiment_evaluation_join(inputs.evidence, inputs.proposal, inputs.experiment)?;
+    check_admission_evidence_join(
+        inputs.admission_evidence,
+        inputs.evidence,
         inputs.proposal,
         inputs.experiment,
-        inputs.evidence,
+    )?;
+    check_rollback_join(
         inputs.rollback,
-    ))
+        inputs.admission_evidence,
+        inputs.policy,
+        inputs.proposal,
+    )?;
+    // A candidate with no owner-proved scope binding carries an empty admitted
+    // scope here. That is not a default: the inner admission owns the
+    // disposition and reports the named `missing-admitted-scope` gap, and no
+    // experiment scope is ever derived from the candidate identity.
+    let admitted_scope_ref = admitted_scope(inputs.candidate)
+        .unwrap_or_default()
+        .to_string();
+    Ok(JoinedImprovementInputs {
+        proposal: inputs.proposal,
+        experiment: inputs.experiment,
+        evidence: inputs.evidence,
+        rollback: inputs.rollback,
+        candidate: inputs.candidate,
+        admission_evidence: inputs.admission_evidence,
+        policy: inputs.policy,
+        normalized,
+        commitment,
+        admitted_scope_ref,
+    })
 }
 
 /// Verifies the eight pipeline operation strings are pairwise distinct.
@@ -592,6 +975,383 @@ fn check_operation_identities() -> Result<(), PipelineError> {
                     detail: format!("duplicate operation identity {first:?}"),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Requires every required bounded-plan field to be present and bounded.
+fn check_experiment_shape(experiment: &ExperimentPlan) -> Result<(), PipelineError> {
+    for (field, value) in [
+        (
+            "experiment.experiment_id",
+            experiment.experiment_id.as_str(),
+        ),
+        (
+            "experiment.testd_owner_id",
+            experiment.testd_owner_id.as_str(),
+        ),
+        ("experiment.evaluator_id", experiment.evaluator_id.as_str()),
+        ("experiment.scope_ref", experiment.scope_ref.as_str()),
+        ("experiment.budget_ref", experiment.budget_ref.as_str()),
+        ("experiment.deadline_ref", experiment.deadline_ref.as_str()),
+        (
+            "experiment.operation_ref",
+            experiment.operation_ref.as_str(),
+        ),
+        (
+            "experiment.idempotency_key",
+            experiment.idempotency_key.as_str(),
+        ),
+    ] {
+        bounded_text(value, field, IMPROVEMENT_MAX_REFERENCE_BYTES)?;
+    }
+    Ok(())
+}
+
+/// Requires independent, passed, non-simulated evidence of a real run.
+fn check_evaluation_shape(evidence: &ActivationEvidence) -> Result<(), PipelineError> {
+    bounded_text(
+        &evidence.evidence_id,
+        "evidence.evidence_id",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    bounded_text(
+        &evidence.verifier_id,
+        "evidence.verifier_id",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    bounded_text(
+        &evidence.run_ref,
+        "evidence.run_ref",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    bounded_text(
+        &evidence.content_revision_ref,
+        "evidence.content_revision_ref",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    bounded_text(
+        &evidence.raw_evidence_ref,
+        "evidence.raw_evidence_ref",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    if evidence.simulated {
+        return Err(PipelineError::SimulatedEvidenceForbidden);
+    }
+    if !evidence.independent || !evidence.verifier_passed {
+        return Err(PipelineError::EvidenceNotIndependent);
+    }
+    Ok(())
+}
+
+/// Requires the proposal and the candidate to declare the same identities.
+///
+/// `proposal_id` is deliberately not compared: a proposal identity is not
+/// necessarily the candidate identity.
+fn check_proposal_candidate_join(
+    proposal: &ImprovementProposal,
+    candidate: &ImprovementCandidateView,
+) -> Result<(), PipelineError> {
+    for (relation, declared, bound) in [
+        (
+            "proposal-candidate: candidate-identity-mismatch",
+            proposal.candidate_id.as_str(),
+            candidate.candidate_id.as_str(),
+        ),
+        (
+            "proposal-candidate: campaign-identity-mismatch",
+            proposal.campaign_id.as_str(),
+            candidate.campaign_id.as_str(),
+        ),
+        (
+            "proposal-candidate: closure-identity-mismatch",
+            proposal.closure_id.as_str(),
+            candidate.closure_id.as_str(),
+        ),
+        (
+            "proposal-candidate: closure-digest-mismatch",
+            proposal.closure_digest.as_str(),
+            candidate.closure_digest.as_str(),
+        ),
+        (
+            "proposal-candidate: operation-mismatch",
+            proposal.operation_ref.as_str(),
+            candidate.operation_ref.as_str(),
+        ),
+        (
+            "proposal-candidate: idempotency-mismatch",
+            proposal.idempotency_key.as_str(),
+            candidate.idempotency_key.as_str(),
+        ),
+    ] {
+        if declared != bound {
+            return Err(PipelineError::UnboundRelation { relation });
+        }
+    }
+    Ok(())
+}
+
+/// Requires the plan's operation join and its admitted scope, budget, and
+/// deadline relation.
+fn check_proposal_experiment_join(
+    experiment: &ExperimentPlan,
+    proposal: &ImprovementProposal,
+    candidate: &ImprovementCandidateView,
+) -> Result<(), PipelineError> {
+    if experiment.operation_ref != proposal.operation_ref
+        || experiment.idempotency_key != proposal.idempotency_key
+    {
+        return Err(PipelineError::UnboundRelation {
+            relation: "proposal-experiment: operation-idempotency-mismatch",
+        });
+    }
+    if let Some(admitted_scope_ref) = admitted_scope(candidate) {
+        check_scope_refinement(experiment, proposal, admitted_scope_ref)?;
+    }
+    Ok(())
+}
+
+/// Returns the owner-proved admitted scope, or `None` for a named gap.
+fn admitted_scope(candidate: &ImprovementCandidateView) -> Option<&str> {
+    candidate
+        .admitted_scope_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Admits an identical scope, budget, and deadline reference, or requires the
+/// owner's explicit narrowing evidence for a different one.
+fn check_scope_refinement(
+    experiment: &ExperimentPlan,
+    proposal: &ImprovementProposal,
+    admitted_scope_ref: &str,
+) -> Result<(), PipelineError> {
+    if experiment.scope_ref == admitted_scope_ref
+        && experiment.budget_ref == proposal.budget_ref
+        && experiment.deadline_ref == proposal.deadline_ref
+    {
+        return Ok(());
+    }
+    let Some(refinement) = experiment.scope_refinement.as_ref() else {
+        return Err(PipelineError::UnboundRelation {
+            relation: "proposal-experiment: unproven-narrowed-scope-budget-or-deadline",
+        });
+    };
+    if !refinement.scope_within_admitted
+        || !refinement.budget_within_ceiling
+        || !refinement.deadline_not_widened
+    {
+        return Err(PipelineError::UnboundRelation {
+            relation: "proposal-experiment: refinement-declares-widening",
+        });
+    }
+    if refinement.admitted_scope_ref != admitted_scope_ref
+        || refinement.admitted_budget_ref != proposal.budget_ref
+        || refinement.admitted_deadline_ref != proposal.deadline_ref
+    {
+        return Err(PipelineError::UnboundRelation {
+            relation: "proposal-experiment: refinement-admitted-binding-mismatch",
+        });
+    }
+    if refinement.refined_scope_ref != experiment.scope_ref
+        || refinement.refined_budget_ref != experiment.budget_ref
+        || refinement.refined_deadline_ref != experiment.deadline_ref
+    {
+        return Err(PipelineError::UnboundRelation {
+            relation: "proposal-experiment: refinement-refined-binding-mismatch",
+        });
+    }
+    bounded_text(
+        &refinement.refinement_owner_id,
+        "experiment.scope_refinement.refinement_owner_id",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    bounded_text(
+        &refinement.refinement_ref,
+        "experiment.scope_refinement.refinement_ref",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )?;
+    check_resource_ceilings(&refinement.resource_ceilings)
+}
+
+/// Requires at least one bounded, nonblank, distinct resource ceiling.
+fn check_resource_ceilings(ceilings: &[AdmittedResourceCeiling]) -> Result<(), PipelineError> {
+    const FIELD: &str = "experiment.scope_refinement.resource_ceilings";
+    if ceilings.is_empty() || ceilings.len() > IMPROVEMENT_MAX_SET_MEMBERS {
+        return Err(PipelineError::InputProfileCeiling(FIELD));
+    }
+    let mut seen = BTreeSet::new();
+    for ceiling in ceilings {
+        bounded_text(
+            &ceiling.dimension,
+            "experiment.scope_refinement.resource_ceilings.dimension",
+            IMPROVEMENT_MAX_REFERENCE_BYTES,
+        )?;
+        bounded_text(
+            &ceiling.ceiling_ref,
+            "experiment.scope_refinement.resource_ceilings.ceiling_ref",
+            IMPROVEMENT_MAX_REFERENCE_BYTES,
+        )?;
+        if !seen.insert(ceiling.dimension.as_str()) {
+            return Err(PipelineError::DuplicateSetMember(
+                "experiment.scope_refinement.resource_ceilings.dimension",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Requires the independent evaluation to name the planned experiment, the
+/// candidate, and the competent evaluator the plan declared.
+fn check_experiment_evaluation_join(
+    evidence: &ActivationEvidence,
+    proposal: &ImprovementProposal,
+    experiment: &ExperimentPlan,
+) -> Result<(), PipelineError> {
+    if evidence.bound_candidate_id != proposal.candidate_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "experiment-evaluation: candidate-binding-mismatch",
+        });
+    }
+    if evidence.bound_experiment_id != experiment.experiment_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "experiment-evaluation: experiment-binding-mismatch",
+        });
+    }
+    if evidence.verifier_id != experiment.evaluator_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "experiment-evaluation: evaluator-is-not-the-competent-planned-evaluator",
+        });
+    }
+    Ok(())
+}
+
+/// Requires the admission-review evidence to name the same candidate, the same
+/// experiment, and the same content revision the experiment evaluation did.
+///
+/// A later independent admission review may legitimately carry a different
+/// verifier identity, so verifier identities are never compared with each
+/// other. The typed relationship to the same candidate, experiment, and content
+/// revision is what is required.
+fn check_admission_evidence_join(
+    admission: &ImprovementEvidenceView,
+    evaluation: &ActivationEvidence,
+    proposal: &ImprovementProposal,
+    experiment: &ExperimentPlan,
+) -> Result<(), PipelineError> {
+    if admission.bound_candidate_id != proposal.candidate_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "admission-evidence: candidate-binding-mismatch",
+        });
+    }
+    if admission.bound_experiment_id != experiment.experiment_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "admission-evidence: experiment-binding-mismatch",
+        });
+    }
+    if admission.content_revision_ref != evaluation.content_revision_ref {
+        return Err(PipelineError::UnboundRelation {
+            relation: "admission-evidence: content-revision-mismatch",
+        });
+    }
+    bounded_text(
+        &admission.run_ref,
+        "admission_evidence.run_ref",
+        IMPROVEMENT_MAX_REFERENCE_BYTES,
+    )
+}
+
+/// Requires one rollback owner and agreeing rollback, disable, reopen, and
+/// expiry references, plus coverage of every required proposal invalidation.
+fn check_rollback_join(
+    rollback: &RollbackContract,
+    admission: &ImprovementEvidenceView,
+    policy: &ImprovementAdmissionPolicy,
+    proposal: &ImprovementProposal,
+) -> Result<(), PipelineError> {
+    check_rollback_contract(rollback)?;
+    if rollback.rollback_owner_id != policy.rollback_owner_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "rollback-policy: rollback-owner-mismatch",
+        });
+    }
+    if rollback.rollback_owner_id != admission.rollback_owner_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "rollback-evidence: rollback-owner-mismatch",
+        });
+    }
+    for (relation, declared, bound) in [
+        (
+            "rollback-evidence: rollback-reference-disagreement",
+            admission.rollback_ref.as_deref(),
+            rollback.rollback_ref.as_str(),
+        ),
+        (
+            "rollback-evidence: disable-reference-disagreement",
+            admission.disable_ref.as_deref(),
+            rollback.disable_ref.as_str(),
+        ),
+        (
+            "rollback-evidence: reopen-reference-disagreement",
+            admission.reopen_ref.as_deref(),
+            rollback.reopen_ref.as_str(),
+        ),
+        (
+            "rollback-evidence: expiry-reference-disagreement",
+            admission.expiry_ref.as_deref(),
+            rollback.expiry_ref.as_str(),
+        ),
+    ] {
+        agree_declared_reference(relation, declared, bound)?;
+    }
+    check_invalidation_coverage(proposal, rollback)
+}
+
+/// Requires two declared references to agree when both sides declare one.
+///
+/// An absent side stays a named gap that the inner admission disposes with a
+/// typed prerequisite cause. This join never invents a default and never reads
+/// absence as agreement.
+fn agree_declared_reference(
+    relation: &'static str,
+    declared: Option<&str>,
+    bound: &str,
+) -> Result<(), PipelineError> {
+    let Some(declared) = declared.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if declared != bound {
+        return Err(PipelineError::UnboundRelation { relation });
+    }
+    Ok(())
+}
+
+/// Requires the rollback contract to cover every required proposal invalidation.
+///
+/// Wider rollback coverage is a repair-path fact, not permission to invalidate
+/// targets outside the proposal's admitted set, so the handoff carries the
+/// proposal's own set.
+fn check_invalidation_coverage(
+    proposal: &ImprovementProposal,
+    rollback: &RollbackContract,
+) -> Result<(), PipelineError> {
+    let covered: BTreeSet<&str> = rollback
+        .invalidation_set
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if covered.len() != rollback.invalidation_set.len() {
+        return Err(PipelineError::DuplicateSetMember(
+            "rollback.invalidation_set",
+        ));
+    }
+    for target in &proposal.invalidation_set {
+        if !covered.contains(target.as_str()) {
+            return Err(PipelineError::UnboundRelation {
+                relation: "rollback-proposal: required-invalidation-not-covered",
+            });
         }
     }
     Ok(())
@@ -634,104 +1394,406 @@ fn check_rollback_contract(contract: &RollbackContract) -> Result<(), PipelineEr
             detail: "missing-invalidation: invalidation set required before experiment".to_string(),
         });
     }
+    if contract.invalidation_set.len() > IMPROVEMENT_MAX_SET_MEMBERS {
+        return Err(PipelineError::InputProfileCeiling(
+            "rollback.invalidation_set",
+        ));
+    }
     for value in &contract.invalidation_set {
-        if value.trim().is_empty() {
-            return Err(PipelineError::RollbackContractGap {
-                detail: "missing-invalidation: invalidation entry must not be empty".to_string(),
-            });
+        bounded_text(
+            value,
+            "rollback.invalidation_set",
+            IMPROVEMENT_MAX_REFERENCE_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+/// Maps a Governor admission decision through the checked joined view.
+fn map_decision(
+    decision: &ImprovementAdmissionDecision,
+    joined: &JoinedImprovementInputs<'_>,
+) -> Result<ImprovementTerminalDisposition, PipelineError> {
+    Ok(match decision {
+        ImprovementAdmissionDecision::AdmitForExperiment {
+            candidate_id,
+            campaign_id,
+            experiment_scope_ref,
+            evaluator_id,
+            rollback_owner_id,
+        } => {
+            check_inner_decision_binding(
+                joined,
+                candidate_id,
+                campaign_id,
+                experiment_scope_ref,
+                evaluator_id,
+                rollback_owner_id,
+            )?;
+            ImprovementTerminalDisposition::CanaryAdmitted {
+                handoff: Box::new(build_canary_handoff(joined)?),
+            }
+        }
+        ImprovementAdmissionDecision::Reject {
+            cause,
+            reason,
+            owner_id,
+        } => map_rejection(*cause, reason, owner_id),
+        ImprovementAdmissionDecision::NeedsMoreEvidence { missing, owner_id } => {
+            ImprovementTerminalDisposition::Inconclusive {
+                missing: missing.clone(),
+                owner_id: owner_id.clone(),
+            }
+        }
+        ImprovementAdmissionDecision::Blocked {
+            cause,
+            reason,
+            owner_id,
+        } => map_block(*cause, reason, owner_id),
+        ImprovementAdmissionDecision::RequiresReconciliation { reason, owner_id } => {
+            ImprovementTerminalDisposition::UnknownRequiresReconciliation {
+                reason: reason.clone(),
+                owner_id: owner_id.clone(),
+            }
+        }
+        ImprovementAdmissionDecision::NoProgress { reason, owner_id } => {
+            ImprovementTerminalDisposition::NoProgress {
+                reason: reason.clone(),
+                owner_id: owner_id.clone(),
+            }
+        }
+    })
+}
+
+/// Maps one typed rejection. A regression subtype needs typed pulse evidence.
+fn map_rejection(
+    cause: ImprovementRejectCause,
+    reason: &str,
+    owner_id: &str,
+) -> ImprovementTerminalDisposition {
+    match cause {
+        ImprovementRejectCause::PulseRegression => {
+            ImprovementTerminalDisposition::RegressionRejected {
+                cause,
+                reason: reason.to_string(),
+                owner_id: owner_id.to_string(),
+            }
+        }
+        ImprovementRejectCause::InvalidClosureBinding | ImprovementRejectCause::HarmObserved => {
+            ImprovementTerminalDisposition::Rejected {
+                cause,
+                reason: reason.to_string(),
+                owner_id: owner_id.to_string(),
+            }
+        }
+    }
+}
+
+/// Maps one typed block. A block is never a rejection and never a completed
+/// rollback; the remedy is derived from the typed cause.
+fn map_block(
+    cause: ImprovementBlockCause,
+    reason: &str,
+    owner_id: &str,
+) -> ImprovementTerminalDisposition {
+    ImprovementTerminalDisposition::Blocked {
+        cause,
+        remedy: cause.remedy(),
+        reason: reason.to_string(),
+        owner_id: owner_id.to_string(),
+    }
+}
+
+/// Requires the admitted decision's candidate, campaign, evaluator, scope, and
+/// rollback owner to still match the checked records that created the handoff.
+fn check_inner_decision_binding(
+    joined: &JoinedImprovementInputs<'_>,
+    candidate_id: &str,
+    campaign_id: &str,
+    experiment_scope_ref: &str,
+    evaluator_id: &str,
+    rollback_owner_id: &str,
+) -> Result<(), PipelineError> {
+    for (relation, declared, bound) in [
+        (
+            "inner-decision: candidate-identity-mismatch",
+            candidate_id,
+            joined.proposal.candidate_id.as_str(),
+        ),
+        (
+            "inner-decision: campaign-identity-mismatch",
+            campaign_id,
+            joined.proposal.campaign_id.as_str(),
+        ),
+        (
+            "inner-decision: evaluator-identity-mismatch",
+            evaluator_id,
+            joined.admission_evidence.verifier_id.as_str(),
+        ),
+        (
+            "inner-decision: rollback-owner-mismatch",
+            rollback_owner_id,
+            joined.rollback.rollback_owner_id.as_str(),
+        ),
+        (
+            "inner-decision: admitted-scope-mismatch",
+            experiment_scope_ref,
+            joined.admitted_scope_ref.as_str(),
+        ),
+    ] {
+        if declared != bound {
+            return Err(PipelineError::UnboundRelation { relation });
         }
     }
     Ok(())
 }
 
-/// Maps a Governor admission decision to the advisory-only terminal disposition.
-fn map_decision(
-    decision: &ImprovementAdmissionDecision,
+/// Builds the inspectable, non-authorizing handoff from the checked view.
+fn build_canary_handoff(
+    joined: &JoinedImprovementInputs<'_>,
+) -> Result<ImprovementCanaryHandoff, PipelineError> {
+    let admission_pulse_ref = joined
+        .admission_evidence
+        .pulse_ref
+        .as_deref()
+        .ok_or(PipelineError::UnboundRelation {
+            relation: "inner-decision: admitted-pulse-evidence-missing",
+        })?
+        .to_string();
+    let handoff = ImprovementCanaryHandoff {
+        proposal_id: joined.proposal.proposal_id.clone(),
+        proposal_commitment: joined.commitment.clone(),
+        candidate_id: joined.proposal.candidate_id.clone(),
+        campaign_id: joined.proposal.campaign_id.clone(),
+        closure_id: joined.proposal.closure_id.clone(),
+        closure_digest: joined.proposal.closure_digest.clone(),
+        target_capability: joined.proposal.target_capability.clone(),
+        target_generation: joined.proposal.target_generation.clone(),
+        experiment_id: joined.experiment.experiment_id.clone(),
+        operation_ref: joined.proposal.operation_ref.clone(),
+        idempotency_key: joined.proposal.idempotency_key.clone(),
+        experiment_scope_ref: joined.admitted_scope_ref.clone(),
+        budget_ref: joined.experiment.budget_ref.clone(),
+        deadline_ref: joined.experiment.deadline_ref.clone(),
+        evidence_id: joined.evidence.evidence_id.clone(),
+        evidence_verifier_id: joined.evidence.verifier_id.clone(),
+        evidence_run_ref: joined.evidence.run_ref.clone(),
+        evidence_content_revision_ref: joined.evidence.content_revision_ref.clone(),
+        raw_evidence_ref: joined.evidence.raw_evidence_ref.clone(),
+        admission_evaluator_id: joined.admission_evidence.verifier_id.clone(),
+        admission_run_ref: joined.admission_evidence.run_ref.clone(),
+        admission_content_revision_ref: joined.admission_evidence.content_revision_ref.clone(),
+        admission_pulse_ref,
+        admission_owner_id: joined.policy.external_owner_id.clone(),
+        rollback_ref: joined.rollback.rollback_ref.clone(),
+        disable_ref: joined.rollback.disable_ref.clone(),
+        reopen_ref: joined.rollback.reopen_ref.clone(),
+        expiry_ref: joined.rollback.expiry_ref.clone(),
+        forward_repair_ref: joined.rollback.forward_repair_ref.clone(),
+        rollback_owner_id: joined.rollback.rollback_owner_id.clone(),
+        invalidation_set: joined.normalized.invalidation_set.clone(),
+        activation_owner_id: KERNEL_CANARY_OWNER.to_string(),
+        handoff_projection: String::new(),
+        execution_authorized: false,
+    };
+    Ok(ImprovementCanaryHandoff {
+        handoff_projection: format!(
+            "canary-handoff: proposal {} candidate {} campaign {} experiment {} admitted-scope {} budget {} deadline {} commitment {}/{} run {} revision {} verifier {} reviewer {} rollback-owner {}; #11 Kernel activation required, not executed here; not a permit",
+            handoff.proposal_id,
+            handoff.candidate_id,
+            handoff.campaign_id,
+            handoff.experiment_id,
+            handoff.experiment_scope_ref,
+            handoff.budget_ref,
+            handoff.deadline_ref,
+            handoff.proposal_commitment.encoding_version,
+            handoff.proposal_commitment.digest,
+            handoff.evidence_run_ref,
+            handoff.evidence_content_revision_ref,
+            handoff.evidence_verifier_id,
+            handoff.admission_evaluator_id,
+            handoff.rollback_owner_id,
+        ),
+        ..handoff
+    })
+}
+
+/// Returns the complete normalized proposal whose exact bytes are committed.
+fn canonical_proposal(
     proposal: &ImprovementProposal,
-    experiment: &ExperimentPlan,
-    evidence: &ActivationEvidence,
-    rollback: &RollbackContract,
-) -> ImprovementTerminalDisposition {
-    match decision {
-        ImprovementAdmissionDecision::AdmitForExperiment {
-            candidate_id,
-            evaluator_id,
-            rollback_owner_id,
-            ..
-        } => ImprovementTerminalDisposition::CanaryAdmitted {
-            canary_permit_request: format!(
-                "canary-handoff: candidate {candidate_id} proposal-digest {} experiment {} evaluator {evaluator_id} rollback-owner {rollback_owner_id}; #11 Kernel activation required, not executed here; verifier {} evidence {}",
-                proposal_digest(proposal),
-                experiment.experiment_id,
-                evidence.verifier_id,
-                evidence.evidence_id
-            ),
-        },
-        ImprovementAdmissionDecision::Reject { reason, .. } => {
-            if reason.contains("pulse-regression") || reason.contains("regression") {
-                ImprovementTerminalDisposition::RegressionRejected {
-                    reason: reason.clone(),
-                }
-            } else {
-                ImprovementTerminalDisposition::Rejected {
-                    reason: reason.clone(),
-                }
-            }
-        }
-        ImprovementAdmissionDecision::NeedsMoreEvidence { missing, .. } => {
-            ImprovementTerminalDisposition::Inconclusive {
-                missing: missing.clone(),
-            }
-        }
-        ImprovementAdmissionDecision::Blocked { reason, .. } => {
-            if reason.contains("rollback")
-                || reason.contains("disable")
-                || reason.contains("reopen")
-                || reason.contains("expiry")
-                || reason.contains("stale")
-            {
-                ImprovementTerminalDisposition::RolledBack {
-                    contract_ref: rollback.rollback_ref.clone(),
-                }
-            } else {
-                ImprovementTerminalDisposition::Rejected {
-                    reason: reason.clone(),
-                }
-            }
-        }
-        ImprovementAdmissionDecision::RequiresReconciliation { reason } => {
-            ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-                reason: reason.clone(),
-            }
-        }
-        ImprovementAdmissionDecision::NoProgress { reason, .. } => {
-            ImprovementTerminalDisposition::NoProgress {
-                reason: reason.clone(),
-            }
-        }
-    }
+) -> Result<ImprovementProposal, PipelineError> {
+    check_commitment_profile(proposal)?;
+    Ok(ImprovementProposal {
+        evidence_refs: declared_set(&proposal.evidence_refs, "evidence_refs")?,
+        invalidation_set: declared_set(&proposal.invalidation_set, "invalidation_set")?,
+        ..proposal.clone()
+    })
 }
 
-/// Computes deterministic FNV-1a 64-bit hex over raw bytes.
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
+/// Commits one already-normalized proposal with the current identity.
+fn commitment_of(normalized: &ImprovementProposal) -> Result<ProposalCommitment, PipelineError> {
+    let envelope = ImprovementProposalCommitmentEnvelope {
+        domain: IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN.to_string(),
+        encoding_version: IMPROVEMENT_PROPOSAL_ENCODING_VERSION.to_string(),
+        algorithm: IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM.to_string(),
+        proposal: normalized.clone(),
+    };
+    let bytes = canonical_json_bytes(&envelope)
+        .map_err(|_| PipelineError::CommitmentFailed("canonical-json-bytes-unavailable"))?;
+    if bytes.len() > IMPROVEMENT_MAX_COMMITMENT_BYTES {
+        return Err(PipelineError::InputProfileCeiling(
+            "proposal-commitment-bytes",
+        ));
     }
-    let mut out = String::with_capacity(16);
-    for shift in [60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0] {
-        let nibble = ((hash >> shift) & 0xf) as u8;
-        out.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0'));
-    }
-    out
+    Ok(ProposalCommitment {
+        domain: envelope.domain,
+        encoding_version: envelope.encoding_version,
+        algorithm: envelope.algorithm,
+        operation_ref: normalized.operation_ref.clone(),
+        idempotency_key: normalized.idempotency_key.clone(),
+        digest: sha256_hex(&bytes),
+        canonical_bytes: bytes.len(),
+    })
 }
 
-/// Reads one required text field without accepting empty or blank values.
+/// Validates the admitted input, count, string, and total-size profile before
+/// any clone, sort, or serialization happens.
+fn check_commitment_profile(proposal: &ImprovementProposal) -> Result<(), PipelineError> {
+    for (field, value) in [
+        ("proposal_id", proposal.proposal_id.as_str()),
+        ("candidate_id", proposal.candidate_id.as_str()),
+        ("campaign_id", proposal.campaign_id.as_str()),
+        ("closure_id", proposal.closure_id.as_str()),
+        ("closure_digest", proposal.closure_digest.as_str()),
+        ("target_capability", proposal.target_capability.as_str()),
+        ("target_generation", proposal.target_generation.as_str()),
+        ("operation_ref", proposal.operation_ref.as_str()),
+        ("idempotency_key", proposal.idempotency_key.as_str()),
+        ("privacy_class", proposal.privacy_class.as_str()),
+        ("risk_ceiling", proposal.risk_ceiling.as_str()),
+        ("effect_ceiling", proposal.effect_ceiling.as_str()),
+        ("budget_ref", proposal.budget_ref.as_str()),
+        ("deadline_ref", proposal.deadline_ref.as_str()),
+        ("source_identity", proposal.source_identity.as_str()),
+        ("runtime_identity", proposal.runtime_identity.as_str()),
+        ("data_identity", proposal.data_identity.as_str()),
+        (
+            "mechanism.mechanism_id",
+            proposal.mechanism.mechanism_id.as_str(),
+        ),
+    ] {
+        bounded_text(value, field, IMPROVEMENT_MAX_REFERENCE_BYTES)?;
+    }
+    for (field, value) in [
+        (
+            "mechanism.hypothesis",
+            proposal.mechanism.hypothesis.as_str(),
+        ),
+        (
+            "mechanism.causal_link",
+            proposal.mechanism.causal_link.as_str(),
+        ),
+        (
+            "mechanism.declared_ref",
+            proposal.mechanism.declared_ref.as_str(),
+        ),
+        ("expected_delta", proposal.expected_delta.as_str()),
+    ] {
+        bounded_text(value, field, IMPROVEMENT_MAX_TEXT_BYTES)?;
+    }
+    for (field, values) in [
+        ("evidence_refs", &proposal.evidence_refs),
+        ("invalidation_set", &proposal.invalidation_set),
+    ] {
+        if values.is_empty() {
+            return Err(PipelineError::MissingField(field));
+        }
+        if values.len() > IMPROVEMENT_MAX_SET_MEMBERS {
+            return Err(PipelineError::InputProfileCeiling(field));
+        }
+        for value in values {
+            bounded_text(value, field, IMPROVEMENT_MAX_REFERENCE_BYTES)?;
+        }
+    }
+    if proposal_total_bytes(proposal) > IMPROVEMENT_MAX_COMMITMENT_BYTES {
+        return Err(PipelineError::InputProfileCeiling("proposal-total-bytes"));
+    }
+    Ok(())
+}
+
+/// Returns the summed byte length of every committed string in the proposal.
+fn proposal_total_bytes(proposal: &ImprovementProposal) -> usize {
+    let scalars: [&str; 22] = [
+        proposal.proposal_id.as_str(),
+        proposal.candidate_id.as_str(),
+        proposal.campaign_id.as_str(),
+        proposal.closure_id.as_str(),
+        proposal.closure_digest.as_str(),
+        proposal.target_capability.as_str(),
+        proposal.target_generation.as_str(),
+        proposal.mechanism.mechanism_id.as_str(),
+        proposal.mechanism.hypothesis.as_str(),
+        proposal.mechanism.causal_link.as_str(),
+        proposal.mechanism.declared_ref.as_str(),
+        proposal.expected_delta.as_str(),
+        proposal.risk_ceiling.as_str(),
+        proposal.effect_ceiling.as_str(),
+        proposal.budget_ref.as_str(),
+        proposal.deadline_ref.as_str(),
+        proposal.privacy_class.as_str(),
+        proposal.operation_ref.as_str(),
+        proposal.idempotency_key.as_str(),
+        proposal.source_identity.as_str(),
+        proposal.runtime_identity.as_str(),
+        proposal.data_identity.as_str(),
+    ];
+    let total: usize = scalars.iter().map(|value| value.len()).sum();
+    total
+        + proposal
+            .evidence_refs
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+        + proposal
+            .invalidation_set
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+}
+
+/// Normalizes one declared set: deterministic byte ordering, explicit duplicate
+/// rejection, and reference bytes left unchanged.
+///
+/// Ordering is a declared property of the set, so a permutation preserves the
+/// commitment. A repeated identity is refused instead of silently collapsed,
+/// because collapsing conflicting evidence destroys the difference it encodes.
+/// Ordered and prose content is never normalized.
+fn declared_set(values: &[String], field: &'static str) -> Result<Vec<String>, PipelineError> {
+    let mut ordered = Vec::with_capacity(values.len());
+    for value in values {
+        if ordered.contains(value) {
+            return Err(PipelineError::DuplicateSetMember(field));
+        }
+        ordered.push(value.clone());
+    }
+    ordered.sort();
+    Ok(ordered)
+}
+
+/// Reads one required field, keeping stored bytes unchanged.
 fn text(value: &str, field: &'static str) -> Result<(), PipelineError> {
     if value.trim().is_empty() {
         Err(PipelineError::MissingField(field))
     } else {
         Ok(())
     }
+}
+
+/// Reads one required field and refuses it above the admitted byte ceiling.
+fn bounded_text(value: &str, field: &'static str, limit: usize) -> Result<(), PipelineError> {
+    text(value, field)?;
+    if value.len() > limit {
+        return Err(PipelineError::InputProfileCeiling(field));
+    }
+    Ok(())
 }
