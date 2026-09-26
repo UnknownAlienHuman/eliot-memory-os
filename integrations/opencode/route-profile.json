@@ -150,7 +150,7 @@
     "prove child-session closure and cancellation before parent attempt disposition"
   ],
   "known_gaps": [
-    "the server-side /v1/host-events durable admission endpoint and User Broker credential materialization are not implemented in this plugin slice",
+    "the production /v1/host-events handler, User Broker introduction materializer, current-session probe, and receipt-verifying plugin path exist, while bridge-process listener scheduling, Governor ActionGate evaluation wiring, the protected bootstrap transport, and broker launch projection remain",
     "the one-shot process bridge remains a compatibility fallback only when the HTTP bridge is entirely unconfigured",
     "current-account provider, model, quota, and auth behavior are unprobed",
     "OpenCode internal runtime storage remains forensic-only and cannot resume ELIOT authority"
@@ -168,7 +168,7 @@
     "admittable": false,
     "admitted": false,
     "proof_ceiling": "The public OpenAPI/SSE surface can host one bounded candidate attempt; OpenCode internal storage and plugin callbacks are not ELIOT task or recovery truth.",
-    "expiry_condition": "No expiry; static unavailable-target. Admission requires the server-side /v1/host-events durable admission endpoint, User Broker credential materialization, and live HTTP/SSE probes. The one-shot process bridge remains a compatibility fallback only when the HTTP bridge is entirely unconfigured and never crosses transport after an HTTP attempt.",
+    "expiry_condition": "No expiry; static unavailable-target. Admission requires the live-wired server-side /v1/host-events route (bridge-process listener scheduling, Governor ActionGate evaluation wiring, protected bootstrap transport, broker launch projection) and live HTTP/SSE probes. The one-shot process bridge remains a compatibility fallback only when the HTTP bridge is entirely unconfigured and never crosses transport after an HTTP attempt.",
     "per_attempt_receipt": true,
     "required_probes": [
       "pin executable and OpenAPI digest for the exact installed runtime",

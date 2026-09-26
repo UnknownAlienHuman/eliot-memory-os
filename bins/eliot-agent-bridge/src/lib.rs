@@ -55,6 +55,7 @@ mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
 pub mod memory_handle_join;
+pub mod opencode_host_events;
 pub mod reactive_injection_receipts;
 pub mod reactive_runtime_composition;
 pub mod settled_plan_transport;
@@ -2129,6 +2130,12 @@ impl BridgeRunner {
         event: &EventEnvelope,
     ) -> Result<EventForwardStatus, BridgeError> {
         self.core.forward_event(event)
+    }
+    // Mirrors `forward_event`'s established `BridgeError` contract instead of
+    // boxing: a divergent error shape here would split one owner surface.
+    #[allow(clippy::result_large_err)]
+    pub fn forward_gap(&mut self, gap: &CoverageGap) -> Result<(), BridgeError> {
+        self.core.forward_gap(gap)
     }
     #[must_use]
     pub fn attach_view(&self) -> Option<AttachView> {
