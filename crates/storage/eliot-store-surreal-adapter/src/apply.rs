@@ -917,6 +917,7 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
             | StoreError::InvalidReceipt
             | StoreError::TransitionDigestMismatch { .. }
             | StoreError::ReceiptNotFound
+            | StoreError::AutomationContinuation(_)
             | StoreError::PayloadTooLarge => AttemptOutcome::Rejected(store),
             StoreError::Serialization(_) => AttemptOutcome::Cancelled,
             StoreError::MissingReceiptEnvelope | StoreError::Unavailable => {

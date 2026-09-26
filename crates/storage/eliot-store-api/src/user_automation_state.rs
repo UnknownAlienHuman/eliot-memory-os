@@ -51,37 +51,13 @@
 //! current under a stale denominator. Absence of the object is `unknown`,
 //! never unrestricted/complete (I5.16).
 //!
-//! Paged continuation (issue #2808). A `TRUNCATED` completeness block also
-//! carries one owner-minted `next_cursor`, and the read accepts it back as the
-//! optional `cursor` selector of the two page-bearing denominator reads
-//! (`history`, `invocations`). The cursor is a versioned, canonically encoded
-//! object bound to every property a stable continuation needs:
-//!
-//! ```text
-//! automation-page:v1:{"after_row_id":…,"automation_id":…,"max_records":…,
-//!                     "order":"ASC","query":…,"read_revision":…,
-//!                     "state_fence":…}
-//! ```
-//!
-//! - `query` and `automation_id` bind the cursor to one declared denominator,
-//!   so a cursor minted for `invocations` cannot page `history` or another
-//!   automation;
-//! - `read_revision` and `state_fence` bind it to one head snapshot, so a page
-//!   requested after a commit that advanced any revision head fails closed
-//!   instead of skipping or repeating a row under a moving set;
-//! - `order` names the ordering direction, so a consumer and an owner cannot
-//!   silently disagree about which key the `after_row_id` compares against;
-//! - `after_row_id` is the **exclusive last row identity** of the page just
-//!   served — never an offset, so reordering, deletion and retirement cannot
-//!   lose or repeat a logical identity;
-//! - `max_records` binds the page bound in force, so a repage under different
-//!   bounds invalidates outstanding cursors instead of re-reading a window.
-//!
-//! Both backends order the `history` denominator by `revision` and the
-//! `invocations` denominator by `occurrence_id`, ascending, so the exclusive
-//! comparison is a total, stable key on either contour. Callers echo cursors;
-//! only the store owner mints them and [`automation_page_cursor_parse`]
-//! re-verifies every binding before a page is served.
+//! Paged continuation (issue #2859). A `TRUNCATED` completeness block carries
+//! an owner-issued V2 reference containing only its closed version and opaque
+//! identifier. The Store owner retains the exact request, snapshot, fence,
+//! ordering, returned-tail, bound, issuer, and finite-retention bindings. It
+//! resolves and validates that retained record against the current request
+//! before applying the private row boundary. Legacy V1 JSON selectors fail
+//! with a typed refresh response and cannot resume an authoritative denominator.
 
 use std::collections::BTreeMap;
 
@@ -91,7 +67,7 @@ use thiserror::Error;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
-    ReadConsistency, StateFence, StoreError, canonical_json_bytes,
+    ReadConsistency, StateFence, StoreError,
 };
 
 /// Versioned wire/schema identity for canonical user-automation state.
@@ -116,13 +92,23 @@ pub const MAX_AUTOMATION_REVISION_ID_BYTES: usize = 128;
 pub const MAX_AUTOMATION_DOC_BYTES: usize = 262_144;
 /// Maximum records one automation read may return.
 pub const MAX_AUTOMATION_PAGE_RECORDS: u16 = 64;
-/// Maximum accepted owner-minted page-continuation cursor length in bytes.
-///
-/// The cursor is a canonically encoded object over two bounded identities, two
-/// digests, the ordering direction and the page bound, so 1 KiB leaves
-/// headroom for the longest admissible identities while keeping the read input
-/// far below the activated read input bound.
-pub const MAX_AUTOMATION_CURSOR_BYTES: usize = 1_024;
+/// Maximum opaque owner-issued continuation identifier length in bytes.
+pub const MAX_AUTOMATION_CONTINUATION_ID_BYTES: usize = 128;
+/// Maximum rendered V2 continuation reference length, including its prefix.
+pub const MAX_AUTOMATION_CONTINUATION_REF_BYTES: usize = 128;
+/// Maximum active-record lifetime (15 minutes), bounding owner retention.
+pub const AUTOMATION_CONTINUATION_TTL_MS: u64 = 900_000;
+/// Maximum active records per owner; live entries are never evicted, so full
+/// capacity returns [`AutomationContinuationFailure::CapacityPressure`].
+pub const AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS: usize = 1_024;
+/// Maximum logical metadata bytes retained for active continuation records.
+/// Reclaim expired and terminal records deterministically by creation revision,
+/// then identifier; never evict a live record.
+pub const AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES: usize = 2 * 1_024 * 1_024;
+/// Maximum terminal continuation tombstones retained per automation owner.
+pub const AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES: usize = 256;
+/// Maximum logical metadata bytes retained for terminal continuation tombstones.
+pub const AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES: usize = 256 * 1_024;
 
 /// Mutation discriminator parameter (closed mutation leg).
 pub const AUTOMATION_PARAM_OPERATION: &str = "operation";
@@ -218,15 +204,10 @@ pub const AUTOMATION_PAGE_STATE_FENCE: &str = "state_fence";
 /// complete denominator has no successor page, so absence here is a proven end
 /// of the set, not missing evidence (I5.16).
 pub const AUTOMATION_PAGE_NEXT_CURSOR: &str = "next_cursor";
-/// Version tag of the canonical automation page-continuation cursor encoding.
-pub const AUTOMATION_CURSOR_VERSION: &str = "automation-page:v1";
-/// The one ordering direction the automation page denominators serve.
-///
-/// Both backends order the `history` denominator by `revision` and the
-/// `invocations` denominator by `occurrence_id`, ascending. The direction is
-/// part of the cursor so a consumer can never compare `after_row_id` against a
-/// different key than the owner paged on.
-pub const AUTOMATION_CURSOR_ORDER_ASCENDING: &str = "ASC";
+/// Canonical prefix of a V2 opaque continuation reference.
+pub const AUTOMATION_CONTINUATION_V2_PREFIX: &str = "automation-page:v2:";
+/// Recognized legacy prefix; such selectors require a first-page refresh.
+pub const AUTOMATION_CONTINUATION_V1_PREFIX: &str = "automation-page:v1:";
 
 /// Fail-closed automation wire errors before [`StoreError`] projection.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -343,191 +324,399 @@ pub struct DecodedAutomationRead {
     pub include_retired: bool,
     /// Page-size bound (list/history/invocations only).
     pub max_records: u16,
-    /// Verified owner-minted continuation for a paged denominator read.
-    pub cursor: Option<AutomationPageCursor>,
+    /// Opaque owner-issued continuation for a paged denominator read.
+    pub cursor: Option<AutomationContinuationRef>,
 }
 
-/// One owner-minted continuation over one paged automation denominator.
+/// Closed continuation-reference version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomationContinuationVersion {
+    /// Owner-held V2 record reference.
+    V2,
+}
+
+/// Opaque owner-issued reference echoed by pagination callers.
 ///
-/// Every field is a binding the owner re-verifies before serving the next page,
-/// and every field is required: a continuation that could omit its denominator,
-/// its head snapshot, its direction or its exclusive last row identity would be
-/// an offset over a changing set. The exclusive last row identity is the
-/// `revision` of the last history row served, or the `occurrence_id` of the
-/// last invocation row served, matching the query's total ordering key.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AutomationPageCursor {
-    /// Closed query discriminator whose denominator this cursor pages.
-    pub query: String,
-    /// Stable automation identity owning the declared denominator.
-    pub automation_id: String,
-    /// Owner-issued read revision this cursor was minted at.
-    pub read_revision: String,
-    /// Admission fence the page was served under.
-    pub state_fence: StateFence,
-    /// Ordering direction of the denominator (`ASC`).
-    pub order: String,
-    /// Exclusive last row identity served; the next page starts strictly after.
-    pub after_row_id: String,
-    /// Page bound in force when the cursor was minted.
+/// The serialized reference contains only this closed version and the bounded
+/// owner identifier. Range boundaries and all request/snapshot bindings live
+/// only in the Store owner's retained record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutomationContinuationRef {
+    version: AutomationContinuationVersion,
+    identifier: String,
+}
+
+impl AutomationContinuationRef {
+    /// Wraps an identifier generated by a Store owner. This accepts no query,
+    /// snapshot, or row-boundary data; the owner-held record grants authority.
+    pub fn from_owner_identifier(identifier: impl Into<String>) -> Result<Self, StoreError> {
+        let identifier = identifier.into();
+        validate_continuation_identifier(&identifier)?;
+        let rendered_len = AUTOMATION_CONTINUATION_V2_PREFIX.len() + identifier.len();
+        if rendered_len > MAX_AUTOMATION_CONTINUATION_REF_BYTES {
+            return Err(continuation_failure(
+                AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        Ok(Self {
+            version: AutomationContinuationVersion::V2,
+            identifier,
+        })
+    }
+
+    /// Returns the closed continuation-reference version.
+    #[must_use]
+    pub const fn version(&self) -> AutomationContinuationVersion {
+        self.version
+    }
+
+    /// Returns the opaque identifier used only for owner-record lookup.
+    #[must_use]
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    /// Parses one canonical V2 reference. V1 JSON selectors receive a typed
+    /// refresh response because their public fields never authenticated a row
+    /// boundary.
+    pub fn parse_wire(wire: &str) -> Result<Self, StoreError> {
+        if wire.starts_with(AUTOMATION_CONTINUATION_V1_PREFIX) {
+            return Err(continuation_failure(
+                AutomationContinuationFailure::LegacyRefresh,
+            ));
+        }
+        if wire.len() > MAX_AUTOMATION_CONTINUATION_REF_BYTES {
+            return Err(continuation_failure(
+                AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        let Some(identifier) = wire.strip_prefix(AUTOMATION_CONTINUATION_V2_PREFIX) else {
+            return Err(continuation_failure(
+                AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        };
+        let reference = Self::from_owner_identifier(identifier)?;
+        if reference.to_wire()?.as_str() != wire {
+            return Err(continuation_failure(
+                AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        Ok(reference)
+    }
+
+    /// Renders the canonical bounded wire reference.
+    pub fn to_wire(&self) -> Result<String, StoreError> {
+        if self.version != AutomationContinuationVersion::V2 {
+            return Err(continuation_failure(
+                AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        validate_continuation_identifier(&self.identifier)?;
+        let wire = format!("{AUTOMATION_CONTINUATION_V2_PREFIX}{}", self.identifier);
+        if wire.len() > MAX_AUTOMATION_CONTINUATION_REF_BYTES {
+            return Err(continuation_failure(
+                AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        Ok(wire)
+    }
+}
+
+/// Closed denominator query bound by a continuation record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomationContinuationQuery {
+    /// Revision-history denominator.
+    History,
+    /// Invocation denominator.
+    Invocations,
+}
+
+/// Closed stable ordering key for a continuation denominator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomationContinuationOrderKey {
+    /// Immutable revision identity.
+    Revision,
+    /// Stable occurrence identity.
+    OccurrenceId,
+}
+
+/// Closed continuation direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomationContinuationDirection {
+    /// Ascending total order.
+    Ascending,
+}
+
+/// Closed ordering binding retained with a continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutomationContinuationOrder {
+    /// Total-order identity compared by the owner.
+    pub key: AutomationContinuationOrderKey,
+    /// Direction in which the denominator was served.
+    pub direction: AutomationContinuationDirection,
+}
+
+/// Owner-held continuation bindings presented to the shared validator.
+///
+/// Backends persist their own private record and construct this non-wire view
+/// only after resolving the opaque identifier. It is never serialized to or
+/// accepted from an ordinary pagination caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutomationContinuationBinding<'a> {
+    /// Opaque owner-record identifier matching the reference.
+    pub identifier: &'a str,
+    /// Closed named operation served by the owner.
+    pub read_operation: NamedReadOperation,
+    /// Closed denominator query served by the owner.
+    pub query: AutomationContinuationQuery,
+    /// Stable automation identity owning the denominator.
+    pub automation_id: &'a str,
+    /// Exact digest of the revision-head set read by the owner.
+    pub read_revision: &'a str,
+    /// Admission fence under which the page was served.
+    pub state_fence: &'a StateFence,
+    /// Stable total-order key and direction.
+    pub order: AutomationContinuationOrder,
+    /// Exclusive identity of the final row returned on the preceding page.
+    pub exclusive_returned_tail: &'a str,
+    /// Page bound under which the preceding page was served.
     pub max_records: u16,
+    /// Exact retired-row selector received by the owner.
+    pub include_retired: bool,
+    /// Stable identity of the owner process/store incarnation.
+    pub issuer_identity: &'a str,
+    /// Owner generation preventing references crossing reincarnations.
+    pub issuer_generation: u64,
+    /// Monotonic owner-record creation revision.
+    pub creation_revision: u64,
+    /// Creation time in Unix milliseconds.
+    pub created_at_unix_ms: u64,
+    /// Finite expiration time in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
 }
 
-impl AutomationPageCursor {
-    /// Validates every binding before a page is served from the cursor.
-    ///
-    /// Rejects a non-closed query, a direction this contract does not serve, a
-    /// blank or unbounded row identity, a page bound outside the closed range,
-    /// and a read revision that is not the SHA-256 hex the owner issues. I5.27:
-    /// the encoding is versioned and every field affecting scope and ordering is
-    /// explicit, never defaulted or omitted.
-    fn validate(&self) -> Result<(), AutomationContractError> {
-        if !matches!(
-            self.query.as_str(),
-            AUTOMATION_QUERY_HISTORY | AUTOMATION_QUERY_INVOCATIONS
-        ) {
-            return Err(AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation is only valid for paged denominator reads",
-            });
-        }
-        if self.order != AUTOMATION_CURSOR_ORDER_ASCENDING {
-            return Err(AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation direction is not a closed value",
-            });
-        }
-        validate_automation_id(&self.automation_id).map_err(|_| {
-            AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation automation identity is invalid",
+/// Current request bindings checked before the owner applies a row boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutomationContinuationReadBinding<'a> {
+    /// Closed named operation being served.
+    pub read_operation: NamedReadOperation,
+    /// Closed denominator query being served.
+    pub query: AutomationContinuationQuery,
+    /// Stable automation identity requested by the caller.
+    pub automation_id: &'a str,
+    /// Exact current revision-head digest.
+    pub read_revision: &'a str,
+    /// Current admission fence.
+    pub state_fence: &'a StateFence,
+    /// Required total-order key and direction.
+    pub order: AutomationContinuationOrder,
+    /// Requested page bound.
+    pub max_records: u16,
+    /// Retired-row selector on the echoed read.
+    pub include_retired: bool,
+    /// Current owner process/store incarnation identity.
+    pub issuer_identity: &'a str,
+    /// Current owner generation.
+    pub issuer_generation: u64,
+}
+
+/// Typed continuation failure returned by the owner boundary.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AutomationContinuationFailure {
+    /// A V1 unauthenticated selector requires a new first-page read.
+    #[error("legacy continuation requires a first-page refresh")]
+    LegacyRefresh,
+    /// The reference or retained owner record is malformed or unknown.
+    #[error("continuation is invalid or unknown")]
+    InvalidOrUnknown,
+    /// The read snapshot or admission fence has advanced.
+    #[error("continuation snapshot is stale")]
+    StaleSnapshot,
+    /// The retained owner record has expired.
+    #[error("continuation has expired")]
+    Expired,
+    /// The owner cannot retain another bounded continuation record.
+    #[error("continuation retention capacity is exhausted")]
+    CapacityPressure,
+}
+
+/// Validated private row boundary returned only after all retained bindings
+/// match the reference, current request, and finite-retention policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedAutomationContinuation {
+    exclusive_returned_tail: String,
+}
+
+impl VerifiedAutomationContinuation {
+    /// Returns the boundary that the backend may apply to its range query.
+    #[must_use]
+    pub fn exclusive_returned_tail(&self) -> &str {
+        &self.exclusive_returned_tail
+    }
+}
+
+/// Verifies a resolved owner record before any row boundary is applied.
+pub fn verify_automation_continuation(
+    reference: &AutomationContinuationRef,
+    retained: AutomationContinuationBinding<'_>,
+    request: AutomationContinuationReadBinding<'_>,
+    now_unix_ms: u64,
+) -> Result<VerifiedAutomationContinuation, StoreError> {
+    let invalid = || continuation_failure(AutomationContinuationFailure::InvalidOrUnknown);
+    if reference.version != AutomationContinuationVersion::V2
+        || retained.identifier != reference.identifier
+    {
+        return Err(invalid());
+    }
+    validate_continuation_identifier(retained.identifier).map_err(|_| invalid())?;
+    validate_automation_id(retained.automation_id).map_err(|_| invalid())?;
+    validate_automation_id(request.automation_id).map_err(|_| invalid())?;
+    validate_continuation_issuer(retained.issuer_identity).map_err(|_| invalid())?;
+    validate_continuation_issuer(request.issuer_identity).map_err(|_| invalid())?;
+    validate_continuation_read_revision(retained.read_revision).map_err(|_| invalid())?;
+    validate_continuation_read_revision(request.read_revision).map_err(|_| invalid())?;
+    if retained.issuer_generation == 0
+        || request.issuer_generation == 0
+        || retained.creation_revision == 0
+    {
+        return Err(invalid());
+    }
+    validate_continuation_row_identity(retained.query, retained.exclusive_returned_tail)
+        .map_err(|_| invalid())?;
+    retained.state_fence.validate().map_err(|_| invalid())?;
+    request.state_fence.validate().map_err(|_| invalid())?;
+    validate_continuation_page_bound(retained.max_records).map_err(|_| invalid())?;
+    validate_continuation_page_bound(request.max_records).map_err(|_| invalid())?;
+    if retained.read_operation != NamedReadOperation::GetUserAutomationState
+        || request.read_operation != NamedReadOperation::GetUserAutomationState
+        || retained.order != continuation_order(retained.query)
+        || request.order != continuation_order(request.query)
+        || retained.expires_at_unix_ms <= retained.created_at_unix_ms
+    {
+        return Err(invalid());
+    }
+    let Some(latest_expiry) = retained
+        .created_at_unix_ms
+        .checked_add(AUTOMATION_CONTINUATION_TTL_MS)
+    else {
+        return Err(invalid());
+    };
+    if retained.expires_at_unix_ms > latest_expiry {
+        return Err(invalid());
+    }
+    if retained.created_at_unix_ms > now_unix_ms {
+        return Err(continuation_failure(
+            AutomationContinuationFailure::StaleSnapshot,
+        ));
+    }
+    if now_unix_ms >= retained.expires_at_unix_ms {
+        return Err(continuation_failure(AutomationContinuationFailure::Expired));
+    }
+    if retained.query != request.query
+        || retained.automation_id != request.automation_id
+        || retained.max_records != request.max_records
+        || retained.include_retired != request.include_retired
+        || retained.issuer_identity != request.issuer_identity
+        || retained.issuer_generation != request.issuer_generation
+    {
+        return Err(invalid());
+    }
+    if retained.read_revision != request.read_revision
+        || retained.state_fence != request.state_fence
+    {
+        return Err(continuation_failure(
+            AutomationContinuationFailure::StaleSnapshot,
+        ));
+    }
+    Ok(VerifiedAutomationContinuation {
+        exclusive_returned_tail: retained.exclusive_returned_tail.to_owned(),
+    })
+}
+
+fn continuation_order(query: AutomationContinuationQuery) -> AutomationContinuationOrder {
+    AutomationContinuationOrder {
+        key: match query {
+            AutomationContinuationQuery::History => AutomationContinuationOrderKey::Revision,
+            AutomationContinuationQuery::Invocations => {
+                AutomationContinuationOrderKey::OccurrenceId
             }
-        })?;
-        if self.after_row_id.trim().is_empty() || self.after_row_id.chars().any(char::is_control) {
-            return Err(AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation last row identity must be non-blank text",
-            });
-        }
-        if self.after_row_id.len() > MAX_AUTOMATION_ID_BYTES {
-            return Err(AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation last row identity exceeds the length bound",
-            });
-        }
-        if self.read_revision.len() != 64
-            || !self
-                .read_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation read revision must be lowercase SHA-256 hex",
-            });
-        }
-        self.state_fence
-            .validate()
-            .map_err(|_| AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation fence is invalid",
-            })?;
-        if self.max_records == 0 || self.max_records > MAX_AUTOMATION_PAGE_RECORDS {
-            return Err(AutomationContractError::InvalidField {
-                field: AUTOMATION_PARAM_CURSOR,
-                reason: "continuation page bound is out of range",
-            });
-        }
-        Ok(())
-    }
-
-    /// Renders the canonical wire encoding of one continuation.
-    ///
-    /// The canonical encoding is deterministic and versioned: the same bindings
-    /// always produce the same bytes on every contour, so a cursor survives a
-    /// round trip through a request, a response and the next request unchanged.
-    ///
-    /// An encoding failure is a typed mint failure, never an empty body: a
-    /// versioned prefix carrying no bindings would be a well-formed-looking
-    /// wire that no echoed continuation can ever verify, so the owner would
-    /// publish a `TRUNCATED` page whose successor has no address. The mint
-    /// fails closed instead, and the read that needed the continuation fails
-    /// rather than reporting a page whose remainder cannot be resumed.
-    fn to_wire(&self) -> Result<String, StoreError> {
-        let body = canonical_json_bytes(self).map_err(|error| {
-            StoreError::Serialization(format!(
-                "automation page cursor canonical encoding failed: {error}"
-            ))
-        })?;
-        let body = String::from_utf8(body).map_err(|error| {
-            StoreError::Serialization(format!(
-                "automation page cursor canonical encoding is not UTF-8: {error}"
-            ))
-        })?;
-        Ok(format!("{AUTOMATION_CURSOR_VERSION}:{body}"))
+        },
+        direction: AutomationContinuationDirection::Ascending,
     }
 }
 
-/// Mints one continuation for the page just served.
-///
-/// The owner calls this only for a `TRUNCATED` page, binding the exclusive last
-/// row identity it actually served, the read revision and fence it served it
-/// under, and the page bound in force. Callers echo the returned text; they
-/// never construct or edit it.
-pub fn automation_cursor_mint(
-    query: &str,
-    automation_id: &str,
-    read_revision: &str,
-    state_fence: &StateFence,
-    after_row_id: &str,
-    max_records: u16,
-) -> Result<String, StoreError> {
-    let cursor = AutomationPageCursor {
-        query: query.to_owned(),
-        automation_id: automation_id.to_owned(),
-        read_revision: read_revision.to_owned(),
-        state_fence: state_fence.clone(),
-        order: AUTOMATION_CURSOR_ORDER_ASCENDING.to_owned(),
-        after_row_id: after_row_id.to_owned(),
-        max_records,
-    };
-    cursor
-        .validate()
-        .map_err(AutomationContractError::into_store_error)?;
-    let wire = cursor.to_wire()?;
-    if wire.len() > MAX_AUTOMATION_CURSOR_BYTES {
-        return Err(StoreError::PayloadTooLarge);
+fn validate_continuation_identifier(identifier: &str) -> Result<(), StoreError> {
+    let max_identifier_bytes = MAX_AUTOMATION_CONTINUATION_REF_BYTES
+        .saturating_sub(AUTOMATION_CONTINUATION_V2_PREFIX.len())
+        .min(MAX_AUTOMATION_CONTINUATION_ID_BYTES);
+    if identifier.is_empty()
+        || identifier.len() > max_identifier_bytes
+        || !identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
+        return Err(continuation_failure(
+            AutomationContinuationFailure::InvalidOrUnknown,
+        ));
     }
-    Ok(wire)
+    Ok(())
 }
 
-/// Verifies one echoed continuation against the page about to be served.
-///
-/// Only the canonical [`AUTOMATION_CURSOR_VERSION`] encoding verifies; no
-/// scaffold, foreign or hand-written shape is accepted, because a cursor whose
-/// denominator, head snapshot, direction, fence, page bound or exclusive last
-/// row identity is not exactly the one the owner minted is an offset over a
-/// moving set. `read_revision` is re-proved against the digest the owner is
-/// serving right now, so a commit that advanced any revision head invalidates
-/// outstanding cursors and restarts enumeration instead of drifting.
-pub fn automation_cursor_verify(
-    wire: &str,
-    query: &str,
-    automation_id: &str,
-    read_revision: &str,
-    state_fence: &StateFence,
-    max_records: u16,
-) -> Result<AutomationPageCursor, StoreError> {
-    let malformed = || StoreError::InvalidField {
-        field: AUTOMATION_PARAM_CURSOR,
-        reason: "continuation is malformed, foreign, or stale",
-    };
-    let cursor = automation_cursor_shape(wire, query, automation_id, max_records)?;
-    if cursor.read_revision != read_revision || cursor.state_fence != *state_fence {
-        return Err(malformed());
+fn validate_continuation_issuer(issuer: &str) -> Result<(), StoreError> {
+    if issuer.trim().is_empty()
+        || issuer.len() > MAX_AUTOMATION_CONTINUATION_ID_BYTES
+        || issuer.chars().any(char::is_control)
+    {
+        return Err(continuation_failure(
+            AutomationContinuationFailure::InvalidOrUnknown,
+        ));
     }
-    Ok(cursor)
+    Ok(())
+}
+
+fn validate_continuation_read_revision(revision: &str) -> Result<(), StoreError> {
+    if revision.len() != 64
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(continuation_failure(
+            AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_continuation_row_identity(
+    query: AutomationContinuationQuery,
+    identity: &str,
+) -> Result<(), StoreError> {
+    let max_bytes = match query {
+        AutomationContinuationQuery::History => MAX_AUTOMATION_REVISION_ID_BYTES,
+        AutomationContinuationQuery::Invocations => MAX_AUTOMATION_ID_BYTES,
+    };
+    if identity.trim().is_empty()
+        || identity.len() > max_bytes
+        || identity.chars().any(char::is_control)
+    {
+        return Err(continuation_failure(
+            AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_continuation_page_bound(max_records: u16) -> Result<(), StoreError> {
+    if max_records == 0 || max_records > MAX_AUTOMATION_PAGE_RECORDS {
+        return Err(continuation_failure(
+            AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
+    Ok(())
+}
+
+const fn continuation_failure(failure: AutomationContinuationFailure) -> StoreError {
+    StoreError::AutomationContinuation(failure)
 }
 
 /// Builds the closed `ApplyUserAutomationState` mutation request.
@@ -1016,9 +1205,9 @@ pub fn validate_automation_read_params(
             // An exact immutable-revision read addresses one immutable row and
             // must never widen into a bounded page, so it cannot also page.
             let cursor = match (query, cursor_text) {
-                (AUTOMATION_QUERY_HISTORY, Some(text)) if requested_revision.is_none() => Some(
-                    automation_cursor_shape(text, query, &automation_id, max_records)?,
-                ),
+                (AUTOMATION_QUERY_HISTORY, Some(text)) if requested_revision.is_none() => {
+                    Some(AutomationContinuationRef::parse_wire(text)?)
+                }
                 (_, Some(_)) => {
                     return Err(StoreError::InvalidField {
                         field: AUTOMATION_PARAM_CURSOR,
@@ -1050,19 +1239,18 @@ pub fn validate_automation_read_params(
             })?;
             // An exact occurrence read addresses one retained row and must never
             // widen into a bounded page, so it cannot also page.
-            let cursor =
-                match cursor_text {
-                    Some(text) if requested_occurrence_id.is_none() => Some(
-                        automation_cursor_shape(text, query, &automation_id, max_records)?,
-                    ),
-                    Some(_) => {
-                        return Err(StoreError::InvalidField {
-                            field: AUTOMATION_PARAM_CURSOR,
-                            reason: "continuation is not valid with an exact occurrence selector",
-                        });
-                    }
-                    None => None,
-                };
+            let cursor = match cursor_text {
+                Some(text) if requested_occurrence_id.is_none() => {
+                    Some(AutomationContinuationRef::parse_wire(text)?)
+                }
+                Some(_) => {
+                    return Err(StoreError::InvalidField {
+                        field: AUTOMATION_PARAM_CURSOR,
+                        reason: "continuation is not valid with an exact occurrence selector",
+                    });
+                }
+                None => None,
+            };
             Ok(DecodedAutomationRead {
                 query: query.to_owned(),
                 automation_id: Some(automation_id),
@@ -1106,40 +1294,6 @@ pub fn validate_automation_read_params(
         }
         _ => Err(StoreError::UnknownOperation),
     }
-}
-
-/// Decodes one echoed continuation into its verified shape bindings.
-///
-/// This is the pre-dispatch half of [`automation_cursor_verify`]: it proves the
-/// encoding, the closed query, the closed direction, the bounded row identity
-/// and that the cursor names this automation under this page bound. The
-/// read-revision binding against the live head set is re-proved by the owner
-/// that serves the page, because only the owner observes those heads.
-fn automation_cursor_shape(
-    wire: &str,
-    query: &str,
-    automation_id: &str,
-    max_records: u16,
-) -> Result<AutomationPageCursor, StoreError> {
-    let malformed = || StoreError::InvalidField {
-        field: AUTOMATION_PARAM_CURSOR,
-        reason: "continuation is malformed or foreign",
-    };
-    if wire.len() > MAX_AUTOMATION_CURSOR_BYTES {
-        return Err(malformed());
-    }
-    let Some(body) = wire.strip_prefix(&format!("{AUTOMATION_CURSOR_VERSION}:")) else {
-        return Err(malformed());
-    };
-    let cursor: AutomationPageCursor = serde_json::from_str(body).map_err(|_| malformed())?;
-    cursor.validate().map_err(|_| malformed())?;
-    if cursor.query != query
-        || cursor.automation_id != automation_id
-        || cursor.max_records != max_records
-    {
-        return Err(malformed());
-    }
-    Ok(cursor)
 }
 
 fn text_param<'a>(

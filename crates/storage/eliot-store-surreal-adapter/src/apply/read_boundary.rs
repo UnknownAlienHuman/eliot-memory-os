@@ -2041,10 +2041,15 @@ async fn automation_history_payload(
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let eligible = match decoded.requested_revision.as_deref() {
+    if decoded.cursor.is_some() && decoded.requested_revision.is_some() {
+        return Err(automation_continuation_failure(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
+    let eligible = if let Some(requested_revision) = decoded.requested_revision.as_deref() {
         // An exact row is still fence-gated: the admission fence is part of
         // what makes a row eligible on every read, paged or exact.
-        Some(requested_revision) => super::surreal_automation::read_revision_for_read(
+        super::surreal_automation::read_revision_for_read(
             db,
             config,
             &automation_id,
@@ -2053,39 +2058,56 @@ async fn automation_history_payload(
         .await?
         .into_iter()
         .filter(|row| row.state_fence == *state_fence)
-        .collect(),
-        None => {
-            // Fetch covers the page bound plus one probe row: the row scan is
-            // O(table) like every other range read on this contour, and the
-            // probe decides coverage without a second query.
-            automation_eligible_revisions(
-                db,
-                config,
-                &automation_id,
-                state_fence,
-                limit,
-                decoded
-                    .cursor
-                    .as_ref()
-                    .map(|cursor| cursor.after_row_id.as_str()),
-            )
-            .await?
-        }
+        .collect()
+    } else {
+        let after_revision = automation_verified_page_boundary(
+            db,
+            config,
+            eliot_store_api::AutomationContinuationQuery::History,
+            decoded,
+            &automation_id,
+            state_fence,
+            read_heads,
+        )
+        .await?;
+        // Fetch covers the page bound plus one probe row: the row scan is
+        // O(table) like every other range read on this contour, and the
+        // probe decides coverage without a second query.
+        automation_eligible_revisions(
+            db,
+            config,
+            &automation_id,
+            state_fence,
+            limit,
+            after_revision.as_deref(),
+        )
+        .await?
     };
     let page = automation_page_slice(eligible, limit, |row| row.revision.as_str());
+    if decoded.requested_revision.is_none() {
+        automation_verify_stable_page_snapshot(db, config, state_fence, read_heads).await?;
+    }
     let returned = page.rows.len();
     let revision = projection_len(returned)?;
     let mut completeness = automation_page_completeness(read_heads, returned, page.truncated)?;
     if page.truncated {
         completeness = automation_page_with_continuation(
+            db,
+            config,
             completeness,
-            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            eliot_store_api::AutomationContinuationQuery::History,
+            decoded.include_retired,
             &automation_id,
             read_heads,
             state_fence,
             page.last_row_id.as_deref(),
             decoded.max_records,
-        )?;
+            decoded
+                .cursor
+                .as_ref()
+                .map(eliot_store_api::AutomationContinuationRef::identifier),
+        )
+        .await?;
     }
     let revisions: Vec<Value> = page
         .rows
@@ -2136,7 +2158,9 @@ async fn read_revisions_after(
     .await?;
     let errors = response.take_errors();
     if super::surreal_automation::missing_automation_table(&errors) {
-        return Ok(Vec::new());
+        return Err(automation_continuation_failure(
+            eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+        ));
     }
     if !errors.is_empty() {
         return Err(AdapterError::Store(StoreError::Serialization(
@@ -2162,33 +2186,143 @@ async fn read_revisions_after(
         .collect()
 }
 
-/// Mints and attaches the owner continuation for one truncated automation page.
-///
-/// A truncated page that carried no successor cursor would be indistinguishable
-/// from a terminator, so the owner refuses rather than serving a page whose
-/// remainder has no address.
-fn automation_page_with_continuation(
+/// Converts an automation continuation contract failure without collapsing it
+/// into a serialization or generic provider error.
+fn automation_continuation_failure(
+    failure: eliot_store_api::AutomationContinuationFailure,
+) -> AdapterError {
+    AdapterError::Store(StoreError::AutomationContinuation(failure))
+}
+
+/// Rechecks the exact head denominator and fence on either side of a paged row
+/// read. Automation commits advance canonical heads atomically with their rows,
+/// so movement means the independent range reads cannot be published under
+/// the earlier digest.
+async fn automation_verify_stable_page_snapshot(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    read_heads: &[RevisionHead],
+) -> Result<(), AdapterError> {
+    let expected_read_revision = automation_page_read_revision(read_heads)?;
+    let current_heads = read_all_revision_heads(db, config).await?;
+    if automation_page_read_revision(&current_heads)? != expected_read_revision {
+        return Err(automation_continuation_failure(
+            eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+        ));
+    }
+    if read_fence(db, config)
+        .await?
+        .is_some_and(|fence| fence.state_fence != *state_fence)
+    {
+        return Err(automation_continuation_failure(
+            eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+        ));
+    }
+    Ok(())
+}
+
+fn automation_now_unix_ms() -> Result<u64, AdapterError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AdapterError::ProviderUnavailable)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| AdapterError::ProviderUnavailable)
+}
+
+/// Resolves an opaque reference and returns its private row boundary only after
+/// the retained record matches the current query and snapshot.
+async fn automation_verified_page_boundary(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: eliot_store_api::AutomationContinuationQuery,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+    automation_id: &str,
+    state_fence: &StateFence,
+    read_heads: &[RevisionHead],
+) -> Result<Option<String>, AdapterError> {
+    automation_verify_stable_page_snapshot(db, config, state_fence, read_heads).await?;
+    let Some(reference) = decoded.cursor.as_ref() else {
+        return Ok(None);
+    };
+    let read_revision = automation_page_read_revision(read_heads)?;
+    let (issuer_identity, issuer_generation) =
+        super::surreal_automation::automation_continuation_owner(config)?;
+    let expected = eliot_store_api::AutomationContinuationReadBinding {
+        read_operation: NamedReadOperation::GetUserAutomationState,
+        query,
+        include_retired: decoded.include_retired,
+        automation_id,
+        read_revision: &read_revision,
+        state_fence,
+        order: eliot_store_api::AutomationContinuationOrder {
+            key: match query {
+                eliot_store_api::AutomationContinuationQuery::History => {
+                    eliot_store_api::AutomationContinuationOrderKey::Revision
+                }
+                eliot_store_api::AutomationContinuationQuery::Invocations => {
+                    eliot_store_api::AutomationContinuationOrderKey::OccurrenceId
+                }
+            },
+            direction: eliot_store_api::AutomationContinuationDirection::Ascending,
+        },
+        max_records: decoded.max_records,
+        issuer_identity: &issuer_identity,
+        issuer_generation,
+    };
+    let verified = super::surreal_automation::resolve_automation_continuation(
+        db,
+        config,
+        reference,
+        expected,
+        automation_now_unix_ms()?,
+    )
+    .await?;
+    Ok(Some(verified.exclusive_returned_tail().to_owned()))
+}
+
+/// Mints and attaches the retained owner continuation for one already-sliced
+/// truncated page. Any write/capacity failure aborts this payload so no
+/// unresumable page can be published as `TRUNCATED`.
+#[allow(clippy::too_many_arguments)]
+async fn automation_page_with_continuation(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
     mut completeness: Value,
-    query: &str,
+    query: eliot_store_api::AutomationContinuationQuery,
+    include_retired: bool,
     automation_id: &str,
     read_heads: &[RevisionHead],
     state_fence: &StateFence,
     last_row_id: Option<&str>,
     max_records: u16,
+    parent_identifier: Option<&str>,
 ) -> Result<Value, AdapterError> {
     let last_row_id = last_row_id.ok_or(AdapterError::Store(StoreError::InvalidField {
         field: "automation.page",
         reason: "truncated automation page served no row to continue from",
     }))?;
-    let next_cursor = eliot_store_api::automation_cursor_mint(
+    automation_verify_stable_page_snapshot(db, config, state_fence, read_heads).await?;
+    let read_revision = automation_page_read_revision(read_heads)?;
+    let next_cursor = super::surreal_automation::issue_automation_continuation(
+        db,
+        config,
         query,
+        include_retired,
         automation_id,
-        &automation_page_read_revision(read_heads)?,
+        &read_revision,
         state_fence,
         last_row_id,
         max_records,
+        parent_identifier,
+        automation_now_unix_ms()?,
     )
-    .map_err(AdapterError::Store)?;
+    .await?;
+    // The source snapshot could move while the durable continuation was
+    // committed. In that case leave the unreachable record for bounded expiry
+    // cleanup and refuse to publish its stale capability.
+    automation_verify_stable_page_snapshot(db, config, state_fence, read_heads).await?;
     completeness
         .as_object_mut()
         .ok_or(AdapterError::Store(StoreError::InvalidField {
@@ -2223,10 +2357,15 @@ async fn automation_invocations_payload(
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let eligible = match decoded.requested_occurrence_id.as_deref() {
+    if decoded.cursor.is_some() && decoded.requested_occurrence_id.is_some() {
+        return Err(automation_continuation_failure(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
+    let eligible = if let Some(occurrence_id) = decoded.requested_occurrence_id.as_deref() {
         // An exact row is still fence-gated: the admission fence is part of
         // what makes a row eligible on every read, paged or exact.
-        Some(occurrence_id) => super::surreal_automation::read_invocation_for_read(
+        super::surreal_automation::read_invocation_for_read(
             db,
             config,
             &automation_id,
@@ -2235,36 +2374,53 @@ async fn automation_invocations_payload(
         .await?
         .into_iter()
         .filter(|row| row.state_fence == *state_fence)
-        .collect(),
-        None => {
-            automation_eligible_invocations(
-                db,
-                config,
-                &automation_id,
-                state_fence,
-                limit,
-                decoded
-                    .cursor
-                    .as_ref()
-                    .map(|cursor| cursor.after_row_id.as_str()),
-            )
-            .await?
-        }
+        .collect()
+    } else {
+        let after_occurrence_id = automation_verified_page_boundary(
+            db,
+            config,
+            eliot_store_api::AutomationContinuationQuery::Invocations,
+            decoded,
+            &automation_id,
+            state_fence,
+            read_heads,
+        )
+        .await?;
+        automation_eligible_invocations(
+            db,
+            config,
+            &automation_id,
+            state_fence,
+            limit,
+            after_occurrence_id.as_deref(),
+        )
+        .await?
     };
     let page = automation_page_slice(eligible, limit, |row| row.occurrence_id.as_str());
+    if decoded.requested_occurrence_id.is_none() {
+        automation_verify_stable_page_snapshot(db, config, state_fence, read_heads).await?;
+    }
     let returned = page.rows.len();
     let revision = projection_len(returned)?;
     let mut completeness = automation_page_completeness(read_heads, returned, page.truncated)?;
     if page.truncated {
         completeness = automation_page_with_continuation(
+            db,
+            config,
             completeness,
-            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            eliot_store_api::AutomationContinuationQuery::Invocations,
+            decoded.include_retired,
             &automation_id,
             read_heads,
             state_fence,
             page.last_row_id.as_deref(),
             decoded.max_records,
-        )?;
+            decoded
+                .cursor
+                .as_ref()
+                .map(eliot_store_api::AutomationContinuationRef::identifier),
+        )
+        .await?;
     }
     let invocations: Vec<Value> = page
         .rows
@@ -2317,7 +2473,9 @@ async fn read_invocations_after(
     .await?;
     let errors = response.take_errors();
     if super::surreal_automation::missing_automation_table(&errors) {
-        return Ok(Vec::new());
+        return Err(automation_continuation_failure(
+            eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+        ));
     }
     if !errors.is_empty() {
         return Err(AdapterError::Store(StoreError::Serialization(
