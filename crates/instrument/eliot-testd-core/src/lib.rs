@@ -1333,6 +1333,8 @@ pub struct TestdVerifierJobSubmission {
 pub const TESTD_OWNER_SUBMIT_OPERATION: &str = "eliot.kernel.testd-owner-submit";
 /// Current TestD owner operation wire revision.
 pub const TESTD_OWNER_WIRE_VERSION: u16 = 1;
+/// Submit-specific wire revision. Other TestD owner routes remain at v1.
+pub const TESTD_OWNER_SUBMIT_WIRE_VERSION: u16 = 2;
 
 /// Governor-resolved input to the Kernel-owned productive TestD owner.
 /// `source_root` is the TaskContract WorkScope result; `project_id` is an
@@ -1399,7 +1401,7 @@ impl TestdOwnerSubmitRequest {
     /// immediately before permit issuance.
     pub fn validate(&self) -> Result<(), TestdError> {
         if self.wire_id != TESTD_OWNER_SUBMIT_OPERATION
-            || self.wire_version != TESTD_OWNER_WIRE_VERSION
+            || self.wire_version != TESTD_OWNER_SUBMIT_WIRE_VERSION
         {
             return Err(TestdError::Invalid {
                 field: "owner_submit.wire",
@@ -1434,15 +1436,85 @@ impl TestdOwnerSubmitRequest {
     }
 }
 
-/// Durable Kernel owner result for one idempotent productive submission.
+/// Typed directive for a productive TestD owner-submit refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TestdOwnerSubmitDirective {
+    /// A task-scoped effect cannot launch without an admitted task selection.
+    TaskSelectionRequired,
+}
+
+/// Versioned, request-bound Kernel owner result for a productive submission.
+///
+/// The `outcome` tag makes a refusal a domain result rather than a transport
+/// failure. Successful v2 submissions retain the exact durable admission
+/// facts; denied submissions carry the original request digest and operation
+/// identity so the caller can correlate the directive without retrying or
+/// guessing whether a child was launched.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestdOwnerSubmitResponse {
-    pub job_id: String,
-    pub operation_id: String,
-    pub authority_epoch: EpochId,
-    pub generation: u64,
-    pub payload_digest: String,
+#[serde(
+    tag = "outcome",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum TestdOwnerSubmitResponse {
+    /// The productive job was durably admitted.
+    Admitted {
+        wire_id: String,
+        wire_version: u16,
+        request_digest: String,
+        job_id: String,
+        operation_id: String,
+        authority_epoch: EpochId,
+        generation: u64,
+        payload_digest: String,
+    },
+    /// Admission stopped before any filesystem, store, or process effect.
+    Denied {
+        wire_id: String,
+        wire_version: u16,
+        request_digest: String,
+        operation_id: String,
+        directive: TestdOwnerSubmitDirective,
+    },
+}
+
+impl TestdOwnerSubmitResponse {
+    /// Checks the explicit submit-v2 envelope before it crosses the wire.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        let (wire_id, wire_version, request_digest, operation_id) = match self {
+            Self::Admitted {
+                wire_id,
+                wire_version,
+                request_digest,
+                operation_id,
+                job_id,
+                generation,
+                payload_digest,
+                ..
+            } => {
+                validate_text(job_id, "owner_submit.response.job_id")?;
+                if *generation == 0 || !is_binding_digest(payload_digest) {
+                    return Err(TestdError::InvalidBinding);
+                }
+                (wire_id, *wire_version, request_digest, operation_id)
+            }
+            Self::Denied {
+                wire_id,
+                wire_version,
+                request_digest,
+                operation_id,
+                ..
+            } => (wire_id, *wire_version, request_digest, operation_id),
+        };
+        if wire_id != TESTD_OWNER_SUBMIT_OPERATION
+            || wire_version != TESTD_OWNER_SUBMIT_WIRE_VERSION
+            || !is_binding_digest(request_digest)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        validate_text(operation_id, "owner_submit.response.operation_id")
+    }
 }
 
 impl TestdVerifierJobSubmission {
