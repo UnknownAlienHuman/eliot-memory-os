@@ -10,6 +10,23 @@
 //! The optional [`AuditFenceNote`] is forensic only: [`describe_audit_fence`]
 //! renders a non-authoritative note, and no API converts it into a lease,
 //! grant, or current-state assertion.
+//!
+//! # Production caller
+//!
+//! [`project_backup_config_owner_bound`] is the production entry point. It is
+//! invoked by `OwnerEvidence::project_backup_configuration` in
+//! `crate::backup_preparation`, which
+//! `crate::backup_preparation::DelegatedPreparation::prepare` runs for every
+//! delegated preparation, so its [`BackupConfigProjection`] is the evidence the
+//! prepared-destination receipt binds. [`describe_audit_fence`] is rendered
+//! there into the same receipt.
+//!
+//! [`project_backup_config`] is the current-authority-snapshot variant. It has
+//! no production caller, and deliberately so: its [`AuthoritySnapshot`] needs
+//! an owner-issued lease reference and a purge-ledger revision, and the
+//! installation registry, [`ApprovedGeneration`] and the activation commit
+//! fence carry neither. See [`project_backup_config_owner_bound`] for exactly
+//! which fields stay caller-presented until #954.
 
 use eliot_contracts::StateFence;
 use eliot_installation::ApprovedGeneration;
@@ -159,6 +176,13 @@ fn note_config_error(op: &'static str, error: ProjectionError) -> ProjectionErro
 /// Current authority evidence supplied by the caller (`HostComposition` at
 /// delegation; fixtures in tests). Compared field-for-field against the
 /// request; never refreshed or defaulted here.
+///
+/// No production constructor exists yet. `owner_lease_ref` and
+/// `purge_ledger_revision` are the two fields the installation registry,
+/// [`ApprovedGeneration`] and the activation commit fence do not carry, and
+/// filling either from caller input would turn the current-authority
+/// comparison into a self-comparison. See [`project_backup_config_owner_bound`]
+/// for the owner-bound production path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritySnapshot {
     /// Owner lease reference (opaque bounded text, never a secret value).
@@ -322,6 +346,12 @@ fn check_bounded_list(values: &[String], field: &'static str) -> Result<(), Proj
 /// Renders the forensic audit note with its non-authoritative ceiling stated
 /// (case 958/3). The returned text is evidence only and can never act as a
 /// lease, grant, or current-state assertion.
+///
+/// Production caller: `crate::backup_preparation::OwnerEvidence`'s delegated
+/// preparation path renders the presented note through this function into the
+/// prepared-destination receipt and the preparation journal record, so a
+/// receipt states which forensic note was presented without the note ever
+/// becoming authority.
 #[must_use]
 pub fn describe_audit_fence(note: &AuditFenceNote) -> String {
     format!(
@@ -542,6 +572,13 @@ pub fn bind_approved_build(
 /// build/profile stay caller-presented: lease issuance and purge-ledger
 /// authority belong to #954 control contracts and HostComposition
 /// delegation, which are open. No secret-typed field exists here.
+///
+/// This is the production projector. Its caller is
+/// `crate::backup_preparation::OwnerEvidence::project_backup_configuration`,
+/// reached from `crate::backup_preparation::DelegatedPreparation::prepare` on
+/// every delegated preparation; the returned
+/// [`BackupConfigProjection::projection_digest`] is what the prepared
+/// destination receipt binds.
 pub fn project_backup_config_owner_bound(
     request: &BackupConfigRequest,
     binding: &ApprovedBuildBinding,
