@@ -31,11 +31,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::derive::{
-    NormalizedMember, derive_attention, derive_cue, derive_epistemic, derive_evidence,
+    NormalizedMember, derive_attention, derive_canonical_projections, derive_cue, derive_epistemic,
+    derive_evidence,
 };
 use crate::inputs::{
-    AttentionInput, CandidatePolicy, CandidateRequest, CueInput, EpistemicInput, EvidenceInput,
-    OpaqueMember, OpaqueProjection, ProjectionState, check_denominator_is_seven, cue_availability,
+    AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput, CueInput,
+    EpistemicInput, EvidenceInput, OpaqueMember, OpaqueProjection, ProjectionState,
+    check_denominator_is_seven, cue_availability,
 };
 use crate::vocabulary::{
     KIND_MAP_VERSION, KindRule, PROVIDER_AFFORDANCE, PROVIDER_ATTENTION, PROVIDER_CUE,
@@ -476,6 +478,68 @@ fn collect_opaque(
     Ok(base)
 }
 
+/// Collect normalized members for the typed CC-004 projection set.
+///
+/// The set's shared binding must equal the request binding exactly: same
+/// task, scope, fence and decision. Provider omissions are decision-bound
+/// records validated by the set itself; they carry into the result only
+/// under the identical decision, never re-interpreted.
+fn collect_canonical(
+    input: &CanonicalProjectionInput,
+    slots: &[ProviderRole],
+    binding: &ContextBinding,
+    per_slot: &mut [Vec<(NormalizedMember, KindRule)>],
+) -> Result<[AtomAvailability; 3], ContextError> {
+    input.validate()?;
+    if input.set.binding != *binding {
+        return Err(ContextError::InvalidFence);
+    }
+    let derived = derive_canonical_projections(
+        input,
+        &slots[0].provider,
+        &slots[4].provider,
+        &slots[6].provider,
+        AtomAvailability::PresentCurrent,
+    )?;
+    push_canonical(
+        &derived.task,
+        PROVIDER_TASK_FRAME,
+        &slots[0],
+        &mut per_slot[0],
+    )?;
+    push_canonical(
+        &derived.negative,
+        PROVIDER_NEGATIVE_MEMORY,
+        &slots[4],
+        &mut per_slot[4],
+    )?;
+    push_canonical(
+        &derived.affordance,
+        PROVIDER_AFFORDANCE,
+        &slots[6],
+        &mut per_slot[6],
+    )?;
+    Ok([AtomAvailability::PresentCurrent; 3])
+}
+
+/// Push derived canonical members under their re-resolved closed rules.
+fn push_canonical(
+    members: &[NormalizedMember],
+    provider_label: &'static str,
+    slot: &ProviderRole,
+    out: &mut Vec<(NormalizedMember, KindRule)>,
+) -> Result<(), ContextError> {
+    for member in members {
+        let rule = kind_rule(provider_label, member.kind.as_str())
+            .ok_or(ContextError::InvalidField("canonical.kind"))?;
+        if rule.role != slot.role {
+            return Err(ContextError::DenominatorMismatch);
+        }
+        out.push((member.clone(), rule));
+    }
+    Ok(())
+}
+
 /// Collect normalized members for the attention projection.
 fn collect_attention(
     input: Option<&AttentionInput>,
@@ -794,6 +858,98 @@ pub fn construct_context_candidates(
         &unified,
         &plan,
         frontier,
+        &[],
+    )
+}
+
+/// Canonical typed equivalent of
+/// `construct_context_candidates_with_canonical(request, recipe, canonical,
+/// attention_and_conflicts, epistemic_position, cue_activation_result,
+/// evidence, policy)`.
+///
+/// Same seven-slot denominator and emission pipeline as
+/// [`construct_context_candidates`], but the three Governor slots (task
+/// frame, negative memory, affordance) arrive as one typed
+/// [`CanonicalProjectionSet`](eliot_context_contracts::CanonicalProjectionSet)
+/// instead of opaque projections. Every projection text maps to whole atoms
+/// verbatim; the set's explicit omissions carry into the result envelope
+/// (validated, capacity-counted, digest-covered). No canonical state is
+/// retrieved and no role prose is invented; a Governor owner that has not
+/// adopted the typed set keeps using the opaque path.
+///
+/// The mapper is pure and deterministic: same inputs always yield the same
+/// ordered set, dispositions, omissions, frontier and digest.
+#[allow(clippy::too_many_arguments)]
+pub fn construct_context_candidates_with_canonical(
+    request: &CandidateRequest,
+    recipe: &ContextRecipe,
+    canonical: &CanonicalProjectionInput,
+    attention_and_conflicts: Option<&AttentionInput>,
+    epistemic_position: Option<&EpistemicInput>,
+    cue_activation_result: Option<&CueInput>,
+    evidence: Option<&EvidenceInput>,
+    policy: &CandidatePolicy,
+) -> Result<ContextCandidateSetResult, ContextError> {
+    let (slots, mandatory) = check_envelope(request, recipe, policy)?;
+    let binding = &request.binding;
+    // Slot tables in denominator order: task, attention, epistemic, cue,
+    // negative, evidence, affordance.
+    let mut per_slot: Vec<Vec<(NormalizedMember, KindRule)>> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        per_slot.push(Vec::new());
+    }
+    let mut bases = [AtomAvailability::PresentCurrent; 7];
+    let mut edge_tables: Vec<Vec<String>> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        edge_tables.push(Vec::new());
+    }
+    let mut frontier = Vec::new();
+    let canonical_bases = collect_canonical(canonical, &slots, binding, &mut per_slot)?;
+    bases[0] = canonical_bases[0];
+    bases[4] = canonical_bases[1];
+    bases[6] = canonical_bases[2];
+    bases[1] = collect_attention(
+        attention_and_conflicts,
+        &slots[1],
+        binding,
+        &mut per_slot[1],
+        &mut edge_tables[1],
+    )?;
+    bases[2] = collect_epistemic(epistemic_position, &slots[2], binding, &mut per_slot[2])?;
+    bases[3] = collect_cue(
+        cue_activation_result,
+        &slots[3],
+        binding,
+        &mut per_slot[3],
+        &mut frontier,
+    )?;
+    bases[5] = collect_evidence(evidence, &slots[5], binding, &mut per_slot[5])?;
+    push_plain_frontiers(&slots, &edge_tables, &mut frontier)?;
+    let unified = unify_members(&slots, &mandatory, per_slot, policy)?;
+    let plan = plan_emission(&unified, policy)?;
+    // Canonical slots carry explicit omissions, not blocked/unavailable
+    // states: no disposition evidence is synthesized for them.
+    let base_evidences: [Option<ProofBinding>; 7] = [
+        None,
+        None,
+        None,
+        disposition_evidence_for_cue(cue_activation_result)?,
+        None,
+        None,
+        None,
+    ];
+    assemble_result(
+        request,
+        recipe,
+        policy,
+        &slots,
+        &mandatory,
+        bases,
+        &base_evidences,
+        &unified,
+        &plan,
+        frontier,
+        &canonical.set.omissions,
     )
 }
 
@@ -1105,6 +1261,7 @@ fn rollup_slot_states(
 /// for reversible handles. Returns the fence revision when omissions exist.
 fn check_omission_capacity(
     plan: &[EmitDecision],
+    provider_omissions: usize,
     max_omissions: usize,
     task_revision: Option<TaskRevision>,
 ) -> Result<Option<TaskRevision>, ContextError> {
@@ -1112,7 +1269,8 @@ fn check_omission_capacity(
         .iter()
         .filter(|decision| **decision == EmitDecision::Omit)
         .count();
-    if omission_count > max_omissions {
+    let total = omission_count.saturating_add(provider_omissions);
+    if total > max_omissions {
         return Err(ContextError::Bounds {
             field: "policy.max_omissions",
         });
@@ -1391,16 +1549,24 @@ fn assemble_result(
     unified: &[WorkMember],
     plan: &[EmitDecision],
     mut frontier: Vec<FrontierRecord>,
+    provider_omissions: &[OmissionRecord],
 ) -> Result<ContextCandidateSetResult, ContextError> {
     let bounds = &policy.bounds;
     let states = rollup_slot_states(bases, unified, plan);
     // Omission records need a task-bound fence for the reversible handle.
     let revision = check_omission_capacity(
         plan,
+        provider_omissions.len(),
         bounds.max_omissions,
         request.binding.state_fence.task_revision,
     )?;
     let mut emission = run_emission(request, recipe, slots, states, unified, plan, revision)?;
+    // Provider-declared coverage gaps carry through verbatim: validated
+    // against the request binding, never re-interpreted.
+    for omission in provider_omissions {
+        omission.validate(&request.binding)?;
+        emission.omissions.push(omission.clone());
+    }
     resolve_dependencies(&mut emission.candidates, &emission.atom_of)?;
     sort_candidates(&mut emission.candidates, mandatory);
     let denominator = ProviderRoleDenominator {
