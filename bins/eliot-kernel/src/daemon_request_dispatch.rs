@@ -6215,15 +6215,60 @@ impl KernelComposition {
             artifact_bytes: operation.artifact_bytes,
             input_bytes: operation.input_bytes,
         };
+        // Publisher concurrency (#2786 step 4): sessions run as `JoinSet`
+        // tasks on the multi-threaded `#[tokio::main]` runtime, so two
+        // `publish_wasm_dispatch_bundle` calls can interleave on different
+        // threads — no single-publisher ownership is claimed. The
+        // publisher serializes replacements only through the live-envelope
+        // gate (claim-by-rename plus per-step re-verification), not a
+        // lock; the residual per-file window is stated at the reclaim.
         let mut joins = eliot_kernel_service::WasmJoinTable::default();
-        let bundle = eliot_kernel_service::publish_wasm_dispatch_bundle(
+        let bundle = match eliot_kernel_service::publish_wasm_dispatch_bundle(
             host_executable_path.as_str(),
             host_artifact_digest.as_str(),
             install_dir,
             &claim,
             &mut joins,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        ) {
+            Ok(bundle) => bundle,
+            // Typed bounded backpressure (#2786 step 4): another live
+            // delivery owns the fixed names, so this publication is
+            // refused without touching a byte. The exact retry condition
+            // is retained in the response, never collapsed into a fence.
+            Err(eliot_kernel_service::WasmDispatchError::Backpressure(live)) => {
+                return Ok(serde_json::json!({
+                    "kind": "wasm_dispatch_backpressure",
+                    "value": {
+                        "live_generation": live.live_generation,
+                        "live_operation_id": live.live_operation_id,
+                        "live_expires_at": live.live_expires_at,
+                        "retry_condition": live.retry_condition,
+                    },
+                }));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
+        // Launch-gate admission (#2786 step 8): the staged bundle executes
+        // only against its matching owner join/grant. Expiry is re-verified
+        // at launch instant (closing the validation-to-start window), so
+        // this is a real expiry gate (`Stale` can fire here); anything else
+        // fails closed before the child starts. The join table above is
+        // function-local and dropped after this op, so the one-shot
+        // consumption by this admission is per-op only and buys zero
+        // cross-call replay protection: a repeated call with the same
+        // delivery re-arms the join through the same-delivery replay path
+        // and relaunches the guest (a second guest effect). Cross-call
+        // duplicate suppression depends on the host-half claim dedup, not
+        // on this table.
+        joins
+            .admit_claim(
+                bundle.material.claim_id.as_str(),
+                bundle.material.operation_id.as_str(),
+                bundle.join.invocation_digest.as_str(),
+                bundle.delivery.envelope_digest.as_str(),
+                unix_ms(),
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         let material_digest = sha256_hex(
             &eliot_kernel_service::material_bytes(&bundle.material)
                 .map_err(|_| TransportError::SessionFenced)?,

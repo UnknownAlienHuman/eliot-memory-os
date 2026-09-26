@@ -254,14 +254,18 @@ pub use user_automation_store::{
     UserAutomationOwnerReadProvenance, UserAutomationOwnerSnapshot,
 };
 pub use wasm_dispatch::{
-    JoinDeny, WASM_DISPATCH_AUTHORITY_PREFIX, WASM_DISPATCH_DERIVATION_DOMAIN,
-    WASM_DISPATCH_GRANT_WINDOW_MS, WASM_DISPATCH_LAUNCH_GRANT_HEAD, WASM_DISPATCH_MATERIAL_WIRE_ID,
+    DeliveryReclaimOutcome, JoinDeny, MAX_DELIVERY_PAYLOAD_BYTES, MAX_DELIVERY_SLOTS,
+    WASM_DELIVERY_IDENTITY_VERSION, WASM_DELIVERY_SLOT_DIR_NAME, WASM_DISPATCH_AUTHORITY_PREFIX,
+    WASM_DISPATCH_DERIVATION_DOMAIN, WASM_DISPATCH_GRANT_WINDOW_MS,
+    WASM_DISPATCH_LAUNCH_GRANT_HEAD, WASM_DISPATCH_MATERIAL_WIRE_ID,
     WASM_DISPATCH_MATERIAL_WIRE_VERSION, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
     WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, WasmAssuranceRecord,
+    WasmDeliveryBackpressure, WasmDeliveryIdentity, WasmDeliveryReclamation,
     WasmDispatchDerivation, WasmDispatchError, WasmDispatchGrant, WasmDispatchMaterial,
     WasmGuestCeilings, WasmJoinGate, WasmJoinTable, WasmManifestRecord, WasmOwnerClaim,
-    WasmPromotionRecord, WasmPublishedBundle, WasmSnapshotRecord, WasmWorkRecord, material_bytes,
-    publish_wasm_dispatch_bundle, publish_wasm_dispatch_material, wasm_dispatch_derivation,
+    WasmPromotionRecord, WasmPublicationState, WasmPublishedBundle, WasmSnapshotRecord,
+    WasmWorkRecord, discover_delivery_publications, material_bytes, publish_wasm_dispatch_bundle,
+    publish_wasm_dispatch_material, wasm_dispatch_derivation,
     wasm_dispatch_derivation_from_epoch_json, wasm_dispatch_grant_for, wasm_join_gate,
 };
 pub use write_coordinator::{

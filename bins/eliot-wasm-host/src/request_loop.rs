@@ -74,7 +74,7 @@ use crate::dispatch_drive::{
 };
 use crate::dispatch_material::{
     MaterialError, ValidatedDispatchMaterial, WASM_HOST_CONTROL_FILE_NAME, admitted_material_path,
-    consume_staged, read_dispatch_material, read_staged_bytes,
+    consume_staged, read_staged_bytes,
 };
 use crate::parent_authority::edge_now_ms;
 use crate::parent_runtime::{AdmittedRuntime, build_admitted_runtime};
@@ -2184,6 +2184,18 @@ pub type OrdinaryOutcome = WasmHostResultFrame;
 pub enum OrdinaryDriveError {
     /// No owner delivery set is staged beside this installation.
     NoDeliverySet,
+    /// A staged delivery this drive already served — or its spent grant
+    /// re-staged — is still present: terminal-unacknowledged across
+    /// restart, with no retained result in this process. Explicit
+    /// in-progress, never mistaken for absence.
+    DeliveryInProgress {
+        /// Served operation identity.
+        operation_id: String,
+        /// Served generation.
+        generation: u64,
+        /// Served claim identity.
+        claim_id: String,
+    },
     /// The delivery set, installation binding, permit, or admitted world
     /// failed closed before the loop could start.
     Drive(DriveError),
@@ -2195,6 +2207,7 @@ impl fmt::Display for OrdinaryDriveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDeliverySet => formatter.write_str("ORDINARY_NO_ADMITTED_DELIVERY_SET"),
+            Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
             Self::Drive(error) => write!(formatter, "{error}"),
             Self::Loop(error) => write!(formatter, "{error}"),
         }
@@ -2224,95 +2237,208 @@ impl std::error::Error for OrdinaryDriveError {}
 /// binding, the one-shot permit, the admitted world, the request source,
 /// the result sink, or a request binding fails closed.
 pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError> {
-    let mut served_grant: Option<String> = None;
+    let mut served: Option<crate::dispatch_material::StagedDeliveryIdentity> = None;
     let mut outcome: Option<OrdinaryOutcome> = None;
+    let mut replayed: Option<crate::dispatch_material::StagedDeliveryIdentity> = None;
     // The staged path is the owner's only route into this process, and the
     // previous set was consumed, so any set observed here is either a
     // replacement generation or a same-grant re-stage. Nothing is carried
-    // across iterations except the served grant digest below, so no
+    // across iterations except the served delivery identity below, so no
     // accumulation is possible.
-    while let Some(material) = read_admitted_material().map_err(OrdinaryDriveError::Drive)? {
-        if served_grant.as_deref() == Some(material.grant.grant_digest.as_str()) {
-            // Same grant this process already served to its published
-            // terminal frame. Serving it again would revive spent one-shot
-            // authority for a new effect, so the chain ends here.
-            break;
+    while let Some((claim, material)) =
+        read_admitted_material().map_err(OrdinaryDriveError::Drive)?
+    {
+        // The claim arrives with the material from one claim-first read:
+        // the pre-read envelope identity selected this operation before
+        // the payload files were trusted, so the claim below is that
+        // selection — never a copy derived after the fact. Durable served
+        // state extends in-memory retention across restart: a staged set
+        // the marker names is terminal-unacknowledged (a crash between
+        // publish and reclaim), so it replays below instead of
+        // re-executing.
+        let served_marker = crate::dispatch_material::admitted_material_path()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            .and_then(|directory| crate::dispatch_material::read_served_marker(&directory));
+        match crate::dispatch_material::classify_staged_delivery(
+            &material,
+            served.as_ref(),
+            served_marker.as_ref(),
+        ) {
+            crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
+                // Same delivery this process already served to its published
+                // terminal frame — or the same grant under spent one-shot
+                // authority, or a durable-marker terminal-unacknowledged set
+                // after a crash between publish and reclaim. Serving it again
+                // would revive spent authority for a new effect, so the chain
+                // ends here with the retained result and the exact replayed
+                // identity preserved.
+                if outcome.is_none() {
+                    // Cross-restart replay with nothing retained in this
+                    // process: drain the exact-identity staged set plus its
+                    // marker so the residue does not repeat every drive.
+                    // Grant-only matches (another operation under the spent
+                    // grant) are not ours to delete — a bounded fixed-name
+                    // residual the owner must retire, still reported
+                    // explicitly below, never as absence.
+                    let exact = served.as_ref() == Some(&identity)
+                        || served_marker
+                            .as_ref()
+                            .is_some_and(|mark| mark.names(&identity));
+                    if exact
+                        && let Some(directory) = crate::dispatch_material::admitted_material_path()
+                            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                    {
+                        let _ =
+                            crate::dispatch_material::reclaim_claimed_delivery(&claim, &directory);
+                    }
+                }
+                replayed = Some(identity);
+                break;
+            }
+            crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { identity } => {
+                // Explicit v1 compatibility: full admission under the staged
+                // identity verbatim, never reinterpreted as a fresh
+                // generation with new identity.
+                let _admitted_operation = identity.operation_id.len();
+            }
         }
         let runtime =
             build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
         let frame = run_request_loop(runtime, &material);
-        // The delivery set is one-shot: it is consumed exactly once, so a
-        // leftover is a fresh-drive signal rather than a silent reuse. The
-        // in-memory retention of the terminal frame above is the readback
+        // The delivery set is one-shot: a published terminal outcome reclaims
+        // exactly the claimed generation, so a leftover is a fresh-drive
+        // signal rather than a silent reuse. Unknown execution, failed
+        // publication, lost response, or failed drain retains the exact
+        // operation/generation evidence for recovery and never reclaims. The
+        // in-memory retention of the terminal frame below is the readback
         // path, not a second execution.
-        consume_delivery_set(&material);
-        let frame = frame.map_err(OrdinaryDriveError::Loop)?;
-        served_grant = Some(material.grant.grant_digest.as_str().to_owned());
-        outcome = Some(frame);
+        match frame {
+            Ok(ok_frame) => {
+                // Durable served marker (#2786 step 7): after the terminal
+                // outcome published, before reclaim. A crash between the two
+                // leaves staged bytes plus this marker, so restart replays
+                // instead of re-executing. Best-effort: the serve already
+                // happened exactly once.
+                if let Some(directory) = crate::dispatch_material::admitted_material_path()
+                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                {
+                    let _ = crate::dispatch_material::write_served_marker(
+                        &directory,
+                        claim.identity(),
+                        edge_now_ms(),
+                    );
+                }
+                let reclamation = consume_delivery_set(&material, &claim);
+                // Bounded residual only: a partial reclamation never
+                // overwrites the primary result; retained files stay for
+                // maintenance under the exact claimed identity.
+                let _residual_complete = match &reclamation {
+                    crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
+                        let _reclaimed_operation = detail.identity.operation_id.len();
+                        detail.fully_reclaimed()
+                    }
+                    crate::dispatch_material::ClaimedReclamation::ReplacementPreserved {
+                        claimed,
+                    }
+                    | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
+                    | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
+                        claimed,
+                    } => {
+                        let _preserved_operation = claimed.operation_id.len();
+                        false
+                    }
+                };
+                served = Some(claim.into_identity());
+                outcome = Some(ok_frame);
+            }
+            Err(loop_error) => {
+                return Err(OrdinaryDriveError::Loop(loop_error));
+            }
+        }
     }
-    outcome.ok_or(OrdinaryDriveError::NoDeliverySet)
+    // A replay with a retained frame returns that result; a replay with
+    // nothing retained (cross-restart terminal-unacknowledged, or a
+    // same-grant re-stage under spent authority) is explicit in-progress
+    // — the marker carries identity, not a result payload, so no result
+    // is fabricated. Only a drive that observed nothing staged reports
+    // absence.
+    match (outcome, replayed) {
+        (Some(frame), _) => Ok(frame),
+        (None, Some(identity)) => Err(OrdinaryDriveError::DeliveryInProgress {
+            operation_id: identity.operation_id,
+            generation: identity.generation,
+            claim_id: identity.claim_id,
+        }),
+        (None, None) => Err(OrdinaryDriveError::NoDeliverySet),
+    }
 }
 
 /// Consumes the staged delivery set beside this installation — but only
-/// while it still names the generation this loop served.
+/// while it still names the exact claimed generation this loop served.
 ///
 /// The publisher stages replacements under the same fixed filenames, so a
 /// replacement published while this loop ran now owns those paths: the
-/// staged envelope is re-read and the set is consumed only when its grant
-/// and guest digests still match the served material. Anything else — a
+/// claimed identity (claim, operation, generation, nonce, grant/fence,
+/// digests, window, epoch) is re-read and compared, preserving the #2895
+/// grant/artifact/input digest comparison as a subset, and each removal
+/// re-verifies after a claim-by-rename move. Anything else — a
 /// replacement, an unreadable envelope, or an already-consumed set — is
 /// left untouched; a leftover is a fresh-drive signal, never silent reuse.
 /// Derived from the loader path only — never from argv, stdin, or
-/// environment. Best effort by contract.
-fn consume_delivery_set(material: &ValidatedDispatchMaterial) {
-    use crate::dispatch_material::{
-        WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
-        WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, consume_staged,
-    };
+/// environment. Returns the typed claimed reclamation; a partial outcome is
+/// a bounded residual, never a primary-result overwrite.
+fn consume_delivery_set(
+    material: &ValidatedDispatchMaterial,
+    claim: &crate::dispatch_material::DeliveryClaim,
+) -> crate::dispatch_material::ClaimedReclamation {
+    use crate::dispatch_material::admitted_material_path;
     let Some(directory) =
         admitted_material_path().and_then(|path| path.parent().map(Path::to_path_buf))
     else {
-        return;
+        return crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
+            claimed: claim.identity().clone(),
+        };
     };
-    let still_ours = match read_dispatch_material() {
-        Ok(Some(current)) => {
-            current.grant.grant_digest == material.grant.grant_digest
-                && current.ceilings.artifact_digest == material.ceilings.artifact_digest
-                && current.ceilings.input_digest == material.ceilings.input_digest
-        }
-        Ok(None) | Err(_) => false,
-    };
-    if still_ours {
-        consume_staged(&directory.join(WASM_HOST_MATERIAL_FILE_NAME));
-        consume_staged(&directory.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME));
-        consume_staged(&directory.join(WASM_HOST_GUEST_INPUT_FILE_NAME));
-    }
-    // A control leftover naming this operation is ours to retire under the
-    // same ownership rule; a foreign or malformed one is left for its own
-    // delivery (and self-heals when the next control overwrites the file).
-    let control_path = directory.join(WASM_HOST_CONTROL_FILE_NAME);
-    if control_names_operation(&control_path, material) {
-        consume_staged(&control_path);
-    }
+    let reclamation = crate::dispatch_material::reclaim_claimed_delivery(claim, &directory);
+    // Control retire is claim-pinned, not a fixed-name delete: the fixed
+    // control name is only a locator — it is renamed aside under the exact
+    // claimed operation identity and only aside bytes that prove they name
+    // this operation are deleted. A foreign or malformed control is
+    // restored (or left when a successor owns the name) for its own
+    // delivery. Control ownership is (operation, grant) by protocol, so a
+    // late same-operation control retires with its operation; the live
+    // poll read-then-consume path above is unchanged and out of scope here.
+    let _control = crate::dispatch_material::reclaim_claimed_file(
+        &directory,
+        WASM_HOST_CONTROL_FILE_NAME,
+        claim.identity(),
+        |bytes| control_bytes_name_operation(bytes, material),
+    );
+    reclamation
 }
 
-/// Returns whether the staged control file names the served operation. Any
-/// read, shape, or identity mismatch answers no: ownership of an
-/// unidentifiable file can never be established.
-fn control_names_operation(path: &Path, material: &ValidatedDispatchMaterial) -> bool {
-    let Ok(bytes) = read_staged_bytes(path) else {
-        return false;
-    };
-    let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
+/// Returns whether staged control bytes name the served operation. Any
+/// shape or identity mismatch answers no: ownership of an unidentifiable
+/// file can never be established.
+fn control_bytes_name_operation(bytes: &[u8], material: &ValidatedDispatchMaterial) -> bool {
+    let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(bytes) else {
         return false;
     };
     frame.operation_id == material.operation_id
         && frame.grant_digest == material.grant.grant_digest.as_str()
 }
 
-/// Reads the owner-staged delivery set beside this installation.
-fn read_admitted_material() -> Result<Option<ValidatedDispatchMaterial>, DriveError> {
-    read_dispatch_material().map_err(|error| match error {
+/// Reads the owner-staged delivery set beside this installation,
+/// claim-first: the pre-read claim arrives with its bound material from
+/// one snapshot, so the fixed names never select the operation twice.
+fn read_admitted_material() -> Result<
+    Option<(
+        crate::dispatch_material::DeliveryClaim,
+        ValidatedDispatchMaterial,
+    )>,
+    DriveError,
+> {
+    crate::dispatch_material::read_claimed_dispatch_material().map_err(|error| match error {
         MaterialError::Missing => DriveError::NoMaterial,
         other => DriveError::Material(other),
     })

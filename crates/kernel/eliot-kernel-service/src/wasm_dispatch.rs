@@ -57,6 +57,32 @@ pub const WASM_DISPATCH_MATERIAL_WIRE_VERSION: u16 = 1;
 /// Grant window: the launch grant funds permits for sixty seconds from the
 /// durable admission time. Freshness opens at admission, never at derivation.
 pub const WASM_DISPATCH_GRANT_WINDOW_MS: u64 = 60_000;
+/// Versioned delivery-identity wire version (#2786 step 1). The child
+/// never parses this (the envelope stays wire v1); slot markers and the
+/// owner join table bind it.
+pub const WASM_DELIVERY_IDENTITY_VERSION: u16 = 1;
+/// Generation-slot parent directory name under the install directory.
+/// Each publication stages one immutable slot here before exposing the
+/// fixed-name set the child reads.
+pub const WASM_DELIVERY_SLOT_DIR_NAME: &str = "eliot-wasm-host.generations";
+/// Pending-publication marker file name inside a generation slot.
+pub const WASM_DELIVERY_PENDING_FILE_NAME: &str = "PENDING.json";
+/// Ready-marker file name inside a generation slot, written last.
+pub const WASM_DELIVERY_READY_FILE_NAME: &str = "READY.json";
+/// Failed-publication marker file name inside a generation slot.
+pub const WASM_DELIVERY_FAILED_FILE_NAME: &str = "FAILED.json";
+/// Bound on retained generation slots per install directory (#2786 step
+/// 4): pruning keeps the live and current slots plus the newest
+/// survivors, never an unbounded per-generation history.
+pub const MAX_DELIVERY_SLOTS: usize = 8;
+/// Bound on one staged guest payload: the transport frame contour
+/// (`eliot_protocol::MAX_FRAME_BYTES`). The daemon gates arrivals at
+/// this bound; the publisher re-enforces it so an oversized claim can
+/// never stage unbounded bytes.
+pub const MAX_DELIVERY_PAYLOAD_BYTES: usize = eliot_protocol::MAX_FRAME_BYTES;
+/// Bound on directory entries scanned during slot discovery and prune.
+/// Discovery never walks an unbounded directory.
+const MAX_SLOT_SCAN_ENTRIES: usize = 64;
 
 /// Fail-closed owner-side dispatch errors. No material content echoed.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -67,6 +93,27 @@ pub enum WasmDispatchError {
     /// A gate-owned construction failed (message only, no material).
     #[error("WASM_DISPATCH_GATE")]
     Gate,
+    /// A replacement publication was refused: another delivery owns the
+    /// fixed names. Typed bounded backpressure (#2786 step 4): the
+    /// caller retries exactly when the carried condition holds, never by
+    /// overwriting the live set.
+    #[error("WASM_DISPATCH_BACKPRESSURE")]
+    Backpressure(WasmDeliveryBackpressure),
+}
+
+/// Typed replacement backpressure (#2786 step 4): the live delivery that
+/// owns the fixed names plus the exact retry condition. Carries
+/// identities only, never guest bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmDeliveryBackpressure {
+    /// Live delivery generation holding the fixed names.
+    pub live_generation: u64,
+    /// Live delivery operation holding the fixed names.
+    pub live_operation_id: String,
+    /// Live delivery grant expiry (Unix milliseconds).
+    pub live_expires_at: u64,
+    /// Exact retry condition, e.g. `current delivery consumed`.
+    pub retry_condition: String,
 }
 
 fn invalid(field: &str) -> WasmDispatchError {
@@ -591,6 +638,341 @@ pub fn publish_wasm_dispatch_material(
     })
 }
 
+/// Owner-issued versioned delivery-set identity (#2786 step 1).
+///
+/// Binds installation/artifact generation, claim and operation, grant and
+/// fence generation, envelope/material-set digest, artifact/input digests,
+/// publication incarnation/revision, and supported expiry. The leading
+/// fields name the host-side `StagedDeliveryIdentity` claim/ack record
+/// member for member (`claim_id`, `operation_id`, `generation`,
+/// `launch_nonce`, `grant_digest`, `fence_generation`,
+/// `artifact_digest`, `input_digest`, `admitted_at_unix_ms`,
+/// `expires_at`, `authority_epoch_json`); the kernel additions
+/// (`delivery_version`, `envelope_digest`, `host_artifact_digest`,
+/// `publication_incarnation`, `publication_revision`) travel only in
+/// slot markers and the owner join table, never in the child-parsed
+/// envelope, which stays wire v1 because the child denies unknown
+/// fields.
+///
+/// A directory/path is only a locator: this identity is what claims bind.
+/// It reuses the envelope's typed IDs (`Generation`, `EpochId`) and
+/// owner receipts, grants no execution beyond the already-issued grant,
+/// and is not a [`WasmJoinGate`] replacement — the one-shot join table
+/// still admits every launch.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WasmDeliveryIdentity {
+    /// Admitted claim identity.
+    pub claim_id: String,
+    /// Admitted operation identity.
+    pub operation_id: String,
+    /// Claiming generation (non-zero).
+    pub generation: u64,
+    /// Claim-bound launch nonce.
+    pub launch_nonce: String,
+    /// Owner-issued grant digest (hex).
+    pub grant_digest: String,
+    /// Grant fence generation.
+    pub fence_generation: u64,
+    /// Re-proven artifact digest (hex).
+    pub artifact_digest: String,
+    /// Re-proven input digest (hex).
+    pub input_digest: String,
+    /// Durable admission time in Unix milliseconds.
+    pub admitted_at_unix_ms: u64,
+    /// Grant expiry in Unix milliseconds.
+    pub expires_at: u64,
+    /// Canonical live-authority-epoch JSON bound at admission.
+    pub authority_epoch_json: String,
+    /// Delivery-identity wire version (`WASM_DELIVERY_IDENTITY_VERSION`).
+    pub delivery_version: u16,
+    /// Envelope/material-set digest: SHA-256 over the exact staged
+    /// envelope bytes (hex).
+    pub envelope_digest: String,
+    /// Owner-measured SHA-256 of the installed child image bytes (hex):
+    /// the installation binding.
+    pub host_artifact_digest: String,
+    /// Publication incarnation: the durable admission time, stable across
+    /// replays of one admission.
+    pub publication_incarnation: u64,
+    /// Publication revision: one plus the distinct envelope slots already
+    /// present for this generation, so two publications under one
+    /// admission stay distinguishable.
+    pub publication_revision: u64,
+}
+
+impl WasmDeliveryIdentity {
+    /// Derives the delivery identity from a validated envelope plus the
+    /// owner-computed envelope digest, installation binding, and
+    /// publication revision. Fails closed on any unbound input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmDispatchError`] when the generation, any digest, the
+    /// admission window, or the revision is unbound.
+    pub fn from_material(
+        material: &WasmDispatchMaterial,
+        envelope_digest: &str,
+        host_artifact_digest: &str,
+        publication_revision: u64,
+    ) -> Result<Self, WasmDispatchError> {
+        if material.generation == 0 || material.admitted_at_unix_ms == 0 {
+            return Err(invalid("delivery-window"));
+        }
+        if publication_revision == 0 {
+            return Err(invalid("delivery-revision"));
+        }
+        require_digest(envelope_digest, "delivery-envelope-digest")?;
+        require_digest(host_artifact_digest, "delivery-host-digest")?;
+        require_digest(&material.grant.grant_digest, "delivery-grant-digest")?;
+        require_digest(&material.guest.artifact_digest, "delivery-artifact-digest")?;
+        require_digest(&material.guest.input_digest, "delivery-input-digest")?;
+        if material.grant.expires_at == 0
+            || material.grant.expires_at <= material.admitted_at_unix_ms
+        {
+            return Err(invalid("delivery-expiry"));
+        }
+        // Canonical epoch JSON identical to the child's staged
+        // `authority_epoch_json`: `EpochId` serializes `lineage_id` before
+        // `sequence`, which is also alphabetical order, so the child's
+        // parsed-value re-serialization matches byte-for-byte.
+        let authority_epoch_json = serde_json::to_string(&material.authority_epoch)
+            .map_err(|_| WasmDispatchError::Gate)?;
+        Ok(Self {
+            claim_id: material.claim_id.clone(),
+            operation_id: material.operation_id.clone(),
+            generation: material.generation,
+            launch_nonce: material.launch_nonce.clone(),
+            grant_digest: material.grant.grant_digest.clone(),
+            fence_generation: material.grant.fence_generation,
+            artifact_digest: material.guest.artifact_digest.clone(),
+            input_digest: material.guest.input_digest.clone(),
+            admitted_at_unix_ms: material.admitted_at_unix_ms,
+            expires_at: material.grant.expires_at,
+            authority_epoch_json,
+            delivery_version: WASM_DELIVERY_IDENTITY_VERSION,
+            envelope_digest: envelope_digest.to_owned(),
+            host_artifact_digest: host_artifact_digest.to_owned(),
+            publication_incarnation: material.admitted_at_unix_ms,
+            publication_revision,
+        })
+    }
+
+    /// Whether a live envelope still names this exact delivery, including
+    /// the grant/artifact/input digests (the preserved #2895 comparison
+    /// as a subset) plus the envelope digest. Anything else is a
+    /// replacement the caller must leave untouched.
+    #[must_use]
+    pub fn matches_material(&self, material: &WasmDispatchMaterial) -> bool {
+        let envelope_matches =
+            material_bytes(material).is_ok_and(|bytes| sha256_hex(&bytes) == self.envelope_digest);
+        envelope_matches
+            && self.claim_id == material.claim_id
+            && self.operation_id == material.operation_id
+            && self.generation == material.generation
+            && self.launch_nonce == material.launch_nonce
+            && self.grant_digest == material.grant.grant_digest
+            && self.fence_generation == material.grant.fence_generation
+            && self.artifact_digest == material.guest.artifact_digest
+            && self.input_digest == material.guest.input_digest
+            && self.admitted_at_unix_ms == material.admitted_at_unix_ms
+            && self.expires_at == material.grant.expires_at
+    }
+
+    /// Whether another identity names the same logical delivery: every
+    /// bound field except the publication revision. Same-delivery replay
+    /// matches here and returns the retained set, never a second
+    /// publication.
+    #[must_use]
+    pub fn same_delivery(&self, other: &Self) -> bool {
+        self.delivery_version == other.delivery_version
+            && self.claim_id == other.claim_id
+            && self.operation_id == other.operation_id
+            && self.generation == other.generation
+            && self.launch_nonce == other.launch_nonce
+            && self.grant_digest == other.grant_digest
+            && self.fence_generation == other.fence_generation
+            && self.artifact_digest == other.artifact_digest
+            && self.input_digest == other.input_digest
+            && self.admitted_at_unix_ms == other.admitted_at_unix_ms
+            && self.expires_at == other.expires_at
+            && self.authority_epoch_json == other.authority_epoch_json
+            && self.envelope_digest == other.envelope_digest
+            && self.host_artifact_digest == other.host_artifact_digest
+            && self.publication_incarnation == other.publication_incarnation
+    }
+
+    /// Immutable slot locator for this delivery: zero-padded generation
+    /// plus the envelope digest prefix. The directory is only a locator;
+    /// the identity is what claims bind.
+    #[must_use]
+    pub fn slot_name(&self) -> String {
+        let prefix = self
+            .envelope_digest
+            .get(..16)
+            .unwrap_or(&self.envelope_digest);
+        format!("{:020}-{prefix}", self.generation)
+    }
+}
+
+/// Owner publication state for one generation slot (#2786 step 2):
+/// filesystem publication and join registration cannot be atomic, so the
+/// slot retains an explicit Pending/Ready/Failed state plus the
+/// reconciliation identity. Readers never treat a slot without a Ready
+/// marker as a complete set.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum WasmPublicationState {
+    /// Publication started; the immutable set is not yet complete.
+    Pending {
+        /// Publishing delivery identity.
+        identity: WasmDeliveryIdentity,
+    },
+    /// Immutable slot set complete; fixed-name exposure is not
+    /// implied. Ready is written at slot completion before fixed
+    /// exposure, so a crash leaves a Ready slot over unexposed names
+    /// until a same-delivery replay re-verifies the fixed payloads and
+    /// re-exposes them from the slot. Join registration may still need
+    /// replay after a crash between exposure and registration.
+    Ready {
+        /// Published delivery identity.
+        identity: WasmDeliveryIdentity,
+    },
+    /// Publication failed; the retained identity and reason are recovery
+    /// evidence, never a consumable set.
+    Failed {
+        /// Failed delivery identity.
+        identity: WasmDeliveryIdentity,
+        /// Stable failure reason (error code, never guest bytes).
+        reason: String,
+    },
+}
+
+impl WasmPublicationState {
+    /// Borrows the reconciliation identity carried by this state.
+    #[must_use]
+    pub fn identity(&self) -> &WasmDeliveryIdentity {
+        match self {
+            Self::Pending { identity }
+            | Self::Ready { identity }
+            | Self::Failed { identity, .. } => identity,
+        }
+    }
+
+    /// Stable code for this state.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Pending { .. } => "DELIVERY_PENDING",
+            Self::Ready { .. } => "DELIVERY_READY",
+            Self::Failed { .. } => "DELIVERY_FAILED",
+        }
+    }
+
+    /// Whether the immutable set is complete.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+}
+
+/// Typed per-file owner-reclamation outcome (#2786 step 4/8): mirrors the
+/// host `ReclaimOutcome` codes member for member. `NotFound`,
+/// sharing-violation, and access-denial are distinct outcomes, never
+/// success; the caller preserves them as a bounded residual instead of
+/// overwriting the primary result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeliveryReclaimOutcome {
+    /// The presented file was removed.
+    Reclaimed,
+    /// No file was present; an already-reclaimed or never-staged path.
+    NotFound,
+    /// The file is open without delete sharing (Windows
+    /// `ERROR_SHARING_VIOLATION`).
+    SharingViolation,
+    /// Removal was denied by ACL or platform policy.
+    AccessDenied,
+    /// Removal failed with another platform error kind (kind string only).
+    Other(String),
+}
+
+impl DeliveryReclaimOutcome {
+    /// Whether this outcome removed the presented bytes.
+    #[must_use]
+    pub const fn reclaimed(&self) -> bool {
+        matches!(self, Self::Reclaimed)
+    }
+
+    /// Stable code for this outcome, shared with the host claim/ack half.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Reclaimed => "RECLAIM_RECLAIMED",
+            Self::NotFound => "RECLAIM_NOT_FOUND",
+            Self::SharingViolation => "RECLAIM_SHARING_VIOLATION",
+            Self::AccessDenied => "RECLAIM_ACCESS_DENIED",
+            Self::Other(_) => "RECLAIM_OTHER",
+        }
+    }
+}
+
+impl std::fmt::Display for DeliveryReclaimOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(kind) => {
+                write!(formatter, "RECLAIM_OTHER:{kind}")
+            }
+            other => formatter.write_str(other.code()),
+        }
+    }
+}
+
+/// Per-file owner reclamation detail for one presented delivery
+/// (bounded: exactly the three fixed names — the envelope is claimed
+/// aside under an identity-scoped name, payloads go first and the
+/// claimed envelope last, so a crash mid-reclaim leaves the envelope
+/// identity for recovery). Only an identity-matching set is ever
+/// reclaimed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmDeliveryReclamation {
+    /// Reclaimed delivery identity.
+    pub identity: WasmDeliveryIdentity,
+    /// Guest artifact file outcome.
+    pub artifact: DeliveryReclaimOutcome,
+    /// Guest input file outcome.
+    pub input: DeliveryReclaimOutcome,
+    /// Material envelope file outcome.
+    pub material: DeliveryReclaimOutcome,
+}
+
+impl WasmDeliveryReclamation {
+    /// Whether every presented file was removed. A partial outcome is a
+    /// bounded residual/maintenance obligation, never a primary-result
+    /// overwrite.
+    #[must_use]
+    pub fn fully_reclaimed(&self) -> bool {
+        self.artifact.reclaimed() && self.input.reclaimed() && self.material.reclaimed()
+    }
+}
+
+/// Removes one presented staging file, reporting the exact platform
+/// outcome. Callers present the exact identity and compare it against the
+/// live set before calling: this removes only the path the identity
+/// bound, never a generic current pathname.
+fn reclaim_one(path: &std::path::Path) -> DeliveryReclaimOutcome {
+    match std::fs::remove_file(path) {
+        Ok(()) => DeliveryReclaimOutcome::Reclaimed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DeliveryReclaimOutcome::NotFound
+        }
+        Err(error) if error.raw_os_error() == Some(32) => DeliveryReclaimOutcome::SharingViolation,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            DeliveryReclaimOutcome::AccessDenied
+        }
+        Err(error) => DeliveryReclaimOutcome::Other(error.kind().to_string()),
+    }
+}
+
 /// Checks one value against a closed spelling set shared with the child
 /// reader (which maps the identical sets and denies anything else).
 fn require_spelling(
@@ -965,8 +1347,8 @@ pub struct WasmJoinTable {
     records: std::collections::HashMap<(String, String), WasmJoinRecord>,
 }
 
-/// One retained join record: the published digests plus the window and
-/// the one-shot consumption flag.
+/// One retained join record: the published digests plus the window,
+/// the one-shot consumption flag, and the bound delivery identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WasmJoinRecord {
     authority_id: String,
@@ -974,6 +1356,12 @@ struct WasmJoinRecord {
     invocation_digest: String,
     expires_at: u64,
     consumed: bool,
+    /// Bound delivery envelope digest (#2786 step 8): `Some` when the
+    /// join was registered with its delivery identity, `None` for
+    /// legacy registrations. Material cannot execute without its
+    /// matching owner join/grant: delivery-bound admission requires
+    /// this binding to match the claimed envelope.
+    envelope_digest: Option<String>,
 }
 
 /// Join admission denial: stable taxonomy, no digests echoed.
@@ -1006,6 +1394,27 @@ impl WasmJoinTable {
                 invocation_digest: join.invocation_digest.clone(),
                 expires_at: join.expires_at,
                 consumed: false,
+                envelope_digest: None,
+            },
+        );
+    }
+
+    /// Registers one published join bound to its delivery identity
+    /// (#2786 step 8): the join/launch binding of the claim. Replaces
+    /// any prior record for the pair; the staged generation slot and
+    /// the fixed-name set were just published with it, so re-publication
+    /// of the same delivery re-arms the exact operation under the same
+    /// identity, never a spent permit.
+    pub fn register_delivery(&mut self, join: &WasmJoinGate, delivery: &WasmDeliveryIdentity) {
+        self.records.insert(
+            (join.claim_id.clone(), join.operation_id.clone()),
+            WasmJoinRecord {
+                authority_id: join.authority_id.clone(),
+                grant_digest: join.grant_digest.clone(),
+                invocation_digest: join.invocation_digest.clone(),
+                expires_at: join.expires_at,
+                consumed: false,
+                envelope_digest: Some(delivery.envelope_digest.clone()),
             },
         );
     }
@@ -1032,6 +1441,43 @@ impl WasmJoinTable {
             return Err(JoinDeny::Replayed);
         }
         if record.invocation_digest != presented_digest {
+            return Err(JoinDeny::Mismatched);
+        }
+        if let Some(record) = self.records.get_mut(&key) {
+            record.consumed = true;
+        }
+        Ok(())
+    }
+
+    /// Admits one presented claim against the retained delivery-bound
+    /// join (#2786 step 8): [`admit`](WasmJoinTable::admit) plus the
+    /// claimed envelope digest. The pair must be published and fresh,
+    /// both digests must match exactly, and a consumed join never
+    /// admits twice. A delivery-bound admission against a legacy
+    /// unbound record denies; material cannot execute without its
+    /// matching owner join/grant. Success consumes the entry; stale
+    /// entries are removed on sight.
+    pub fn admit_claim(
+        &mut self,
+        claim_id: &str,
+        operation_id: &str,
+        presented_digest: &str,
+        envelope_digest: &str,
+        now_ms: u64,
+    ) -> Result<(), JoinDeny> {
+        let key = (claim_id.to_owned(), operation_id.to_owned());
+        let record = self.records.get(&key).ok_or(JoinDeny::Missing)?;
+        if record.expires_at <= now_ms {
+            self.records.remove(&key);
+            return Err(JoinDeny::Stale);
+        }
+        if record.consumed {
+            return Err(JoinDeny::Replayed);
+        }
+        if record.invocation_digest != presented_digest {
+            return Err(JoinDeny::Mismatched);
+        }
+        if record.envelope_digest.as_deref() != Some(envelope_digest) {
             return Err(JoinDeny::Mismatched);
         }
         if let Some(record) = self.records.get_mut(&key) {
@@ -1123,15 +1569,633 @@ pub struct WasmPublishedBundle {
     pub artifact_path: std::path::PathBuf,
     /// Staged input file path.
     pub input_path: std::path::PathBuf,
+    /// Owner-issued delivery identity bound to this publication.
+    pub delivery: WasmDeliveryIdentity,
+    /// Immutable generation slot directory retaining this set.
+    pub slot_dir: std::path::PathBuf,
+}
+
+/// Requires the install directory to be a real directory: present, not
+/// a symlink or reparse point. Exact path checks are owned here; the
+/// installer's ACL owns who may write beneath it, and the publisher
+/// widens no ACL — staged files inherit the install directory's.
+fn require_install_dir(install_dir: &std::path::Path) -> Result<(), WasmDispatchError> {
+    let metadata =
+        std::fs::symlink_metadata(install_dir).map_err(|_| invalid("delivery-install-dir"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid("delivery-install-dir"));
+    }
+    Ok(())
+}
+
+/// Flushes one staged file so its bytes are durable before any rename
+/// names them (the repository's sealed-body contour: durable body
+/// before the row that names it).
+fn sync_file(path: &std::path::Path) -> Result<(), WasmDispatchError> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| invalid("delivery-io"))
+}
+
+/// Flushes a freshly renamed directory entry on platforms with
+/// directory `fsync`.
+#[cfg(unix)]
+fn sync_parent_directory(directory: &std::path::Path) -> Result<(), WasmDispatchError> {
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| invalid("delivery-io"))
+}
+
+/// Directory `fsync` has no Windows equivalent; the file flush plus the
+/// atomic rename is the owned contour there. Infallible by construction.
+#[cfg(not(unix))]
+fn sync_parent_directory(_directory: &std::path::Path) {}
+
+/// Stages one file atomically: a stale partial from an interrupted write
+/// is replaced, never appended to, so a crash can never splice two
+/// bodies together; the body is flushed before the rename publishes it.
+/// The post-rename path must be a real file, never a symlink or reparse
+/// point. `tag` scopes the partial name to this publication so two
+/// publishers never share one partial.
+fn stage_file_atomic(
+    directory: &std::path::Path,
+    file_name: &str,
+    tag: &str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, WasmDispatchError> {
+    let path = directory.join(file_name);
+    let partial = directory.join(format!(".{file_name}.{tag}.partial"));
+    if partial.exists() {
+        std::fs::remove_file(&partial).map_err(|_| invalid("delivery-io"))?;
+    }
+    std::fs::write(&partial, bytes).map_err(|_| invalid("delivery-io"))?;
+    sync_file(&partial)?;
+    std::fs::rename(&partial, &path).map_err(|_| invalid("delivery-io"))?;
+    #[cfg(unix)]
+    sync_parent_directory(directory)?;
+    #[cfg(not(unix))]
+    sync_parent_directory(directory);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| invalid("delivery-io"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid("delivery-symlink"));
+    }
+    Ok(path)
+}
+
+/// Stages one immutable slot file: an identical existing body is an
+/// idempotent replay, a differing one is a slot collision that fails
+/// closed. Slot bytes are never overwritten in place.
+fn stage_slot_file_atomic(
+    slot: &std::path::Path,
+    file_name: &str,
+    tag: &str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, WasmDispatchError> {
+    let path = slot.join(file_name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let existing = std::fs::read(&path).map_err(|_| invalid("delivery-slot-collision"))?;
+            if existing == bytes {
+                return Ok(path);
+            }
+            return Err(invalid("delivery-slot-collision"));
+        }
+        Ok(_) => return Err(invalid("delivery-slot-collision")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(invalid("delivery-io")),
+    }
+    stage_file_atomic(slot, file_name, tag, bytes)
+}
+
+/// Generation-slot parent directory under the install directory.
+fn slots_dir(install_dir: &std::path::Path) -> std::path::PathBuf {
+    install_dir.join(WASM_DELIVERY_SLOT_DIR_NAME)
+}
+
+/// Counts the distinct envelope slots already present for one
+/// generation (bounded scan) plus one: the next publication revision.
+/// Deterministic for a fixed directory state.
+fn slot_revision_for(slots: &std::path::Path, generation: u64) -> u64 {
+    let prefix = format!("{generation:020}-");
+    let mut count = 0_u64;
+    if let Ok(entries) = std::fs::read_dir(slots) {
+        for entry in entries.flatten().take(MAX_SLOT_SCAN_ENTRIES) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count.saturating_add(1)
+}
+
+/// Reads one slot's retained publication state: a Ready marker wins, then
+/// Failed, then Pending. A slot with no parsable marker reports `None`:
+/// an incomplete publication, never a complete set.
+fn read_slot_state(slot: &std::path::Path) -> Option<WasmPublicationState> {
+    for file_name in [
+        WASM_DELIVERY_READY_FILE_NAME,
+        WASM_DELIVERY_FAILED_FILE_NAME,
+        WASM_DELIVERY_PENDING_FILE_NAME,
+    ] {
+        if let Ok(bytes) = std::fs::read(slot.join(file_name))
+            && let Ok(state) = serde_json::from_slice::<WasmPublicationState>(&bytes)
+        {
+            let expected = matches!(
+                (&state, file_name),
+                (
+                    WasmPublicationState::Ready { .. },
+                    WASM_DELIVERY_READY_FILE_NAME
+                ) | (
+                    WasmPublicationState::Failed { .. },
+                    WASM_DELIVERY_FAILED_FILE_NAME
+                ) | (
+                    WasmPublicationState::Pending { .. },
+                    WASM_DELIVERY_PENDING_FILE_NAME
+                )
+            );
+            if expected {
+                return Some(state);
+            }
+        }
+    }
+    None
+}
+
+/// Discovers owner publication state for restart recovery (#2786 steps
+/// 2/7): each generation slot's retained marker state under its original
+/// identity — Ready, InFlight-as-Pending, terminal-unacknowledged, or
+/// Failed — never arbitrary files alone. Marker-less slots are
+/// incomplete publications and are skipped; their bytes stay on disk as
+/// evidence. The scan is bounded; discovery never walks an unbounded
+/// directory.
+#[must_use]
+pub fn discover_delivery_publications(install_dir: &std::path::Path) -> Vec<WasmPublicationState> {
+    let mut states = Vec::new();
+    let Ok(entries) = std::fs::read_dir(slots_dir(install_dir)) else {
+        return states;
+    };
+    for entry in entries.flatten().take(MAX_SLOT_SCAN_ENTRIES) {
+        if let Some(state) = read_slot_state(&entry.path()) {
+            states.push(state);
+        }
+    }
+    states
+}
+
+/// Reads the currently exposed fixed-name envelope, if any. Absent
+/// means free to publish. Present-but-unreadable-or-invalid refuses:
+/// the publisher only replaces a set it can identify, never a silent
+/// overwrite of unknown bytes.
+fn read_live_material(
+    install_dir: &std::path::Path,
+) -> Result<Option<WasmDispatchMaterial>, WasmDispatchError> {
+    let path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(invalid("live-envelope")),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| invalid("live-envelope"))
+}
+
+/// Retires exactly the presented delivery's fixed-name files by
+/// claim-then-remove: the live set is re-read and compared against the
+/// presented identity, then the live envelope is renamed aside under an
+/// identity-scoped claimed name before any payload is removed. The
+/// claimed bytes are re-verified after the rename, each fixed payload
+/// is re-hashed against the presented digests before its own removal,
+/// and the fixed envelope name must stay absent after every step, so a
+/// replacement exposed mid-reclaim stops the reclaim instead of being
+/// deleted. Payloads go first and the claimed envelope last, so a crash
+/// mid-reclaim leaves the envelope identity for recovery.
+///
+/// Residual window (honest): each payload verify-then-remove is still
+/// one non-atomic step — a replacement staged between that payload's
+/// hash check and its removal is deleted with the old set. No
+/// single-publisher ownership is claimed: the daemon serves sessions as
+/// `JoinSet` tasks on the multi-threaded `#[tokio::main]` runtime, so
+/// two publishers can interleave here on different threads. The
+/// same-delivery replay path re-verifies the fixed payloads and
+/// re-exposes from the slot, which bounds that window's damage to one
+/// healable set.
+fn reclaim_fixed_delivery(
+    install_dir: &std::path::Path,
+    presented: &WasmDeliveryIdentity,
+) -> Result<WasmDeliveryReclamation, WasmDispatchError> {
+    let live = read_live_material(install_dir)?.ok_or_else(|| invalid("delivery-reclaim-gone"))?;
+    if !presented.matches_material(&live) {
+        return Err(invalid("delivery-reclaim-replaced"));
+    }
+    let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
+    let digest = &presented.envelope_digest;
+    let claimed_path =
+        install_dir.join(format!(".{WASM_HOST_MATERIAL_FILE_NAME}.{digest}.claimed"));
+    // A stale claimed file names this same identity (a crashed reclaim
+    // held the claim while the live name was absent, so no live
+    // reclaimer can be using it); drop it before claiming. The live
+    // envelope just verified above stays authoritative.
+    let _ = std::fs::remove_file(&claimed_path);
+    // Claim the envelope by rename: after this the fixed envelope name
+    // is absent until a publisher exposes a replacement. A concurrent
+    // publisher that already replaced the set owns the renamed bytes
+    // instead; the re-verification below detects exactly that.
+    match std::fs::rename(&material_path, &claimed_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(invalid("delivery-reclaim-gone"));
+        }
+        Err(_) => return Err(invalid("delivery-io")),
+    }
+    let claimed_matches = std::fs::read(&claimed_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WasmDispatchMaterial>(&bytes).ok())
+        .is_some_and(|material| presented.matches_material(&material));
+    if !claimed_matches {
+        restore_claimed_envelope(&material_path, &claimed_path);
+        return Err(invalid("delivery-reclaim-replaced"));
+    }
+    let artifact_path = install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME);
+    verify_fixed_payload(
+        &artifact_path,
+        &presented.artifact_digest,
+        &material_path,
+        &claimed_path,
+    )?;
+    let artifact = reclaim_one(&artifact_path);
+    check_reclaim_quiescent(&material_path, &claimed_path)?;
+    let input_path = install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME);
+    verify_fixed_payload(
+        &input_path,
+        &presented.input_digest,
+        &material_path,
+        &claimed_path,
+    )?;
+    let input = reclaim_one(&input_path);
+    check_reclaim_quiescent(&material_path, &claimed_path)?;
+    // The claimed name is identity-scoped and held by this reclaim, so
+    // removing it cannot touch a replacement even if one exposed after
+    // the last quiescence check.
+    let material = reclaim_one(&claimed_path);
+    Ok(WasmDeliveryReclamation {
+        identity: presented.clone(),
+        artifact,
+        input,
+        material,
+    })
+}
+
+/// Restores a claimed envelope that failed re-verification: the claim
+/// rename moved a replacement's bytes aside, so they go back only when
+/// no newer exposure owns the fixed name. The restore is atomic
+/// create-new, never an overwrite of a live replacement; when the fixed
+/// name is already live the claimed file stays as bounded
+/// identity-scoped evidence and the caller still fails closed.
+fn restore_claimed_envelope(material_path: &std::path::Path, claimed_path: &std::path::Path) {
+    let Ok(bytes) = std::fs::read(claimed_path) else {
+        return;
+    };
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(material_path);
+    let Ok(mut file) = created else {
+        return;
+    };
+    if std::io::Write::write_all(&mut file, &bytes).is_ok() {
+        let _ = file.sync_all();
+        let _ = std::fs::remove_file(claimed_path);
+    }
+}
+
+/// Re-hashes one fixed payload against the presented digest immediately
+/// before its removal: a replacement staged after the envelope claim
+/// stops the reclaim instead of being deleted as the old set. A torn
+/// live set (envelope/payload mismatch) fails here by design — only an
+/// identified set is ever removed — and the claimed envelope is
+/// restored best-effort before failing as replaced.
+fn verify_fixed_payload(
+    path: &std::path::Path,
+    expected_digest: &str,
+    material_path: &std::path::Path,
+    claimed_path: &std::path::Path,
+) -> Result<(), WasmDispatchError> {
+    let matches = std::fs::read(path)
+        .ok()
+        .is_some_and(|bytes| sha256_hex(&bytes) == expected_digest);
+    if matches {
+        Ok(())
+    } else {
+        restore_claimed_envelope(material_path, claimed_path);
+        Err(invalid("delivery-reclaim-replaced"))
+    }
+}
+
+/// Re-verifies after one removal step that no replacement exposed a new
+/// live envelope mid-reclaim: the fixed envelope name must stay absent
+/// while the claim is held. A live envelope here means a concurrent
+/// publisher finished an exposure, so the reclaim stops instead of
+/// removing further files that may already be the replacement's; the
+/// held claim is a stale copy of the retired set (the slot retains it),
+/// so it is dropped rather than restored over the live set.
+fn check_reclaim_quiescent(
+    material_path: &std::path::Path,
+    claimed_path: &std::path::Path,
+) -> Result<(), WasmDispatchError> {
+    if material_path.exists() {
+        let _ = std::fs::remove_file(claimed_path);
+        return Err(invalid("delivery-reclaim-replaced"));
+    }
+    Ok(())
+}
+
+/// Retires an expired live set under its exact presented identity, or
+/// refuses the replacement with typed bounded backpressure (#2786 step
+/// 4). Supported expiry without a wall clock: a live set whose grant
+/// expired before the new admission opened can no longer execute, so the
+/// owner reclaims exactly that set and the replacement publishes fresh.
+/// Anything still live backpressures with the exact retry condition, and
+/// a partially reclaimed set fails closed instead of publishing over
+/// unknown bytes.
+fn retire_or_backpressure_live(
+    live: &WasmDispatchMaterial,
+    live_envelope: &[u8],
+    claim_admitted_at_unix_ms: u64,
+    install_dir: &std::path::Path,
+) -> Result<(), WasmDispatchError> {
+    let live_digest = sha256_hex(live_envelope);
+    let live_identity = WasmDeliveryIdentity::from_material(
+        live,
+        &live_digest,
+        &live.grant.host_artifact_digest,
+        1,
+    )?;
+    if live_identity.expires_at <= claim_admitted_at_unix_ms {
+        let reclamation = reclaim_fixed_delivery(install_dir, &live_identity)?;
+        if !reclamation.fully_reclaimed() {
+            return Err(invalid("delivery-reclaim-partial"));
+        }
+        Ok(())
+    } else {
+        Err(WasmDispatchError::Backpressure(WasmDeliveryBackpressure {
+            live_generation: live_identity.generation,
+            live_operation_id: live_identity.operation_id.clone(),
+            live_expires_at: live_identity.expires_at,
+            retry_condition: "current delivery consumed".to_owned(),
+        }))
+    }
+}
+
+/// Stages the immutable generation slot, then exposes the fixed-name
+/// set: payloads first and the envelope last, each file atomic. A
+/// publication error inside slot staging never touches the fixed names,
+/// so it cannot delete another generation; readers never see a torn
+/// generation. Returns the staged envelope path.
+fn stage_and_expose_delivery(
+    install_dir: &std::path::Path,
+    slot: &std::path::Path,
+    slot_name: &str,
+    identity: &WasmDeliveryIdentity,
+    envelope: &[u8],
+    claim: &WasmOwnerClaim,
+) -> Result<std::path::PathBuf, WasmDispatchError> {
+    stage_delivery_slot(slot, identity, envelope, claim)?;
+    stage_file_atomic(
+        install_dir,
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+        slot_name,
+        &claim.artifact_bytes,
+    )?;
+    stage_file_atomic(
+        install_dir,
+        WASM_HOST_GUEST_INPUT_FILE_NAME,
+        slot_name,
+        &claim.input_bytes,
+    )?;
+    stage_file_atomic(
+        install_dir,
+        WASM_HOST_MATERIAL_FILE_NAME,
+        slot_name,
+        envelope,
+    )
+}
+
+/// Prunes retained slots beyond [`MAX_DELIVERY_SLOTS`]: oldest first
+/// (slot names sort by generation), keeping the current slot and any
+/// slot whose Ready identity still owns the fixed names. A completion,
+/// failure, cancellation, publication error, or failed drain never
+/// removes another generation: each removal names one exact non-live
+/// slot path. Best-effort and bounded; failures stay as disk residual
+/// and never fail the publication.
+fn prune_delivery_slots(
+    slots: &std::path::Path,
+    live_envelope_digest: Option<&str>,
+    current_slot_name: &str,
+) {
+    let Ok(entries) = std::fs::read_dir(slots) else {
+        return;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .take(MAX_SLOT_SCAN_ENTRIES)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect();
+    if names.len() <= MAX_DELIVERY_SLOTS {
+        return;
+    }
+    names.sort();
+    let surplus = names.len().saturating_sub(MAX_DELIVERY_SLOTS);
+    let mut removed = 0_usize;
+    for name in names {
+        if removed >= surplus {
+            break;
+        }
+        if name == current_slot_name {
+            continue;
+        }
+        if let Some(live) = live_envelope_digest {
+            let live_slot = read_slot_state(&slots.join(&name))
+                .is_some_and(|state| state.identity().envelope_digest == live);
+            if live_slot {
+                continue;
+            }
+        }
+        if std::fs::remove_dir_all(slots.join(&name)).is_ok() {
+            removed = removed.saturating_add(1);
+        }
+    }
+}
+
+/// Stages the immutable generation slot: Pending marker, bounded
+/// payloads, envelope copy, then the Ready marker last. A Ready slot
+/// for the same delivery is an idempotent replay (Ready covers the slot
+/// set only — a crash between slot completion and fixed-name exposure
+/// leaves exposure to the replay's re-verification); anything else
+/// Ready under this name is a collision. On failure the slot records
+/// Failed with the stable reason and the fixed names stay untouched:
+/// partial publication is never accepted as a complete set.
+fn stage_delivery_slot(
+    slot: &std::path::Path,
+    identity: &WasmDeliveryIdentity,
+    envelope: &[u8],
+    claim: &WasmOwnerClaim,
+) -> Result<(), WasmDispatchError> {
+    if let Some(WasmPublicationState::Ready { identity: ready }) = read_slot_state(slot) {
+        if ready.same_delivery(identity) {
+            return Ok(());
+        }
+        return Err(invalid("delivery-slot-collision"));
+    }
+    std::fs::create_dir_all(slot).map_err(|_| invalid("delivery-io"))?;
+    let tag = identity.slot_name();
+    let staged: Result<(), WasmDispatchError> = (|| {
+        let pending = serde_json::to_vec(&WasmPublicationState::Pending {
+            identity: identity.clone(),
+        })
+        .map_err(|_| WasmDispatchError::Gate)?;
+        stage_file_atomic(slot, WASM_DELIVERY_PENDING_FILE_NAME, &tag, &pending)?;
+        stage_slot_file_atomic(
+            slot,
+            WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+            &tag,
+            &claim.artifact_bytes,
+        )?;
+        stage_slot_file_atomic(
+            slot,
+            WASM_HOST_GUEST_INPUT_FILE_NAME,
+            &tag,
+            &claim.input_bytes,
+        )?;
+        stage_slot_file_atomic(slot, WASM_HOST_MATERIAL_FILE_NAME, &tag, envelope)?;
+        let ready = serde_json::to_vec(&WasmPublicationState::Ready {
+            identity: identity.clone(),
+        })
+        .map_err(|_| WasmDispatchError::Gate)?;
+        stage_slot_file_atomic(slot, WASM_DELIVERY_READY_FILE_NAME, &tag, &ready)?;
+        Ok(())
+    })();
+    if let Err(error) = &staged {
+        let failed = serde_json::to_vec(&WasmPublicationState::Failed {
+            identity: identity.clone(),
+            reason: error.to_string(),
+        });
+        if let Ok(failed) = failed {
+            let _ = stage_file_atomic(slot, WASM_DELIVERY_FAILED_FILE_NAME, &tag, &failed);
+        }
+    }
+    staged
+}
+
+/// Whether the fixed payloads currently exposed re-hash to the identity
+/// digests: both files must exist with byte-exact bodies. A live
+/// envelope alone proves nothing — reclaim removes payloads first, so a
+/// crash leaves the envelope identity over missing payloads.
+fn fixed_payloads_match(install_dir: &std::path::Path, identity: &WasmDeliveryIdentity) -> bool {
+    let artifact_ok = std::fs::read(install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))
+        .ok()
+        .is_some_and(|bytes| sha256_hex(&bytes) == identity.artifact_digest);
+    let input_ok = std::fs::read(install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))
+        .ok()
+        .is_some_and(|bytes| sha256_hex(&bytes) == identity.input_digest);
+    artifact_ok && input_ok
+}
+
+/// Re-exposes the fixed-name set from the generation slot after a
+/// same-delivery replay found the live payloads missing or replaced:
+/// the slot's payload and envelope copies are re-hashed against the
+/// identity digests, then staged payloads-first envelope-last, each
+/// file atomic. The live envelope must still name this delivery
+/// immediately before staging; a concurrent replacement fails the
+/// replay instead of being overwritten.
+///
+/// Residual window (honest): the live check and the staging are
+/// non-atomic, so a replacement exposed between them can still be
+/// overwritten file-by-file. The daemon serializes publishers only
+/// through the live-envelope gate, not a lock.
+fn reexpose_fixed_delivery_from_slot(
+    install_dir: &std::path::Path,
+    slot: &std::path::Path,
+    identity: &WasmDeliveryIdentity,
+) -> Result<(), WasmDispatchError> {
+    let live = read_live_material(install_dir)?.ok_or_else(|| invalid("delivery-reclaim-gone"))?;
+    if !identity.matches_material(&live) {
+        return Err(invalid("delivery-reclaim-replaced"));
+    }
+    let artifact = std::fs::read(slot.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))
+        .map_err(|_| invalid("delivery-slot-payload"))?;
+    if sha256_hex(&artifact) != identity.artifact_digest {
+        return Err(invalid("delivery-slot-payload"));
+    }
+    let input = std::fs::read(slot.join(WASM_HOST_GUEST_INPUT_FILE_NAME))
+        .map_err(|_| invalid("delivery-slot-payload"))?;
+    if sha256_hex(&input) != identity.input_digest {
+        return Err(invalid("delivery-slot-payload"));
+    }
+    let slot_envelope = std::fs::read(slot.join(WASM_HOST_MATERIAL_FILE_NAME))
+        .map_err(|_| invalid("delivery-slot-payload"))?;
+    if sha256_hex(&slot_envelope) != identity.envelope_digest {
+        return Err(invalid("delivery-slot-payload"));
+    }
+    let tag = identity.slot_name();
+    stage_file_atomic(
+        install_dir,
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+        &tag,
+        &artifact,
+    )?;
+    stage_file_atomic(install_dir, WASM_HOST_GUEST_INPUT_FILE_NAME, &tag, &input)?;
+    stage_file_atomic(
+        install_dir,
+        WASM_HOST_MATERIAL_FILE_NAME,
+        &tag,
+        &slot_envelope,
+    )?;
+    Ok(())
+}
+
+/// Records an explicit Failed publication in the slot when a
+/// same-delivery replay cannot restore the fixed set from the retained
+/// bytes: the Ready marker is removed so discovery never reports a
+/// complete set, and the Failed marker carries the stable reason as
+/// recovery evidence. Best-effort; the caller still fails closed. A
+/// later replay re-stages the identical slot bytes and rewrites Ready,
+/// so a transient failure heals instead of stranding the delivery.
+fn mark_slot_failed(slot: &std::path::Path, identity: &WasmDeliveryIdentity, reason: &str) {
+    let _ = std::fs::remove_file(slot.join(WASM_DELIVERY_READY_FILE_NAME));
+    let failed = serde_json::to_vec(&WasmPublicationState::Failed {
+        identity: identity.clone(),
+        reason: reason.to_owned(),
+    });
+    if let Ok(failed) = failed {
+        let tag = identity.slot_name();
+        let _ = stage_file_atomic(slot, WASM_DELIVERY_FAILED_FILE_NAME, &tag, &failed);
+    }
 }
 
 /// Publishes one dispatch bundle from retained actual owner state plus the
 /// installation-approved host binding: validates every record, binds the
 /// registry digest into the grant and the envelope, re-hashes the staged
-/// bytes against the bound digests, computes the owner-side join gate, and
-/// stages the three delivery files in the install directory. No ambient
+/// bytes against the bound digests, computes the owner-side join gate,
+/// stages the generation-bound immutable set, exposes the fixed-name
+/// delivery files, and registers the delivery-bound join. No ambient
 /// paths, no caller-asserted digests, no minted window: freshness opens at
 /// the durable admission time through the grant expiry.
+///
+/// Replacement is serialized (#2786 step 4): the fixed names admit
+/// exactly one live delivery. A different live set backpressures the
+/// replacement with the exact retry condition; a set that expired before
+/// the new admission opened is owner-reclaimed under its exact identity
+/// first. Same-delivery replay verifies the fixed payloads against
+/// the identity digests, then returns the retained set and re-arms the
+/// join under the same identity; only a payload mismatch re-exposes
+/// bytes from the slot, never as a new operation. No argv/env/fs
+/// widening: all paths derive from the install directory and the fixed
+/// file names.
 ///
 /// `host_executable_path` / `host_artifact_digest` are the registry values
 /// the registration lane reads through the descriptor's validated
@@ -1142,7 +2206,9 @@ pub struct WasmPublishedBundle {
 /// # Errors
 ///
 /// Returns [`WasmDispatchError`] when any record, the host binding, the
-/// byte bindings, or the file staging fails closed.
+/// byte bindings, or the file staging fails closed, or
+/// [`WasmDispatchError::Backpressure`] when another live delivery owns
+/// the fixed names.
 pub fn publish_wasm_dispatch_bundle(
     host_executable_path: &str,
     host_artifact_digest: &str,
@@ -1156,6 +2222,11 @@ pub fn publish_wasm_dispatch_bundle(
     require_digest(host_artifact_digest, "registry-host-digest")?;
     if claim.artifact_bytes.is_empty() || claim.input_bytes.is_empty() {
         return Err(invalid("guest-bytes"));
+    }
+    if claim.artifact_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
+        || claim.input_bytes.len() > MAX_DELIVERY_PAYLOAD_BYTES
+    {
+        return Err(invalid("guest-bytes-bound"));
     }
     if sha256_hex(&claim.artifact_bytes) != claim.guest.artifact_digest
         || sha256_hex(&claim.input_bytes) != claim.guest.input_digest
@@ -1180,28 +2251,86 @@ pub fn publish_wasm_dispatch_bundle(
         claim.snapshot.clone(),
         claim.prior_conformance_artifact.clone(),
     )?;
-    let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
-    let artifact_path = install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME);
-    let input_path = install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME);
     let join = wasm_join_gate(
         claim,
         host_executable_path,
         host_artifact_digest,
         install_dir,
     )?;
-    let io_denied = |_| invalid("delivery-io");
-    std::fs::write(&material_path, material_bytes(&material)?).map_err(io_denied)?;
-    std::fs::write(&artifact_path, &claim.artifact_bytes).map_err(io_denied)?;
-    std::fs::write(&input_path, &claim.input_bytes).map_err(io_denied)?;
+    require_install_dir(install_dir)?;
+    let envelope = material_bytes(&material)?;
+    let envelope_digest = sha256_hex(&envelope);
+    let slots = slots_dir(install_dir);
+    std::fs::create_dir_all(&slots).map_err(|_| invalid("delivery-io"))?;
+    let revision = slot_revision_for(&slots, claim.generation);
+    let identity = WasmDeliveryIdentity::from_material(
+        &material,
+        &envelope_digest,
+        host_artifact_digest,
+        revision,
+    )?;
+    let slot_name = identity.slot_name();
+    let slot = slots.join(&slot_name);
+    // Replacement serialization: a running claimed A and a concurrently
+    // published B never share mutable bytes or cleanup authority. Only
+    // an identified live set gates here; an unidentifiable leftover
+    // refuses above, never silently overwritten.
+    if let Some(live) = read_live_material(install_dir)? {
+        let live_envelope = material_bytes(&live)?;
+        if sha256_hex(&live_envelope) == envelope_digest {
+            // Same-delivery replay: the retained set stands. A legacy v1
+            // set without a slot is adopted by staging its immutable
+            // record; the join re-arms under the same identity, and no
+            // spent permit is inherited. The fixed payloads are
+            // re-verified before re-arming: a crash inside reclaim
+            // removes payloads first and the envelope last, so a live
+            // envelope over missing payloads heals from the slot —
+            // never a re-armed Ready over missing payloads.
+            stage_delivery_slot(&slot, &identity, &envelope, claim)?;
+            if !fixed_payloads_match(install_dir, &identity)
+                && let Err(error) = reexpose_fixed_delivery_from_slot(install_dir, &slot, &identity)
+            {
+                mark_slot_failed(&slot, &identity, &error.to_string());
+                return Err(error);
+            }
+            joins.register_delivery(&join, &identity);
+            return Ok(WasmPublishedBundle {
+                material,
+                join,
+                material_path: install_dir.join(WASM_HOST_MATERIAL_FILE_NAME),
+                artifact_path: install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME),
+                input_path: install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME),
+                delivery: identity,
+                slot_dir: slot,
+            });
+        }
+        retire_or_backpressure_live(
+            &live,
+            &live_envelope,
+            claim.admitted_at_unix_ms,
+            install_dir,
+        )?;
+    }
+    // Immutable generation staging first: a publication error here never
+    // touches the fixed names, so it cannot delete another generation.
+    // Fixed-name exposure follows, payloads first and envelope last, each
+    // file atomic: readers never see a torn generation.
+    let material_path =
+        stage_and_expose_delivery(install_dir, &slot, &slot_name, &identity, &envelope, claim)?;
     // Register only after every file staged: a failed delivery leaves no
-    // phantom join behind.
-    joins.register(&join);
+    // phantom join behind. The join closes over the delivery identity so
+    // Join Ready cannot outlive missing material without an explicit
+    // recoverable failed publication.
+    joins.register_delivery(&join, &identity);
+    prune_delivery_slots(&slots, Some(&envelope_digest), &slot_name);
     Ok(WasmPublishedBundle {
         material,
         join,
         material_path,
-        artifact_path,
-        input_path,
+        artifact_path: install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME),
+        input_path: install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME),
+        delivery: identity,
+        slot_dir: slot,
     })
 }
 
