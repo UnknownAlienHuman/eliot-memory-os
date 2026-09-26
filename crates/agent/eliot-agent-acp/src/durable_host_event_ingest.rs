@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventId,
+    AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventCursor, EventId,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
     HostEventPrivacyClass, LowercaseSha256, NormalizedHostEventEnvelope,
     PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
@@ -1312,7 +1312,7 @@ impl DurableHostEventJournal {
                     return Err(IngestError::InvalidInput("observation/lineage"));
                 }
             }
-            ProviderObservationLineage::ExecutionUnitObservation(_) => {
+            ProviderObservationLineage::ExecutionUnitObservation(lineage) => {
                 let binding = binding.ok_or(IngestError::InvalidInput("binding/lineage"))?;
                 let admission = admission.ok_or(IngestError::InvalidInput("admission/lineage"))?;
                 envelope
@@ -1324,6 +1324,8 @@ impl DurableHostEventJournal {
                     physical_observation,
                     requested_route_digest,
                     actual_route_digest,
+                    &lineage.cursor,
+                    lineage.sequence,
                 )?;
                 return Ok(());
             }
@@ -1359,23 +1361,31 @@ impl DurableHostEventJournal {
     /// The observation itself is fully validated with
     /// [`PhysicalRouteObservationReceipt::validate_against`] against this
     /// event's binding and admission: a receipt from another attempt, start
-    /// request, generation, fence, cursor, or admission boundary rejects, and
+    /// request, generation, fence, or admission boundary rejects, and
     /// the legitimate admission-selection boundary is preserved (the
     /// observation's requested route agrees with the admission's selected
     /// route, while the staged requested column keeps the admission's
-    /// original requested route). A valid divergent observation passes with
+    /// original requested route). The observation's own cursor/sequence
+    /// position is additionally bound to this event's lineage-declared
+    /// cursor/sequence below: a receipt minted for another observation
+    /// boundary of the same attempt is not automatically evidence for every
+    /// event (`validate_against` cannot see the staged event, so the journal
+    /// binds it here before any mutation). A valid divergent observation passes with
     /// its differences retained (it is evidence, never malformed), and an
     /// `Unobserved` observation carries no fabricated actual fingerprint: the
     /// actual column stays absent rather than copying requested bytes. A
     /// pre-observation event stages with no observation and no actual digest;
     /// later immutable observation evidence links as a new record, never as a
     /// silent rewrite.
+    #[allow(clippy::too_many_arguments)]
     fn check_route_digests(
         binding: &ProviderExecutionBinding,
         admission: &AdmittedRouteReceipt,
         physical_observation: Option<&PhysicalRouteObservationReceipt>,
         requested: Option<&LowercaseSha256>,
         actual: Option<&LowercaseSha256>,
+        event_cursor: &EventCursor,
+        event_sequence: u64,
     ) -> Result<(), IngestError> {
         let expected_requested = route_fingerprint_digest_for(&admission.requested_route)
             .map_err(|_| IngestError::DigestEncoding)?;
@@ -1388,6 +1398,16 @@ impl DurableHostEventJournal {
             }
             return Ok(());
         };
+        // Causal applicability (issue #2645 W1/A1): the observation's declared
+        // position inside the bound execution unit must equal this event's
+        // lineage-declared position. A receipt minted for another
+        // cursor/sequence boundary — even with the same attempt, binding,
+        // admission, fence, and generation — cannot justify this event's
+        // actual-route column.
+        if observation.event_cursor != *event_cursor || observation.event_sequence != event_sequence
+        {
+            return Err(IngestError::Contract(ContractError::BindingMismatch));
+        }
         observation
             .validate_against(binding, admission)
             .map_err(IngestError::Contract)?;
