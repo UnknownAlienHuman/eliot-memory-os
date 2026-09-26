@@ -27,8 +27,9 @@ permission. See [`../../docs/architecture/READING_PROTOCOL.md`](../../docs/archi
 <!-- eliot-doc-routing:end -->
 
 
-This brief routes open primary issues #14, #18–#22, #24, completed boundary
-baselines #16, #17, #23, and confirmed bounded defect units #63–#67, #74, #77–#79.
+This brief routes open primary issues #18, #19, #21, #22, #24, completed
+boundary baselines #14, #16, #17, #20, #23, and confirmed bounded defect units
+#63, #64, #66, #67, #74, #77, #78.
 It is not normative. Current meaning comes from the canonical pair in
 `docs/architecture/`, and the exact issue body is the work-unit contract.
 
@@ -103,34 +104,37 @@ Every candidate returns:
 
 | Issue | Primary boundary |
 |---|---|
-| #14 | Host lifecycle and `HostStateJournal` |
 | #18 | `eliotd` semantic admission, legacy-facade extraction, `PreparedTransition`, strict finish |
 | #19 | store bridge, BlobStore owner, Surreal process generation |
-| #20 | isolated typed Instrument/testd execution |
 | #21 | capability-limited WASM component generations |
 | #22 | native worker artifact/facet/epoch/process boundary |
 | #24 | governed Researcher provider process bridge |
 
-Completed primaries #13 and #15 are historical references only and are never
-valid writers. #15 is succeeded for req.1+2+6 by open #1238 (per #1238 body;
-not stated in #15 body). #13 has no single successor; #11 consumes registry
-identities.
+Completed primaries #13, #14, #15 and #20 are historical references only and are
+never valid writers. #15 req.1+2+6 completed via #1238 (closed; per #1238 body,
+not stated in #15 body) with no further open successor observed. #13 has no
+single successor; #11 consumes registry identities. #14 and #20 retain #11 as
+their open follow-up (per Dependencies in the #14/#20 bodies).
 
-Regression probes #7–#10 own Claude Desktop completion, attach/context,
-Antigravity terminal reconciliation, and arbitrary JSON payload integrity.
+Regression probes #7, #8 and #10 own Claude Desktop completion, attach/context,
+and arbitrary JSON payload integrity. Probe #9 (Antigravity terminal
+reconciliation) completed on main and remains a historical discriminator only.
 Issue #11 owns live Windows operational-spine/Product-Pulse evidence.
 
 ## Completed boundary baselines
 
 Completed baseline issues remain historical boundary/proof references and are
-never valid writers. Issue #100 owns the shared native-process convergence
-follow-up.
+never valid writers. Issue #100 completed the shared native-process convergence
+contract on main; open #297 is the follow-on for process-stream sink integration
+(per the #100/#85 comments; #296 and #298 are closed).
 
 | Issue | Completed boundary baseline | Follow-up |
 |---|---|---|
-| #16 | Watchdog deterministic core, protected spool, SCM, containment | #100 |
-| #17 | bounded one-shot Doctor repair execution | #100 |
-| #23 | User Broker SID/session/credential/resource boundary | #100 |
+| #14 | Host lifecycle and `HostStateJournal` boundary | #11 |
+| #16 | Watchdog deterministic core, protected spool, SCM, containment | #297 |
+| #17 | bounded one-shot Doctor repair execution | #297 |
+| #20 | isolated typed Instrument/testd execution plane | #11 |
+| #23 | User Broker SID/session/credential/resource boundary | #297 |
 
 ## Confirmed bounded defect units
 
@@ -141,26 +145,31 @@ the primary integration issues above.
 |---|---|
 | #63 | recompute one canonical executable request hash across Governor, Kernel and Store |
 | #64 | replace scalar authority epochs with one lineage-aware identity and migration |
-| #65 | separate normal admission from protected Control Reserve at every claimed bottleneck |
 | #66 | submit one typed semantic activation result instead of silently re-claiming tickets |
 | #67 | allow bounded concurrent Store transactions for disjoint Ordering Scopes |
 | #74 | give User Broker register/heartbeat/launch/fence distinct operation identities |
 | #77 | translate host requests before Kernel RequestIdentity binding; no raw Frame passthrough |
 | #78 | give notification verification/delivery/ledger steps distinct child operation identities |
-| #79 | separate transport connection identity from durable process/session ownership |
 
-Open issues #82, #83 and #84 remain #100-coordinated restricted subissues, not
-ordinary active branches; their references are retained in the registry as an
-explicit forbidden set so they cannot be reintroduced accidentally as standalone
-defect branches.
+Completed defect units #65 (protected Control Reserve) and #79 (transport vs
+process/session identity) completed on main (verified 2026-09-19 per issue
+comments). Completed evidence unit #85 (durable process-stream evidence handles)
+completed on main with open follow-on #297 (per the #85 comment). All three are
+historical contract references, never writers.
+
+Completed issues #82, #83 and #84 remain #100-coordinated restricted subissues,
+not ordinary active branches; their references are retained in the registry as
+an explicit forbidden set so they cannot be reintroduced accidentally as
+standalone defect branches. #100 itself completed on main.
 
 Merged local repairs #59, #61, #68, #70, #72, #73, #75, #76 and #120 close
 only their exact source discriminators. They are historical baselines, not active
 writers, and must exist on current main before dependent work. #72 now keeps later
 same-project testd work behind every earlier nonterminal durable record, but its
-focused tests were not executed by Actions and #20/#11 still own daemon integration,
-crash recovery and Product Proof. #73 binds provider/config identity to the
-workspace-pinned Wasmtime 47.0.4 generation without establishing #21 runtime
+focused tests were not executed by Actions and #11 still owns daemon integration,
+crash recovery and Product Proof (#20 completed on main). #73 binds
+provider/config identity to the workspace-pinned Wasmtime 47.0.4 generation
+without establishing #21 runtime
 conformance. #75 removes the hidden WASM deadline clamp, while #76 preserves
 typed Store errors and recovery directives; #120 independently persists and
 verifies the effective epoch policy. None establishes runtime or Product
@@ -169,14 +178,13 @@ support.
 ### Required wave ordering
 
 Do not combine the load-bearing migrations into one broad patch. Completed repairs
-(#59, #61, #68, #70, #72, #73, #75, #76, #120) must exist on current main before
-dependent work:
+and migrations (#59, #61, #65, #68, #70, #72, #73, #75, #76, #79, #85, #100, #120)
+must exist on current main before dependent work:
 
 ```text
 #64 lineaged epoch contract
 → #63 executable request digest
-→ #65 protected capacity classes
-→ process-specific identity/activation/error units (#66, #74, #77–#79)
+→ process-specific identity/activation/error units (#66, #74, #77, #78)
 → local scheduler/provider units (#67)
 → affected real edges
 → #11 Product Pulse.

@@ -1,9 +1,9 @@
 {
   "schema": "eliot.core-daemon-workstream.v4",
-  "updated_at": "2026-09-10",
+  "updated_at": "2026-09-26",
   "authority": {
     "branch": "main",
-    "normative_pair": "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b",
+    "normative_pair": "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
     "product_status": "NOT_ACCEPTED_UNVERIFIED",
     "source_identity_rule": "Resolve exact current main at work start and record base/candidate SHAs in issue/PR evidence; this inventory never freezes a source head.",
     "role": "Non-authoritative routing projection; source presence does not create lifecycle, state, semantic, runtime, or support authority."
@@ -65,12 +65,12 @@
     },
     {
       "issue": 65,
-      "status": "OPEN_LOAD_BEARING_MIGRATION",
+      "status": "CLOSED_COMPLETED",
       "property": "Protected control/recovery capacity unavailable to normal workload at every claimed bottleneck."
     },
     {
       "issue": 100,
-      "status": "OPEN_INTEGRATION_OWNER",
+      "status": "CLOSED_COMPLETED",
       "property": "One admitted native ProcessExecutor identity/stream/deadline/cancel/no-orphan contract.",
       "subissues": [
         82,
@@ -81,7 +81,7 @@
     },
     {
       "issue": 79,
-      "status": "OPEN_CONTRACT_MIGRATION",
+      "status": "CLOSED_COMPLETED",
       "property": "Transport connection identity remains distinct from durable process/WorkScope/UserBroker Session identity."
     }
   ],
@@ -108,16 +108,16 @@
       "strategy": "TARGETED_EXTRACTION_AND_HARDENING",
       "main_nonconformant_boundary": "Binary is not yet composition-only and shared process/control-reserve semantics are neither closed nor live-proved.",
       "owner_issues": [
-        14,
-        64,
-        65,
-        100
+        64
       ],
       "next_causal_action": "Close one-writer Host cells and prove journal corruption, lineage replacement, no-orphan lifecycle and independent managed-dependency restart.",
       "proof_required": [
         "journal corruption Module Proof",
         "real Windows service/Job Edge Proof",
         "D0/D1 install/restart/rollback pulse"
+      ],
+      "completed_baseline_issues": [
+        14
       ]
     },
     {
@@ -146,11 +146,8 @@
       "owner_issues": [
         63,
         64,
-        65,
         66,
-        79,
-        88,
-        100
+        88
       ],
       "merged_local_repairs": [
         59
@@ -219,9 +216,7 @@
       "main_nonconformant_boundary": "Independent spool ownership, sustained lease observation, protected containment and live SCM coverage are not closed end to end.",
       "owner_issues": [
         64,
-        65,
-        88,
-        100
+        88
       ],
       "merged_local_repairs": [
         68
@@ -255,9 +250,7 @@
       "strategy": "KEEP_AND_HARDEN",
       "main_nonconformant_boundary": "Canonical identities, shared process/effect execution, unknown-outcome reconciliation and independent verifier-backed terminal state are not fully bound.",
       "owner_issues": [
-        64,
-        65,
-        100
+        64
       ],
       "next_causal_action": "Bind exact recipe identity, RecoveryLease/effect ceilings and one-shot verifier-backed disposition.",
       "proof_required": [
@@ -329,8 +322,7 @@
       "owner_issues": [
         11,
         19,
-        64,
-        100
+        64
       ],
       "next_causal_action": "Bind exact artifact/config/credential/data-root identity and execute rehearsal, quiesce, replacement and rollback/forward repair.",
       "proof_required": [
@@ -358,8 +350,7 @@
       "strategy": "KEEP_AND_HARDEN",
       "main_nonconformant_boundary": "One active root owner and durable process-stream expansion handles are not integrated across crash, purge and consumer reconstruction.",
       "owner_issues": [
-        19,
-        85
+        19
       ],
       "next_causal_action": "Close root ownership, privacy-retention identity, staged-orphan GC and exact expansion handles.",
       "proof_required": [
@@ -389,10 +380,7 @@
       "strategy": "KEEP_CORE_AND_REBUILD_AUTHENTICATED_COMPOSITION",
       "main_nonconformant_boundary": "No authenticated Kernel job path exists; FIFO ordering, shared ProcessExecutor health/evidence and immutable raw-output closure remain open.",
       "owner_issues": [
-        20,
-        79,
-        85,
-        100
+        11
       ],
       "merged_local_repairs": [
         70,
@@ -409,6 +397,9 @@
         82,
         83,
         84
+      ],
+      "completed_baseline_issues": [
+        20
       ]
     },
     {
@@ -466,10 +457,7 @@
       "main_nonconformant_boundary": "Artifact/protocol/facet identity, lineaged epoch, credentials/resources, containment and unknown-effect reconciliation are incomplete.",
       "owner_issues": [
         22,
-        64,
-        79,
-        85,
-        100
+        64
       ],
       "next_causal_action": "Bind one immutable execution manifest to shared ProcessExecutor and explicit resource introductions without worker policy ownership.",
       "proof_required": [
@@ -503,10 +491,7 @@
       "main_nonconformant_boundary": "One durable launch RequestIdentity is reused across operations; logoff/lease/resource/credential and no-orphan behavior are unproved.",
       "owner_issues": [
         64,
-        74,
-        79,
-        85,
-        100
+        74
       ],
       "next_causal_action": "Separate stable launch binding from fresh operation identities, then bind SID/session/epoch/process/resource lifecycle.",
       "proof_required": [
@@ -577,11 +562,9 @@
       "owner_issues": [
         7,
         8,
-        9,
         64,
         66,
-        77,
-        79
+        77
       ],
       "merged_local_repairs": [
         104,
@@ -618,11 +601,7 @@
       "main_nonconformant_boundary": "No admitted provider artifact/process generation, typed adapter, durable Governor job or shared process/evidence path exists.",
       "owner_issues": [
         24,
-        64,
-        65,
-        79,
-        85,
-        100
+        64
       ],
       "merged_local_repairs": [
         86
@@ -663,7 +642,6 @@
       "main_nonconformant_boundary": "Static source/build/signing evidence is not an installed runtime; SCM, ACL, credentials, process lineage, store ownership and failure recovery remain unobserved.",
       "owner_issues": [
         11,
-        14,
         18,
         19
       ],
@@ -676,6 +654,7 @@
         "live-canary decision"
       ],
       "completed_baseline_issues": [
+        14,
         16
       ]
     }
