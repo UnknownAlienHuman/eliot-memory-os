@@ -1761,9 +1761,9 @@ impl<'a> CrossTaskCarryover<'a> {
 /// the local admission HERE and the compilation must be for the foreign task
 /// that distinct admission names — so no screen can be talked into treating a
 /// foreign compilation as local, and none has to re-derive the rule.
-pub fn bound_compilation_task<'a, 'b>(
+pub fn bound_compilation_task<'a>(
     verified: &VerifiedLearningAdmission<'a>,
-    cross_task: Option<&'b CrossTaskCarryover<'a>>,
+    cross_task: Option<&CrossTaskCarryover<'a>>,
 ) -> Result<&'a str, BoundsError> {
     match cross_task {
         Some(carryover) => {
