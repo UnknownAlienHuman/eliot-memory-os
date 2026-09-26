@@ -15,8 +15,13 @@ mod test_cost;
 pub use test_cost::TestCostService;
 
 mod current;
+mod governed;
 
 mod report_clusters;
+pub use governed::{
+    GOVERNED_PROFILE_REPORT_SCHEMA, GovernedProfileReport, GovernedProfileService,
+    GovernedStageReport,
+};
 pub use report_clusters::{FlakeDetectionService, StatefulDbTestIsolationService};
 
 pub struct TestInventoryService;

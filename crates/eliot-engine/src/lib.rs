@@ -263,7 +263,8 @@ pub use ul::{
     weekly_exam_route,
 };
 pub use verification::{
-    FlakeDetectionService, StatefulDbTestIsolationService, TestCostService, TestInventoryService,
+    FlakeDetectionService, GovernedProfileReport, GovernedProfileService, GovernedStageReport,
+    StatefulDbTestIsolationService, TestCostService, TestInventoryService,
     VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,
     VerificationRunnerService, VerificationVerdictService,
 };
