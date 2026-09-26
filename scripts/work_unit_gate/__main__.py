@@ -95,6 +95,181 @@ FROZEN_LEAF_ROUTER_SHA256 = {
 
 PROOF_CHOICES = ("catalogue-only", "selected", "full-project")
 
+# ---------------------------------------------------------------------------
+# Accepted prerequisite evidence (#852 W13).
+#
+# A catalogue row that declares `prerequisites` cannot be selected unless the
+# gate supplies one PrerequisiteEvidence per declared edge, each carrying the
+# historical source receipt, the exact accepted Git object and the accepted
+# result digest. Both acceptance facts are OBSERVED here, never assumed:
+#
+#   accepted_commit       the commit in the current repository that carries the
+#                         issue's owner-claim marker in its subject, resolved
+#                         with a fixed read-only `git rev-list` projection and
+#                         required to be an ancestor of the checked-out HEAD.
+#   accepted_result_sha256 the canonical digest of that observed accepted tree
+#                         (`git rev-parse <commit>^{tree}`), so the recorded
+#                         result identity is bound to the exact accepted
+#                         source object rather than to a free-floating string.
+#
+# Both are real on-disk/git observations. A row whose accepted commit cannot be
+# observed stays unselectable (incomplete), never fabricated, and no fallback
+# accepts a close, an ancestor of the wrong owner, or a supplied literal.
+# ---------------------------------------------------------------------------
+_ACCEPTED_CLAIM_MARKER = "Implements #{number})"
+_GIT_READ_TIMEOUT_S = 30
+_ACCEPTED_RESULT_SCHEMA = "eliot-work-unit-accepted-result-v1"
+
+
+def _git_observed(root: Path, arguments: list[str]) -> str | None:
+    """Run one fixed read-only git projection; return stripped stdout or None.
+
+    `root` bounds the working tree, `-C` keeps every invocation inside the
+    selected repository and no caller-supplied argv, URL or environment ever
+    reaches this call. Any nonzero exit, timeout, decode error or oversized
+    output is an unavailable observation, never a partial answer.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True, timeout=_GIT_READ_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    raw = completed.stdout or b""
+    if not raw or len(raw) > 65536:
+        return None
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeError:
+        return None
+    return text.strip() or ""
+
+
+def _git_succeeds(root: Path, arguments: list[str]) -> bool:
+    """True only when a fixed read-only git projection exits zero.
+
+    Used for predicate projections such as `merge-base --is-ancestor`, which
+    are silent on success and nonzero on a negative answer. A timeout, missing
+    tool or any other failure is reported as a negative answer, so an
+    unobservable ancestry never counts as acceptance.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True, timeout=_GIT_READ_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _accepted_commit(root: Path, issue: int) -> str | None:
+    """Observe the accepted merge commit that claims this issue.
+
+    Closed rule: the newest commit reachable from HEAD that carries the issue's
+    owner-claim marker in its subject, observed with the fixed read-only
+    `git log --grep=<marker> -1 --format=%H` projection (subject lines are
+    matched literally, so no caller text can be read as an option or a shell
+    metacharacter). The result must be a full 40-hex object id, an existing
+    commit object, and an ancestor of the checked-out HEAD, so a commit from an
+    unmerged side branch, a tag or an unrelated ref can never be recorded as
+    accepted evidence.
+    """
+    if not cohort.is_real_repository_root(root):
+        return None
+    marker = _ACCEPTED_CLAIM_MARKER.format(number=issue)
+    observed = _git_observed(root, ["log", "--grep=" + marker, "-1", "--format=%H", "HEAD"])
+    if observed is None or re.fullmatch(r"[0-9a-f]{40}", observed) is None:
+        return None
+    if _git_observed(root, ["cat-file", "-t", observed]) != "commit":
+        return None
+    head = _git_observed(root, ["rev-parse", "HEAD"])
+    if head is None or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        return None
+    if not _git_succeeds(root, ["merge-base", "--is-ancestor", observed, head]):
+        return None
+    return observed
+
+
+def _accepted_result_sha256(root: Path, accepted_commit: str) -> str | None:
+    """Digest the observed accepted tree, binding the result to real source.
+
+    The digest is the canonical hash of the observed accepted commit identity
+    together with its observed tree object, so two different accepted trees
+    can never share a result digest and a changed tree always changes it.
+    """
+    tree = _git_observed(root, ["rev-parse", f"{accepted_commit}^{{tree}}"])
+    if tree is None or not re.fullmatch(r"[0-9a-f]{40}", tree):
+        return None
+    try:
+        return c.canonical_sha256({"schema": _ACCEPTED_RESULT_SCHEMA,
+                                   "commit": accepted_commit, "tree": tree})
+    except c.ContractViolation:
+        return None
+
+
+def _prerequisite_evidence(
+    acceptance_root: Path,
+    mode: c.SourceAuthority,
+    rows: dict,
+    required: set,
+    memo: dict,
+) -> tuple:
+    """Supply one PrerequisiteEvidence per declared prerequisite edge.
+
+    `rows` maps issue number to the catalogue row; `required` is the exact set
+    the plan will demand. Each prerequisite row must be ACCEPTED_HISTORICAL
+    (the #857 contract enforces that too) and its historical source is acquired
+    through the frozen #849 source with the distinct PREREQUISITE_EVIDENCE
+    use. Acquisition and observation run once per distinct issue.
+
+    `acceptance_root` is the real repository that carries the accepted history;
+    it is observed, never written. A declared edge whose historical source,
+    accepted commit or accepted result cannot be observed yields no evidence
+    at all, so the selected plan stays unsatisfied rather than half-proven.
+    """
+    evidence: list = []
+    for number in sorted(required):
+        row = rows.get(number)
+        if row is None:
+            return ()
+        unit = row.unit
+        issue = row.issue
+        if number in memo:
+            document = memo[number]
+        else:
+            try:
+                request = assignment_source.SourceRequest(
+                    issue=issue, unit=unit,
+                    source_use=c.AssignmentSourceUse.PREREQUISITE_EVIDENCE)
+            except (assignment_source.SourceError, c.ContractViolation):
+                return ()
+            try:
+                source = assignment_source.AssignmentSource(request)
+            except Exception:
+                return ()
+            if type(source) is not assignment_source.AssignmentSource:
+                return ()
+            try:
+                document = source.read(mode)
+            except Exception:
+                return ()
+            if type(document) is not assignment_source.AssignmentDocument:
+                return ()
+            memo[number] = document
+        accepted = _accepted_commit(acceptance_root, number)
+        if accepted is None:
+            return ()
+        result = _accepted_result_sha256(acceptance_root, accepted)
+        if result is None:
+            return ()
+        try:
+            evidence.append(c.PrerequisiteEvidence(document.receipt, accepted, result))
+        except c.ContractViolation:
+            return ()
+    return tuple(evidence)
+
 # Frozen CLI contract (#837 D-WU-FINAL, integrator-frozen; byte-for-byte).
 # Proof kinds: catalogue-only | selected | full-project (validated before
 # effects). Selector: --issue NUMBER (repeatable, distinct values) xor --crate
@@ -629,6 +804,7 @@ def main(argv: list[str] | None = None) -> int:
     memo_assignment: dict[int, object] = {}
     memo_descriptor: dict[int, object] = {}
     memo_markers: dict[str, object] = {}
+    memo_prereq: dict[int, object] = {}
 
     def fail_result(terminal_detail: str, exit_code: int, counts: dict | None = None,
                     missing: list | None = None, blocked: list | None = None,
@@ -1062,10 +1238,38 @@ def main(argv: list[str] | None = None) -> int:
         all_typed: list = []
         for num in sorted(set(bound_descs) | set(unbound_descs)):
             all_typed.append(bound_descs[num] if num in bound_descs else unbound_descs[num])
+        # Declared prerequisite edges come from the committed lock the gate
+        # already reads; a root that ships no lock declares none. Erasing the
+        # edges here would make a prerequisite-carrying row permanently
+        # unselectable instead of merely unexercised, so the declared edges
+        # are projected onto the rows and their locked prerequisite rows are
+        # added to the denominator.
+        lock_path = root / ".github" / "work-unit-cohort.toml"
         try:
-            rows_all = tuple(c.CatalogueRow(issue=d.issue, unit=d.unit, body_sha256=d.body_sha256,
-                                            disposition=c.CatalogueDisposition.ASSIGNED,
-                                            descriptor=d, prerequisites=()) for d in all_typed)  # type: ignore[attr-defined]
+            locked = cohort.locked_catalogue_rows(lock_path, {d.issue.number: d for d in all_typed})
+        except cohort.CohortError as exc:
+            return finish(fail_result(
+                f"catalogue aggregate lock invalid: {_redact(exc.problem.value)}", 1,
+                failed=["catalogue-lock"]))
+        except c.ContractViolation:
+            return finish(fail_result("catalogue contract failure", 1, failed=["catalogue"]))
+        except Exception:
+            return finish(fail_result("catalogue internal failure", 2))
+        try:
+            # A discovered descriptor keeps its own ASSIGNED row when the lock
+            # declares none for it (a root that ships no lock at all, or a
+            # descriptor added ahead of its locked row). Only a lock that
+            # actually declares the row supplies its disposition, body digest
+            # and prerequisite edges, so an unlocked descriptor is never
+            # silently re-dispositioned and a locked edge is never dropped.
+            synthesized = {d.issue.number: c.CatalogueRow(
+                issue=d.issue, unit=d.unit, body_sha256=d.body_sha256,
+                disposition=c.CatalogueDisposition.ASSIGNED,
+                descriptor=d, prerequisites=()) for d in all_typed}
+            rows_all = tuple(locked.get(d.issue.number, synthesized[d.issue.number])
+                             for d in all_typed) + tuple(
+                row for number, row in sorted(locked.items())
+                if number not in synthesized)
             expected_all = tuple(sorted({r.issue for r in rows_all}))
             catalogue_full = cohort.materialize_catalogue(rows_all, expected_all)
         except cohort.CohortError as exc:
@@ -1097,7 +1301,31 @@ def main(argv: list[str] | None = None) -> int:
                                                 profile_sha256=profile_sha,
                                                 scope=scope, issues=sel_issues)
             plan_descs = tuple(bound_descs[n] for n in sorted(bound_descs))
-            plan = cohort.materialize_selection_plan(catalogue_full, selection, plan_descs, ())
+            # Real prerequisite evidence for every declared edge of every
+            # selected row. An empty declared set supplies the empty evidence
+            # tuple exactly as before; a declared edge demands its own
+            # accepted-historical source, accepted commit and accepted result,
+            # and an unobservable one leaves the plan unsatisfied.
+            rows_by_issue = {r.issue.number: r for r in catalogue_full.rows}
+            required_prereqs = set()
+            for d in plan_descs:
+                row = rows_by_issue[d.issue.number]
+                required_prereqs.update(prereq.number for prereq in row.prerequisites)
+            prereq_evidence: tuple = ()
+            if required_prereqs:
+                # Accepted history lives in the repository that owns the
+                # catalogue, exactly like the leaf-router freeze below, so a
+                # temp fixture root never has to fabricate a git object.
+                acceptance_root = Path(__file__).resolve().parents[2]
+                prereq_evidence = _prerequisite_evidence(
+                    acceptance_root, mode, rows_by_issue, required_prereqs, memo_prereq)
+                if len(prereq_evidence) != len(required_prereqs):
+                    return finish(fail_result(
+                        "prerequisite evidence unavailable: accepted prerequisite source, "
+                        "accepted commit or accepted result is not observable", 1,
+                        failed=[f"issue-{n}" for n in sorted(required_prereqs)]))
+            plan = cohort.materialize_selection_plan(catalogue_full, selection, plan_descs,
+                                                     prereq_evidence)
         except cohort.CohortError as exc:
             problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
             return finish(fail_result(f"selection failure: {_redact(problem)}", 1, failed=["selection"]))
