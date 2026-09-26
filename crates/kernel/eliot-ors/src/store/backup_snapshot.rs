@@ -86,6 +86,21 @@
 //! - A request that declares no family cursor yields a snapshot with no family
 //!   denominator, which [`OrsBackupSnapshot::validate`] can never accept as
 //!   `Complete`. Legacy evidence is partial evidence, not an empty family.
+//!
+//! Issue #2883 adds the durable `backup.verify` result family to that same
+//! denominator. `RowFamilyKind::BackupVerificationResults` is one row per distinct
+//! `(principal, authority lineage, operation id)` within one installation's ORS
+//! file, and it is now DECLARED in this EXISTING ORS operational retention/export
+//! contract, which is the existing owner of its lifecycle. Be precise about what
+//! that declaration is worth: `row_family_denominator` has NO production reader in
+//! this tree, on this branch and on `origin/main`, so nothing yet COUNTS the family
+//! and nothing bounds it. Its real cardinality is one row per distinct
+//! `(principal, authority lineage, operation id)`, plus one quarantined row per
+//! pre-#2883 caller key. No eviction, TTL, cap or deletion is added here, and the
+//! bounded-retirement work stays with the separate ORS retention owner. The
+//! family's disposition delegates to [`RowFamilyKind::disposition`], which routes
+//! it to `ForensicOnly` alongside the `UnknownCommitRecovery` sibling, so an
+//! exported row lands as forensics and never as an importable answer.
 
 use std::fmt::Write as _;
 use std::ops::Bound;
@@ -202,6 +217,22 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::RestoreJournalMeta),
         // Scan disclosure receipts are evidence, never live scan state (#2900).
         RowFamilyDisposition::of(RowFamilyKind::ScanDisclosure),
+        // Owner-backed verification results are evidence, never authority: this
+        // family is DECLARED in the EXISTING ORS operational retention/export
+        // contract here (#2883 instruction 10), which is that contract's own
+        // lifecycle owner. Be precise about what the declaration buys: this
+        // function has NO production reader in this tree, so nothing yet counts
+        // the family and nothing bounds it. No eviction, TTL, cap or deletion is
+        // added; the real cardinality is one row per distinct
+        // `(principal, authority lineage, operation id)` within one installation's
+        // ORS file, plus one quarantined row per pre-#2883 caller key, and bounded
+        // retirement stays with the separate ORS retention owner. Its
+        // `ForensicOnly` disposition is the `UnknownCommitRecovery` sibling's, and
+        // the reason is that this family has no `import_*_suspended` path at all —
+        // `Restorable` would advertise a durable re-import that does not exist, so
+        // a restored installation can never read a prior installation's
+        // verification answer back as its own.
+        RowFamilyDisposition::of(RowFamilyKind::BackupVerificationResults),
     ]
 }
 

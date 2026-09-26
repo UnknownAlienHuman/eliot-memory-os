@@ -255,7 +255,24 @@ impl ArchivedFenceRelation {
 
 /// Outcome of one capture or verification: the requested class, exact
 /// source and archive identities, evidence level, class ceiling, archived-fence
-/// relation, member dispositions, and terminal state.
+/// relation, member dispositions, terminal state, and the archive's own
+/// source/provenance commitments.
+///
+/// The three source/provenance commitments
+/// ([`source_installation`](Self::source_installation),
+/// [`owner_contract`](Self::owner_contract) and
+/// [`export_fence_digest`](Self::export_fence_digest)) are the archive's own
+/// declared source and provenance, not recovery evidence. Be precise about the
+/// word "declared": on the verify path the result is a
+/// [`CaptureEvidenceLevel::StructurallyValidCandidate`], so these are text the
+/// ARCHIVE declares about itself and this owner re-validates for internal
+/// consistency — the export fence is re-checked by the bundle's own `validate`,
+/// and the manifest's digest binding is re-computed — but they are NOT proved
+/// against a capture owner, because none exists on this path. Equal bytes
+/// exported by a different owner, from a different installation, or under a
+/// different export fence are therefore a different request (I5.27: "archive
+/// SHA-256 alone is content integrity, not the source/capture operation
+/// identity"), not a contradiction this route can detect.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureReport {
     /// Archive backup identity bound at build.
@@ -264,6 +281,30 @@ pub struct CaptureReport {
     pub class: BackupClass,
     /// Deterministic digest of the complete encoded archive.
     pub archive_sha256: String,
+    /// The archive's own source installation identity, as declared in the export
+    /// fence (`ExportFence::export_id`) this owner already treats as the
+    /// archive's source installation in [`SnapshotRelation::installation_id`].
+    /// Read from the decoded archive, never inferred from the verifying session
+    /// or a local path, and NOT proved against a capture owner.
+    pub source_installation: String,
+    /// The archive's own capture/owner contract identity, read from the decoded
+    /// manifest's `source_adapter` — the producer identity the archive declares.
+    /// The `EcxfManifest` carries no separate owner-contract field beyond the
+    /// producing `source_adapter`, `backup_id` and class, so that is the one real
+    /// owner-identity value available and no second spelling of it is invented
+    /// here. It is declared by the archive and re-validated for internal
+    /// consistency only, NOT proved against a capture owner.
+    pub owner_contract: String,
+    /// The archive's own export-fence digest, taken from the manifest's
+    /// `export_fence_sha256`. This one IS re-derived rather than merely declared:
+    /// the archive format computes it at build and `BackupBundle::validate`
+    /// recomputes it from the decoded fence and re-checks the manifest binding on
+    /// every decode, so a mismatch is refused before this value is read. The
+    /// owner value is used as-is; the digest formula is not recomputed in a second
+    /// place. It is historical fence evidence: it says what fence the export
+    /// happened under, which is not the same fact as the verifying session's
+    /// current authority.
+    pub export_fence_digest: String,
     /// Operation identity of this result. Capture mints it once at the single
     /// publication; verification only reports back the identity its admitted
     /// caller bound, because I5.27 defines idempotency over canonical bytes and
@@ -392,6 +433,13 @@ impl KernelBackupCapture {
             backup_id,
             class: request.plan.class,
             archive_sha256,
+            // The producing owner is this very operation, so the archive's own
+            // source installation and owner contract are the frozen plan's and
+            // the export fence's own declared values, and the fence digest is
+            // the one the bundle format computed and validated at build.
+            source_installation: bundle.export_fence.export_id.clone(),
+            owner_contract: bundle.manifest.source_adapter.clone(),
+            export_fence_digest: bundle.manifest.export_fence_sha256.clone(),
             operation_id,
             state,
             // The capture really did build, validate and publish once through
@@ -420,6 +468,15 @@ impl KernelBackupCapture {
     /// over canonical bytes, "not over caller spelling or an unversioned hash",
     /// so a fabricated `verify-only-{backup_id}` would be a spelling, not an
     /// operation identity.
+    ///
+    /// The report also carries the archive's own source/provenance commitments
+    /// (`source_installation`, `owner_contract`, `export_fence_digest`), read
+    /// out of the decoded `export_fence` and `manifest`. A caller that keeps
+    /// them in its canonical request digest is what makes "the same bytes,
+    /// exported by a different owner or from a different installation" a
+    /// different operation rather than a replay (#2883 instruction 6); reading
+    /// them here is a decode, not a second validation, so no check is duplicated
+    /// and none is weakened.
     #[allow(
         clippy::unused_self,
         reason = "governed owner seam keeps &self receivers; the work root binds composition"
@@ -444,6 +501,18 @@ impl KernelBackupCapture {
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
         let backup_id = bundle.manifest.backup_id.clone();
         let class = bundle.manifest.class;
+        // The archive's own source and provenance, read out of the decoded fence
+        // and manifest rather than from the verifying session. I5.27 requires
+        // them in the canonical request digest because archive SHA-256 alone is
+        // content integrity, not the source/capture operation identity. Two are
+        // the archive's own declared text (`export_fence.export_id`,
+        // `manifest.source_adapter`); the fence digest is the manifest's
+        // precomputed `export_fence_sha256`, which `BackupBundle::validate` has
+        // already recomputed and re-bound on this decode, so it is never a digest
+        // recomputed here.
+        let source_installation = bundle.export_fence.export_id.clone();
+        let owner_contract = bundle.manifest.source_adapter.clone();
+        let export_fence_digest = bundle.manifest.export_fence_sha256.clone();
         let member_dispositions = member_disposition_list(
             &bundle.canonical_events,
             &bundle.projections,
@@ -464,6 +533,9 @@ impl KernelBackupCapture {
             backup_id,
             class,
             archive_sha256,
+            source_installation,
+            owner_contract,
+            export_fence_digest,
             state,
             // Decoding, validating and relating bytes is the whole of this
             // path: no retained capture artifact is looked up, so the result

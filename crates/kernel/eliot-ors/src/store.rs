@@ -63,22 +63,23 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
-    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
-    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
-    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
-    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
-    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
-    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
-    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
-    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
-    RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
-    RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach,
-    StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
-    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
-    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
-    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    KernelAuthoritySnapshot, LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission,
+    NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel,
+    OperationIdentity, OperationalMutationReceipt, OperationalPhase, OperationalRecordContext,
+    OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
+    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
+    ProcessStartReplayState, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
+    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRevalidation,
+    ProcessStreamRecoveryStatusProjection, ProcessStreamRecoveryWriteOutcome,
+    ProcessStreamRetirementProof, ProcessStreamSourceResolver, RecoveredAuthoritySnapshot,
+    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
+    RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, ReservationRecord,
+    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
+    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
+    StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
+    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
+    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
+    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
@@ -2823,7 +2824,6 @@ impl persistence_codec::PersistedValue for BackupVerificationResultRecord {
         self.validate()
     }
 }
-
 fn doctor_storage(error: impl std::fmt::Display) -> crate::DoctorLedgerError {
     crate::DoctorLedgerError::Storage(error.to_string())
 }
@@ -3838,12 +3838,37 @@ impl RedbRecoveryStore {
 
     /// Loads one durable `backup.verify` result by exact idempotency key
     /// (I14.21 readback, issue #2802).
+    /// Loads one durable `backup.verify` result by exact durable row key
+    /// (I14.21 readback, issue #2802, rescoped by #2883).
+    ///
+    /// The row key is a *byte key*, not an identity. Both production callers pass
+    /// a 64-hex digest: the fresh-verify path passes the presented identity's own
+    /// [`BackupVerificationResultRecord::record_key`], and the reconciliation path
+    /// deliberately passes the *presented* `predecessor_namespace_digest`, so the
+    /// route never has to compute a key for an operation it did not run. The
+    /// parameter name is retained for that caller-supplied value, which is a
+    /// digest and not caller text.
     ///
     /// The stored row is re-validated through the same ORS codec every sibling
-    /// reader uses, so a row whose own digests or owner spellings no longer hold
-    /// is an integrity failure rather than a replayable answer. `Ok(None)` means
-    /// this operation identity was never recorded; it is not an unknown answer,
-    /// and a caller must not treat it as one.
+    /// reader uses — `decode` runs the record's `PersistedValue::validate_persisted`,
+    /// which for this record IS `validate()` — so a row whose own digests or owner
+    /// spellings no longer hold is an integrity failure rather than a replayable
+    /// answer, and a second explicit `validate()` here would be redundant.
+    ///
+    /// It additionally asserts that the decoded row's OWN key is the key it was
+    /// read under, the way the sibling readers in this file do. That is strictly
+    /// stronger than a shape check: it catches a row filed under a key that is not
+    /// its own, which on this family would otherwise let a caller-presented digest
+    /// address a row belonging to a different operation. `Ok(None)` means nothing
+    /// is stored under that key; it is not an unknown answer, and a caller must not
+    /// treat it as one.
+    ///
+    /// This reader is NOT the legacy/quarantine probe and must not be pointed at
+    /// raw caller text: a pre-#2883 row cannot decode under the current contract,
+    /// so it would surface as an integrity error rather than a typed legacy
+    /// refusal. Use
+    /// [`RedbRecoveryStore::legacy_unscoped_backup_verification_class`] for that
+    /// question.
     pub fn load_backup_verification_result(
         &self,
         idempotency_key: &str,
@@ -3857,27 +3882,117 @@ impl RedbRecoveryStore {
             .map_err(storage)?
             .map(|value| {
                 let record: BackupVerificationResultRecord = decode(value.value())?;
-                record.validate()?;
+                if record.record_key()? != idempotency_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+                        reason: "table key does not match the row's own namespace digest"
+                            .to_owned(),
+                    });
+                }
                 Ok(record)
             })
             .transpose()
     }
 
-    /// Stages one durable `backup.verify` result under its operation identity.
+    /// Classifies a raw caller key against the pre-#2883 legacy shape
+    /// (instruction 9: legacy rows are quarantined, never certified or re-keyed).
     ///
-    /// Persist-before-answer: the row is committed before the route answers, so
-    /// a lost response reconciles to this same persisted result instead of
-    /// re-deriving a differently-fenced one. An exact replay under the same key
-    /// returns [`BackupVerificationDisposition::AlreadyBound`] with the durable
-    /// winner; a different request digest under the same key fails with
-    /// [`OrsError::IntegrityProblem`] and never overwrites the bound row.
+    /// The probe exists for exactly one reason: a durable row under the caller's
+    /// own text must be neither silently ignored nor silently adopted. Silently
+    /// ignoring it would leave a caller re-running a key that already has a
+    /// stored answer with no explanation, and silently adopting it would certify an
+    /// answer that carries no principal, session, scope or fence ownership to the
+    /// first caller who asks after an upgrade.
+    ///
+    /// It returns one of three classes, and the caller must honour all three
+    /// differently — that is what makes the probe fail CLOSED rather than fail
+    /// open: [`LegacyUnscopedBackupVerificationClass::Absent`] means the key is
+    /// free and a fresh scoped row may be staged;
+    /// [`LegacyUnscopedBackupVerificationClass::Legacy`] means pre-#2883 evidence
+    /// that must be quarantined, never certified, re-keyed or projected; and
+    /// [`LegacyUnscopedBackupVerificationClass::Unreadable`] means bytes are there
+    /// that are neither shape, so NO verification result may be answered at all —
+    /// staging over an unreadable row would destroy evidence and answer `ok` for a
+    /// verification whose prior answer is still on disk.
+    ///
+    /// It returns `Legacy` only for the pre-#2883 shape, whose key was the
+    /// caller's own text: a current-contract row carries a nested `identity` and no
+    /// `idempotency_key` at all, and this is the ONLY path that produces the legacy
+    /// class — a staged key is always a 64-hex namespace digest, so staging can
+    /// never be where a legacy row is found. Nothing is migrated, re-keyed,
+    /// backfilled or returned.
+    pub fn legacy_unscoped_backup_verification_class(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<LegacyUnscopedBackupVerificationClass, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BACKUP_VERIFICATION_RESULTS)
+            .map_err(storage)?;
+        let Some(bytes) = table
+            .get(idempotency_key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(LegacyUnscopedBackupVerificationClass::Absent);
+        };
+        Ok(crate::classify_backup_verification_key(
+            &bytes,
+            idempotency_key,
+        ))
+    }
+    /// Stages one durable `backup.verify` result under its scoped namespace key.
+    ///
+    /// Persist-before-answer: the row is committed before the route answers, so a
+    /// lost response reconciles to this same persisted result instead of
+    /// re-deriving a differently-fenced one (I14.21). That reconcile is possible
+    /// only because the durable key does not move: a lost response, a reconnect, a
+    /// module re-registration and an Authority Epoch rotation all leave
+    /// `record_key()` unchanged, so the retry addresses the row that was already
+    /// committed instead of staging a second one under a different key.
+    ///
+    /// The durable key is [`BackupVerificationResultRecord::record_key`], the
+    /// 64-hex namespace digest over principal, authority lineage, operation id and
+    /// the four profile constants; its preimage is enumerated in exactly one place,
+    /// [`BackupVerifyRequestIdentity::namespace_digest`]. Two principals who picked
+    /// the same human idempotency text therefore can never reach each other's row.
+    /// There is no in-band installation component: a row is only ever read out of
+    /// one installation's ORS file, structurally, because that file owns it.
+    ///
+    /// The three outcomes are answers, not faults:
+    /// - [`BackupVerificationDisposition::Stored`] — this candidate is now the
+    ///   durable row.
+    /// - [`BackupVerificationDisposition::AlreadyBound`] — an equal
+    ///   `same_binding` canonical-request-hash match; the durable winner decides
+    ///   the reply.
+    /// - [`BackupVerificationDisposition::ForeignOperation`] — a row occupies this
+    ///   key but its stored `principal` or `scope_id` differs from the candidate's.
+    ///   Reach this on an ORDINARY, uncorrupted row: `scope_id` is NOT a key
+    ///   component, so two sessions of one principal on one lineage with one
+    ///   `operation_id` and one archive but different `WorkScope`s share one key,
+    ///   and on a load-then-stage race the second writer reads the first's row here.
+    ///   A different PRINCIPAL at the same key would be a SHA-256 collision and is
+    ///   not reachable through the route. The existing row is NOT read back and NOT
+    ///   returned, so no foreign projection leaves the store either way.
+    ///
+    /// There is deliberately no legacy class on this path, and no variant to
+    /// carry one: a pre-#2883 row's key was caller text, so it cannot sit at a
+    /// 64-hex staged key except in the corner where a pre-#2883 caller happened to
+    /// choose a 64-hex idempotency key, and that row falls through to
+    /// [`OrsError::IntegrityProblem`] and fails closed rather than being adopted.
+    /// The legacy class is a LOAD-time classification in a different type,
+    /// [`LegacyUnscopedBackupVerificationClass`], returned by
+    /// [`RedbRecoveryStore::legacy_unscoped_backup_verification_class`].
+    ///
+    /// A row that is not a decodable current-contract row is still
+    /// [`OrsError::IntegrityProblem`]: fail closed rather than classify corruption.
     pub fn stage_backup_verification_result(
         &self,
         record: &BackupVerificationResultRecord,
     ) -> Result<BackupVerificationDisposition, OrsError> {
         record.validate()?;
         let write = self.database.begin_write().map_err(storage)?;
-        let key = record.record_key();
+        let key = record.record_key()?;
         let disposition = {
             let mut table = write
                 .open_table(BACKUP_VERIFICATION_RESULTS)
@@ -3895,15 +4010,32 @@ impl RedbRecoveryStore {
                 write.commit().map_err(storage)?;
                 return Ok(BackupVerificationDisposition::Stored);
             };
-            let existing: BackupVerificationResultRecord = decode(&bytes)?;
-            existing.validate()?;
-            if !existing.same_binding(record) {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
-                    reason: "existing backup-verification binding conflicts".to_owned(),
-                });
+            // A pre-#2883 shape cannot deserialize into the current record, so the
+            // two shapes are read separately instead of one being coerced into the
+            // other. `decode` would fold a legacy row into `IntegrityProblem`,
+            // which is what this path deliberately does with one.
+            match serde_json::from_str::<BackupVerificationResultRecord>(&bytes) {
+                Ok(existing) => {
+                    existing.validate()?;
+                    if existing.same_binding(record) {
+                        BackupVerificationDisposition::AlreadyBound(Box::new(existing))
+                    } else if existing.foreign_to(record) {
+                        BackupVerificationDisposition::ForeignOperation
+                    } else {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+                            reason: "existing backup-verification binding conflicts".to_owned(),
+                        });
+                    }
+                }
+                Err(_) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+                        reason: "existing backup-verification row is not readable under the current contract"
+                            .to_owned(),
+                    });
+                }
             }
-            BackupVerificationDisposition::AlreadyBound(Box::new(existing))
         };
         write.commit().map_err(storage)?;
         Ok(disposition)
