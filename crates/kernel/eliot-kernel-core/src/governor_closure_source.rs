@@ -961,6 +961,8 @@ mod tests {
                 status: GrantStatus::Active,
             }],
             revoked: Vec::new(),
+            root_transitions: Vec::new(),
+            quarantined_cross_root: Vec::new(),
         })
     }
 

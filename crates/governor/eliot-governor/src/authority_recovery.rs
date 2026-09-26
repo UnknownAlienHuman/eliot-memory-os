@@ -384,7 +384,7 @@ impl AuthorityOwner {
     ) -> Result<Self, CompositionError> {
         let snapshot = AuthorityOwnerSnapshot::canonical_durable_snapshot(snapshot)?;
         snapshot.validate_against(expected_fence)?;
-        let grants = GrantGraph::from_recovery_snapshot(snapshot.grant_graph.clone())
+        let grants = GrantGraph::from_recovery_snapshot(&snapshot.grant_graph)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -434,7 +434,7 @@ impl AuthorityOwner {
             ));
         }
         let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
-            snapshot.grant_graph.clone(),
+            &snapshot.grant_graph,
             Some(evidence),
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
