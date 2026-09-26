@@ -7,6 +7,7 @@
 //! reading either alone tells you nothing about what is actually guaranteed.
 
 use super::*;
+use eliot_engine::ProfileResolutionRequest;
 use eliot_types::{ObserveHint, ObserveInput};
 
 /// Capture-first canonical observation route.
@@ -2052,7 +2053,12 @@ pub(super) fn dispatch_verify_plan(state: &McpState, arguments: Value) -> Result
 
 fn dispatch_governed_verify_plan(state: &McpState, profile: &str) -> Result<Value> {
     let blob_store = BlobStore::open(&state.blob_store)?;
-    let report = GovernedProfileService.describe_execution(profile, Some(&blob_store))?;
+    let request = mcp_governed_profile_resolution_request(state)?;
+    let report = GovernedProfileService.describe_execution(
+        profile,
+        &request.bindings()?,
+        Some(&blob_store),
+    )?;
     write_verification_report_json_md(
         state,
         "governed-profile",
@@ -2066,6 +2072,45 @@ fn dispatch_governed_verify_plan(state: &McpState, profile: &str) -> Result<Valu
         "success": report.success,
         "report_ref": state.root.join("reports").join("governed-profile").join("latest.json")
     }))
+}
+
+/// Assembles the admitted resolution inputs for one governed MCP verify plan.
+///
+/// The source root is the live worktree this invocation runs in, the target and
+/// cache roots are the instrument lane's own subtrees of this runtime root, the
+/// authority lineage is the running runtime's own published `runtime_id`, and
+/// the environment class is the one the instrument specs declare. Nothing is
+/// defaulted, so a plan that cannot be resolved against a real binding fails
+/// closed instead of running under a substituted one.
+fn mcp_governed_profile_resolution_request(state: &McpState) -> Result<ProfileResolutionRequest> {
+    let worktree = std::env::current_dir()
+        .context("resolve the verified worktree for a governed profile plan")?;
+    let source_root = std::fs::canonicalize(&worktree).with_context(|| {
+        format!(
+            "resolve the verified worktree for a governed profile plan: {}",
+            worktree.display()
+        )
+    })?;
+    let runtime_root = std::fs::canonicalize(&state.root).with_context(|| {
+        format!(
+            "resolve the MCP runtime root for a governed profile plan: {}",
+            state.root.display()
+        )
+    })?;
+    let target_root = runtime_root.join("instrument-target");
+    let cache_root = runtime_root.join("instrument-cache");
+    std::fs::create_dir_all(&target_root)
+        .context("create the admitted instrument target root for a governed profile plan")?;
+    std::fs::create_dir_all(&cache_root)
+        .context("create the admitted instrument cache root for a governed profile plan")?;
+    Ok(ProfileResolutionRequest::new(
+        source_root.to_string_lossy().into_owned(),
+        target_root.to_string_lossy().into_owned(),
+        cache_root.to_string_lossy().into_owned(),
+        state.runtime_id.clone(),
+        format!("mcp:{}", state.instance_name),
+        eliot_engine::ISOLATED_PROCESS_CLASS.to_owned(),
+    ))
 }
 
 pub(super) fn dispatch_verify_report(state: &McpState) -> Result<Value> {

@@ -18,9 +18,16 @@ mod current;
 mod governed;
 
 mod report_clusters;
+/// Environment class the admitted instrument specs declare for their stages.
+///
+/// Composition roots pass this exact class into
+/// [`ProfileResolutionRequest::new`]; the resolver refuses any other class, so
+/// a caller cannot silently resolve a stage under a different environment.
+pub use eliot_instrument_runner::profile::ISOLATED_PROCESS_CLASS;
 pub use governed::{
     GOVERNED_PROFILE_REPORT_SCHEMA, GovernedProfileReport, GovernedProfileService,
-    GovernedStageReport,
+    GovernedStageReport, ProfileResolutionBindings, ProfileResolutionRequest,
+    ResolvedBindingReport,
 };
 pub use report_clusters::{FlakeDetectionService, StatefulDbTestIsolationService};
 

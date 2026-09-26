@@ -31,11 +31,11 @@ pub use process_owner::{
     KernelInstrumentRequestPort,
 };
 pub use profile::{
-    AdmittedProfile, AdmittedStage, BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION,
-    COMPILER_PROFILE, CompiledProfile, InstrumentProfile, InstrumentProfileResolver,
-    InstrumentRegistry, InstrumentSpec, ProfileCompiler, ProfileError, ProfileScopeClasses,
-    ResolvedProfile, ResolvedStage, StageDag, StageDecl, StageEnvironment, TEST_PROFILE,
-    TargetLayout, WorkScope,
+    ADMITTED_SCOPE_CLASS, ADMITTED_WORKTREE_CLASS, AdmittedProfile, AdmittedStage,
+    BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION, COMPILER_PROFILE, CompiledProfile,
+    ISOLATED_PROCESS_CLASS, InstrumentProfile, InstrumentProfileResolver, InstrumentRegistry,
+    InstrumentSpec, ProfileCompiler, ProfileError, ProfileScopeClasses, ResolvedProfile,
+    ResolvedStage, StageDag, StageDecl, StageEnvironment, TEST_PROFILE, TargetLayout, WorkScope,
 };
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,

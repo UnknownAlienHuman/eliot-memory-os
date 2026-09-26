@@ -1372,4 +1372,37 @@ impl<'a> ProfileCompiler<'a> {
             environment,
         )
     }
+
+    /// Compiles one profile name and resolves its exact admitted revision.
+    ///
+    /// This is the production resolution entry of the single compiler: the
+    /// revision is taken from this compiler's own governed admission instead
+    /// of from caller text, so a resolved profile always shares the compiled
+    /// definition, and a quarantined name never reaches the resolver. Callers
+    /// supply only the admitted execution bindings (target layout, `WorkScope`,
+    /// and environment), which the resolver validates against the profile
+    /// classes before expanding the stage DAG.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::UnknownProfile`] when the name quarantines with
+    /// no admitted revision, and the [`InstrumentProfileResolver::resolve`]
+    /// failures when a binding is refused.
+    pub fn resolve_admitted(
+        &self,
+        profile: &str,
+        layout: TargetLayout,
+        scope: WorkScope,
+        environment: StageEnvironment,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        let admitted = self.registry.admitted_head(profile)?;
+        let admission = self.compile_exact(&admitted.name, admitted.revision)?;
+        self.resolve_full(
+            &admission.name,
+            admission.revision,
+            layout,
+            scope,
+            environment,
+        )
+    }
 }

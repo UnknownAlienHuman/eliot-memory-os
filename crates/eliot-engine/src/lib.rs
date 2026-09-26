@@ -264,7 +264,8 @@ pub use ul::{
 };
 pub use verification::{
     FlakeDetectionService, GovernedProfileReport, GovernedProfileService, GovernedStageReport,
-    StatefulDbTestIsolationService, TestCostService, TestInventoryService,
+    ISOLATED_PROCESS_CLASS, ProfileResolutionBindings, ProfileResolutionRequest,
+    ResolvedBindingReport, StatefulDbTestIsolationService, TestCostService, TestInventoryService,
     VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,
     VerificationRunnerService, VerificationVerdictService,
 };
