@@ -37,7 +37,11 @@
 //! terminal-completion call by construction; the only cryptography is the
 //! canonical digest below, and the only fallible work is pure bounded
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
-//! every branch binds an explicit input field.
+//! every branch binds an explicit input field. The retained comparison and
+//! causal supplement shapes are legacy version 1 declarations: their values
+//! are preserved and digested, but never treated as owner evidence. They do
+//! not qualify equality, difference, prediction support, intervention, or
+//! causal attribution. No legacy bytes are deserialized into a stronger shape.
 //!
 //! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
@@ -158,7 +162,7 @@ pub const MAX_CAUSAL_CLAIMS: usize = 64;
 pub const EXPECTED_COMPARISON_DIMENSIONS: usize = 8;
 
 /// Routing-only proof ceiling carried by every emitted candidate.
-pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved without Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
+pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved; legacy v1 comparison and causal declarations remain unverified and cannot qualify equality, difference, prediction, intervention, or causality; no Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
 
 // ---------------------------------------------------------------------------
 // Small pure helpers (no ambient clock, no allocation of authority).
@@ -510,30 +514,32 @@ pub const COMPARISON_DIMENSIONS: [ComparisonDimension; EXPECTED_COMPARISON_DIMEN
     ComparisonDimension::FactualPredictiveCausal,
 ];
 
-/// Typed outcome of comparing one canonical dimension across two positions.
+/// Legacy caller-declared outcome for one canonical comparison dimension.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DimensionOutcome {
-    /// Both positions state the same canonical value.
+    /// The legacy caller declares the same value for both positions. This is
+    /// not an owner-bound observation and cannot establish equality.
     Equal {
-        /// The shared canonical value, preserved verbatim.
+        /// The caller-declared value, preserved verbatim and unverified.
         value: String,
     },
-    /// The positions state different canonical values.
+    /// The legacy caller declares different values for the positions. This is
+    /// not an owner-bound observation and cannot establish a difference.
     Differing {
-        /// Canonical value stated by the left position.
+        /// Caller-declared value for the left position, preserved verbatim.
         left: String,
-        /// Canonical value stated by the right position.
+        /// Caller-declared value for the right position, preserved verbatim.
         right: String,
     },
-    /// The field cannot be normalized. It stays ambiguous and is never
-    /// smoothed into agreement or difference.
+    /// The caller declares the field unnormalizable. It stays unverified and
+    /// cannot be promoted to an evidence-backed relation.
     Unnormalizable {
         /// Bounded reason the field cannot be normalized.
         reason: String,
     },
 }
 
-/// One canonical dimension compared across two positions.
+/// One legacy caller-declared outcome for a canonical comparison dimension.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DimensionComparison {
     /// Which canonical dimension this entry compares.
@@ -542,9 +548,11 @@ pub struct DimensionComparison {
     pub outcome: DimensionOutcome,
 }
 
-/// One caller-supplied typed comparison of two positions over every canonical
-/// dimension. Prose is never parsed into dimensions: the caller states the
-/// canonical values, and an unnormalizable field is stated as such.
+/// Legacy version 1 caller declaration for two positions over the canonical
+/// dimensions. No source bytes, revisions, owner-issued profile, or admitted
+/// dimension records accompany this shape, so declarations are never
+/// qualified as equality or difference. Rust callers may continue constructing
+/// it for compatibility; this crate does not deserialize legacy bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppliedComparison {
     /// Source handle of the left position.
@@ -558,11 +566,11 @@ pub struct SuppliedComparison {
 /// Typed relation between two positions over the canonical dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CompatibilityRelation {
-    /// Every supplied dimension is equal: the claims stand or fall together.
+    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
     EqualConditions,
-    /// At least one dimension differs and none is ambiguous.
+    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
     TypedDifference,
-    /// At least one dimension is unnormalizable; the relation stays ambiguous.
+    /// Legacy declarations lack owner-bound evidence; relation is unknown.
     Ambiguous,
 }
 
@@ -578,24 +586,43 @@ impl CompatibilityRelation {
     }
 }
 
-/// One position's exact compatibility mapping against another position.
+/// One position's preserved legacy declaration mapping against another.
 ///
-/// [`Self::outcomes`] carries the caller's canonical values for every dimension
-/// in [`COMPARISON_DIMENSIONS`] order, so the mapping is exact rather than a bare
-/// verdict: a reader can see which value each position asserted and why a field
-/// was unnormalizable.
+/// [`Self::outcomes`] carries the caller's declarations in
+/// [`COMPARISON_DIMENSIONS`] order. `relation` stays ambiguous because no
+/// owner-bound source/profile/value records exist in legacy v1. The declared
+/// differing and unnormalizable dimensions are retained for review, not proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionCompatibility {
     /// Source handle of the other position.
     pub other_source: String,
-    /// Typed relation derived from the canonical dimensions.
+    /// Legacy proof ceiling; always ambiguous until owner records exist.
     pub relation: CompatibilityRelation,
+    /// Proof ceiling for these retained declarations.
+    pub supplement_version: SupplementVersion,
     /// Every dimension outcome in canonical order, values preserved.
     pub outcomes: Vec<DimensionComparison>,
-    /// Dimensions that differ, in canonical order.
+    /// Dimensions the legacy caller declares to differ, in canonical order.
     pub differing_dimensions: Vec<ComparisonDimension>,
-    /// Dimensions that remain ambiguous, in canonical order.
+    /// Dimensions the legacy caller declares unnormalizable, in canonical order.
     pub unnormalizable_dimensions: Vec<ComparisonDimension>,
+}
+
+/// Version and proof ceiling of a retained caller-supplied supplement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SupplementVersion {
+    /// Legacy caller declarations with no owner-bound records; never verified.
+    LegacyV1Unverified,
+}
+
+impl SupplementVersion {
+    /// Canonical spelling of the supplement version and proof ceiling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyV1Unverified => "legacy_v1_unverified",
+        }
+    }
 }
 
 /// Distinct states a causal or predictive claim may hold (algorithm step 7).
@@ -634,33 +661,30 @@ impl CausalClaimState {
     }
 }
 
-/// One caller-supplied causal or predictive claim.
+/// One legacy version 1 caller declaration of a causal or predictive claim.
 ///
-/// Algorithm step 7 requires exact mechanism, falsifier, matched control or
-/// evaluator evidence, and rival or confounder status for a **causal** claim.
-/// A claim declaring [`CausalClaimState::CausalHypothesis`] or
-/// [`CausalClaimState::Intervention`] is reduced to [`CausalClaimState::Unknown`]
-/// unless all four are supplied. The four evidence fields may be left empty —
-/// that absence is what makes the reduction fire, so it is admitted here and
-/// bounded rather than rejected as a malformed shape. A `Prediction` is not a
-/// causal claim and is carried at its declared state.
+/// The prose fields are declarations, not evidence records. Nonblank mechanism,
+/// falsifier, control/evaluator, and rival/confounder text cannot qualify a
+/// causal or intervention state. This compatibility shape has no owner-issued
+/// observation, verification receipt, or coverage denominator and is never
+/// deserialized from old bytes into a stronger contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppliedCausalClaim {
     /// Source handle holding the claim.
     pub source_handle: String,
     /// State the caller declares for this claim.
     pub declared_state: CausalClaimState,
-    /// Exact mechanism behind the claim.
+    /// Caller-declared mechanism prose, not owner evidence.
     pub mechanism: String,
-    /// Exact falsifier for the claim.
+    /// Caller-declared falsifier prose, not an observed falsifier result.
     pub falsifier: String,
-    /// Matched control and evaluator evidence for the claim.
+    /// Caller-declared control/evaluator prose, not a matched owner record.
     pub control_evaluator: String,
-    /// Rival or confounder status for the claim.
+    /// Caller-declared rival/confounder prose, not a covered denominator.
     pub rivals_or_confounders: String,
 }
 
-/// One preserved causal claim with its declared and effective state.
+/// One preserved causal declaration and its lower-ceiling legacy assessment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CausalClaimRecord {
     /// Source handle holding the claim.
@@ -669,11 +693,17 @@ pub struct CausalClaimRecord {
     pub declared_state: CausalClaimState,
     /// State after the algorithm step 7 evidence rule is applied.
     pub effective_state: CausalClaimState,
-    /// Bounded reason the effective state was reduced; empty when unchanged.
+    /// Proof ceiling for the caller-declared supplement.
+    pub supplement_version: SupplementVersion,
+    /// Bounded reason for reduction or unverified preservation.
     pub reduction_reason: String,
 }
 
 /// Caller-supplied supplements bound to one `ConflictSet` analysis.
+///
+/// `comparisons` and `causal_claims` retain legacy v1 declaration shapes and
+/// are digested as such. This type has no byte deserializer that could silently
+/// fill defaults while upgrading old serialized values into a stronger schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictSupplements {
     /// Expected A-05 receipt the item and draft receipts bind against.
@@ -694,9 +724,9 @@ pub struct ConflictSupplements {
     pub unknowns: Vec<String>,
     /// Supplied structured probe candidates in any order.
     pub supplied_probes: Vec<SuppliedProbe>,
-    /// Caller-supplied typed comparisons over the canonical dimensions.
+    /// Legacy v1 caller declarations over canonical dimensions; never qualified.
     pub comparisons: Vec<SuppliedComparison>,
-    /// Caller-supplied causal or predictive claims with their evidence.
+    /// Legacy v1 causal/predictive declarations; prose is not evidence.
     pub causal_claims: Vec<SuppliedCausalClaim>,
     /// Externally supplied resolution status, when one exists.
     pub external_resolution: Option<ExternalResolution>,
@@ -1033,11 +1063,10 @@ fn check_bounded_text(value: &str, field: &str, max: usize) -> Result<(), Confli
 /// Checks one optional evidence field for control characters and byte ceiling,
 /// permitting an empty value.
 ///
-/// An absent piece of evidence is a legitimate thing for a caller to declare:
-/// it is exactly what makes a causal claim unsupported, and the algorithm step 7
-/// reduction turns it into an inert `Unknown` state. Rejecting it as a malformed
-/// shape here would make that reduction unreachable and turn a semantic shortfall
-/// into a request error, which is the opposite of this cell's design.
+/// An absent piece of declaration text is a legitimate input. Whether it is
+/// blank or nonblank, legacy prose is not owner evidence and cannot raise a
+/// causal proof ceiling. Rejecting blank text as malformed would hide the same
+/// semantic unknown behind a request error.
 fn check_optional_text(value: &str, field: &str, max: usize) -> Result<(), ConflictAnalysisError> {
     if has_control(value) {
         return Err(ConflictAnalysisError::Shape {
@@ -1393,7 +1422,7 @@ fn comparison_pair_key(left: &str, right: &str) -> String {
     )
 }
 
-/// Validates supplied canonical comparisons before any interpretation.
+/// Validates legacy declarations before they are preserved in the candidate.
 ///
 /// Every comparison must name two distinct positions that exist in the set and
 /// must cover each canonical dimension exactly once. A mirrored duplicate pair
@@ -1948,12 +1977,13 @@ fn dimension_outcome_spelling(outcome: &DimensionOutcome) -> String {
     }
 }
 
-/// Builds the typed compatibility mapping for one position.
+/// Preserves the legacy compatibility declarations for one position.
 ///
 /// Every supplied comparison naming this position contributes one entry, from
-/// either side, so the mapping is symmetric. An unnormalizable dimension makes
-/// the whole relation [`CompatibilityRelation::Ambiguous`]: ambiguity is the
-/// honest state and is never resolved into agreement or difference here.
+/// either side, so the mapping is symmetric. Because version 1 has no
+/// owner-bound source/profile/value records, every relation remains
+/// [`CompatibilityRelation::Ambiguous`] even when the caller declares eight
+/// equal or differing dimensions. Outcomes are preserved only as declarations.
 fn build_compatibility(
     source_handle: &str,
     comparisons: &[SuppliedComparison],
@@ -1997,18 +2027,11 @@ fn build_compatibility(
                 outcome: entry.outcome.clone(),
             });
         }
-        let relation = if unnormalizable.is_empty() {
-            if differing.is_empty() {
-                CompatibilityRelation::EqualConditions
-            } else {
-                CompatibilityRelation::TypedDifference
-            }
-        } else {
-            CompatibilityRelation::Ambiguous
-        };
+        let relation = CompatibilityRelation::Ambiguous;
         out.push(PositionCompatibility {
             other_source: other.to_owned(),
             relation,
+            supplement_version: SupplementVersion::LegacyV1Unverified,
             outcomes,
             differing_dimensions: differing,
             unnormalizable_dimensions: unnormalizable,
@@ -2044,9 +2067,10 @@ fn compatibility_clause(mapping: &[PositionCompatibility]) -> String {
             )
         };
         clauses.push(format!(
-            "against {}: {}{}{}",
+            "against {}: {} {}{}{}",
             entry.other_source,
             entry.relation.as_str(),
+            entry.supplement_version.as_str(),
             differing,
             unnormalizable
         ));
@@ -2066,13 +2090,13 @@ fn compatibility_note_with_mapping(base: &str, mapping: &[PositionCompatibility]
     format!("{base}; {}", compatibility_clause(mapping))
 }
 
-/// Applies the algorithm step 7 evidence rule to one supplied claim.
+/// Applies the legacy v1 proof ceiling to one supplied declaration.
 ///
-/// A claim declaring a causal-hypothesis or intervention state without an exact
-/// mechanism, an exact falsifier, matched control or evaluator evidence, and
-/// rival or confounder status stays [`CausalClaimState::Unknown`]. Topology,
-/// chronology, correlation, and count never raise a state, so the reduction is
-/// the only direction this cell moves a declared state.
+/// Caller prose is not owner-issued evidence. Causal and intervention claims
+/// therefore stay [`CausalClaimState::Unknown`] regardless of whether all four
+/// prose fields are nonblank. Lower-level structural, correlational, and
+/// prediction declarations are preserved as declarations and explicitly
+/// marked unverified; none is evidence-qualified by this projection.
 fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
     let mut effective = claim.declared_state;
     let mut reduction_reason = String::new();
@@ -2080,32 +2104,34 @@ fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
         claim.declared_state,
         CausalClaimState::CausalHypothesis | CausalClaimState::Intervention
     ) {
-        let mut missing: Vec<&str> = Vec::new();
-        if claim.mechanism.trim().is_empty() {
-            missing.push("mechanism");
-        }
-        if claim.falsifier.trim().is_empty() {
-            missing.push("falsifier");
-        }
-        if claim.control_evaluator.trim().is_empty() {
-            missing.push("control_evaluator");
-        }
-        if claim.rivals_or_confounders.trim().is_empty() {
-            missing.push("rivals_or_confounders");
-        }
-        if !missing.is_empty() {
-            effective = CausalClaimState::Unknown;
-            reduction_reason = format!(
-                "declared {} reduced to unknown: missing {}",
-                claim.declared_state.as_str(),
-                missing.join("+")
-            );
-        }
+        effective = CausalClaimState::Unknown;
+        reduction_reason = format!(
+            "declared {} retained as legacy v1 unverified: owner-bound evidence and coverage are absent",
+            claim.declared_state.as_str()
+        );
+    } else if matches!(
+        claim.declared_state,
+        CausalClaimState::Structural | CausalClaimState::Correlational
+    ) {
+        reduction_reason = format!(
+            "declared {} retained as legacy v1 unverified; declaration is not support evidence",
+            claim.declared_state.as_str()
+        );
+    } else if matches!(
+        claim.declared_state,
+        CausalClaimState::Prediction | CausalClaimState::Refuted
+    ) {
+        effective = CausalClaimState::Unknown;
+        reduction_reason = format!(
+            "declared {} retained as legacy v1 unverified: outcome and verifier records are absent",
+            claim.declared_state.as_str()
+        );
     }
     CausalClaimRecord {
         source_handle: claim.source_handle.clone(),
         declared_state: claim.declared_state,
         effective_state: effective,
+        supplement_version: SupplementVersion::LegacyV1Unverified,
         reduction_reason,
     }
 }
@@ -2579,13 +2605,14 @@ fn check_preservation(
 // Digest and emission.
 // ---------------------------------------------------------------------------
 
-/// Builds the sorted digest parts binding the typed comparison and causal
-/// claim inputs.
+/// Builds the sorted digest parts binding the legacy v1 comparison and causal
+/// declaration inputs.
 ///
-/// Both lists are bound whole: a caller that changes a canonical value, a
-/// dimension outcome, or any causal evidence field moves the candidate digest.
-/// The comparison pair key is order-independent, so supplying the same pair
-/// from either side yields the same digest.
+/// Both lists are bound whole: a caller that changes a declared value, outcome,
+/// or causal prose moves the candidate digest. This digest binds declarations,
+/// not their truth or owner qualification. The comparison pair key is
+/// order-independent, so supplying the same pair from either side yields the
+/// same digest.
 fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for comparison in &supplements.comparisons {
