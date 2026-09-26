@@ -67,8 +67,10 @@ use eliot_ors::{
     EpochIdentity, EpochLineage, JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES,
     MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_STREAM_KEY_BYTES, OpaqueLabel, OrsError,
     RESTORE_JOURNAL_RECORD_SCHEMA, RecoveryAccessClass, RecoveryEnvelopeContext,
-    RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass, RestoreJournalEntry,
-    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding, StateFenceSnapshot,
+    RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass,
+    RestoreJournalCompleteness, RestoreJournalEntry, RestoreJournalMemberDenominator,
+    RestoreJournalOperation, RestoreJournalReadbackRequest, RestoreJournalResult,
+    RestoreJournalStreamBinding, StateFenceSnapshot,
 };
 use eliot_platform::PlatformHandle;
 use eliot_security_contracts::PrivacyClass;
@@ -683,6 +685,41 @@ impl OrsRestoreBinding {
     }
 }
 
+/// What the durable owner PROVED about one restore-journal stream.
+///
+/// These are three separate observations and are deliberately not collapsed
+/// into one optional pair. The shape this replaced reported `(None, None)`
+/// both for a stream nothing was ever written to and for a bound stream that
+/// read as empty, so a caller could not tell an unadopted stream from a proven
+/// one, and an empty read carried no proof at all.
+///
+/// - [`JournalStreamVerdict::Unbound`] — no binding is persisted for this
+///   stream. The ORS owner reports a missing binding as a refusal, so this is
+///   an observation the adapter made directly, and it is what lets the engine's
+///   genesis compare-and-swap bind the stream.
+/// - [`JournalStreamVerdict::KnownEmpty`] — the stream IS bound and the owner
+///   proved an exact new journal: zero members, no retained row, no retired
+///   phase slot and no prune fence. Zero entries is known-empty only here. Every
+///   other empty-shaped observation — a reclaimed prefix, a fence that does not
+///   account for itself, a page beyond the bound, a corrupt row — is a typed
+///   refusal on the way in, so it can never arrive as this variant.
+/// - [`JournalStreamVerdict::Complete`] — the owner proved the journal accounts
+///   for exactly the member denominator this adapter demanded, and returned the
+///   durable head this adapter must chain its next append to.
+// The one large variant is the record the accepted seam returns. Boxing it would
+// add an allocation to every resume and reconcile read to save stack space, and
+// this value is produced once per read and consumed immediately.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+enum JournalStreamVerdict {
+    Unbound,
+    KnownEmpty,
+    Complete {
+        record: RestoreJournalRecord,
+        head: JournalPredecessor,
+    },
+}
+
 /// Adapter from the accepted [`RestoreJournalPort`] seam onto the durable ORS
 /// restore journal owned by production composition (#957).
 ///
@@ -829,37 +866,51 @@ impl OrsRestoreJournal {
         }
     }
 
-    /// Reads the newest durably appended record and the durable head of one
-    /// stream.
+    /// Reads the durable journal of one stream and reduces it to a three-state
+    /// verdict, so an unadopted stream, a proven empty journal and a complete
+    /// journal are three observations instead of one collapsed empty.
     ///
-    /// An **unbound** stream is an exact new stream: the ORS owner reports it
-    /// as a missing binding, not as corruption, so it reads as empty and the
-    /// engine's genesis compare-and-swap can bind it. Reading it as an error
-    /// would strand every fresh transaction before its first append.
+    /// An **unbound** stream is an exact new stream: the ORS owner reports a
+    /// missing binding as absent, not as corruption, so it reads as no journal
+    /// at all and the engine's genesis compare-and-swap can bind it. Reading it
+    /// as an error would strand every fresh transaction before its first append.
     ///
-    /// The head is **derived from the retained rows** when nothing was pruned,
-    /// because the ORS owner installs `history_fence` only when a prune retired
-    /// a slot, so a populated unpruned stream still reports no fence. Once a
-    /// prune has run, the fence predecessor *is* the durable head and sits
-    /// beyond the retained suffix, so it is used verbatim.
+    /// A **bound** stream is only ever reported through the owner's
+    /// denominator-checked readback
+    /// ([`RedbRecoveryStore::load_restore_journal_readback_against`]). The
+    /// denominator this adapter demands is derived from the durable head record
+    /// it reads SEPARATELY, before asking for any row: a head at sequence `h`
+    /// accounts for exactly `h + 1` members, because sequences are dense from
+    /// zero and an append never reuses one. The store then has to show that its
+    /// retained-plus-retired member set is exactly that run. The two sides come
+    /// from different durable facts — the head record on one side, the retained
+    /// intent rows plus the fence's recorded retire counter on the other — so
+    /// the equality is a requirement rather than a round trip, and a fence whose
+    /// retire counter, phase-slot tombstones and sequence chain no longer
+    /// describe one history is refused instead of certified complete.
     ///
-    /// The newest record is the newest retained row in both cases. A prune
-    /// retires the oldest rows and keeps the newest, so a retained suffix still
-    /// carries the exact latest record and a resume reads the true journal
-    /// state rather than a truncated guess.
-    fn read_state(
-        &mut self,
-        stream: &str,
-    ) -> Result<(Option<RestoreJournalRecord>, Option<JournalPredecessor>), BackupError> {
+    /// That is also what makes known-empty provable rather than assumed: a
+    /// bound stream that reads as empty is reported only when the owner returns
+    /// [`RestoreJournalCompleteness::ExactNew`], which it does only for a bound
+    /// journal with no retained member, no retired phase slot and no prune
+    /// fence. Every other empty shape is a typed refusal, never a silent `None`.
+    ///
+    /// The head is the **owner's proved durable head**, never a digest this
+    /// adapter recomputed from whichever row it happened to receive. The newest
+    /// record is the newest retained member; a prune retires the oldest members
+    /// and keeps the newest, so a retained suffix still carries the exact latest
+    /// record and a resume reads the true journal state rather than a truncated
+    /// guess.
+    fn read_state(&mut self, stream: &str) -> Result<JournalStreamVerdict, BackupError> {
         let persisted = self
             .store
             .load_restore_journal_binding(stream)
             .map_err(ors_to_backup)?;
         // An unbound stream is an exact new stream: the ORS owner reports a
-        // missing binding as absent, not as corruption, so it reads as empty
-        // and the engine's genesis compare-and-swap can bind it.
+        // missing binding as absent, not as corruption, so it reads as no
+        // journal and the engine's genesis compare-and-swap can bind it.
         let Some(existing) = persisted else {
-            return Ok((None, None));
+            return Ok(JournalStreamVerdict::Unbound);
         };
         // A stream already bound to another source, class, destination, writer
         // or fence is refused on READ, not only on append. Checking it later
@@ -870,35 +921,47 @@ impl OrsRestoreJournal {
         if !matches_stream(&self.binding, &existing, &self.writer_fence_digest) {
             return Err(BackupError::RestoreJournalMismatch);
         }
-        let (entries, fence_head) = self
+        // Read the durable head FIRST and independently, so the expected member
+        // denominator is a function of durable evidence rather than of the rows
+        // this call is about to ask for. The owner refuses an unbound stream
+        // here, which is why the unbound case above has to be settled before.
+        let durable_head = self
             .store
-            .load_restore_journal_readback(stream, MAX_JOURNAL_PAGE_ENTRIES)
+            .restore_journal_durable_head(stream)
             .map_err(ors_to_backup)?;
-        let latest = entries.iter().max_by_key(|entry| entry.sequence);
-        // The head is the newest RETAINED row, always. The readback fence
-        // argument is the prune boundary (the predecessor of the first retained
-        // row), not the head, so trusting it would submit a stale predecessor
-        // after any prune. A prune retires the oldest rows and leaves the head
-        // in place, so the newest retained row is the head in both cases.
-        let Some(latest) = latest else {
-            if fence_head.is_some() {
-                return Err(BackupError::IntegrityMismatch {
-                    subject: "restore journal head has no retained record row".to_owned(),
-                });
-            }
-            return Ok((None, None));
+        let readback = self
+            .store
+            .load_restore_journal_readback_against(&RestoreJournalReadbackRequest {
+                stream: stream.to_owned(),
+                limit: MAX_JOURNAL_PAGE_ENTRIES,
+                denominator: RestoreJournalMemberDenominator::for_head(durable_head.as_ref())
+                    .map_err(ors_to_backup)?,
+            })
+            .map_err(ors_to_backup)?;
+        match readback.completeness {
+            // Reaching this arm IS the proof: the owner has already established
+            // a bound journal with no member, no retired phase slot, no prune
+            // fence and no head, so this stream provably has no history.
+            RestoreJournalCompleteness::ExactNew => return Ok(JournalStreamVerdict::KnownEmpty),
+            RestoreJournalCompleteness::Complete => {}
+        }
+        // A complete readback with no retained member is a journal every member
+        // of which was reclaimed. The owner accounts for it honestly, but this
+        // adapter cannot produce a record from it, and reporting it as an
+        // un-started transaction would restart one that already has history.
+        let Some(latest) = readback.entries.last() else {
+            return Err(BackupError::IntegrityMismatch {
+                subject: "restore journal head has no retained record row".to_owned(),
+            });
         };
-        // The head digest is the owner's canonical digest of exactly this row,
-        // so a row that does not hash to its own head is corruption rather
-        // than a resume point.
-        let head = JournalPredecessor {
-            sequence: latest.sequence,
-            digest: sha256_hex(
-                serde_json::to_string(latest)
-                    .map_err(|error| BackupError::Serialization(error.to_string()))?
-                    .as_bytes(),
-            ),
-        };
+        // The entries arrive in ascending sequence order, so the last one is the
+        // newest member, and the head the owner proved beside them is the
+        // predecessor its next append must chain to.
+        let head = readback
+            .head
+            .ok_or_else(|| BackupError::IntegrityMismatch {
+                subject: "restore journal head has no retained record row".to_owned(),
+            })?;
         self.heads.insert(stream.to_owned(), head.clone());
         let record = self.open_bound_sealed(latest)?;
         // The durable binding's transaction must be the transaction this record
@@ -907,20 +970,34 @@ impl OrsRestoreJournal {
         if record.transaction.transaction_id != existing.transaction_id {
             return Err(BackupError::RestoreJournalMismatch);
         }
-        Ok((Some(record), Some(head)))
+        Ok(JournalStreamVerdict::Complete { record, head })
     }
 
     /// Returns the durable head this adapter must chain its next append to.
+    ///
+    /// A stream with no proven journal has nothing to chain to, and that is a
+    /// genesis predecessor rather than an error.
     fn durable_head(&mut self, stream: &str) -> Result<Option<JournalPredecessor>, BackupError> {
         if let Some(head) = self.heads.get(stream) {
             return Ok(Some(head.clone()));
         }
-        Ok(self.read_state(stream)?.1)
+        Ok(match self.read_state(stream)? {
+            JournalStreamVerdict::Unbound | JournalStreamVerdict::KnownEmpty => None,
+            JournalStreamVerdict::Complete { head, .. } => Some(head),
+        })
     }
 
     /// Reads the newest durably appended record for one stream.
+    ///
+    /// A stream that is unadopted and a stream the owner proved to be an exact
+    /// new journal both report no record, but only the second one is reported
+    /// that way after the owner proved there is no member to return; anything
+    /// the owner could not prove refused as a typed error above instead.
     fn read_record(&mut self, stream: &str) -> Result<Option<RestoreJournalRecord>, BackupError> {
-        Ok(self.read_state(stream)?.0)
+        Ok(match self.read_state(stream)? {
+            JournalStreamVerdict::Unbound | JournalStreamVerdict::KnownEmpty => None,
+            JournalStreamVerdict::Complete { record, .. } => Some(record),
+        })
     }
 
     /// Seals one record into the content-addressed payload root.

@@ -500,9 +500,48 @@ pub struct RestoreJournalMemberDenominator {
 }
 
 impl RestoreJournalMemberDenominator {
-    pub fn validate(&self) -> Result<(), OrsError> {
-        if let Some(head) = &self.head {
+    /// The member denominator a durable head record accounts for on its own.
+    ///
+    /// Journal sequences are dense from zero and an append never reuses one, so
+    /// a head at sequence `h` accounts for exactly `h + 1` members, and a
+    /// journal with no head accounts for none. Building the expectation from
+    /// the head is what keeps the denominator a requirement: a requester cannot
+    /// pair a head with a count that merely restates the rows it is about to
+    /// receive, so the store has to show that its retained-plus-retired member
+    /// set is exactly the run that head covers.
+    pub fn for_head(head: Option<&JournalPredecessor>) -> Result<Self, OrsError> {
+        if let Some(head) = head {
             head.validate()?;
+        }
+        let members = match head {
+            Some(head) => head
+                .sequence
+                .checked_add(1)
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "restore_journal_readback",
+                    reason: "journal sequence is exhausted".to_owned(),
+                })?,
+            None => 0,
+        };
+        Ok(Self {
+            members,
+            head: head.cloned(),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), OrsError> {
+        // The count is DEFINED by the head it is paired with, so a denominator
+        // claiming members for a journal with no head — or a count its own head
+        // does not cover — is refused before it can be compared against an
+        // observation. Otherwise the equality check in the readback would only
+        // be able to fail on a requester that invented its own arithmetic.
+        if self.members != Self::for_head(self.head.as_ref())?.members {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "restore_journal_readback",
+                reason:
+                    "the requested member count does not match the durable head it is paired with"
+                        .to_owned(),
+            });
         }
         Ok(())
     }
