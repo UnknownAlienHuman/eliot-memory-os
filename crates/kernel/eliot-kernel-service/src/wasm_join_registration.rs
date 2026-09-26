@@ -66,7 +66,21 @@ impl WasmJoinRegistrationBinding {
         require_text(&join.authority_id, "join.authority_id")?;
         require_digest(&join.grant_digest, "join.grant_digest")?;
         require_digest(&join.invocation_digest, "join.invocation_digest")?;
+        require_text(&delivery.claim_id, "delivery.claim_id")?;
+        require_text(&delivery.operation_id, "delivery.operation_id")?;
+        require_text(&delivery.launch_nonce, "delivery.launch_nonce")?;
+        require_text(
+            &delivery.authority_epoch_json,
+            "delivery.authority_epoch_json",
+        )?;
+        require_digest(&delivery.grant_digest, "delivery.grant_digest")?;
+        require_digest(&delivery.artifact_digest, "delivery.artifact_digest")?;
+        require_digest(&delivery.input_digest, "delivery.input_digest")?;
         require_digest(&delivery.envelope_digest, "delivery.envelope_digest")?;
+        require_digest(
+            &delivery.host_artifact_digest,
+            "delivery.host_artifact_digest",
+        )?;
         if join.expires_at == 0 {
             return Err(WasmJoinRegistrationError::InvalidField(
                 "join.expires_at",
@@ -77,7 +91,18 @@ impl WasmJoinRegistrationBinding {
                 "delivery.delivery_version",
             ));
         }
-        if delivery.publication_incarnation == 0 || delivery.publication_revision == 0 {
+        if delivery.generation == 0
+            || delivery.fence_generation != delivery.generation
+            || delivery.admitted_at_unix_ms == 0
+            || delivery.expires_at <= delivery.admitted_at_unix_ms
+        {
+            return Err(WasmJoinRegistrationError::InvalidField(
+                "delivery.admission_window",
+            ));
+        }
+        if delivery.publication_incarnation != delivery.admitted_at_unix_ms
+            || delivery.publication_revision == 0
+        {
             return Err(WasmJoinRegistrationError::InvalidField(
                 "delivery.publication_identity",
             ));
@@ -115,6 +140,26 @@ impl WasmJoinRegistrationBinding {
             publication_revision: delivery.publication_revision,
         })
     }
+
+    /// Reports whether two bindings name the same logical delivery.
+    ///
+    /// Publication revision is deliberately excluded, mirroring
+    /// [`WasmDeliveryIdentity::same_delivery`]: a rediscovery pass may compute a
+    /// later tentative revision, but an exact delivery replay must return the
+    /// retained publication and preserve its original revision and consumption
+    /// state.
+    #[must_use]
+    pub fn same_delivery(&self, other: &Self) -> bool {
+        self.claim_id == other.claim_id
+            && self.operation_id == other.operation_id
+            && self.authority_id == other.authority_id
+            && self.grant_digest == other.grant_digest
+            && self.invocation_digest == other.invocation_digest
+            && self.envelope_digest == other.envelope_digest
+            && self.expires_at == other.expires_at
+            && self.delivery_version == other.delivery_version
+            && self.publication_incarnation == other.publication_incarnation
+    }
 }
 
 /// Retained replay state for one registered delivery-bound join.
@@ -127,7 +172,7 @@ pub struct WasmJoinRegistrationState {
 impl WasmJoinRegistrationState {
     /// Creates a fresh, unconsumed registration.
     #[must_use]
-    pub const fn fresh(binding: WasmJoinRegistrationBinding) -> Self {
+    pub fn fresh(binding: WasmJoinRegistrationBinding) -> Self {
         Self {
             binding,
             consumed: false,
@@ -239,7 +284,7 @@ pub fn reconcile_wasm_join_registration(
             WasmJoinRegistrationDisposition::Registered,
         ));
     };
-    if retained.binding != incoming {
+    if !retained.binding.same_delivery(&incoming) {
         return Err(WasmJoinRegistrationError::IdentityConflict);
     }
     let disposition = if retained.consumed {
