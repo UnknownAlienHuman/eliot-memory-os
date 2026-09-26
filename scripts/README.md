@@ -18,6 +18,7 @@ committed as repository authority.
 | `verify.sh` | Unix entrypoint for the same PowerShell-owned bounded verification profile | Source/build candidate only |
 | `verify-normative.ps1` | Recompute canonical Architecture/Implementation digests and pair key; reject predecessor copies | Normative artifact identity only |
 | `verify-normative.sh` | Unix-compatible normative-pair verifier | Normative artifact identity only |
+| `read_freeze_digest.py` | Reproducible-digest readback for the Wave 1 static field contract freeze | Static field contract only |
 | `docs_shards.py` | Public documentation front door: generate/check routed instruction surfaces and verify reconstructed shards, Markdown paths, anchors, exclusions, and exact path case | Normative content/layout and Markdown-link integrity only |
 | `docs_shards_core.py` | Byte-preserved sharding/reconstruction implementation called by `docs_shards.py`; not a separate operator entrypoint | Internal documentation implementation |
 | `docs_router.py` | Public router front door: reject unsafe paths, include deletions in changed-path routing, and emit bounded content-addressed route receipts | Documentation routing evidence only |
