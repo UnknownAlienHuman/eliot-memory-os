@@ -51,7 +51,13 @@ Strict validation is run against the `installPath` returned by
 
 Claude Code is the one host that moves off the legacy Governor MCP entry
 behind an explicit flag; OpenCode, Claude Desktop, and the Codex plugin keep
-their `eliot-governor` entries unchanged.
+their `eliot-governor` entries while the flag is absent. Once
+`ELIOT_CLAUDE_FRONT_DOOR=agent-bridge` selects the new stack, every legacy
+entrypoint (`daemon run`, `service run`, `hook`, `mcp stdio`) on every host
+refuses with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the canonical-route
+receipt (gating owned by #1858); the flagged Claude MCP edge is served by
+the staged bridge instead, and the flag being absent preserves the legacy
+path on all hosts.
 
 - Tracked host config `integrations/claude/eliot/.mcp.json` keeps the legacy
   default byte-identical: one `eliot` server,
@@ -68,15 +74,19 @@ their `eliot-governor` entries unchanged.
   the bundle stages it.
 - Operator launch flag: `ELIOT_CLAUDE_FRONT_DOOR=agent-bridge` selects the
   new path at launch; unset (or any other value) means legacy. The flag is
-  consumed by entrypoint delegation owned by the #1858/#77 track, not by
-  this plugin tree.
+  consumed by entrypoint gating (owned by #1858) and Claude MCP bridge
+  delegation (owned by #2562 with the #1858/#77 track), not by this plugin
+  tree.
 - Full retirement of the legacy Governor entry (Work option 1) or re-home
   of the Codex entry point (Work option 2) does not land in this slice:
   both remain BLOCKED-BY #18 (legacy-deletion owner), and the Codex
   re-home additionally awaits the eliot-mcp behavior track per canon.
-- New path argv: `eliot-agent-bridge --profile SPINE_FUNCTIONAL --transport
-  stdio --client-declaration <installation-absolute
-  path>/agent-bridge/client-declaration-v2.json`. The declaration file is
+- New path argv: `eliot-agent-bridge mcp --profile SPINE_FUNCTIONAL
+  --transport stdio --client-declaration <installation-absolute
+  path>/agent-bridge/client-declaration-v2.json`. The leading `mcp` token is
+  the explicit checked MCP entrypoint contract owned by #2562: it selects
+  the MCP JSON-RPC front door, while the tokenless argv keeps serving the
+  private `op` stdio clients unchanged. The declaration file is
   installation-owned (absolute path, file name
   `client-declaration-v2.json`, parent directory `agent-bridge`, enforced by
   `bins/eliot-agent-bridge/src/cli_contract.rs`); the bundle and this
