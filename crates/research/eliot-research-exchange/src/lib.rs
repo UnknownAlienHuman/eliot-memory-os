@@ -301,10 +301,13 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// validated against the admitted request, so every citation must be a
     /// manifest-admitted handle at a permitted anchor precision with delivered
     /// source lineage behind it, every delivered source handle must itself be
-    /// admitted, every absolute locator URL must be an admitted URL handle, and
-    /// every delivered artifact handle must be admitted. A bundle that fails
-    /// any of these is refused and never becomes this job's result, so it can
-    /// produce no evidence edge and no supported citation.
+    /// admitted, every absolute external locator URL must be an admitted URL
+    /// handle, every delivered artifact handle must be admitted, and every typed
+    /// coverage-gap handle must be admitted too — the handoff seal publishes
+    /// `coverage_gap_handles` inside its own digest, so an unadmitted gap handle
+    /// would cross a sealed boundary. A bundle that fails any of these is
+    /// refused and never becomes this job's result, so it can produce no
+    /// evidence edge and no supported citation.
     pub fn import_bundle(
         &mut self,
         bundle: ResearchEvidenceBundle,

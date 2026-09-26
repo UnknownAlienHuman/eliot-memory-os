@@ -110,15 +110,81 @@ fn digest(value: &str, field: &'static str) -> Result<(), ResearchContractError>
     }
 }
 
+/// Locator schemes this repository mints itself, so a locator carrying one is an
+/// internal ELIOT reference and not an external URL a run has to admit.
+///
+/// Measured, not guessed: `git grep -hoE '[A-Za-z][A-Za-z0-9+.-]*://' -- '*.rs'`
+/// over this repository yields exactly `canonical`, `connected-session`, `eliot`,
+/// `governor`, `http`, `https`, `local`, `rocksdb`, `route`, `runtime`,
+/// `surrealkv`, `tcp`, `ws` and `wss`. The five network schemes (`http`,
+/// `https`, `ws`, `wss`, `tcp`) address a remote peer and are therefore external
+/// by construction and deliberately absent. The other nine are the internal
+/// store, session, route and resource identities this repository mints into its
+/// own reference and locator fields — `eliot://` is the canonical `ResourceUri`
+/// family (`crates/surfaces/eliot-agent-bridge-core/src/resources.rs`),
+/// `surrealkv://` the store data URL, `route://` a kernel `route_ref`,
+/// `canonical://` a worktree ref, `runtime://` a spool ref, `governor://` a
+/// managed tool identity, `local://` and `connected-session://` session uris, and
+/// `rocksdb:` the local store spec that `rocksdb://` is explicitly *not*
+/// (`crates/eliot-types/src/config.rs`). A scheme absent from this list is not
+/// thereby internal: it is unrecognised, and
+/// [`AllowedReferenceManifest::admits_url`] decides it.
+const INTERNAL_LOCATOR_SCHEMES: [&str; 9] = [
+    "canonical",
+    "connected-session",
+    "eliot",
+    "governor",
+    "local",
+    "rocksdb",
+    "route",
+    "runtime",
+    "surrealkv",
+];
+
+/// The scheme token of `locator`, or `None` when it carries none.
+///
+/// RFC 3986 spells a scheme `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+/// immediately before the first `:`. The scan stops at the first character
+/// outside that grammar, so a locator with no `:` at all, and a handle that
+/// merely contains a colon in a position that is not a scheme — `src ref:3` —
+/// carry no scheme and stay opaque handles. The check reads characters and never
+/// resolves, normalises or fetches anything.
+fn scheme_token(locator: &str) -> Option<&str> {
+    let colon = locator.find(':')?;
+    let scheme = &locator[..colon];
+    let mut characters = scheme.chars();
+    let opens = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic());
+    let continues = characters
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'));
+    (opens && continues).then_some(scheme)
+}
+
 /// Whether a delivered locator presents an absolute external URL.
 ///
-/// The check is deliberately structural and never parses: a locator carrying a
-/// scheme separator is treated as an unadmitted external reference unless the
-/// manifest names it, and anything else is treated as an opaque store handle.
-/// A locator this crate cannot recognise as a URL is therefore never refused
-/// here on a guess.
+/// The check is deliberately structural and decides on the scheme token rather
+/// than on the shape of what follows it, so it stays sound in both directions a
+/// `://` substring test is not: an absolute URI that carries no scheme separator
+/// (`urn:doi:10.1000/182`, `mailto:`, `data:`) is still external, and an
+/// internal ELIOT reference that does carry one is not. A locator with no scheme
+/// is an opaque store handle. A `name::id` double-colon spelling is this
+/// repository's namespaced handle form (`snapshot::src-a`) and cannot be a URI
+/// at all, because a path and an opaque part may not begin with a colon, so it
+/// stays a handle. A scheme in [`INTERNAL_LOCATOR_SCHEMES`] is an internal
+/// reference. Everything else is external and must be named in `url_handles`, so
+/// a scheme this crate cannot classify fails closed through
+/// [`AllowedReferenceManifest::admits_url`] instead of being admitted on a
+/// guess. That includes a single-letter Windows drive scheme (`C:\…` is
+/// formally a URI with scheme `C`): this contract calls such a locator external
+/// and requires it to be admitted, which is the fail-closed reading and not a
+/// claim that it is a network address.
 fn is_absolute_locator(locator: &str) -> bool {
-    locator.contains("://")
+    match scheme_token(locator) {
+        None => false,
+        Some(scheme) if locator.as_bytes().get(scheme.len()) == Some(&b':') => false,
+        Some(scheme) => !INTERNAL_LOCATOR_SCHEMES.contains(&scheme),
+    }
 }
 
 #[derive(
@@ -306,8 +372,15 @@ pub struct AllowedReferenceManifest {
     pub disclosure: DisclosureClass,
     /// I21.7: the retention class this allowlist is bound to.
     pub retention_class: String,
-    /// Stale or revoked entries. A listed handle is refused even when it is also
-    /// allowed, and a stale entry is never removed by widening.
+    /// Stale or revoked entries: references this manifest once admitted and
+    /// that have since gone stale or been revoked.
+    ///
+    /// Revocation wins over admission. A handle listed here is refused by
+    /// [`Self::allows`] and [`Self::admits_url`] even though it is still listed
+    /// in an allowlist above — the overlap is legal, and it is exactly how "this
+    /// WAS admitted and has since gone stale or revoked" is expressed, so a
+    /// manifest must not treat the pair as a contradiction. Widening an
+    /// allowlist never removes a stale entry.
     pub stale_or_revoked_handles: Vec<String>,
     /// I21.7: the routes this manifest may be expanded onto. An empty list means
     /// the manifest travels nowhere else, which is the fail-closed reading.
@@ -371,18 +444,10 @@ impl AllowedReferenceManifest {
         }
         text(&self.scope_class, "manifest.scope_class")?;
         text(&self.retention_class, "manifest.retention_class")?;
-        for value in &self.stale_or_revoked_handles {
-            text(value, "manifest.stale_or_revoked_handles")?;
-        }
-        if self
-            .stale_or_revoked_handles
-            .iter()
-            .any(|stale| self.allowed_handles().any(|allowed| allowed == stale))
-        {
-            // A handle cannot be both admitted and revoked: the pair would make
-            // `allows` depend on evaluation order rather than on the allowlist.
-            return Err(ResearchContractError::InvalidDisposition);
-        }
+        optional_texts(
+            &self.stale_or_revoked_handles,
+            "manifest.stale_or_revoked_handles",
+        )?;
         digest(&self.digest, "manifest.digest")?;
         if self.canonical_digest()? != self.digest {
             return Err(ResearchContractError::InvalidDigest {
@@ -419,22 +484,33 @@ impl AllowedReferenceManifest {
         Ok(sha256_hex(&bytes))
     }
 
-    /// Every handle this manifest admits, in its declared order.
+    /// Every handle this manifest admits as a *citable reference*, in its
+    /// declared order.
+    ///
+    /// `url_handles` is deliberately absent. A URL is a locator, not a source
+    /// identity, and [`Self::admits_url`] is its only admission path; chaining
+    /// it here would let a bare URL become a `SourceSnapshot::source_handle`,
+    /// an evidence edge and a supporting `ExactCitation::source_handle` with no
+    /// source record behind it.
     fn allowed_handles(&self) -> impl Iterator<Item = &str> {
         self.source_handles
             .iter()
             .chain(&self.evidence_handles)
             .chain(&self.artifact_handles)
-            .chain(&self.url_handles)
             .map(String::as_str)
     }
 
     /// Whether this manifest admits `handle` as a citable reference.
     ///
-    /// URL handles are admitted here on purpose: I21.7 lists URL handles beside
-    /// source/evidence/artifact handles, so a URL that the manifest lists is a
-    /// reference and a URL it does not list is not. A handle this manifest
-    /// admits but also lists as stale or revoked is never admitted.
+    /// Only source, evidence and artifact handles are citable reference
+    /// identities, so a URL listed in `url_handles` is *not* admitted here and
+    /// can never become a source handle, an evidence edge or a supporting
+    /// citation. A URL is admitted as a locator by [`Self::admits_url`] alone.
+    ///
+    /// A handle this manifest admits but also lists as stale or revoked is
+    /// never admitted: revocation is applied after membership and on every
+    /// call, so the answer does not depend on the order the two lists are read
+    /// in.
     #[must_use]
     pub fn allows(&self, handle: &str) -> bool {
         self.allowed_handles().any(|candidate| candidate == handle)
@@ -608,6 +684,17 @@ impl ResearchEvidenceBundle {
                 return Err(ResearchContractError::DuplicateIdentity {
                     field: "bundle.coverage_gaps",
                 });
+            }
+            // A typed gap names a source identity, and the handoff seal
+            // publishes `coverage_gap_handles` verbatim inside the digest it
+            // seals. Without this check a bundle could therefore carry an
+            // unadmitted reference — including a bare URL — across a sealed
+            // boundary, so a gap handle is gated exactly like a delivered source
+            // handle. The duplicate rule above still runs first, so a repeated
+            // gap identity is still `DuplicateIdentity` and the gap/source
+            // overlap rule below is unchanged.
+            if !request.allowed_references.allows(&gap.source_handle) {
+                return Err(ResearchContractError::ReferenceNotAdmitted);
             }
         }
         if self.coverage_gaps.iter().any(|gap| {

@@ -256,7 +256,12 @@ fn reference_outside_frozen_manifest_fails() {
         Err(HandoffError::Contract(_))
     ));
     let mut revoked_req = request();
-    revoked_req.allowed_references.stale_or_revoked_handles = vec!["src-b".to_owned()];
+    let mut revoked_manifest = revoked_req.allowed_references.clone();
+    revoked_manifest.stale_or_revoked_handles = vec!["src-b".to_owned()];
+    // Revocation has to be sealed in, because the digest covers the stale set.
+    revoked_req.allowed_references = revoked_manifest
+        .seal()
+        .expect("revoked fixture manifest must seal");
     let revoked_bundle = bundle(&job_id);
     let mut revoked_claim = claim("src-b", "a revoked claim");
     revoked_claim.claim_id = "claim-revoked".to_owned();

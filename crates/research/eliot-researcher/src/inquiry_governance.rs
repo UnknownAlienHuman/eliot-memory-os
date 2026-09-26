@@ -3111,12 +3111,41 @@ pub struct CandidateEvidence {
 /// snapshot it, an artifact handle needs a manifest transition, and a stale or
 /// revoked handle needs a fresh admission rather than any acquisition at all.
 ///
-/// The live record path observes exactly these three identities and no more,
-/// because the composition root never decodes the provider body: a source
-/// identity is judged on the `SourceRecord.handle` the observation projects into
-/// ([`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`]), and a
+/// # What the live record path can actually observe
+///
+/// The whole live classification is `reference_firewall`, and the only thing it
+/// looks at is each `ObservationCandidate`'s `handle`. That makes the reachable
+/// set a property of what a candidate handle can be, not of all six identities
+/// I21.7 enumerates:
+///
+/// - `ArtifactHandle` is what the live path produces. The composition root
+///   supplies exactly one candidate, derived from the retained provider artifact
+///   digest as `provider-artifact:<sha256>`
+///   (`retained_provider_material` in `bins/eliot-mod-research`), which is
+///   caller-influenced text the manifest does not admit.
+/// - `LocatorUrl` is **not** reachable on the live path today, and the reason is
+///   structural: the arm is chosen by a `://` test, and the single live handle
+///   `provider-artifact:<sha256>` contains no scheme separator. A URL inside the
+///   provider body is never observable here because the projection never decodes
+///   the body; the URL surface is closed instead at
+///   `SourceSnapshot::locator` in
+///   `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
+/// - `StaleOrRevoked` is reachable only for a manifest that lists a candidate
+///   handle in `stale_or_revoked_handles`. The live handle is minted after
+///   admission from a digest an out-of-repo envelope has no reason to list, so
+///   the live path does not reach it either — but the case it names is real and
+///   distinct: a reference the manifest *did* admit and that has since gone
+///   stale, which [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`]
+///   reports as `ManifestEntryRevoked`.
+///
+/// All three variants are kept because this is the retained diagnostic's
+/// vocabulary and a candidate handle is caller-shaped, not fixed: a bridge that
+/// projects a URL-shaped or manifest-revoked candidate reaches the other two
+/// arms with no code change here. A source identity is judged on the
+/// `SourceRecord.handle` the observation projects into
+/// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`], and a
 /// line range is judged by the manifest's admitted anchor precision in
-/// [`EvidenceSetPrecision::evaluate`]. Neither can be a *citation* on this path,
+/// [`EvidenceSetPrecision::evaluate`]; neither can be a *citation* on this path,
 /// so neither is a candidate diagnostic here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnadmittedReferenceKind {
