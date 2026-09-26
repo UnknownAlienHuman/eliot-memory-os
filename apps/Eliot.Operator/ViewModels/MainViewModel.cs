@@ -485,20 +485,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// reuses stale owner evidence. Each refusal is reported with the owner's
     /// exact sentence and the one action that answers it, never as a generic
     /// JSON error, and nothing is sent. A revision that passes the local check
-    /// is reported as ADMITTED FOR SUBMISSION, never as normalized:
-    /// normalization is the owner's act and only an owner answer establishes it.
+    /// is reported as ADMITTED FOR SUBMISSION, never as normalized. An owner
+    /// transition can echo the caller-supplied revision; normalization requires
+    /// separately bound owner receipt/provenance, which this projection does not
+    /// carry.
     public async Task RunUserAutomationAsync()
     {
-        // A create or an edit needs an owner-issued normalization result in
-        // hand. With none, the Operator states that it has no owner evidence
-        // instead of reporting a schedule: it never derives, re-normalizes or
-        // invents one, and it never rewrites an immutable revision in place.
+        // A create or edit needs a caller-supplied schedule revision. The
+        // Operator checks its closed shape but cannot prove its normalization
+        // provenance; with no revision, it has no schedule data to submit. It
+        // never derives or rewrites an immutable revision in place.
         if (UserAutomationOperation is "create" or "edit"
             && string.IsNullOrWhiteSpace(UserAutomationRevisionJson))
         {
             var absent = UserAutomationOutcomeClassifier.OwnerAbsent(
                 UserAutomationOperation,
-                "no owner-normalized revision payload was supplied.");
+                "no schedule revision payload was supplied.");
             SetBanner(absent.Title, absent.Detail, OperatorBannerSeverity.Warning);
             return;
         }
@@ -522,8 +524,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
         // What this create/edit is BOUND to, stated before transmission: the
         // exact contract version, the pinned zone database release, the zone
-        // identity and the occurrence source digest the owner-issued bytes
-        // already carry, together with the one retry-stable operation identity
+        // identity and the occurrence source digest the caller-supplied revision
+        // bytes carry, together with the one retry-stable operation identity
         // those exact canonical bytes derive. This is the effect-relevant
         // contract identity of the request. It is NOT a normalization claim:
         // admission and normalization remain the owner's decision.
@@ -567,10 +569,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             try
             {
+                var readRequest = UserAutomationOperatorRequest.Create(operation);
                 var read = await _client.UserAutomationAsync(
-                    UserAutomationOperatorRequest.Create(operation),
+                    readRequest,
                     _requestCancellation?.Token ?? CancellationToken.None);
-                ShowUserAutomationResult(action, read);
+                ShowUserAutomationResult(action, read, readRequest.IdempotencyKey);
             }
             catch (Exception error)
             {
@@ -640,11 +643,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var answer = await _client.UserAutomationAsync(
                 request,
                 _requestCancellation?.Token ?? CancellationToken.None);
-            ShowUserAutomationResult(action, answer);
-            // The owner answered. This route reports admission, not a canonical
-            // write receipt, so the effect stays reconcilable under the same
-            // identity until the owner proves its terminal disposition.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            ShowUserAutomationResult(action, answer, request.IdempotencyKey);
+            // A typed attempt refusal can prove that this attempt stopped before
+            // Store, but it does not settle an earlier attempt of the same
+            // retained identity. Preserve an already-unknown phase; a first
+            // structured answer becomes reconcilable under this exact identity.
+            var unresolvedPhase = pending.Phase is
+                OperatorOperationPhase.UnknownReconciling
+                or OperatorOperationPhase.PossiblyExecuted
+                    ? pending.Phase
+                    : OperatorOperationPhase.UnknownReconciling;
+            ReplacePending(pending.OperationId, unresolvedPhase);
             RefreshPendingState();
         }
         catch (OperatorUnknownOutcomeException unknown)
@@ -721,27 +730,30 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// The answer is decoded into a typed outcome instead of being reported as an
     /// undifferentiated success. A typed Kernel refusal is shown as its own
     /// actionable reason — unsupported contract version, legacy encoding, stale
-    /// normalization revision, invalid or moved receipt, or semantic rejection —
-    /// and the retained owner bytes stay available for exact inspection. When the
+    /// normalization revision, owner unavailability, invalid or moved receipt,
+    /// or semantic rejection —
+    /// and the retained response bytes stay available for exact inspection. When the
     /// owner answer itself carries the versioned occurrence projection, the zone
     /// database revision, the resolved instant and offset and the applied fold or
-    /// gap disposition are decoded from those owner bytes and displayed; the
-    /// Operator decodes and shows them and resolves nothing itself. When the owner
-    /// answer carries no such projection, the outcome is reported as UNVERIFIED
-    /// and never as normalized: a success banner is reachable only with owner
-    /// evidence in hand.
+    /// gap disposition are decoded and displayed as inspection data. A Store
+    /// transition can echo caller-authored revision bytes, so that projection
+    /// alone never proves fresh owner normalization; it is reported as UNVERIFIED
+    /// with a warning. The original bounded response remains available for exact
+    /// inspection.
     /// </remarks>
-    private void ShowUserAutomationResult(string action, JsonElement answer)
+    private void ShowUserAutomationResult(
+        string action,
+        JsonElement answer,
+        string expectedIdempotencyKey)
     {
         ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(answer) ?? string.Empty;
-        var outcome = UserAutomationOutcomeClassifier.Read(action, answer);
+        var outcome = UserAutomationOutcomeClassifier.Read(action, answer, expectedIdempotencyKey);
         ResultSummary = outcome.Detail;
         SetBanner(
             outcome.Title,
             outcome.Detail,
             outcome.Class switch
             {
-                UserAutomationOutcomeClass.OwnerIssuedNormalization => OperatorBannerSeverity.Success,
                 UserAutomationOutcomeClass.OwnerAnswered => OperatorBannerSeverity.Informational,
                 _ => OperatorBannerSeverity.Warning
             });
@@ -751,12 +763,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// Mints the one typed operation for the selected closed kind.
     /// </summary>
     /// <remarks>
-    /// Create and edit both carry the operator-supplied owner-normalized revision
-    /// through the closed profile. An edit carries BOTH the previous and the new
-    /// revision, so the supersession lineage and the stale-owner-evidence refusal
-    /// are both decided from the exact bytes that are about to be sent. No
-    /// revision is ever rewritten or re-normalized here: the Operator reads the
-    /// owner's result and refuses what it cannot accept.
+    /// Create and edit both carry a caller-supplied schedule revision through the
+    /// closed profile. An edit carries BOTH the previous and the new revision,
+    /// preserving its supersession lineage. The local mirror checks shape and
+    /// source-digest consistency, but cannot prove fresh owner normalization for
+    /// effect-relevant schedule changes. No revision is rewritten here.
     /// </remarks>
     private UserAutomationOperation BuildUserAutomationOperation() => UserAutomationOperation switch
     {
@@ -791,20 +802,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Reads one operator-supplied owner-normalized revision into the closed
-    /// contract type and admits it for submission.
+    /// Reads one caller-supplied schedule revision into the closed contract type
+    /// and admits its shape for submission.
     /// </summary>
     /// <remarks>
     /// The payload is READ, never repaired. The closed profile refuses an
     /// unmapped member, and the schedule mirror refuses the occurrence grammar
     /// and the exact supported contract version, so a legacy shape-only
-    /// occurrence cannot be submitted as a current revision. A refusal carries
-    /// the owner's exact sentence and the one action that answers it — for a
-    /// legacy encoding, the owner re-normalization action followed by a NEW
-    /// revision, because an immutable revision is never rewritten in place.
+    /// occurrence cannot be submitted as a current revision. Parsing does not
+    /// prove owner normalization provenance. A refusal carries the owner's exact
+    /// sentence and the one action that answers it — for a
+    /// legacy encoding, a fresh owner normalization must be obtained before a
+    /// NEW revision is supplied; this UI does not produce that normalization,
+    /// and an immutable revision is never rewritten in place.
     /// <para>
     /// The exact supported contract version and the pinned zone database release
-    /// are read out of the owner's own occurrence bytes rather than from a second
+    /// are read out of the supplied occurrence bytes rather than from a second
     /// copy carried on this record: the owner side is
     /// <c>deny_unknown_fields</c>, so a member the owner does not know would make
     /// every request undecodable.
@@ -813,7 +826,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private static UserAutomationRevision ParseRevision(string value)
     {
         var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value)
-            ?? throw new InvalidOperationException("owner-normalized UserAutomation revision JSON is required.");
+            ?? throw new InvalidOperationException("UserAutomation schedule revision JSON is required.");
         revision.Validate();
         return revision;
     }

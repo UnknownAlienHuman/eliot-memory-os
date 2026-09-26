@@ -3125,96 +3125,48 @@ impl KernelComposition {
         request_id: RequestId,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        let route: UserAutomationOperatorRoute =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
-        if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
-            return Err(TransportError::SessionFenced);
+        let request = Self::build_user_automation_operator_request(session, &request_id, payload)?;
+        match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
+            Ok(()) => {}
+            Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
+                return Ok(Self::user_automation_precommit_refusal_response(
+                    &request, &error,
+                ));
+            }
+            Err(_) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "user_automation_request_validation_outcome_unavailable".to_owned(),
+                    ),
+                ));
+            }
         }
-        let identity = route.request_identity;
-        identity
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        if identity.request.metadata.request_id != request_id
-            || identity.request.state_fence != session.module_generation.state_fence
-            || route.payload.idempotency_key != identity.idempotency_key
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
-        let principal = authenticated_user_automation_principal(session)?;
-        let operation_id = eliot_contracts::OperationId::new(format!(
-            "user-automation-operation:{}",
-            route.payload.idempotency_key
-        ))
-        .map_err(|_| TransportError::SessionFenced)?;
-        let intent = eliot_kernel_core::UserAutomationOperatorIntent {
-            intent_id: format!("user-automation-intent:{}", route.payload.idempotency_key),
-            principal_ref: principal.clone(),
-            state_fence: session.module_generation.state_fence.clone(),
-            operation: route.payload.operation,
-        };
-        let request = eliot_kernel_service::UserAutomationServiceRequest {
-            context: identity.request.metadata.clone(),
-            authenticated_principal: principal,
-            identity: OperationIdentity {
-                operation_id,
-                idempotency_key: route.payload.idempotency_key,
-                canonical_request_hash: String::new(),
-            },
-            intent,
-        };
-        // The existing authenticated Host execution channel is composed for
-        // exactly the operations that own a wake or execution handoff, so a
-        // read-only answer never depends on the Host contour. The composed
-        // `UserAutomationOperatorRuntime` is the concrete runtime port the
-        // post-commit transition calls; no second transport or route is created.
-        let runtime_channel = match self
-            .user_automation_operator_runtime_channel(
-                &request.intent.operation,
-                &session.module_generation.state_fence,
-            )
+        let transition = match self
+            .dispatch_user_automation_operator_transition(session, &request)
             .await
         {
-            Ok(channel) => channel,
-            Err(error) => {
-                return Ok(Self::user_automation_runtime_error_response(error));
-            }
+            Ok(transition) => transition,
+            Err(response) => return Ok(response),
         };
-        let runtime = runtime_channel
-            .as_ref()
-            .map(eliot_kernel_service::UserAutomationOperatorRuntime::new);
-        let gateway = self.retained_store_gateway()?;
-        let transition =
-            Box::pin(gateway.execute_user_automation_operation(request.clone(), runtime.as_ref()))
-                .await
-                .map_err(|_error| {
-                    // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
-                    // observation only. The single designated terminal for
-                    // this failed operation is emitted by
-                    // `execute_daemon_request_observed`; a second terminal
-                    // here would inflate one store failure into two.
-                    observe_daemon_request(
-                        "kernel.daemon_user_automation_operator_store",
-                        "fenced",
-                    );
-                    TransportError::SessionFenced
-                })?;
         // The Human inspect surface shows the deterministic schedule
         // projection before activation: the same normalized occurrence set the
         // trigger contract uses, compiled here into the immutable
         // revision-bound occurrence identities. A schedule the compiler cannot
         // compile fails closed instead of projecting a guessed occurrence.
-        let occurrences =
-            Self::user_automation_inspection_occurrences(&transition).map_err(|_error| {
-                // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
-                // observation only; `execute_daemon_request_observed` owns
-                // the single designated terminal for this failed operation.
-                observe_daemon_request(
-                    "kernel.daemon_user_automation_occurrence_projection",
-                    "fenced",
-                );
-                TransportError::SessionFenced
-            })?;
+        let Ok(occurrences) = Self::user_automation_inspection_occurrences(&transition) else {
+            // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+            // observation only; `execute_daemon_request_observed` owns
+            // the single designated terminal for this failed operation.
+            observe_daemon_request(
+                "kernel.daemon_user_automation_occurrence_projection",
+                "unknown",
+            );
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "user_automation_occurrence_projection_requires_reconciliation".to_owned(),
+                ),
+            ));
+        };
         let recovery = transition.recovery();
         let known = transition.is_known();
         if !known {
@@ -3238,6 +3190,181 @@ impl KernelComposition {
             },
             "recovery": recovery,
         }))
+    }
+
+    #[cfg(windows)]
+    fn build_user_automation_operator_request(
+        session: &Session,
+        request_id: &RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<eliot_kernel_service::UserAutomationServiceRequest, TransportError> {
+        let route: UserAutomationOperatorRoute =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        let identity = route.request_identity;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if &identity.request.metadata.request_id != request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+            || route.payload.idempotency_key != identity.idempotency_key
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
+        let principal = authenticated_user_automation_principal(session)?;
+        let operation_id = eliot_contracts::OperationId::new(format!(
+            "user-automation-operation:{}",
+            route.payload.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let intent = eliot_kernel_core::UserAutomationOperatorIntent {
+            intent_id: format!("user-automation-intent:{}", route.payload.idempotency_key),
+            principal_ref: principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+            operation: route.payload.operation,
+        };
+        Ok(eliot_kernel_service::UserAutomationServiceRequest {
+            context: identity.request.metadata.clone(),
+            authenticated_principal: principal,
+            identity: OperationIdentity {
+                operation_id,
+                idempotency_key: route.payload.idempotency_key,
+                canonical_request_hash: String::new(),
+            },
+            intent,
+        })
+    }
+
+    /// Composes the existing Host runtime and executes the canonical operator
+    /// transition. An error is already projected as the route's structured
+    /// response; unknown post-Store failures remain reconcilable.
+    #[cfg(windows)]
+    async fn dispatch_user_automation_operator_transition(
+        &self,
+        session: &Session,
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+    ) -> Result<eliot_kernel_service::UserAutomationOperatorTransition, serde_json::Value> {
+        // The existing authenticated Host execution channel is composed for
+        // exactly the operations that own a wake or execution handoff, so a
+        // read-only answer never depends on the Host contour. This reuses the
+        // existing route and transport rather than creating new authority.
+        let runtime_channel = self
+            .user_automation_operator_runtime_channel(
+                &request.intent.operation,
+                &session.module_generation.state_fence,
+            )
+            .await
+            .map_err(Self::user_automation_runtime_error_response)?;
+        let runtime = runtime_channel
+            .as_ref()
+            .map(eliot_kernel_service::UserAutomationOperatorRuntime::new);
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Err(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::Unavailable(
+                    "canonical UserAutomation Store owner is unavailable".to_owned(),
+                ),
+            ));
+        };
+        match Box::pin(gateway.execute_user_automation_operation(request.clone(), runtime.as_ref()))
+            .await
+        {
+            Ok(transition) => Ok(transition),
+            Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => Err(
+                Self::user_automation_precommit_refusal_response(request, &error),
+            ),
+            Err(_error) => {
+                // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+                // observation only. The single designated terminal for
+                // this failed operation is emitted by
+                // `execute_daemon_request_observed`; a second terminal
+                // here would inflate one store failure into two.
+                observe_daemon_request("kernel.daemon_user_automation_operator_store", "unknown");
+                Err(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "user_automation_operator_transition_requires_reconciliation".to_owned(),
+                    ),
+                ))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn user_automation_precommit_refusal_response(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+        error: &eliot_kernel_core::user_automation::UserAutomationError,
+    ) -> serde_json::Value {
+        use eliot_kernel_core::user_automation::UserAutomationError;
+
+        let (code, field) = match error {
+            UserAutomationError::ZoneTableIntegrity => {
+                return Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Unavailable(
+                        "pinned UserAutomation zone table integrity failure".to_owned(),
+                    ),
+                );
+            }
+            UserAutomationError::Invalid("schedule.occurrence_key.encoding") => (
+                "unsupported_contract_version",
+                Some("schedule.occurrence_key.encoding"),
+            ),
+            UserAutomationError::LegacyScheduleEncoding(field) => ("legacy_encoding", Some(*field)),
+            UserAutomationError::ZoneDatabaseRevision(field) => {
+                ("stale_normalization_revision", Some(*field))
+            }
+            UserAutomationError::Invalid("schedule.occurrence_key.source_digest") => (
+                "stale_normalization_revision",
+                Some("schedule.occurrence_key.source_digest"),
+            ),
+            UserAutomationError::Receipt(_) | UserAutomationError::ReceiptBinding => {
+                ("invalid_or_moved_receipt", None)
+            }
+            UserAutomationError::Invalid(field)
+            | UserAutomationError::LimitExceeded(field)
+            | UserAutomationError::UnknownZone(field)
+            | UserAutomationError::ZoneEvidence(field)
+            | UserAutomationError::ZoneTableWindow { field, .. } => {
+                ("semantic_rejection", Some(*field))
+            }
+            UserAutomationError::InvalidSupersession => {
+                ("semantic_rejection", Some("revision.supersedes"))
+            }
+            UserAutomationError::Config(_)
+            | UserAutomationError::RevisionMismatch
+            | UserAutomationError::OccurrenceMismatch
+            | UserAutomationError::FailureProjectionMissing
+            | UserAutomationError::FailureFingerprintMismatch
+            | UserAutomationError::Serialization(_) => ("semantic_rejection", None),
+        };
+        let mut refusal = serde_json::Map::new();
+        refusal.insert("code".to_owned(), serde_json::json!(code));
+        if let Some(field) = field {
+            refusal.insert("field".to_owned(), serde_json::json!(field));
+        }
+        // The caller key was already capped at 256 UTF-8 bytes. The request ID
+        // and StateFence have closed validated shapes, and every refusal field
+        // is a fixed enum or a static contract field, so this envelope is bounded.
+        serde_json::json!({
+            "status": "unknown",
+            "value": {
+                "kind": "user_automation_refusal",
+                "schema_version": 1,
+                "operation": {
+                    "operation_id": request.identity.operation_id.as_str(),
+                    "request_id": &request.context.request_id,
+                    "idempotency_key": request.identity.idempotency_key.as_str(),
+                },
+                "state_fence": &request.context.state_fence,
+                "attempt_state": "store_not_called",
+                "refusal": refusal,
+            },
+            "recovery": {
+                "kind": "unknown_outcome",
+                "reason": "prior_attempt_may_have_committed",
+            },
+        })
     }
 
     /// Composes the existing authenticated Host execution channel for the
