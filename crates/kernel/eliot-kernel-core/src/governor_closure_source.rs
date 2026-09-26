@@ -437,12 +437,12 @@ impl GovernorClosureSource {
         // crossing (refused: v1 cannot fence it) from an unresolved one
         // (refused: the verdict would be partial/unknown).
         let covered_edges: BTreeSet<(&str, &str)> = graph_snapshot
-            .root_transitions
+            .admitted_root_transitions
             .iter()
-            .map(|receipt| {
+            .map(|admitted| {
                 (
-                    receipt.parent_grant_id.as_str(),
-                    receipt.child_grant_id.as_str(),
+                    admitted.record.parent_grant_id.as_str(),
+                    admitted.record.child_grant_id.as_str(),
                 )
             })
             .collect();
@@ -711,10 +711,10 @@ fn check_declaration_cross_root_closure(
     covered_edges: &BTreeSet<(&str, &str)>,
 ) -> Result<(), KernelError> {
     let target = declaration.target_grant_id.as_str();
-    for receipt in &snapshot.root_transitions {
-        if closure_edge_reaches_target(snapshot, &receipt.parent_grant_id, target) {
+    for admitted in &snapshot.admitted_root_transitions {
+        if closure_edge_reaches_target(snapshot, &admitted.record.parent_grant_id, target) {
             return Err(KernelError::RecoveryUnavailable(
-                "owner declaration target has receipt-authorized cross-root descendants the single-root declaration cannot fence"
+                "owner declaration target has owner-verified cross-root descendants the single-root declaration cannot fence"
                     .to_owned(),
             ));
         }
@@ -1094,7 +1094,7 @@ mod tests {
                 status: GrantStatus::Active,
             }],
             revoked: Vec::new(),
-            root_transitions: Vec::new(),
+            admitted_root_transitions: Vec::new(),
             quarantined_cross_root: Vec::new(),
         })
     }

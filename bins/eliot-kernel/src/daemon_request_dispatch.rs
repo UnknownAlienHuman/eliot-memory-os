@@ -98,6 +98,18 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
 
+/// Authenticated P-07 root-transition activation route (`#2962`).
+///
+/// A DISTINCT Kernel-owned front-door operation: the presented payload is the
+/// complete typed root-transition operation, and the reply is the
+/// transition-specific activation receipt. It is never an `activate_grant`
+/// overload, and the dispatcher never reads transition fields out of an
+/// untyped map.
+pub(crate) const ACTIVATE_ROOT_TRANSITION_OPERATION: &str = "activate_root_transition";
+
+/// Typed receipt kind answered by the root-transition activation arm.
+pub(crate) const ROOT_TRANSITION_RECEIPT_KIND: &str = "authority_root_transition_receipt";
+
 /// Authenticated P-07 read route answering the completed canonical second
 /// phases of one authority root (issue #2100, `R6`).
 ///
@@ -459,6 +471,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
         "revoke_introduction" => "revoke_introduction",
+        ACTIVATE_ROOT_TRANSITION_OPERATION => ACTIVATE_ROOT_TRANSITION_OPERATION,
         QUERY_GRANT_CLOSURE_LINKS_OPERATION => QUERY_GRANT_CLOSURE_LINKS_OPERATION,
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
@@ -574,6 +587,44 @@ struct GrantActivationOperation {
 struct GrantRevocationOperation {
     grant_id: String,
     snapshot_id: String,
+    binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
+}
+
+/// Closed P-07 root-transition activation operation (`#2962`).
+///
+/// This is a DISTINCT front-door operation, not an `activate_grant` overload:
+/// it carries the complete typed root-transition operation — operation
+/// identity, idempotency key, both grant identities AND their immutable
+/// commitments, both authority roots, the graph snapshot and its
+/// predecessor/expected-next revisions, policy revision, deadline, effect
+/// ceiling, semantic decision reference, canonical request digest, the
+/// presented authority binding, and the presented principal/session/scope
+/// subject. The dispatcher decodes it closed, rechecks binding and subject
+/// against the authenticated session, and routes it through the retained
+/// P-07 owner port; it never mints authority and never reads the transition
+/// fields out of an untyped map. Unknown or absent fields fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootTransitionActivationOperation {
+    operation_id: String,
+    idempotency_key: String,
+    transition_id: String,
+    parent_grant_id: String,
+    child_grant_id: String,
+    parent_grant_commitment: String,
+    child_grant_commitment: String,
+    from_authority_root_ref: String,
+    to_authority_root_ref: String,
+    issuer: String,
+    graph_snapshot_id: String,
+    predecessor_graph_revision: u64,
+    expected_next_graph_revision: u64,
+    policy_revision: String,
+    deadline_unix_ms: u64,
+    effect_ceiling: eliot_receipts::EffectClass,
+    semantic_decision_ref: String,
+    canonical_request_digest: String,
     binding: eliot_receipts::AuthorityBinding,
     subject: eliot_receipts::AuthorityRequestSubject,
 }
@@ -756,7 +807,8 @@ fn p07_binding_agrees_with_session(
 fn map_p07_port_error(error: &eliot_authority::P07PortError) -> TransportError {
     match error {
         eliot_authority::P07PortError::UnknownOutcome { .. } => TransportError::UnknownOutcome,
-        eliot_authority::P07PortError::InvalidBinding => TransportError::IdentityConflict,
+        eliot_authority::P07PortError::InvalidBinding
+        | eliot_authority::P07PortError::IdentityConflict => TransportError::IdentityConflict,
         eliot_authority::P07PortError::NotAdmitted | eliot_authority::P07PortError::Unavailable => {
             TransportError::SessionFenced
         }
@@ -2526,6 +2578,68 @@ impl KernelComposition {
                     serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
                 Ok(serde_json::json!({
                     "kind": "authority_revocation_receipt",
+                    "value": value,
+                }))
+            }
+            ACTIVATE_ROOT_TRANSITION_OPERATION => {
+                let operation: RootTransitionActivationOperation =
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                // Binding and subject are rechecked against the authenticated
+                // session BEFORE the retained owner is touched, so a stale or
+                // cross-session crossing never reaches the port.
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                let record = eliot_authority::RootTransitionRecord {
+                    transition_id: operation.transition_id,
+                    operation_id: operation.operation_id,
+                    idempotency_key: operation.idempotency_key,
+                    parent_grant_id: operation.parent_grant_id,
+                    child_grant_id: operation.child_grant_id,
+                    parent_grant_commitment: operation.parent_grant_commitment,
+                    child_grant_commitment: operation.child_grant_commitment,
+                    from_authority_root_ref: operation.from_authority_root_ref,
+                    to_authority_root_ref: operation.to_authority_root_ref,
+                    issuer: operation.issuer,
+                    graph_snapshot_id: operation.graph_snapshot_id,
+                    predecessor_graph_revision: operation.predecessor_graph_revision,
+                    expected_next_graph_revision: operation.expected_next_graph_revision,
+                    admitted_at_revision: operation.expected_next_graph_revision,
+                    policy_revision: operation.policy_revision,
+                    deadline_unix_ms: operation.deadline_unix_ms,
+                    effect_ceiling: operation.effect_ceiling,
+                    semantic_decision_ref: operation.semantic_decision_ref,
+                    binding: operation.binding,
+                };
+                // The presented canonical request digest must be the one this
+                // exact operation produces: a recomputed digest is authority
+                // readback over the presented bytes, not caller assertion.
+                let request = eliot_authority::RootTransitionActivationRequest::new(
+                    record,
+                    operation.subject,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                if request.canonical_request_digest() != operation.canonical_request_digest {
+                    return Err(TransportError::IdentityConflict);
+                }
+                let owner = self.retained_p07_owner()?;
+                let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+                let receipt = eliot_authority::P07AuthorityPort::activate_root_transition(
+                    bound.port(),
+                    &request,
+                )
+                .map_err(|error| map_p07_port_error(&error))?;
+                receipt
+                    .validate(&request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let value =
+                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": ROOT_TRANSITION_RECEIPT_KIND,
                     "value": value,
                 }))
             }

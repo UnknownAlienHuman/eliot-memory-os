@@ -34,7 +34,8 @@ use std::sync::Arc;
 
 use eliot_authority::{
     GrantActivationRequest, GrantRevocationRequest, IntroductionActivationRequest,
-    IntroductionRevocationRequest, P07AuthorityPort, P07PortError, SnapshotId,
+    IntroductionRevocationRequest, P07AuthorityPort, P07PortError, RootTransitionActivationReceipt,
+    RootTransitionActivationRequest, SnapshotId,
 };
 use eliot_contracts::StateFence;
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
@@ -51,9 +52,15 @@ const ACTIVATE_GRANT_OPERATION: &str = "activate_grant";
 const REVOKE_GRANT_OPERATION: &str = "revoke_grant";
 const ACTIVATE_INTRODUCTION_OPERATION: &str = "activate_introduction";
 const REVOKE_INTRODUCTION_OPERATION: &str = "revoke_introduction";
+/// Authenticated root-transition route (issue #2962). It is a DISTINCT
+/// Kernel-owned front-door operation, not an `activate_grant` overload: the
+/// payload is the complete typed root-transition operation, and the reply is
+/// the transition-specific activation receipt.
+const ACTIVATE_ROOT_TRANSITION_OPERATION: &str = "activate_root_transition";
 
 const ACTIVATION_RECEIPT_KIND: &str = "authority_activation_receipt";
 const REVOCATION_RECEIPT_KIND: &str = "authority_revocation_receipt";
+const ROOT_TRANSITION_RECEIPT_KIND: &str = "authority_root_transition_receipt";
 
 /// The exact session capability this adapter presents as its authenticated
 /// scope. It is the same closed constant the daemon's authenticated
@@ -203,6 +210,86 @@ impl P07AuthorityPort for KernelAuthorityClient {
         let value = kind_value(&value, REVOCATION_RECEIPT_KIND)
             .map_err(|_| P07PortError::InvalidBinding)?;
         decode_revocation_receipt(value, request.snapshot_id.as_str(), &fence)
+    }
+
+    /// Presents one exact authenticated root-transition operation.
+    ///
+    /// Same two proofs as the other four arms, at the same boundary and before
+    /// the transport is touched: [`check_binding`] proves the presented fence
+    /// is the CURRENT Kernel fence with a self-consistent epoch, and
+    /// [`Self::subject`] proves the principal/session/scope from the live
+    /// authenticated session. The payload then carries the whole typed
+    /// operation — every bound transition field plus the subject — so nothing
+    /// is tunnelled through an untyped map and ordinary grant activation is not
+    /// overloaded. The reply must be the transition-specific receipt and must
+    /// validate against the exact presented request, which is what proves both
+    /// the semantic decision and the mechanical activation.
+    fn activate_root_transition(
+        &self,
+        request: &RootTransitionActivationRequest,
+    ) -> Result<RootTransitionActivationReceipt, P07PortError> {
+        let fence = self.active_fence();
+        check_binding(&request.record().binding, &fence)?;
+        let subject = self.subject()?;
+        if subject != *request.subject() {
+            return Err(P07PortError::InvalidBinding);
+        }
+        let record = request.record();
+        let payload = serde_json::json!({
+            "operation_id": record.operation_id,
+            "idempotency_key": record.idempotency_key,
+            "transition_id": record.transition_id,
+            "parent_grant_id": record.parent_grant_id,
+            "child_grant_id": record.child_grant_id,
+            "parent_grant_commitment": record.parent_grant_commitment,
+            "child_grant_commitment": record.child_grant_commitment,
+            "from_authority_root_ref": record.from_authority_root_ref,
+            "to_authority_root_ref": record.to_authority_root_ref,
+            "issuer": record.issuer,
+            "graph_snapshot_id": record.graph_snapshot_id,
+            "predecessor_graph_revision": record.predecessor_graph_revision,
+            "expected_next_graph_revision": record.expected_next_graph_revision,
+            "policy_revision": record.policy_revision,
+            "deadline_unix_ms": record.deadline_unix_ms,
+            "effect_ceiling": record.effect_ceiling,
+            "semantic_decision_ref": record.semantic_decision_ref,
+            "canonical_request_digest": request.canonical_request_digest(),
+            "binding": record.binding,
+            "subject": subject,
+        });
+        let snapshot_id = transition_snapshot_id(record.graph_snapshot_id.as_str())?;
+        let value = self
+            .kernel
+            .request_blocking(ACTIVATE_ROOT_TRANSITION_OPERATION, payload)
+            .map_err(|error| map_transport(error, &snapshot_id))?;
+        let value = kind_value(&value, ROOT_TRANSITION_RECEIPT_KIND)
+            .map_err(|_| P07PortError::InvalidBinding)?;
+        let receipt: RootTransitionActivationReceipt =
+            serde_json::from_value(value).map_err(|_| P07PortError::InvalidBinding)?;
+        receipt
+            .validate(request)
+            .map_err(|error| map_transition_validation_error(&error))?;
+        Ok(receipt)
+    }
+}
+
+/// Adapts one transition's graph-snapshot identity to the retention-ledger
+/// snapshot identity the typed P-07 errors carry, so a lost acknowledgement
+/// names the exact snapshot the operation was presented under.
+fn transition_snapshot_id(graph_snapshot_id: &str) -> Result<SnapshotId, P07PortError> {
+    SnapshotId::new(graph_snapshot_id.to_owned()).map_err(|_| P07PortError::InvalidBinding)
+}
+
+/// Maps a refused transition receipt onto the typed P-07 vocabulary.
+///
+/// A receipt that does not commit the exact presented operation is an identity
+/// conflict, never a silent success: the caller re-serves fresh state instead of
+/// retrying the same operation under a new request.
+fn map_transition_validation_error(error: &eliot_authority::AuthorityError) -> P07PortError {
+    match error {
+        eliot_authority::AuthorityError::IdentityConflict => P07PortError::IdentityConflict,
+        eliot_authority::AuthorityError::P07Unavailable => P07PortError::Unavailable,
+        _ => P07PortError::InvalidBinding,
     }
 }
 

@@ -15,12 +15,13 @@
 use super::CompositionError;
 use crate::owner_closure_provider::AdmittedHydrationsSnapshot;
 use eliot_authority::{
-    EffectAuthorizer, EffectAuthorizerRecoverySnapshot, GrantActivationRequest, GrantGraph,
-    GrantGraphRecoverySnapshot, GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
-    IntroductionRevocationRequest, IntroductionStatus, P07PortError, RevocationHistoryEvidence,
-    SnapshotId, SuppressedGrant,
+    EffectAuthorizer, EffectAuthorizerRecoverySnapshot, GRANT_GRAPH_RECOVERY_SCHEMA,
+    GrantActivationRequest, GrantGraph, GrantGraphRecoverySnapshot, GrantRevocationRequest,
+    GrantStatus, IntroductionActivationRequest, IntroductionRevocationRequest, IntroductionStatus,
+    LEGACY_GRANT_GRAPH_RECOVERY_VERSION, P07PortError, RevocationHistoryEvidence, SnapshotId,
+    SuppressedGrant,
 };
-use eliot_contracts::{EpochId, StateFence};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use schemars::JsonSchema;
@@ -28,10 +29,157 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// Versioned semantic owner payload retained by Governor recovery.
-pub const AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v2";
-pub const AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 2;
-const LEGACY_AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v1";
-const LEGACY_AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 1;
+///
+/// #2962 step 11: the enclosing payload moved to v3 because accepting grant-graph
+/// v2 changes the outer canonical preimage and the compatibility meaning of
+/// the embedded `grant_graph` section. Old v2 bytes are never silently
+/// reinterpreted as v3; they take the closed [`GrantGraphLegacyMigration`]
+/// path instead.
+pub const AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v3";
+pub const AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 3;
+const LEGACY_AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v2";
+const LEGACY_AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 2;
+const OLDEST_AUTHORITY_OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.authority-owner.v1";
+const OLDEST_AUTHORITY_OWNER_SNAPSHOT_VERSION: u16 = 1;
+
+/// Nested version dispatch for the embedded grant-graph contract (issue #2962,
+/// step 9).
+///
+/// The graph schema AND version are decided before any protected field is
+/// interpreted, so a legacy payload — whose `root_transitions` carried only
+/// self-agreeing structural fields — can never be read under current
+/// authenticated-transition semantics, and its absent transition/quarantine
+/// sections are never treated as "no crossings recorded".
+fn require_current_grant_graph_contract(
+    grant_graph: &GrantGraphRecoverySnapshot,
+) -> Result<(), CompositionError> {
+    let version = GrantGraph::recovery_contract_version(grant_graph);
+    if grant_graph.schema != GRANT_GRAPH_RECOVERY_SCHEMA {
+        return Err(CompositionError::Recovery(
+            "authority owner grant graph has an unsupported schema identity".to_owned(),
+        ));
+    }
+    if version != eliot_authority::GRANT_GRAPH_RECOVERY_VERSION {
+        return Err(CompositionError::Recovery(format!(
+            "authority owner grant graph declares legacy contract version {version}; \
+             legacy cross-root data is inert/quarantined and cannot be restored as authority"
+        )));
+    }
+    Ok(())
+}
+
+/// One legacy (v1) grant-graph payload plus the digest of the exact bytes it
+/// was read from.
+///
+/// The bytes are preserved, not rewritten: a v1 cross-root entry becomes inert
+/// evidence under v2 restore, and this record proves for audit WHICH original
+/// bytes were migrated and what the migration decided. Obtaining active
+/// authority for a legacy crossing requires a NEW explicit v2 verification and
+/// activation operation — never an in-place historical rewrite.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantGraphLegacyMigration {
+    /// Declared contract version of the migrated payload.
+    pub from_version: u16,
+    /// Canonical digest of the exact original v1 record bytes.
+    pub original_record_sha256: String,
+    /// Cross-root edges the v1 payload named, in parent/child order.
+    pub legacy_cross_root_edges: Vec<LegacyCrossRootEdgeRecord>,
+    /// Fixed migration disposition: every legacy crossing is unqualified.
+    pub disposition: LegacyGrantGraphDisposition,
+    /// Closed migration schema identity.
+    pub schema: String,
+    /// Closed migration schema version.
+    pub version: u16,
+}
+
+/// One legacy cross-root edge retained for audit under the migration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCrossRootEdgeRecord {
+    /// Crossing source grant identity.
+    pub parent_grant: String,
+    /// Crossing dependent grant identity.
+    pub child_grant: String,
+    /// Legacy transition identity, retained verbatim for audit.
+    pub legacy_transition: String,
+}
+
+/// The only disposition a legacy v1 grant-graph payload may take.
+///
+/// `InertQuarantined` is total and unconditional: a v1 `root_transitions`
+/// entry does not become active authority merely because its copied fields
+/// agree with the live grants, because v1 never carried an operation identity,
+/// a canonical request digest, grant commitments, or mechanical activation
+/// evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyGrantGraphDisposition {
+    InertQuarantined,
+}
+
+/// Closed schema identity of the legacy grant-graph migration record.
+pub const GRANT_GRAPH_LEGACY_MIGRATION_SCHEMA: &str = "eliot.governor.grant-graph-legacy-migration";
+/// Closed schema version of the legacy grant-graph migration record.
+pub const GRANT_GRAPH_LEGACY_MIGRATION_VERSION: u16 = 1;
+
+impl GrantGraphLegacyMigration {
+    /// Builds the migration record for one decoded v1 payload.
+    ///
+    /// The digest is computed over the decoded value's canonical bytes, which
+    /// is the exact v1 contract shape, so the retained digest identifies the
+    /// migrated record rather than any ELIOT-authored reinterpretation of it.
+    pub fn from_legacy_v1(snapshot: &GrantGraphRecoverySnapshot) -> Result<Self, CompositionError> {
+        let bytes = canonical_json_bytes(snapshot).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "legacy grant graph could not be canonicalized for audit: {error}"
+            ))
+        })?;
+        Ok(Self {
+            from_version: snapshot.version,
+            original_record_sha256: sha256_hex(&bytes),
+            legacy_cross_root_edges: Vec::new(),
+            disposition: LegacyGrantGraphDisposition::InertQuarantined,
+            schema: GRANT_GRAPH_LEGACY_MIGRATION_SCHEMA.to_owned(),
+            version: GRANT_GRAPH_LEGACY_MIGRATION_VERSION,
+        })
+    }
+
+    /// Validates the closed migration shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] for a foreign schema/version, a
+    /// from-version that is not the legacy version, or any disposition other
+    /// than the one inert migration permits.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        if self.schema != GRANT_GRAPH_LEGACY_MIGRATION_SCHEMA
+            || self.version != GRANT_GRAPH_LEGACY_MIGRATION_VERSION
+        {
+            return Err(CompositionError::Recovery(
+                "grant graph legacy migration record has an invalid schema or version".to_owned(),
+            ));
+        }
+        if self.from_version != LEGACY_GRANT_GRAPH_RECOVERY_VERSION {
+            return Err(CompositionError::Recovery(
+                "grant graph legacy migration record does not name the legacy graph version"
+                    .to_owned(),
+            ));
+        }
+        if self.disposition != LegacyGrantGraphDisposition::InertQuarantined {
+            return Err(CompositionError::Recovery(
+                "legacy grant graph cannot migrate to anything but inert quarantined evidence"
+                    .to_owned(),
+            ));
+        }
+        if self.original_record_sha256.len() != 64 {
+            return Err(CompositionError::Recovery(
+                "grant graph legacy migration record has a malformed original digest".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Complete typed authority state bound to one outer Governor fence.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -52,6 +200,11 @@ pub struct AuthorityOwnerSnapshot {
     /// projection: the daemon may recover its other owners, but the P-07 owner
     /// feed remains closed until canonical hydrations are supplied.
     pub owner_hydrations: Option<AdmittedHydrationsSnapshot>,
+    /// Closed record of a deliberate legacy (v1 grant-graph) migration, with
+    /// the exact original record digest and the inert disposition. `None` is
+    /// the normal case for a payload that never migrated; it is never
+    /// synthesized to excuse an absent legacy section.
+    pub legacy_grant_graph_migration: Option<GrantGraphLegacyMigration>,
 }
 
 impl AuthorityOwnerSnapshot {
@@ -90,6 +243,35 @@ impl AuthorityOwnerSnapshot {
         effect_authorizer: EffectAuthorizerRecoverySnapshot,
         owner_hydrations: AdmittedHydrationsSnapshot,
     ) -> Result<Self, CompositionError> {
+        Self::new_with_owner_hydrations_and_migration(
+            state_fence,
+            grant_graph,
+            effect_authorizer,
+            owner_hydrations,
+            None,
+        )
+    }
+
+    /// Constructs the canonical authority-owner payload, optionally carrying a
+    /// closed record of a deliberate legacy grant-graph migration.
+    ///
+    /// #2962 step 10/11: a migrated payload is admitted only when it declares
+    /// the CURRENT grant-graph contract version and presents its migration
+    /// record. A payload still carrying a legacy (v1) grant-graph section is
+    /// refused here rather than silently upgraded, so old outer-v2 bytes can
+    /// never acquire stronger nested authority semantics by passing through
+    /// this constructor.
+    pub fn new_with_owner_hydrations_and_migration(
+        state_fence: StateFence,
+        grant_graph: GrantGraphRecoverySnapshot,
+        effect_authorizer: EffectAuthorizerRecoverySnapshot,
+        owner_hydrations: AdmittedHydrationsSnapshot,
+        legacy_grant_graph_migration: Option<GrantGraphLegacyMigration>,
+    ) -> Result<Self, CompositionError> {
+        require_current_grant_graph_contract(&grant_graph)?;
+        if let Some(migration) = &legacy_grant_graph_migration {
+            migration.validate()?;
+        }
         let snapshot = Self {
             schema: AUTHORITY_OWNER_SNAPSHOT_SCHEMA.to_owned(),
             version: AUTHORITY_OWNER_SNAPSHOT_VERSION,
@@ -97,6 +279,7 @@ impl AuthorityOwnerSnapshot {
             grant_graph,
             effect_authorizer,
             owner_hydrations: Some(owner_hydrations),
+            legacy_grant_graph_migration,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -104,7 +287,7 @@ impl AuthorityOwnerSnapshot {
 
     /// Rehydrates the canonical owner parts from one durable owner payload.
     ///
-    /// This is the production constructor seam for a v2 payload. The
+    /// This is the production constructor seam for a current payload. The
     /// hydration registry is supplied by the durable owner record; it is never
     /// replaced with an empty registry when the graph contains live lineage.
     pub fn from_durable_owner_payload(
@@ -121,18 +304,19 @@ impl AuthorityOwnerSnapshot {
         )
     }
 
-    /// Re-runs the v2 constructor for a decoded durable payload before the
-    /// semantic owner is built. Legacy payloads remain explicit unavailable
+    /// Re-runs the current constructor for a decoded durable payload before
+    /// the semantic owner is built. Legacy payloads remain explicit unavailable
     /// projections and are never promoted into a populated registry.
     fn canonical_durable_snapshot(snapshot: &Self) -> Result<Self, CompositionError> {
         let Some(owner_hydrations) = snapshot.owner_hydrations.clone() else {
             return Ok(snapshot.clone());
         };
-        Self::from_durable_owner_payload(
+        Self::new_with_owner_hydrations_and_migration(
             snapshot.state_fence.clone(),
             snapshot.grant_graph.clone(),
             snapshot.effect_authorizer.clone(),
             owner_hydrations,
+            snapshot.legacy_grant_graph_migration.clone(),
         )
     }
 
@@ -147,12 +331,17 @@ impl AuthorityOwnerSnapshot {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let current_schema = self.schema == AUTHORITY_OWNER_SNAPSHOT_SCHEMA
             && self.version == AUTHORITY_OWNER_SNAPSHOT_VERSION;
-        // A v1 owner record may still recover unrelated Governor owners, but
-        // its absent closure registry is an explicit unavailable marker. The
-        // P-07 feed refuses it; it is never treated as an empty registry.
-        let legacy_schema = self.schema == LEGACY_AUTHORITY_OWNER_SNAPSHOT_SCHEMA
+        // A pre-current owner record may still recover unrelated Governor
+        // owners, but its absent closure registry is an explicit unavailable
+        // marker. The P-07 feed refuses it; it is never treated as an empty
+        // registry. Two legacy schemas are distinguished because only the
+        // v2-shaped one carries a hydration registry.
+        let legacy_schema = (self.schema == LEGACY_AUTHORITY_OWNER_SNAPSHOT_SCHEMA
             && self.version == LEGACY_AUTHORITY_OWNER_SNAPSHOT_VERSION
-            && self.owner_hydrations.is_none();
+            && self.owner_hydrations.is_none())
+            || (self.schema == OLDEST_AUTHORITY_OWNER_SNAPSHOT_SCHEMA
+                && self.version == OLDEST_AUTHORITY_OWNER_SNAPSHOT_VERSION
+                && self.owner_hydrations.is_none());
         if !current_schema && !legacy_schema {
             return Err(CompositionError::Recovery(
                 "authority owner snapshot has an invalid schema or version".to_owned(),
@@ -160,10 +349,18 @@ impl AuthorityOwnerSnapshot {
         }
         if legacy_schema && !self.grant_graph.grants.is_empty() {
             return Err(CompositionError::Recovery(
-                "legacy authority owner payload cannot restore non-empty grant lineage without a v2 hydration registry"
+                "legacy authority owner payload cannot restore non-empty grant lineage without a current hydration registry"
                     .to_owned(),
             ));
         }
+        if let Some(migration) = &self.legacy_grant_graph_migration {
+            migration.validate()?;
+        }
+        // Nested dispatch: the grant-graph contract version is decided before
+        // any of its protected sections is interpreted, so a legacy payload
+        // refuses by its own version rather than being read under current
+        // semantics with absent authority-sensitive fields.
+        require_current_grant_graph_contract(&self.grant_graph)?;
         self.grant_graph
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -501,6 +698,7 @@ impl AuthorityOwner {
             grant_graph,
             effect_authorizer,
             owner_hydrations: self.owner_hydrations.clone(),
+            legacy_grant_graph_migration: None,
         };
         snapshot.validate()?;
         Ok(snapshot)

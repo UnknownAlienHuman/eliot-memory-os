@@ -12,6 +12,14 @@ mod effects;
 mod grants;
 mod leases;
 mod revocation_history;
+mod root_transition;
+
+pub use root_transition::{
+    AdmittedRootTransition, AdmittedRootTransitionRecord, ROOT_TRANSITION_OPERATION_KIND,
+    ROOT_TRANSITION_RECEIPT_SCHEMA, ROOT_TRANSITION_RECEIPT_VERSION,
+    RootTransitionActivationReceipt, RootTransitionActivationRequest, RootTransitionDisposition,
+    RootTransitionRecord, grant_commitment,
+};
 
 pub use activation::{
     GrantActivationRequest, GrantRevocationRequest, IntroductionActivationRequest,
@@ -31,9 +39,9 @@ pub use grants::{
     CrossRootRelationDisposition, EffectiveCapabilityPath, EffectiveCapabilitySnapshot,
     GRANT_GRAPH_RECOVERY_SCHEMA, GRANT_GRAPH_RECOVERY_VERSION, GrantClosureDelegation,
     GrantClosureMemberRef, GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord,
-    GrantStatus, IntroductionId, IntroductionStatus, LogicalTime, PrincipalRef,
-    QuarantinedCrossRootRecord, QuarantinedCrossRootRelation, QuarantinedFrontierMember,
-    ReceiptObligation, RevocationClosureState, RevocationClosureVerdict, RootTransitionReceipt,
+    GrantStatus, IntroductionId, IntroductionStatus, LEGACY_GRANT_GRAPH_RECOVERY_VERSION,
+    LogicalTime, PrincipalRef, QuarantinedCrossRootRecord, QuarantinedCrossRootRelation,
+    QuarantinedFrontierMember, ReceiptObligation, RevocationClosureState, RevocationClosureVerdict,
     SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
@@ -66,6 +74,11 @@ pub enum AuthorityError {
     UnauthorizedResource,
     EffectCeilingExceeded,
     IdentityConflict,
+    /// Admitted transition evidence no longer matches CURRENT owner state, or
+    /// a transition operation was presented without a committed mechanical
+    /// disposition. The named field says which readback clause refused, so a
+    /// stale crossing is distinguishable from a malformed one.
+    StaleTransitionEvidence(&'static str),
     InvalidLifecycleTransition,
     ReceiptMismatch,
     P07Unavailable,
@@ -98,6 +111,10 @@ impl fmt::Display for AuthorityError {
             Self::UnauthorizedResource => formatter.write_str("resource is not authorized"),
             Self::EffectCeilingExceeded => formatter.write_str("effect ceiling exceeded"),
             Self::IdentityConflict => formatter.write_str("idempotency identity conflict"),
+            Self::StaleTransitionEvidence(field) => write!(
+                formatter,
+                "stale or uncommitted root-transition evidence: {field}"
+            ),
             Self::InvalidLifecycleTransition => formatter.write_str("invalid lifecycle transition"),
             Self::ReceiptMismatch => {
                 formatter.write_str("effect receipt does not match authorization")

@@ -9626,6 +9626,13 @@ mod tests {
         ) -> Result<AuthorityRevocationReceipt, P07PortError> {
             Err(P07PortError::Unavailable)
         }
+
+        fn activate_root_transition(
+            &self,
+            _request: &eliot_authority::RootTransitionActivationRequest,
+        ) -> Result<eliot_authority::RootTransitionActivationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
     }
 
     fn pending_grant_fixture(
