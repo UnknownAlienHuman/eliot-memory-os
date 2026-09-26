@@ -2,9 +2,54 @@
 
 use crate::{AgentSessionId, ProjectId, VerificationResult, WriteReceiptRef};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 use time::OffsetDateTime;
+
+/// Deserialize a map while refusing a repeated key before insertion.
+///
+/// Derived map decoding keeps the last entry and silently drops earlier
+/// ones, so a lexical duplicate would rewrite a count or role entry without
+/// evidence. Every valid single-key encoding decodes exactly as before.
+fn deserialize_strict_btree_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    struct StrictMapVisitor<K, V>(PhantomData<fn() -> BTreeMap<K, V>>);
+
+    impl<'de, K, V> de::Visitor<'de> for StrictMapVisitor<K, V>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+    {
+        type Value = BTreeMap<K, V>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map with unique keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<BTreeMap<K, V>, A::Error>
+        where
+            A: de::MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some(key) = access.next_key::<K>()? {
+                if values.contains_key(&key) {
+                    return Err(de::Error::custom("duplicate map key"));
+                }
+                let value = access.next_value::<V>()?;
+                values.insert(key, value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(StrictMapVisitor(PhantomData))
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +79,7 @@ pub enum ExperienceMaturityState {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceBranchCommitEnvironment {
     pub branch: String,
     pub commit: String,
@@ -43,10 +89,12 @@ pub struct SourceBranchCommitEnvironment {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceProblemFrame {
     pub goal_pattern: String,
     pub task_or_action_type: String,
     pub trigger_or_symptom: String,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub entity_roles: BTreeMap<String, String>,
     pub desired_state_transition: String,
     pub constraints: Vec<String>,
@@ -54,6 +102,7 @@ pub struct ExperienceProblemFrame {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceCausalModel {
     pub mechanism: String,
     pub causal_chain: Vec<String>,
@@ -62,6 +111,7 @@ pub struct ExperienceCausalModel {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceInterventionOutcome {
     pub attempted_actions: Vec<String>,
     pub decisive_action_or_non_action: String,
@@ -70,6 +120,7 @@ pub struct ExperienceInterventionOutcome {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceTransferBoundary {
     pub retrieval_cues: Vec<String>,
     pub conceptual_aliases: Vec<String>,
@@ -82,6 +133,7 @@ pub struct ExperienceTransferBoundary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceMaturity {
     pub state: ExperienceMaturityState,
     pub support_count: u32,
@@ -103,6 +155,7 @@ impl Default for ExperienceMaturity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceAuthority {
     pub current_truth: bool,
     pub candidate_only: bool,
@@ -126,6 +179,7 @@ impl Default for ExperienceAuthority {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceCase {
     pub case_id: String,
     pub project_id: ProjectId,
@@ -144,6 +198,7 @@ pub struct ExperienceCase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperiencePattern {
     pub pattern_id: String,
     pub project_id: ProjectId,
@@ -163,6 +218,7 @@ pub struct ExperiencePattern {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifiedEpisodeProjection {
     pub project_id: ProjectId,
     pub source_episode_refs: Vec<String>,
@@ -178,7 +234,7 @@ pub struct VerifiedEpisodeProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExperienceFormationResult {
     Formed {
         experience_case: Box<ExperienceCase>,
@@ -189,14 +245,14 @@ pub enum ExperienceFormationResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContrastiveAbstractionResult {
     Formed { pattern: Box<ExperiencePattern> },
     NoLearnablePattern { reason: String },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct TaskMeaningFrame {
     pub task_id: String,
     pub user_goal: String,
@@ -205,6 +261,7 @@ pub struct TaskMeaningFrame {
     pub task_or_action_type: String,
     pub desired_state_transition: String,
     pub problem_or_failure_signature: String,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub entity_roles: BTreeMap<String, String>,
     pub project_module_boundary: Vec<String>,
     pub files_symbols_config: Vec<String>,
@@ -221,10 +278,12 @@ pub struct TaskMeaningFrame {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CausalBridgeQualityReport {
     pub task_id: String,
     pub report_ref: String,
     pub bridge_hops: Vec<String>,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub exact_evidence_per_hop: BTreeMap<String, Vec<String>>,
     pub unknown_hops: Vec<String>,
     pub predicted_observable: String,
@@ -247,6 +306,7 @@ pub enum MemoryNeed {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryNeedDecision {
     pub task_id: String,
     pub need: MemoryNeed,
@@ -272,10 +332,12 @@ pub enum ApplicabilityVerdict {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryApplicabilityDecision {
     pub decision_id: String,
     pub task_frame_ref: String,
     pub experience_ref: String,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub mapped_entity_roles: BTreeMap<String, String>,
     pub matched_conditions: Vec<String>,
     pub critical_differences: Vec<String>,
@@ -288,6 +350,7 @@ pub struct MemoryApplicabilityDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FusedRankRoute {
     pub route: String,
     pub cue: String,
@@ -295,6 +358,7 @@ pub struct FusedRankRoute {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FusedRankTrace {
     pub task_frame_ref: String,
     pub candidate_ref: String,
@@ -304,6 +368,7 @@ pub struct FusedRankTrace {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextReinstatementBundle {
     pub bundle_id: String,
     pub experience_ref: String,
@@ -318,6 +383,7 @@ pub struct ContextReinstatementBundle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceBrief {
     pub memory_kind: MemoryKind,
     pub essence: String,
@@ -334,6 +400,7 @@ pub struct ExperienceBrief {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceRecallRequest {
     pub project_id: ProjectId,
     pub task_frame: TaskMeaningFrame,
@@ -342,6 +409,7 @@ pub struct ExperienceRecallRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperienceRecallResponse {
     pub project_id: ProjectId,
     pub decision: MemoryNeedDecision,
@@ -430,10 +498,15 @@ impl ExperienceRecallResponse {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryCorpusProfile {
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub counts_by_kind: BTreeMap<String, u64>,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub counts_by_epistemic_status: BTreeMap<String, u64>,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub counts_by_lifecycle: BTreeMap<String, u64>,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub counts_by_maturity: BTreeMap<String, u64>,
     pub verified_episode_count: u64,
     pub reconstructed_case_count: u64,
@@ -451,6 +524,7 @@ pub struct MemoryCorpusProfile {
     pub counterexample_coverage: f64,
     pub verifier_link_coverage: f64,
     pub cross_agent_source_diversity: u64,
+    #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub mechanism_family_distribution: BTreeMap<String, u64>,
 }
 
@@ -472,6 +546,7 @@ pub enum CognitiveFailureStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveFailureLocalizationReport {
     pub report_id: String,
     pub experiment_ref: String,
@@ -519,6 +594,7 @@ pub enum NegativeTransferLifecycleAction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NegativeTransferHarm {
     pub extra_tool_calls: u32,
     pub wrong_generalization: bool,
@@ -526,6 +602,7 @@ pub struct NegativeTransferHarm {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NegativeTransferRecord {
     pub record_id: String,
     pub experiment_ref: String,
@@ -551,6 +628,7 @@ pub enum MemoryExposureMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryExposurePolicy {
     pub mode: MemoryExposureMode,
     pub allowed_kinds: Vec<MemoryKind>,
@@ -589,6 +667,7 @@ pub enum ReasoningJobKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateReasoningJobOutput {
     pub job_ref: String,
     pub kind: ReasoningJobKind,
@@ -604,6 +683,7 @@ pub struct CandidateReasoningJobOutput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveHiddenEssence {
     pub required_concepts: Vec<String>,
     pub mechanism: String,
@@ -616,6 +696,7 @@ pub struct CognitiveHiddenEssence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveCaseSpec {
     pub case_id: String,
     pub source_case_refs: Vec<String>,
@@ -633,6 +714,7 @@ pub struct CognitiveCaseSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveReaderAnswer {
     pub case_id: String,
     pub retrieved_refs: Vec<String>,
@@ -653,6 +735,7 @@ pub struct CognitiveReaderAnswer {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveCaseResult {
     pub case_id: String,
     pub encoding_pass: bool,
@@ -668,6 +751,7 @@ pub struct CognitiveCaseResult {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveTransferMetrics {
     pub encoding_gist_fidelity: f64,
     pub mechanism_fidelity: f64,
@@ -686,6 +770,7 @@ pub struct CognitiveTransferMetrics {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CognitiveTransferLabReport {
     pub run_id: String,
     pub results: Vec<CognitiveCaseResult>,
