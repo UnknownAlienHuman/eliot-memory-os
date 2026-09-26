@@ -46,7 +46,8 @@ pub use improvement_pipeline::{
     MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_EVALUATE, OP_EXECUTE_EXPERIMENT,
     OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError, ProposalCommitment,
     RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY, assess_improvement_replay,
-    proposal_digest, reconcile_unknown_activation, run_improvement_candidate_pipeline,
+    compare_improvement_commitments, proposal_digest, reconcile_unknown_activation,
+    run_improvement_candidate_pipeline,
 };
 
 /// Stable wire name for the maintenance governor contract.
