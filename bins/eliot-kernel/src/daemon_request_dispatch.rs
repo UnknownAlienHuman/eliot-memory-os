@@ -2295,8 +2295,9 @@ impl KernelComposition {
                 ))
             }
             "initialize_owner_revision" => {
-                let operation: OwnerRevisionOperation = serde_json::from_value(payload.clone())
-                    .map_err(|_| TransportError::SessionFenced)?;
+                let operation: OwnerRevisionOperation =
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                        .map_err(|_| TransportError::SessionFenced)?;
                 if operation.state_fence != session.module_generation.state_fence {
                     return Err(TransportError::SessionFenced);
                 }
@@ -2383,7 +2384,7 @@ impl KernelComposition {
             }
             QUERY_GRANT_CLOSURE_LINKS_OPERATION => {
                 let query: eliot_kernel_service::GrantClosureCanonicalLinksQuery =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 // The live session fence binds the served view, exactly as the
                 // authority-history read binds it: a query presented under any
@@ -2411,7 +2412,7 @@ impl KernelComposition {
             }
             "activate_grant" => {
                 let operation: GrantActivationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
@@ -2443,7 +2444,7 @@ impl KernelComposition {
             }
             "revoke_grant" => {
                 let operation: GrantRevocationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
@@ -2470,7 +2471,7 @@ impl KernelComposition {
             }
             "activate_introduction" => {
                 let operation: IntroductionActivationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.introduction_id.trim().is_empty()
                     || operation.snapshot_id.trim().is_empty()
@@ -2508,7 +2509,7 @@ impl KernelComposition {
             }
             "revoke_introduction" => {
                 let operation: IntroductionRevocationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.introduction_id.trim().is_empty()
                     || operation.snapshot_id.trim().is_empty()
@@ -4812,7 +4813,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: OriginChallengeIssueOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         validate_origin_session_fence(session, operation.request.state_fence())?;
         let (owner, _) =
             super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
@@ -4850,7 +4852,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: OriginControlDecideOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let presentation_bytes = serde_json::to_vec(&operation.presentation)
             .map_err(|_| TransportError::SessionFenced)?;
         let presentation = OriginControlPresentation::from_json_bytes(&presentation_bytes)
@@ -4900,7 +4903,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let query: ActiveGenerationRegistryQuery =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let projection = self
             .active_generation_registry_query(&query, &session.module_generation.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -5191,7 +5195,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreRecoveryOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = operation.request.validate() {
             return Ok(Self::store_error_response_text(
                 "store_recovery",
@@ -5232,7 +5237,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreInitializeGenesisOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         operation
             .context
             .validate()
@@ -5287,7 +5293,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreApplyOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if operation.context.request_id != request_id {
             return Err(TransportError::SessionFenced);
         }
@@ -5715,7 +5722,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: NotificationStateReadOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &operation.state_fence)?;
         let page = self
             .read_notification_page(&NotificationPageQuery::from_read_operation(&operation))
@@ -5965,7 +5973,8 @@ impl KernelComposition {
         // Closed decode first: unknown fields never reach the read leg, and a
         // read without the Kernel-issued attempt capability never decodes.
         let operation: LocalReadOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let envelope = operation.envelope;
         let tool = operation.tool;
         let attempt = operation.attempt;
@@ -6131,7 +6140,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: WasmDispatchBundleOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         // Guest byte vectors must each fit one transport frame
         // (`eliot_protocol::MAX_FRAME_BYTES`): anything larger could not
         // have arrived intact, and unbounded staging buffers are refused.
@@ -6456,7 +6466,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: NotifyLaunchGrantOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &session.module_generation.state_fence)?;
         self.admit_material_authority_for_fence(
             GovernanceProfile::full(),
