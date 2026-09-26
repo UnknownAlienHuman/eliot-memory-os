@@ -41,6 +41,7 @@
 //! credentials.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
@@ -647,9 +648,28 @@ struct CapturePoint {
     schema_generation: String,
 }
 
-/// Frozen per-handle capture state. No `Debug` impl by design: registry
-/// contents never render into logs or errors.
+/// Frozen per-capture state. No `Debug` impl by design: registry contents
+/// never render into logs or errors.
+///
+/// The entry is keyed by the handle digest, but the digest is only an index: the
+/// authority is [`SnapshotState::issued`], the complete owner-issued handle
+/// retained once at begin. Every page and end request is compared against it,
+/// and every emitted handle is read back from it, so a presented object can
+/// never stand in for the issued one.
 struct SnapshotState {
+    /// The exact handle this capture was opened under, retained once.
+    ///
+    /// Constructed only after the source observation is validated. A digest
+    /// alone is an index and a commitment, not the identity: the consistency
+    /// point and the operation/idempotency pair are the other three fields.
+    issued: SnapshotHandle,
+    /// Monotonic incarnation of this registry entry.
+    ///
+    /// Owner-issued by [`next_incarnation`]; never a timestamp and never derived
+    /// from caller input. A post-provider-read request re-checks it so a request
+    /// that began against one capture cannot advance the successor that reused
+    /// the same digest.
+    incarnation: u64,
     begin: SnapshotBeginRequest,
     point: CapturePoint,
     /// Proof that the canonical enumeration ran. `None` means the denominator
@@ -678,6 +698,82 @@ fn registry() -> &'static Mutex<HashMap<String, SnapshotState>> {
 fn lock_registry()
 -> Result<std::sync::MutexGuard<'static, HashMap<String, SnapshotState>>, StoreError> {
     registry().lock().map_err(|_| StoreError::Unavailable)
+}
+
+/// Issues the next capture incarnation identity.
+///
+/// Owner-issued and monotonic. It is deliberately not a timestamp and not
+/// derived from any caller value: the only property the post-await re-check
+/// needs is that two different registry entries never share one, and a
+/// process-local counter proves that without importing a clock.
+fn next_incarnation() -> u64 {
+    static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
+    NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Compares a presented handle with the retained owner-issued handle.
+///
+/// All four fields are compared. The digest is checked too, but a digest match
+/// alone is not acceptance: a shape-valid handle whose `consistency_point`,
+/// `operation_id` or `idempotency_key` was substituted carries the right index
+/// and the wrong capture. A substituted consistency point is a bounded
+/// field-level contradiction; a substituted operation or idempotency field is
+/// [`StoreError::IdentityConflict`], the I05-27 cause for one operation id under
+/// a different identity.
+///
+/// The caller must run this before any mutation, so a refusal advances no
+/// counter, records no interruption, arms no guard, clears no transient state
+/// and closes nothing.
+fn require_retained_handle(
+    state: &SnapshotState,
+    presented: &SnapshotHandle,
+) -> Result<(), StoreError> {
+    if presented.consistency_point != state.issued.consistency_point {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.consistency_point",
+            reason: "presented handle is not the owner-issued handle for this capture",
+        });
+    }
+    if presented.operation_id != state.issued.operation_id
+        || presented.idempotency_key != state.issued.idempotency_key
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    if presented.snapshot_digest != state.issued.snapshot_digest {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.snapshot_digest",
+            reason: "presented handle is not the owner-issued handle for this capture",
+        });
+    }
+    Ok(())
+}
+
+/// Resolves a replayed begin against the retained owner decision.
+///
+/// `Ok(Some(handle))` is an exact replay: the same canonical bytes are already
+/// open, so the original handle and the original progress are returned and the
+/// source is not read again. `Ok(None)` means the logical begin is unclaimed and
+/// the caller must open a new capture.
+///
+/// A different canonical input under an already claimed operation/idempotency
+/// namespace is [`StoreError::IdentityConflict`]. The registry is keyed by the
+/// request digest, so on its own it cannot see that collision at all — the scan
+/// is what makes the namespace claim observable. A deliberate refresh needs its
+/// own new logical capture; it never resets the open one.
+fn retained_begin_handle(
+    digest: &str,
+    request: &SnapshotBeginRequest,
+) -> Result<Option<SnapshotHandle>, StoreError> {
+    let states = lock_registry()?;
+    for (claimed, state) in states.iter() {
+        if claimed != digest
+            && state.issued.operation_id == request.operation.operation_id
+            && state.issued.idempotency_key == request.operation.idempotency_key
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+    }
+    Ok(states.get(digest).map(|state| state.issued.clone()))
 }
 
 /// Reports whether a capture can no longer serve: owner expiry passed (or
@@ -1780,6 +1876,15 @@ pub(crate) async fn begin_snapshot(
     // The acting principal is named, not assumed, before any protected read.
     bind_capture_principal(adapter, SNAPSHOT_BEGIN_OPERATION)?;
     verify_canonical_source_classes()?;
+    // Resolve the exact logical begin through the registry BEFORE the source is
+    // read. An exact replay returns the retained handle and the retained
+    // progress; re-enumerating here would present a second observation as the
+    // old capture, and the consistency point embeds the observed scope digest,
+    // so the replayed handle would differ from the one actually in force.
+    let snapshot_digest = request.compute_digest().map_err(redact_snapshot_error)?;
+    if let Some(retained) = retained_begin_handle(&snapshot_digest, &request)? {
+        return Ok(retained);
+    }
     // The denominator and the scope projection are read from the provider, in one
     // coherent transaction with the point they claim, and the caller's claims are
     // reconciled against what was observed. The caller never supplies the served
@@ -1804,8 +1909,6 @@ pub(crate) async fn begin_snapshot(
         });
     }
 
-    let snapshot_digest = request.compute_digest().map_err(redact_snapshot_error)?;
-
     let member_count = ordered_members.len() as u64;
     if member_count > request.bounds.max_members || member_count > MAX_SNAPSHOT_MEMBERS as u64 {
         return Err(StoreError::PayloadTooLarge);
@@ -1826,6 +1929,8 @@ pub(crate) async fn begin_snapshot(
         return Err(StoreError::PayloadTooLarge);
     }
 
+    // Constructed only now, after the source observation is validated, and
+    // retained with the entry rather than returned as a throwaway value.
     let handle = SnapshotHandle {
         // The owner-issued point binds the caller's claim *and* the scope
         // projection read back from the provider, so a reader of the handle can
@@ -1838,14 +1943,19 @@ pub(crate) async fn begin_snapshot(
     handle.validate()?;
 
     let mut states = lock_registry()?;
-    if states.contains_key(&snapshot_digest) {
-        // Deterministic replay of the same begin request: keep the in-flight
-        // capture (and its served-page progress) instead of rebinding it.
-        return Ok(handle);
+    if let Some(state) = states.get(&snapshot_digest) {
+        // Another begin for the same logical request claimed this capture while
+        // this one was enumerating. The retained decision is authoritative: a
+        // deliberate refresh needs its own new logical capture, never a reset of
+        // the open one, and an expired or retired replay keeps its original
+        // window because the entry is left exactly as it is.
+        return Ok(state.issued.clone());
     }
     states.insert(
         snapshot_digest.clone(),
         SnapshotState {
+            issued: handle.clone(),
+            incarnation: next_incarnation(),
             begin: request,
             point,
             enumeration: Some(evidence),
@@ -1886,17 +1996,17 @@ fn check_cursor(state: &SnapshotState, cursor: &SnapshotCursor) -> Result<(), St
 /// Slices the next page out of a drift-verified capture, advances its served
 /// progress, and chains the predecessor digest. Runs under the registry lock
 /// with no awaits inside.
+///
+/// The page's handle is read back from the retained owner-issued handle, never
+/// from the object the caller presented: the caller has already been proven to
+/// hold the issued identity, so echoing its own copy would prove nothing.
 fn serve_next_page(
     states: &mut HashMap<String, SnapshotState>,
     digest: &str,
-    handle: SnapshotHandle,
     cursor: SnapshotCursor,
 ) -> Result<SnapshotPage, StoreError> {
     let Some(state) = states.get_mut(digest) else {
-        return Err(StoreError::InvalidField {
-            field: "snapshot.snapshot_digest",
-            reason: "unknown snapshot handle",
-        });
+        return Err(unknown_snapshot_handle());
     };
     // Served progress is contiguous from index zero, so the served member
     // count doubles as the next slice start; `try_from` keeps the
@@ -1937,7 +2047,7 @@ fn serve_next_page(
         })
     };
     let page = SnapshotPage {
-        handle,
+        handle: state.issued.clone(),
         cursor,
         members,
         cumulative_bytes,
@@ -1961,6 +2071,14 @@ fn serve_next_page(
 /// Validates one page request against the live capture without any provider
 /// I/O. Runs under the registry lock with no awaits inside.
 ///
+/// The presented handle is resolved against the retained owner-issued handle
+/// FIRST, and the resolved incarnation is returned so the post-await path can
+/// prove it is still serving the same capture. A mismatched handle therefore
+/// advances no counter, records no interruption, arms no guard, clears no
+/// transient state and closes nothing; independent expiry maintenance also does
+/// not run for a request that does not target a real capture under its own
+/// identity.
+///
 /// When the capture can no longer serve, the exact partial evidence is recorded
 /// and the entry deliberately retained, so a later `end_snapshot` can still
 /// issue an honest `Expired` or `Partial` receipt instead of deleting the only
@@ -1968,14 +2086,18 @@ fn serve_next_page(
 fn prepare_page(
     states: &mut HashMap<String, SnapshotState>,
     digest: &str,
+    presented: &SnapshotHandle,
     ctx: &RequestMeta,
     cursor: &SnapshotCursor,
     now_ms: u64,
-) -> Result<(), StoreError> {
-    purge_expired_except(states, now_ms, digest);
+) -> Result<u64, StoreError> {
     let Some(state) = states.get(digest) else {
         return Err(unknown_snapshot_handle());
     };
+    require_retained_handle(state, presented)?;
+    let incarnation = state.incarnation;
+    purge_expired_except(states, now_ms, digest);
+    let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
     let retired = capture_is_retired(state, now_ms);
     let next_page = state.pages_served.saturating_add(1);
     let over_page_bound =
@@ -2009,21 +2131,32 @@ fn prepare_page(
         mark_interruption(states, digest, INTERRUPTION_PAGE_BOUND);
         return Err(StoreError::PayloadTooLarge);
     }
-    Ok(())
+    Ok(incarnation)
 }
 
 /// Re-verifies the bound point after the provider await and serves the page, or
 /// records the exact partial evidence that ends the capture.
+///
+/// The claim is re-resolved against owner state, not only against the provider:
+/// exact handle equality does not prove the entry was not replaced while the
+/// await was in flight, so the incarnation the pre-read claim was validated
+/// against is re-checked too. A successor that reused the digest is reported as
+/// the typed identity conflict it is and is not mutated.
 fn finish_page(
     digest: &str,
     observed: &CapturePoint,
-    handle: SnapshotHandle,
+    presented: &SnapshotHandle,
+    incarnation: u64,
     cursor: SnapshotCursor,
     guard: &mut CaptureRelease,
 ) -> Result<SnapshotPage, StoreError> {
     let mut states = lock_registry()?;
     let (moved, retired, interrupted) = {
         let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+        if state.incarnation != incarnation {
+            return Err(StoreError::IdentityConflict);
+        }
+        require_retained_handle(state, presented)?;
         (
             observed != &state.point,
             capture_is_retired(state, crate::write_execution::current_time_ms()),
@@ -2050,7 +2183,7 @@ fn finish_page(
     guard.retain();
     let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
     check_cursor(state, &cursor)?;
-    serve_next_page(&mut states, digest, handle, cursor)
+    serve_next_page(&mut states, digest, cursor)
 }
 
 /// Reads one bounded page of an open capture under its bound point.
@@ -2073,16 +2206,17 @@ pub(crate) async fn read_snapshot_page(
     // only at begin: a page is protected data too.
     bind_capture_principal(adapter, SNAPSHOT_PAGE_OPERATION)?;
     let digest = handle.snapshot_digest.clone();
-    {
+    let incarnation = {
         let mut states = lock_registry()?;
         prepare_page(
             &mut states,
             &digest,
+            &handle,
             ctx,
             &cursor,
             crate::write_execution::current_time_ms(),
-        )?;
-    }
+        )?
+    };
     // No registry lock is held across this provider await (I5.7). The guard is
     // armed across it, so a future dropped while the await is in flight still
     // releases exactly the capture-owned entry; only a provider failure that
@@ -2096,7 +2230,7 @@ pub(crate) async fn read_snapshot_page(
             return Err(error);
         }
     };
-    finish_page(&digest, &observed, handle, cursor, &mut guard)
+    finish_page(&digest, &observed, &handle, incarnation, cursor, &mut guard)
 }
 
 /// Builds and validates the closing receipt, then releases the capture entry.
@@ -2109,10 +2243,13 @@ pub(crate) async fn read_snapshot_page(
 /// a recorded provider failure was only a transport blip, so that one transient
 /// record is cleared before completeness is computed. Every other interruption
 /// reason, and every `moved`/`expired` observation, stays terminal.
+///
+/// The receipt's handle comes from the retained owner-issued handle, so the
+/// receipt and its operation identity describe the same capture by
+/// construction rather than by agreement between two caller-reachable values.
 fn close_capture(
     digest: &str,
     observed: Option<&CapturePoint>,
-    handle: SnapshotHandle,
 ) -> Result<SnapshotEndReceipt, StoreError> {
     let mut states = lock_registry()?;
     let (expired, moved) = {
@@ -2140,7 +2277,7 @@ fn close_capture(
         let (completeness, members_served, bytes_served) =
             closing_accounting(state, expired, moved)?;
         SnapshotEndReceipt {
-            handle,
+            handle: state.issued.clone(),
             operation: state.begin.operation.clone(),
             member_count: members_served,
             byte_count: bytes_served,
@@ -2167,6 +2304,13 @@ pub(crate) async fn end_snapshot(
     let digest = handle.snapshot_digest.clone();
     let retired = {
         let mut states = lock_registry()?;
+        // The target request is resolved against the retained owner-issued
+        // handle before any maintenance runs, so a mismatched handle purges
+        // nothing, interrupts nothing and closes nothing.
+        {
+            let state = states.get(&digest).ok_or_else(unknown_snapshot_handle)?;
+            require_retained_handle(state, &handle)?;
+        }
         purge_expired_except(
             &mut states,
             crate::write_execution::current_time_ms(),
@@ -2199,5 +2343,5 @@ pub(crate) async fn end_snapshot(
         };
         Some(observed)
     };
-    close_capture(&digest, observed.as_ref(), handle)
+    close_capture(&digest, observed.as_ref())
 }
