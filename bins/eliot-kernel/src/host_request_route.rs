@@ -379,6 +379,13 @@ impl KernelComposition {
         envelope
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        if matches!(
+            envelope.kind,
+            HostRequestKind::Invocation | HostRequestKind::Cancellation
+        ) && envelope.identity.correlation_projection.is_none()
+        {
+            return Err(TransportError::LegacyCorrelationUnresolved);
+        }
         let now = unix_ms();
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
@@ -1031,56 +1038,38 @@ impl KernelComposition {
                 Ok(host_request_resolved_response(&record, Some(&key)))
             }
             Some("legacy-presence") => {
-                if envelope.identity.parent_operation_id.is_some() {
+                if envelope.identity.parent_operation_id.is_some() || object.len() != 5 {
                     return Err(TransportError::SessionFenced);
                 }
                 let key = resolve_digest_field(object, "logical_key")?;
                 let occurrence = resolve_text_field(object, "occurrence")?;
-                let capability = resolve_text_field(object, "capability")?;
-                let payload = resolve_digest_field(object, "payload_digest")?;
-                let parent = object
-                    .get("parent_operation_id")
-                    .filter(|value| !value.is_null())
-                    .map(|value| value.as_str().ok_or(TransportError::SessionFenced))
-                    .transpose()?;
-                let stored = self
-                    .generation_gateway
-                    .ors
-                    .load_host_request_by_logical_key(&key)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                let Some(record) = stored else {
-                    return Ok(host_request_resolve_unresolved_response(
-                        "absent",
-                        Some(&key),
-                        None,
-                    ));
-                };
-                let recomputed = RedbRecoveryStore::host_request_logical_key_for_record(&record)
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .ok_or(TransportError::SessionFenced)?;
-                if recomputed != key {
+                let requested_session = resolve_text_field(object, "session")?;
+                if requested_session != session.as_str() {
                     return Err(TransportError::SessionFenced);
                 }
-                if record.correlation_projection.is_some() {
-                    return Ok(host_request_resolve_unresolved_response(
-                        "conflict",
-                        Some(&key),
-                        None,
-                    ));
-                }
-                let expected_kind = if parent.is_some() {
-                    OrsHostRequestKind::Cancellation
-                } else {
-                    OrsHostRequestKind::Invocation
+                let expected_kind = match object.get("kind").and_then(serde_json::Value::as_str) {
+                    Some("INVOCATION") => OrsHostRequestKind::Invocation,
+                    Some("CANCELLATION") => OrsHostRequestKind::Cancellation,
+                    _ => return Err(TransportError::SessionFenced),
                 };
-                if record.kind == expected_kind
-                    && record.parent_operation_id.as_ref().map(OpaqueLabel::as_str) == parent
-                    && record.request_id.as_str() == occurrence
-                    && record.capability_ref.as_str() == capability
-                    && record.payload_digest == payload
-                    && record.session_ref.as_ref().map(OpaqueLabel::as_str)
-                        == Some(session.as_str())
+                if RedbRecoveryStore::host_request_legacy_presence_key(
+                    expected_kind,
+                    &requested_session,
+                    &occurrence,
+                ) != key
                 {
+                    return Err(TransportError::SessionFenced);
+                }
+                let present = self
+                    .generation_gateway
+                    .ors
+                    .has_host_request_legacy_presence(
+                        expected_kind,
+                        &requested_session,
+                        &occurrence,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if present {
                     Ok(host_request_resolve_unresolved_response(
                         "legacy_correlation_unresolved",
                         Some(&key),
@@ -1088,7 +1077,7 @@ impl KernelComposition {
                     ))
                 } else {
                     Ok(host_request_resolve_unresolved_response(
-                        "conflict",
+                        "absent",
                         Some(&key),
                         None,
                     ))
@@ -3106,13 +3095,6 @@ impl KernelComposition {
         }
         if frame.request_id.as_ref() != Some(&envelope.identity.request_id) {
             return Err(TransportError::SessionFenced);
-        }
-        if matches!(
-            envelope.kind,
-            HostRequestKind::Invocation | HostRequestKind::Cancellation
-        ) && envelope.identity.correlation_projection.is_none()
-        {
-            return self.host_request_legacy_correlation_refusal(session, request_id);
         }
         let value = match operation {
             AGENT_HOST_REQUEST_SUBMIT_OPERATION => {

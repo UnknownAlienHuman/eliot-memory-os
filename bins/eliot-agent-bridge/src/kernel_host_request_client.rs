@@ -90,24 +90,6 @@ const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydra
 const AGENT_HOST_REQUEST_RESOLVE_OPERATION: &str = "agent_host_request_resolve";
 /// Canonical prefix of the kernel-derived opaque operation handle.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
-/// Authenticated owner namespace for every logical host-request key
-/// (issue #2571: the admitted correlation namespace).
-///
-/// Mirrors `HOST_REQUEST_LOGICAL_NAMESPACE` in
-/// `crates/kernel/eliot-ors/src/store.rs`; the two literals are the shared
-/// recovery contract and must change together. The namespace names the
-/// Kernel-admitted application-continuity domain: keys derive only from the
-/// Kernel-issued session, the stable client occurrence, and the exact
-/// commitment — never from bare text, a principal alone, or a
-/// connection/deadline.
-const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
-/// Explicit admitted-unbound marker for parent/task/scope key components.
-///
-/// Mirrors `HOST_REQUEST_UNBOUND_MARKER` in
-/// `crates/kernel/eliot-ors/src/store.rs`. Recovery preserves an old
-/// task/scope binding but never silently rebinds it: a changed binding
-/// under a known key is a conflict, not an adoption.
-const HOST_REQUEST_UNBOUND_MARKER: &str = "-";
 /// Logical-key kind marker for invocation replay (issue #2571).
 ///
 /// Mirrors the `host_request_kind_marker` mapping in
@@ -237,69 +219,6 @@ impl ParentLink {
     }
 }
 
-/// Derives the canonical logical key for one host request (issue #2571:
-/// the logical key and replay contract).
-///
-/// Byte-identical contract to `host_request_logical_key` in
-/// `crates/kernel/eliot-ors/src/store.rs`: the owner namespace, kind
-/// marker, Kernel-issued session continuity, stable client occurrence,
-/// parent (or the explicit unbound marker), task/scope binding (or the
-/// explicit admitted-unbound marker), capability, and payload commitment are
-/// joined with a control separator text can never contain, then digested.
-/// Connection, deadline, fence, epoch, and generation are never key
-/// material. The occurrence rule is strict: one correlation value names at
-/// most one logical occurrence, so a retry reuses its correlation while an
-/// intentional second action mints a new one — identical payload bytes
-/// alone never distinguish the two, the occurrence does.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the logical key binds every commitment component explicitly so no binding is implicit at the call site"
-)]
-fn logical_host_request_key(
-    kind_marker: &str,
-    session: &str,
-    occurrence: &str,
-    parent: Option<&str>,
-    task: Option<&str>,
-    scope: Option<&str>,
-    capability: &str,
-    payload_digest: &str,
-) -> Result<String, PortFailure> {
-    for component in [kind_marker, session, occurrence, capability] {
-        if component.trim().is_empty() || component.chars().any(char::is_control) {
-            return Err(request_failure());
-        }
-    }
-    for component in [parent, task, scope].into_iter().flatten() {
-        if component.trim().is_empty() || component.chars().any(char::is_control) {
-            return Err(request_failure());
-        }
-    }
-    if payload_digest.len() != 64
-        || !payload_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(request_failure());
-    }
-    for component in [kind_marker, session, occurrence, capability]
-        .into_iter()
-        .chain([parent, task, scope].into_iter().flatten())
-    {
-        if component == HOST_REQUEST_UNBOUND_MARKER {
-            return Err(request_failure());
-        }
-    }
-    let text = format!(
-        "{namespace}\x1fkind={kind_marker}\x1fsession={session}\x1foccurrence={occurrence}\x1fparent={parent}\x1ftask={task}\x1fscope={scope}\x1fcapability={capability}\x1fpayload={payload_digest}",
-        namespace = HOST_REQUEST_LOGICAL_NAMESPACE,
-        parent = parent.unwrap_or(HOST_REQUEST_UNBOUND_MARKER),
-        task = task.unwrap_or(HOST_REQUEST_UNBOUND_MARKER),
-        scope = scope.unwrap_or(HOST_REQUEST_UNBOUND_MARKER),
-    );
-    Ok(sha256_hex(text.as_bytes()))
-}
-
 /// Derives the logical key for one invocation replay lookup.
 ///
 /// The occurrence is the request correlation; the bridge carries no
@@ -318,29 +237,6 @@ fn logical_invocation_key(
     projection_key(LOGICAL_KIND_INVOCATION, session, projection)
 }
 
-/// Derives the logical key for one explicit invocation occurrence.
-///
-/// Used only for presence probes of old unmarked rows (issue #2765 W4).
-/// A hit produces an unresolved compatibility disposition; this helper
-/// never returns an old row as a typed winner.
-fn logical_invocation_key_for_occurrence(
-    occurrence: &str,
-    capability: &str,
-    session: &str,
-    payload_digest: &str,
-) -> Result<String, PortFailure> {
-    logical_host_request_key(
-        LOGICAL_KIND_INVOCATION,
-        session,
-        occurrence,
-        None,
-        None,
-        None,
-        capability,
-        payload_digest,
-    )
-}
-
 /// Derives the logical key for one cancellation intent.
 ///
 /// The cancellation binds its own stable identity — the cancel correlation
@@ -357,20 +253,12 @@ fn logical_cancellation_key(
     projection_key(LOGICAL_KIND_CANCELLATION, session, projection)
 }
 
-fn logical_cancellation_key_for_occurrence(
-    occurrence: &str,
-    parent: &ParentLink,
-    session: &str,
-) -> Result<String, PortFailure> {
-    logical_host_request_key(
-        LOGICAL_KIND_CANCELLATION,
-        session,
-        occurrence,
-        Some(parent.handle.as_str()),
-        None,
-        None,
-        parent.capability.as_str(),
-        parent.payload_digest.as_str(),
+fn legacy_presence_key(kind: &str, session: &str, occurrence: &str) -> String {
+    sha256_hex(
+        format!(
+            "eliot.host-request.legacy-presence.v1\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}"
+        )
+        .as_bytes(),
     )
 }
 
@@ -782,12 +670,7 @@ impl KernelHostRequestClient {
         };
         let capability = request.tool.canonical_name();
         for occurrence in candidates {
-            let legacy_key = logical_invocation_key_for_occurrence(
-                &occurrence,
-                capability,
-                session_id,
-                payload_digest,
-            )?;
+            let legacy_key = legacy_presence_key("INVOCATION", session_id, &occurrence);
             let resolve_label = resolve_request_label(&occurrence);
             let resolve_envelope = build_resolve_envelope(
                 &resolve_label,
@@ -798,8 +681,7 @@ impl KernelHostRequestClient {
                 payload_digest,
                 now_ms,
             )?;
-            let query =
-                legacy_presence_query(&legacy_key, &occurrence, capability, payload_digest, None);
+            let query = legacy_presence_query(&legacy_key, "INVOCATION", session_id, &occurrence);
             let frame = host_request_resolve_frame(&query, &resolve_envelope, facts)?;
             let outcome = match self.exchange(&frame) {
                 Ok(reply) => decode_resolve_reply(
@@ -1033,7 +915,7 @@ impl KernelHostRequestClient {
             }
         };
         for occurrence in candidates {
-            let key = logical_cancellation_key_for_occurrence(&occurrence, parent, session_id)?;
+            let key = legacy_presence_key("CANCELLATION", session_id, &occurrence);
             let label = resolve_request_label(&occurrence);
             let envelope = build_resolve_envelope(
                 &label,
@@ -1044,13 +926,7 @@ impl KernelHostRequestClient {
                 parent.payload_digest.as_str(),
                 now_ms,
             )?;
-            let query = legacy_presence_query(
-                &key,
-                &occurrence,
-                parent.capability.as_str(),
-                parent.payload_digest.as_str(),
-                Some(parent.handle.as_str()),
-            );
+            let query = legacy_presence_query(&key, "CANCELLATION", session_id, &occurrence);
             let frame = host_request_resolve_frame(&query, &envelope, facts)?;
             let outcome = match self.exchange(&frame) {
                 Ok(reply) => decode_resolve_reply(
@@ -1605,18 +1481,16 @@ fn resolve_key_query(
 /// The owner can confirm ambiguity but never returns the operation row.
 fn legacy_presence_query(
     logical_key: &str,
+    kind: &str,
+    session: &str,
     occurrence: &str,
-    capability: &str,
-    payload_digest: &str,
-    parent_operation_id: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "form": "legacy-presence",
         "logical_key": logical_key,
+        "kind": kind,
+        "session": session,
         "occurrence": occurrence,
-        "capability": capability,
-        "payload_digest": payload_digest,
-        "parent_operation_id": parent_operation_id,
     })
 }
 

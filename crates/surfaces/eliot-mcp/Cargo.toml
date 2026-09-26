@@ -7,6 +7,7 @@ license.workspace = true
 description = "Stateless MCP contract bridge over ELIOT Kernel and Governor ports"
 
 [dependencies]
+eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-protocol.workspace = true
 eliot-receipts.workspace = true
