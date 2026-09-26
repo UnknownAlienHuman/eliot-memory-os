@@ -6,7 +6,9 @@
 //! resolves the exact native owner for one closed [`JobClass`] and invokes it
 //! with no fallthrough: Curation names the A-31 curation fan-in
 //! ([`route_validated_curation`](eliot_dreamer_curation::route_validated_curation)),
-//! Orientation names `eliot-dreamer-orientation` `build_projection`, and every
+//! Orientation names the Orientation pulse composer
+//! ([`project_validated_orientation`], which reaches
+//! `eliot-dreamer-orientation` `build_projection`), and every
 //! other class names its native owner. Exhaustive with no wildcard arm:
 //! extending the closed taxonomy breaks compilation here until the new class
 //! is assigned an owning slice.
@@ -25,7 +27,8 @@
 //! There is no class-only stub seam: every arm either genuinely invokes its
 //! owner or refuses naming the exact missing governed input. Orientation
 //! derives the v1 hypothesis pair, validates it through the real v1 A-05
-//! entry, and genuinely invokes `build_projection` before projecting the
+//! entry, and genuinely invokes the pulse composer (which runs the packet
+//! projection) before projecting the
 //! packet; Curation genuinely resolves descriptors, validates
 //! registry/policy/screen, and routes the injected batch through the real
 //! A-31 fan-in; `ResearchSynthesis` and `Maintenance` fail closed naming
@@ -62,7 +65,7 @@ use eliot_dreamer_curation::{
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, OrientationError, OrientationPolicy,
-    projection::{OrientationPacketCandidate, build_projection},
+    projection::OrientationPacketCandidate,
 };
 
 use crate::admitted_material::{
@@ -185,7 +188,7 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// match runs with no wildcard. Orientation proves the structured receipt
 /// binding first ([`require_validated_binding`]), then derives the v1
 /// hypothesis pair, validates it through the real v1 A-05 entry, and
-/// genuinely invokes `build_projection`; Curation checks the carrier first
+/// genuinely invokes the pulse composer; Curation checks the carrier first
 /// (a missing carrier refuses before any screen or registry work, so no
 /// generic stage burns on a job that cannot route), then the screen binding,
 /// then the real A-31 fan-in; `ResearchSynthesis` and `Maintenance` prove
@@ -219,7 +222,8 @@ pub(crate) fn dispatch_admitted(
             };
             dispatch_curation(binding, carrier)
         }
-        // Native owner: eliot-dreamer-orientation build_projection, gated on
+        // Native owner: the Orientation pulse composer (packet projection via
+        // eliot-dreamer-orientation build_projection), gated on
         // the structured A-05 receipt: without the validated candidate there
         // is no proved pre-handler gate, so the arm refuses before any v1
         // derivation or owner projection work.
@@ -321,14 +325,17 @@ pub(crate) fn require_validated_binding(
 
 /// Projects one v1-validated candidate through the native owner.
 ///
-/// This is the single `build_projection` call site in this binary (the
+/// This is the single pulse-composer call site in this binary (the
 /// production `project_once` body, also reused by the validation-stage
 /// integration tests so they exercise the identical call site): it takes
 /// only `&ValidatedCandidate` — the receipt-bound v1 aggregate — plus the
 /// admitted job/bundle/policy it was validated against, never a raw draft.
-/// Raw unvalidated input cannot reach the native projector through this
-/// seam: construction requires the v1 validator receipt, and dispatch proves
-/// the structured receipt binding first. Governor-resolved evidence and
+/// The pulse runs with packet inputs only; every other stage records an
+/// explicit pending disposition until its owner values land, and the packet
+/// projection is byte-identical to the direct owner call. Raw unvalidated
+/// input cannot reach the native projector through this seam: construction
+/// requires the v1 validator receipt, and dispatch proves the structured
+/// receipt binding first. Governor-resolved evidence and
 /// epistemic-position handles travel empty here (G5: locally built envelopes
 /// would be self-issued authority).
 pub(crate) fn project_validated_orientation(
@@ -337,7 +344,9 @@ pub(crate) fn project_validated_orientation(
     bundle: &DreamInputBundle,
     policy: &OrientationPolicy,
 ) -> Result<OrientationPacketCandidate, OrientationError> {
-    build_projection(admitted_job, candidate, bundle, &[], policy)
+    crate::pulse::run_production_orientation_pulse(admitted_job, candidate, bundle, policy)
+        .map(|pulse| pulse.packet)
+        .map_err(crate::pulse::PulseError::into_orientation_error)
 }
 
 /// Dispatches one admitted Orientation job through the native projector.
