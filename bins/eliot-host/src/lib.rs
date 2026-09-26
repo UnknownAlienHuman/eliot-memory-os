@@ -5378,12 +5378,31 @@ impl HostComposition {
         let durable = self.journal.snapshot().map_err(|error| {
             CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
         })?;
+        // The retirement is resolved by the SAME journal owner through a further
+        // read, so it must be bracketed on its far side exactly as
+        // `read_cutover_disposition` brackets it: resolve it FROM `durable` and
+        // take one more sample afterwards to prove `durable` is still current.
+        // Resolving it after the coherence decision - which is what this path did
+        // - left the retirement observation strictly outside the compared
+        // interval while the `Reconciled` arm gates on that interval. Two
+        // consequences, both fail-closed but both false: a record landing between
+        // the last sample and the lookup is reported as `UnboundRetirement`
+        // ("a substituted record") when the status port would have reported
+        // `ConcurrentOwnerMovement` ("the owners moved"), and a positive
+        // history claim is gated by a coherence proof that does not cover the
+        // observation it gates. This is the same stale-currency defect
+        // `read_cutover_disposition` already closed on the status side.
+        let retirement =
+            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
         // A failed READ is a failure, never a concurrency fact: it is propagated
         // with the same error the surrounding reads use, so it can never be
         // reported as owner movement.
         let coherence = match self.journal.snapshot() {
             Ok(resampled)
-                if crate::backup_cutover::cutover_observation_unchanged(&before, &resampled) =>
+                if crate::backup_cutover::cutover_observation_unchanged(&before, &durable)
+                    && crate::backup_cutover::cutover_observation_unchanged(
+                        &durable, &resampled,
+                    ) =>
             {
                 OwnerObservationCoherence::Coherent
             }
@@ -5394,8 +5413,6 @@ impl HostComposition {
                 )));
             }
         };
-        let retirement =
-            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
         let reconciled = reconcile_cutover_outcome(
             request,
             durable.pending_cutover.as_ref(),
