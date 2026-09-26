@@ -788,6 +788,27 @@ pub trait McpForwardingPort {
         &mut self,
         binding: &AttachBinding,
     ) -> Result<ReconciliationPortOutcome, ProviderFailure>;
+
+    /// Reads one bounded recovery page inside the declared window.
+    ///
+    /// A pure continuation read: it changes no producer/consumer cursor and
+    /// carries the exact contiguous acknowledgement frontier derived from
+    /// the receiving owner's receipts, like the full read. The default
+    /// owner refuses: only a forwarding owner that speaks the bounded
+    /// continuation route may answer, so stub ports keep compiling while
+    /// failing closed when a walk actually needs them.
+    fn reconcile_continue(
+        &mut self,
+        binding: &AttachBinding,
+        request: &RecoveryReadRequest,
+    ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+        let _ = (binding, request);
+        Err(ProviderFailure::new(
+            "eliot-agent-bridge-core",
+            "bounded recovery continuation is not admitted by this forwarding owner; \
+             reconcile the full window through reconcile_external instead",
+        ))
+    }
 }
 
 /// Current attach binding projected by the bridge.
@@ -877,6 +898,139 @@ impl AttachView {
     }
 }
 
+/// One stream's recovered progress inside the declared window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryStreamView {
+    stream_id: String,
+    acked_base: u64,
+    durable_cursor: u64,
+    contiguous_frontier: u64,
+    highest_observed: u64,
+    next_after: u64,
+    recovered_events: u64,
+    recovered_gaps: u64,
+    page_complete: bool,
+}
+
+impl RecoveryStreamView {
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub const fn acked_base(&self) -> u64 {
+        self.acked_base
+    }
+
+    pub const fn durable_cursor(&self) -> u64 {
+        self.durable_cursor
+    }
+
+    pub const fn contiguous_frontier(&self) -> u64 {
+        self.contiguous_frontier
+    }
+
+    pub const fn highest_observed(&self) -> u64 {
+        self.highest_observed
+    }
+
+    pub const fn next_after(&self) -> u64 {
+        self.next_after
+    }
+
+    pub const fn recovered_events(&self) -> u64 {
+        self.recovered_events
+    }
+
+    pub const fn recovered_gaps(&self) -> u64 {
+        self.recovered_gaps
+    }
+
+    pub const fn page_complete(&self) -> bool {
+        self.page_complete
+    }
+}
+
+/// Read-only progress of the declared finite recovery window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryView {
+    window_key: String,
+    live_generation: u64,
+    streams: Vec<RecoveryStreamView>,
+    unscoped_gaps: u64,
+    unproven_scope_present: bool,
+    stream_list_complete: bool,
+    disposition: RecoveryDisposition,
+}
+
+impl RecoveryView {
+    pub fn window_key(&self) -> &str {
+        &self.window_key
+    }
+
+    pub const fn live_generation(&self) -> u64 {
+        self.live_generation
+    }
+
+    pub fn streams(&self) -> &[RecoveryStreamView] {
+        &self.streams
+    }
+
+    pub const fn unscoped_gaps(&self) -> u64 {
+        self.unscoped_gaps
+    }
+
+    pub const fn unproven_scope_present(&self) -> bool {
+        self.unproven_scope_present
+    }
+
+    pub const fn stream_list_complete(&self) -> bool {
+        self.stream_list_complete
+    }
+
+    pub const fn disposition(&self) -> RecoveryDisposition {
+        self.disposition
+    }
+}
+
+/// One recovered-but-unforwarded obligation: a retained owner receipt the
+/// bridge has not yet covered with its own acknowledgement.
+///
+/// These facts stay visible for the live walk while forwarding is
+/// interrupted, so pending work is delayed but never erased owner-side and
+/// never re-minted as a fresh event. A new attach opens a new walk: the
+/// durable source stays with its owner, and the producer's at-least-once
+/// redelivery re-observes anything still unacknowledged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredPendingView {
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    phase: AckPhase,
+    envelope_digest: String,
+}
+
+impl RecoveredPendingView {
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn phase(&self) -> AckPhase {
+        self.phase
+    }
+
+    pub fn envelope_digest(&self) -> &str {
+        &self.envelope_digest
+    }
+}
+
 /// Exact old authority binding plus the replacement transport identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconnectRequest {
@@ -905,6 +1059,14 @@ impl ReconnectRequest {
 
 /// Trusted reconciliation result emitted only by the injected forwarding
 /// boundary. It is inert until A-16 validates and seals it.
+///
+/// A result built by [`ReconciliationPortResult::reconciled`] carries no
+/// recovered facts: it attests an empty inventory through a legacy port and
+/// keeps the historical gate-clearing semantics. A result built by
+/// [`ReconciliationPortResult::reconciled_with_pages`] carries the checked
+/// owner page facts plus the declared window binding; the core imports those
+/// facts into its recovery progress and clears the gate only when the walk
+/// disposition is complete (issue #2732).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconciliationPortResult {
     session_id: SessionId,
@@ -912,6 +1074,7 @@ pub struct ReconciliationPortResult {
     state_fence: FencingToken,
     task_binding: Box<TaskBinding>,
     receipt_ref: ReconciliationReceiptRef,
+    window: Option<RecoveryWindowFacts>,
 }
 
 impl ReconciliationPortResult {
@@ -930,11 +1093,61 @@ impl ReconciliationPortResult {
             state_fence: binding.state_fence.clone(),
             task_binding: Box::new(binding.task_binding.clone()),
             receipt_ref,
+            window: None,
+        })
+    }
+
+    /// Seals one bounded recovery read carrying checked owner page facts.
+    ///
+    /// The window facts bind the reply to the presenting connection, the
+    /// live producer generation, and the verified reconciliation key. The
+    /// core re-validates every leg against the live attach binding on
+    /// import; a late result for a replaced attach fails closed there and
+    /// changes no recovery state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconciled_with_pages(
+        binding: &AttachBinding,
+        receipt_ref: ReconciliationReceiptRef,
+        window_key: String,
+        live_generation: Generation,
+        presenting_connection: ConnectionId,
+        unproven_scope_present: bool,
+        handoffs_reconciled: u64,
+        stream_facts: Vec<RecoveredStreamFacts>,
+        unscoped_gaps: Vec<RecoveredGapFact>,
+        stream_list_complete: bool,
+    ) -> Result<Self, BridgeError> {
+        validate_authority_binding(
+            &binding.session_id,
+            binding.activation_generation,
+            &binding.state_fence,
+        )?;
+        let window = RecoveryWindowFacts::checked(
+            window_key,
+            live_generation,
+            presenting_connection,
+            unproven_scope_present,
+            handoffs_reconciled,
+            stream_facts,
+            unscoped_gaps,
+            stream_list_complete,
+        )?;
+        Ok(Self {
+            session_id: binding.session_id.clone(),
+            activation_generation: binding.activation_generation,
+            state_fence: binding.state_fence.clone(),
+            task_binding: Box::new(binding.task_binding.clone()),
+            receipt_ref,
+            window: Some(window),
         })
     }
 
     pub const fn receipt_ref(&self) -> &ReconciliationReceiptRef {
         &self.receipt_ref
+    }
+
+    pub const fn window(&self) -> Option<&RecoveryWindowFacts> {
+        self.window.as_ref()
     }
 }
 
@@ -953,6 +1166,7 @@ struct ReconciliationPermit {
     state_fence: FencingToken,
     task_binding: TaskBinding,
     receipt_ref: ReconciliationReceiptRef,
+    window: Option<RecoveryWindowFacts>,
 }
 
 impl ReconciliationPermit {
@@ -968,7 +1182,626 @@ impl ReconciliationPermit {
             state_fence: result.state_fence,
             task_binding: *result.task_binding,
             receipt_ref: result.receipt_ref,
+            window: result.window,
         })
+    }
+}
+
+/// Disposition of one bounded recovery walk (issue #2732).
+///
+/// Inventory recovery is not task/effect completion: [`RecoveryDisposition::Complete`]
+/// means the declared window's required ownership/accounting facts were
+/// recovered or explicitly dispositioned under the recovery policy. A
+/// complete inventory can still contain pending events and known blind
+/// intervals; that is not an APPLIED stream or complete historical coverage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryDisposition {
+    Complete,
+    Partial { reason: &'static str },
+    Unavailable { reason: &'static str },
+}
+
+/// A required stream page or the stream list still has an owner continuation.
+pub const RECOVERY_PARTIAL_PAGE_CONTINUATION: &str = "page-continuation-pending";
+/// The owner reports material outside the proven scope; the inventory is
+/// explicitly incomplete rather than silently whole.
+pub const RECOVERY_PARTIAL_UNPROVEN_SCOPE: &str = "unproven-scope-present";
+/// Required material inside the declared window moved (concurrent
+/// stage/ack/compaction); the walk needs a refresh, never a silent stitch.
+pub const RECOVERY_PARTIAL_WINDOW_MOVED: &str = "window-moved-refresh-required";
+/// The stream list itself reached the negotiated bound; coverage needs its
+/// own bounded continuation, not an unbounded outer collection.
+pub const RECOVERY_PARTIAL_STREAM_LIST_TRUNCATED: &str = "stream-list-truncated";
+/// The page named a foreign scope, future continuation, or stale window and
+/// was refused without applying half a page.
+pub const RECOVERY_UNAVAILABLE_FOREIGN_PAGE: &str = "foreign-page-refused";
+
+/// One checked retained-event receipt fact restored from an owner page.
+///
+/// Digest-only by construction: owner pages carry metadata, not the
+/// original event payload, so this fact never fabricates an
+/// [`EventEnvelope`]. Raw/redacted/normalized linkage is re-established
+/// only through the retained source/artifact owner; the bridge keeps the
+/// digest, producer, and phase legs separate instead of merging them into a
+/// synthetic envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredEventFact {
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    phase: AckPhase,
+    envelope_digest: String,
+    producer_id: String,
+    producer_generation: u64,
+    staging_connection: String,
+}
+
+impl RecoveredEventFact {
+    /// Checks one wire-decoded owner event fact before it may enter the
+    /// recovery window. Exact identities, a nonzero sequence, a nonzero
+    /// producer generation, and non-blank digest/producer/connection legs
+    /// are required; the digest format itself is verified at the transport
+    /// decode boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checked(
+        stream_id: String,
+        event_id: String,
+        sequence: u64,
+        phase: AckPhase,
+        envelope_digest: String,
+        producer_id: String,
+        producer_generation: u64,
+        staging_connection: String,
+    ) -> Result<Self, BridgeError> {
+        validate_text(&stream_id, "recovered_event.stream_id")?;
+        validate_text(&event_id, "recovered_event.event_id")?;
+        if event_id.contains("::") || stream_id.contains("::") {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.identity",
+                reason: "stream/event identity must not contain the key separator",
+            });
+        }
+        if sequence == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.sequence",
+                reason: "recovered event sequence must be nonzero",
+            });
+        }
+        if producer_generation == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.producer_generation",
+                reason: "recovered producer generation must be nonzero",
+            });
+        }
+        validate_text(&envelope_digest, "recovered_event.envelope_digest")?;
+        validate_text(&producer_id, "recovered_event.producer_id")?;
+        validate_text(&staging_connection, "recovered_event.staging_connection")?;
+        Ok(Self {
+            stream_id,
+            event_id,
+            sequence,
+            phase,
+            envelope_digest,
+            producer_id,
+            producer_generation,
+            staging_connection,
+        })
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn phase(&self) -> AckPhase {
+        self.phase
+    }
+
+    pub fn envelope_digest(&self) -> &str {
+        &self.envelope_digest
+    }
+
+    pub fn producer_id(&self) -> &str {
+        &self.producer_id
+    }
+
+    pub const fn producer_generation(&self) -> u64 {
+        self.producer_generation
+    }
+
+    pub fn staging_connection(&self) -> &str {
+        &self.staging_connection
+    }
+}
+
+/// One checked retained-gap fact restored from an owner page.
+///
+/// A gap accounts for missing coverage; it never moves a cursor and never
+/// converts absent events into applied events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredGapFact {
+    gap_id: String,
+    stream_id: String,
+    start_sequence: u64,
+    end_sequence: u64,
+    reason_ref: String,
+}
+
+impl RecoveredGapFact {
+    /// Checks one wire-decoded owner gap fact. An empty stream scope marks
+    /// an unscoped gap, which reconciles at top level; a malformed interval
+    /// refuses the whole page, never half of it. Gap identities are bare
+    /// keys (never key-encoded with a separator), mirroring the owner's
+    /// gap rule.
+    pub fn checked(
+        gap_id: String,
+        stream_id: String,
+        start_sequence: u64,
+        end_sequence: u64,
+        reason_ref: String,
+    ) -> Result<Self, BridgeError> {
+        validate_text(&gap_id, "recovered_gap.gap_id")?;
+        if !stream_id.is_empty() {
+            validate_text(&stream_id, "recovered_gap.stream_id")?;
+            if stream_id.contains("::") {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_gap.stream_id",
+                    reason: "gap stream scope must not contain the key separator",
+                });
+            }
+        }
+        if start_sequence == 0 || end_sequence == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_gap.interval",
+                reason: "gap interval bounds must be nonzero",
+            });
+        }
+        if end_sequence < start_sequence {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_gap.interval",
+                reason: "gap interval must not end before it starts",
+            });
+        }
+        validate_text(&reason_ref, "recovered_gap.reason_ref")?;
+        Ok(Self {
+            gap_id,
+            stream_id,
+            start_sequence,
+            end_sequence,
+            reason_ref,
+        })
+    }
+
+    pub fn gap_id(&self) -> &str {
+        &self.gap_id
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub const fn start_sequence(&self) -> u64 {
+        self.start_sequence
+    }
+
+    pub const fn end_sequence(&self) -> u64 {
+        self.end_sequence
+    }
+
+    pub fn reason_ref(&self) -> &str {
+        &self.reason_ref
+    }
+}
+
+/// One checked per-stream page: owner cursors, retained event/gap facts,
+/// and the page's own bounded continuation.
+///
+/// The accounting derivation lives here, not at the transport boundary:
+/// [`RecoveredStreamFacts::checked`] recomputes the contiguous durable
+/// frontier (the contiguous DURABLE-or-later run above the acked base) and
+/// the highest observed sequence from the carried facts, and refuses an
+/// incoherent page. An individually durable out-of-order event may
+/// legitimately exceed the contiguous frontier; it is retained above the
+/// hole, never acknowledged past it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredStreamFacts {
+    stream_id: String,
+    durable_cursor: u64,
+    acked_cursor: u64,
+    contiguous_durable_frontier: u64,
+    highest_observed_sequence: u64,
+    events: Vec<RecoveredEventFact>,
+    gaps: Vec<RecoveredGapFact>,
+    page_continuation: Option<u64>,
+    page_complete: bool,
+}
+
+impl RecoveredStreamFacts {
+    /// Checks one wire-decoded stream page and derives its accounting.
+    /// Events must arrive strictly increasing with nonzero sequences above
+    /// the acked base and without duplicate identities; `acked` must not
+    /// exceed the contiguous durable cursor; a continuation must name the
+    /// page's last sequence and stay within the durable cursor; a complete
+    /// page carries no continuation.
+    pub fn checked(
+        stream_id: String,
+        durable_cursor: u64,
+        acked_cursor: u64,
+        events: Vec<RecoveredEventFact>,
+        gaps: Vec<RecoveredGapFact>,
+        page_continuation: Option<u64>,
+        page_complete: bool,
+    ) -> Result<Self, BridgeError> {
+        validate_text(&stream_id, "recovered_stream.stream_id")?;
+        if stream_id.contains("::") {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_stream.stream_id",
+                reason: "stream identity must not contain the key separator",
+            });
+        }
+        if acked_cursor > durable_cursor {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_stream.acked_cursor",
+                reason: "acknowledged cursor must not exceed the contiguous durable cursor",
+            });
+        }
+        let mut seen_sequences = BTreeSet::new();
+        let mut seen_identities = BTreeSet::new();
+        let mut previous = acked_cursor;
+        for event in &events {
+            if event.stream_id != stream_id {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.event",
+                    reason: "page event names a foreign stream",
+                });
+            }
+            if event.sequence <= acked_cursor {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.event",
+                    reason: "page event does not advance past the acknowledged base",
+                });
+            }
+            if event.sequence <= previous {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.event",
+                    reason: "page events must arrive strictly increasing",
+                });
+            }
+            previous = event.sequence;
+            if !seen_sequences.insert(event.sequence) {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.event",
+                    reason: "duplicate page sequence",
+                });
+            }
+            if !seen_identities.insert(event.event_id.clone()) {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.event",
+                    reason: "duplicate page event identity",
+                });
+            }
+        }
+        for gap in &gaps {
+            if !gap.stream_id.is_empty() && gap.stream_id != stream_id {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.gap",
+                    reason: "scoped page gap names a foreign stream",
+                });
+            }
+        }
+        match (page_continuation, page_complete, events.last()) {
+            (None, _, _) => {}
+            (Some(_), true, _) => {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.continuation",
+                    reason: "a complete page carries no continuation",
+                });
+            }
+            (Some(continuation), false, None) => {
+                if continuation <= acked_cursor || continuation > durable_cursor {
+                    return Err(BridgeError::InvalidContract {
+                        field: "recovered_stream.continuation",
+                        reason: "continuation must advance past the base within the durable cursor",
+                    });
+                }
+            }
+            (Some(continuation), false, Some(last)) => {
+                if continuation != last.sequence || continuation > durable_cursor {
+                    return Err(BridgeError::InvalidContract {
+                        field: "recovered_stream.continuation",
+                        reason: "continuation must name the page tail within the durable cursor",
+                    });
+                }
+            }
+        }
+        let mut contiguous = acked_cursor;
+        for event in &events {
+            if event.sequence == contiguous.saturating_add(1)
+                && phase_reaches(AckPhase::Durable, event.phase)
+            {
+                contiguous = event.sequence;
+            } else if event.sequence > contiguous.saturating_add(1) {
+                break;
+            }
+        }
+        let highest = events
+            .last()
+            .map(|event| event.sequence)
+            .unwrap_or(acked_cursor)
+            .max(page_continuation.unwrap_or(acked_cursor))
+            .max(durable_cursor);
+        Ok(Self {
+            stream_id,
+            durable_cursor,
+            acked_cursor,
+            contiguous_durable_frontier: contiguous,
+            highest_observed_sequence: highest,
+            events,
+            gaps,
+            page_continuation,
+            page_complete,
+        })
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub const fn durable_cursor(&self) -> u64 {
+        self.durable_cursor
+    }
+
+    pub const fn acked_cursor(&self) -> u64 {
+        self.acked_cursor
+    }
+
+    pub const fn contiguous_durable_frontier(&self) -> u64 {
+        self.contiguous_durable_frontier
+    }
+
+    pub const fn highest_observed_sequence(&self) -> u64 {
+        self.highest_observed_sequence
+    }
+
+    pub fn events(&self) -> &[RecoveredEventFact] {
+        &self.events
+    }
+
+    pub fn gaps(&self) -> &[RecoveredGapFact] {
+        &self.gaps
+    }
+
+    pub const fn page_continuation(&self) -> Option<u64> {
+        self.page_continuation
+    }
+
+    pub const fn page_complete(&self) -> bool {
+        self.page_complete
+    }
+}
+
+/// The declared finite recovery window carried by one owner answer.
+///
+/// `window_key` is the verified reconciliation key of the answer that
+/// opened the walk (the recovery identity); `handoffs_reconciled` is the
+/// owner's later mutation receipt count, carried as accounting and
+/// explicitly excluded from the key preimage and from completion proof.
+/// `stream_list_complete` is false when the stream enumeration itself hit
+/// the negotiated bound: stream-list coverage needs its own bounded
+/// continuation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryWindowFacts {
+    window_key: String,
+    live_generation: Generation,
+    presenting_connection: ConnectionId,
+    unproven_scope_present: bool,
+    handoffs_reconciled: u64,
+    stream_facts: Vec<RecoveredStreamFacts>,
+    unscoped_gaps: Vec<RecoveredGapFact>,
+    stream_list_complete: bool,
+}
+
+impl RecoveryWindowFacts {
+    /// Checks the window binding legs. Stream facts arrive pre-checked;
+    /// duplicate stream scopes refuse the whole window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checked(
+        window_key: String,
+        live_generation: Generation,
+        presenting_connection: ConnectionId,
+        unproven_scope_present: bool,
+        handoffs_reconciled: u64,
+        stream_facts: Vec<RecoveredStreamFacts>,
+        unscoped_gaps: Vec<RecoveredGapFact>,
+        stream_list_complete: bool,
+    ) -> Result<Self, BridgeError> {
+        validate_text(&window_key, "recovery_window.window_key")?;
+        if live_generation.get() == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.live_generation",
+                reason: "live producer generation must be nonzero",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for facts in &stream_facts {
+            if !seen.insert(facts.stream_id.clone()) {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovery_window.stream",
+                    reason: "duplicate stream scope in one recovery window",
+                });
+            }
+        }
+        for gap in &unscoped_gaps {
+            if !gap.stream_id.is_empty() {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovery_window.unscoped_gap",
+                    reason: "top-level gap must carry no stream scope",
+                });
+            }
+        }
+        Ok(Self {
+            window_key,
+            live_generation,
+            presenting_connection,
+            unproven_scope_present,
+            handoffs_reconciled,
+            stream_facts,
+            unscoped_gaps,
+            stream_list_complete,
+        })
+    }
+
+    pub fn window_key(&self) -> &str {
+        &self.window_key
+    }
+
+    pub const fn live_generation(&self) -> Generation {
+        self.live_generation
+    }
+
+    pub const fn presenting_connection(&self) -> &ConnectionId {
+        &self.presenting_connection
+    }
+
+    pub const fn unproven_scope_present(&self) -> bool {
+        self.unproven_scope_present
+    }
+
+    pub const fn handoffs_reconciled(&self) -> u64 {
+        self.handoffs_reconciled
+    }
+
+    pub fn stream_facts(&self) -> &[RecoveredStreamFacts] {
+        &self.stream_facts
+    }
+
+    pub fn unscoped_gaps(&self) -> &[RecoveredGapFact] {
+        &self.unscoped_gaps
+    }
+
+    pub const fn stream_list_complete(&self) -> bool {
+        self.stream_list_complete
+    }
+}
+
+/// One bounded read continuation: a pure selector, never an
+/// acknowledgement.
+///
+/// The request names the declared window, one stream scope, the predecessor
+/// sequence the next page must advance past, and explicit event/gap budgets.
+/// It carries the expected live authority (generation plus presenting
+/// connection) so each call rechecks the #2729 rights against the live
+/// attach: possession of the token alone authorizes nothing, and a request
+/// built before a reconnect fails closed instead of resuming a stale walk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryReadRequest {
+    window_key: String,
+    stream_id: String,
+    after_sequence: u64,
+    event_limit: u64,
+    gap_offset: u64,
+    gap_limit: u64,
+    expected_generation: u64,
+    expected_connection: String,
+}
+
+/// Owner page budget mirrored from the retained-source page cap: one page
+/// never exceeds the owner's own truncation bound.
+pub const RECOVERY_PAGE_EVENT_LIMIT: u64 = 128;
+/// Owner gap budget mirrored from the retained-source per-stream gap cap.
+pub const RECOVERY_PAGE_GAP_LIMIT: u64 = 256;
+
+impl RecoveryReadRequest {
+    /// Builds one bounded continuation read. Limits stay within the
+    /// owner's page/gap caps; larger content travels behind admitted
+    /// immutable handles, never behind higher frame ceilings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn checked(
+        window_key: String,
+        stream_id: String,
+        after_sequence: u64,
+        event_limit: u64,
+        gap_offset: u64,
+        gap_limit: u64,
+        expected_generation: u64,
+        expected_connection: String,
+    ) -> Result<Self, BridgeError> {
+        validate_text(&window_key, "recovery_read.window_key")?;
+        validate_text(&stream_id, "recovery_read.stream_id")?;
+        if stream_id.contains("::") {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_read.stream_id",
+                reason: "stream identity must not contain the key separator",
+            });
+        }
+        if event_limit == 0 || event_limit > RECOVERY_PAGE_EVENT_LIMIT {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_read.event_limit",
+                reason: "event budget must stay within the owner page cap",
+            });
+        }
+        if gap_limit == 0 || gap_limit > RECOVERY_PAGE_GAP_LIMIT {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_read.gap_limit",
+                reason: "gap budget must stay within the owner gap cap",
+            });
+        }
+        if expected_generation == 0 {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_read.expected_generation",
+                reason: "expected live generation must be nonzero",
+            });
+        }
+        validate_text(&expected_connection, "recovery_read.expected_connection")?;
+        Ok(Self {
+            window_key,
+            stream_id,
+            after_sequence,
+            event_limit,
+            gap_offset,
+            gap_limit,
+            expected_generation,
+            expected_connection,
+        })
+    }
+
+    pub fn window_key(&self) -> &str {
+        &self.window_key
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub const fn after_sequence(&self) -> u64 {
+        self.after_sequence
+    }
+
+    pub const fn event_limit(&self) -> u64 {
+        self.event_limit
+    }
+
+    pub const fn gap_offset(&self) -> u64 {
+        self.gap_offset
+    }
+
+    pub const fn gap_limit(&self) -> u64 {
+        self.gap_limit
+    }
+
+    pub const fn expected_generation(&self) -> u64 {
+        self.expected_generation
+    }
+
+    pub fn expected_connection(&self) -> &str {
+        &self.expected_connection
     }
 }
 
@@ -1065,6 +1898,109 @@ struct ActiveAttach {
     binding: AttachBinding,
     reconciliation_required: bool,
     blind_interval: Option<BlindInterval>,
+    recovery: Option<RecoveryWindow>,
+}
+
+/// One stream's imported recovery state inside the declared window.
+///
+/// `acked_base` is the retention floor observed when the stream entered
+/// the window: pages below it are owner-confirmed history, pages above it
+/// are the walk's required material. `events` retains every checked fact
+/// by sequence, including durable out-of-order events above the contiguous
+/// frontier, so holes are preserved instead of excluded.
+struct RecoveryStreamProgress {
+    acked_base: u64,
+    acked_high: u64,
+    durable_cursor: u64,
+    contiguous_frontier: u64,
+    highest_observed: u64,
+    next_after: u64,
+    page_complete: bool,
+    events: BTreeMap<u64, RecoveredEventFact>,
+    gaps: BTreeMap<String, RecoveredGapFact>,
+}
+
+/// The declared finite recovery window: one coherent owner observation
+/// bound to the live attach authority.
+///
+/// Bridge process memory stays a reconstructable cache: the durable source
+/// and recovery progress live with their existing owners, and this window
+/// only tracks which required facts have been restored. A lost cache
+/// delays acknowledgement; it never mints fresh events or erases known
+/// pending work. No database transaction is held across network calls —
+/// each page is validated whole against this window before anything is
+/// applied.
+struct RecoveryWindow {
+    window_key: String,
+    live_generation: u64,
+    stream_order: Vec<String>,
+    streams: BTreeMap<String, RecoveryStreamProgress>,
+    unscoped_gaps: BTreeMap<String, RecoveredGapFact>,
+    unproven_scope_present: bool,
+    stream_list_complete: bool,
+    incomplete_reason: Option<&'static str>,
+}
+
+impl RecoveryWindow {
+    fn disposition(&self) -> RecoveryDisposition {
+        if !self.stream_list_complete {
+            return RecoveryDisposition::Partial {
+                reason: RECOVERY_PARTIAL_STREAM_LIST_TRUNCATED,
+            };
+        }
+        if self.unproven_scope_present {
+            return RecoveryDisposition::Partial {
+                reason: RECOVERY_PARTIAL_UNPROVEN_SCOPE,
+            };
+        }
+        if let Some(reason) = self.incomplete_reason {
+            if reason == RECOVERY_UNAVAILABLE_FOREIGN_PAGE {
+                return RecoveryDisposition::Unavailable { reason };
+            }
+            return RecoveryDisposition::Partial { reason };
+        }
+        for stream_id in &self.stream_order {
+            let complete = self
+                .streams
+                .get(stream_id)
+                .map(|progress| progress.page_complete)
+                .unwrap_or(false);
+            if !complete {
+                return RecoveryDisposition::Partial {
+                    reason: RECOVERY_PARTIAL_PAGE_CONTINUATION,
+                };
+            }
+        }
+        RecoveryDisposition::Complete
+    }
+
+    fn view(&self) -> RecoveryView {
+        RecoveryView {
+            window_key: self.window_key.clone(),
+            live_generation: self.live_generation,
+            streams: self
+                .stream_order
+                .iter()
+                .filter_map(|stream_id| {
+                    self.streams.get(stream_id).map(|progress| RecoveryStreamView {
+                        stream_id: stream_id.clone(),
+                        acked_base: progress.acked_base,
+                        durable_cursor: progress.durable_cursor,
+                        contiguous_frontier: progress.contiguous_frontier,
+                        highest_observed: progress.highest_observed,
+                        next_after: progress.next_after,
+                        recovered_events: progress.events.len() as u64,
+                        recovered_gaps: progress.gaps.len() as u64,
+                        page_complete: progress.page_complete,
+                    })
+                })
+                .collect(),
+            unscoped_gaps: self.unscoped_gaps.len() as u64,
+            unproven_scope_present: self.unproven_scope_present,
+            stream_list_complete: self.stream_list_complete,
+            disposition: self.disposition(),
+        }
+    }
 }
 
 /// The thin, restart-empty A-16 bridge core.
@@ -1181,6 +2117,7 @@ impl AgentBridgeCore {
             },
             reconciliation_required: request.attach_kind == AttachKind::External,
             blind_interval: request.pre_attach_blind_interval,
+            recovery: None,
         };
         self.active = Some(active);
         self.replay = ReplayLedger::new();
@@ -1245,8 +2182,332 @@ impl AgentBridgeCore {
             return Err(BridgeError::StaleAuthority);
         }
         validate_text(permit.receipt_ref.as_str(), "reconciliation_receipt_ref")?;
-        active.reconciliation_required = false;
+        // A legacy port attests an empty inventory and keeps the historical
+        // gate-clearing semantics. A bounded recovery read imports its
+        // checked facts and clears the gate only on a complete walk:
+        // missing required pages or owner evidence keep
+        // `reconciliation_required` raised, while recovery-only reads stay
+        // reachable through `recover_next_page` below.
+        if let Some(window) = permit.window {
+            let disposition =
+                Self::apply_recovery_window(&active.binding, &mut active.recovery, window)?;
+            if disposition == RecoveryDisposition::Complete {
+                active.reconciliation_required = false;
+            }
+        } else {
+            active.reconciliation_required = false;
+        }
         self.attach_view().ok_or(BridgeError::NotAttached)
+    }
+
+    /// Reads one bounded recovery page inside the declared window without
+    /// clearing the gate by itself.
+    ///
+    /// Recovery-only reads stay reachable while normal forwarding is gated
+    /// (`ensure_forwardable` is not required here), so the gate cannot
+    /// prevent the very work needed to satisfy it. The read changes no
+    /// producer/consumer cursor, performs no ordinary effect, and never
+    /// marks anything APPLIED: it only restores checked receipt/accounting
+    /// facts. Each call rechecks the live attach authority, including after
+    /// a reconnect, and a late result for a replaced attach fails closed
+    /// without touching current recovery state.
+    pub fn recover_next_page(&mut self) -> Result<RecoveryView, BridgeError> {
+        self.ensure_contracts()?;
+        let (binding, request) = {
+            let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
+            let window = active.recovery.as_ref().ok_or(BridgeError::InvalidTransition(
+                "no declared recovery window; reconcile_external opens the walk",
+            ))?;
+            let next = window
+                .stream_order
+                .iter()
+                .find(|stream_id| {
+                    window
+                        .streams
+                        .get(*stream_id)
+                        .map(|progress| !progress.page_complete)
+                        .unwrap_or(false)
+                })
+                .ok_or(BridgeError::InvalidTransition(
+                    "recovery window has no pending page; the walk is complete or unstarted",
+                ))?;
+            let progress = window.streams.get(next).ok_or(BridgeError::InvalidTransition(
+                "recovery window names a stream without progress",
+            ))?;
+            let request = RecoveryReadRequest::checked(
+                window.window_key.clone(),
+                next.clone(),
+                progress.next_after,
+                RECOVERY_PAGE_EVENT_LIMIT,
+                progress.gaps.len() as u64,
+                RECOVERY_PAGE_GAP_LIMIT,
+                active.binding.activation_generation.get(),
+                active.binding.connection_id.as_str().to_owned(),
+            )?;
+            (active.binding.clone(), request)
+        };
+        if request.expected_generation != binding.activation_generation.get()
+            || request.expected_connection != binding.connection_id.as_str()
+        {
+            return Err(BridgeError::StaleAuthority);
+        }
+        let outcome = self.forwarder()?.reconcile_continue(&binding, &request)?;
+        let permit = match outcome {
+            ReconciliationPortOutcome::Reconciled(result) => ReconciliationPermit::seal(result)?,
+            ReconciliationPortOutcome::Denied { reason_code } => {
+                validate_text(reason_code, "reconciliation_denial.reason_code")?;
+                return Err(BridgeError::ExternalReconciliationDenied(reason_code));
+            }
+        };
+        let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+        if !active.binding.authority_matches(
+            &permit.session_id,
+            permit.activation_generation,
+            &permit.state_fence,
+            &permit.task_binding,
+        ) {
+            return Err(BridgeError::StaleAuthority);
+        }
+        validate_text(permit.receipt_ref.as_str(), "reconciliation_receipt_ref")?;
+        let window = permit.window.ok_or(BridgeError::InvalidTransition(
+            "bounded recovery continuation requires a windowed owner answer",
+        ))?;
+        // The reply carries its own freshly verified key; continuity with
+        // the declared walk is enforced by authority, generation,
+        // connection, and per-stream monotonicity inside
+        // `apply_recovery_window`, never by key equality — while a bare
+        // legacy answer carries no window at all and cannot continue a walk.
+        let _disposition =
+            Self::apply_recovery_window(&active.binding, &mut active.recovery, window)?;
+        self.recovery_view().ok_or(BridgeError::NotAttached)
+    }
+
+    /// Returns the read-only progress of the declared recovery window, if any.
+    pub fn recovery_view(&self) -> Option<RecoveryView> {
+        self.active
+            .as_ref()?
+            .recovery
+            .as_ref()
+            .map(RecoveryWindow::view)
+    }
+
+    /// Lists recovered owner receipts the bridge has not yet covered with
+    /// its own acknowledgement: the pending obligations of the walk.
+    ///
+    /// These facts are digest-only obligations for the owner-redelivery
+    /// path; they never fabricate envelopes and never clear the gate.
+    pub fn recovered_pending(&self) -> Vec<RecoveredPendingView> {
+        let Some(active) = self.active.as_ref() else {
+            return Vec::new();
+        };
+        let Some(window) = active.recovery.as_ref() else {
+            return Vec::new();
+        };
+        let mut pending = Vec::new();
+        for progress in window.streams.values() {
+            for event in progress.events.values() {
+                let key = EventIdentityKey::new(&event.stream_id, &event.event_id);
+                if self.acknowledged_phases.contains_key(&key)
+                    || self.pending_deliveries.contains_key(&key)
+                {
+                    continue;
+                }
+                pending.push(RecoveredPendingView {
+                    stream_id: event.stream_id.clone(),
+                    event_id: event.event_id.clone(),
+                    sequence: event.sequence,
+                    phase: event.phase,
+                    envelope_digest: event.envelope_digest.clone(),
+                });
+            }
+        }
+        pending.sort_by(|left, right| {
+            left.stream_id
+                .cmp(&right.stream_id)
+                .then(left.sequence.cmp(&right.sequence))
+        });
+        pending
+    }
+
+    /// Validates one windowed owner answer whole, then imports it.
+    ///
+    /// Nothing is applied until every leg passes: the presenting connection
+    /// and live generation must still match the live binding (a late
+    /// page/result for an earlier attach fails closed here and changes no
+    /// current recovery state), and every stream page must satisfy the
+    /// declared window's monotonicity. A new live generation opens a fresh
+    /// window — pages are never merged across generations — while a
+    /// repeated page restores the same facts idempotently without duplicate
+    /// normalization or application. Concurrent movement inside the window
+    /// marks the stream incomplete with an explicit reason instead of
+    /// stitching a silently complete view.
+    fn apply_recovery_window(
+        binding: &AttachBinding,
+        recovery: &mut Option<RecoveryWindow>,
+        facts: RecoveryWindowFacts,
+    ) -> Result<RecoveryDisposition, BridgeError> {
+        if facts.presenting_connection != binding.connection_id {
+            return Err(BridgeError::StaleAuthority);
+        }
+        if facts.live_generation != binding.activation_generation {
+            return Err(BridgeError::StaleAuthority);
+        }
+        let window = match recovery {
+            Some(window) if window.live_generation == facts.live_generation.get() => window,
+            _ => {
+                *recovery = Some(RecoveryWindow {
+                    window_key: facts.window_key.clone(),
+                    live_generation: facts.live_generation.get(),
+                    stream_order: Vec::new(),
+                    streams: BTreeMap::new(),
+                    unscoped_gaps: BTreeMap::new(),
+                    unproven_scope_present: false,
+                    stream_list_complete: true,
+                    incomplete_reason: None,
+                });
+                recovery.as_mut().ok_or(BridgeError::NotAttached)?
+            }
+        };
+        // A redeclared window never inherits the previous walk's key: the
+        // fresh answer's key becomes the recovery identity from here on.
+        window.window_key = facts.window_key.clone();
+        window.stream_list_complete = facts.stream_list_complete;
+        window.unproven_scope_present = facts.unproven_scope_present;
+        if !facts.stream_list_complete && window.incomplete_reason.is_none() {
+            window.incomplete_reason = Some(RECOVERY_PARTIAL_STREAM_LIST_TRUNCATED);
+        }
+        for stream_facts in &facts.stream_facts {
+            Self::apply_recovery_stream(&mut *window, stream_facts)?;
+        }
+        // Required scope that vanishes from the enumeration is unknown
+        // coverage, not completion: a previously incomplete stream absent
+        // from this answer holds the gate with an explicit reason instead
+        // of clearing silently.
+        if facts.stream_list_complete {
+            for stream_id in window.stream_order.clone() {
+                let missing = !facts
+                    .stream_facts
+                    .iter()
+                    .any(|stream| stream.stream_id == stream_id);
+                let incomplete = window
+                    .streams
+                    .get(&stream_id)
+                    .map(|progress| !progress.page_complete)
+                    .unwrap_or(false);
+                if missing && incomplete && window.incomplete_reason.is_none() {
+                    window.incomplete_reason = Some(RECOVERY_UNAVAILABLE_FOREIGN_PAGE);
+                }
+            }
+        }
+        for gap in &facts.unscoped_gaps {
+            match window.unscoped_gaps.get(&gap.gap_id) {
+                None => {
+                    window.unscoped_gaps.insert(gap.gap_id.clone(), gap.clone());
+                }
+                Some(existing) => {
+                    if existing != gap {
+                        window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
+                    }
+                }
+            }
+        }
+        // Streams that fall out of the enumeration keep their progress but
+        // cannot prove completeness; a vanished incomplete stream holds the
+        // gate with an explicit reason instead of clearing silently.
+        Ok(window.disposition())
+    }
+
+    /// Validates one stream page against its declared progress, then merges
+    /// it. Exact replays restore the same facts; conflicting content under
+    /// an already-applied sequence marks movement; new facts extend the
+    /// retained set, including durable out-of-order events above the
+    /// contiguous frontier.
+    fn apply_recovery_stream(
+        window: &mut RecoveryWindow,
+        facts: &RecoveredStreamFacts,
+    ) -> Result<(), BridgeError> {
+        let progress = window
+            .streams
+            .entry(facts.stream_id.clone())
+            .or_insert_with(|| RecoveryStreamProgress {
+                acked_base: facts.acked_cursor,
+                acked_high: facts.acked_cursor,
+                durable_cursor: facts.acked_cursor,
+                contiguous_frontier: facts.acked_cursor,
+                highest_observed: facts.acked_cursor,
+                next_after: facts.acked_cursor,
+                page_complete: false,
+                events: BTreeMap::new(),
+                gaps: BTreeMap::new(),
+            });
+        if !window.stream_order.contains(&facts.stream_id) {
+            window.stream_order.push(facts.stream_id.clone());
+        }
+        if facts.durable_cursor < progress.durable_cursor
+            || facts.acked_cursor < progress.acked_high
+        {
+            progress.page_complete = false;
+            if window.incomplete_reason.is_none() {
+                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
+            }
+            return Ok(());
+        }
+        progress.acked_high = progress.acked_high.max(facts.acked_cursor);
+        let mut moved = false;
+        for event in facts.events() {
+            match progress.events.get(&event.sequence) {
+                None => {
+                    progress.events.insert(event.sequence, event.clone());
+                }
+                Some(existing) => {
+                    if existing != event {
+                        moved = true;
+                    }
+                }
+            }
+        }
+        for gap in facts.gaps() {
+            match progress.gaps.get(&gap.gap_id) {
+                None => {
+                    progress.gaps.insert(gap.gap_id.clone(), gap.clone());
+                }
+                Some(existing) => {
+                    if existing != gap {
+                        moved = true;
+                    }
+                }
+            }
+        }
+        if moved {
+            progress.page_complete = false;
+            if window.incomplete_reason.is_none() {
+                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
+            }
+            return Ok(());
+        }
+        progress.durable_cursor = progress.durable_cursor.max(facts.durable_cursor);
+        let acked = progress.acked_base.max(facts.acked_cursor);
+        let mut contiguous = acked;
+        while let Some(event) = progress.events.get(&contiguous.saturating_add(1)) {
+            if phase_reaches(AckPhase::Durable, event.phase) {
+                contiguous = contiguous.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        progress.contiguous_frontier = contiguous;
+        progress.highest_observed = progress
+            .highest_observed
+            .max(facts.highest_observed_sequence)
+            .max(facts.durable_cursor);
+        progress.next_after = progress
+            .events
+            .last_key_value()
+            .map(|(sequence, _)| sequence.saturating_add(1))
+            .unwrap_or(acked.saturating_add(1))
+            .max(facts.page_continuation.unwrap_or(0));
+        progress.page_complete = facts.page_complete;
+        Ok(())
     }
 
     pub fn attach_view(&self) -> Option<AttachView> {
