@@ -41,6 +41,20 @@
 //! the stored record may influence a subsequent attempt, and the typed
 //! [`DeliveryRefusal`] is what it records, so a stale or mismatched admission
 //! receipt is refused and stays distinguishable from an absent one.
+//!
+//! Promotion boundary: the closure also evaluates the candidate-only promotion
+//! boundary through [`crate::learning_promotion`] on every committed record, so
+//! the promotion verdict is produced by this production path rather than by
+//! tests alone. The two verdicts are independent and both stay visible on the
+//! receipt: neither gate decides for the other, and neither promotes anything.
+//!
+//! The current owner at this seam publishes no boundary, so the live caller
+//! presents [`PromotionBoundaryInput::Absent`] and the committed record carries
+//! [`PromotionRefusal::MissingBoundary`](crate::learning_promotion::PromotionRefusal::MissingBoundary).
+//! That is the fail-closed outcome, and it is what the receipt states: the
+//! promotion *verdict* runs on every committed record here, while the
+//! boundary-content validation behind [`PromotionBoundaryInput::Published`] has
+//! no production caller until an owner publishes a boundary.
 
 use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard};
@@ -65,6 +79,7 @@ use crate::composition::{
     CanonicalVerifierExecutionFact, GovernorComposition, KernelGenerationPort,
 };
 use crate::learning_delta_integration::{StoredDeltaIdentity, delta_delivery_refusal};
+use crate::learning_promotion::{LearningPromotionOutcome, PromotionBoundaryInput};
 
 /// Revision dependency key addressing the canonical learning-delta image.
 ///
@@ -300,6 +315,16 @@ pub struct LearningClosureReceipt {
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
     /// Ordering head expectation for the same commit.
     pub expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    /// Promotion-boundary evaluation for the record this closure committed.
+    ///
+    /// The closure is the production seam where a candidate is judged, so the
+    /// candidate-only promotion boundary is evaluated here beside the delivery
+    /// verdict, and both verdicts stay separately visible. `Withheld` with
+    /// [`PromotionRefusal::MissingBoundary`](crate::learning_promotion::PromotionRefusal::MissingBoundary)
+    /// is the honest current outcome: no owner publishes a promotion boundary
+    /// at this seam yet, and an absent boundary is recorded as absent rather
+    /// than treated as admissible.
+    pub promotion: LearningPromotionOutcome,
 }
 
 /// Typed outcome of one learning-closure attempt.
@@ -405,6 +430,15 @@ impl LearningClosureService {
     /// owner at the finish seam, so the live caller presents `None` and the
     /// gate refuses with [`DeliveryRefusal::MissingReceipt`], which is exactly
     /// the required "unadmitted means undelivered" outcome.
+    ///
+    /// Promotion boundary: the owner-published candidate-only promotion boundary
+    /// for this record and its attribution/experiment lineage. The verdict is
+    /// produced on every committed record here. A caller that holds no boundary
+    /// presents [`PromotionBoundaryInput::absent`] and the evaluation records
+    /// [`PromotionRefusal::MissingBoundary`](crate::learning_promotion::PromotionRefusal::MissingBoundary)
+    /// instead of passing; the boundary-content validation behind
+    /// [`PromotionBoundaryInput::Published`] runs only once an owner publishes a
+    /// boundary.
     #[allow(
         clippy::too_many_arguments,
         reason = "one validated owner slot per closure input plus the typed outcome"
@@ -418,6 +452,7 @@ impl LearningClosureService {
         retry_relation: Option<StoredRetryRelation>,
         evidence_refs: Vec<ArtifactId>,
         receipt: Option<&AdmissionReceipt>,
+        promotion: PromotionBoundaryInput<'_>,
     ) -> Result<LearningClosureOutcome, LearningClosureError> {
         let boundaries = match derive_boundaries(activity_name, observed) {
             Ok(boundaries) if !boundaries.is_empty() => boundaries,
@@ -440,6 +475,7 @@ impl LearningClosureService {
             evidence_refs,
         )?;
         let delivery_refusal = delta_delivery_refusal(receipt, &record);
+        let promotion_outcome = promotion.evaluate(&record, receipt);
         let version = commit_closure(&self.store, record.clone())?;
         Ok(LearningClosureOutcome::Committed(Box::new(
             LearningClosureReceipt {
@@ -465,6 +501,7 @@ impl LearningClosureService {
                 .map_err(|error| {
                     LearningClosureError::Canonical(format!("ordering head: {error}"))
                 })?,
+                promotion: promotion_outcome,
             },
         )))
     }
@@ -658,6 +695,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// this seam, so the live caller presents `None` and the durable receipt
     /// records the gate refusal, which is exactly the required "unadmitted means
     /// undelivered" outcome.
+    ///
+    /// `promotion` is the owner-published candidate-only promotion boundary for
+    /// this attempt together with the attribution and experiment lineage whose
+    /// digests it consumed. The promotion verdict is produced on every committed
+    /// record here. A caller that holds no boundary presents
+    /// [`PromotionBoundaryInput::absent`], and the committed receipt records the
+    /// withheld verdict with its exact reason.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one validated owner slot per closure input plus the typed outcome"
+    )]
     pub fn close_attempt_learning(
         &self,
         service: &LearningClosureService,
@@ -666,6 +714,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         activity_name: &str,
         declared_retry_reason: Option<RetryReason>,
         receipt: Option<&AdmissionReceipt>,
+        promotion: PromotionBoundaryInput<'_>,
     ) -> Result<LearningClosureOutcome, LearningClosureError> {
         let job = &evidence.job;
         let fence = evidence
@@ -747,6 +796,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             retry_relation,
             evidence_refs,
             receipt,
+            promotion,
         )
     }
 }
