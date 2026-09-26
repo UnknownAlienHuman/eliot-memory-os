@@ -19,6 +19,17 @@
 //! * restoring: [`AuthorityOwner::from_snapshot_with_revocation_history`]
 //!   (in `authority_recovery.rs`) applies that evidence before any grant
 //!   becomes effective; missing, stale, or unknown evidence refuses.
+//! * reconciling: the two durable boundary traits
+//!   [`GrantClosureCanonicalLinkPort`] and [`GrantClosureReceiptPort`] are
+//!   implemented below over the owners that already exist in production — the
+//!   one ORS store that holds the immutable first-phase closure row, and the
+//!   one Kernel P-07 port that committed that row. Neither adapter is a
+//!   second Store client, ledger, or authority machine: the link adapter
+//!   delegates to the same `eliot_ors::OperationalRecoveryStore` call
+//!   `eliot_kernel_core`'s durable owner bootstrap already makes, and the
+//!   readback adapter delegates to that Kernel port's own committed-closure
+//!   index. Both answer with durable evidence or a typed
+//!   [`KernelPortError`]; neither synthesizes a receipt.
 //!
 //! Validation order (fail-closed): admitted [`RequestIdentity`] shape and
 //! exact fence agreement first, then non-blank revocation binding fields
@@ -40,9 +51,12 @@
 //! store enforces the live sequence).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
+use eliot_kernel_core::GrantActivationPort;
+use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoveryStore, OrsError};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::{
@@ -53,8 +67,10 @@ use eliot_store_api::{
     generated_operation_manifests, operation_manifest_set_digest, parse_revocation_history_payload,
 };
 
-use crate::CompositionError;
-use eliot_authority::RevocationHistoryEvidence;
+use crate::{
+    CompositionError, GrantClosureCanonicalLinkPort, GrantClosureReceiptPort, KernelPortError,
+};
+use eliot_authority::{GrantRevocationRequest, RevocationHistoryEvidence};
 
 /// Governor scope reused from the observation/operator precedent; no new
 /// scope is introduced for revocation recording.
@@ -385,6 +401,114 @@ pub fn decode_revocation_history_evidence(
         source_revision: payload.source_revision,
         closures,
     })
+}
+
+/// Maps one ORS refusal on the canonical second-phase link to the typed
+/// Governor port failure, keeping the store's own reason.
+///
+/// The first-phase closure row is immutable, so a duplicate operation
+/// identity carrying a different receipt, a reconciliation that does not
+/// exactly bind its evidence, or a broken inbox binding is a determinate
+/// contract conflict rather than an unestablished outcome. Every other
+/// refusal leaves the outcome unknown at this boundary and is reported as
+/// such; it is never read as a completed link and never retried blindly.
+fn closure_link_error(error: OrsError) -> KernelPortError {
+    let reason = error.to_string();
+    match error {
+        OrsError::DuplicateConflict
+        | OrsError::ReconciliationMismatch
+        | OrsError::InboxIntegrityMismatch
+        | OrsError::Contract(_) => {
+            KernelPortError::Contract(format!("ORS refused the closure link: {reason}"))
+        }
+        other => KernelPortError::Unknown(format!(
+            "canonical closure link outcome is unestablished at the ORS boundary: {other}"
+        )),
+    }
+}
+
+/// Production second-phase link adapter over the one ORS store that owns the
+/// immutable first-phase closure row.
+///
+/// This is the Governor-side implementation of
+/// [`GrantClosureCanonicalLinkPort`]. It delegates to
+/// `eliot_ors::OperationalRecoveryStore::link_grant_closure_canonical_receipt`
+/// — the same owner call `eliot_kernel_core`'s durable owner bootstrap makes
+/// when it links an owner bundle — and then proves the read-back before it
+/// returns. The proof is the conjunction of that owner-side check and the
+/// composition-level saga check: the committed operation identity, the durable
+/// second-phase link, and the first-phase receipt's own canonical link must all
+/// agree with the presented identity. A store that answers with a different
+/// identity or an absent link is a typed [`KernelPortError`], never a success
+/// and never a rewritten first phase.
+impl GrantClosureCanonicalLinkPort for Arc<dyn OperationalRecoveryStore> {
+    fn link_grant_closure_canonical_receipt(
+        &self,
+        operation_id: &OperationIdentity,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<GrantClosureProjection, KernelPortError> {
+        let projection = OperationalRecoveryStore::link_grant_closure_canonical_receipt(
+            self.as_ref(),
+            operation_id,
+            canonical_receipt,
+        )
+        .map_err(closure_link_error)?;
+        let commit = projection.commit();
+        if commit.operation_id != operation_id.as_str()
+            || projection.second_phase() != Some(canonical_receipt)
+            || commit
+                .canonical_receipt
+                .as_ref()
+                .is_some_and(|first_phase| first_phase != canonical_receipt)
+        {
+            return Err(KernelPortError::Contract(
+                "canonical closure receipt link read-back disagrees".to_owned(),
+            ));
+        }
+        Ok(projection)
+    }
+}
+
+/// Production closure-readback adapter over the one Kernel P-07 port that
+/// committed the first phase.
+///
+/// This is the Governor-side implementation of [`GrantClosureReceiptPort`].
+/// It resolves the request's target grant through that port's own committed
+/// closure index (`eliot_kernel_core::GrantActivationPort::closure_receipt_for_target`),
+/// which restart rehydration repopulates from the durable ORS rows, and then
+/// proves the returned receipt binds the presented request. A grant with no
+/// committed closure is an unestablished outcome, and a receipt that names a
+/// different target, snapshot, or State Fence is a determinate binding
+/// conflict. No closure is ever fabricated, defaulted, or inferred from the
+/// request: the only accepted value is the one the port already committed.
+impl GrantClosureReceiptPort for GrantActivationPort {
+    fn grant_closure_receipt(
+        &self,
+        request: &GrantRevocationRequest,
+    ) -> Result<GrantClosureReceipt, KernelPortError> {
+        let closure = self
+            .closure_receipt_for_target(request.grant_id.as_str())
+            .ok_or_else(|| {
+                KernelPortError::Unknown(format!(
+                    "no committed grant closure is bound to target grant {}; the first P-07 \
+                     phase has not committed for this request",
+                    request.grant_id.as_str()
+                ))
+            })?;
+        if closure.declaration.target_grant_id != request.grant_id.as_str()
+            || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
+            || !closure
+                .authority_receipt
+                .authority_epoch
+                .is_same_authority(&request.binding.state_fence.authority_epoch)
+            || closure.authority.state_fence != request.binding.state_fence
+        {
+            return Err(KernelPortError::Contract(
+                "committed grant closure does not bind the presented revocation request".to_owned(),
+            ));
+        }
+        Ok(closure)
+    }
 }
 
 #[cfg(test)]
