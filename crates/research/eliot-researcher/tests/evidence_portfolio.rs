@@ -304,6 +304,8 @@ fn source_outside_claim_authority_domain() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::Unsupported);
@@ -362,13 +364,23 @@ fn stale_partial_and_contested_sources_limit_grade() {
         statement: "the alloy survives".to_owned(),
         material: true,
         domain: "propulsion".to_owned(),
-        citations: vec!["base-src".to_owned(), "rival-src".to_owned()],
+        citations: vec!["base-src".to_owned()],
         precision: Vec::new(),
         counterclaim_ids: vec!["rival-src".to_owned()],
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
-    assert_eq!(verdict.outcome, ClaimOutcome::Contradicted);
+    // The old fixture listed `rival-src` as a citation AND as a counterclaim and
+    // expected CONTRADICTED. That is the defect #2874 closes: listing a handle
+    // contests nothing. With no opposition relation supplied the honest class is
+    // NOT_VERIFIABLE_IN_SCOPE, and the identity is still preserved.
+    assert_eq!(verdict.outcome, ClaimOutcome::NotVerifiableInScope);
+    assert_eq!(
+        verdict.public_class(),
+        PublicAuditClass::NotVerifiableInScope
+    );
     assert_eq!(verdict.counterevidence, vec!["rival-src".to_owned()]);
 }
 
@@ -691,6 +703,8 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: vec!["unread-dossier-9".to_owned()],
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&hidden_unknown, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -705,6 +719,8 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&bare, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -717,9 +733,20 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
+    // A claim with no frozen identity cannot be released as supported: there is
+    // nothing to check its wording and revision against, so `MethodArtifact-
+    // Alignment` fails by construction. The internal outcome stays
+    // INCOMPLETE_ACCOUNTING rather than acquiring a new terminal class.
     let verdict = audit_claim(&clean, &portfolio, &manifest, 1_700_000_300_000);
-    assert_eq!(verdict.outcome, ClaimOutcome::Supported);
+    assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
+    assert_eq!(
+        verdict.public_class(),
+        PublicAuditClass::NotVerifiableInScope
+    );
+    assert!(!verdict.dimensions_complete());
     assert_eq!(verdict.grade_ceiling, Some(2));
     assert!(GOLDEN.contains("INCOMPLETE_ACCOUNTING"));
     assert!(GOLDEN.contains("SUPPORTED"));
