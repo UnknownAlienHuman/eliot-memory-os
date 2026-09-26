@@ -6,8 +6,21 @@
 //! promotes epistemic status, or treats writer-supplied utility as authority.
 
 #![forbid(unsafe_code)]
+// Frozen #40 facade: internal cross-uses of deprecated compat items stay
+// warning-free here; downstream uses still warn. See `facade`.
+#![allow(deprecated)]
 
+/// Frozen #40/#1905 compatibility: typed lifecycle admission linkage retained
+/// for the kernel persist seam. See [`facade::FACADE_DISPOSITIONS`].
+#[deprecated(
+    note = "#40 frozen compat; migrate lifecycle_persist to neutral owners; see facade::FACADE_DISPOSITIONS"
+)]
 pub mod admission;
+/// Frozen #40/#1905 compatibility: admission drivers retained for the kernel
+/// proof tests. See [`facade::FACADE_DISPOSITIONS`].
+#[deprecated(
+    note = "#40 frozen compat; migrate lifecycle_persist tests to neutral owners; see facade::FACADE_DISPOSITIONS"
+)]
 pub mod candidate_admission;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -265,6 +278,12 @@ impl PreviewRequest {
     }
 }
 
+/// Frozen #40 compatibility entry point: the screening owner is
+/// `eliot-memory-curation-screen`. Do not extend.
+/// See [`facade::FACADE_DISPOSITIONS`].
+#[deprecated(
+    note = "#40 frozen compat; screening owner is eliot-memory-curation-screen::screen_memory_curation"
+)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryCurationOwner;
@@ -532,3 +551,9 @@ fn digest(value: &str) -> String {
 fn digest_for_cursor(scope: &str, revision: u64) -> String {
     digest(&format!("{scope}:{revision}"))[..24].to_owned()
 }
+
+pub mod facade;
+
+pub use eliot_memory_curation_contracts::{
+    CurationScreenRequest, CurationScreenResult, ProtectionEvidence, SourceSnapshot,
+};
