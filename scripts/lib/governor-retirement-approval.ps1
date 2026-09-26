@@ -653,7 +653,7 @@ function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCom
         schema = $script:GovernorRetirementClosureSchema
         status = $status
         rule_set = $script:GovernorRetirementClosureRuleSet
-        verifier = $script:MyInvocation.MyCommand.Name
+        verifier = $MyInvocation.MyCommand.Name
         candidate_commit = $SourceCommit
         candidate_tree = (Get-GovernorRetirementCandidateTree $Repo $SourceCommit)
         tracked_file_count = $tracked.Count
