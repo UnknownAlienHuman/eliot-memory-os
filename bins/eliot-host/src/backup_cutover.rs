@@ -978,6 +978,25 @@ pub enum CutoverError {
 // `host-backup-cutover-failed` code; operation failure stays distinct from
 // any process shutdown failure.
 //
+// Production disposition call sites (#983): `cutover_disposition_token` has TWO
+// production callers. The first is `reconcile_cutover_outcome` below, which
+// projects the full owner read model. The second is
+// `observe_retained_cutover_disposition`, which the Host's existing approved
+// contour reconcile (`HostComposition::reconcile_approved_contour`, reached
+// from `fn main` through `run_scm_contour_tick`) now calls, so the retained
+// `pending_cutover` disposition is observed on the live contour. That read
+// never reaches `validate_cutover_request`: the owner gate set requires an
+// admitted `CutoverRequest` plus the #960 owner-issued
+// `IsolatedRecoveryEvidence`, and NEITHER is reconstructible from the durable
+// journal slot (`CutoverIntentRecord` retains no envelope, admission receipt,
+// archive digest/class, activation fence, or recovery evidence). Only the
+// admitted cutover dispatch `HostComposition::backup_dispatch_cutover` holds
+// those two values, and it has no production caller on this base because the
+// console wire is closed with Status/Stop and `eliot-kernel` does not depend
+// on `eliot-host`. Manufacturing one would need a new transport surface this
+// issue does not own, so the gap is stated here rather than papered over with
+// a fabricated request.
+//
 // Explicit no-event list: `is_exact_replay`/`check_replay_identity` (pure
 // predicates; the observed replay is recorded at the committed-intent return
 // in `execute_cutover`, never as a second effect),
@@ -1037,6 +1056,63 @@ fn cutover_disposition_token(disposition: CutoverDisposition) -> &'static str {
         CutoverDisposition::Failed => "failed",
         CutoverDisposition::Unknown => "unknown",
     }
+}
+
+/// Projects one durable [`CutoverIntentState`] the journal owner itself
+/// committed to its stable [`CutoverDisposition`].
+///
+/// Pure and exhaustive over the journal owner's closed state set. The mapping
+/// adds no state of its own: a durably committed intent is exactly what the
+/// journal owner recorded, so `Committed` and `Failed` are the owner's own
+/// terminal words and a `Pending` intent is `Prepared` — the pre-effect state
+/// a durable intent commits to. `Validated`, `Reconciled`, `RetirementPending`
+/// and `Unknown` are never inferred here: they are conclusions only the full
+/// `reconcile_cutover_outcome` owner read model may reach, so this projection
+/// can never report a settlement, an owed retirement, or an ambiguity it did
+/// not read.
+fn retained_cutover_disposition(state: CutoverIntentState) -> CutoverDisposition {
+    match state {
+        CutoverIntentState::Pending => CutoverDisposition::Prepared,
+        CutoverIntentState::Committed => CutoverDisposition::Committed,
+        CutoverIntentState::Failed => CutoverDisposition::Failed,
+    }
+}
+
+/// Observes the live disposition the Host journal owner currently retains for
+/// one outstanding installation cutover, on the Host's existing approved
+/// contour reconcile (`HostComposition::reconcile_approved_contour`).
+///
+/// Strictly a read-and-observe owner path: it appends nothing, mutates no
+/// registry, activates nothing, retires nothing, and resolves no cutover. The
+/// single `pending_cutover` slot is the journal owner's own projection; when
+/// the slot is empty there is no outstanding cutover and nothing is observed,
+/// so an installation that never had a cutover logs nothing. When a cutover IS
+/// outstanding, the disposition repeats the owner's durably committed state
+/// verbatim through [`cutover_disposition_token`] and the bounded evidence
+/// count is a number, never a handle, digest, or request identity.
+///
+/// This is the owner-path read that makes the cutover disposition observable
+/// on the live contour without an admitted request: the durable slot is
+/// present exactly when a cutover operation is in flight, and its recorded
+/// state is the owner's own terminal or pre-effect word.
+pub fn observe_retained_cutover_disposition(
+    host: &HostComposition,
+) -> Result<Option<CutoverDisposition>, HostError> {
+    let snapshot = host
+        .journal
+        .snapshot()
+        .map_err(|error| note_cutover_read_error(super::HostError::from(error)))?;
+    let Some(intent) = snapshot.pending_cutover.as_ref() else {
+        return Ok(None);
+    };
+    let disposition = retained_cutover_disposition(intent.state);
+    observe_cutover_progress(
+        "contour_reconcile",
+        "retained_intent",
+        cutover_disposition_token(disposition),
+        backup_cutover_count(intent.intent_evidence_refs.len()),
+    );
+    Ok(Some(disposition))
 }
 
 /// Observes one nonterminal cutover phase outcome after the decision exists.
