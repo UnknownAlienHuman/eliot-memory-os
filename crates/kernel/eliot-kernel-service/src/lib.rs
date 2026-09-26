@@ -181,7 +181,9 @@ pub use store_client::{
     StoreClientFaultHarness,
 };
 #[cfg(windows)]
-pub use store_gateway::KernelStoreGateway;
+pub use store_gateway::{
+    DreamerCommitUncertain, DreamerJobFailure, DreamerRetainedOutcome, KernelStoreGateway,
+};
 pub use store_write_reservation::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,

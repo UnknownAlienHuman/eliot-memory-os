@@ -36,6 +36,7 @@ use super::dispatch_launch::dreamer_dispatch_launch::{
     DREAMER_MODULE_ID, dreamer_launch_permits_lease,
 };
 use super::*;
+use eliot_kernel_service::{DreamerCommitUncertain, DreamerJobFailure};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation, JobRole};
 use eliot_store_api::RequestMeta;
 use serde::Deserialize;
@@ -73,6 +74,13 @@ pub(crate) struct DreamerJobEnvelope {
 /// ledger owned by the test. The trait never routes: dispatch plus execute
 /// validation always runs first, so a test double can only answer an already
 /// admitted envelope, never admit one itself.
+///
+/// The port is typed all the way to this edge (issue #2764 item 6). It used
+/// to answer `Result<DurableJobResponse, String>`, which flattened every
+/// recovered commit outcome into prose before the real caller could see it; the
+/// error is now [`DreamerJobFailure`], so the recovery leg's outcome and its
+/// refusals arrive as variants and the single rendering happens in
+/// [`KernelComposition::project_dreamer_call`].
 #[allow(async_fn_in_trait)]
 pub(crate) trait DreamerJobStore {
     /// Applies one admitted Dreamer ledger operation exactly once.
@@ -80,7 +88,7 @@ pub(crate) trait DreamerJobStore {
         &self,
         context: &RequestMeta,
         request: DurableJobRequest,
-    ) -> Result<DurableJobResponse, String>;
+    ) -> Result<DurableJobResponse, DreamerJobFailure>;
 }
 
 #[cfg(windows)]
@@ -89,7 +97,7 @@ impl DreamerJobStore for KernelStoreGateway {
         &self,
         context: &RequestMeta,
         request: DurableJobRequest,
-    ) -> Result<DurableJobResponse, String> {
+    ) -> Result<DurableJobResponse, DreamerJobFailure> {
         KernelStoreGateway::dreamer_job(self, context, request).await
     }
 }
@@ -146,6 +154,12 @@ fn dreamer_envelope_from_payload(
 
 /// Fail-closed classifier over stringified gateway/store errors.
 ///
+/// This applies to the [`DreamerJobFailure::Refused`] channel only, and to a
+/// recovery refusal's own rendering. The [`DreamerJobFailure::Recovered`]
+/// channel is never tested here: a proven or preserved commit outcome is not
+/// a fence marker, and deciding that from its prose is exactly the coupling
+/// the typed carrier removes.
+///
 /// Fence and unknown markers fence the session: claiming a typed refusal
 /// when the store outcome is unknown (or when the gateway route itself is
 /// fenced) would be a false proof. Every other (deterministic, typed) store
@@ -157,6 +171,12 @@ fn dreamer_envelope_from_payload(
 /// "fenced" (a fenced gateway, generation, or session): a bare "fence"
 /// also appears in the deterministic `FenceMismatch` refusal, which stays
 /// a typed reply.
+///
+/// A [`DreamerJobFailure::Recovery`] refusal is tested through the same
+/// markers so a fenced-gateway recovery refusal keeps fencing exactly as it
+/// did when it was stringified; that is why the recovery channel reaches
+/// this function at all, and it decides a transport fence, never a binding
+/// and never a recovery outcome.
 fn dreamer_store_error_fences(error: &str) -> bool {
     let folded = error.to_lowercase();
     folded.contains("fenced")
@@ -164,6 +184,107 @@ fn dreamer_store_error_fences(error: &str) -> bool {
         || folded.contains("unknown_outcome")
         || folded.contains("timed out")
         || folded.contains("timeout")
+}
+
+/// Closed wire projection of one typed recovered commit outcome.
+///
+/// Every field the outcome carries is present in the projection: the
+/// discriminant, the original idempotency key, the exact terminal outcome,
+/// the receipt digest that proves it, the Ordering Scopes it holds paused,
+/// any pause-refresh limitation, and the remaining ledger-read obligation.
+/// The discriminant is a closed set, so an unknown value cannot decode as any
+/// of them.
+///
+/// A field that does not exist for a variant is projected as an explicit
+/// `null`, never as an empty string, a zero, or an omitted key: `null` says
+/// "this outcome proves no such thing", which is a fact about the variant,
+/// whereas a blank value would be a silent default a reader could mistake for
+/// one. So a settled outcome carries no paused scopes (an empty real vector)
+/// and no refresh limitation, while an open one carries no terminal outcome
+/// and no receipt digest.
+fn dreamer_recovery_body(outcome: &DreamerCommitUncertain) -> serde_json::Value {
+    match outcome {
+        DreamerCommitUncertain::Reconciled {
+            idempotency_key,
+            evidence_receipt_digest,
+            outcome,
+        } => {
+            let commit_outcome = format!("{outcome:?}");
+            dreamer_recovery_projection(
+                "reconciled",
+                idempotency_key,
+                Some(&commit_outcome),
+                Some(evidence_receipt_digest),
+                &[],
+                None,
+            )
+        }
+        DreamerCommitUncertain::AlreadyDispositioned {
+            idempotency_key,
+            outcome,
+            evidence_receipt_digest,
+        } => {
+            let commit_outcome = format!("{outcome:?}");
+            dreamer_recovery_projection(
+                "already_dispositioned",
+                idempotency_key,
+                Some(&commit_outcome),
+                Some(evidence_receipt_digest),
+                &[],
+                None,
+            )
+        }
+        DreamerCommitUncertain::ReconciledWithRefreshLimitation {
+            idempotency_key,
+            outcome,
+            evidence_receipt_digest,
+            refresh_limitation,
+        } => {
+            let commit_outcome = format!("{outcome:?}");
+            dreamer_recovery_projection(
+                "reconciled_with_refresh_limitation",
+                idempotency_key,
+                Some(&commit_outcome),
+                Some(evidence_receipt_digest),
+                &[],
+                Some(refresh_limitation),
+            )
+        }
+        DreamerCommitUncertain::UnknownCommitOpen {
+            idempotency_key,
+            paused_scopes,
+        } => dreamer_recovery_projection(
+            "unknown_commit_open",
+            idempotency_key,
+            None,
+            None,
+            paused_scopes,
+            None,
+        ),
+    }
+}
+
+/// Builds the closed recovery projection from one outcome's exact fields.
+///
+/// A settled outcome genuinely holds no Ordering Scopes and no refresh
+/// limitation, so it passes real empty/absent values rather than placeholders.
+fn dreamer_recovery_projection(
+    discriminant: &str,
+    idempotency_key: &str,
+    commit_outcome: Option<&str>,
+    evidence_receipt_digest: Option<&str>,
+    paused_scopes: &[String],
+    refresh_limitation: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": discriminant,
+        "idempotency_key": idempotency_key,
+        "commit_outcome": commit_outcome,
+        "evidence_receipt_digest": evidence_receipt_digest,
+        "paused_scopes": paused_scopes,
+        "refresh_limitation": refresh_limitation,
+        "ledger_answer_obligation": "the DurableJobResponse is still unknown and must be read through a ledger Status/Reconcile observation",
+    })
 }
 
 impl KernelComposition {
@@ -460,6 +581,15 @@ impl KernelComposition {
     /// single store call, the `validate_for` answer binding, the
     /// request-identity echo, and the refusal/fence error split run here
     /// exactly once per admitted envelope.
+    ///
+    /// This is the single transport edge, and it is the only place a Dreamer
+    /// recovery outcome is rendered. The decision is made on the typed
+    /// channel, not on prose: a [`DreamerJobFailure::Recovered`] answer is
+    /// never a fence and never a plain refusal — it replies with its own
+    /// closed projection — while a deterministic refusal and a recovery
+    /// refusal both take the existing marker test. The requester's durable
+    /// mutation identity is unchanged either way, so a reply here is
+    /// reconcilable under the same key.
     pub(crate) async fn project_dreamer_call(
         store: &impl DreamerJobStore,
         session: &Session,
@@ -486,7 +616,46 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?;
                 Ok(reply)
             }
-            Err(error) => {
+            Err(DreamerJobFailure::Recovered(outcome)) => {
+                let mut reply = status_frame(
+                    session,
+                    FrameKind::Response,
+                    MessageType::Result,
+                    serde_json::json!({
+                        "status": "error",
+                        "operation": DREAMER_JOB_WIRE_ID,
+                        "error": outcome.to_string(),
+                        "recovery": dreamer_recovery_body(&outcome),
+                    }),
+                )?;
+                reply.request_id = Some(request_id);
+                reply
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(reply)
+            }
+            Err(DreamerJobFailure::Recovery(error)) => {
+                let rendered = error.to_string();
+                if dreamer_store_error_fences(&rendered) {
+                    return Err(TransportError::SessionFenced);
+                }
+                let mut reply = status_frame(
+                    session,
+                    FrameKind::Response,
+                    MessageType::Result,
+                    serde_json::json!({
+                        "status": "error",
+                        "operation": DREAMER_JOB_WIRE_ID,
+                        "error": rendered,
+                    }),
+                )?;
+                reply.request_id = Some(request_id);
+                reply
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(reply)
+            }
+            Err(DreamerJobFailure::Refused(error)) => {
                 if dreamer_store_error_fences(&error) {
                     return Err(TransportError::SessionFenced);
                 }
@@ -1038,10 +1207,10 @@ mod dreamer_job_dispatch_tests {
             &self,
             _context: &RequestMeta,
             request: DurableJobRequest,
-        ) -> Result<DurableJobResponse, String> {
+        ) -> Result<DurableJobResponse, DreamerJobFailure> {
             self.calls.lock().expect("calls lock").push(request.clone());
             if let Some(message) = self.refusal.lock().expect("refusal lock").clone() {
-                return Err(message);
+                return Err(DreamerJobFailure::Refused(message));
             }
             match &request.operation {
                 JobOperation::Submit { submission } => {
@@ -1070,10 +1239,10 @@ mod dreamer_job_dispatch_tests {
                         "selection_coverage": [],
                         "selection_frontier": null,
                     }))
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| DreamerJobFailure::Refused(error.to_string()))?;
                     response
                         .validate_for(&request)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| DreamerJobFailure::Refused(error.to_string()))?;
                     self.jobs.lock().expect("jobs lock").insert(
                         Self::job_key(&job_value),
                         StoredK2Job {
@@ -1098,11 +1267,17 @@ mod dreamer_job_dispatch_tests {
                         .expect("jobs lock")
                         .get(&key)
                         .cloned()
-                        .ok_or_else(|| "dreamer test ledger: unknown job".to_owned())?;
+                        .ok_or_else(|| {
+                            DreamerJobFailure::Refused(
+                                "dreamer test ledger: unknown job".to_owned(),
+                            )
+                        })?;
                     if stored.revision != *expected_revision
                         || stored.attempt != serde_json::to_value(attempt_id).expect("attempt json")
                     {
-                        return Err("dreamer test ledger: revision conflict".to_owned());
+                        return Err(DreamerJobFailure::Refused(
+                            "dreamer test ledger: revision conflict".to_owned(),
+                        ));
                     }
                     let response: DurableJobResponse = serde_json::from_value(serde_json::json!({
                         "request_identity": serde_json::to_value(&request.request_identity)
@@ -1121,10 +1296,10 @@ mod dreamer_job_dispatch_tests {
                         "selection_coverage": [],
                         "selection_frontier": null,
                     }))
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| DreamerJobFailure::Refused(error.to_string()))?;
                     response
                         .validate_for(&request)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| DreamerJobFailure::Refused(error.to_string()))?;
                     Ok(response)
                 }
                 JobOperation::LeaseExact { selector, job_id } => {
@@ -1135,7 +1310,11 @@ mod dreamer_job_dispatch_tests {
                         .expect("jobs lock")
                         .get(&key)
                         .cloned()
-                        .ok_or_else(|| "dreamer test ledger: unknown job".to_owned())?;
+                        .ok_or_else(|| {
+                            DreamerJobFailure::Refused(
+                                "dreamer test ledger: unknown job".to_owned(),
+                            )
+                        })?;
                     // The selector must reproduce the queued record exactly:
                     // scope, revision, and fence. The K2 lineage gate already
                     // enforces this; the ledger re-proves it.
@@ -1147,10 +1326,14 @@ mod dreamer_job_dispatch_tests {
                         || stored.revision != selector.expected_revision
                         || stored.scope.get("state_fence") != Some(&selector_fence)
                     {
-                        return Err("dreamer test ledger: lease selector mismatch".to_owned());
+                        return Err(DreamerJobFailure::Refused(
+                            "dreamer test ledger: lease selector mismatch".to_owned(),
+                        ));
                     }
                     if !self.leased.lock().expect("leased lock").insert(key.clone()) {
-                        return Err("dreamer test ledger: job already leased".to_owned());
+                        return Err(DreamerJobFailure::Refused(
+                            "dreamer test ledger: job already leased".to_owned(),
+                        ));
                     }
                     let response: DurableJobResponse = serde_json::from_value(
                         serde_json::json!({
@@ -1189,15 +1372,15 @@ mod dreamer_job_dispatch_tests {
                             "selection_frontier": null,
                         }),
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| DreamerJobFailure::Refused(error.to_string()))?;
                     response
                         .validate_for(&request)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| DreamerJobFailure::Refused(error.to_string()))?;
                     Ok(response)
                 }
-                _ => Err(
+                _ => Err(DreamerJobFailure::Refused(
                     "dreamer test ledger: operation not admitted on the requester path".to_owned(),
-                ),
+                )),
             }
         }
     }

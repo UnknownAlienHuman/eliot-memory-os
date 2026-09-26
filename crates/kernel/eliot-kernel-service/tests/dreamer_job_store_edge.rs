@@ -1749,7 +1749,7 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/20 fenced gateway must reject");
-        assert!(error.contains("fenced"), "779/20 got {error:?}");
+        assert!(error.to_string().contains("fenced"), "779/20 got {error:?}");
         let (dreamer, receipt) = {
             let log = setup.log.lock().expect("loopback log");
             (log.dreamer.clone(), log.receipt.clone())
@@ -1780,8 +1780,11 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/21 foreign lineage must fail the route gate");
+        let rendered = error.to_string();
         assert!(
-            error.contains("epoch") || error.contains("generation") || error.contains("route"),
+            rendered.contains("epoch")
+                || rendered.contains("generation")
+                || rendered.contains("route"),
             "779/21 got {error:?}"
         );
         let dreamer = { setup.log.lock().expect("loopback log").dreamer.clone() };
@@ -1802,9 +1805,10 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/22 denied role must fail");
-        assert!(error.contains("role"), "779/22 got {error:?}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("role"), "779/22 got {error:?}");
         assert!(
-            !error.contains("eliotd") && !error.contains("daemon"),
+            !rendered.contains("eliotd") && !rendered.contains("daemon"),
             "779/22 caller rule must not be a source check, got {error:?}"
         );
         let dreamer = { setup.log.lock().expect("loopback log").dreamer.clone() };
@@ -1849,7 +1853,7 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/23 split fence must fail");
-        assert!(error.contains("fence"), "779/23 got {error:?}");
+        assert!(error.to_string().contains("fence"), "779/23 got {error:?}");
         let dreamer = { setup.log.lock().expect("loopback log").dreamer.clone() };
         assert!(dreamer.is_empty(), "779/23 no ledger frame");
         finish_loopback(setup).await;
@@ -1867,7 +1871,10 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/24 unknown answer must stay unknown");
-        assert!(error.contains("receipt"), "779/24 got {error:?}");
+        assert!(
+            error.to_string().contains("receipt"),
+            "779/24 got {error:?}"
+        );
         let (dreamer, receipt) = {
             let log = setup.log.lock().expect("loopback log");
             (log.dreamer.clone(), log.receipt.clone())

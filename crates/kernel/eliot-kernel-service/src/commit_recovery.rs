@@ -1270,16 +1270,54 @@ pub(crate) enum RetainedCommitState {
 /// Verifies that a retained record binds the exact presented operation
 /// (issue #2764 items 1 and 3).
 ///
-/// The comparison covers operation id, idempotency key, canonical request
-/// hash, and the original scope/owner binding. The canonical request hash is
-/// the value the existing contract computed and bound, not caller spelling:
-/// a resubmission that reuses a key with a changed operation or a changed
-/// hash is rejected even when the retained record is already terminal, and
-/// historical operation/fence data in the record is never rewritten to
-/// today's epoch.
+/// Issue item 1 names five fields. Four are compared here and the fifth is
+/// recorded void; none is silently skipped:
+///
+/// | item's field | compared | against |
+/// |---|---|---|
+/// | operation id | yes | `record.operation_id` |
+/// | idempotency key | yes | `record.idempotency_key` |
+/// | canonical request hash | yes | `record.canonical_request_hash` |
+/// | original scope/owner binding | yes | `record.ordering_scopes`, the retained complete Ordering Scope set (I5.5) |
+/// | applicable contract version | **void** | see below |
+///
+/// ## Why the contract-version clause is void, not merely missing
+///
+/// `UnknownCommitRecord` retains no version field. Its persisted shape is
+/// unversioned `serde_json` under `deny_unknown_fields` in a raw durable
+/// table, so adding one is an on-disk format change that would make every
+/// already-stored record undecodable; that migration belongs to the ORS
+/// persistence codec and restore journal, not to this comparison. A version
+/// comparison against a compile-time constant would also prove nothing.
+/// What the clause actually protects is already bound, and bound by a
+/// *recomputed* value: the store side hashes `admission_contract_set_digest`
+/// and `operation_manifest_digest` into `canonical_request_hash`
+/// (`eliot_store_api::request_hash`), and the Dreamer side hashes the
+/// versioned `DURABLE_JOB_CANONICAL_ENCODING` tag into its own canonical
+/// digest. A second, weaker copy of that fact in the record would not add
+/// proof, and the shared digest is compared here.
+///
+/// ## What "scope/owner binding" is, concretely
+///
+/// `ordering_scopes` is the retained complete scope set the record was
+/// staged with and the set its pauses are keyed on, so it is compared here.
+/// It is compared exactly as `UnknownCommitRecord::same_binding` compares
+/// it, so this gate can never reject a binding the durable owner would have
+/// accepted; a divergence that used to surface as an opaque ORS integrity
+/// failure on restage is now an exact `ordering_scopes` conflict. The
+/// *owner* half of the clause (scope id, principal, authority epoch, State
+/// Fence, transition class, contract-set digest) is not a separate record
+/// field: it is hash-bound inside `canonical_request_hash`, which is why the
+/// canonical binding must be recomputed through its owning contract rather
+/// than accepted as caller spelling before this comparison means anything.
+///
+/// Historical operation/fence data in the record is never rewritten: a
+/// rejected adoption leaves the retained row and its pauses exactly as
+/// staged, and a terminal record is not reopened.
 pub(crate) fn verify_retained_binding(
     record: &UnknownCommitRecord,
     identity: &OperationIdentity,
+    ordering_scopes: &[String],
 ) -> Result<(), CommitRecoveryError> {
     let mut mismatches: Vec<&str> = Vec::new();
     if record.idempotency_key != identity.idempotency_key {
@@ -1290,6 +1328,9 @@ pub(crate) fn verify_retained_binding(
     }
     if record.canonical_request_hash != identity.canonical_request_hash {
         mismatches.push("canonical_request_hash");
+    }
+    if record.ordering_scopes != ordering_scopes {
+        mismatches.push("ordering_scopes");
     }
     if mismatches.is_empty() {
         return Ok(());
@@ -1312,9 +1353,16 @@ pub(crate) fn verify_retained_binding(
 /// be read, and I14.21's "keep the scope paused until an exact
 /// evidence-backed disposition" is only meaningful while the record is
 /// honestly classified.
+///
+/// `ordering_scopes` is the presented complete Ordering Scope set for this
+/// operation. It is passed in rather than re-derived so the scope/owner half
+/// of the retained binding is compared against exactly the set the caller is
+/// about to act on, and it is compared by
+/// [`verify_retained_binding`] before any classification happens.
 pub(crate) fn classify_retained_commit(
     ors: Option<&RedbRecoveryStore>,
     identity: &OperationIdentity,
+    ordering_scopes: &[String],
 ) -> Result<RetainedCommitState, CommitRecoveryError> {
     let Some(ors) = ors else {
         return Err(CommitRecoveryError::OrsUnavailable {
@@ -1331,7 +1379,7 @@ pub(crate) fn classify_retained_commit(
     else {
         return Ok(RetainedCommitState::Absent);
     };
-    verify_retained_binding(&record, identity)?;
+    verify_retained_binding(&record, identity, ordering_scopes)?;
     match record.outcome {
         None => Ok(RetainedCommitState::Open { record }),
         Some(_) => Ok(RetainedCommitState::Terminal { record }),
