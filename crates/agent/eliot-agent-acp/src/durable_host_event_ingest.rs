@@ -45,9 +45,10 @@ use std::collections::BTreeMap;
 use eliot_agent_api::{
     AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventId,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
-    HostEventPrivacyClass, LowercaseSha256, NormalizedHostEventEnvelope, ProviderExecutionBinding,
-    ProviderObservationLineage, QualifiedSourceDigest,
-    host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+    HostEventPrivacyClass, LowercaseSha256, NormalizedHostEventEnvelope,
+    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
+    QualifiedSourceDigest, host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+    route_fingerprint_digest_for,
 };
 use eliot_contracts::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -513,6 +514,13 @@ pub struct StageAllowed<'a> {
     /// lineage (the envelope must reference it by digest); forbidden for
     /// session-only lineage.
     pub admission: Option<&'a AdmittedRouteReceipt>,
+    /// Recorded #369 physical-route observation for this event's observation
+    /// boundary. `None` exactly when no observation applies yet (a valid
+    /// pre-observation event records the applicable absence with no actual
+    /// digest); `Some` is fully validated against the binding and admission
+    /// (`DurableHostEventJournal::check_route_digests`) and determines the
+    /// actual column. Forbidden for session-only lineage.
+    pub physical_observation: Option<&'a PhysicalRouteObservationReceipt>,
     /// Requested route reference digest, when the lineage carries one.
     pub requested_route_digest: Option<LowercaseSha256>,
     /// Observed actual route reference digest, when one was observed.
@@ -551,6 +559,10 @@ pub struct StageRedacted<'a> {
     /// lineage (the envelope must reference it by digest); forbidden for
     /// session-only lineage.
     pub admission: Option<&'a AdmittedRouteReceipt>,
+    /// Recorded #369 physical-route observation for this event's observation
+    /// boundary, with the same required/forbidden shape as the allowed path
+    /// above. The allowed and redacted paths enforce identical route rules.
+    pub physical_observation: Option<&'a PhysicalRouteObservationReceipt>,
     /// Requested route reference digest, when the lineage carries one.
     pub requested_route_digest: Option<LowercaseSha256>,
     /// Observed actual route reference digest, when one was observed.
@@ -723,6 +735,15 @@ impl DurableHostEventJournal {
     /// [`CommittedHostEventIntake`](eliot_agent_api::CommittedHostEventIntake)),
     /// plus the stable identity derived from the normalized input. The
     /// coordinator intake re-verifies every fact before observing.
+    ///
+    /// Route-relation note (issue #2645): commit implies the record's
+    /// requested/actual route columns already passed owner-qualified staging
+    /// validation (admission fingerprint for requested, validated physical
+    /// observation for actual, explicit absence otherwise). The envelope's
+    /// `admitted_route_digest` travels in this view as the exact
+    /// owner-resolvable admission reference; the fingerprint-level columns
+    /// remain readable on the committed record itself. No unused column is
+    /// declared proof of coordinator validation here.
     pub fn to_coordinator_intake(
         &self,
         key: &EventKey,
@@ -794,6 +815,7 @@ impl DurableHostEventJournal {
             request.envelope,
             request.binding,
             request.admission,
+            request.physical_observation,
             request.requested_route_digest,
             request.actual_route_digest,
             request.predecessors,
@@ -849,6 +871,7 @@ impl DurableHostEventJournal {
             request.envelope,
             request.binding,
             request.admission,
+            request.physical_observation,
             request.requested_route_digest,
             request.actual_route_digest,
             request.predecessors,
@@ -1148,6 +1171,7 @@ impl DurableHostEventJournal {
         envelope: NormalizedHostEventEnvelope,
         binding: Option<&ProviderExecutionBinding>,
         admission: Option<&AdmittedRouteReceipt>,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
         requested_route_digest: Option<LowercaseSha256>,
         actual_route_digest: Option<LowercaseSha256>,
         predecessors: Vec<EventId>,
@@ -1168,6 +1192,7 @@ impl DurableHostEventJournal {
             &envelope,
             binding,
             admission,
+            physical_observation,
             requested_route_digest.as_ref(),
             actual_route_digest.as_ref(),
         )?;
@@ -1186,6 +1211,8 @@ impl DurableHostEventJournal {
         if let Some(existing) = self.records.get(&(stream_id.to_owned(), sequence)) {
             if existing.transport_hash.as_str() == hash_hex
                 && existing.envelope_digest == envelope_digest
+                && existing.requested_route_digest.as_ref() == requested_route_digest.as_ref()
+                && existing.actual_route_digest.as_ref() == actual_route_digest.as_ref()
             {
                 return Ok(StageOutcome { key, fresh: false });
             }
@@ -1263,12 +1290,13 @@ impl DurableHostEventJournal {
     /// generation, cursor, or route reference rejects here); a session-only
     /// envelope must arrive without them, carrying no attempt authority and
     /// no admission reference. The carried requested/actual route digests must
-    /// anchor the envelope's admission reference (see
-    /// [`Self::check_route_digests`]).
+    /// each bind their own owner (see [`Self::check_route_digests`]).
+    #[allow(clippy::too_many_arguments)]
     fn check_staging_context(
         envelope: &NormalizedHostEventEnvelope,
         binding: Option<&ProviderExecutionBinding>,
         admission: Option<&AdmittedRouteReceipt>,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
         requested_route_digest: Option<&LowercaseSha256>,
         actual_route_digest: Option<&LowercaseSha256>,
     ) -> Result<(), IngestError> {
@@ -1280,6 +1308,9 @@ impl DurableHostEventJournal {
                 if admission.is_some() {
                     return Err(IngestError::InvalidInput("admission/lineage"));
                 }
+                if physical_observation.is_some() {
+                    return Err(IngestError::InvalidInput("observation/lineage"));
+                }
             }
             ProviderObservationLineage::ExecutionUnitObservation(_) => {
                 let binding = binding.ok_or(IngestError::InvalidInput("binding/lineage"))?;
@@ -1287,36 +1318,87 @@ impl DurableHostEventJournal {
                 envelope
                     .validate_for_lineage(binding, admission)
                     .map_err(IngestError::Contract)?;
+                Self::check_route_digests(
+                    binding,
+                    admission,
+                    physical_observation,
+                    requested_route_digest,
+                    actual_route_digest,
+                )?;
+                return Ok(());
             }
         }
-        Self::check_route_digests(
-            envelope.admitted_route_digest.as_ref(),
-            requested_route_digest,
-            actual_route_digest,
-        )
+        Self::check_session_route_digests(requested_route_digest, actual_route_digest)
     }
 
-    /// Checks that the carried route-reference digests anchor the envelope's
-    /// admission reference: session envelopes (no admission reference) carry
-    /// no route digests; execution envelopes must carry at least one digest
-    /// equal to the admission reference. Divergent route columns reject
-    /// before any mutation.
-    fn check_route_digests(
-        admitted: Option<&LowercaseSha256>,
+    /// Checks that a session-only envelope carries no route digests: session
+    /// lineage has no admission reference and therefore no route authority.
+    fn check_session_route_digests(
         requested: Option<&LowercaseSha256>,
         actual: Option<&LowercaseSha256>,
     ) -> Result<(), IngestError> {
-        match admitted {
-            None => {
-                if requested.is_some() || actual.is_some() {
-                    return Err(IngestError::EnvelopeMismatch("route_digest"));
-                }
+        if requested.is_some() || actual.is_some() {
+            return Err(IngestError::EnvelopeMismatch("route_digest"));
+        }
+        Ok(())
+    }
+
+    /// Checks that the carried execution-unit route-reference digests each
+    /// bind their own owner, recomputed here rather than trusted as caller
+    /// strings (issue #2645).
+    ///
+    /// The admission's self-digest is logical-decision identity, not route
+    /// identity: an admission digest in either column rejects, since a
+    /// matching column must never smuggle an unrelated valid-form hash
+    /// through the other. Instead the requested column must equal the
+    /// fingerprint digest recomputed from the accepted admission's original
+    /// requested route, and the actual column must equal the fingerprint
+    /// digest recomputed from the validated physical observation's observed
+    /// route, or be absent exactly when no observation applies.
+    ///
+    /// The observation itself is fully validated with
+    /// [`PhysicalRouteObservationReceipt::validate_against`] against this
+    /// event's binding and admission: a receipt from another attempt, start
+    /// request, generation, fence, cursor, or admission boundary rejects, and
+    /// the legitimate admission-selection boundary is preserved (the
+    /// observation's requested route agrees with the admission's selected
+    /// route, while the staged requested column keeps the admission's
+    /// original requested route). A valid divergent observation passes with
+    /// its differences retained (it is evidence, never malformed), and an
+    /// `Unobserved` observation carries no fabricated actual fingerprint: the
+    /// actual column stays absent rather than copying requested bytes. A
+    /// pre-observation event stages with no observation and no actual digest;
+    /// later immutable observation evidence links as a new record, never as a
+    /// silent rewrite.
+    fn check_route_digests(
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        physical_observation: Option<&PhysicalRouteObservationReceipt>,
+        requested: Option<&LowercaseSha256>,
+        actual: Option<&LowercaseSha256>,
+    ) -> Result<(), IngestError> {
+        let expected_requested = route_fingerprint_digest_for(&admission.requested_route)
+            .map_err(|_| IngestError::DigestEncoding)?;
+        if requested != Some(&expected_requested) {
+            return Err(IngestError::EnvelopeMismatch("route_digest"));
+        }
+        let Some(observation) = physical_observation else {
+            if actual.is_some() {
+                return Err(IngestError::EnvelopeMismatch("route_digest"));
             }
-            Some(admitted) => {
-                if requested != Some(admitted) && actual != Some(admitted) {
-                    return Err(IngestError::EnvelopeMismatch("route_digest"));
-                }
-            }
+            return Ok(());
+        };
+        observation
+            .validate_against(binding, admission)
+            .map_err(IngestError::Contract)?;
+        let expected_actual = observation
+            .observed_route
+            .as_ref()
+            .map(route_fingerprint_digest_for)
+            .transpose()
+            .map_err(|_| IngestError::DigestEncoding)?;
+        if actual != expected_actual.as_ref() {
+            return Err(IngestError::EnvelopeMismatch("route_digest"));
         }
         Ok(())
     }
