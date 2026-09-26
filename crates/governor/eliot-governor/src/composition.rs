@@ -3531,27 +3531,37 @@ fn testd_raw_evidence(
         .collect()
 }
 
-/// Runs the registered diagnostic normalizer over every completed nextest
-/// event. The evaluator owns outcome/coverage; this projection only attaches
-/// canonical event identity and keeps each normalized item linked to the
-/// exact raw stream which produced it.
-fn normalize_nextest_run(
-    run: &mut VerificationRun,
-    job: &TestJob,
-    plan: &CanonicalVerifierPlanBinding,
-    receipt: &VerificationReceipt,
-    raw: &[RawEvidence],
+/// Shared inputs for building normalized nextest evidence items.
+///
+/// The context borrows the receipt projections owned by the nextest
+/// normalization entry point so per-event builders stay small without
+/// re-reading the receipt.
+struct NextestItemContext<'a> {
+    job: &'a TestJob,
+    tool_identity: &'a str,
+    plan: &'a CanonicalVerifierPlanBinding,
+    source_before: &'a TestdSourceObservation,
+    capture: &'a CaptureProvenance,
+    classifier: &'a DiagnosticClassifier,
     observed_at: ClockReading,
-) -> Result<(), CompositionError> {
-    if raw.is_empty() {
-        return Err(CompositionError::Recovery(
-            "nextest normalization has no raw artifact".to_owned(),
-        ));
-    }
+    freshness: EvidenceFreshness,
+    coverage: EvidenceCoverage,
+}
+
+/// Admits the before/after source observation for nextest normalization.
+///
+/// A missing observation degrades the run to unknown freshness and partial
+/// coverage instead of failing: the evaluator owns outcome/coverage and the
+/// projection only attaches what the receipt observed.
+fn admitted_nextest_source<'a>(
+    receipt: &'a VerificationReceipt,
+    job: &TestJob,
+    run: &mut VerificationRun,
+) -> Result<Option<&'a TestdSourceObservation>, CompositionError> {
     let Some(source_observation) = receipt.source_observation.as_ref() else {
         run.freshness = EvidenceFreshness::Unknown;
         run.coverage = EvidenceCoverage::PartialForScope;
-        return Ok(());
+        return Ok(None);
     };
     source_observation.validate().map_err(|error| {
         CompositionError::Recovery(format!("source observation invalid: {error}"))
@@ -3567,15 +3577,15 @@ fn normalize_nextest_run(
         run.freshness = EvidenceFreshness::Unknown;
         run.coverage = EvidenceCoverage::PartialForScope;
     }
-    let source_before = &source_observation.before;
-    let tool = receipt.tool_observation.as_ref().ok_or_else(|| {
-        CompositionError::Recovery(
-            "productive TestD receipt has no owner-observed tool identity".to_owned(),
-        )
-    })?;
-    tool.validate().map_err(|error| {
-        CompositionError::Recovery(format!("tool observation invalid: {error}"))
-    })?;
+    Ok(Some(&source_observation.before))
+}
+
+/// Joined nextest stdout: bytes, per-artifact byte spans backing raw
+/// lineage, and whether any contributing artifact was truncated.
+type NextestStdoutStream = (Vec<u8>, Vec<(usize, usize, ArtifactId)>, bool);
+
+/// Joins the admitted nextest stdout artifacts into one event stream.
+fn nextest_joined_stdout(raw: &[RawEvidence]) -> Result<NextestStdoutStream, CompositionError> {
     let stdout = raw
         .iter()
         .filter(|evidence| {
@@ -3588,17 +3598,35 @@ fn normalize_nextest_run(
             "registered nextest normalizer has no stdout event stream".to_owned(),
         ));
     }
-    // I10.8.5 capture attach: every normalized item carries the
-    // owner-observed executable identity, config hash, WorkScope/candidate
-    // identity, profile revision, and truncation signal of the exact run it
-    // was parsed from. Timing detail stays on the run clocks; the TestD
-    // receipt projects no Job Object resource accounting, so
-    // `resource_outcome` stays absent rather than invented. Parse success is
-    // proven by the fail-closed full-consumption check below, so no parse
-    // note is attached.
     let stream_truncated = stdout.iter().any(|evidence| evidence.truncated);
-    let capture = CaptureProvenance {
-        executable_identity: Some(tool.nextest_identity()),
+    let mut stream = Vec::new();
+    let mut spans = Vec::new();
+    for evidence in stdout {
+        let start = stream.len();
+        stream.extend_from_slice(&evidence.bytes);
+        spans.push((start, stream.len(), evidence.artifact_id.clone()));
+    }
+    Ok((stream, spans, stream_truncated))
+}
+
+/// Builds the capture provenance attached to normalized nextest items.
+///
+/// Every normalized item carries the owner-observed executable identity,
+/// config hash, WorkScope/candidate identity, profile revision, and
+/// truncation signal of the exact run it was parsed from. Timing detail
+/// stays on the run clocks; the TestD receipt projects no Job Object
+/// resource accounting, so `resource_outcome` stays absent rather than
+/// invented. Parse success is proven by the fail-closed full-consumption
+/// check, so no parse note is attached.
+fn nextest_capture_provenance(
+    tool_identity: &str,
+    plan: &CanonicalVerifierPlanBinding,
+    source_before: &TestdSourceObservation,
+    job: &TestJob,
+    stream_truncated: bool,
+) -> CaptureProvenance {
+    CaptureProvenance {
+        executable_identity: Some(tool_identity.to_owned()),
         config_hash: Some(plan.planned.verifier_config_hash.clone()),
         workscope: Some(WorkscopeIdentity {
             branch: Some(source_before.branch.clone()),
@@ -3611,21 +3639,14 @@ fn normalize_nextest_run(
         resource_outcome: None,
         truncated: stream_truncated,
         parse_note: None,
-    };
-    let mut stream = Vec::new();
-    let mut spans = Vec::new();
-    for evidence in stdout {
-        let start = stream.len();
-        stream.extend_from_slice(&evidence.bytes);
-        spans.push((start, stream.len(), evidence.artifact_id.clone()));
     }
-    let events = parse_test_events(&stream).map_err(|error| {
-        CompositionError::Recovery(format!(
-            "registered nextest normalizer rejected the joined stdout stream: {error}"
-        ))
-    })?;
-    let mut normalized = Vec::new();
-    let classifier = DiagnosticClassifier::default();
+}
+
+/// Parses per-line nextest events, proving the joined stream lost nothing.
+fn nextest_line_events(
+    stream: &[u8],
+    expected: usize,
+) -> Result<Vec<NextestTestEvent>, CompositionError> {
     let mut line_start = 0usize;
     let mut line_events = Vec::new();
     for line_end in stream
@@ -3647,11 +3668,25 @@ fn normalize_nextest_run(
         }
         line_start = line_end.saturating_add(1);
     }
-    if line_events.len() != events.len() {
+    if line_events.len() != expected {
         return Err(CompositionError::Recovery(
             "registered nextest normalizer lost an event while joining stdout chunks".to_owned(),
         ));
     }
+    Ok(line_events)
+}
+
+/// Maps every parsed line event to normalized owner evidence.
+///
+/// Non-completed events advance the consumption cursor without producing
+/// items; the trailing check proves every parsed event was consumed.
+fn nextest_completed_items(
+    ctx: &NextestItemContext,
+    stream: &[u8],
+    spans: &[(usize, usize, ArtifactId)],
+    line_events: &[NextestTestEvent],
+) -> Result<Vec<NormalizedEvidence>, CompositionError> {
+    let mut normalized = Vec::new();
     let mut line_start = 0usize;
     let mut event_index = 0usize;
     for line_end in stream
@@ -3681,98 +3716,7 @@ fn normalize_nextest_run(
                 let NextestTestEvent::Completed { name, status } = event else {
                     continue;
                 };
-                let status_label = nextest_status_label(*status);
-                let severity = match status {
-                    NextestTestStatus::Pass => DiagnosticSeverity::Information,
-                    NextestTestStatus::Fail
-                    | NextestTestStatus::Timeout
-                    | NextestTestStatus::Leak
-                    | NextestTestStatus::Cancelled => DiagnosticSeverity::Error,
-                    NextestTestStatus::Skip => DiagnosticSeverity::Warning,
-                };
-                let raw_observation_ref = handles.first().cloned().ok_or_else(|| {
-                    CompositionError::Recovery("nextest event has no raw artifact".to_owned())
-                })?;
-                let diagnostic = DiagnosticEvent::from_input(DiagnosticInput {
-                    project_id: job.invocation.request.product_id.to_string(),
-                    task_id: job
-                        .invocation
-                        .request
-                        .task_id
-                        .as_ref()
-                        .map(ToString::to_string),
-                    tool_id: job.invocation.instrument.to_string(),
-                    tool_version: tool.nextest_identity(),
-                    config_hash: plan.planned.verifier_config_hash.clone(),
-                    branch: source_before.branch.clone(),
-                    commit: source_before.commit.clone(),
-                    dirty_state_hash: source_before.dirty_state_sha256.clone(),
-                    file_path: job.invocation.target.clone(),
-                    range: None,
-                    severity,
-                    rule_id: format!("nextest.test.{}", status_label.to_ascii_lowercase()),
-                    message: format!("nextest test {name} completed with status {status_label}"),
-                    raw_observation_ref: raw_observation_ref.clone(),
-                    observed_at,
-                    status: if matches!(*status, NextestTestStatus::Pass) {
-                        DiagnosticStatus::Resolved
-                    } else {
-                        DiagnosticStatus::Active
-                    },
-                })
-                .map_err(|error| {
-                    CompositionError::Recovery(format!(
-                        "registered diagnostic normalizer rejected nextest event: {error}"
-                    ))
-                })?;
-                let diagnostic = classifier.admit(diagnostic).map_err(|error| {
-                    CompositionError::Recovery(format!(
-                        "registered diagnostic normalizer rejected nextest event: {error}"
-                    ))
-                })?;
-                let evidence_id = ArtifactId::new(format!("nextest-evidence-{}", sha256_hex(line)))
-                    .map_err(|error| {
-                        CompositionError::Recovery(format!(
-                            "normalized evidence id is invalid: {error}"
-                        ))
-                    })?;
-                let mut value = serde_json::to_value(&diagnostic).map_err(|error| {
-                    CompositionError::Recovery(format!(
-                        "normalized diagnostic serialization failed: {error}"
-                    ))
-                })?;
-                value["raw_artifact_handles"] = serde_json::json!(handles);
-                // Preserve the typed nextest item identity and outcome in the
-                // normalized owner evidence. FinishAttempt joins these exact
-                // fields to the canonical required-test set; diagnostic prose
-                // and run-level status are not item-level acceptance proof.
-                value["nextest_test_id"] = serde_json::json!(catalog_test_id(name));
-                value["nextest_status"] = serde_json::json!(status_label);
-                let mut item = NormalizedEvidence {
-                    evidence_id,
-                    raw_artifact_id: raw_observation_ref,
-                    normalizer: ContractId::new(DIAGNOSTIC_CONTRACT).map_err(|error| {
-                        CompositionError::Recovery(format!(
-                            "diagnostic contract id is invalid: {error}"
-                        ))
-                    })?,
-                    kind: "nextest.test".to_owned(),
-                    summary: format!("nextest test {name} completed with status {status_label}"),
-                    value,
-                    axes: EvidenceAxes::observed(),
-                    freshness: run.freshness,
-                    coverage: if plan.required_test_ids.contains(catalog_test_id(name)) {
-                        run.coverage
-                    } else {
-                        EvidenceCoverage::PartialForScope
-                    },
-                };
-                item.attach_capture_provenance(&capture).map_err(|error| {
-                    CompositionError::Recovery(format!(
-                        "normalized evidence capture attach failed: {error}"
-                    ))
-                })?;
-                normalized.push(item);
+                normalized.push(nextest_completed_item(ctx, name, *status, &handles, line)?);
             }
         }
         line_start = line_end.saturating_add(1);
@@ -3782,6 +3726,171 @@ fn normalize_nextest_run(
             "registered nextest normalizer did not consume every parsed event".to_owned(),
         ));
     }
+    Ok(normalized)
+}
+
+const fn nextest_diagnostic_severity(status: NextestTestStatus) -> DiagnosticSeverity {
+    match status {
+        NextestTestStatus::Pass => DiagnosticSeverity::Information,
+        NextestTestStatus::Fail
+        | NextestTestStatus::Timeout
+        | NextestTestStatus::Leak
+        | NextestTestStatus::Cancelled => DiagnosticSeverity::Error,
+        NextestTestStatus::Skip => DiagnosticSeverity::Warning,
+    }
+}
+
+const fn nextest_diagnostic_status(status: NextestTestStatus) -> DiagnosticStatus {
+    if matches!(status, NextestTestStatus::Pass) {
+        DiagnosticStatus::Resolved
+    } else {
+        DiagnosticStatus::Active
+    }
+}
+
+/// Builds one normalized evidence item for a completed nextest test.
+fn nextest_completed_item(
+    ctx: &NextestItemContext,
+    name: &str,
+    status: NextestTestStatus,
+    handles: &[ArtifactId],
+    line: &[u8],
+) -> Result<NormalizedEvidence, CompositionError> {
+    let status_label = nextest_status_label(status);
+    let raw_observation_ref = handles.first().cloned().ok_or_else(|| {
+        CompositionError::Recovery("nextest event has no raw artifact".to_owned())
+    })?;
+    let diagnostic = DiagnosticEvent::from_input(DiagnosticInput {
+        project_id: ctx.job.invocation.request.product_id.to_string(),
+        task_id: ctx
+            .job
+            .invocation
+            .request
+            .task_id
+            .as_ref()
+            .map(ToString::to_string),
+        tool_id: ctx.job.invocation.instrument.to_string(),
+        tool_version: ctx.tool_identity.to_owned(),
+        config_hash: ctx.plan.planned.verifier_config_hash.clone(),
+        branch: ctx.source_before.branch.clone(),
+        commit: ctx.source_before.commit.clone(),
+        dirty_state_hash: ctx.source_before.dirty_state_sha256.clone(),
+        file_path: ctx.job.invocation.target.clone(),
+        range: None,
+        severity: nextest_diagnostic_severity(status),
+        rule_id: format!("nextest.test.{}", status_label.to_ascii_lowercase()),
+        message: format!("nextest test {name} completed with status {status_label}"),
+        raw_observation_ref: raw_observation_ref.clone(),
+        observed_at: ctx.observed_at,
+        status: nextest_diagnostic_status(status),
+    })
+    .map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered diagnostic normalizer rejected nextest event: {error}"
+        ))
+    })?;
+    let diagnostic = ctx.classifier.admit(diagnostic).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered diagnostic normalizer rejected nextest event: {error}"
+        ))
+    })?;
+    let evidence_id =
+        ArtifactId::new(format!("nextest-evidence-{}", sha256_hex(line))).map_err(|error| {
+            CompositionError::Recovery(format!("normalized evidence id is invalid: {error}"))
+        })?;
+    let mut value = serde_json::to_value(&diagnostic).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "normalized diagnostic serialization failed: {error}"
+        ))
+    })?;
+    value["raw_artifact_handles"] = serde_json::json!(handles);
+    // Preserve the typed nextest item identity and outcome in the
+    // normalized owner evidence. FinishAttempt joins these exact
+    // fields to the canonical required-test set; diagnostic prose
+    // and run-level status are not item-level acceptance proof.
+    value["nextest_test_id"] = serde_json::json!(catalog_test_id(name));
+    value["nextest_status"] = serde_json::json!(status_label);
+    let mut item = NormalizedEvidence {
+        evidence_id,
+        raw_artifact_id: raw_observation_ref,
+        normalizer: ContractId::new(DIAGNOSTIC_CONTRACT).map_err(|error| {
+            CompositionError::Recovery(format!("diagnostic contract id is invalid: {error}"))
+        })?,
+        kind: "nextest.test".to_owned(),
+        summary: format!("nextest test {name} completed with status {status_label}"),
+        value,
+        axes: EvidenceAxes::observed(),
+        freshness: ctx.freshness,
+        coverage: if ctx.plan.required_test_ids.contains(catalog_test_id(name)) {
+            ctx.coverage
+        } else {
+            EvidenceCoverage::PartialForScope
+        },
+    };
+    item.attach_capture_provenance(ctx.capture)
+        .map_err(|error| {
+            CompositionError::Recovery(format!(
+                "normalized evidence capture attach failed: {error}"
+            ))
+        })?;
+    Ok(item)
+}
+
+/// Runs the registered diagnostic normalizer over every completed nextest
+/// event. The evaluator owns outcome/coverage; this projection only attaches
+/// canonical event identity and keeps each normalized item linked to the
+/// exact raw stream which produced it.
+fn normalize_nextest_run(
+    run: &mut VerificationRun,
+    job: &TestJob,
+    plan: &CanonicalVerifierPlanBinding,
+    receipt: &VerificationReceipt,
+    raw: &[RawEvidence],
+    observed_at: ClockReading,
+) -> Result<(), CompositionError> {
+    if raw.is_empty() {
+        return Err(CompositionError::Recovery(
+            "nextest normalization has no raw artifact".to_owned(),
+        ));
+    }
+    let Some(source_before) = admitted_nextest_source(receipt, job, run)? else {
+        return Ok(());
+    };
+    let tool = receipt.tool_observation.as_ref().ok_or_else(|| {
+        CompositionError::Recovery(
+            "productive TestD receipt has no owner-observed tool identity".to_owned(),
+        )
+    })?;
+    tool.validate().map_err(|error| {
+        CompositionError::Recovery(format!("tool observation invalid: {error}"))
+    })?;
+    let tool_identity = tool.nextest_identity();
+    let (stream, spans, stream_truncated) = nextest_joined_stdout(raw)?;
+    // I10.8.5 capture attach: every normalized item carries the
+    // owner-observed executable identity, config hash, WorkScope/candidate
+    // identity, profile revision, and truncation signal of the exact run it
+    // was parsed from.
+    let capture =
+        nextest_capture_provenance(&tool_identity, plan, source_before, job, stream_truncated);
+    let events = parse_test_events(&stream).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered nextest normalizer rejected the joined stdout stream: {error}"
+        ))
+    })?;
+    let classifier = DiagnosticClassifier::default();
+    let line_events = nextest_line_events(&stream, events.len())?;
+    let ctx = NextestItemContext {
+        job,
+        tool_identity: &tool_identity,
+        plan,
+        source_before,
+        capture: &capture,
+        classifier: &classifier,
+        observed_at,
+        freshness: run.freshness,
+        coverage: run.coverage,
+    };
+    let normalized = nextest_completed_items(&ctx, &stream, &spans, &line_events)?;
     if normalized.is_empty() {
         return Err(CompositionError::Recovery(
             "registered nextest normalizer produced no completed test evidence".to_owned(),
