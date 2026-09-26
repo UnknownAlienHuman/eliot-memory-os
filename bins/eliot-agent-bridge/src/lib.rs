@@ -2461,7 +2461,8 @@ impl BridgeRunner {
         self.core.recovery_view()
     }
     /// Pages checked, imported recovery identities for the active window.
-    /// The core binds the continuation to that window and its import revision.
+    /// The core checks the cursor's window and import revision claims. The
+    /// cursor does not attest exhaustive coverage.
     #[allow(clippy::result_large_err)]
     pub fn recovery_projection_page(
         &self,
