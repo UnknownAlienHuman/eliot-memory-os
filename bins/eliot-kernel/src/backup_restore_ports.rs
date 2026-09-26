@@ -1452,6 +1452,33 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         | OrsError::CampaignSourcePublicationConflict { .. } => BackupError::IntegrityMismatch {
             subject: "restore journal campaign learning state".to_owned(),
         },
+        // #2884: the process-stream recovery family is paged through one frozen
+        // owner-issued family snapshot, so these two refusals are genuinely
+        // different classes and are deliberately two arms rather than one.
+        //
+        // Movement is an observation about live durable state, not a corruption
+        // claim and not a fence: the family's single write path advances its
+        // durable revision in the same transaction as every insert, evidence
+        // advance and retirement, so the pages already emitted and the pages
+        // still owed are no longer one snapshot. It therefore reads as the
+        // integrity class the #1862 campaign arm already uses for a durable
+        // view that disagrees with the current durable ORS head, and the bounded
+        // subject names the family snapshot instead of discarding the owner
+        // identity. The ORS record already carries the exact frozen and observed
+        // revisions, both content roots and the last emitted key for the operator.
+        OrsError::ProcessStreamRecoveryFamilyMoved { .. } => BackupError::IntegrityMismatch {
+            subject: "restore journal process-stream recovery family snapshot".to_owned(),
+        },
+        // The boundary is re-derived from durable state, so this refusal is
+        // about a caller-presented cursor that does not name the owner-emitted
+        // durable-key prefix, not about damaged durable state. It is therefore
+        // the same bounded invalid-field class the `InvalidCursorLimit` arm above
+        // already uses for a refused cursor on this seam, with a static reason,
+        // and it never reads as an integrity failure of the restore journal.
+        OrsError::ProcessStreamRecoveryFamilyCursorMismatch { .. } => BackupError::InvalidField {
+            field: "backup.process_stream_recovery_family_cursor",
+            reason: "must name the owner-emitted durable-key prefix",
+        },
     }
 }
 
