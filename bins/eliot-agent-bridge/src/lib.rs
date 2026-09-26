@@ -19,8 +19,8 @@ use eliot_agent_bridge_core::{
     ProviderReadiness, ReconciliationConsumedFrontier, ReconciliationPortOutcome,
     ReconciliationPortResult, ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact,
     RecoveredGapFact, RecoveredPendingView, RecoveredStreamFacts, RecoveryDirective,
-    RecoveryReadRequest, RecoveryStreamCut, RecoveryUnscopedGapCursor, RecoveryView,
-    RecoveryWindowStatus, TerminalReductionInputs, TransportEdge,
+    RecoveryProjectionPage, RecoveryReadRequest, RecoveryStreamCut, RecoveryUnscopedGapCursor,
+    RecoveryView, RecoveryWindowStatus, TerminalReductionInputs, TransportEdge,
 };
 /// I7.17 recall response projection: bounded handles-first agent output with
 /// a server-derived disposition, binding receipt, and rank-trace handle.
@@ -2460,6 +2460,15 @@ impl BridgeRunner {
     pub fn recovery_view(&self) -> Option<RecoveryView> {
         self.core.recovery_view()
     }
+    /// Pages checked, imported recovery identities for the active window.
+    /// The core binds the continuation to that window and its import revision.
+    #[allow(clippy::result_large_err)]
+    pub fn recovery_projection_page(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<RecoveryProjectionPage, BridgeError> {
+        self.core.recovery_projection_page(cursor)
+    }
     /// Lists recovered owner receipts without local acknowledgement cover.
     #[must_use]
     pub fn recovered_pending(&self) -> Vec<RecoveredPendingView> {
@@ -2860,6 +2869,21 @@ impl BridgeRunner {
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
         BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
         Ok(bootstrap)
+    }
+    /// Previews the one-time bootstrap without marking it delivered. A
+    /// response can check its complete frame before consuming the delivery.
+    pub fn preview_first_response_bootstrap(
+        &self,
+        tasks: &BootstrapTaskInputs,
+        requested_assessment: CurrentAssessment,
+    ) -> Option<UnderstandingBootstrap> {
+        let snapshot = self.bootstrap_snapshot.clone()?;
+        let sealed = snapshot.sealed_live_binding(self.attach_view())?;
+        let preview =
+            get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
+        BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
+        let mut session = self.bootstrap_session;
+        session.take_auto_boot(&snapshot.context, tasks, requested_assessment)
     }
     /// Takes the once-per-session auto-boot for the first successful response.
     ///

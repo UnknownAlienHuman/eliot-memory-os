@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::pin::Pin;
 
 pub use eliot_agent_api::{
@@ -28,6 +29,7 @@ use eliot_skill::{
     LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod resources;
@@ -912,7 +914,7 @@ impl AttachView {
 }
 
 /// One stream's recovered progress inside the declared window.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveryStreamView {
     stream_id: String,
     acked_base: u64,
@@ -1010,6 +1012,346 @@ impl RecoveryView {
     }
 }
 
+/// One bounded read-only page through the identities retained in a recovery
+/// window. The continuation is scoped to the current window, attach
+/// generation, and imported-owner-page revision; importing another owner
+/// page makes an earlier continuation stale instead of silently skipping
+/// facts added before its keyset position.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryProjectionPage {
+    /// `None` means no owner recovery window has been imported yet.
+    pub summary: Option<RecoveryProjectionSummary>,
+    /// At most `MAX_RECOVERY_PROJECTION_ITEMS` facts, in stream, event,
+    /// scoped-gap, then unscoped-gap order.
+    pub items: Vec<RecoveryProjectionRecord>,
+    /// Opaque continuation for the next bounded read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Compact status for the whole imported recovery window. Fact identities
+/// are available only through `RecoveryProjectionPage::items`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryProjectionSummary {
+    pub live_generation: u64,
+    pub stream_count: usize,
+    pub unscoped_gap_count: usize,
+    pub unproven_scope_present: bool,
+    pub stream_list_complete: bool,
+    pub unscoped_gaps_complete: bool,
+    pub disposition: RecoveryDisposition,
+}
+
+/// A single checked record from the recovery window. Event records contain
+/// receipt metadata and digest references only; they never synthesize an
+/// `EventEnvelope` from those fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "record", rename_all = "snake_case")]
+pub enum RecoveryProjectionRecord {
+    Stream(RecoveryStreamView),
+    Event(RecoveryProjectionEvent),
+    Gap(RecoveredGapFact),
+}
+
+/// The current local obligation state for one imported checked receipt.
+/// Every owner event identity remains in the page even after local coverage;
+/// this label distinguishes pending work from an active delivery or a
+/// receipt already covered by the bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryProjectionObligation {
+    Pending,
+    DeliveryInProgress,
+    Covered,
+}
+
+/// One imported event receipt and its current bridge-local obligation state.
+/// The receipt is still digest-only and is never converted into an event
+/// envelope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryProjectionEvent {
+    pub receipt: RecoveredEventFact,
+    pub obligation: RecoveryProjectionObligation,
+}
+
+const MAX_RECOVERY_PROJECTION_ITEMS: usize = 32;
+const MAX_RECOVERY_PROJECTION_SCANS: usize = 256;
+const MAX_RECOVERY_PROJECTION_CURSOR_BYTES: usize = 16_384;
+const MAX_RECOVERY_PROJECTION_CURSOR_GAP_KEY_BYTES: usize = 1_024;
+/// Leaves room below the bridge's 512 KiB output frame for the containing
+/// response and its stdio framing.
+const MAX_RECOVERY_PROJECTION_PAGE_BYTES: usize = 384 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryProjectionSection {
+    Streams,
+    Pending,
+    ScopedGaps,
+    UnscopedGaps,
+    Done,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryProjectionCursor {
+    version: u8,
+    window_digest: String,
+    live_generation: u64,
+    import_revision: u64,
+    section: RecoveryProjectionSection,
+    stream_index: usize,
+    after_sequence: Option<u64>,
+    after_gap_id: Option<String>,
+}
+
+fn recovery_window_digest(window_key: &str) -> String {
+    let digest = Sha256::digest(window_key.as_bytes());
+    encode_hex(&digest)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn encode_recovery_projection_cursor(
+    cursor: &RecoveryProjectionCursor,
+) -> Result<String, BridgeError> {
+    if cursor
+        .after_gap_id
+        .as_ref()
+        .is_some_and(|gap_id| gap_id.len() > MAX_RECOVERY_PROJECTION_CURSOR_GAP_KEY_BYTES)
+    {
+        return Err(BridgeError::InvalidTransition(
+            "recovery gap identity exceeds the bounded cursor; owner index or handle required",
+        ));
+    }
+    let claims = serde_json::to_vec(cursor).map_err(|_| {
+        BridgeError::InvalidTransition("recovery projection cursor could not be encoded")
+    })?;
+    let encoded_len = claims.len().saturating_mul(2).saturating_add(4);
+    if encoded_len > MAX_RECOVERY_PROJECTION_CURSOR_BYTES {
+        return Err(BridgeError::InvalidTransition(
+            "recovery projection cursor exceeds its byte bound",
+        ));
+    }
+    let mut token = String::with_capacity(encoded_len);
+    token.push_str("rp1:");
+    token.push_str(&encode_hex(&claims));
+    Ok(token)
+}
+
+fn decode_recovery_projection_cursor(token: &str) -> Result<RecoveryProjectionCursor, BridgeError> {
+    if token.len() > MAX_RECOVERY_PROJECTION_CURSOR_BYTES {
+        return Err(BridgeError::InvalidTransition(
+            "invalid recovery projection cursor",
+        ));
+    }
+    let encoded =
+        token
+            .strip_prefix("rp1:")
+            .and_then(decode_hex)
+            .ok_or(BridgeError::InvalidTransition(
+                "invalid recovery projection cursor",
+            ))?;
+    let cursor: RecoveryProjectionCursor = serde_json::from_slice(&encoded)
+        .map_err(|_| BridgeError::InvalidTransition("invalid recovery projection cursor"))?;
+    if cursor.version != 1
+        || cursor.window_digest.len() != 64
+        || !cursor
+            .window_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || cursor
+            .after_gap_id
+            .as_ref()
+            .is_some_and(|gap_id| gap_id.len() > MAX_RECOVERY_PROJECTION_CURSOR_GAP_KEY_BYTES)
+    {
+        return Err(BridgeError::InvalidTransition(
+            "invalid recovery projection cursor",
+        ));
+    }
+    Ok(cursor)
+}
+
+fn next_event(
+    progress: &RecoveryStreamProgress,
+    after_sequence: Option<u64>,
+) -> Option<&RecoveredEventFact> {
+    match after_sequence {
+        Some(after) => progress
+            .events
+            .range((Excluded(after), Unbounded))
+            .next()
+            .map(|(_, event)| event),
+        None => progress.events.first_key_value().map(|(_, event)| event),
+    }
+}
+
+fn next_gap<'a>(
+    gaps: &'a BTreeMap<String, RecoveredGapFact>,
+    after_gap_id: Option<&str>,
+) -> Option<&'a RecoveredGapFact> {
+    match after_gap_id {
+        Some(after) => gaps
+            .range::<str, _>((Excluded(after), Unbounded))
+            .next()
+            .map(|(_, gap)| gap),
+        None => gaps.first_key_value().map(|(_, gap)| gap),
+    }
+}
+
+struct LimitedProjectionWriter {
+    size: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl LimitedProjectionWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            size: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for LimitedProjectionWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(next_size) = self.size.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("projection byte count overflow"));
+        };
+        if next_size > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("projection record exceeds bound"));
+        }
+        self.size = next_size;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn projection_record_size(
+    record: &RecoveryProjectionRecord,
+    remaining: usize,
+) -> Result<Option<usize>, BridgeError> {
+    let mut writer = LimitedProjectionWriter::new(remaining);
+    match serde_json::to_writer(&mut writer, record) {
+        Ok(()) => Ok(Some(writer.size)),
+        Err(_) if writer.exceeded => Ok(None),
+        Err(_) => Err(BridgeError::InvalidTransition(
+            "recovery projection record could not be encoded",
+        )),
+    }
+}
+
+fn validate_recovery_projection_position(
+    window: &RecoveryWindow,
+    cursor: &RecoveryProjectionCursor,
+) -> Result<(), BridgeError> {
+    let invalid = || BridgeError::InvalidTransition("invalid recovery projection cursor position");
+    match cursor.section {
+        RecoveryProjectionSection::Streams => {
+            if cursor.after_sequence.is_some() || cursor.after_gap_id.is_some() {
+                return Err(invalid());
+            }
+        }
+        RecoveryProjectionSection::Pending => {
+            if cursor.after_gap_id.is_some() {
+                return Err(invalid());
+            }
+            if let Some(sequence) = cursor.after_sequence {
+                let stream_id = window
+                    .stream_order
+                    .get(cursor.stream_index)
+                    .ok_or_else(invalid)?;
+                if !window
+                    .streams
+                    .get(stream_id)
+                    .is_some_and(|progress| progress.events.contains_key(&sequence))
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        RecoveryProjectionSection::ScopedGaps => {
+            if cursor.after_sequence.is_some() {
+                return Err(invalid());
+            }
+            if let Some(gap_id) = cursor.after_gap_id.as_deref() {
+                let stream_id = window
+                    .stream_order
+                    .get(cursor.stream_index)
+                    .ok_or_else(invalid)?;
+                if !window
+                    .streams
+                    .get(stream_id)
+                    .is_some_and(|progress| progress.gaps.contains_key(gap_id))
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        RecoveryProjectionSection::UnscopedGaps => {
+            if cursor.stream_index != 0 || cursor.after_sequence.is_some() {
+                return Err(invalid());
+            }
+            if cursor
+                .after_gap_id
+                .as_deref()
+                .is_some_and(|gap_id| !window.unscoped_gaps.contains_key(gap_id))
+            {
+                return Err(invalid());
+            }
+        }
+        RecoveryProjectionSection::Done => {
+            if cursor.stream_index != 0
+                || cursor.after_sequence.is_some()
+                || cursor.after_gap_id.is_some()
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One recovered-but-unforwarded obligation: a retained owner receipt the
 /// bridge has not yet covered with its own acknowledgement.
 ///
@@ -1018,7 +1360,7 @@ impl RecoveryView {
 /// never re-minted as a fresh event. A new attach opens a new walk: the
 /// durable source stays with its owner, and the producer's at-least-once
 /// redelivery re-observes anything still unacknowledged.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveredPendingView {
     stream_id: String,
     event_id: String,
@@ -1264,7 +1606,7 @@ impl ReconciliationPermit {
 /// recovered or explicitly dispositioned under the recovery policy. A
 /// complete inventory can still contain pending events and known blind
 /// intervals; that is not an APPLIED stream or complete historical coverage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum RecoveryDisposition {
     Complete,
     Partial { reason: &'static str },
@@ -1327,7 +1669,7 @@ pub const RECOVERY_UNAVAILABLE_FOREIGN_PAGE: &str = "foreign-page-refused";
 /// only through the retained source/artifact owner; the bridge keeps the
 /// digest, producer, and phase legs separate instead of merging them into a
 /// synthetic envelope.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveredEventFact {
     stream_id: String,
     event_id: String,
@@ -1429,7 +1771,7 @@ impl RecoveredEventFact {
 ///
 /// A gap accounts for missing coverage; it never moves a cursor and never
 /// converts absent events into applied events.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveredGapFact {
     gap_id: String,
     stream_id: String,
@@ -2410,6 +2752,7 @@ impl RecoveryStreamProgress {
 struct RecoveryWindow {
     window_key: String,
     live_generation: u64,
+    import_revision: u64,
     stream_order: Vec<String>,
     streams: BTreeMap<String, RecoveryStreamProgress>,
     unscoped_gaps: BTreeMap<String, RecoveredGapFact>,
@@ -2824,6 +3167,272 @@ impl AgentBridgeCore {
             .map(RecoveryWindow::view)
     }
 
+    /// Reads a bounded projection of every imported stream, pending event,
+    /// and scoped or unscoped gap identity. The owner window and attach stay
+    /// read-only: paging changes neither owner cursors nor delivery state.
+    /// A continuation is refused if another owner page was imported after it
+    /// was issued, so a keyset cannot silently omit facts inserted earlier
+    /// in the walk.
+    #[allow(clippy::result_large_err)]
+    pub fn recovery_projection_page(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<RecoveryProjectionPage, BridgeError> {
+        let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
+        let Some(window) = active.recovery.as_ref() else {
+            if cursor.is_some() {
+                return Err(BridgeError::InvalidTransition(
+                    "recovery projection cursor is stale because no window is active",
+                ));
+            }
+            return Ok(RecoveryProjectionPage {
+                summary: None,
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        };
+
+        let window_digest = recovery_window_digest(&window.window_key);
+        let mut position = if let Some(cursor) = cursor {
+            let claims = decode_recovery_projection_cursor(cursor)?;
+            if claims.window_digest != window_digest
+                || claims.live_generation != window.live_generation
+                || claims.import_revision != window.import_revision
+            {
+                return Err(BridgeError::InvalidTransition(
+                    "recovery projection cursor is stale for the current window revision",
+                ));
+            }
+            if claims.stream_index > window.stream_order.len() {
+                return Err(BridgeError::InvalidTransition(
+                    "invalid recovery projection cursor position",
+                ));
+            }
+            validate_recovery_projection_position(window, &claims)?;
+            claims
+        } else {
+            RecoveryProjectionCursor {
+                version: 1,
+                window_digest,
+                live_generation: window.live_generation,
+                import_revision: window.import_revision,
+                section: RecoveryProjectionSection::Streams,
+                stream_index: 0,
+                after_sequence: None,
+                after_gap_id: None,
+            }
+        };
+
+        let summary = RecoveryProjectionSummary {
+            live_generation: window.live_generation,
+            stream_count: window.stream_order.len(),
+            unscoped_gap_count: window.unscoped_gaps.len(),
+            unproven_scope_present: window.unproven_scope_present,
+            stream_list_complete: window.stream_list_complete,
+            unscoped_gaps_complete: window.unscoped_gaps_complete,
+            disposition: window.disposition(),
+        };
+        let mut items = Vec::with_capacity(MAX_RECOVERY_PROJECTION_ITEMS);
+        let mut content_bytes = 0usize;
+        let mut scans = 0usize;
+
+        while items.len() < MAX_RECOVERY_PROJECTION_ITEMS
+            && scans < MAX_RECOVERY_PROJECTION_SCANS
+            && position.section != RecoveryProjectionSection::Done
+        {
+            match position.section {
+                RecoveryProjectionSection::Streams => {
+                    if position.stream_index >= window.stream_order.len() {
+                        position.section = RecoveryProjectionSection::Pending;
+                        position.stream_index = 0;
+                        scans += 1;
+                        continue;
+                    }
+                    let stream_id = &window.stream_order[position.stream_index];
+                    let progress =
+                        window
+                            .streams
+                            .get(stream_id)
+                            .ok_or(BridgeError::InvalidTransition(
+                                "recovery stream order names missing progress",
+                            ))?;
+                    let record = RecoveryProjectionRecord::Stream(RecoveryStreamView {
+                        stream_id: stream_id.clone(),
+                        acked_base: progress.acked_base,
+                        durable_cursor: progress.durable_cursor,
+                        contiguous_frontier: progress.contiguous_frontier,
+                        highest_observed: progress.highest_observed,
+                        next_after: progress.next_after,
+                        recovered_events: progress.events.len() as u64,
+                        recovered_gaps: progress.gaps.len() as u64,
+                        page_complete: progress.page_complete,
+                    });
+                    let Some(record_bytes) = projection_record_size(
+                        &record,
+                        MAX_RECOVERY_PROJECTION_PAGE_BYTES - content_bytes,
+                    )?
+                    else {
+                        if items.is_empty() {
+                            return Err(BridgeError::InvalidTransition(
+                                "recovery projection record exceeds the bounded inline page; owner index or handle required",
+                            ));
+                        }
+                        break;
+                    };
+                    content_bytes += record_bytes;
+                    items.push(record);
+                    position.stream_index += 1;
+                    scans += 1;
+                }
+                RecoveryProjectionSection::Pending => {
+                    if position.stream_index >= window.stream_order.len() {
+                        position.section = RecoveryProjectionSection::ScopedGaps;
+                        position.stream_index = 0;
+                        position.after_sequence = None;
+                        scans += 1;
+                        continue;
+                    }
+                    let stream_id = &window.stream_order[position.stream_index];
+                    let progress =
+                        window
+                            .streams
+                            .get(stream_id)
+                            .ok_or(BridgeError::InvalidTransition(
+                                "recovery stream order names missing progress",
+                            ))?;
+                    let event = next_event(progress, position.after_sequence);
+                    let Some(event) = event else {
+                        position.stream_index += 1;
+                        position.after_sequence = None;
+                        scans += 1;
+                        continue;
+                    };
+                    let event_key = EventIdentityKey::new(&event.stream_id, &event.event_id);
+                    let obligation = if self.acknowledged_phases.contains_key(&event_key) {
+                        RecoveryProjectionObligation::Covered
+                    } else if self.pending_deliveries.contains_key(&event_key) {
+                        RecoveryProjectionObligation::DeliveryInProgress
+                    } else {
+                        RecoveryProjectionObligation::Pending
+                    };
+                    let record = RecoveryProjectionRecord::Event(RecoveryProjectionEvent {
+                        receipt: event.clone(),
+                        obligation,
+                    });
+                    let Some(record_bytes) = projection_record_size(
+                        &record,
+                        MAX_RECOVERY_PROJECTION_PAGE_BYTES - content_bytes,
+                    )?
+                    else {
+                        if items.is_empty() {
+                            return Err(BridgeError::InvalidTransition(
+                                "recovery projection record exceeds the bounded inline page; owner index or handle required",
+                            ));
+                        }
+                        break;
+                    };
+                    content_bytes += record_bytes;
+                    items.push(record);
+                    position.after_sequence = Some(event.sequence);
+                    scans += 1;
+                }
+                RecoveryProjectionSection::ScopedGaps => {
+                    if position.stream_index >= window.stream_order.len() {
+                        position.section = RecoveryProjectionSection::UnscopedGaps;
+                        position.stream_index = 0;
+                        position.after_gap_id = None;
+                        scans += 1;
+                        continue;
+                    }
+                    let stream_id = &window.stream_order[position.stream_index];
+                    let progress =
+                        window
+                            .streams
+                            .get(stream_id)
+                            .ok_or(BridgeError::InvalidTransition(
+                                "recovery stream order names missing progress",
+                            ))?;
+                    let gap = next_gap(&progress.gaps, position.after_gap_id.as_deref());
+                    let Some(gap) = gap else {
+                        position.stream_index += 1;
+                        position.after_gap_id = None;
+                        scans += 1;
+                        continue;
+                    };
+                    if gap.gap_id.len() > MAX_RECOVERY_PROJECTION_CURSOR_GAP_KEY_BYTES {
+                        if items.is_empty() {
+                            return Err(BridgeError::InvalidTransition(
+                                "recovery gap identity exceeds the bounded cursor; owner index or handle required",
+                            ));
+                        }
+                        break;
+                    }
+                    let record = RecoveryProjectionRecord::Gap(gap.clone());
+                    let Some(record_bytes) = projection_record_size(
+                        &record,
+                        MAX_RECOVERY_PROJECTION_PAGE_BYTES - content_bytes,
+                    )?
+                    else {
+                        if items.is_empty() {
+                            return Err(BridgeError::InvalidTransition(
+                                "recovery projection record exceeds the bounded inline page; owner index or handle required",
+                            ));
+                        }
+                        break;
+                    };
+                    content_bytes += record_bytes;
+                    items.push(record);
+                    position.after_gap_id = Some(gap.gap_id.clone());
+                    scans += 1;
+                }
+                RecoveryProjectionSection::UnscopedGaps => {
+                    let gap = next_gap(&window.unscoped_gaps, position.after_gap_id.as_deref());
+                    let Some(gap) = gap else {
+                        position.section = RecoveryProjectionSection::Done;
+                        position.after_gap_id = None;
+                        scans += 1;
+                        continue;
+                    };
+                    if gap.gap_id.len() > MAX_RECOVERY_PROJECTION_CURSOR_GAP_KEY_BYTES {
+                        if items.is_empty() {
+                            return Err(BridgeError::InvalidTransition(
+                                "recovery gap identity exceeds the bounded cursor; owner index or handle required",
+                            ));
+                        }
+                        break;
+                    }
+                    let record = RecoveryProjectionRecord::Gap(gap.clone());
+                    let Some(record_bytes) = projection_record_size(
+                        &record,
+                        MAX_RECOVERY_PROJECTION_PAGE_BYTES - content_bytes,
+                    )?
+                    else {
+                        if items.is_empty() {
+                            return Err(BridgeError::InvalidTransition(
+                                "recovery projection record exceeds the bounded inline page; owner index or handle required",
+                            ));
+                        }
+                        break;
+                    };
+                    content_bytes += record_bytes;
+                    items.push(record);
+                    position.after_gap_id = Some(gap.gap_id.clone());
+                    scans += 1;
+                }
+                RecoveryProjectionSection::Done => break,
+            }
+        }
+
+        let next_cursor = (position.section != RecoveryProjectionSection::Done)
+            .then(|| encode_recovery_projection_cursor(&position))
+            .transpose()?;
+        Ok(RecoveryProjectionPage {
+            summary: Some(summary),
+            items,
+            next_cursor,
+        })
+    }
+
     /// Lists recovered owner receipts the bridge has not yet covered with
     /// its own acknowledgement: the pending obligations of the walk.
     ///
@@ -2886,6 +3495,9 @@ impl AgentBridgeCore {
         if facts.live_generation != binding.activation_generation {
             return Err(BridgeError::StaleAuthority);
         }
+        let new_window = recovery
+            .as_ref()
+            .is_none_or(|window| window.live_generation != facts.live_generation.get());
         let window = match recovery {
             Some(window) if window.live_generation == facts.live_generation.get() => {
                 if window.window_key != facts.window_key {
@@ -2897,6 +3509,7 @@ impl AgentBridgeCore {
                 *recovery = Some(RecoveryWindow {
                     window_key: facts.window_key.clone(),
                     live_generation: facts.live_generation.get(),
+                    import_revision: 0,
                     stream_order: Vec::new(),
                     streams: BTreeMap::new(),
                     unscoped_gaps: BTreeMap::new(),
@@ -2910,17 +3523,32 @@ impl AgentBridgeCore {
                 recovery.as_mut().ok_or(BridgeError::NotAttached)?
             }
         };
+        let mut changed = new_window;
+        let previous_incomplete_reason = window.incomplete_reason;
         match facts.window_status {
             RecoveryWindowStatus::Active => {}
             RecoveryWindowStatus::Moved => {
                 window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
+                if window.incomplete_reason != previous_incomplete_reason {
+                    changed = true;
+                }
+                Self::bump_recovery_import_revision(window, changed)?;
                 return Ok(window.disposition());
             }
             RecoveryWindowStatus::Expired => {
                 window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_EXPIRED);
+                if window.incomplete_reason != previous_incomplete_reason {
+                    changed = true;
+                }
+                Self::bump_recovery_import_revision(window, changed)?;
                 return Ok(window.disposition());
             }
         }
+        changed |= window.stream_list_complete != facts.stream_list_complete;
+        changed |= window.stream_list_continuation != facts.stream_list_continuation;
+        changed |= window.unscoped_gaps_complete != facts.unscoped_gaps_complete;
+        changed |= window.unscoped_gaps_continuation != facts.unscoped_gaps_continuation;
+        changed |= !window.unproven_scope_present && facts.unproven_scope_present;
         window.stream_list_complete = facts.stream_list_complete;
         window
             .stream_list_continuation
@@ -2931,14 +3559,14 @@ impl AgentBridgeCore {
             .clone_from(&facts.unscoped_gaps_continuation);
         window.unproven_scope_present |= facts.unproven_scope_present;
         for stream_facts in &facts.stream_facts {
-            if !Self::apply_recovery_stream(&mut *window, stream_facts) {
-                return Err(BridgeError::StaleAuthority);
-            }
+            changed |= Self::apply_recovery_stream(window, stream_facts)
+                .ok_or(BridgeError::StaleAuthority)?;
         }
         for gap in &facts.unscoped_gaps {
             match window.unscoped_gaps.get(&gap.gap_id) {
                 None => {
                     window.unscoped_gaps.insert(gap.gap_id.clone(), gap.clone());
+                    changed = true;
                 }
                 Some(existing) => {
                     if existing != gap {
@@ -2950,7 +3578,25 @@ impl AgentBridgeCore {
         // Streams that fall out of the enumeration keep their progress but
         // cannot prove completeness; a vanished incomplete stream holds the
         // gate with an explicit reason instead of clearing silently.
+        changed |= window.incomplete_reason != previous_incomplete_reason;
+        Self::bump_recovery_import_revision(window, changed)?;
         Ok(window.disposition())
+    }
+
+    fn bump_recovery_import_revision(
+        window: &mut RecoveryWindow,
+        changed: bool,
+    ) -> Result<(), BridgeError> {
+        if changed {
+            window.import_revision =
+                window
+                    .import_revision
+                    .checked_add(1)
+                    .ok_or(BridgeError::InvalidTransition(
+                        "recovery owner import revision overflowed",
+                    ))?;
+        }
+        Ok(())
     }
 
     /// Validates one stream page against its declared progress, then merges
@@ -2958,37 +3604,55 @@ impl AgentBridgeCore {
     /// an already-applied sequence marks movement; new facts extend the
     /// retained set, including durable out-of-order events above the
     /// contiguous frontier.
-    fn apply_recovery_stream(window: &mut RecoveryWindow, facts: &RecoveredStreamFacts) -> bool {
+    fn apply_recovery_stream(
+        window: &mut RecoveryWindow,
+        facts: &RecoveredStreamFacts,
+    ) -> Option<bool> {
         if let Some(progress) = window.streams.get(&facts.stream_id) {
             if !progress.matches_owner(facts) {
+                let changed = window.incomplete_reason != Some(RECOVERY_PARTIAL_WINDOW_MOVED);
                 window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
-                return true;
+                return Some(changed);
             }
             if facts.durable_cursor < progress.durable_cursor
                 || facts.acked_cursor < progress.acked_high
             {
-                return false;
+                return None;
             }
             for event in facts.events() {
                 if let Some(existing) = progress.events.get(&event.sequence)
                     && existing != event
                 {
-                    return false;
+                    return None;
                 }
                 if progress.events.values().any(|existing| {
                     existing.event_id == event.event_id && existing.sequence != event.sequence
                 }) {
-                    return false;
+                    return None;
                 }
             }
             for gap in facts.gaps() {
                 if let Some(existing) = progress.gaps.get(&gap.gap_id)
                     && existing != gap
                 {
-                    return false;
+                    return None;
                 }
             }
         }
+        let is_new_stream = !window.streams.contains_key(&facts.stream_id);
+        let previous_progress = window.streams.get(&facts.stream_id).map(|progress| {
+            (
+                progress.acked_high,
+                progress.durable_cursor,
+                progress.contiguous_frontier,
+                progress.highest_observed,
+                progress.next_after,
+                progress.next_gap_offset,
+                progress.page_complete,
+                progress.events.len(),
+                progress.gaps.len(),
+            )
+        });
         let progress = window
             .streams
             .entry(facts.stream_id.clone())
@@ -3048,13 +3712,36 @@ impl AgentBridgeCore {
             .max(progress.next_after);
         if let Some(next) = facts.gap_continuation() {
             if next < progress.next_gap_offset {
+                let changed = window.incomplete_reason != Some(RECOVERY_PARTIAL_WINDOW_MOVED);
                 window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
-                return true;
+                return Some(is_new_stream || changed);
             }
             progress.next_gap_offset = next;
         }
         progress.page_complete = facts.page_complete;
-        true
+        let previous_progress = previous_progress.unwrap_or((
+            facts.acked_cursor,
+            facts.acked_cursor,
+            facts.acked_cursor,
+            facts.acked_cursor,
+            facts.acked_cursor,
+            0,
+            false,
+            0,
+            0,
+        ));
+        Some(
+            is_new_stream
+                || progress.acked_high != previous_progress.0
+                || progress.durable_cursor != previous_progress.1
+                || progress.contiguous_frontier != previous_progress.2
+                || progress.highest_observed != previous_progress.3
+                || progress.next_after != previous_progress.4
+                || progress.next_gap_offset != previous_progress.5
+                || progress.page_complete != previous_progress.6
+                || progress.events.len() != previous_progress.7
+                || progress.gaps.len() != previous_progress.8,
+        )
     }
 
     pub fn attach_view(&self) -> Option<AttachView> {
