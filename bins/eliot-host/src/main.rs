@@ -7,6 +7,10 @@ use std::sync::OnceLock;
 
 #[cfg(windows)]
 use eliot_host::activation_lifecycle::{ActivationTriggerClass, DrainWakeOutcome, IdleLeaseCensus};
+use eliot_host::host_diagnostics::{
+    HostConsoleRequest, HostRequestProjection, observe_host_request,
+};
+use eliot_host::windows_event_log::AdmittedEvent;
 #[cfg(windows)]
 use eliot_host::{
     HostBranchDisposition, HostLivenessTick, HostReactiveContextProducer,
@@ -16,6 +20,7 @@ use eliot_host::{
     HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
     SERVICE_NAME,
 };
+use eliot_host_state::HostState;
 #[cfg(windows)]
 use eliot_host_state::WakeDisposition;
 #[cfg(windows)]
@@ -254,27 +259,35 @@ fn console_process_exit_code() -> i32 {
 // detail, keeping stderr/capsule/exit 1066 as its receipt.
 //
 // B1  process bootstrap capture (`PROCESS_BOOTSTRAP.set`, Startup): cached
-//     only; a static outcome word, never launch material.
+//     only; a static outcome word, never launch material. The #889
+//     projection alongside carries process id and operation only.
 // B2  diagnostics install (#889): preserved exactly once, never repeated.
 // B3  SCM dispatcher contour (windows-only, ScmDispatch): the `Ok(true)`
 //     service path stays unobserved (SCM owns the process); `Ok(false)`
 //     console fallback vs `Err` dispatcher failure stay distinct, and no
-//     fallback is added where none existed.
-// B4  console terminal exit (HOST-0 reference): preserved verbatim.
+//     fallback is added where none existed. No projection here.
+// B4  console terminal exit (HOST-0 reference): preserved verbatim, plus a
+//     typed #889 projection subordinate (INFO, not a second terminal).
 // B5  console launch parse (ConsoleLoop/LaunchConfig): the Error frame plus
-//     the `false` return are unchanged; no payload is logged.
+//     the `false` outcome are unchanged (now paired with the retained
+//     options for correlation); no payload is logged.
 // B6  console open (ConsoleLoop): the Error frame plus `false` are unchanged;
-//     lib owns the terminal, main only correlates.
+//     lib owns the terminal, main only correlates. Options are retained
+//     via one clone so the projection keeps installation identity.
 // B7  Ready write (ConsoleLoop): bytes unchanged; the record never upgrades
 //     Ready into durable/global readiness (I01.10).
 // B8  read loop incl. blank/malformed (ConsoleLoop): blank input still skips
 //     silently by design; read failure keeps Error plus terminate.
 // B9  dispatch Status/Stop/malformed (ConsoleLoop): response correlation and
-//     terminate flags unchanged; no second terminal for lib-terminal faults.
+//     terminate flags unchanged; the stop `Err` arm is split
+//     (`Stopped` vs other) with identical responses so cancellation with
+//     proven no-effect stays distinct from failure; no second terminal
+//     for lib-terminal faults. The served request kind is returned for B10.
 // B10 response write failure (ConsoleLoop): the identical break-to-shutdown.
 // B11 EOF (ShutdownDrain): normal drain, not a failure record.
 // B12 shutdown/cancellation (`finish_console_shutdown`, ShutdownDrain): the
-//     single `host.stop()` call is preserved; drain outcome observed only.
+//     single `host.stop()` call is preserved; the `Ok`/`Stopped` outcomes
+//     are distinguished with identical results; drain outcome observed only.
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
 // B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
 
@@ -287,6 +300,15 @@ fn main() {
     // the cached value may carry launch material (I15.4).
     eliot_host::host_diagnostics::observe_entrypoint(
         eliot_host::host_diagnostics::EntrypointStage::Startup,
+    );
+    // #889 projection: serving process started for the start operation.
+    // Process id and operation only; never launch material (B1).
+    observe_host_request(
+        &HostRequestProjection::process_started(
+            eliot_host::host_diagnostics::EntrypointStage::Startup,
+            std::process::id(),
+        )
+        .with_operation(AdmittedEvent::ServiceStart),
     );
     #[cfg(windows)]
     match run_as_scm_service() {
@@ -322,13 +344,26 @@ fn main() {
             std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
         }
     }
-    if !run_console() {
+    let (console_ok, console_options) = run_console();
+    if !console_ok {
         // HOST-0 (issue #889): the single reference failure observation.
         // Diagnostics observe only; capsule, stderr, and exit code below
         // still own the terminal receipt. Other sites stay for #891/#982.
         eliot_host::host_diagnostics::observe_terminal_error(
             eliot_host::host_diagnostics::HOST_TERMINAL_CODE_CONSOLE_FAILED,
         );
+        // #889 projection: the console run failed. The boolean outcome
+        // collapsed which step and reason failed, so operation, request,
+        // and reason stay explicitly missing; subordinate records own the
+        // specific attribution. Installation correlates when retained.
+        let mut terminal = HostRequestProjection::failed_without_reason(
+            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+        )
+        .with_terminal_exit(console_process_exit_code());
+        if let Some(options) = console_options.as_ref() {
+            terminal = terminal.with_launch_options(options);
+        }
+        observe_host_request(&terminal);
         let cached = captured_bootstrap_snapshot();
         persist_host_start_failure(
             HostStopCode::ConsoleFailed,
@@ -340,13 +375,82 @@ fn main() {
     }
 }
 
-fn run_console() -> bool {
+/// #889 projection: launch-config parse outcome for the start operation.
+///
+/// `Ok` admits installation and generation; `Err` fails with the typed
+/// reason while installation and generation stay explicitly missing (no
+/// options exist). Observation only; the outcome itself is unchanged.
+fn observe_launch_config_outcome(parsed: &Result<HostLaunchOptions, HostError>) {
+    match parsed {
+        Ok(options) => observe_host_request(
+            &HostRequestProjection::admitted(
+                eliot_host::host_diagnostics::EntrypointStage::LaunchConfig,
+                options,
+            )
+            .with_operation(AdmittedEvent::ServiceStart),
+        ),
+        Err(error) => observe_host_request(
+            &HostRequestProjection::failed(
+                eliot_host::host_diagnostics::EntrypointStage::LaunchConfig,
+                error,
+            )
+            .with_operation(AdmittedEvent::ServiceStart),
+        ),
+    }
+}
+
+/// #889 projection: host-open failure for the start operation at this
+/// installation. Open success carries no record here: the Ready record
+/// below positionally requires it. Observation only.
+fn observe_host_open_outcome(
+    options: &HostLaunchOptions,
+    opened: &Result<HostComposition, HostError>,
+) {
+    if let Err(error) = opened {
+        observe_host_request(
+            &HostRequestProjection::failed(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                error,
+            )
+            .with_operation(AdmittedEvent::ServiceStart)
+            .with_launch_options(options),
+        );
+    }
+}
+
+/// #889 projection: console-serving readiness for this installation,
+/// asserted only where the just-opened host actually reports running;
+/// otherwise the record is honestly unknown. Observation only.
+fn observe_console_ready(host: &HostComposition, options: &HostLaunchOptions) {
+    if host.running() {
+        observe_host_request(
+            &HostRequestProjection::semantically_ready(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                host,
+            )
+            .with_operation(AdmittedEvent::ServiceStart)
+            .with_launch_options(options),
+        );
+    } else {
+        observe_host_request(
+            &HostRequestProjection::unknown(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+            )
+            .with_operation(AdmittedEvent::ServiceStart)
+            .with_launch_options(options),
+        );
+    }
+}
+
+fn run_console() -> (bool, Option<HostLaunchOptions>) {
     // F-LOG-HOST-7 B5 (issue #982): console loop entered; stdout framing below
     // is unchanged.
     eliot_host::host_diagnostics::observe_entrypoint(
         eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
     );
-    let launch_options = match HostLaunchOptions::parse(std::env::args_os().skip(1)) {
+    let parsed = HostLaunchOptions::parse(std::env::args_os().skip(1));
+    observe_launch_config_outcome(&parsed);
+    let launch_options = match parsed {
         Ok(options) => {
             // F-LOG-HOST-7 B5: launch config accepted; no argv/env echoed.
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
@@ -357,7 +461,7 @@ fn run_console() -> bool {
         }
         Err(error) => {
             // F-LOG-HOST-7 B5: parse failure keeps the exact Error frame and
-            // `false` return; the raw error text is never logged.
+            // `false` outcome; the raw error text is never logged.
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                 "launch_parse_failed",
@@ -365,10 +469,12 @@ fn run_console() -> bool {
             write_response(&Response::Error {
                 error: error.to_string(),
             });
-            return false;
+            return (false, None);
         }
     };
-    let mut host = match open_host(launch_options) {
+    let opened = open_host(launch_options.clone());
+    observe_host_open_outcome(&launch_options, &opened);
+    let mut host = match opened {
         Ok(host) => host,
         Err(error) => {
             // F-LOG-HOST-7 B6 (issue #982): open failure correlates only; the
@@ -380,14 +486,15 @@ fn run_console() -> bool {
             write_response(&Response::Error {
                 error: error.to_string(),
             });
-            return false;
+            return (false, Some(launch_options));
         }
     };
     if !write_response(&Response::Ready {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
     }) {
-        return finish_console_shutdown(&mut host, "ready response failed");
+        let drained = finish_console_shutdown(&mut host, "ready response failed", &launch_options);
+        return (drained, Some(launch_options));
     }
     // F-LOG-HOST-7 B7 (issue #982): Ready bytes unchanged; this record never
     // promotes Ready into durable/global readiness (I01.10).
@@ -395,12 +502,13 @@ fn run_console() -> bool {
         eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
         "ready_written",
     );
+    observe_console_ready(&host, &launch_options);
     for line in io::stdin().lock().lines() {
-        let (response, terminate) = match line {
+        let (response, terminate, served) = match line {
             // Blank input still skips silently by design: not a failure, so
             // intentionally unobserved (keeps the hot path quiet).
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&mut host, &line),
+            Ok(line) => dispatch(&mut host, &line, &launch_options),
             Err(error) => {
                 // F-LOG-HOST-7 B8 (issue #982): read failure keeps Error plus
                 // terminate; the raw error text stays out of diagnostics.
@@ -408,11 +516,20 @@ fn run_console() -> bool {
                     eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                     "console_read_failed",
                 );
+                // #889 projection: the read failed, so no request identity
+                // exists; the non-`Host` io error stays out of the reason.
+                observe_host_request(
+                    &HostRequestProjection::failed_without_reason(
+                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                    )
+                    .with_launch_options(&launch_options),
+                );
                 (
                     Response::Error {
                         error: error.to_string(),
                     },
                     true,
+                    None,
                 )
             }
         };
@@ -424,13 +541,23 @@ fn run_console() -> bool {
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                 "response_write_failed",
             );
+            // #889 projection: the served response never reached the peer.
+            let mut unwritten = HostRequestProjection::failed_without_reason(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+            )
+            .with_launch_options(&launch_options);
+            if let Some(kind) = served {
+                unwritten = unwritten.with_request(kind);
+            }
+            observe_host_request(&unwritten);
             break;
         }
         if terminate || !host.running() {
             break;
         }
     }
-    finish_console_shutdown(&mut host, "console input ended")
+    let drained = finish_console_shutdown(&mut host, "console input ended", &launch_options);
+    (drained, Some(launch_options))
 }
 
 fn parse_process_bootstrap<I, S>(args: I) -> Result<HostLaunchOptions, String>
@@ -456,10 +583,55 @@ fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostE
     HostComposition::open(launch_options)
 }
 
-fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
+/// #889 projection: status-query outcome at this journal state.
+///
+/// `Ok` admits the query with the live journal sequence; `Err` fails with
+/// the typed reason while the asked-for state stays explicitly missing. A
+/// status query is not a service operation, so the operation slot stays
+/// explicitly missing. Observation only.
+fn observe_status_served(options: &HostLaunchOptions, outcome: &Result<HostState, HostError>) {
+    match outcome {
+        Ok(state) => observe_host_request(
+            &HostRequestProjection::admitted(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                options,
+            )
+            .with_request(HostConsoleRequest::Status)
+            .with_journal_state(state),
+        ),
+        Err(error) => observe_host_request(
+            &HostRequestProjection::failed(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                error,
+            )
+            .with_request(HostConsoleRequest::Status)
+            .with_launch_options(options),
+        ),
+    }
+}
+
+/// #889 projection: malformed-line sighting for this installation.
+/// The line parsed as nothing, so request and operation stay explicitly
+/// missing, never guessed. Observation only.
+fn observe_malformed_sighted(options: &HostLaunchOptions) {
+    observe_host_request(
+        &HostRequestProjection::observed(
+            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+        )
+        .with_launch_options(options),
+    );
+}
+
+fn dispatch(
+    host: &mut HostComposition,
+    line: &str,
+    options: &HostLaunchOptions,
+) -> (Response, bool, Option<HostConsoleRequest>) {
     match serde_json::from_str::<Request>(line) {
-        Ok(Request::Status) => (
-            match host.snapshot() {
+        Ok(Request::Status) => {
+            let outcome = host.snapshot();
+            observe_status_served(options, &outcome);
+            let response = match outcome {
                 Ok(state) => Response::State {
                     running: host.running(),
                     active_process: state
@@ -481,9 +653,9 @@ fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
                         error: error.to_string(),
                     }
                 }
-            },
-            false,
-        ),
+            };
+            (response, false, Some(HostConsoleRequest::Status))
+        }
         Ok(Request::Stop) => (
             match host.stop() {
                 Ok(()) => {
@@ -493,7 +665,37 @@ fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
                         eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                         "stop_accepted",
                     );
+                    // #889 projection: the stop effect committed durably.
+                    observe_host_request(
+                        &HostRequestProjection::durable_committed(
+                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        )
+                        .with_request(HostConsoleRequest::Stop)
+                        .with_operation(AdmittedEvent::ServiceStop)
+                        .with_launch_options(options),
+                    );
                     Response::Stopped
+                }
+                Err(error @ HostError::Stopped) => {
+                    // F-LOG-HOST-7 B9: already-stopped stop keeps the exact
+                    // Error response plus terminate; cancellation with
+                    // proven no-effect stays distinct from failure.
+                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        "stop_failed",
+                    );
+                    // #889 projection: admitted stop effected nothing.
+                    observe_host_request(
+                        &HostRequestProjection::cancelled(
+                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        )
+                        .with_request(HostConsoleRequest::Stop)
+                        .with_operation(AdmittedEvent::ServiceStop)
+                        .with_launch_options(options),
+                    );
+                    Response::Error {
+                        error: error.to_string(),
+                    }
                 }
                 Err(error) => {
                     // F-LOG-HOST-7 B9: stop failure correlates only; a
@@ -502,12 +704,23 @@ fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
                         eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                         "stop_failed",
                     );
+                    // #889 projection: the stop failed with a typed reason.
+                    observe_host_request(
+                        &HostRequestProjection::failed(
+                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                            &error,
+                        )
+                        .with_request(HostConsoleRequest::Stop)
+                        .with_operation(AdmittedEvent::ServiceStop)
+                        .with_launch_options(options),
+                    );
                     Response::Error {
                         error: error.to_string(),
                     }
                 }
             },
             true,
+            Some(HostConsoleRequest::Stop),
         ),
         Err(error) => {
             // F-LOG-HOST-7 B9: malformed input keeps Error plus stay-in-loop;
@@ -516,17 +729,23 @@ fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                 "request_malformed",
             );
+            observe_malformed_sighted(options);
             (
                 Response::Error {
                     error: error.to_string(),
                 },
                 false,
+                None,
             )
         }
     }
 }
 
-fn finish_console_shutdown(host: &mut HostComposition, cause: &str) -> bool {
+fn finish_console_shutdown(
+    host: &mut HostComposition,
+    cause: &str,
+    options: &HostLaunchOptions,
+) -> bool {
     // F-LOG-HOST-7 B11/B12 (issue #982): drain entered; `cause` is one of the
     // two frozen caller literals, so it is safe detail. EOF is a normal drain,
     // not a failure record.
@@ -535,16 +754,67 @@ fn finish_console_shutdown(host: &mut HostComposition, cause: &str) -> bool {
         cause,
     );
     if !host.running() {
-        return !host.shutdown_failed();
+        // #889 projection: the drain outcome rests on actual shutdown
+        // state. A clean already-stopped drain stands committed; a prior
+        // failure with the reason not in hand stays unknown, never guessed.
+        if host.shutdown_failed() {
+            observe_host_request(
+                &HostRequestProjection::unknown(
+                    eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+                )
+                .with_operation(AdmittedEvent::ServiceStop)
+                .with_launch_options(options),
+            );
+            return false;
+        }
+        observe_host_request(
+            &HostRequestProjection::durable_committed(
+                eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+            )
+            .with_operation(AdmittedEvent::ServiceStop)
+            .with_launch_options(options),
+        );
+        return true;
     }
     match host.stop() {
-        Ok(()) | Err(HostError::Stopped) => true,
+        Ok(()) => {
+            // #889 projection: the drain stop committed durably.
+            observe_host_request(
+                &HostRequestProjection::durable_committed(
+                    eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+                )
+                .with_operation(AdmittedEvent::ServiceStop)
+                .with_launch_options(options),
+            );
+            true
+        }
+        Err(HostError::Stopped) => {
+            // #889 projection: the drain stop was vacuous (already
+            // stopped): cancellation with proven no-effect, same `true`.
+            observe_host_request(
+                &HostRequestProjection::cancelled(
+                    eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+                )
+                .with_operation(AdmittedEvent::ServiceStop)
+                .with_launch_options(options),
+            );
+            true
+        }
         Err(error) => {
             // F-LOG-HOST-7 B12: durable-shutdown failure keeps the exact
             // stderr text and `false` below; observed with a static word only.
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                 eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
                 "durable_shutdown_failed",
+            );
+            // #889 projection: the drain stop failed with a typed reason.
+            observe_host_request(
+                &HostRequestProjection::failed(
+                    eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+                    &error,
+                )
+                .with_operation(AdmittedEvent::ServiceStop)
+                .with_launch_options(options),
             );
             let _ = writeln!(
                 io::stderr().lock(),
