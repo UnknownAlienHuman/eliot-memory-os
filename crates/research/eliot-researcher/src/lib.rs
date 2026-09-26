@@ -40,8 +40,8 @@ pub use inquiry_governance::{
     InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
     InquiryStopRule, InquiryTerminalRecord, InquiryUncertainty, MissingSourceClass,
     PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind,
-    SourcePortfolio, SpecialistDiscoverability, StopRuleKind, StreamEvidence, UnadmittedReference,
-    UnadmittedReferenceKind, VerifierStrength,
+    ResearchDebtRestriction, SourcePortfolio, SpecialistDiscoverability, StopRuleKind,
+    StreamEvidence, UnadmittedReference, UnadmittedReferenceKind, VerifierStrength,
 };
 pub use inquiry_lanes::{
     AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,
