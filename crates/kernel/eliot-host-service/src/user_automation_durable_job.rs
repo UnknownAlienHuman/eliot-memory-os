@@ -7,8 +7,8 @@
 
 use eliot_contracts::RequestMetadata;
 use eliot_kernel_service::{
-    AutomationExecutionReference, UserAutomationDurableJobPort, UserAutomationRuntimeAdmission,
-    UserAutomationRuntimeError,
+    AutomationExecutionReference, CommitRecoveryError, DreamerJobFailure,
+    UserAutomationDurableJobPort, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use thiserror::Error;
@@ -111,7 +111,74 @@ impl HostDurableJobOwner for eliot_kernel_service::KernelStoreGateway {
     ) -> Result<DurableJobResponse, HostDurableJobOwnerError> {
         self.dreamer_job(context, request)
             .await
-            .map_err(classify_gateway_error)
+            .map_err(classify_gateway_failure)
+    }
+}
+
+/// Projects the gateway's typed route failure onto this adapter's closed
+/// owner-error set.
+///
+/// The gateway answers `Result<DurableJobResponse, DreamerJobFailure>` (issue
+/// #2764 item 6), a closed typed carrier, so the class is decided from the
+/// variant that owns the fact and never by sniffing rendered prose. Only
+/// [`DreamerJobFailure::Refused`] carries free text — it is the route's
+/// pre-store checks, its rebind fence, and the transport client's own refusal
+/// rendering — so that one channel keeps the keyword classifier it always had,
+/// in [`classify_refusal_text`].
+///
+/// The mapping, and why each variant lands where it does:
+///
+/// * [`DreamerJobFailure::Recovered`] is
+///   [`HostDurableJobOwnerError::UnknownOutcome`]. The commit is settled, but
+///   the `DurableJobResponse` this adapter needs in order to admit the
+///   occurrence was never produced, so the admission has no determined result
+///   and no `AutomationExecutionReference` can be built. `Rejected` would be
+///   the unsafe direction here: it asserts nothing was sent, and reporting a
+///   proven commit as rejected is precisely what invites a blind resubmission.
+///   The exact proven outcome, the bound receipt evidence and the outstanding
+///   `Status`/`Reconcile` read obligation stay in the reason text, which is
+///   that variant's own `Display`; the same carrier reaches the Kernel route's
+///   transport edge as a structured recovery object rather than as this prose.
+/// * [`CommitRecoveryError::OrsUnavailable`] is
+///   [`HostDurableJobOwnerError::Unavailable`]: the durable recovery owner
+///   itself could not be read, which is an unreachable owner rather than an
+///   answer about the request.
+/// * [`CommitRecoveryError::UnknownCommitOpen`] and
+///   [`CommitRecoveryError::ReceiptQueryFailed`] are
+///   [`HostDurableJobOwnerError::UnknownOutcome`]: the commit outcome stays
+///   exactly as unknown as it was, so no retry is licensed.
+/// * every other recovery refusal is [`HostDurableJobOwnerError::Rejected`].
+///   Each is a deterministic refusal observed before or without a send — a
+///   paused Ordering Scope, evidence that does not bind the admitted identity, a
+///   retained record that conflicts, an unresolvable Ordering Scope, or a
+///   pre-effect contract refusal — so nothing was committed and the same
+///   material may be presented again later.
+#[cfg(windows)]
+fn classify_gateway_failure(failure: DreamerJobFailure) -> HostDurableJobOwnerError {
+    match failure {
+        DreamerJobFailure::Refused(reason) => classify_refusal_text(reason),
+        DreamerJobFailure::Recovered(outcome) => {
+            HostDurableJobOwnerError::UnknownOutcome(outcome.to_string())
+        }
+        DreamerJobFailure::Recovery(error) => {
+            let reason = error.to_string();
+            match error {
+                CommitRecoveryError::OrsUnavailable { .. } => {
+                    HostDurableJobOwnerError::Unavailable(reason)
+                }
+                CommitRecoveryError::UnknownCommitOpen { .. }
+                | CommitRecoveryError::ReceiptQueryFailed { .. } => {
+                    HostDurableJobOwnerError::UnknownOutcome(reason)
+                }
+                CommitRecoveryError::ScopePaused { .. }
+                | CommitRecoveryError::ReceiptIdentityConflict { .. }
+                | CommitRecoveryError::RetainedRecordConflict { .. }
+                | CommitRecoveryError::OrderingScopeUnresolved { .. }
+                | CommitRecoveryError::CommitRefused { .. } => {
+                    HostDurableJobOwnerError::Rejected(reason)
+                }
+            }
+        }
     }
 }
 
@@ -127,8 +194,17 @@ fn map_owner_error(error: HostDurableJobOwnerError) -> UserAutomationRuntimeErro
     }
 }
 
+/// Classifies one free-text refusal produced by the route's own pre-store
+/// checks, its rebind fence, or the transport client.
+///
+/// This is the only channel that is text by construction, so it is the only
+/// one read as text. Every other route failure is decided from its typed
+/// variant in [`classify_gateway_failure`]; a rendered recovery outcome is
+/// never re-sniffed here, because the word "unknown" in a retained-record
+/// refusal does not mean the *presented* operation's commit is unknown and
+/// classifying on it would report a proven noncommit as a possible one.
 #[cfg(windows)]
-fn classify_gateway_error(reason: String) -> HostDurableJobOwnerError {
+fn classify_refusal_text(reason: String) -> HostDurableJobOwnerError {
     let lower = reason.to_ascii_lowercase();
     if lower.contains("unknown")
         || lower.contains("reconcil")
