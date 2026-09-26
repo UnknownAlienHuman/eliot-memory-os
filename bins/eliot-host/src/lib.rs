@@ -333,7 +333,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::credential_control",
         owner_state: "owner lease credential capability",
         event: "host.credential-control requested",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -341,7 +341,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::credential_control",
         owner_state: "owner lease credential capability",
         event: concat!("host-credential-", "control-failed"),
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-14",
     },
     HostLifecycleBoundary {
@@ -349,7 +349,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::credential_control",
         owner_state: "control handle, identities only",
         event: "host.credential-control admitted receipt",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -477,7 +477,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::runtime_control",
         owner_state: "owner lease activation capability",
         event: "host.runtime-control requested",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -485,7 +485,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::runtime_control",
         owner_state: "owner lease activation capability",
         event: "host-runtime-control-failed",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-14",
     },
     HostLifecycleBoundary {
@@ -493,7 +493,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::runtime_control",
         owner_state: "control handle/queues",
         event: "host.runtime-control admitted receipt",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -501,7 +501,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::process_user_automation_requests",
         owner_state: "kernel owner/execution queue",
         event: "host.user-automation owner requested",
-        caller: "none (exported API; no in-repo caller)",
+        caller: "main::process_user_automation_request/process_user_automation_owner_requests",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -821,7 +821,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::has_durable_branch_fence",
         owner_state: "durable fence probe",
         event: "host.branch-fence requested",
-        caller: "none (exported API; no in-repo caller)",
+        caller: "main::service_main/HostIdleDrainSupervisor::evaluate",
         test: "891/case-13",
     },
     HostLifecycleBoundary {
@@ -845,7 +845,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "activation/drain records",
         event: "host.stop requested",
-        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -853,7 +853,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "activation/drain records/owner lease",
         event: concat!("host-", "stop-failed"),
-        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -861,7 +861,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "running activation/SCM stop control",
         event: "host.stop cancellation requested",
-        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/case-12",
     },
     HostLifecycleBoundary {
@@ -893,7 +893,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "StoppedClean/clean marker",
         event: "host.stop stopped-clean drained",
-        caller: "HostComposition::stop",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -901,7 +901,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "released lease/stopped contour",
         event: "host.stop stopped",
-        caller: "HostComposition::stop",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
