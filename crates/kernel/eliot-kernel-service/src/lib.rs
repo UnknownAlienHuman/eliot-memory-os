@@ -64,6 +64,7 @@ mod user_automation_store;
 mod user_automation_store_tests;
 mod wasm_control;
 mod wasm_dispatch;
+mod wasm_join_registration;
 mod write_coordinator;
 
 pub use capacity_evidence::{
@@ -290,6 +291,10 @@ pub use wasm_dispatch::{
     WasmWorkRecord, discover_delivery_publications, material_bytes, publish_wasm_dispatch_bundle,
     publish_wasm_dispatch_material, wasm_dispatch_derivation,
     wasm_dispatch_derivation_from_epoch_json, wasm_dispatch_grant_for, wasm_join_gate,
+};
+pub use wasm_join_registration::{
+    WasmJoinRegistrationBinding, WasmJoinRegistrationDisposition, WasmJoinRegistrationError,
+    WasmJoinRegistrationState, reconcile_wasm_join_registration,
 };
 pub use write_coordinator::{
     CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
