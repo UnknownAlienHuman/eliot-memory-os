@@ -88,6 +88,139 @@ pub enum PreparationError {
     FilesystemEffect { path: String, reason: String },
 }
 
+// F-LOG-HOST-8 (#983) backup preparation diagnostics: observation-only helpers.
+//
+// Through the #889 facade's target and bounded-field helpers only, on the
+// existing subscriber; the Event Log seam stays typed-Unavailable (never
+// implemented here, #984 still open). `EntrypointStage` describes process
+// startup/shutdown, not backup phases, so these observations carry local event
+// names and never reuse that enum.
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static tokens or validated numeric facts
+// (generations, owner-minted destination epochs); never operation/installation
+// strings, paths, digests, nonces, reasons, `redacted_debug()` text, or
+// arbitrary error `Debug`/`Display` (a canary stays absent even inside an
+// alleged identity string). Truncation bounds size, never sensitivity. Before
+// validation only the static attempt record fires. Macro arguments are
+// precomputed pure values; sink outcome never alters call counts, order,
+// results, receipts, rollback, or cleanup, and stdout framing is untouched
+// (facade stderr subscriber). No owner reads, effects, hashing, retries, or
+// mutation are added for logging.
+//
+// Terminal ownership (W4): the leaf emits nonterminal phase/refusal evidence
+// only, with no dedup cache. Child phase records may remain beneath one
+// caller-level record. The single terminal record per failed operation belongs
+// to the outer caller boundary, which owns the one `observe_terminal_error`
+// call. Handoff (caller-owned, not applied here): `prepare_backup_destination`
+// / `backup_dispatch_prepare` and the reconcile/cancel/cleanup holders arm one
+// terminal guard each with a frozen `host-backup-prepare-failed` code;
+// operation failure stays distinct from any process shutdown failure.
+//
+// Explicit no-event list: `DelegatedPreparation::{reconcile, cancel, cleanup}`
+// (pure passthroughs; the inner operation owns the record),
+// `OwnerEvidence::approved_binding` (mapping adapter covered by the inner bind
+// and outer delegate records), `BackupCallerAuth::{check_shapes, authenticate}`
+// (the former surfaces through `authenticate_for_owner`; the latter is the
+// pending-#954 always-refuse stub with no production path),
+// `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
+// /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
+// /`projection_to_preparation`/`intent_json`/`result_json`/`destination_from_result`
+// (private steps whose outcome surfaces with its exact category at the owning
+// boundary). No record asserts destination readiness, source retirement, or
+// activation: `destination_epoch` is preparation scope, never authority.
+
+/// Operation tokens for preparation diagnostics (stable, static only).
+const OP_PREPARE: &str = "prepare";
+const OP_RECONCILE: &str = "reconcile";
+const OP_CANCEL: &str = "cancel";
+const OP_CLEANUP: &str = "cleanup";
+const OP_DELEGATE: &str = "delegate_prepare";
+const OP_OWNER_EVIDENCE: &str = "owner_evidence";
+const OP_SOURCE_ROOT: &str = "source_root";
+const OP_STAGING_LEASE: &str = "staging_lease";
+const OP_CALLER_AUTH: &str = "caller_auth";
+
+/// Notes the facade's actual Event Log seam status (typed-unavailable).
+fn backup_prepare_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+/// Projects one [`PreparationError`] to its stable diagnostic category plus a
+/// static facet. Pure and exhaustive; carries no paths, reasons, or
+/// operation/installation strings.
+#[must_use]
+fn preparation_error_category(error: &PreparationError) -> (&'static str, &'static str) {
+    match *error {
+        PreparationError::InvalidRequest { field, .. } => ("invalid_request", field),
+        PreparationError::UnapprovedGeneration { .. } => ("unapproved_generation", "generation"),
+        PreparationError::ArbitraryPath { .. } => ("arbitrary_path", "path"),
+        PreparationError::SourceIsActive => ("source_is_active", "source_root"),
+        PreparationError::ForeignContent { .. } => ("foreign_content", "destination_root"),
+        PreparationError::AliasSubstitution { .. } => ("alias_substitution", "path"),
+        PreparationError::IdentityConflict { .. } => ("identity_conflict", "root_identity"),
+        PreparationError::ConflictField { field } => ("conflict_field", field),
+        PreparationError::UnknownState { .. } => ("unknown_state", "operation"),
+        PreparationError::JournalFault(_) => ("journal_fault", "journal"),
+        PreparationError::PlatformUnsupported => ("platform_unsupported", "platform"),
+        PreparationError::FilesystemEffect { .. } => ("filesystem_effect", "path"),
+    }
+}
+
+/// Observes one nonterminal preparation phase outcome after the decision
+/// exists. `approved_generation` is carried only once validated (else 0), and
+/// `destination_epoch` only from a produced destination (else 0); 0 marks a
+/// fact this boundary does not carry, never a real epoch.
+fn observe_prepare_progress(
+    op: &'static str,
+    phase: &'static str,
+    outcome: &'static str,
+    approved_generation: u64,
+    destination_epoch: u64,
+) {
+    backup_prepare_note_event_log_unavailable();
+    let op = crate::host_diagnostics::bound_field(op);
+    let phase = crate::host_diagnostics::bound_field(phase);
+    let outcome = crate::host_diagnostics::bound_field(outcome);
+    tracing::info!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.backup.prepare_phase",
+        op = op.text(),
+        phase = phase.text(),
+        outcome = outcome.text(),
+        approved_generation = approved_generation,
+        destination_epoch = destination_epoch,
+        "host backup preparation phase observed"
+    );
+}
+
+/// Observes one typed preparation refusal after the decision exists, then hands
+/// the unchanged error back. Terminal ownership stays with the outer caller.
+fn note_prepare_error(
+    op: &'static str,
+    phase: &'static str,
+    error: PreparationError,
+    approved_generation: u64,
+) -> PreparationError {
+    backup_prepare_note_event_log_unavailable();
+    let (category, field) = preparation_error_category(&error);
+    let op = crate::host_diagnostics::bound_field(op);
+    let phase = crate::host_diagnostics::bound_field(phase);
+    let category = crate::host_diagnostics::bound_field(category);
+    let field = crate::host_diagnostics::bound_field(field);
+    tracing::warn!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.backup.prepare_refusal",
+        op = op.text(),
+        phase = phase.text(),
+        category = category.text(),
+        field = field.text(),
+        approved_generation = approved_generation,
+        "host backup preparation refused"
+    );
+    error
+}
+
 /// Closed preparation class set (issue #958, case 958/18 guard).
 ///
 /// There is deliberately NO cutover/activation variant: preparation produces
@@ -675,43 +808,81 @@ fn destination_from_result(
 /// recorded destination; changed inputs conflict by field) → record intent →
 /// admit parent → create root → pin identity → record result. The source root
 /// is only ever read for comparison, never modified.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the preparation order (validate, replay, intent, admit, effect, identity, result) stays in one boundary so no phase observation can be skipped between neighbors"
+)]
 pub fn prepare_isolated_destination<J: PreparationJournal>(
     journal: &mut J,
     admission: &DestinationAdmission,
 ) -> Result<PreparedDestination, PreparationError> {
-    validate_admission(admission)?;
+    // Static attempt record before validation; the operation id is unvalidated
+    // caller text here and is never logged.
+    observe_prepare_progress(OP_PREPARE, "attempt", "attempted", 0, 0);
+    validate_admission(admission)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "validate", error, 0))?;
+    let generation = admission.approved_generation;
     let digest = admission_digest(admission);
-    if let Some((intent, result)) = journal.load(&admission.operation_id)? {
+    let recorded_entry = journal
+        .load(&admission.operation_id)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "replay_check", error, generation))?;
+    if let Some((intent, result)) = recorded_entry {
         let recorded = intent
             .get("admission_digest")
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if recorded != digest {
-            return Err(PreparationError::ConflictField {
-                field: conflict_field(&intent, admission),
-            });
+            return Err(note_prepare_error(
+                OP_PREPARE,
+                "replay_check",
+                PreparationError::ConflictField {
+                    field: conflict_field(&intent, admission),
+                },
+                generation,
+            ));
         }
         if let Some(result) = result {
             if let Some(destination) = destination_from_result(&admission.operation_id, &result) {
-                let live = capture_identity(&destination.root).map_err(|_| {
-                    PreparationError::UnknownState {
+                let live = capture_identity(&destination.root)
+                    .map_err(|_| PreparationError::UnknownState {
                         operation: admission.operation_id.clone(),
                         reason: "recorded root no longer observable; preserved".to_owned(),
-                    }
-                })?;
+                    })
+                    .map_err(|error| {
+                        note_prepare_error(OP_PREPARE, "replay_check", error, generation)
+                    })?;
                 if live != destination.root_identity {
-                    return Err(PreparationError::IdentityConflict {
-                        operation: admission.operation_id.clone(),
-                        recorded: destination.root_identity.identity.clone(),
-                        observed: live.identity.clone(),
-                    });
+                    return Err(note_prepare_error(
+                        OP_PREPARE,
+                        "replay_check",
+                        PreparationError::IdentityConflict {
+                            operation: admission.operation_id.clone(),
+                            recorded: destination.root_identity.identity.clone(),
+                            observed: live.identity.clone(),
+                        },
+                        generation,
+                    ));
                 }
+                // Observed replay, not a second effect: the recorded
+                // destination is re-verified and reused unchanged.
+                observe_prepare_progress(
+                    OP_PREPARE,
+                    "replay_check",
+                    "replay_observed",
+                    generation,
+                    destination.destination_epoch,
+                );
                 return Ok(destination);
             }
-            return Err(PreparationError::UnknownState {
-                operation: admission.operation_id.clone(),
-                reason: "result record malformed; preserved for inspection".to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_PREPARE,
+                "replay_check",
+                PreparationError::UnknownState {
+                    operation: admission.operation_id.clone(),
+                    reason: "result record malformed; preserved for inspection".to_owned(),
+                },
+                generation,
+            ));
         }
         // Intent without result: a crash between intent and result recording.
         // Root absent means nothing exists: fall through and prepare fresh
@@ -722,30 +893,47 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if !intent_root.is_empty() && Path::new(intent_root).exists() {
-            return Err(PreparationError::UnknownState {
-                operation: admission.operation_id.clone(),
-                reason: "intent without verifiable result and root present; reconcile before retry"
-                    .to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_PREPARE,
+                "replay_check",
+                PreparationError::UnknownState {
+                    operation: admission.operation_id.clone(),
+                    reason:
+                        "intent without verifiable result and root present; reconcile before retry"
+                            .to_owned(),
+                },
+                generation,
+            ));
         }
     }
-    let canonical_parent = admit_staging_parent(admission)?;
+    let canonical_parent = admit_staging_parent(admission)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "admit_parent", error, generation))?;
     let destination_id = derive_destination_id(&admission.operation_id, &admission.authority_nonce);
     let root = canonical_parent.join(format!("dest-{destination_id}"));
     if root.exists() {
-        return Err(PreparationError::ForeignContent {
-            path: root.to_string_lossy().into_owned(),
-        });
+        return Err(note_prepare_error(
+            OP_PREPARE,
+            "create_root",
+            PreparationError::ForeignContent {
+                path: root.to_string_lossy().into_owned(),
+            },
+            generation,
+        ));
     }
-    journal.record_intent(
-        &admission.operation_id,
-        &intent_json(admission, &digest, &root),
-    )?;
-    std::fs::create_dir(&root).map_err(|error| PreparationError::FilesystemEffect {
-        path: root.to_string_lossy().into_owned(),
-        reason: format!("destination creation failed: {error}"),
-    })?;
-    let identity = capture_identity(&root)?;
+    journal
+        .record_intent(
+            &admission.operation_id,
+            &intent_json(admission, &digest, &root),
+        )
+        .map_err(|error| note_prepare_error(OP_PREPARE, "record_intent", error, generation))?;
+    std::fs::create_dir(&root)
+        .map_err(|error| PreparationError::FilesystemEffect {
+            path: root.to_string_lossy().into_owned(),
+            reason: format!("destination creation failed: {error}"),
+        })
+        .map_err(|error| note_prepare_error(OP_PREPARE, "create_root", error, generation))?;
+    let identity = capture_identity(&root)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "capture_identity", error, generation))?;
     let destination = PreparedDestination {
         operation_id: admission.operation_id.clone(),
         root: root.clone(),
@@ -757,7 +945,18 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
         ),
         admission_digest: digest,
     };
-    journal.record_result(&admission.operation_id, &result_json(&destination))?;
+    journal
+        .record_result(&admission.operation_id, &result_json(&destination))
+        .map_err(|error| note_prepare_error(OP_PREPARE, "record_result", error, generation))?;
+    // Fresh preparation observed; this asserts a fenced destination only,
+    // never readiness, retirement, or activation.
+    observe_prepare_progress(
+        OP_PREPARE,
+        "complete",
+        "prepared_fresh",
+        generation,
+        destination.destination_epoch,
+    );
     Ok(destination)
 }
 
@@ -773,9 +972,14 @@ pub fn reconcile_preparation<J: PreparationJournal>(
     journal: &J,
     operation_id: &str,
 ) -> Result<ReconcileDisposition, PreparationError> {
-    check_identity(operation_id, "operation_id")?;
+    check_identity(operation_id, "operation_id")
+        .map_err(|error| note_prepare_error(OP_RECONCILE, "validate", error, 0))?;
     // Intent proves the operation was admitted; its digest binds the inputs.
-    let Some((intent, result)) = journal.load(operation_id)? else {
+    let recorded = journal
+        .load(operation_id)
+        .map_err(|error| note_prepare_error(OP_RECONCILE, "load", error, 0))?;
+    let Some((intent, result)) = recorded else {
+        observe_prepare_progress(OP_RECONCILE, "outcome", "absent", 0, 0);
         return Ok(ReconcileDisposition::Absent);
     };
     let Some(result) = result else {
@@ -788,23 +992,40 @@ pub fn reconcile_preparation<J: PreparationJournal>(
             .and_then(|value| value.as_str())
             .is_none_or(|root| !Path::new(root).exists());
         if root_absent {
+            observe_prepare_progress(OP_RECONCILE, "outcome", "absent", 0, 0);
             return Ok(ReconcileDisposition::Absent);
         }
+        observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
         return Ok(ReconcileDisposition::Uncertain {
             reason: "intent recorded without result and root present; effects unverified"
                 .to_owned(),
         });
     };
     let Some(destination) = destination_from_result(operation_id, &result) else {
+        observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
         return Ok(ReconcileDisposition::Uncertain {
             reason: "result record malformed; preserved for inspection".to_owned(),
         });
     };
     match reverify_recorded_destination(operation_id, &destination) {
-        Ok(()) => Ok(ReconcileDisposition::Current(destination)),
-        Err(error) => Ok(ReconcileDisposition::Uncertain {
-            reason: error.to_string(),
-        }),
+        Ok(()) => {
+            observe_prepare_progress(
+                OP_RECONCILE,
+                "outcome",
+                "current",
+                0,
+                destination.destination_epoch,
+            );
+            Ok(ReconcileDisposition::Current(destination))
+        }
+        Err(error) => {
+            // The failure text names recorded paths; only the uncertain
+            // outcome is observed, never the error content.
+            observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
+            Ok(ReconcileDisposition::Uncertain {
+                reason: error.to_string(),
+            })
+        }
     }
 }
 
@@ -817,22 +1038,37 @@ pub fn cancel_preparation<J: PreparationJournal>(
     journal: &mut J,
     operation_id: &str,
 ) -> Result<(), PreparationError> {
-    match reconcile_preparation(journal, operation_id)? {
+    match reconcile_preparation(journal, operation_id)
+        .map_err(|error| note_prepare_error(OP_CANCEL, "reconcile", error, 0))?
+    {
         ReconcileDisposition::Current(destination) => {
             let mut envelope = result_json(&destination);
             envelope["status"] = serde_json::Value::String("cancelled".to_owned());
             envelope["prior_receipt"] = result_json(&destination);
-            journal.record_result(operation_id, &envelope)?;
+            journal
+                .record_result(operation_id, &envelope)
+                .map_err(|error| note_prepare_error(OP_CANCEL, "record_result", error, 0))?;
+            observe_prepare_progress(OP_CANCEL, "outcome", "cancelled", 0, 0);
             Ok(())
         }
-        ReconcileDisposition::Absent => Err(PreparationError::UnknownState {
-            operation: operation_id.to_owned(),
-            reason: "nothing recorded; nothing to cancel".to_owned(),
-        }),
-        ReconcileDisposition::Uncertain { reason } => Err(PreparationError::UnknownState {
-            operation: operation_id.to_owned(),
-            reason: format!("reconcile first: {reason}"),
-        }),
+        ReconcileDisposition::Absent => Err(note_prepare_error(
+            OP_CANCEL,
+            "outcome",
+            PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "nothing recorded; nothing to cancel".to_owned(),
+            },
+            0,
+        )),
+        ReconcileDisposition::Uncertain { reason } => Err(note_prepare_error(
+            OP_CANCEL,
+            "outcome",
+            PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: format!("reconcile first: {reason}"),
+            },
+            0,
+        )),
     }
 }
 
@@ -857,9 +1093,14 @@ pub fn cleanup_preparations<J: PreparationJournal>(
     operation_ids: &[String],
 ) -> Result<CleanupReport, PreparationError> {
     let mut report = CleanupReport::default();
-    let owned = journal.list_operations()?;
+    let owned = journal
+        .list_operations()
+        .map_err(|error| note_prepare_error(OP_CLEANUP, "list", error, 0))?;
     for requested in operation_ids {
         if !owned.contains(requested) {
+            // Refused, never deleted: a caller can never nominate a deletion.
+            // The requested id itself is unowned caller text and is not logged.
+            observe_prepare_progress(OP_CLEANUP, "sweep", "refused_not_owned", 0, 0);
             report.preserved.push((
                 requested.clone(),
                 "operation is not owned by this journal; refused, never deleted".to_owned(),
@@ -870,16 +1111,20 @@ pub fn cleanup_preparations<J: PreparationJournal>(
         if !operation_ids.is_empty() && !operation_ids.contains(operation_id) {
             continue;
         }
-        match reconcile_preparation(journal, operation_id)? {
+        match reconcile_preparation(journal, operation_id)
+            .map_err(|error| note_prepare_error(OP_CLEANUP, "reconcile", error, 0))?
+        {
             ReconcileDisposition::Current(destination) => {
                 remove_reverified_destination(operation_id, &destination, &mut report);
             }
             ReconcileDisposition::Absent => {
+                observe_prepare_progress(OP_CLEANUP, "sweep", "absent", 0, 0);
                 report
                     .preserved
                     .push((operation_id.clone(), "nothing recorded".to_owned()));
             }
             ReconcileDisposition::Uncertain { reason } => {
+                observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);
                 report.preserved.push((operation_id.clone(), reason));
             }
         }
@@ -899,17 +1144,24 @@ fn remove_reverified_destination(
     report: &mut CleanupReport,
 ) {
     if let Err(error) = reverify_recorded_destination(operation_id, destination) {
+        observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
         report
             .preserved
             .push((operation_id.to_owned(), error.to_string()));
         return;
     }
     match std::fs::remove_dir_all(&destination.root) {
-        Ok(()) => report.removed.push(operation_id.to_owned()),
-        Err(error) => report.preserved.push((
-            operation_id.to_owned(),
-            format!("removal failed, preserved: {error}"),
-        )),
+        Ok(()) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "removed", 0, 0);
+            report.removed.push(operation_id.to_owned());
+        }
+        Err(error) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            report.preserved.push((
+                operation_id.to_owned(),
+                format!("removal failed, preserved: {error}"),
+            ));
+        }
     }
 }
 
@@ -931,18 +1183,25 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
         .map_err(|_| PreparationError::InvalidRequest {
             field: "source_roots",
             reason: "owner runtime roots violate topology".to_owned(),
-        })?;
-    let canonical = std::fs::canonicalize(roots.installation_root.as_str()).map_err(|error| {
-        PreparationError::FilesystemEffect {
+        })
+        .map_err(|error| note_prepare_error(OP_SOURCE_ROOT, "resolve", error, 0))?;
+    let canonical = std::fs::canonicalize(roots.installation_root.as_str())
+        .map_err(|error| PreparationError::FilesystemEffect {
             path: roots.installation_root.as_str().to_owned(),
             reason: format!("cannot canonicalize owner installation root: {error}"),
-        }
-    })?;
+        })
+        .map_err(|error| note_prepare_error(OP_SOURCE_ROOT, "resolve", error, 0))?;
     if !canonical.is_dir() {
-        return Err(PreparationError::ArbitraryPath {
-            reason: "owner installation root is not a directory".to_owned(),
-        });
+        return Err(note_prepare_error(
+            OP_SOURCE_ROOT,
+            "resolve",
+            PreparationError::ArbitraryPath {
+                reason: "owner installation root is not a directory".to_owned(),
+            },
+            0,
+        ));
     }
+    observe_prepare_progress(OP_SOURCE_ROOT, "resolve", "resolved", 0, 0);
     Ok(canonical)
 }
 
@@ -1015,19 +1274,28 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
         evidence: &OwnerEvidence,
         request: &PresentedPreparationRequest,
     ) -> Result<PreparedDestination, PreparationError> {
-        let binding: ApprovedBuildBinding = evidence.approved_binding()?;
-        let source_root = resolve_owner_source_root(evidence.runtime_roots())?;
+        let binding: ApprovedBuildBinding = evidence
+            .approved_binding()
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "bind_build", error, 0))?;
+        let source_root = resolve_owner_source_root(evidence.runtime_roots())
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "resolve_source", error, 0))?;
         for digest in &request.build_digests {
-            check_digest(digest, "build_digests")?;
+            check_digest(digest, "build_digests")
+                .map_err(|error| note_prepare_error(OP_DELEGATE, "check_build", error, 0))?;
             if !binding
                 .artifact_digests
                 .iter()
                 .any(|artifact| artifact == digest)
             {
-                return Err(PreparationError::InvalidRequest {
-                    field: "build_digests",
-                    reason: "build digest is not an owner-approved artifact".to_owned(),
-                });
+                return Err(note_prepare_error(
+                    OP_DELEGATE,
+                    "check_build",
+                    PreparationError::InvalidRequest {
+                        field: "build_digests",
+                        reason: "build digest is not an owner-approved artifact".to_owned(),
+                    },
+                    0,
+                ));
             }
         }
         let admission = DestinationAdmission {
@@ -1044,7 +1312,10 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
             authority_nonce: request.authority_nonce.clone(),
             state_fence_digest: request.state_fence_digest.clone(),
         };
+        // The inner preparation owns its phase records; this notes only the
+        // propagation of its failure to the delegation boundary.
         prepare_isolated_destination(&mut self.journal, &admission)
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "prepare", error, 0))
     }
 
     /// Reconciles one operation without duplicating effects.
@@ -1124,7 +1395,25 @@ impl OwnerEvidence {
     /// fence↔manifest agreement. Any step fails closed with a static
     /// [`PreparationError`]; owner error internals are never echoed.
     /// Absence of proof is never treated as proof of absence.
+    ///
+    /// The outcome is observed once: the static field in each refusal already
+    /// names the failed inspection step, and no path or owner text is logged.
     pub fn inspect(host_state_root: &Path) -> Result<Self, PreparationError> {
+        match Self::inspect_inner(host_state_root) {
+            Ok(evidence) => {
+                observe_prepare_progress(OP_OWNER_EVIDENCE, "inspect", "inspected", 0, 0);
+                Ok(evidence)
+            }
+            Err(error) => Err(note_prepare_error(OP_OWNER_EVIDENCE, "inspect", error, 0)),
+        }
+    }
+
+    /// Inspection body behind the outcome observation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered inspection chain stays in one boundary; the wrapper only observes the outcome"
+    )]
+    fn inspect_inner(host_state_root: &Path) -> Result<Self, PreparationError> {
         if !host_state_root.is_absolute() {
             return Err(PreparationError::InvalidRequest {
                 field: "host_state_root",
@@ -1295,18 +1584,21 @@ impl OwnerEvidence {
 /// static reasons; lease error internals are echoed only inside
 /// [`PreparationError::FilesystemEffect`], matching file precedent.
 pub fn verify_staging_parent_lease(parent: &Path) -> Result<PathBuf, PreparationError> {
-    let lease = ProtectedRootLease::open_existing(parent).map_err(|error| {
-        PreparationError::FilesystemEffect {
+    let lease = ProtectedRootLease::open_existing(parent)
+        .map_err(|error| PreparationError::FilesystemEffect {
             path: parent.to_string_lossy().into_owned(),
             reason: format!("staging parent is not a protected root: {error}"),
-        }
-    })?;
-    lease
+        })
+        .map_err(|error| note_prepare_error(OP_STAGING_LEASE, "verify", error, 0))?;
+    let verified = lease
         .canonical_path()
         .map_err(|error| PreparationError::FilesystemEffect {
             path: parent.to_string_lossy().into_owned(),
             reason: format!("staging parent identity changed during admission: {error}"),
         })
+        .map_err(|error| note_prepare_error(OP_STAGING_LEASE, "verify", error, 0))?;
+    observe_prepare_progress(OP_STAGING_LEASE, "verify", "verified", 0, 0);
+    Ok(verified)
 }
 
 /// Authenticated caller control for one delegated preparation (issue #958).
@@ -1362,19 +1654,31 @@ impl BackupCallerAuth {
         installation: &PlatformHandle,
         source_installation_id: &str,
     ) -> Result<(), PreparationError> {
-        self.check_shapes()?;
+        self.check_shapes()
+            .map_err(|error| note_prepare_error(OP_CALLER_AUTH, "authenticate", error, 0))?;
         if !lease.is_for_installation(installation) {
-            return Err(PreparationError::InvalidRequest {
-                field: "caller_auth",
-                reason: "held owner lease does not cover the launch installation".to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "held owner lease does not cover the launch installation".to_owned(),
+                },
+                0,
+            ));
         }
         if source_installation_id != installation.as_str() {
-            return Err(PreparationError::InvalidRequest {
-                field: "caller_auth",
-                reason: "presented source differs from the lease-bound installation".to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "presented source differs from the lease-bound installation".to_owned(),
+                },
+                0,
+            ));
         }
+        observe_prepare_progress(OP_CALLER_AUTH, "authenticate", "authenticated", 0, 0);
         Ok(())
     }
 }

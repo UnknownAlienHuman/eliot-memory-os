@@ -380,6 +380,152 @@ pub enum CutoverError {
     Registry(String),
 }
 
+// F-LOG-HOST-8 (#983) backup cutover diagnostics: observation-only helpers.
+//
+// Through the #889 facade's target and bounded-field helpers only, on the
+// existing subscriber; the Event Log seam stays typed-Unavailable (never
+// implemented here, #984 still open). `EntrypointStage` describes process
+// startup/shutdown, not backup phases, so these observations carry local event
+// names and never reuse that enum.
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static tokens, owner disposition tokens,
+// or counts; never operation/installation/archive/build/fence strings,
+// digests, reasons, receipts, or arbitrary error `Debug`/`Display` (a canary
+// stays absent even inside an alleged identity string). Truncation bounds
+// size, never sensitivity. Macro arguments are precomputed pure values; sink
+// outcome never alters call counts, order, results, receipts, rollback, or
+// cleanup, and stdout framing is untouched (facade stderr subscriber). No
+// owner reads, effects, hashing, retries, or mutation are added for logging.
+// Requested/validated/prepared/committed/reconciled/retirement-pending/
+// failed/unknown stay exactly the owner-observed dispositions: rehearsal
+// never emits success, ambiguity stays unknown, and retirement-pending never
+// implies erasure.
+//
+// Terminal ownership (W4): the leaf emits nonterminal phase/refusal evidence
+// only, with no dedup cache. The single terminal record per failed operation
+// belongs to the outer caller boundary, which owns the one
+// `observe_terminal_error` call. Handoff (caller-owned, not applied here):
+// `backup_dispatch_cutover` / `backup_dispatch_cutover_disposition` /
+// `backup_dispatch_cutover_retire` arm one terminal guard each with a frozen
+// `host-backup-cutover-failed` code; operation failure stays distinct from
+// any process shutdown failure.
+//
+// Explicit no-event list: `is_exact_replay`/`check_replay_identity` (pure
+// predicates; the observed replay is recorded at the committed-intent return
+// in `execute_cutover`, never as a second effect),
+// `bind_approved_target`/`read_and_verify_prior_authority`/
+// `commit_with_durable_intent`/`append_cutover_intent`/`bounded_evidence`/
+// `admission_handle`/`receipt_handle`/`owner_approved_build_digests`/
+// `cutover_intent_state_spelling` (private steps whose outcome surfaces with
+// its exact category at the validate/execute/retire boundary).
+
+/// Notes the facade's actual Event Log seam status (typed-unavailable).
+fn backup_cutover_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+/// Counts bounded collections as a log-safe `u64` without truncation casts.
+fn backup_cutover_count(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// Projects one [`CutoverError`] to its stable diagnostic category. Pure and
+/// exhaustive; carries no payloads, digests, or owner error text.
+#[must_use]
+fn cutover_error_category(error: &CutoverError) -> &'static str {
+    match error {
+        CutoverError::NotSeparatelyAdmitted(_) => "not_separately_admitted",
+        CutoverError::RehearsalCannotCutover => "rehearsal_cannot_cutover",
+        CutoverError::BindingMismatch => "binding_mismatch",
+        CutoverError::ScopeExportForbidden => "scope_export_forbidden",
+        CutoverError::DegradedPolicyViolation => "degraded_policy_violation",
+        CutoverError::MissingPhaseReceipt => "missing_phase_receipt",
+        CutoverError::PartialDenominator => "partial_denominator",
+        CutoverError::StalePurgeKeyReference => "stale_purge_key_reference",
+        CutoverError::PriorAuthorityStillActive => "prior_authority_still_active",
+        CutoverError::AuthorityOrReadinessMissing => "authority_or_readiness_missing",
+        CutoverError::ExpectedPredecessorConflict => "expected_predecessor_conflict",
+        CutoverError::IdentityConflict => "identity_conflict",
+        CutoverError::BarrierDenied(_) => "barrier_denied",
+        CutoverError::InvalidRecoveryReceipt(_) => "invalid_recovery_receipt",
+        CutoverError::HostTransition(_) => "host_transition",
+        CutoverError::Registry(_) => "registry",
+    }
+}
+
+/// Projects one owner [`CutoverDisposition`] to its stable diagnostic token.
+/// Pure and exhaustive; the token repeats the owner observation verbatim.
+#[must_use]
+fn cutover_disposition_token(disposition: CutoverDisposition) -> &'static str {
+    match disposition {
+        CutoverDisposition::Requested => "requested",
+        CutoverDisposition::Validated => "validated",
+        CutoverDisposition::Prepared => "prepared",
+        CutoverDisposition::Committed => "committed",
+        CutoverDisposition::Reconciled => "reconciled",
+        CutoverDisposition::RetirementPending => "retirement_pending",
+        CutoverDisposition::Failed => "failed",
+        CutoverDisposition::Unknown => "unknown",
+    }
+}
+
+/// Observes one nonterminal cutover phase outcome after the decision exists.
+/// `disposition` repeats the owner-observed disposition (or `"none"` when the
+/// step produces none); `evidence_count` counts refs without naming them.
+fn observe_cutover_progress(
+    op: &'static str,
+    outcome: &'static str,
+    disposition: &'static str,
+    evidence_count: u64,
+) {
+    backup_cutover_note_event_log_unavailable();
+    let op = crate::host_diagnostics::bound_field(op);
+    let outcome = crate::host_diagnostics::bound_field(outcome);
+    let disposition = crate::host_diagnostics::bound_field(disposition);
+    tracing::info!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.backup.cutover_phase",
+        op = op.text(),
+        outcome = outcome.text(),
+        disposition = disposition.text(),
+        evidence_count = evidence_count,
+        "host backup cutover phase observed"
+    );
+}
+
+/// Observes one typed cutover refusal after the decision exists, then hands
+/// the unchanged error back. Terminal ownership stays with the outer caller.
+fn note_cutover_error(op: &'static str, error: CutoverError) -> CutoverError {
+    backup_cutover_note_event_log_unavailable();
+    let category = cutover_error_category(&error);
+    let op = crate::host_diagnostics::bound_field(op);
+    let category = crate::host_diagnostics::bound_field(category);
+    tracing::warn!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.backup.cutover_refusal",
+        op = op.text(),
+        category = category.text(),
+        "host backup cutover refused"
+    );
+    error
+}
+
+/// Observes one failed owner read behind disposition projection, then hands
+/// the unchanged error back. The unowned [`HostError`] text is never logged:
+/// a failed read is an error, never a disposition.
+fn note_cutover_read_error(error: super::HostError) -> super::HostError {
+    backup_cutover_note_event_log_unavailable();
+    tracing::warn!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.backup.cutover_refusal",
+        op = "read_disposition",
+        category = "owner_read_failed",
+        "host backup cutover disposition read failed"
+    );
+    error
+}
+
 /// Bounds and dedupes evidence references for owner records, which reject
 /// empty and duplicate handle sets.
 fn bounded_evidence(refs: Vec<PlatformHandle>) -> Vec<PlatformHandle> {
@@ -484,11 +630,35 @@ fn bind_approved_target<'a>(
 /// # Errors
 ///
 /// Returns the exact failing gate. Nothing is activated here.
+///
+/// The outcome is observed once: success repeats the validated disposition,
+/// and each refusal carries its exact typed category. No request, evidence,
+/// or receipt string is logged.
+pub fn validate_cutover_request(
+    request: &CutoverRequest,
+    evidence: &IsolatedRecoveryEvidence,
+    registry: &ApprovedGenerationRegistry,
+) -> Result<ValidatedCutover, CutoverError> {
+    match validate_cutover_request_inner(request, evidence, registry) {
+        Ok(validated) => {
+            observe_cutover_progress(
+                "validate",
+                "validated",
+                "validated",
+                backup_cutover_count(validated.evidence.fenced_introductions.len()),
+            );
+            Ok(validated)
+        }
+        Err(error) => Err(note_cutover_error("validate", error)),
+    }
+}
+
+/// Validation gate body behind the outcome observation.
 #[allow(
     clippy::too_many_lines,
     reason = "the ordered fail-closed cutover gate set stays in one boundary so no admission, receipt, or registry check can be skipped between neighbors"
 )]
-pub fn validate_cutover_request(
+fn validate_cutover_request_inner(
     request: &CutoverRequest,
     evidence: &IsolatedRecoveryEvidence,
     registry: &ApprovedGenerationRegistry,
@@ -739,7 +909,29 @@ pub fn check_replay_identity(
 /// the durable drain/commit disagrees; `Registry` on CAS conflict or an
 /// unapproved target; `Unknown`-class host failures propagate as
 /// `HostTransition` for fenced reconciliation.
+///
+/// Refusals are observed here with their exact typed category. Successes are
+/// observed at the exact inner return that produced them, so an observed
+/// replay stays distinct from a fresh commit.
 pub fn execute_cutover(
+    host: &mut HostComposition,
+    validated: &ValidatedCutover,
+    retirement: &GenerationRetirementFence,
+    activation_id: &PlatformHandle,
+    activation_generation: &EpochTransition,
+) -> Result<(CutoverOutcome, GenerationRetirementBarrier), CutoverError> {
+    execute_cutover_inner(
+        host,
+        validated,
+        retirement,
+        activation_id,
+        activation_generation,
+    )
+    .map_err(|error| note_cutover_error("execute", error))
+}
+
+/// Execution body behind the refusal observation.
+fn execute_cutover_inner(
     host: &mut HostComposition,
     validated: &ValidatedCutover,
     retirement: &GenerationRetirementFence,
@@ -840,17 +1032,23 @@ pub fn execute_cutover(
         }
         match committed.state {
             CutoverIntentState::Committed => {
-                return Ok((
-                    CutoverOutcome {
-                        disposition: CutoverDisposition::Committed,
-                        operation: validated.request.operation.clone(),
-                        evidence_refs: bounded_evidence(vec![
-                            admission_handle(&validated.request.admission)?,
-                            committed.target_generation.clone(),
-                        ]),
-                    },
-                    barrier,
-                ));
+                // Observed replay of the same committed cutover, not a second
+                // activation: the durable intent already proves it happened.
+                let outcome = CutoverOutcome {
+                    disposition: CutoverDisposition::Committed,
+                    operation: validated.request.operation.clone(),
+                    evidence_refs: bounded_evidence(vec![
+                        admission_handle(&validated.request.admission)?,
+                        committed.target_generation.clone(),
+                    ]),
+                };
+                observe_cutover_progress(
+                    "execute",
+                    "replay_observed",
+                    "committed",
+                    backup_cutover_count(outcome.evidence_refs.len()),
+                );
+                return Ok((outcome, barrier));
             }
             // A refused operation is terminal for that operation identity, and
             // the durable record is never revised. Re-running the activation
@@ -886,6 +1084,12 @@ pub fn execute_cutover(
         expected_revision,
         activation_id,
     )?;
+    observe_cutover_progress(
+        "execute",
+        "committed",
+        "committed",
+        backup_cutover_count(committed_outcome.evidence_refs.len()),
+    );
     Ok((committed_outcome, barrier))
 }
 
@@ -1050,11 +1254,16 @@ pub fn read_cutover_disposition(
     validated: bool,
     retirement_receipt: Option<&AppendReceipt>,
 ) -> Result<CutoverOutcome, HostError> {
-    let snapshot = host.journal.snapshot()?;
+    let snapshot = host
+        .journal
+        .snapshot()
+        .map_err(|error| note_cutover_read_error(super::HostError::from(error)))?;
     let registry = host
-        .open_registry_store()?
+        .open_registry_store()
+        .map_err(note_cutover_read_error)?
         .load()
-        .map_err(|error| HostError::Platform(error.to_string()))?;
+        .map_err(|error| HostError::Platform(error.to_string()))
+        .map_err(note_cutover_read_error)?;
     Ok(reconcile_cutover_outcome(
         &request.operation,
         validated,
@@ -1104,7 +1313,10 @@ pub fn retire_authorized_generation(
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
     let journal = host.journal.snapshot().map_err(|error| {
-        CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        note_cutover_error(
+            "retire_authorize",
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string())),
+        )
     })?;
     let intent = journal
         .pending_cutover
@@ -1115,18 +1327,27 @@ pub fn retire_authorized_generation(
                 && intent.request_digest == request.operation.request_digest
         })
         .ok_or_else(|| {
-            CutoverError::NotSeparatelyAdmitted(
-                "retirement has no durable cutover intent for this operation".to_owned(),
+            note_cutover_error(
+                "retire_authorize",
+                CutoverError::NotSeparatelyAdmitted(
+                    "retirement has no durable cutover intent for this operation".to_owned(),
+                ),
             )
         })?;
     match intent.state {
         CutoverIntentState::Committed => {}
         CutoverIntentState::Pending => {
-            return Err(CutoverError::AuthorityOrReadinessMissing);
+            return Err(note_cutover_error(
+                "retire_authorize",
+                CutoverError::AuthorityOrReadinessMissing,
+            ));
         }
         CutoverIntentState::Failed => {
-            return Err(CutoverError::Registry(
-                "retirement refused: the cutover activation was not applied".to_owned(),
+            return Err(note_cutover_error(
+                "retire_authorize",
+                CutoverError::Registry(
+                    "retirement refused: the cutover activation was not applied".to_owned(),
+                ),
             ));
         }
     }
@@ -1135,7 +1356,10 @@ pub fn retire_authorized_generation(
         || barrier.fence().activation_generation != intent.fence.activation_generation
         || !fences_match_exact(&barrier.fence().state_fence, &request.activation_fence)
     {
-        return Err(CutoverError::BindingMismatch);
+        return Err(note_cutover_error(
+            "retire_authorize",
+            CutoverError::BindingMismatch,
+        ));
     }
     // The prior epoch must be one this Host journal still retains, unretired,
     // and different from the epoch performing the cutover. Stated precisely:
@@ -1152,8 +1376,13 @@ pub fn retire_authorized_generation(
             && prior_host.epoch != host.host.epoch
     });
     if !outstanding {
-        return Err(CutoverError::BindingMismatch);
+        return Err(note_cutover_error(
+            "retire_authorize",
+            CutoverError::BindingMismatch,
+        ));
     }
+    // The retirement step owns its outcome record; this notes only the
+    // propagation of its failure to the authorization boundary.
     retire_prior_generation(
         host,
         &ValidatedCutover {
@@ -1164,6 +1393,7 @@ pub fn retire_authorized_generation(
         prior_host,
         retirement_authorization,
     )
+    .map_err(|error| note_cutover_error("retire_authorize", error))
 }
 
 /// Stable wire spelling of one cutover intent disposition, used to derive the
@@ -1270,15 +1500,19 @@ pub fn retire_prior_generation(
     prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
-    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)?;
+    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)
+        .map_err(|error| note_cutover_error("retire", CutoverError::from(error)))?;
     if retirement_authorization.as_str().trim().is_empty() {
-        return Err(CutoverError::AuthorityOrReadinessMissing);
+        return Err(note_cutover_error(
+            "retire",
+            CutoverError::AuthorityOrReadinessMissing,
+        ));
     }
     if prior_host.installation != host.host.installation {
-        return Err(CutoverError::BindingMismatch);
+        return Err(note_cutover_error("retire", CutoverError::BindingMismatch));
     }
     if prior_host.epoch == host.host.epoch {
-        return Err(CutoverError::BindingMismatch);
+        return Err(note_cutover_error("retire", CutoverError::BindingMismatch));
     }
     let operation = IdempotencyIdentity {
         operation_id: validated.request.operation.operation_id.clone(),
@@ -1316,7 +1550,8 @@ pub fn retire_prior_generation(
         operation,
         retired_host: prior_host.clone(),
         retirement_evidence_refs: bounded_evidence(vec![
-            admission_handle(&validated.request.admission)?,
+            admission_handle(&validated.request.admission)
+                .map_err(|error| note_cutover_error("retire", error))?,
             validated.request.archive_digest.clone(),
             validated.request.target_generation.clone(),
             // The exact new authority this retirement completes: without it
@@ -1325,23 +1560,37 @@ pub fn retire_prior_generation(
             validated.request.user_broker_ref.clone(),
             validated.request.target_build_digest.clone(),
             validated.request.target_config_digest.clone(),
-            receipt_handle(&validated.evidence.restore_receipt.receipt_id)?,
-            receipt_handle(&validated.evidence.restore_receipt.effect_receipt_sha256)?,
-            receipt_handle(&validated.evidence.operational_validation.validation_digest)?,
+            receipt_handle(&validated.evidence.restore_receipt.receipt_id)
+                .map_err(|error| note_cutover_error("retire", error))?,
+            receipt_handle(&validated.evidence.restore_receipt.effect_receipt_sha256)
+                .map_err(|error| note_cutover_error("retire", error))?,
+            receipt_handle(&validated.evidence.operational_validation.validation_digest)
+                .map_err(|error| note_cutover_error("retire", error))?,
             retirement_authorization.clone(),
         ]),
         retired_at,
     });
-    let receipt = super::journal_append::append_reconciled(&host.journal, record)?;
-    Ok(CutoverOutcome {
+    let receipt = super::journal_append::append_reconciled(&host.journal, record)
+        .map_err(|error| note_cutover_error("retire", CutoverError::from(error)))?;
+    let outcome = CutoverOutcome {
         disposition: CutoverDisposition::Reconciled,
         operation: validated.request.operation.clone(),
         evidence_refs: bounded_evidence(vec![
             receipt.transaction_id().clone(),
-            admission_handle(&validated.request.admission)?,
+            admission_handle(&validated.request.admission)
+                .map_err(|error| note_cutover_error("retire", error))?,
             retirement_authorization.clone(),
         ]),
-    })
+    };
+    // Observed authorized retirement only; source erasure is a separate
+    // explicitly authorized action and is never inferred here.
+    observe_cutover_progress(
+        "retire",
+        "reconciled",
+        "reconciled",
+        backup_cutover_count(outcome.evidence_refs.len()),
+    );
+    Ok(outcome)
 }
 
 /// Reconciles a cutover from real owner observations after lost response,
@@ -1418,7 +1667,7 @@ pub fn reconcile_cutover_outcome(
     } else {
         CutoverDisposition::Unknown
     };
-    CutoverOutcome {
+    let outcome = CutoverOutcome {
         disposition,
         operation: operation.clone(),
         evidence_refs: bounded_evidence(match retirement_receipt {
@@ -1433,5 +1682,15 @@ pub fn reconcile_cutover_outcome(
                 },
             ),
         }),
-    }
+    };
+    // The projected disposition repeats the owner observations verbatim:
+    // ambiguity stays unknown with the original operation identity, and no
+    // rollback request or archive hash can surface as a commit here.
+    observe_cutover_progress(
+        "reconcile",
+        "projected",
+        cutover_disposition_token(outcome.disposition),
+        backup_cutover_count(outcome.evidence_refs.len()),
+    );
+    outcome
 }
