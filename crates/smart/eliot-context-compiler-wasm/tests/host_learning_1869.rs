@@ -437,6 +437,9 @@ fn composed_request(
         measurement_digest: &"d".repeat(64),
         measurement_serializer: "json-v1",
         verified: &verified,
+        // The produced atom is always for the local permit's own target task
+        // here, so no distinct cross-task carryover is presented.
+        cross_task: None,
     })
     .expect("covered production emits");
     let input = input_with_produced(task, fence, atom);
@@ -455,7 +458,7 @@ fn composed_request(
 fn producer_to_consumer_chain_admits() {
     let chain = live_chain();
     let (request, permit) = composed_request(&chain, TASK_1869, &chain.fence.clone());
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+    let response = compile_learning_context(&chain.governor, &permit, None, &request, NOW_1869);
     assert_eq!(response.error, None);
     assert_eq!(response.native_calls, 1);
     let result = response.result.expect("admission result present");
@@ -502,7 +505,7 @@ fn fabricated_digest_refuses_before_native_call() {
             .expect("measured candidate");
         measurement.binding.subject_digest = canonical_digest(candidate).expect("remarked subject");
     }
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+    let response = compile_learning_context(&chain.governor, &permit, None, &request, NOW_1869);
     assert_eq!(response.native_calls, 0);
     assert!(
         response.result.is_none(),
@@ -522,14 +525,14 @@ fn stale_fence_and_foreign_task_refuse_before_native_call() {
     for candidate in &mut request.input.candidates.candidates {
         candidate.binding.state_fence = drifted.clone();
     }
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+    let response = compile_learning_context(&chain.governor, &permit, None, &request, NOW_1869);
     assert_eq!(response.native_calls, 0);
     assert!(response.result.is_none());
     assert!(response.error.is_some());
 
     // Foreign task: same permit, compilation for another task.
     let (request, permit) = composed_request(&chain, "task-1869-foreign", &chain.fence.clone());
-    let response = compile_learning_context(&chain.governor, &permit, &request, NOW_1869);
+    let response = compile_learning_context(&chain.governor, &permit, None, &request, NOW_1869);
     assert_eq!(response.native_calls, 0);
     assert!(response.result.is_none());
     assert!(response.error.is_some());
