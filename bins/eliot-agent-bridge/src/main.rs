@@ -2125,9 +2125,11 @@ const MCP_CONNECTION_ID: &str = "mcp-stdio-1";
 
 /// Live MCP front-door session: negotiated version plus bounded retention.
 ///
-/// Retention maps are correlation-only. Handles are exact Kernel-issued
-/// operation identities and exact retained resource handles; nothing here
-/// mints, rebinds, or revives session, task, or authority state.
+/// Retention maps are correlation-only, keyed by the type-qualified
+/// [`JsonRpcId::correlation_text`] (`int:`/`str:`) so numeric and string wire
+/// identities never share a handle or a cancellation mark. Handles are exact
+/// Kernel-issued operation identities and exact retained resource handles;
+/// nothing here mints, rebinds, or revives session, task, or authority state.
 struct McpFrontDoor {
     version: NegotiatedWireVersion,
     initialized: bool,
@@ -2601,8 +2603,10 @@ fn handle_mcp_tools_list(id: &JsonRpcId, params: &Value) -> Value {
 ///
 /// The wire name plus arguments become one inert `HostInvocationRequest`;
 /// the gateway plus trusted port admit it and the exact admitted operation
-/// is retained for later cancellation. Correlation crosses verbatim from the
-/// JSON-RPC identity to the host correlation and back.
+/// is retained for later cancellation. The JSON-RPC identity is retained
+/// under its type-qualified correlation for the host request, handle lookup,
+/// and cancellation marks; response envelopes echo the original wire identity
+/// unchanged.
 fn handle_mcp_tools_call(
     gateway: &HostRequestGateway,
     port: &mut KernelHostRequestClient,
