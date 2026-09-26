@@ -156,13 +156,12 @@ async fn read_canonical_closure_receipts(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unspecified durable refusal");
                 if reason == RECEIPT_NOT_FOUND_REASON {
-                    let pending = match first_bind {
-                        Some(pending) => pending,
-                        None => {
-                            let pending = owner_first_bind_pending(kernel).await?;
-                            first_bind = Some(pending);
-                            pending
-                        }
+                    let pending = if let Some(pending) = first_bind {
+                        pending
+                    } else {
+                        let pending = owner_first_bind_pending(kernel).await?;
+                        first_bind = Some(pending);
+                        pending
                     };
                     if pending {
                         // First bind: ORS durably holds no committed
