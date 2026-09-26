@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope,
     CancellationState, CandidateSelectionDisposition, CommittedHostEventIntake, ContinuityKind,
-    ContractError, EffectCeiling, EffectKind, HostEventNormalizationReceipt,
+    ContractError, EffectCeiling, EffectKind, EventCursor, HostEventNormalizationReceipt,
     HostEventQuarantineReason, HostEventReplayDisposition, MAX_ROUTE_CANDIDATES,
     NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
     ProviderExecutionBinding, ProviderObservationLineage, RejectedRouteCandidate,
@@ -197,6 +197,66 @@ fn classify_route_replay(
         Err(ContractError::ConflictingObservation) => Err(CoordinatorError::IdempotencyConflict),
         Ok(()) | Err(_) => Ok(()),
     }
+}
+
+/// First-intake event-boundary gate for one candidate result (issue #369
+/// W17): the observation's causal position must extend the attempt's last
+/// accepted causal boundary, not regress behind it or arrive on an alien
+/// cursor.
+///
+/// The sibling intake leg ([`Self::observe_provider_event`]) rejects a host
+/// event whose sequence does not advance past `last_host_sequence` with
+/// [`CoordinatorError::StaleResult`]; without this gate a regressed-boundary
+/// observation would enter through [`Self::submit_result`] instead, become
+/// the attempt's durable accepted observation, and silently contradict the
+/// boundary the host leg already accepted. The accepted host events for the
+/// attempt's exact execution unit therefore form the boundary: with no
+/// accepted host event for the unit there is no boundary to extend and the
+/// gate passes vacuously; otherwise the observation sequence must advance
+/// strictly past the last accepted host sequence (else `StaleResult`, exactly
+/// like the sibling leg) and the observation cursor must anchor at the last
+/// accepted host cursor for that unit (else `IdentityConflict`: a cursor
+/// naming any other causal position is built on a stale view, never the
+/// boundary). Runs before any mutation.
+fn validate_intake_event_boundary(
+    coordinator: &AgentCoordinator,
+    current: &AttemptRecord,
+    actual: &PhysicalRouteObservationReceipt,
+) -> Result<(), CoordinatorError> {
+    let stored = current
+        .provider_binding
+        .as_ref()
+        .ok_or(CoordinatorError::MissingExecutionBinding)?;
+    let mut boundary: Option<(u64, EventCursor)> = None;
+    for entry in coordinator.observed_host_events.values() {
+        let ProviderObservationLineage::ExecutionUnitObservation(unit_observation) =
+            &entry.event.lineage
+        else {
+            continue;
+        };
+        if unit_observation.binding.attempt_id != current.attempt_id
+            || unit_observation.binding.execution_unit != stored.execution_unit
+        {
+            continue;
+        }
+        let candidate = (entry.event.sequence, entry.event.cursor.clone());
+        if boundary
+            .as_ref()
+            .is_none_or(|(sequence, _)| candidate.0 > *sequence)
+        {
+            boundary = Some(candidate);
+        }
+    }
+    let Some((last_sequence, last_cursor)) = boundary else {
+        return Ok(());
+    };
+    if actual.event_sequence <= last_sequence {
+        return Err(CoordinatorError::StaleResult);
+    }
+    if actual.event_cursor != last_cursor {
+        return Err(CoordinatorError::IdentityConflict("event_cursor"));
+    }
+    Ok(())
 }
 
 /// Production observation-intake gate for one candidate result (issue #369
@@ -1446,6 +1506,7 @@ impl AgentCoordinator {
             .validate(&work_unit.effect_ceiling)
             .map_err(provider_contract)?;
         validate_result_intake_binding(&current, &submission.result, &work_unit.effect_ceiling)?;
+        validate_intake_event_boundary(self, &current, &submission.result.actual_route)?;
         if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
         }
