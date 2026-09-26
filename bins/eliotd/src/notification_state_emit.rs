@@ -108,23 +108,25 @@ use eliot_contracts::{
 use eliot_governor::{
     CanonicalWriteEnvelope, CompositionError, KernelGenerationSnapshotProvider, KernelPortError,
 };
-use eliot_kernel_core::{DeadlineOrReview, DeliveryChannel, NotificationDraft, NotificationSeverity};
+use eliot_kernel_core::{
+    DeadlineOrReview, DeliveryChannel, NotificationDraft, NotificationSeverity,
+};
 use eliot_maintenance::AutomationTriggerDecision;
 use eliot_platform::PlatformHandle;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{
-    ArtifactBinding, AuthorityBinding, CausalBinding, OperationBinding, ProofCeiling,
-    ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding, WorkScopeBinding,
+    ArtifactBinding, AuthorityBinding, CausalBinding, OperationBinding, ProofCeiling, ReceiptCore,
+    ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding, WorkScopeBinding,
     WorkScopeId,
 };
 use eliot_store_api::{
     CanonicalReadClient, EffectClass, EventProjectionRelationIntents,
-    NOTIFICATION_STATE_MUTATION_NAME, NOTIFICATION_STATE_MUTATION_UPSERT,
-    NOTIFICATION_STATE_SCOPE, NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_MUTATION,
-    NOTIFY_PARAM_RECORD_JSON, NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NamedReadOperation,
-    NamedReadRequest, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    ReadConsistency, RevisionHeadExpectation, ScopeId, SecurityContext, StoreError,
-    TransitionClass, WriteReceipt, WriteReceiptStatus,
+    NOTIFICATION_STATE_MUTATION_NAME, NOTIFICATION_STATE_SCOPE, NOTIFY_MUTATION_UPSERT,
+    NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_RECORD_JSON,
+    NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NamedReadOperation, NamedReadRequest, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReadConsistency,
+    RevisionHeadExpectation, ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt,
+    WriteReceiptStatus,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -562,8 +564,7 @@ fn source_receipt_json(
         contract: eliot_receipts::contract_identity().map_err(StoreError::Receipt)?,
         kind: ReceiptKind::Operation,
         work_scope: WorkScopeBinding {
-            scope_id: WorkScopeId::new(key.affected_scope.clone())
-                .map_err(StoreError::Receipt)?,
+            scope_id: WorkScopeId::new(key.affected_scope.clone()).map_err(StoreError::Receipt)?,
             product_id: identity.request.metadata.product_id.clone(),
             resource_generation: state_fence.resource_generation,
             state_fence: state_fence.clone(),
@@ -614,8 +615,7 @@ fn source_receipt_json(
             proof: ProofCeiling::Observation,
         },
     };
-    let receipt =
-        ReceiptEnvelope::issue(core).map_err(StoreError::Receipt)?;
+    let receipt = ReceiptEnvelope::issue(core).map_err(StoreError::Receipt)?;
     serde_json::to_value(&receipt).map_err(|error| StoreError::Serialization(error.to_string()))
 }
 
@@ -647,7 +647,7 @@ fn notification_transition(
     let mut parameters = BTreeMap::new();
     parameters.insert(
         NOTIFY_PARAM_MUTATION.to_owned(),
-        serde_json::Value::String(NOTIFICATION_STATE_MUTATION_UPSERT.to_owned()),
+        serde_json::Value::String(NOTIFY_MUTATION_UPSERT.to_owned()),
     );
     parameters.insert(
         NOTIFY_PARAM_DEDUP_KEY.to_owned(),
