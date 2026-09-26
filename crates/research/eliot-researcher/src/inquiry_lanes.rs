@@ -4263,12 +4263,10 @@ impl InquiryLaneDiscipline {
         // `verify_lane_and_profile_binding` states: naming the full
         // `integrity_digest` would be a SHA-256 fixed point, because that digest
         // already covers the committed registration identity.
-        let registration_binds_profile = self
-            .active_registration()
-            .is_none_or(|registration| {
-                registration.profile_digest == self.profile.registration_binding_digest
-                    && registration.inquiry_id == self.profile.inquiry_id
-            });
+        let registration_binds_profile = self.active_registration().is_none_or(|registration| {
+            registration.profile_digest == self.profile.registration_binding_digest
+                && registration.inquiry_id == self.profile.inquiry_id
+        });
         if !registration_binds_profile {
             return Err(LaneRegistrationError::OrderingReceiptReplayed {
                 field: "revalidate.registration_profile_digest",
