@@ -462,10 +462,14 @@ fn decode_event_port_outcome(
             || !matches!(
                 pressure.dimension,
                 BridgeEventCapacityDimension::EventRecords
+                    | BridgeEventCapacityDimension::EnvelopeBytes
                     | BridgeEventCapacityDimension::PendingHandoffs
             )
-            || (pressure.dimension == BridgeEventCapacityDimension::EventRecords
-                && pressure.local_phase != BridgeEventLocalPhase::NotCommitted)
+            || (matches!(
+                pressure.dimension,
+                BridgeEventCapacityDimension::EventRecords
+                    | BridgeEventCapacityDimension::EnvelopeBytes
+            ) && pressure.local_phase != BridgeEventLocalPhase::NotCommitted)
             || value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false)
             || reply_stream != event.stream_id
             || reply_event != event.event_id

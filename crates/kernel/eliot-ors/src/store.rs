@@ -187,9 +187,8 @@ const BRIDGE_EVENT_HANDOFFS: TableDefinition<&str, &str> =
 /// (typed backpressure), never with silent loss.
 const MAX_BRIDGE_EVENT_RECORDS: usize = 2048;
 /// Maximum canonical envelope bytes staged per bridge event. Mirrors the I7.2
-/// hard MCP structured response ceiling (256 KiB): larger envelopes fail with
-/// [`OrsError::PayloadTooLarge`] instead of occupying unbounded durable
-/// space.
+/// hard MCP structured response ceiling (256 KiB): an oversized admission
+/// returns `EnvelopeBytes` backpressure before the event transaction begins.
 const MAX_BRIDGE_EVENT_ENVELOPE_BYTES: usize = 256 * 1024;
 /// Maximum rows served by one bridge-event pending page. Restart enumeration
 /// walks pages with continuations; nothing materializes an unbounded page.
@@ -5812,6 +5811,14 @@ impl RedbRecoveryStore {
         Ok((redacted, classes, reason))
     }
 
+    fn bridge_event_envelope_capacity_error() -> OrsError {
+        OrsError::BridgeEventCapacityExceeded(
+            eliot_contracts::BridgeEventCapacityPressure::envelope_bytes(
+                eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+            ),
+        )
+    }
+
     /// Resolves the I7.23 disclosure staging for one stage call: the
     /// presented pre-persistence decision must equal the decision this owner
     /// recomputes over the canonical envelope bytes, and denied bytes resolve
@@ -5973,7 +5980,7 @@ impl RedbRecoveryStore {
                 reason: "bridge event envelope is not canonicalizable",
             })?;
         if envelope_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES {
-            return Err(OrsError::PayloadTooLarge);
+            return Err(Self::bridge_event_envelope_capacity_error());
         }
         let presented_sha = bridge_text(staged, "envelope_sha256")?;
         crate::model::validate_digest(&presented_sha, "envelope_sha256")?;
@@ -7959,7 +7966,7 @@ impl RedbRecoveryStore {
                 reason: "bridge event envelope is not canonicalizable",
             })?;
         if envelope_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES {
-            return Err(OrsError::PayloadTooLarge);
+            return Err(Self::bridge_event_envelope_capacity_error());
         }
         let presented_sha = bridge_text(staged, "envelope_sha256")?;
         crate::model::validate_digest(&presented_sha, "envelope_sha256")?;

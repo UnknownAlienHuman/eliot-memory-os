@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 pub enum BridgeEventCapacityDimension {
     /// Retained event rows for fresh event identities.
     EventRecords,
+    /// Canonical bytes of one durable event envelope.
+    EnvelopeBytes,
     /// Pending handoff rows that retain delivery obligations.
     PendingHandoffs,
     /// Scoped gap rows retained for one producer stream.
@@ -68,6 +70,15 @@ impl BridgeEventCapacityPressure {
         }
     }
 
+    /// Builds pressure for the canonical per-envelope byte ceiling.
+    pub const fn envelope_bytes(local_phase: BridgeEventLocalPhase) -> Self {
+        Self {
+            dimension: BridgeEventCapacityDimension::EnvelopeBytes,
+            recovery: BridgeEventCapacityRecovery::ReconcileStagedEvents,
+            local_phase,
+        }
+    }
+
     /// Builds pressure for the pending-handoff budget.
     pub const fn pending_handoffs(local_phase: BridgeEventLocalPhase) -> Self {
         Self {
@@ -92,7 +103,8 @@ impl BridgeEventCapacityPressure {
         matches!(
             (self.dimension, self.recovery),
             (
-                BridgeEventCapacityDimension::EventRecords,
+                BridgeEventCapacityDimension::EventRecords
+                    | BridgeEventCapacityDimension::EnvelopeBytes,
                 BridgeEventCapacityRecovery::ReconcileStagedEvents
             ) | (
                 BridgeEventCapacityDimension::PendingHandoffs,
