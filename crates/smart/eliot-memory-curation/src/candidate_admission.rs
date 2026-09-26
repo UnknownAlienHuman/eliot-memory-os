@@ -28,6 +28,9 @@ use eliot_epistemic::lifecycle::{
 };
 use eliot_evidence::EpistemicStatus;
 
+// Frozen intra-facade path: both modules are #40-deprecated together and are
+// removed together; no new caller may join this edge.
+#[allow(deprecated)]
 use crate::admission::{
     AdmissionChainView, CurationAdmission, CurationMutationOperation, verify_admission_chain,
 };

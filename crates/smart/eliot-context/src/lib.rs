@@ -7,6 +7,9 @@
 //! inspect every decision made by the compiler.
 
 #![forbid(unsafe_code)]
+// Frozen #40 facade: internal cross-uses of deprecated compat items stay
+// warning-free here; downstream uses still warn. See `facade`.
+#![allow(deprecated)]
 
 use std::{
     cmp::Ordering,
@@ -360,6 +363,13 @@ pub struct CompiledContext {
 }
 
 /// Pure compiler for decision-local context.
+///
+/// Frozen #40 compatibility entry point: behavior is pinned by
+/// `tests/admission_integrity.rs` and the #832 battery. Do not extend.
+/// See [`facade::FACADE_DISPOSITIONS`] for the bounded removal plan.
+#[deprecated(
+    note = "#40 frozen compat; migrate to the eliot-context cells via the facade adapters"
+)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ContextCompiler;
 
@@ -1000,6 +1010,10 @@ impl std::error::Error for LegacyCueKindError {}
 /// empty or differently-cased text) fails as
 /// [`LegacyCueKindError::UnknownSpelling`]. Ambiguous input stays
 /// rejected rather than guessing context.
+///
+/// Frozen #40 compatibility decoder: behavior is pinned by the #832 battery.
+/// Do not extend. See [`facade::FACADE_DISPOSITIONS`].
+#[deprecated(note = "#40 frozen compat; frozen #832 legacy decoder, no owner conversion exists")]
 pub fn decode_legacy_cue_kind(value: &str) -> Result<CueKind, LegacyCueKindError> {
     match value {
         "SYMBOL" => Ok(CueKind::Symbol),
@@ -1081,6 +1095,10 @@ pub struct CueActivation {
 /// Declaration order follows the single A-10 owner
 /// (`eliot_cue_contracts::CueKind`); this crate defines no kind ordering
 /// of its own.
+///
+/// Frozen #40 compatibility entry point: behavior is pinned by the #832
+/// battery. Do not extend. See [`facade::FACADE_DISPOSITIONS`].
+#[deprecated(note = "#40 frozen compat; cue firing owners are the eliot-cue cells")]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CueIndex {
     entries: Vec<(String, CueKind, String, Vec<ArtifactId>)>,
@@ -1140,6 +1158,10 @@ impl CueIndex {
 }
 
 /// Request for a bounded, read-only orientation packet.
+///
+/// Frozen #40 compatibility entry point: no admitted owner cell exists yet.
+/// Do not extend. See [`facade::FACADE_DISPOSITIONS`].
+#[deprecated(note = "#40 frozen compat; no admitted orientation owner cell yet")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationRequest {
@@ -1210,6 +1232,18 @@ impl OrientationRequest {
         })
     }
 }
+
+pub mod facade;
+
+pub use eliot_context_assembly::{ActiveUnderstandingViewResult, AssemblyPolicy};
+pub use eliot_context_candidates::{
+    AttentionInput, CandidatePolicy, CandidateRequest, ContextCandidateSetResult, CueInput,
+    EpistemicInput, EvidenceInput, OpaqueProjection,
+};
+pub use eliot_context_contracts::{
+    AdmissionInput, AdmissionResult, AdmittedContextSet, ContextCandidate, ContextCandidateSet,
+    QualityScorecard, SerializedContextMeasurement,
+};
 
 #[cfg(test)]
 mod tests {
