@@ -14,6 +14,9 @@ eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.
 eliot-contracts.workspace = true
 eliot-cue-contracts = { path = "../eliot-cue-contracts", version = "0.1.0" }
 eliot-evidence.workspace = true
+eliot-learning-contracts.workspace = true
+eliot-learning-state-view.workspace = true
+eliot-protocol.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

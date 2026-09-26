@@ -32,7 +32,7 @@ use eliot_process::{
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
-    RequestIdentity, host_request_operation_id,
+    RequestIdentity, TaskControllerResultBody, host_request_operation_id,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -40,11 +40,13 @@ use eliot_runtime_contracts::{
     DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
 };
 use eliot_store_api::{
-    CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
-    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
-    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
+    CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
+    CampaignSourceRevisionRef, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationIdentity, OrderingHeadExpectation, PreparedTransition,
+    ReadConsistency, RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation,
+    StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -441,6 +443,10 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
+        "campaign_packet_claim" => "campaign_packet_claim",
+        "campaign_packet_result" => "campaign_packet_result",
+        "task_controller_claim" => "task_controller_claim",
+        "task_controller_result" => "task_controller_result",
         "agent_host_request_submit" => "agent_host_request_submit",
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
@@ -906,6 +912,347 @@ impl NotificationPageQuery {
             self.state_fence.clone(),
         )
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the closed campaign publication admission path keeps the source transition, owner matrix, and recipe binding together"
+)]
+fn campaign_source_publications_for_transition(
+    transition: &PreparedTransition,
+    request_id: &eliot_contracts::RequestId,
+) -> Result<Vec<CampaignSourcePublication>, String> {
+    let mut task_operation = None;
+    let mut task_recipe: Option<eliot_store_api::LearningStateViewRecipe> = None;
+    let mut campaign_matrix_complete = false;
+    let mut publications = Vec::new();
+    for operation in &transition.named_operations {
+        if operation.operation != eliot_store_api::NamedMutationOperation::UpdateTaskState {
+            if operation
+                .parameters
+                .contains_key("campaign_source_publications_json")
+            {
+                return Err(
+                    "campaign source publication must be carried by the owner transition".into(),
+                );
+            }
+            continue;
+        }
+        if task_operation.is_some() {
+            return Err("campaign publication transition must contain one task update".into());
+        }
+        let task_id = operation
+            .parameters
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "task update lacks its exact task identity".to_owned())?;
+        task_operation = Some(task_id.to_owned());
+        if let Some(value) = operation
+            .parameters
+            .get("campaign_source_publications_json")
+        {
+            publications = serde_json::from_value(value.clone()).map_err(|_| {
+                "campaign source publications are not the closed typed list".to_owned()
+            })?;
+        }
+        if let Some(value) = operation.parameters.get("campaign_source_matrix_complete") {
+            campaign_matrix_complete = match value.as_str() {
+                Some("true") => true,
+                Some("false") => false,
+                _ => {
+                    return Err(
+                        "campaign source matrix completeness marker is not a boolean wire value"
+                            .into(),
+                    );
+                }
+            };
+        }
+        if let Some(value) = operation
+            .parameters
+            .get("campaign_learning_state_recipe_json")
+        {
+            let text = value.as_str().ok_or_else(|| {
+                "campaign learning-state recipe parameter is not a JSON string".to_owned()
+            })?;
+            task_recipe = Some(serde_json::from_str(text).map_err(|_| {
+                "campaign learning-state recipe parameter is not the closed typed recipe".to_owned()
+            })?);
+        }
+    }
+    if campaign_matrix_complete && task_recipe.is_none() {
+        return Err("complete campaign source matrix requires its bound recipe".into());
+    }
+    if publications.is_empty() {
+        if task_recipe.is_some() {
+            return Err(
+                "campaign learning-state recipe requires its atomic source publications".into(),
+            );
+        }
+        return Ok(publications);
+    }
+    let task_id = task_operation
+        .ok_or_else(|| "campaign source publication has no task update".to_owned())?;
+    if transition.transition_class != eliot_store_api::TransitionClass::TaskControl
+        || transition.task_id.as_deref() != Some(task_id.as_str())
+        || transition.state_fence.task_revision.is_none()
+    {
+        return Err("campaign sources require the exact TaskControl task/fence binding".into());
+    }
+    let task_revision = transition
+        .state_fence
+        .task_revision
+        .as_ref()
+        .ok_or_else(|| "campaign sources require an exact task revision fence".to_owned())?;
+    let task_record_id = eliot_store_api::CampaignOwnerRecordId::Task(
+        eliot_contracts::TaskId::new(task_id.clone()).map_err(|error| error.to_string())?,
+    );
+    let mut by_role = BTreeMap::new();
+    for publication in &publications {
+        publication.validate().map_err(|error| error.to_string())?;
+        if publication.read_receipt.read_state_fence != transition.state_fence {
+            return Err(
+                "campaign source publication is not bound to the admitted read fence".into(),
+            );
+        }
+        let record = &publication.record;
+        match &publication.state {
+            eliot_store_api::CampaignSourcePublicationState::NewRevision { .. }
+                if record.recorded_state_fence != transition.state_fence =>
+            {
+                return Err(
+                    "new campaign source must carry the exact admitted transition fence".into(),
+                );
+            }
+            eliot_store_api::CampaignSourcePublicationState::CurrentReference { .. }
+                if publication.read_receipt.read_state_fence != transition.state_fence =>
+            {
+                return Err(
+                    "current campaign source reference must carry the exact admitted read fence"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        if !campaign_matrix_complete
+            && !matches!(
+                record.role,
+                eliot_store_api::CampaignSourceRole::TaskObjective
+                    | eliot_store_api::CampaignSourceRole::TaskAcceptance
+                    | eliot_store_api::CampaignSourceRole::TaskPlan
+                    | eliot_store_api::CampaignSourceRole::TaskOpenItems
+            )
+        {
+            return Err(
+                "partial campaign source publication may carry only Task Controller rows".into(),
+            );
+        }
+        if by_role.insert(record.role, publication).is_some() {
+            return Err("campaign source publication matrix contains a duplicate role".into());
+        }
+        if matches!(
+            record.role,
+            eliot_store_api::CampaignSourceRole::TaskObjective
+                | eliot_store_api::CampaignSourceRole::TaskPlan
+        ) && (record.record_id != task_record_id
+            || record.revision != eliot_store_api::CampaignOwnerRevision::Task(*task_revision))
+        {
+            return Err(
+                "Task Controller source identity must match the admitted task revision".into(),
+            );
+        }
+    }
+
+    let task_roles = [
+        eliot_store_api::CampaignSourceRole::TaskObjective,
+        eliot_store_api::CampaignSourceRole::TaskAcceptance,
+        eliot_store_api::CampaignSourceRole::TaskPlan,
+        eliot_store_api::CampaignSourceRole::TaskOpenItems,
+    ];
+    if campaign_matrix_complete {
+        let Some(recipe) = task_recipe.as_ref() else {
+            return Err("complete campaign source matrix requires its bound recipe".into());
+        };
+        let expected_publications = recipe
+            .source_requirements
+            .iter()
+            .filter(|requirement| {
+                requirement.source_binding
+                    != eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent
+            })
+            .count();
+        if by_role.len() != expected_publications {
+            return Err(format!(
+                "complete campaign source matrix requires {expected_publications} publications after explicit absences, observed {}",
+                by_role.len()
+            ));
+        }
+        for requirement in &recipe.source_requirements {
+            match requirement.source_binding {
+                eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent => {
+                    if by_role.contains_key(&requirement.role) {
+                        return Err(format!(
+                            "explicitly absent campaign role {:?} must not have a publication",
+                            requirement.role
+                        ));
+                    }
+                }
+                _ => {
+                    if !by_role.contains_key(&requirement.role) {
+                        return Err(format!(
+                            "complete campaign source matrix omits declared role {:?}",
+                            requirement.role
+                        ));
+                    }
+                }
+            }
+        }
+    } else if by_role.len() != task_roles.len()
+        || task_roles.iter().any(|role| !by_role.contains_key(role))
+    {
+        return Err(
+            "partial campaign source publication must contain the four Task Controller rows".into(),
+        );
+    }
+
+    if let Some(recipe) = task_recipe {
+        recipe.validate().map_err(|error| error.to_string())?;
+        for role in by_role.keys() {
+            if !recipe
+                .source_requirements
+                .iter()
+                .any(|requirement| requirement.role == *role)
+            {
+                return Err("campaign source publication contains an undeclared role".into());
+            }
+        }
+        let mut history_count = 0usize;
+        for publication in &publications {
+            history_count = history_count.saturating_add(publication.record.history_plans.len());
+            for history in &publication.record.history_plans {
+                history
+                    .validate_for_source_at_fence(
+                        recipe.campaign_id.as_str(),
+                        &publication.record.owner_id,
+                        &transition.state_fence,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if campaign_matrix_complete && history_count == 0 {
+            return Err("complete campaign source matrix requires owner-produced history".into());
+        }
+        if recipe.binding.task_id.as_str() != task_id
+            || recipe.binding.request_id != *request_id
+            || recipe.binding.operation_id != transition.identity.operation_id
+            || recipe.binding.state_fence != transition.state_fence
+        {
+            return Err("TaskPlan recipe does not bind the admitted task operation".into());
+        }
+        let task_plan = by_role
+            .get(&eliot_store_api::CampaignSourceRole::TaskPlan)
+            .ok_or_else(|| "TaskPlan source publication is missing".to_owned())?;
+        let task_plan_recipe: eliot_store_api::LearningStateViewRecipe =
+            serde_json::from_value(task_plan.record.document.body.clone())
+                .map_err(|_| "TaskPlan is not the typed learning-state recipe".to_owned())?;
+        if task_plan_recipe != recipe {
+            return Err("TaskPlan publication and recipe parameter are not byte-equivalent".into());
+        }
+        if task_plan.record.record_id
+            != eliot_store_api::CampaignOwnerRecordId::Task(
+                eliot_contracts::TaskId::new(task_id.clone()).map_err(|error| error.to_string())?,
+            )
+            || task_plan.record.revision
+                != eliot_store_api::CampaignOwnerRevision::Task(*task_revision)
+            || task_plan.record.recorded_state_fence != recipe.binding.state_fence
+        {
+            return Err("TaskPlan publication does not bind the admitted task identity".into());
+        }
+        let anchor = recipe
+            .source_requirements
+            .iter()
+            .find(|requirement| requirement.role == eliot_store_api::CampaignSourceRole::TaskPlan)
+            .ok_or_else(|| "TaskPlan recipe lacks its authenticated anchor".to_owned())?;
+        if anchor.owner.as_str() != eliot_store_api::TASK_CONTROLLER_CAMPAIGN_OWNER_ID
+            || anchor.source_binding
+                != eliot_store_api::CampaignSourceBinding::AuthenticatedTaskAnchor
+            || anchor.expected_reference.is_some()
+        {
+            return Err("TaskPlan recipe has an invalid authenticated owner anchor".into());
+        }
+        let objective_requirement = recipe
+            .source_requirements
+            .iter()
+            .find(|requirement| {
+                requirement.role == eliot_store_api::CampaignSourceRole::TaskObjective
+            })
+            .ok_or_else(|| "TaskPlan recipe lacks its TaskObjective source".to_owned())?;
+        let objective_publication = by_role
+            .get(&eliot_store_api::CampaignSourceRole::TaskObjective)
+            .ok_or_else(|| "TaskObjective source publication is missing".to_owned())?;
+        let expected_objective = objective_requirement
+            .expected_reference
+            .as_ref()
+            .ok_or_else(|| "TaskObjective recipe reference is missing".to_owned())?;
+        let observed_objective = CampaignSourceRevisionRef {
+            role: objective_publication.record.role,
+            owner: objective_publication.record.owner_id.clone(),
+            record_id: objective_publication.record.record_id.clone(),
+            revision: objective_publication.record.revision.clone(),
+            content_digest: objective_publication.record.content_digest.clone(),
+            slot_projection_digests: objective_publication.record.slot_projection_digests.clone(),
+            recorded_state_fence: objective_publication.record.recorded_state_fence.clone(),
+        };
+        if &observed_objective != expected_objective {
+            return Err(
+                "TaskPlan reference does not bind the owner-issued TaskObjective row".into(),
+            );
+        }
+        for requirement in &recipe.source_requirements {
+            let Some(publication) = by_role.get(&requirement.role) else {
+                if requirement.source_binding
+                    == eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent
+                    || (!campaign_matrix_complete
+                        && !matches!(
+                            requirement.role,
+                            eliot_store_api::CampaignSourceRole::TaskObjective
+                                | eliot_store_api::CampaignSourceRole::TaskPlan
+                        ))
+                {
+                    continue;
+                }
+                return Err("campaign source publication matrix omits a declared owner".into());
+            };
+            if requirement.source_binding
+                == eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent
+            {
+                return Err("an explicitly absent source cannot be published".into());
+            }
+            if requirement.source_binding == eliot_store_api::CampaignSourceBinding::ExactReference
+            {
+                let expected = requirement.expected_reference.as_ref().ok_or_else(|| {
+                    "exact source requirement lacks its owner reference".to_owned()
+                })?;
+                let observed = CampaignSourceRevisionRef {
+                    role: publication.record.role,
+                    owner: publication.record.owner_id.clone(),
+                    record_id: publication.record.record_id.clone(),
+                    revision: publication.record.revision.clone(),
+                    content_digest: publication.record.content_digest.clone(),
+                    slot_projection_digests: publication.record.slot_projection_digests.clone(),
+                    recorded_state_fence: publication.record.recorded_state_fence.clone(),
+                };
+                if &observed != expected {
+                    return Err("published source does not match the recipe owner reference".into());
+                }
+            }
+        }
+    } else if by_role
+        .keys()
+        .any(|role| !matches!(role, eliot_store_api::CampaignSourceRole::TaskObjective))
+    {
+        return Err("owner-specific campaign sources require the bound recipe".into());
+    }
+    Ok(publications)
 }
 
 #[derive(Deserialize)]
@@ -1689,6 +2036,134 @@ impl KernelComposition {
                             Self::settled_observe_daemon_response(record.operation_id.as_str()),
                         ),
                         Ok(host_request_route::ObserveDeferDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "campaign_packet_claim" => {
+                // Campaign packets have their own closed queue and attempt
+                // ledger. This route never scans the `eliot.query` queue and
+                // never derives evidence-pack selectors from packet material.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_campaign_packet_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, tool, attempt)) => serde_json::json!({
+                                "status": "known",
+                                "value": {
+                                    "pair": {
+                                        "envelope": envelope,
+                                        "tool": tool,
+                                        "attempt": attempt,
+                                    }
+                                },
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "campaign_packet_result" => {
+                // A packet result is submitted through the packet queue only;
+                // the shared result gate still proves the exact attempt,
+                // envelope fence, owner publication binding, and digest.
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_campaign_packet_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "task_controller_claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_task_controller_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, tool, invocation, attempt)) => serde_json::json!({
+                                "status": "known",
+                                "value": {
+                                    "pair": {
+                                        "invocation": invocation,
+                                        "envelope": envelope,
+                                        "tool": tool,
+                                        "operation_id": attempt.operation_id,
+                                        "attempt": attempt,
+                                    }
+                                },
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "task_controller_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: TaskControllerResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_task_controller_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
@@ -3875,6 +4350,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the authenticated store admission path retains the complete prepared-transition and source-publication checks"
+    )]
     async fn store_apply_operation(
         &self,
         session: &Session,
@@ -3970,6 +4449,31 @@ impl KernelComposition {
         {
             return Ok(rejection);
         }
+        let campaign_source_publications = match campaign_source_publications_for_transition(
+            &operation.transition,
+            &operation.context.request_id,
+        ) {
+            Ok(publications) => publications,
+            Err(error) => {
+                return Ok(Self::store_error_response_text("write_receipt", &error));
+            }
+        };
+        let campaign_source_operation_id = operation.transition.identity.operation_id.clone();
+        let campaign_source_request_digest =
+            operation.transition.identity.canonical_request_hash.clone();
+        if !campaign_source_publications.is_empty()
+            && let Err(error) = self.p07_ors.reserve_campaign_source_publications(
+                &campaign_source_operation_id,
+                &campaign_source_request_digest,
+                &campaign_source_publications,
+            )
+        {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                &error.to_string(),
+            ));
+        }
+        let gateway = self.retained_store_gateway()?;
         match gateway
             .apply(
                 &operation.context,
@@ -3979,7 +4483,36 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => Ok(store_apply_response(&receipt)),
+            Ok(receipt) => {
+                if !campaign_source_publications.is_empty() {
+                    if receipt.status == WriteReceiptStatus::Committed {
+                        if let Err(error) = self.p07_ors.commit_campaign_source_publications(
+                            &campaign_source_operation_id,
+                            &campaign_source_request_digest,
+                            &campaign_source_publications,
+                            &receipt,
+                        ) {
+                            // Keep the source reservation. An exact replay of
+                            // this same canonical operation obtains the
+                            // durable receipt and completes ORS reconciliation.
+                            return Ok(Self::store_error_response_text(
+                                "write_receipt",
+                                &error.to_string(),
+                            ));
+                        }
+                    } else if let Err(error) = self.p07_ors.abort_campaign_source_publications(
+                        &campaign_source_operation_id,
+                        &campaign_source_request_digest,
+                        &campaign_source_publications,
+                    ) {
+                        return Ok(Self::store_error_response_text(
+                            "write_receipt",
+                            &error.to_string(),
+                        ));
+                    }
+                }
+                Ok(store_apply_response(&receipt))
+            }
             Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
         }
     }
@@ -4308,6 +4841,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed named-read route keeps fence, catalogue, and owner-source admission together"
+    )]
     async fn store_named_operation(
         &self,
         session: &Session,
@@ -4327,6 +4864,107 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
+        if operation.request.operation == NamedReadOperation::GetCampaignLearningStateView {
+            let lookup: CampaignLearningStateViewLookup = operation
+                .request
+                .parameters
+                .get("lookup")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or(TransportError::SessionFenced)?;
+            lookup
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if operation
+                .request
+                .scope_id
+                .as_ref()
+                .map(eliot_store_api::ScopeId::as_str)
+                != Some(lookup.scope_id.as_str())
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let read = match self
+                .p07_ors
+                .load_campaign_learning_state_view(&lookup.view_id)
+            {
+                Ok(Some(publication))
+                    if publication.task_id == lookup.task_id
+                        && publication.scope_id == lookup.scope_id =>
+                {
+                    CampaignLearningStateViewRead {
+                        status: CampaignLearningStateViewReadStatus::Current,
+                        publication: Some(publication),
+                        read_state_fence: operation.request.state_fence.clone(),
+                    }
+                }
+                Ok(Some(_) | None) => CampaignLearningStateViewRead {
+                    status: CampaignLearningStateViewReadStatus::Missing,
+                    publication: None,
+                    read_state_fence: operation.request.state_fence.clone(),
+                },
+                Err(error) => {
+                    return Ok(Self::store_error_response_text(
+                        "store_named",
+                        &error.to_string(),
+                    ));
+                }
+            };
+            read.validate().map_err(|_| TransportError::SessionFenced)?;
+            let response = NamedReadResponse {
+                operation: NamedReadOperation::GetCampaignLearningStateView,
+                state_fence: operation.request.state_fence,
+                revision_heads: Vec::new(),
+                payload: serde_json::json!({"campaign_learning_state_view": read}),
+            };
+            return Ok(store_named_response(&response));
+        }
+        if operation.request.operation == NamedReadOperation::GetCampaignSourceRevision {
+            if operation.request.scope_id.is_none() {
+                return Err(TransportError::SessionFenced);
+            }
+            let lookup: CampaignSourceRevisionLookup = operation
+                .request
+                .parameters
+                .get("lookup")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or(TransportError::SessionFenced)?;
+            lookup
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let read = self
+                .p07_ors
+                .load_campaign_source_revision(&lookup, &operation.request.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if let Some(source) = &read.source
+                && source.document.schema
+                    == eliot_store_api::CampaignSourceDocumentSchema::LearningStateViewRecipe
+            {
+                let recipe_scope = source
+                    .document
+                    .body
+                    .pointer("/binding/scope_id")
+                    .and_then(serde_json::Value::as_str);
+                if recipe_scope
+                    != operation
+                        .request
+                        .scope_id
+                        .as_ref()
+                        .map(eliot_store_api::ScopeId::as_str)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+            }
+            read.validate().map_err(|_| TransportError::SessionFenced)?;
+            let response = NamedReadResponse {
+                operation: NamedReadOperation::GetCampaignSourceRevision,
+                state_fence: operation.request.state_fence,
+                revision_heads: Vec::new(),
+                payload: serde_json::json!({"campaign_source_revision": read}),
+            };
+            return Ok(store_named_response(&response));
+        }
         // Authority-history reads are Kernel-owned fence state (`#2100`):
         // serve durable closure-fence history from the retained ORS instead
         // of forwarding to the store bridge. The store catalogue truthfully
@@ -4366,9 +5004,9 @@ impl KernelComposition {
         Err(TransportError::SessionFenced)
     }
 
-    /// Executes one closed local read for an admitted `eliot.query`.
+    /// Executes one closed local read for an admitted query or campaign packet.
     ///
-    /// The `local_read` kind is the GetEvidencePack-only sibling of
+    /// The `local_read` kind is the authenticated dispatch sibling of
     /// `store_named` on the same authenticated daemon session: no new
     /// transport, pipe, or listener. Rejection happens before reading —
     /// linkage plus closed selectors are proven (pure, no IO), then the full
@@ -4384,8 +5022,10 @@ impl KernelComposition {
     /// never bypass attempt ownership: persistence, exact-replay, conflict,
     /// expiry, fence, and staleness joins are identical to the async submit
     /// leg. A stale attempt fails closed here (never a bound result);
-    /// `eliot.packet` pairs are admitted and returned honestly, never read on
-    /// this leg.
+    /// `eliot.packet` pairs are admitted, queued, and claimed through the
+    /// same attempt-bound lifecycle; the daemon campaign compiler performs
+    /// their owner reads and result construction before the shared submit
+    /// leg.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -4409,18 +5049,23 @@ impl KernelComposition {
         // Rejection-before-reading: linkage plus closed selectors next. This
         // validation is pure, so a changed payload digest, a forged
         // descriptor, or a malformed selector never reaches Gateway IO.
-        let selectors = host_request_route::check_local_read_admission(&envelope, &tool)?;
+        let admission = host_request_route::check_local_read_admission(&envelope, &tool)?;
+        let selectors = match admission {
+            host_request_route::LocalReadAdmission::Query(selectors) => selectors,
+            host_request_route::LocalReadAdmission::CampaignPacket { .. } => {
+                // `local_read` is the query-only Gateway leg. A campaign
+                // packet is served only by the dedicated packet claim/compile/
+                // result flight; admitting it here would risk reinterpreting
+                // packet material as `GetEvidencePack` selectors.
+                return Err(TransportError::SessionFenced);
+            }
+        };
         let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
         if let Some(replayed) =
             host_request_route::local_read_replay_response(&receipt, &record, &envelope)?
         {
             return Ok(replayed);
         }
-        let Some(selectors) = selectors else {
-            return Ok(host_request_route::host_request_admitted_response(
-                &receipt, &record,
-            ));
-        };
         // No bypass: the presented attempt must be the live claim-record
         // attempt owned by the presenting session before any Gateway IO. A
         // replaced, retired, or revoked attempt fails closed here. Full
