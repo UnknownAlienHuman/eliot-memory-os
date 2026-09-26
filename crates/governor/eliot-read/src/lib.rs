@@ -95,7 +95,8 @@ use eliot_contracts::{
 };
 use eliot_store_api::{
     CanonicalReadClient, ExperienceRangePage, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
+    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
+    StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1432,13 +1433,14 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         max_records: u32,
     ) -> Result<QueryResult, ReadError> {
         let binding = Self::evidence_query_binding()?;
-        let subject_selector = binding
-            .subject_selector
-            .as_deref()
-            .ok_or_else(|| ReadError::InvalidField {
-                field: "local_read_port.EvidenceQuery.Subject".to_owned(),
-                reason: "the store declares no required discriminator selector".to_owned(),
-            })?;
+        let subject_selector =
+            binding
+                .subject_selector
+                .as_deref()
+                .ok_or_else(|| ReadError::InvalidField {
+                    field: "local_read_port.EvidenceQuery.Subject".to_owned(),
+                    reason: "the store declares no required discriminator selector".to_owned(),
+                })?;
         let bound_selector = binding
             .result_set_bound_selector
             .as_deref()
@@ -1455,7 +1457,10 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         }
         let parameters = NamedParameters::from_map(BTreeMap::from([
             (subject_selector.to_owned(), Value::String(subject)),
-            (bound_selector.to_owned(), Value::String(max_records.to_string())),
+            (
+                bound_selector.to_owned(),
+                Value::String(max_records.to_string()),
+            ),
         ]))?;
         let request = QueryRequest {
             intent: binding.intent,
@@ -1523,29 +1528,6 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
     }
 }
 
-impl<C: CanonicalReadClient> ReadService<C> {
-    /// Resolves the declared, store-validated binding of the evidence-query
-    /// port method.
-    ///
-    /// The binding is a section of this owner's resolved inventory, so the
-    /// port's intent, operation, consistency and selector names come from one
-    /// audited place and are checked against the Store declaration table rather
-    /// than written as literals at this call site.
-    fn evidence_query_binding() -> Result<LocalReadPortBinding, ReadError> {
-        Ok(owner_inventory::read_owner_inventory()?
-            .port_binding(LocalReadPortMethod::EvidenceQuery)?
-            .clone())
-    }
-
-    /// Resolves the declared, store-validated binding of the
-    /// projection-inputs port method.
-    fn projection_inputs_binding() -> Result<LocalReadPortBinding, ReadError> {
-        Ok(owner_inventory::read_owner_inventory()?
-            .port_binding(LocalReadPortMethod::ProjectionInputs)?
-            .clone())
-    }
-}
-
 /// Governor read service over a store-neutral canonical client.
 pub struct ReadService<C> {
     store: C,
@@ -1560,6 +1542,27 @@ impl<C: CanonicalReadClient> ReadService<C> {
     /// Returns the underlying store client to the owning composition root.
     pub fn into_store(self) -> C {
         self.store
+    }
+
+    /// Resolves the declared, store-validated binding of the evidence-query
+    /// port method.
+    ///
+    /// The binding is a section of this owner's resolved inventory, so the
+    /// port's intent, operation, consistency and selector names come from one
+    /// audited place and are checked against the Store declaration table rather
+    /// than written as literals at the call site.
+    fn evidence_query_binding() -> Result<LocalReadPortBinding, ReadError> {
+        Ok(owner_inventory::read_owner_inventory()?
+            .port_binding(LocalReadPortMethod::EvidenceQuery)?
+            .clone())
+    }
+
+    /// Resolves the declared, store-validated binding of the
+    /// projection-inputs port method.
+    fn projection_inputs_binding() -> Result<LocalReadPortBinding, ReadError> {
+        Ok(owner_inventory::read_owner_inventory()?
+            .port_binding(LocalReadPortMethod::ProjectionInputs)?
+            .clone())
     }
 
     /// The single read engine of this package: resolve the identity closure,
@@ -1585,8 +1588,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
             field: "request_metadata".to_owned(),
             reason: error.to_string(),
         })?;
-        let comparison =
-            owner_inventory::compare_operation_with_store_read_model(operation)?;
+        let comparison = owner_inventory::compare_operation_with_store_read_model(operation)?;
         comparison.refuse_scope_divergence()?;
         let source = comparison.source.clone();
         let schema = comparison.schema.clone();

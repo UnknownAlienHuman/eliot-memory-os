@@ -54,13 +54,13 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     BoundRead, BranchEnvironmentScope, CONTRACT_NAME, CONTRACT_VERSION, CurrentStateView,
-    DeclaredPageSelector, DeclaredResultSelector, EliotResourceUri, FreshnessPolicy, NamedParameters,
-    ProvenanceDisposition, ProvenanceHandle, QueryIntent, QueryMode, QueryRequest, QueryResult,
-    ReadCoverage, ReadError, ReadIdentity, ReadInvalidationSet, ReadOrderingBinding, ReadOutcome,
-    ReadPrincipal, ReadProvenance, ReadSchemaIdentity, ReadSourceIdentity, RequiredAssurance,
-    ResourceContent, ResourceRequest, StateRequest, StoreReadFailure, TimeScope, contract_identity,
-    context_reconstruction_operations, declares_store_coverage_statement, is_state_operation,
-    operation_matches_intent, requires_scope,
+    DeclaredPageSelector, DeclaredResultSelector, EliotResourceUri, FreshnessPolicy,
+    NamedParameters, ProvenanceDisposition, ProvenanceHandle, QueryIntent, QueryMode, QueryRequest,
+    QueryResult, ReadCoverage, ReadError, ReadIdentity, ReadInvalidationSet, ReadOrderingBinding,
+    ReadOutcome, ReadPrincipal, ReadProvenance, ReadSchemaIdentity, ReadSourceIdentity,
+    RequiredAssurance, ResourceContent, ResourceRequest, StateRequest, StoreReadFailure, TimeScope,
+    context_reconstruction_operations, contract_identity, declares_store_coverage_statement,
+    is_state_operation, operation_matches_intent, requires_scope,
 };
 
 /// How one inventory row was established.
@@ -334,7 +334,8 @@ impl OperationReadModelComparison {
         {
             return Err(ReadError::OperationNotAllowed {
                 operation: self.operation,
-                context: "owner scope declaration is narrower than the store catalogue row".to_owned(),
+                context: "owner scope declaration is narrower than the store catalogue row"
+                    .to_owned(),
             });
         }
         Ok(())
@@ -509,11 +510,19 @@ pub fn read_owner_inventory() -> Result<ReadOwnerInventory, ReadError> {
 pub fn compare_operation_with_store_read_model(
     operation: NamedReadOperation,
 ) -> Result<OperationReadModelComparison, ReadError> {
+    compare_operation_in_catalogue(operation, &generated_manifests()?)
+}
+
+/// Compares one named read against an already generated Store catalogue.
+fn compare_operation_in_catalogue(
+    operation: NamedReadOperation,
+    entries: &[NamedOperationManifest],
+) -> Result<OperationReadModelComparison, ReadError> {
     let operation_name = named_read_operation_name(operation);
     if !activated_read_operations().contains(&operation) {
         return Err(ReadError::Outcome(ReadOutcome::NotRunning));
     }
-    let entry = read_manifest(operation_name)?;
+    let entry = read_manifest(entries, operation_name)?;
     let declared_parameters = resolve_declared_parameter_rows(operation);
     let admitted_query_modes = admitted_query_modes(operation);
     let owner_admission = owner_admission(operation, &admitted_query_modes);
@@ -522,8 +531,8 @@ pub fn compare_operation_with_store_read_model(
     Ok(OperationReadModelComparison {
         operation,
         operation_name: operation_name.to_owned(),
-        source: resolve_source_identity(operation, operation_name, &entry),
-        schema: resolve_schema_identity(operation, &entry)?,
+        source: resolve_source_identity(operation, operation_name, entry),
+        schema: resolve_schema_identity(operation, entry)?,
         owner_admission,
         admitted_query_modes,
         owner_scope,
@@ -697,7 +706,16 @@ const PUBLIC_TYPE_DECLARATIONS: &[PublicTypeDeclaration] = &public_type_rows![
     ReadOwnerInventory => WireObject,
 ];
 
-/// Declared public items of this package that have no concrete type path.const PUBLIC_ITEM_DECLARATIONS: &[PublicTypeDeclaration] = &[
+/// The one generic public type of this package, witnessed through a concrete
+/// view so the compiler reports its real instantiated path.
+const PUBLIC_GENERIC_TYPE_DECLARATIONS: &[PublicTypeDeclaration] = &[PublicTypeDeclaration {
+    name: "BoundRead",
+    kind: PublicApiKind::WireObject,
+    witness: Some(|| std::any::type_name::<BoundRead<CurrentStateView>>()),
+}];
+
+/// Declared public items of this package that have no concrete type path.
+const PUBLIC_ITEM_DECLARATIONS: &[PublicTypeDeclaration] = &[
     PublicTypeDeclaration {
         name: "owner_inventory",
         kind: PublicApiKind::Module,
@@ -819,8 +837,16 @@ fn resolve_contract_identity() -> Result<OwnerContractIdentity, ReadError> {
 /// declared name and against this crate's own module path.
 fn resolve_public_api_rows() -> Result<Vec<PublicApiRow>, ReadError> {
     let mut seen = BTreeSet::new();
-    let mut rows = Vec::with_capacity(PUBLIC_TYPE_DECLARATIONS.len() + PUBLIC_ITEM_DECLARATIONS.len());
-    for declaration in PUBLIC_TYPE_DECLARATIONS.iter().chain(PUBLIC_ITEM_DECLARATIONS) {
+    let mut rows = Vec::with_capacity(
+        PUBLIC_TYPE_DECLARATIONS.len()
+            + PUBLIC_GENERIC_TYPE_DECLARATIONS.len()
+            + PUBLIC_ITEM_DECLARATIONS.len(),
+    );
+    for declaration in PUBLIC_TYPE_DECLARATIONS
+        .iter()
+        .chain(PUBLIC_GENERIC_TYPE_DECLARATIONS)
+        .chain(PUBLIC_ITEM_DECLARATIONS)
+    {
         if !seen.insert(declaration.name) {
             return Err(ReadError::DuplicateField("public_api".to_owned()));
         }
@@ -897,10 +923,15 @@ fn resolve_store_dependency_rows() -> Vec<StoreDependencyRow> {
 }
 
 /// Compares every activated Store read operation with this owner.
+///
+/// The catalogue is generated once for the whole sweep: it is a pure function
+/// of the Store declaration table, so resolving it per operation would repeat
+/// the same digests without adding a single derived value.
 fn compare_activated_read_model() -> Result<Vec<OperationReadModelComparison>, ReadError> {
+    let entries = generated_manifests()?;
     activated_read_operations()
         .into_iter()
-        .map(compare_operation_with_store_read_model)
+        .map(|operation| compare_operation_in_catalogue(operation, &entries))
         .collect()
 }
 
@@ -972,7 +1003,11 @@ fn resolve_port_binding(
         operation_name: comparison.operation_name.clone(),
         intent: declaration.intent,
         consistency: declaration.consistency,
-        subject_selector: resolve_port_selector(declaration, comparison, PortSelectorRole::Subject)?,
+        subject_selector: resolve_port_selector(
+            declaration,
+            comparison,
+            PortSelectorRole::Subject,
+        )?,
         result_set_bound_selector: resolve_port_selector(
             declaration,
             comparison,
@@ -1048,9 +1083,12 @@ fn resolve_schema_identity(
 }
 
 /// Returns the catalogue manifest of one canonical read operation name.
-fn read_manifest(operation_name: &str) -> Result<NamedOperationManifest, ReadError> {
-    generated_manifests()?
-        .into_iter()
+fn read_manifest<'a>(
+    entries: &'a [NamedOperationManifest],
+    operation_name: &str,
+) -> Result<&'a NamedOperationManifest, ReadError> {
+    entries
+        .iter()
         .find(|entry| entry.name == operation_name)
         .ok_or(ReadError::Outcome(ReadOutcome::NotRunning))
 }
@@ -1128,14 +1166,10 @@ const fn compare_scope_declarations(
     store: StoreScopeDeclaration,
 ) -> ScopeDeclarationComparison {
     match (owner, store) {
-        (
-            OwnerScopeDeclaration::Required,
-            StoreScopeDeclaration::Required,
-        )
-        | (
-            OwnerScopeDeclaration::NotRequired,
-            StoreScopeDeclaration::NotRequired,
-        ) => ScopeDeclarationComparison::Agree,
+        (OwnerScopeDeclaration::Required, StoreScopeDeclaration::Required)
+        | (OwnerScopeDeclaration::NotRequired, StoreScopeDeclaration::NotRequired) => {
+            ScopeDeclarationComparison::Agree
+        }
         (OwnerScopeDeclaration::Required, StoreScopeDeclaration::NotRequired) => {
             ScopeDeclarationComparison::OwnerRequiresScopeStoreDoesNot
         }
