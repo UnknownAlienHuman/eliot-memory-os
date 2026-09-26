@@ -339,6 +339,151 @@ impl TerminalStorageRelease {
     }
 }
 
+/// Typed outcome of one bounded Win32 transfer/length observation (issue
+/// #789, implementation-requirements paragraph 5).
+///
+/// Every site that consumes a kernel-reported byte/unit count classifies it
+/// here before touching memory. Only [`TransferOutcome::Complete`] carries
+/// a consumable count, so a partial, empty, or corrupt transfer can never
+/// flow into a full-frame or domain-success value. Counts over this
+/// crate's own plausibility bounds are [`TransferOutcome::Rejected`]
+/// (corrupt); counts the kernel could not fit into the supplied buffer are
+/// [`TransferOutcome::Truncated`] (partial knowledge: grow-and-retry or
+/// fail, never consume).
+///
+/// Zero-length delivery ([`TransferOutcome::Empty`]) stays distinct from
+/// both success-with-data and failure; each site decides whether its own
+/// contract accepts it. There is deliberately no broken-pipe/message-mode
+/// variant with an in-crate producer: this crate never calls
+/// `ReadFile`/`WriteFile`, pipe byte I/O belongs to Tokio above, and
+/// `ERROR_MORE_DATA` (the Win32 message-truncation signal) arrives only as
+/// `Truncated` below.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferOutcome {
+    /// Exact validated unit count, safe to consume (truncate/slice/size).
+    Complete { units: usize },
+    /// Zero units delivered while the call itself succeeded (EOF-shaped).
+    /// Consumable only as zero-length, and only where the site's own
+    /// contract accepts an empty transfer.
+    Empty,
+    /// The kernel reported more than the supplied capacity (message
+    /// truncated, no room for the NUL, scan hit its bound): partial
+    /// knowledge that may size a regrown buffer but never yields data.
+    Truncated { reported: usize, capacity: usize },
+    /// Corrupt count (conversion overflow or over this crate's hard
+    /// plausibility bound): fail closed, never size or slice anything.
+    Rejected,
+}
+
+impl TransferOutcome {
+    /// Returns the consumable count, and only for
+    /// [`TransferOutcome::Complete`]. Every other arm fails closed, so a
+    /// partial, empty, or corrupt transfer can never convert into a full
+    /// frame or domain success. Callers map the generic error to their
+    /// site-specific message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` for any non-complete transfer.
+    pub fn complete_units(self) -> io::Result<usize> {
+        match self {
+            Self::Complete { units } => Ok(units),
+            Self::Empty => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer delivered zero units",
+            )),
+            Self::Truncated { .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer was truncated",
+            )),
+            Self::Rejected => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer count is invalid",
+            )),
+        }
+    }
+
+    /// Returns the regrow size for [`TransferOutcome::Truncated`]: the
+    /// kernel-reported need that a retry buffer must satisfy. Any other
+    /// state refuses: only a genuine partial may drive grow-and-retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` for any non-truncated transfer.
+    pub fn retry_capacity(self) -> io::Result<usize> {
+        match self {
+            Self::Truncated { reported, .. } => Ok(reported),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "only a truncated transfer can size a retry",
+            )),
+        }
+    }
+}
+
+/// Classifies one bounded NUL-scan length (SID text, credential target
+/// names): zero means the string is empty, reaching the bound means the
+/// terminator was not found (partial knowledge), anything inside is exact.
+fn classify_bounded_scan(length: usize, bound: usize) -> TransferOutcome {
+    if length == 0 {
+        TransferOutcome::Empty
+    } else if length >= bound {
+        TransferOutcome::Truncated {
+            reported: length,
+            capacity: bound,
+        }
+    } else {
+        TransferOutcome::Complete { units: length }
+    }
+}
+
+/// Classifies one `QueryFullProcessImageNameW` reported length: zero or an
+/// unrepresentable value is corrupt, reaching the buffer length means the
+/// image was truncated (no room for the NUL), anything inside is exact.
+fn classify_image_chars(chars: u32, capacity: usize) -> TransferOutcome {
+    let Ok(length) = usize::try_from(chars) else {
+        return TransferOutcome::Rejected;
+    };
+    if length == 0 {
+        TransferOutcome::Empty
+    } else if length >= capacity {
+        TransferOutcome::Truncated {
+            reported: length,
+            capacity,
+        }
+    } else {
+        TransferOutcome::Complete { units: length }
+    }
+}
+
+/// Classifies one kernel-reported count against this crate's bound for it
+/// (token size, enumeration entry count, job process count): zero is an
+/// empty (shape-valid) report, over the bound is corrupt, anything inside
+/// is exact. Whether an empty report satisfies the site is decided by the
+/// caller, never here.
+fn classify_bounded_count(count: usize, bound: usize) -> TransferOutcome {
+    if count > bound {
+        TransferOutcome::Rejected
+    } else if count == 0 {
+        TransferOutcome::Empty
+    } else {
+        TransferOutcome::Complete { units: count }
+    }
+}
+
+/// Classifies one `CREDENTIALW` blob report: over the Win32 blob limit or a
+/// nonzero size with a null pointer is corrupt, zero is an empty (valid)
+/// blob, anything else is exact.
+fn classify_credential_blob(size: usize, blob_is_null: bool) -> TransferOutcome {
+    if size > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize || (size > 0 && blob_is_null) {
+        TransferOutcome::Rejected
+    } else if size == 0 {
+        TransferOutcome::Empty
+    } else {
+        TransferOutcome::Complete { units: size }
+    }
+}
+
 /// Kernel-derived identity of a process observed through a named pipe or Job Object.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProcessImageIdentity {
@@ -724,6 +869,13 @@ pub fn write_new_pinned_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Resolves the PID and executable image of the client connected to a server pipe.
 ///
+/// The returned identity is an unverified kernel observation, not an
+/// authentication verdict: a connected handle proves a client is attached,
+/// not that it is the expected principal, session, or generation. Callers
+/// must bind the PID, image, file identity, and creation ticks against
+/// their expected peer; failures authenticate nothing. Authority and ACL
+/// ownership stay with the existing transport owners.
+///
 /// # Errors
 ///
 /// Returns an error when Windows cannot bind the server pipe to its client PID or
@@ -733,8 +885,16 @@ pub fn named_pipe_client_process(pipe: &NamedPipeServer) -> io::Result<ProcessIm
     // SAFETY: Tokio owns a live server-end pipe handle and `pid` is a valid out pointer.
     let resolved =
         unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle().cast(), &raw mut pid) };
-    if resolved == 0 || pid == 0 {
+    if resolved == 0 {
         return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // Success with no client PID proves nothing about the peer: fail
+        // closed with a typed error instead of a stale last-error value.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "named pipe reported no client process",
+        ));
     }
     Ok(open_process_identity(pid)?.identity)
 }
@@ -774,12 +934,20 @@ pub fn current_process_token_sid() -> io::Result<String> {
     unsafe {
         GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut needed);
     }
-    if needed == 0 || needed > 4096 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process token size is invalid",
-        ));
-    }
+    // The required-size report is classified before it sizes anything: zero
+    // or over the `TOKEN_USER` plausibility bound fails closed here, so only
+    // an exact count reaches the buffer below.
+    let mut needed = match classify_bounded_count(needed as usize, 4096) {
+        TransferOutcome::Complete { units } => u32::try_from(units).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "process token size is invalid")
+        })?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process token size is invalid",
+            ));
+        }
+    };
     // The query writes a TOKEN_USER (8-byte aligned), so the buffer is
     // 8-byte aligned u64 storage sized up from the reported byte count.
     let mut buffer = vec![0u64; (needed as usize).div_ceil(std::mem::size_of::<u64>())];
@@ -827,7 +995,10 @@ fn sid_to_string(sid: PSID) -> io::Result<String> {
         }
         len += 1;
     }
-    if len == 0 || len >= 512 {
+    // Only an exact in-bound scan length reaches the slice below: an empty
+    // or unterminated conversion fails closed (freeing first) instead of
+    // exposing a partial SID.
+    let Ok(len) = classify_bounded_scan(len, 512).complete_units() else {
         // SAFETY: `wide` is the live `LocalAlloc` string from the conversion.
         unsafe {
             LocalFree(wide.cast());
@@ -836,7 +1007,7 @@ fn sid_to_string(sid: PSID) -> io::Result<String> {
             io::ErrorKind::InvalidData,
             "process SID text is invalid",
         ));
-    }
+    };
     // SAFETY: `wide` holds `len` live units; freed exactly once below.
     let slice = unsafe { std::slice::from_raw_parts(wide, len) };
     let sid = OsString::from_wide(slice).into_string().map_err(|_| {
@@ -897,24 +1068,25 @@ fn query_process_image(process: HANDLE) -> io::Result<PathBuf> {
 /// for the NUL) or the length is corrupt, so it fails closed instead of
 /// exposing trailing NULs.
 fn truncate_image_buffer(mut image: Vec<u16>, chars: u32) -> io::Result<PathBuf> {
-    if chars == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process image length is invalid",
-        ));
-    }
-    let chars = usize::try_from(chars).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process image length is invalid",
-        )
-    })?;
-    if chars >= image.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process image length exceeds its buffer",
-        ));
-    }
+    // The reported length is classified before it truncates anything: zero
+    // or unrepresentable is corrupt, reaching the buffer length means the
+    // image was truncated (no room for the NUL), and only an exact count
+    // reaches the truncation below.
+    let chars = match classify_image_chars(chars, image.len()) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process image length is invalid",
+            ));
+        }
+        TransferOutcome::Truncated { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process image length exceeds its buffer",
+            ));
+        }
+    };
     image.truncate(chars);
     Ok(PathBuf::from(OsString::from_wide(&image)))
 }
@@ -2237,12 +2409,19 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
             let count = usize::try_from(header.NumberOfProcessIdsInList).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "Job process count is invalid")
             })?;
-            if count > capacity {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Job process list exceeded its supplied buffer",
-                ));
-            }
+            // A count beyond the supplied buffer contradicts the success
+            // return (corrupt): fail closed instead of slicing past the
+            // buffer. An empty job stays consumable as zero IDs.
+            let count = match classify_bounded_count(count, capacity) {
+                TransferOutcome::Complete { units } => units,
+                TransferOutcome::Empty => 0,
+                TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Job process list exceeded its supplied buffer",
+                    ));
+                }
+            };
             let ids = job_id_slice(&buffer, count)?;
             return ids
                 .iter()
@@ -2260,7 +2439,15 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
             return Err(error);
         }
         let assigned = usize::try_from(header.NumberOfAssignedProcesses).unwrap_or(capacity + 1);
-        capacity = assigned.max(capacity.saturating_mul(2));
+        // Partial enumeration: the kernel kept the remainder, so this
+        // `Truncated` outcome may only size the regrown buffer below; it
+        // never yields IDs and never converts into a complete result.
+        let partial = TransferOutcome::Truncated {
+            reported: assigned,
+            capacity,
+        };
+        let grown = partial.retry_capacity()?;
+        capacity = grown.max(capacity.saturating_mul(2));
         if capacity > MAX_JOB_PROCESS_IDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2929,12 +3116,20 @@ fn credential_target_name(target: *const u16) -> io::Result<String> {
             length += 1;
         }
     }
-    if length == MAX_CREDENTIAL_TARGET_CHARS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "credential target name exceeded the bounded scan",
-        ));
-    }
+    // Only an exact in-bound scan reaches the slice below: hitting the bound
+    // means the terminator was not found (partial knowledge), so it fails
+    // closed instead of exposing a truncated name. An empty target stays
+    // consumable as zero-length, exactly as before.
+    let length = match classify_bounded_scan(length, MAX_CREDENTIAL_TARGET_CHARS) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty => 0,
+        TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential target name exceeded the bounded scan",
+            ));
+        }
+    };
     // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the
     // scanned prefix): the scan above observed `length` consecutive non-NUL
     // units followed by a NUL at `target[length]`, all within the live
@@ -2992,13 +3187,18 @@ pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<S
     let count = usize::try_from(count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "credential count is invalid"))?;
     // Fail closed on a corrupt count before forming any slice: never default
-    // to zero or truncate, and keep the allocation bounded.
-    if count > MAX_CREDENTIAL_ENUM_ENTRIES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "credential enumeration count exceeds the bound",
-        ));
-    }
+    // to zero or truncate, and keep the allocation bounded. An empty result
+    // stays consumable as zero entries, exactly as before.
+    let count = match classify_bounded_count(count, MAX_CREDENTIAL_ENUM_ENTRIES) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty => 0,
+        TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential enumeration count exceeds the bound",
+            ));
+        }
+    };
     if count.saturating_mul(std::mem::size_of::<*mut CREDENTIALW>()) > isize::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3355,14 +3555,19 @@ pub fn credential_read_current_user(credential_id: &str) -> io::Result<Option<Ve
             "credential blob size is invalid",
         )
     })?;
-    if credential.CredentialBlobSize > CRED_MAX_CREDENTIAL_BLOB_SIZE
-        || (blob_size > 0 && credential.CredentialBlob.is_null())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "credential blob is invalid",
-        ));
-    }
+    // The blob report is classified before the slice below is formed: an
+    // over-limit or dangling report fails closed, while an empty blob stays
+    // consumable as zero-length, exactly as before.
+    let blob_size = match classify_credential_blob(blob_size, credential.CredentialBlob.is_null()) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty => 0,
+        TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential blob is invalid",
+            ));
+        }
+    };
     // SAFETY (WORK_UNIT 789, credential family — blob `from_raw_parts`):
     // `credential` is borrowed from the live `buffer` allocation, so
     // `CredentialBlob` (when `blob_size > 0`, proven non-null above) points at
