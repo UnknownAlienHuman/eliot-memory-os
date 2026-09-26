@@ -16,10 +16,10 @@ use eliot_agent_bridge_core::{
     ConnectionId, CoverageGap, CursorPolicy, DeliveryClass, DemandId, EventDisposition,
     EventForwardAck, EventForwardStatus, EventPortOutcome, Generation, HostActivationPort,
     HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
-    ProviderReadiness, ReconciliationPortOutcome, ReconciliationPortResult,
-    ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact, RecoveredGapFact,
-    RecoveredPendingView, RecoveredStreamFacts, RecoveryDirective, RecoveryReadRequest,
-    RecoveryView, TerminalReductionInputs, TransportEdge,
+    ProviderReadiness, ReconciliationConsumedFrontier, ReconciliationPortOutcome,
+    ReconciliationPortResult, ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact,
+    RecoveredGapFact, RecoveredPendingView, RecoveredStreamFacts, RecoveryDirective,
+    RecoveryReadRequest, RecoveryView, TerminalReductionInputs, TransportEdge,
 };
 /// I7.17 recall response projection: bounded handles-first agent output with
 /// a server-derived disposition, binding receipt, and rank-trace handle.
@@ -989,7 +989,7 @@ fn decode_reconciliation_outcome(
     binding: &AttachBinding,
     facts: &BridgeEventTransportFacts,
     value: &serde_json::Value,
-    port: &mut KernelMcpForwardingPort,
+    consumed_frontiers: Vec<ReconciliationConsumedFrontier>,
     expected: Option<&RecoveryReadRequest>,
 ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
     if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -1024,7 +1024,7 @@ fn decode_reconciliation_outcome(
     decode_handoff_maintenance_pressure(reconciliation)?;
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
     let (stream_facts, stream_list_complete) =
-        decode_reconciliation_streams(reconciliation, live_generation, &mut budget, port)?;
+        decode_reconciliation_streams(reconciliation, live_generation, &mut budget)?;
     let unscoped_gaps = decode_unscoped_gaps(reconciliation, &mut budget)?;
     let unproven_scope_present = reconciliation
         .get("unproven_scope_present")
@@ -1067,7 +1067,8 @@ fn decode_reconciliation_outcome(
         event_shape_failure(
             "reconciliation refused: live attach binding does not seal the owner answer",
         )
-    })?;
+    })?
+    .with_consumed_frontiers(consumed_frontiers);
     Ok(ReconciliationPortOutcome::Reconciled(result))
 }
 
@@ -1107,15 +1108,15 @@ fn decode_handoff_maintenance_pressure(
 }
 
 /// Decodes the stream enumeration of one owner answer within the
-/// negotiated stream budget, recording each page's owner-confirmed acked
-/// base on the port as it is decoded. The enumeration itself needs its
-/// own bound: without it the outer collection would be unbounded no
-/// matter how small each page is.
+/// negotiated stream budget. It remains pure with respect to the bridge
+/// forwarding cache: owner ack bases are committed only after the core has
+/// accepted every fact in the answer. The enumeration itself needs its own
+/// bound: without it the outer collection would be unbounded no matter how
+/// small each page is.
 fn decode_reconciliation_streams(
     reconciliation: &serde_json::Value,
     live_generation: u64,
     budget: &mut RecoveryDecodeBudget,
-    port: &mut KernelMcpForwardingPort,
 ) -> Result<(Vec<RecoveredStreamFacts>, bool), ProviderFailure> {
     let streams = reconciliation
         .get("streams")
@@ -1128,9 +1129,14 @@ fn decode_reconciliation_streams(
     }
     let stream_list_complete = streams.len() < MAX_RECOVERY_STREAMS;
     let mut stream_facts = Vec::with_capacity(streams.len().min(64));
+    let mut seen_streams = BTreeSet::new();
     for stream in streams {
-        let (page, acked) = decode_recovery_stream(stream, live_generation, budget)?;
-        port.note_owner_acked(page.stream_id(), acked);
+        let (page, _) = decode_recovery_stream(stream, live_generation, budget)?;
+        if !seen_streams.insert(page.stream_id().to_owned()) {
+            return Err(event_shape_failure(
+                "reconciliation refused: duplicate stream identity in owner answer",
+            ));
+        }
         stream_facts.push(page);
     }
     Ok((stream_facts, stream_list_complete))
@@ -1189,6 +1195,15 @@ fn check_expected_continuation(
             return Err(event_shape_failure(
                 "recovery continuation refused: answer continuation does not advance past \
                  the requested predecessor",
+            ));
+        }
+        if page
+            .events()
+            .iter()
+            .any(|event| event.sequence() <= request.after_sequence())
+        {
+            return Err(event_shape_failure(
+                "recovery continuation refused: page repeats or precedes the requested frontier",
             ));
         }
     }
@@ -1402,8 +1417,8 @@ impl KernelMcpForwardingPort {
         held.insert(sequence);
     }
 
-    /// Records the owner-confirmed acked base from a verified reconcile
-    /// reply and prunes the held sequences it confirms.
+    /// Records the owner-confirmed acked base only after core import accepted
+    /// the verified reconcile reply, then prunes the held sequences it confirms.
     ///
     /// Owner confirmation is a receipt, not local inference: only sequences
     /// at or below the confirmed base leave the held set, and the
@@ -1441,9 +1456,11 @@ impl KernelMcpForwardingPort {
     /// reply reports the owner's acknowledged cursor. A lost, rejected, or
     /// undecodable answer therefore offers the same exact sequence set on
     /// the next call.
-    fn contiguous_consumed_payload(&mut self) -> Vec<serde_json::Value> {
+    fn contiguous_consumed_payload(
+        &self,
+    ) -> (Vec<serde_json::Value>, Vec<ReconciliationConsumedFrontier>) {
         let Ok(owner) = self.shared.try_borrow() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mut frontiers: Vec<(String, u64)> = Vec::new();
         for (stream_id, held) in &owner.delivered_sequences {
@@ -1461,12 +1478,19 @@ impl KernelMcpForwardingPort {
         }
         frontiers.sort_by(|left, right| left.0.cmp(&right.0));
         frontiers.truncate(MAX_RECONCILE_CONSUMED_ENTRIES);
-        frontiers
+        let confirmations = frontiers
+            .iter()
+            .map(|(stream_id, sequence)| {
+                ReconciliationConsumedFrontier::new(stream_id.clone(), *sequence)
+            })
+            .collect();
+        let payload = frontiers
             .into_iter()
             .map(|(stream_id, sequence)| {
                 serde_json::json!({ "stream_id": stream_id, "sequence": sequence })
             })
-            .collect()
+            .collect();
+        (payload, confirmations)
     }
 }
 
@@ -1630,7 +1654,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             ));
         }
         let now_ms = bridge_event_unix_ms()?;
-        let consumed = self.contiguous_consumed_payload();
+        let (consumed, consumed_frontiers) = self.contiguous_consumed_payload();
         let correlation = format!("bridge-reconcile:{}", facts.connection_id);
         let frame = bridge_event_frame_for_operation(
             &correlation,
@@ -1644,7 +1668,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let reply = self.exchange(&frame)?;
         let value =
             decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
-        decode_reconciliation_outcome(binding, &facts, &value, self, None)
+        decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, None)
     }
     /// Reads one bounded recovery page inside the declared window through
     /// the real reconcile route (issue #2732).
@@ -1690,7 +1714,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             ));
         }
         let now_ms = bridge_event_unix_ms()?;
-        let consumed = self.contiguous_consumed_payload();
+        let (consumed, consumed_frontiers) = self.contiguous_consumed_payload();
         let correlation = format!(
             "bridge-recover:{}:{}:{}",
             facts.connection_id,
@@ -1717,7 +1741,25 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let reply = self.exchange(&frame)?;
         let value =
             decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
-        decode_reconciliation_outcome(binding, &facts, &value, self, Some(request))
+        decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, Some(request))
+    }
+
+    fn reconciliation_imported(
+        &mut self,
+        binding: &AttachBinding,
+        result: &ReconciliationPortResult,
+    ) {
+        // Core calls this only after its staged recovery window was accepted.
+        // Keep an additional live transport check so an adapter cannot apply
+        // a cache receipt after its connection has been replaced.
+        if self.check_continuity(binding).is_err() {
+            return;
+        }
+        if let Some(window) = result.window() {
+            for stream in window.stream_facts() {
+                self.note_owner_acked(stream.stream_id(), stream.acked_cursor());
+            }
+        }
     }
 }
 
@@ -3524,6 +3566,13 @@ mod tests {
                     "reconciliation not exercised",
                 ))
             }
+
+            fn reconciliation_imported(
+                &mut self,
+                _binding: &AttachBinding,
+                _result: &ReconciliationPortResult,
+            ) {
+            }
         }
 
         fn reactive_runner(attached: bool) -> BridgeRunner {
@@ -3922,6 +3971,13 @@ mod tests {
                     "test-forwarder",
                     "reconciliation not exercised",
                 ))
+            }
+
+            fn reconciliation_imported(
+                &mut self,
+                _binding: &AttachBinding,
+                _result: &ReconciliationPortResult,
+            ) {
             }
         }
 

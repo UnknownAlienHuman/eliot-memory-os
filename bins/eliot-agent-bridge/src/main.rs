@@ -4594,6 +4594,13 @@ mod tests {
                     "reconciliation not exercised",
                 ))
             }
+
+            fn reconciliation_imported(
+                &mut self,
+                _binding: &AttachBinding,
+                _result: &eliot_agent_bridge_core::ReconciliationPortResult,
+            ) {
+            }
         }
 
         fn test_epoch(sequence: u64) -> EpochId {
