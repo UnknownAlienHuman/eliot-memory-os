@@ -779,6 +779,30 @@ impl RedbRecoveryStore {
             .and_then(|stream_state| stream_state.binding.clone()))
     }
 
+    /// Reads the durable head record of one bound stream, after validating the
+    /// complete journal schema, index closure and sequence chain.
+    ///
+    /// The head is written in the same transaction as every append and prune and
+    /// is proved equal to the head the retained rows derive, so it is the one
+    /// durable witness a requester can chain to and derive its member
+    /// denominator from
+    /// ([`RestoreJournalMemberDenominator::for_head`]). It is deliberately NOT
+    /// a readback of any entry: a requester that took its expected member count
+    /// from the very rows it is asking about would be comparing an answer with
+    /// itself, and the retire counter, the phase-slot tombstones and the
+    /// sequence chain could then disagree without anything noticing.
+    ///
+    /// A stream with no persisted binding is refused, so an absent head can
+    /// never be read as a complete empty journal.
+    pub fn restore_journal_durable_head(
+        &self,
+        stream: &str,
+    ) -> Result<Option<JournalPredecessor>, OrsError> {
+        validate_journal_text(stream, "journal.stream")?;
+        let state = self.read_restore_journal_state()?;
+        Ok(state.stream(stream)?.head.clone())
+    }
+
     /// Ensures the explicit versioned journal layout. This method is
     /// idempotent for a valid v2 layout and refuses to recreate a missing or
     /// legacy table.
@@ -1271,7 +1295,15 @@ impl RedbRecoveryStore {
     ///
     /// The denominator counts the WHOLE journal, retired members included, so
     /// a retained suffix is proved rather than assumed to be the entire
-    /// history. Missing, corrupt, unsupported, stale or partially reclaimed
+    /// history. Because a denominator is always the member count its own head
+    /// covers, the equality below is a real requirement and not a round trip:
+    /// the requester counts from the durable head record read by
+    /// [`Self::restore_journal_durable_head`], while the store counts from the
+    /// retained intent rows plus the fence's recorded retire counter. Those are
+    /// different durable facts, and they disagree exactly when a fence, its
+    /// tombstones and the sequence chain no longer describe one history —
+    /// which this refusal reports instead of certifying a corrupt journal
+    /// complete. Missing, corrupt, unsupported, stale or partially reclaimed
     /// storage returns a typed refusal instead of a proof. Zero entries is
     /// [`RestoreJournalCompleteness::ExactNew`] only for a validated exact new
     /// journal — bound, no retained member, no retired phase slot and no prune
