@@ -142,10 +142,7 @@ impl RecordedRevocation {
             });
         }
         validate_affected_refs(&affected_refs)?;
-        if affected_refs
-            .binary_search_by(|reference| reference.as_str().cmp(root_ref.as_str()))
-            .is_err()
-        {
+        if affected_refs.binary_search(&root_ref).is_err() {
             return Err(StoreError::InvalidField {
                 field: "dependent_refs",
                 reason: "affected set must contain the revoked origin",
@@ -173,11 +170,7 @@ impl RecordedRevocation {
         validate_reference(&self.closure_id, "closure_id")?;
         validate_reference(&self.root_ref, "root_ref")?;
         validate_affected_refs(&self.dependent_refs)?;
-        if self
-            .dependent_refs
-            .binary_search_by(|reference| reference.as_str().cmp(self.root_ref.as_str()))
-            .is_err()
-        {
+        if self.dependent_refs.binary_search(&self.root_ref).is_err() {
             return Err(StoreError::InvalidField {
                 field: "dependent_refs",
                 reason: "recorded revocation must contain its root_ref",
@@ -266,10 +259,12 @@ fn validate_affected_refs(affected_refs: &[String]) -> Result<(), StoreError> {
     for reference in affected_refs {
         validate_reference(reference, "dependent_ref")?;
     }
-    if affected_refs
-        .windows(2)
-        .any(|pair| pair[0].as_str() >= pair[1].as_str())
-    {
+    if affected_refs.windows(2).any(|pair| {
+        let [left, right] = pair else {
+            return false;
+        };
+        left >= right
+    }) {
         return Err(StoreError::InvalidField {
             field: "dependent_refs",
             reason: "affected references must be strictly sorted and unique",
