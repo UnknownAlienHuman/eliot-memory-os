@@ -32,13 +32,13 @@
 //!   result is projected into [`RegistryRouteAdjudication`] by the caller that
 //!   owns the registry. This module constructs no provider clients, no SDK
 //!   handles, no credentials, and no shell paths.
-//! - A replaced backing adapter under the same logical attempt identity is a
-//!   fail-closed replay question, answered only through the existing
-//!   [`verify_exact_replay`](super::durable_dispatch::verify_exact_replay):
-//!   same identity with a changed payload is `PayloadConflict`; a different
-//!   identity is `ForeignIdentity` (not a replay: the candidate proceeds);
-//!   only an exact-digest replay is idempotent. Without a prior dispatch to
-//!   prove exact replay, entry/grant drift is `RouteBlocked`.
+//! - A supplied prior dispatch is always checked through the existing
+//!   [`verify_exact_replay`](super::durable_dispatch::verify_exact_replay),
+//!   even when the registry entry digest matches the grant fingerprint. A
+//!   same-identity changed payload is `PayloadConflict`; a different identity
+//!   is `ForeignIdentity` (not a replay: the candidate proceeds); only a
+//!   validated exact replay with matching complete dispatch lineage is
+//!   idempotent. Entry/grant drift without a prior blocks a new launch.
 //! - I09-09: every launch passes the admission gate; a revoked or stale route
 //!   blocks with no local fallback. I10-15: no silent mid-attempt failover —
 //!   a replaced route never relaunches silently under an old identity.
@@ -163,11 +163,11 @@ fn hex_digest(bytes: &[u8; 32]) -> String {
 /// generation, generation fingerprint, or adapter-entry digest is
 /// `RouteBlocked`; request lineage that disagrees with the attachment or item
 /// is `StaleLineage`; the remaining dispatch rules are `dispatch_child`'s
-/// own. When the registry entry digest differs from the lineage route
-/// fingerprint the backing adapter was replaced: with a prior dispatch the
-/// exact-replay verdict decides (`PayloadConflict` propagates, `Idempotent`
-/// re-observes, `ForeignIdentity` is not a replay and proceeds); without a
-/// prior dispatch the drift is `RouteBlocked` rather than a silent relaunch.
+/// own. Any supplied prior dispatch is checked for exact replay regardless of
+/// registry digest equality (`PayloadConflict` propagates; `Idempotent`
+/// requires the complete dispatch lineage to match before re-observation;
+/// `ForeignIdentity` is not a replay and proceeds). Registry drift without a
+/// prior blocks a new launch rather than silently relaunching on a stale route.
 pub fn launch_admitted_child(
     _store: &dyn DurableWorkStore,
     _executor: &dyn WorkExecutor,
@@ -211,13 +211,17 @@ pub fn launch_admitted_child(
         request.term,
         request.epoch,
     )?;
-    if hex_digest(&registry.adapter_entry_digest) != launch.lineage.route_fingerprint {
-        match prior {
-            None => return Err(SwarmError::RouteBlocked),
-            Some(prior) => match verify_exact_replay(prior, &launch.intent)? {
-                ReplayVerdict::Idempotent | ReplayVerdict::ForeignIdentity => {}
-            },
-        }
+    let entry_matches_grant =
+        hex_digest(&registry.adapter_entry_digest) == launch.lineage.route_fingerprint;
+    match prior {
+        Some(prior) => match verify_exact_replay(prior, &launch.intent)? {
+            ReplayVerdict::Idempotent if prior.lineage != launch.lineage => {
+                return Err(SwarmError::PayloadConflict);
+            }
+            ReplayVerdict::Idempotent | ReplayVerdict::ForeignIdentity => {}
+        },
+        None if !entry_matches_grant => return Err(SwarmError::RouteBlocked),
+        None => {}
     }
     Ok(AdmittedChildLaunch {
         launch,
