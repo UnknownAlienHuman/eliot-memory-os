@@ -1180,6 +1180,9 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read"
             | "local_read_claim"
             | "local_read_result"
+            | "semantic_observe_claim"
+            | "semantic_observe_result"
+            | "semantic_observe_deferred"
             | "initialize_owner_revision"
             // I1.5 (#1750): the Host request leg. These are the four admitted
             // lifecycle legs of the Host request surface; the branch admits
