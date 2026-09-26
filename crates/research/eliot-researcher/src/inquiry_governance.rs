@@ -159,6 +159,19 @@ pub enum InquiryError {
     /// binding the disposition anyway would publish a claim the same record
     /// proves is blocked. A debt that is resolved, or one whose claim class
     /// this disposition does not name, does not raise this error.
+    ///
+    /// MEASURED REACHABILITY, stated so this is not mistaken for live
+    /// enforcement: on the `InquiryGovernance::record` path this error CANNOT
+    /// fire today, and the reason is structural rather than accidental. The
+    /// only disposition `terminal_disposition` can return that any debt
+    /// refuses is `ANSWERED_WITH_SUPPORTED_RESULT`, and reaching it requires
+    /// `outcome == Completed` with an intact denominator. A completed run
+    /// contributes no `provider_degradation` (so no `Verification` debt) and
+    /// leaves no open member (so no `Coverage` debt); `Replication` and
+    /// `Provenance` refuse no disposition, and `Contradiction` is never
+    /// registered. The guard is kept because it is the correct invariant and
+    /// because `bind` is public: a caller that binds a record directly can
+    /// reach it today. It is a bound, not a fired, check.
     DebtRestrictedDisposition {
         /// Failing field path.
         field: &'static str,
@@ -3075,6 +3088,18 @@ impl ResearchDebtKind {
     /// instead of by a disposition the I21.9 vocabulary has no word for.
     /// Refusing more would turn an honest narrow outcome into a refusal, and
     /// I21.12 keeps unrelated independently supported claims free to proceed.
+    ///
+    /// The published [`blocks`](Self::blocks) text is the I21.12 claim-class
+    /// LABEL, verbatim from the table; this function is that label's projection
+    /// onto dispositions, and the two are not the same granularity. `Coverage`
+    /// reads "completeness" and refuses both closing dispositions, because a
+    /// supported result inside an incomplete scope asserts completeness just as
+    /// much as a scoped absence does. `Verification` reads "release" and
+    /// likewise refuses both, because both closing dispositions ARE releases.
+    /// A reader who needs the enforced set rather than the label reads
+    /// [`ResearchDebtRestriction::refused_dispositions`], which publishes it
+    /// per record, and [`ResearchDebtRestriction::statement`], which names it
+    /// per debt.
     #[must_use]
     pub const fn blocks_disposition(self, disposition: CompletionDisposition) -> bool {
         match self {
@@ -3211,6 +3236,12 @@ pub struct ResearchDebtRestriction {
     pub refused_dispositions: Vec<CompletionDisposition>,
     /// Identity of every open debt contributing to the restriction.
     pub debt_ids: Vec<String>,
+    /// I21.12 kind of every open debt, aligned with `debt_ids`.
+    ///
+    /// Published so a reader can tell WHICH restriction applies to which debt
+    /// without re-deriving it, and so the enforced refusal set is stated per
+    /// debt rather than only in aggregate.
+    pub debt_kinds: Vec<ResearchDebtKind>,
     /// The claim class each open debt blocks, paired with its debt identity.
     pub blocked_claims: Vec<(String, String)>,
     /// Accountable owner of each open debt, paired with its debt identity.
@@ -3246,12 +3277,14 @@ impl ResearchDebtRestriction {
             }
         }
         let mut debt_ids = Vec::with_capacity(open.len());
+        let mut debt_kinds = Vec::with_capacity(open.len());
         let mut blocked_claims = Vec::with_capacity(open.len());
         let mut owners = Vec::with_capacity(open.len());
         let mut review_conditions = Vec::with_capacity(open.len());
         let mut expiries = Vec::with_capacity(open.len());
         for debt in &open {
             debt_ids.push(debt.debt_id.clone());
+            debt_kinds.push(debt.kind);
             blocked_claims.push((debt.debt_id.clone(), debt.blocks.clone()));
             owners.push((debt.debt_id.clone(), debt.owner.clone()));
             review_conditions.push((debt.debt_id.clone(), debt.review_condition.clone()));
@@ -3262,6 +3295,7 @@ impl ResearchDebtRestriction {
             restricted: !open.is_empty(),
             refused_dispositions: refused,
             debt_ids,
+            debt_kinds,
             blocked_claims,
             owners,
             review_conditions,
@@ -3282,7 +3316,10 @@ impl ResearchDebtRestriction {
     ///
     /// Names the debt, the claim class it blocks, its owner and its review
     /// condition, so a release that carries open debts states them rather than
-    /// describing them as minor limitations. No provider prose is reproduced.
+    /// describing them as minor limitations. Where a debt actually refuses a
+    /// disposition, the refused wire names are stated with it, so the claim a
+    /// reader can check and the claim the gate enforces are the same claim.
+    /// No provider prose is reproduced.
     #[must_use]
     pub fn statement(&self) -> Option<String> {
         if !self.restricted {
@@ -3294,12 +3331,21 @@ impl ResearchDebtRestriction {
             .zip(&self.blocked_claims)
             .zip(&self.owners)
             .zip(&self.review_conditions)
+            .zip(&self.debt_kinds)
             .map(
-                |(((debt_id, (blocked_id, blocks)), (owner_id, owner)), (review_id, review))| {
+                |((((debt_id, (blocked_id, blocks)), (owner_id, owner)), (review_id, review)), kind)| {
                     debug_assert_eq!(debt_id, blocked_id);
                     debug_assert_eq!(debt_id, owner_id);
                     debug_assert_eq!(debt_id, review_id);
-                    format!("{debt_id} blocks {blocks} (owner {owner}; review: {review})")
+                    let refused = refused_dispositions_for(*kind);
+                    if refused.is_empty() {
+                        format!("{debt_id} blocks {blocks} (owner {owner}; review: {review})")
+                    } else {
+                        format!(
+                            "{debt_id} blocks {blocks} and refuses {} (owner {owner}; review: {review})",
+                            refused.join(",")
+                        )
+                    }
                 },
             )
             .collect::<Vec<String>>()
@@ -3329,6 +3375,9 @@ impl ResearchDebtRestriction {
         push_count(&mut preimage, "debt_ids", self.debt_ids.len());
         for debt_id in &self.debt_ids {
             push_field(&mut preimage, "debt_id", debt_id);
+        }
+        for kind in &self.debt_kinds {
+            push_field(&mut preimage, "debt_kind", kind.wire_name());
         }
         for (debt_id, blocks) in &self.blocked_claims {
             push_field(&mut preimage, "blocked_debt", debt_id);
@@ -5245,12 +5294,16 @@ fn research_debts(
             None,
         )?);
     }
-    // I21.12 names eight debt kinds. The three above are the ones the coverage,
-    // independence and precision receipts decide; the two below are decided by
-    // signals this record already computed, so registering them reuses an
-    // observed fact rather than inventing one. A kind with no observed signal
-    // is not registered: an unobserved obligation is not a debt, and a debt
-    // raised without evidence would be the fabricated caveat I21.12 forbids.
+    // I21.12 names eight debt kinds. The three above are decided by the
+    // coverage, independence and precision receipts; `Verification` below by a
+    // fourth signal this record already computes. The remaining four
+    // (`Contradiction`, `Epistemic`, `Fidelity`, `Authority`) are deliberately
+    // NOT registered, each for a measured reason rather than for convenience: a
+    // producer that can never fire is the "helper without a caller" the brief
+    // forbids, so a kind is registered only where an observed signal exists.
+    // `Contradiction` is the instructive one - see `unresolved_contradictions`
+    // - and the assert below is the tripwire that will tell the next attempt
+    // when its signal finally becomes real.
     if !coverage_receipt.provider_degradation.is_empty() {
         debts.push(ResearchDebt::register(
             &format!("debt-verification-{}", observation.inquiry_id),
@@ -5258,43 +5311,37 @@ fn research_debts(
             profile,
             ResearchDebtKind::Verification,
             &format!(
-                "{} provider source(s) degraded during acquisition, so no admitted candidate \
-                 carries an independent sufficient verifier: {}",
-                coverage_receipt.provider_degradation.len(),
+                "acquisition degraded rather than completing cleanly, so no admitted candidate is \
+                 backed by an independently verified source: {}",
                 coverage_receipt.provider_degradation.join(",")
             ),
             "researcher",
-            "a non-degraded source admits a candidate with an independent sufficient verifier",
+            "a non-degraded acquisition admits a candidate with an independently verified source",
             None,
         )?);
     }
     let contradictions = unresolved_contradictions(admissibility);
-    if !contradictions.is_empty() {
-        debts.push(ResearchDebt::register(
-            &format!("debt-contradiction-{}", observation.inquiry_id),
-            &observation.inquiry_id,
-            profile,
-            ResearchDebtKind::Contradiction,
-            &format!(
-                "{} admitted source(s) are recorded as counterevidence of another admitted source \
-                 and the conflict is unresolved and unscoped: {}",
-                contradictions.len(),
-                contradictions.join(",")
-            ),
-            "researcher",
-            "each recorded counterevidence relation is scoped and resolved by its owner",
-            None,
-        )?);
-    }
+    debug_assert!(
+        contradictions.is_empty(),
+        "a populated counterevidence set changes the I21.12 debt set; re-derive the producers",
+    );
     Ok(debts)
 }
 
 /// The admitted sources recorded as counterevidence of another admitted source.
 ///
-/// Extracted so the contradiction debt and the evidence freeze read the SAME
-/// unresolved set: if they computed it separately, a debt could name a
-/// conflict the freeze does not carry, and the freeze would then understate an
+/// Extracted so the contradiction check and the evidence freeze read the SAME
+/// unresolved set: if they computed it separately, one could name a conflict
+/// the other does not carry, and the freeze would then understate an
 /// obligation the same record registered.
+///
+/// MEASURED: on the `InquiryGovernance::record` path this set is provably
+/// EMPTY, because `candidate_source_record` is the only producer of
+/// admissibility records here and it hardcodes `counterevidence_of:
+/// BTreeSet::new()`. A `Contradiction` debt registered from it would be a
+/// producer that can never fire, which is the "helper without a caller" the
+/// brief forbids, so no such debt is registered. Populating the field is the
+/// prerequisite, and it is NOT invented here.
 fn unresolved_contradictions(admissibility: &[SourceAdmissibilityRecord]) -> Vec<String> {
     let included: Vec<&str> = admissibility
         .iter()
@@ -5475,6 +5522,13 @@ fn terminal_record(
     // have carried is blocked, and I21.13 requires the honest limited outcome
     // to be the one reported. The debt statement below keeps the specific
     // reason, so the downgrade loses nothing a reader needs.
+    //
+    // MEASURED: on this path the downgrade is currently INERT. No debt kind
+    // that refuses a disposition can coexist with a disposition this function
+    // produces - see the reachability note on
+    // `InquiryError::DebtRestrictedDisposition` for the proof. The branch is
+    // kept because it is the correct invariant and because it costs nothing,
+    // but nothing should be read into it as live enforcement today.
     let disposition = if debt_restriction.refuses(derived) {
         CompletionDisposition::IncompleteCoverage
     } else {
@@ -5606,6 +5660,21 @@ fn disclosure_wire(class: DisclosureClass) -> &'static str {
 }
 
 /// Stable wire spelling of the canonical completion disposition.
+/// The dispositions one I21.12 debt kind refuses, in wire names.
+///
+/// Stated per debt so a reader can check the enforced set against the claim
+/// class the debt publishes, instead of having to trust that the two agree.
+fn refused_dispositions_for(kind: ResearchDebtKind) -> Vec<&'static str> {
+    [
+        CompletionDisposition::AnsweredWithSupportedResult,
+        CompletionDisposition::NoMatchInCompleteScope,
+    ]
+    .into_iter()
+    .filter(|disposition| kind.blocks_disposition(*disposition))
+    .map(disposition_wire)
+    .collect()
+}
+
 /// Stable wire spelling of the debt kinds a run registered, deduplicated and
 /// ordered.
 ///
@@ -5619,6 +5688,7 @@ fn debt_kinds_wire(debts: &[ResearchDebt]) -> String {
     kinds.join(",")
 }
 
+/// Stable wire spelling of the canonical completion disposition.
 fn disposition_wire(disposition: CompletionDisposition) -> &'static str {
     match disposition {
         CompletionDisposition::AnsweredWithSupportedResult => "ANSWERED_WITH_SUPPORTED_RESULT",
