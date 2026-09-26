@@ -41,10 +41,11 @@ use eliot_research_exchange_api::{
 };
 
 use crate::evidence_portfolio::{
-    AbsenceVerdict, ClaimVerdict, CoverageAccount, LineageTable, PortfolioError,
-    PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
-    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, check_precision, digest, freeze,
-    grade_name, grade_rank, push_count, push_field, reject_vague, text,
+    AbsencePreconditions, AbsenceVerdict, ClaimVerdict, CoverageAccount, LineageTable,
+    ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
+    SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
+    check_precision, digest, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
+    text,
 };
 use crate::inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationParams, InquiryObligationStatus,
@@ -485,6 +486,70 @@ pub enum CounterSearchStatus {
     Satisfied,
     /// One was required and is still open.
     RequiredAndOpen,
+}
+
+/// What one run actually established about the frozen eligible scope (I21.1).
+///
+/// "No eligible source" and "the enumeration never ran" are different facts and
+/// must never be read as one. A verified empty scope needs an enumeration that
+/// ran over a closed population; when nothing was enumerated the same empty
+/// eligible set is an absent measurement and stays `Uninitialised`.
+///
+/// A *verified empty* eligible scope is a state this vocabulary cannot
+/// currently express, and no placeholder member is invented to close that gap:
+/// [`crate::evidence_portfolio::CoverageAccount::open`] refuses a zero-member
+/// denominator and [`CoverageReceipt::compute`] refuses a zero expected-member
+/// count, so an inquiry whose admitted manifest declares no member produces no
+/// record at all rather than a record stating that the eligible scope is empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnumerationState {
+    /// Nothing was observed against the frozen scope, so an empty eligible set
+    /// is an absent measurement and never an empty population.
+    Uninitialised,
+    /// The enumeration ran and the declared remainder is still unexamined.
+    Incomplete,
+    /// The enumeration ran and every declared member closed intact.
+    Complete,
+}
+
+impl EnumerationState {
+    /// Stable wire spelling of this enumeration state.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Uninitialised => "uninitialised",
+            Self::Incomplete => "incomplete",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+impl std::fmt::Display for EnumerationState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.wire_name())
+    }
+}
+
+/// Derives what one run actually established about the frozen eligible scope.
+///
+/// An enumeration that recorded nothing leaves the declared remainder
+/// indistinguishable from a scope nobody ever checked. The state, read beside
+/// the observed population that is provably outside the frozen scope, keeps
+/// those two facts apart instead of letting an enumeration that never ran read
+/// as a verified empty scope.
+fn enumeration_state(
+    account: &CoverageAccount,
+    observed_outside_scope: &[ObservedOutsideScope],
+) -> EnumerationState {
+    if account.all_closed() {
+        return EnumerationState::Complete;
+    }
+    if observed_outside_scope.is_empty()
+        && account.open_members().len() == account.denominator_size()
+    {
+        return EnumerationState::Uninitialised;
+    }
+    EnumerationState::Incomplete
 }
 
 /// Denominator kind of one coverage receipt (I21.6).
@@ -2050,6 +2115,12 @@ pub struct CoverageReceipt {
     pub accounted: bool,
     /// Whether every accounted member closed intact.
     pub all_closed: bool,
+    /// Candidates the run observed outside the frozen scope, each with its real
+    /// disposition and evidence identity. They close no declared member and
+    /// narrow no denominator.
+    pub observed_outside_scope: Vec<ObservedOutsideScope>,
+    /// What the run actually established about the frozen eligible scope.
+    pub enumeration_state: EnumerationState,
     /// Eligible handles the receipt represents.
     pub eligible_handles: Vec<String>,
     /// Explicit coverage unknowns, preserved rather than smoothed.
@@ -2076,8 +2147,9 @@ impl CoverageReceipt {
     /// # Errors
     ///
     /// Returns [`InquiryError::IncompleteDenominator`] when the frozen
-    /// denominator has no member to account, and a field error for a vague
-    /// scope or a malformed frozen-scope digest.
+    /// denominator has no member to account, a field error for a vague
+    /// scope or a malformed frozen-scope digest, and the absence-precondition
+    /// error when a bound predicate evaluation names no member.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         profile: &InquiryProtocolProfile,
@@ -2089,6 +2161,7 @@ impl CoverageReceipt {
         provider_degradation: Vec<String>,
         unknown_coverage: Vec<String>,
         budget_limitation: Option<String>,
+        assessment_time_ms: i64,
     ) -> Result<Self, InquiryError> {
         require_scope(requested_scope, "coverage.requested_scope")?;
         require_digest(frozen_scope_digest, "coverage.frozen_scope_digest")?;
@@ -2107,11 +2180,22 @@ impl CoverageReceipt {
             .collect();
         eligible_handles.sort();
         eligible_handles.dedup();
-        // Completeness is never claimed here: this boundary does not prove the
-        // route authoritative for the scope, so the absence assessment stays
-        // unproven and the denominator kind is established only by the exact
-        // accounting, which is the sole admissible basis.
-        let absence_verdict = assess_absence(all_closed, account, false);
+        let observed_outside_scope = account.observed_outside_scope();
+        let enumeration_state = enumeration_state(&account, &observed_outside_scope);
+        // This plane records per-source acquisition dispositions, not per-member
+        // query predicate results, and it holds no authoritative enumeration
+        // attestation for the route. It therefore binds no bounded predicate
+        // evaluation here, and the absence assessment names the accounting facts
+        // that block the negative as its reason instead of resting on a
+        // caller-supplied flag.
+        let absence_preconditions = AbsencePreconditions::derive(
+            account,
+            &vetted_records(records),
+            assessment_time_ms,
+            frozen_scope_digest,
+            None,
+        )?;
+        let absence_verdict = assess_absence(&absence_preconditions);
         let counter_search_status = if profile.hypothesis_policy.requires_counter_search() {
             CounterSearchStatus::RequiredAndOpen
         } else {
@@ -2140,6 +2224,8 @@ impl CoverageReceipt {
             open_members: account.open_members(),
             accounted,
             all_closed,
+            observed_outside_scope,
+            enumeration_state,
             eligible_handles,
             unknown_coverage,
             routes_used,
@@ -2186,6 +2272,31 @@ impl CoverageReceipt {
         }
         push_field(&mut preimage, "accounted", bool_text(self.accounted));
         push_field(&mut preimage, "all_closed", bool_text(self.all_closed));
+        push_count(
+            &mut preimage,
+            "observed_outside_scope",
+            self.observed_outside_scope.len(),
+        );
+        // The handles and dispositions the receipt publishes are bound here;
+        // each observation's content digest, admitted operation and manifest
+        // digest are bound by the adjacent account digest.
+        for observation in &self.observed_outside_scope {
+            push_field(
+                &mut preimage,
+                ObservedOutsideScope::REASON,
+                &observation.handle,
+            );
+            push_field(
+                &mut preimage,
+                "observed_disposition",
+                observation.disposition.wire_name(),
+            );
+        }
+        push_field(
+            &mut preimage,
+            "enumeration_state",
+            self.enumeration_state.wire_name(),
+        );
         push_count(
             &mut preimage,
             "eligible_handles",
@@ -3452,7 +3563,7 @@ impl InquiryGovernance {
         let admissibility = assess_sources(&observation, &profile)?;
         let portfolio =
             SourcePortfolio::assemble(&observation.inquiry_id, &profile, &admissibility)?;
-        let account = coverage_account(&observation)?;
+        let account = coverage_account(&observation, &admissibility)?;
         let degradation = degradation(&observation, &account);
         let coverage_receipt = CoverageReceipt::compute(
             &profile,
@@ -3464,6 +3575,7 @@ impl InquiryGovernance {
             degradation.provider_degradation,
             degradation.unknown_coverage,
             degradation.budget_limitation,
+            observation.assessment_time_ms,
         )?;
         let precision = EvidenceSetPrecision::evaluate(
             &observation.inquiry_id,
@@ -3610,8 +3722,9 @@ impl std::fmt::Display for InquiryGovernance {
              coverage_goal={} goal_text_resolved={} hypothesis_policy={} manifest={} \
              admitted_inquiry={} admitted_denominator={} stop_rule={} output_contract={} \
              independence_ok={} admissibility={} eligible={} unadmitted_refs={} portfolio={} \
-             expected_members={} open_members={} accounted={} all_closed={} denominator_kind={} \
-             absence={} supported_precision={} precision_residue={} obligations={} \
+             expected_members={} open_members={} accounted={} all_closed={} enumeration={} \
+             observed_outside={} denominator_kind={} absence={} \
+             supported_precision={} precision_residue={} obligations={} \
              materialisable={} deferred={} compilation_inputs={} freeze={} debts={} \
              disposition={} terminal_denominator_kind={} may_close={} \
              acquisition_succeeded={} preserved_unknown={} narrower_claim={} \
@@ -3640,6 +3753,8 @@ impl std::fmt::Display for InquiryGovernance {
             self.coverage_receipt.open_members.len(),
             self.coverage_receipt.accounted,
             self.coverage_receipt.all_closed,
+            self.coverage_receipt.enumeration_state,
+            self.coverage_receipt.observed_outside_scope.len(),
             self.coverage_receipt.denominator_kind,
             absence_wire(&self.coverage_receipt.absence_verdict),
             anchor_wire(self.precision.supported_precision),
@@ -3788,7 +3903,19 @@ fn reference_firewall(
 }
 
 /// Opens the exact coverage accounting over the admitted reference members.
-fn coverage_account(observation: &InquiryObservation) -> Result<CoverageAccount, InquiryError> {
+///
+/// The declared denominator is exactly the admitted manifest, and it is never
+/// widened to fit an observation. Each observed candidate is either bound to the
+/// member the manifest declared for it, or retained as an
+/// [`ObservedOutsideScope`] observation: a provider result the Kernel could not
+/// have known when it froze the manifest stays visibly outside the frozen scope
+/// with its real disposition instead of silently becoming part of it. The two
+/// populations stay separately readable in the account digest, which is what
+/// lets a verified empty scope be told apart from an enumeration that never ran.
+fn coverage_account(
+    observation: &InquiryObservation,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<CoverageAccount, InquiryError> {
     let manifest = &observation.reference_manifest;
     let mut members: BTreeSet<String> = BTreeSet::new();
     for handle in manifest
@@ -3799,7 +3926,17 @@ fn coverage_account(observation: &InquiryObservation) -> Result<CoverageAccount,
     {
         members.insert(handle.clone());
     }
-    CoverageAccount::open(members).map_err(InquiryError::from)
+    let mut account = CoverageAccount::open(members).map_err(InquiryError::from)?;
+    for record in admissibility {
+        account.observe(
+            &record.record.handle,
+            record.record.acquisition,
+            &record.record.content_digest,
+            &record.record.operation_id,
+            &manifest.digest,
+        )?;
+    }
+    Ok(account)
 }
 
 /// Observed degradation, coverage unknowns and the budget limitation of one run.
@@ -3886,8 +4023,11 @@ fn research_debts(
             profile,
             ResearchDebtKind::Coverage,
             &format!(
-                "{} admitted reference members carry no disposition",
-                coverage_receipt.open_members.len()
+                "{} admitted reference member(s) carry no disposition: {}; {} candidate(s) were \
+                 observed outside the frozen scope instead and close none of them",
+                coverage_receipt.open_members.len(),
+                coverage_receipt.open_members.join(","),
+                coverage_receipt.observed_outside_scope.len()
             ),
             "researcher",
             "a source record is admitted for every frozen reference member",

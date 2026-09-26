@@ -131,6 +131,33 @@ fn record(handle: &str) -> SourceRecord {
     SourceRecord::new(source_params(handle)).expect("source record")
 }
 
+// Fixture for the owner-bound absence preconditions: the two former
+// caller-supplied booleans are no longer inputs, so the cases below present the
+// evidence those flags stood in for.
+fn no_match_evaluation(members: &[String], frozen_scope_digest: &str) -> NoMatchEvaluation {
+    NoMatchEvaluation {
+        predicate_id: "predicate-700".to_owned(),
+        frozen_scope_digest: frozen_scope_digest.to_owned(),
+        index_revision: "index-rev-1".to_owned(),
+        no_match_members: members.to_vec(),
+    }
+}
+
+fn preconditions(
+    account: &CoverageAccount,
+    evaluation: Option<NoMatchEvaluation>,
+    frozen_scope_digest: &str,
+) -> AbsencePreconditions {
+    AbsencePreconditions::derive(
+        account,
+        &BTreeMap::new(),
+        1_700_000_300_000,
+        frozen_scope_digest,
+        evaluation,
+    )
+    .expect("preconditions")
+}
+
 fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> AuthorizedManifest {
     let mut sources = BTreeMap::new();
     for (handle, entry) in &portfolio.records {
@@ -442,37 +469,49 @@ fn acquisition_dispositions_stay_distinct() {
 #[test]
 fn absence_requires_complete_authoritative_lookup() {
     let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
-    let mut proven = CoverageAccount::open(inquiry.denominator_members()).expect("account");
-    for member in inquiry.denominator_members() {
+    let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    let mut proven = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
         proven
             .record(
-                &member,
+                member,
                 SourceDisposition::Observed,
                 Some(format!("h-{member}")),
             )
             .expect("record");
     }
-    assert_eq!(assess_absence(true, &proven, true), AbsenceVerdict::Proven);
-    let mut gapped = CoverageAccount::open(inquiry.denominator_members()).expect("account");
-    for member in inquiry.denominator_members() {
+    assert_eq!(
+        assess_absence(&preconditions(
+            &proven,
+            Some(no_match_evaluation(&members, DIGEST_A)),
+            DIGEST_A
+        )),
+        AbsenceVerdict::Proven
+    );
+    let mut gapped = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
         let disposition = if member == "primary#0" {
             SourceDisposition::Unknown
         } else {
             SourceDisposition::Observed
         };
         gapped
-            .record(&member, disposition, Some(format!("h-{member}")))
+            .record(member, disposition, Some(format!("h-{member}")))
             .expect("record");
     }
     assert!(matches!(
-        assess_absence(true, &gapped, true),
+        assess_absence(&preconditions(
+            &gapped,
+            Some(no_match_evaluation(&members, DIGEST_A)),
+            DIGEST_A
+        )),
         AbsenceVerdict::Unproven { .. }
     ));
-    let mut exhausted = CoverageAccount::open(inquiry.denominator_members()).expect("account");
-    for member in inquiry.denominator_members() {
+    let mut exhausted = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
         exhausted
             .record(
-                &member,
+                member,
                 SourceDisposition::Observed,
                 Some(format!("h-{member}")),
             )
@@ -482,15 +521,23 @@ fn absence_requires_complete_authoritative_lookup() {
         .note_frontier("route budget ended early")
         .expect("frontier");
     assert!(matches!(
-        assess_absence(true, &exhausted, true),
+        assess_absence(&preconditions(
+            &exhausted,
+            Some(no_match_evaluation(&members, DIGEST_A)),
+            DIGEST_A
+        )),
         AbsenceVerdict::PartialExhaustion { .. }
     ));
     assert!(matches!(
-        assess_absence(false, &proven, true),
+        assess_absence(&preconditions(&proven, None, DIGEST_A)),
         AbsenceVerdict::Unproven { .. }
     ));
     assert!(matches!(
-        assess_absence(true, &proven, false),
+        assess_absence(&preconditions(
+            &proven,
+            Some(no_match_evaluation(&members, DIGEST_B)),
+            DIGEST_A
+        )),
         AbsenceVerdict::Unproven { .. }
     ));
 }

@@ -1256,16 +1256,50 @@ pub fn decide_grade(records: &[&SourceRecord], claim_domain: &str, now_ms: i64) 
     GradeDecision { ceiling, limits }
 }
 
+/// One observed candidate the frozen denominator never declared.
+///
+/// I21.1: a provider result that was never admitted stays visibly outside the
+/// frozen scope. The observation keeps its real [`SourceDisposition`], its exact
+/// content digest and the admitted operation that produced it, it closes no
+/// declared member, and it never becomes part of the declared population. The
+/// denominator is never widened to fit an observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedOutsideScope {
+    /// Observed source handle, exactly as the acquisition route reported it.
+    pub handle: String,
+    /// What the acquisition route actually observed.
+    pub disposition: SourceDisposition,
+    /// Exact digest of the observed content bytes.
+    pub content_digest: String,
+    /// Admitted operation identity that produced the observation.
+    pub operation_id: String,
+    /// Digest of the admitted reference manifest the observation fell outside
+    /// of.
+    pub admitted_manifest_digest: String,
+}
+
+impl ObservedOutsideScope {
+    /// Closed reason code an observation in this set carries. It is the only
+    /// reason the set can hold: an observation is retained here exactly because
+    /// the frozen denominator never declared it, and the code is digested so a
+    /// reader never has to infer the reason from the schema.
+    pub const REASON: &'static str = "observed_outside_frozen_scope";
+}
+
 /// Exact coverage accounting over the frozen denominator: every expected
 /// member carries exactly one visible disposition, an explicit exclusion, or
-/// a budget-frontier note. Complete accounting never implies that all
-/// evidence succeeded.
+/// a budget-frontier note, and every candidate the run actually observed is
+/// either bound to one of those members or retained as an observation outside
+/// the frozen scope. Complete accounting never implies that all evidence
+/// succeeded, and the two populations stay separately visible in every digest
+/// so a verified empty scope never reads as an enumeration that never ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverageAccount {
     expected: BTreeSet<String>,
     outcomes: BTreeMap<String, (SourceDisposition, Option<String>)>,
     exclusions: BTreeMap<String, String>,
     frontier: Option<String>,
+    observed: BTreeMap<String, ObservedOutsideScope>,
 }
 
 impl CoverageAccount {
@@ -1281,12 +1315,14 @@ impl CoverageAccount {
             outcomes: BTreeMap::new(),
             exclusions: BTreeMap::new(),
             frontier: None,
+            observed: BTreeMap::new(),
         })
     }
 
     /// Records one disposition for one expected member, with the acquiring
-    /// source handle when one exists. Re-recording the same disposition is
-    /// idempotent; a changed disposition for the same member conflicts.
+    /// source handle when one exists. A repeated delivery of the identical
+    /// member/disposition/handle binding is idempotent; any changed binding
+    /// conflicts rather than disappearing behind the same disposition.
     pub fn record(
         &mut self,
         member: &str,
@@ -1298,25 +1334,85 @@ impl CoverageAccount {
                 field: "coverage.member",
             });
         }
+        if let Some(handle) = &handle {
+            text(handle, "coverage.handle")?;
+        }
         if self.exclusions.contains_key(member) {
             return Err(PortfolioError::Conflict {
                 field: "coverage.member",
             });
         }
         match self.outcomes.get(member) {
-            Some((current, _)) if *current == disposition => Ok(()),
+            Some((current, current_handle))
+                if *current == disposition && *current_handle == handle =>
+            {
+                Ok(())
+            }
             Some(_) => Err(PortfolioError::Conflict {
                 field: "coverage.member",
             }),
             None => {
-                if let Some(handle) = &handle {
-                    text(handle, "coverage.handle")?;
-                }
                 self.outcomes
                     .insert(member.to_owned(), (disposition, handle));
                 Ok(())
             }
         }
+    }
+
+    /// Records one observed candidate against the accounting.
+    ///
+    /// A handle the frozen denominator declared is recorded as that member's
+    /// disposition. A handle the denominator never declared is retained as an
+    /// [`ObservedOutsideScope`] observation: it keeps its real disposition,
+    /// content digest and admitted operation, closes no member, and stays
+    /// outside the declared population. A repeated delivery of the identical
+    /// binding is idempotent; a changed disposition, content digest or admitted
+    /// operation under an already-retained handle conflicts instead of
+    /// overwriting the earlier observation.
+    pub fn observe(
+        &mut self,
+        handle: &str,
+        disposition: SourceDisposition,
+        content_digest: &str,
+        operation_id: &str,
+        admitted_manifest_digest: &str,
+    ) -> Result<(), PortfolioError> {
+        text(handle, "coverage.handle")?;
+        digest(content_digest, "coverage.content_digest")?;
+        text(operation_id, "coverage.operation_id")?;
+        digest(
+            admitted_manifest_digest,
+            "coverage.admitted_manifest_digest",
+        )?;
+        if self.expected.contains(handle) {
+            return self.record(handle, disposition, Some(handle.to_owned()));
+        }
+        let observation = ObservedOutsideScope {
+            handle: handle.to_owned(),
+            disposition,
+            content_digest: content_digest.to_owned(),
+            operation_id: operation_id.to_owned(),
+            admitted_manifest_digest: admitted_manifest_digest.to_owned(),
+        };
+        match self.observed.get(handle) {
+            Some(current) if *current == observation => Ok(()),
+            Some(_) => Err(PortfolioError::Conflict {
+                field: "coverage.observed_handle",
+            }),
+            None => {
+                self.observed.insert(handle.to_owned(), observation);
+                Ok(())
+            }
+        }
+    }
+
+    /// Every observed candidate the frozen denominator never declared, in
+    /// canonical handle order. These close no declared member and narrow no
+    /// denominator: they are retained so an empty eligible scope stays
+    /// distinguishable from an enumeration that never ran.
+    #[must_use]
+    pub fn observed_outside_scope(&self) -> Vec<ObservedOutsideScope> {
+        self.observed.values().cloned().collect()
     }
 
     /// Excludes one member under an explicit permitted reason.
@@ -1418,6 +1514,26 @@ impl CoverageAccount {
                 push_field(preimage, "handle", handle);
             }
         }
+        push_count(preimage, "observed", self.observed.len());
+        for observation in self.observed.values() {
+            push_field(preimage, ObservedOutsideScope::REASON, &observation.handle);
+            push_field(
+                preimage,
+                "observed_disposition",
+                observation.disposition.wire_name(),
+            );
+            push_field(
+                preimage,
+                "observed_content_digest",
+                &observation.content_digest,
+            );
+            push_field(preimage, "observed_operation_id", &observation.operation_id);
+            push_field(
+                preimage,
+                "observed_manifest_digest",
+                &observation.admitted_manifest_digest,
+            );
+        }
         push_count(preimage, "exclusions", self.exclusions.len());
         for (member, reason) in &self.exclusions {
             push_field(preimage, "excluded", member);
@@ -1439,9 +1555,10 @@ impl CoverageAccount {
 /// Absence verdict for one scoped negative claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AbsenceVerdict {
-    /// Proven: complete denominator, full accounting, authoritative lookup.
+    /// Proven: complete denominator, full accounting, current sources and a
+    /// bounded predicate evaluation over exactly the closed members.
     Proven,
-    /// Unproven: unknown or unavailable material leaves the negative open.
+    /// Unproven: a named retained fact leaves the negative open.
     Unproven {
         /// Bounded reason the absence cannot be claimed.
         reason: String,
@@ -1453,43 +1570,286 @@ pub enum AbsenceVerdict {
     },
 }
 
-/// Assesses a scoped absence claim. Only a complete denominator with full
-/// accounting and an authoritative lookup proves absence; unknown or
-/// unavailable material is never absence, and bounded exhaustion is partial.
-pub fn assess_absence(
-    denominator_complete: bool,
-    account: &CoverageAccount,
-    authoritative_lookup: bool,
-) -> AbsenceVerdict {
-    if account.frontier.is_some() {
+/// One owner-bound, identity-bearing record of a bounded predicate evaluation
+/// over a named closed population.
+///
+/// This is neither a verdict nor a flag: it is the identity of the per-member
+/// predicate result. It names the predicate that was evaluated, the frozen
+/// scope snapshot and index revision the evaluation was bounded to, and the
+/// exact members it found no match for. [`assess_absence`] proves absence only
+/// when that member set is exactly the set of declared members the accounting
+/// closed intact, so an incomplete evaluation cannot be presented as
+/// exhaustive and a ranked index can neither add a member to the denominator
+/// of a negative nor remove one from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoMatchEvaluation {
+    /// Exact identity of the predicate that was evaluated.
+    pub predicate_id: String,
+    /// Digest of the frozen scope snapshot the evaluation was bounded to.
+    pub frozen_scope_digest: String,
+    /// Revision of the source/index the evaluation ran against.
+    pub index_revision: String,
+    /// Members the predicate found no match for. Normalised into canonical
+    /// order by [`AbsencePreconditions::derive`] so arrival order never
+    /// affects the comparison against the closed denominator.
+    pub no_match_members: Vec<String>,
+}
+
+/// The owner-bound preconditions one exact negative claim is assessed against.
+///
+/// Every field is derived from the exact coverage accounting, the vetted source
+/// records behind it and the frozen scope snapshot the claim is scoped to, so a
+/// caller supplies evidence and never a verdict. The record names which
+/// precondition is unmet, and its digest binds the preconditions to that exact
+/// evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbsencePreconditions {
+    /// Digest of the frozen scope snapshot the claim is scoped to.
+    pub frozen_scope_digest: String,
+    /// Digest of the exact accounting the preconditions were derived over.
+    pub account_digest: String,
+    /// Declared members that were never examined at all.
+    pub unexamined: Vec<String>,
+    /// Declared members examined with a disposition that did not close them,
+    /// paired with that disposition's stable spelling.
+    pub unclosed: Vec<(String, &'static str)>,
+    /// Declared members carrying an explicit exclusion. An exclusion is not a
+    /// successful search, so an excluded member can never support a negative.
+    pub excluded: Vec<String>,
+    /// Closed members whose source or index is no longer current.
+    pub incompatible: Vec<String>,
+    /// Declared members the accounting closed intact.
+    pub closed: Vec<String>,
+    /// Candidates observed outside the frozen scope. They are counted so an
+    /// empty eligible set stays distinguishable from an enumeration that never
+    /// ran; they close no member and narrow no denominator.
+    pub observed_outside_scope: usize,
+    /// Frontier where a bounded enumeration stopped, when one applied.
+    pub frontier: Option<String>,
+    /// The bounded predicate evaluation bound to the requested query, when one
+    /// exists. The research plane records acquisition dispositions, not
+    /// per-member query predicate results, so an inquiry record binds none and
+    /// the negative stays unproven.
+    pub evaluation: Option<NoMatchEvaluation>,
+    /// Digest over the preconditions.
+    pub digest: String,
+}
+
+impl AbsencePreconditions {
+    /// Derives the preconditions of one exact negative claim from the exact
+    /// accounting, the vetted records behind it and the frozen snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a digest or field error for a malformed frozen-scope digest or a
+    /// malformed evaluation binding, and
+    /// [`PortfolioError::IncompleteDenominator`] for an evaluation that names
+    /// no member, which no closed population produces.
+    pub fn derive(
+        account: &CoverageAccount,
+        records: &BTreeMap<String, SourceRecord>,
+        now_ms: i64,
+        frozen_scope_digest: &str,
+        evaluation: Option<NoMatchEvaluation>,
+    ) -> Result<Self, PortfolioError> {
+        digest(frozen_scope_digest, "absence.frozen_scope_digest")?;
+        let mut unclosed: Vec<(String, &'static str)> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
+        let mut incompatible: Vec<String> = Vec::new();
+        for (member, (disposition, handle)) in &account.outcomes {
+            if disposition.closes_member() {
+                closed.push(member.clone());
+                let stale = handle.as_ref().is_some_and(|handle| {
+                    records
+                        .get(handle)
+                        .is_some_and(|record| record.is_stale_at(now_ms))
+                });
+                if stale {
+                    incompatible.push(member.clone());
+                }
+            } else {
+                unclosed.push((member.clone(), disposition.wire_name()));
+            }
+        }
+        let evaluation = match evaluation {
+            Some(mut evaluation) => {
+                text(&evaluation.predicate_id, "absence.predicate_id")?;
+                text(&evaluation.index_revision, "absence.index_revision")?;
+                digest(
+                    &evaluation.frozen_scope_digest,
+                    "absence.evaluation_frozen_scope_digest",
+                )?;
+                if evaluation.no_match_members.is_empty() {
+                    return Err(PortfolioError::IncompleteDenominator {
+                        field: "absence.no_match_members",
+                    });
+                }
+                for member in &evaluation.no_match_members {
+                    text(member, "absence.no_match_member")?;
+                }
+                evaluation.no_match_members.sort();
+                evaluation.no_match_members.dedup();
+                Some(evaluation)
+            }
+            None => None,
+        };
+        let mut preconditions = Self {
+            frozen_scope_digest: frozen_scope_digest.to_owned(),
+            account_digest: account.digest(),
+            unexamined: account.open_members(),
+            unclosed,
+            excluded: account.exclusions.keys().cloned().collect(),
+            incompatible,
+            closed,
+            observed_outside_scope: account.observed.len(),
+            frontier: account.frontier.clone(),
+            evaluation,
+            digest: String::new(),
+        };
+        preconditions.digest = preconditions.compute_digest();
+        Ok(preconditions)
+    }
+
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("absence-preconditions/v1;");
+        push_field(
+            &mut preimage,
+            "frozen_scope_digest",
+            &self.frozen_scope_digest,
+        );
+        push_field(&mut preimage, "account_digest", &self.account_digest);
+        for (tag, members) in [
+            ("unexamined", &self.unexamined),
+            ("excluded", &self.excluded),
+            ("incompatible", &self.incompatible),
+            ("closed", &self.closed),
+        ] {
+            push_count(&mut preimage, tag, members.len());
+            for member in members {
+                push_field(&mut preimage, tag, member);
+            }
+        }
+        push_count(&mut preimage, "unclosed", self.unclosed.len());
+        for (member, disposition) in &self.unclosed {
+            push_field(&mut preimage, "unclosed_member", member);
+            push_field(&mut preimage, "unclosed_disposition", disposition);
+        }
+        push_count(
+            &mut preimage,
+            "observed_outside_scope",
+            self.observed_outside_scope,
+        );
+        if let Some(frontier) = &self.frontier {
+            push_field(&mut preimage, "frontier", frontier);
+        }
+        match &self.evaluation {
+            Some(evaluation) => {
+                push_field(&mut preimage, "predicate_id", &evaluation.predicate_id);
+                push_field(
+                    &mut preimage,
+                    "evaluation_frozen_scope_digest",
+                    &evaluation.frozen_scope_digest,
+                );
+                push_field(&mut preimage, "index_revision", &evaluation.index_revision);
+                push_count(
+                    &mut preimage,
+                    "no_match_members",
+                    evaluation.no_match_members.len(),
+                );
+                for member in &evaluation.no_match_members {
+                    push_field(&mut preimage, "no_match_member", member);
+                }
+            }
+            None => push_field(&mut preimage, "evaluation", "absent"),
+        }
+        freeze(&preimage)
+    }
+}
+
+/// Assesses a scoped absence claim over owner-bound preconditions.
+///
+/// Only a complete denominator, an exact accounting of every declared member,
+/// an intact source/index for each closed member, no exclusion and a bounded
+/// predicate evaluation over exactly the closed members proves absence. A
+/// bounded enumeration that stopped is partial exhaustion. Every rejected claim
+/// names the retained fact that rejected it, so no verdict rests on a
+/// caller-supplied flag.
+pub fn assess_absence(preconditions: &AbsencePreconditions) -> AbsenceVerdict {
+    if let Some(frontier) = &preconditions.frontier {
         return AbsenceVerdict::PartialExhaustion {
-            frontier: account.frontier.clone().unwrap_or_default(),
+            frontier: frontier.clone(),
         };
     }
-    if !denominator_complete {
+    if !preconditions.unexamined.is_empty() {
         return AbsenceVerdict::Unproven {
-            reason: "denominator is not a complete scope".to_owned(),
+            reason: format!(
+                "coverage: {} declared denominator member(s) were never examined: {}",
+                preconditions.unexamined.len(),
+                preconditions.unexamined.join(",")
+            ),
         };
     }
-    if !account.is_accounted() {
+    if !preconditions.excluded.is_empty() {
         return AbsenceVerdict::Unproven {
-            reason: "coverage accounting is incomplete".to_owned(),
+            reason: format!(
+                "coverage: an exclusion is not a successful search; {} member(s) were excluded: {}",
+                preconditions.excluded.len(),
+                preconditions.excluded.join(",")
+            ),
         };
     }
-    if !authoritative_lookup {
+    if !preconditions.unclosed.is_empty() {
+        let unclosed = preconditions
+            .unclosed
+            .iter()
+            .map(|(member, disposition)| format!("{member}={disposition}"))
+            .collect::<Vec<String>>()
+            .join(",");
         return AbsenceVerdict::Unproven {
-            reason: "lookup is not authoritative for this scope".to_owned(),
+            reason: format!(
+                "coverage: {} examined member(s) did not close their denominator slot: {unclosed}",
+                preconditions.unclosed.len()
+            ),
         };
     }
-    let open = account.outcomes.values().any(|(disposition, _)| {
-        matches!(
-            disposition,
-            SourceDisposition::Unknown | SourceDisposition::Unavailable
-        )
-    });
-    if open {
+    if !preconditions.incompatible.is_empty() {
         return AbsenceVerdict::Unproven {
-            reason: "unknown or unavailable material leaves the negative open".to_owned(),
+            reason: format!(
+                "coverage: {} closed member(s) are no longer current for the frozen snapshot: {}",
+                preconditions.incompatible.len(),
+                preconditions.incompatible.join(",")
+            ),
+        };
+    }
+    let Some(evaluation) = &preconditions.evaluation else {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: no bounded predicate evaluation is bound to the requested query over \
+                 frozen scope snapshot {}; accounting {} declared member(s) closed and observing \
+                 {} candidate(s) outside that scope does not prove the query has no match",
+                preconditions.frozen_scope_digest,
+                preconditions.closed.len(),
+                preconditions.observed_outside_scope
+            ),
+        };
+    };
+    if evaluation.frozen_scope_digest != preconditions.frozen_scope_digest {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: the predicate evaluation is bounded to frozen scope snapshot {}, not to {}",
+                evaluation.frozen_scope_digest, preconditions.frozen_scope_digest
+            ),
+        };
+    }
+    if evaluation.no_match_members != preconditions.closed {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: the predicate evaluation covers {} member(s) over index revision {}, \
+                 not the {} closed member(s) of the frozen denominator",
+                evaluation.no_match_members.len(),
+                evaluation.index_revision,
+                preconditions.closed.len()
+            ),
         };
     }
     AbsenceVerdict::Proven
