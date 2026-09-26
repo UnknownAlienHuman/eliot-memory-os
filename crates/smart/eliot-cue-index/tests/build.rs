@@ -42,7 +42,7 @@ fn provenance() -> Provenance {
         capture_route: "unit".into(),
         scope: "scope-1".into(),
         raw_handle: None,
-        revision: None,
+        revision: Some("1".to_owned()),
     }
 }
 
@@ -402,6 +402,24 @@ fn denominator(
     omitted_rows: usize,
     omitted_edges: usize,
 ) -> CueProjectionDenominator {
+    let row_omissions = (0..omitted_rows)
+        .map(|index| {
+            CueProjectionOmission::new(
+                format!("omitted-row-{index}"),
+                CueProjectionOmissionKind::Row,
+                CueProjectionOmissionReason::OwnerBound,
+            )
+        })
+        .collect();
+    let edge_omissions = (0..omitted_edges)
+        .map(|index| {
+            CueProjectionOmission::new(
+                format!("omitted-edge-{index}"),
+                CueProjectionOmissionKind::Edge,
+                CueProjectionOmissionReason::OwnerBound,
+            )
+        })
+        .collect();
     CueProjectionDenominator::new(
         expected_rows,
         expected_edges,
@@ -409,6 +427,7 @@ fn denominator(
         omitted_edges,
         1,
     )
+    .with_omissions(row_omissions, edge_omissions)
 }
 
 #[test]
@@ -581,7 +600,7 @@ fn named_edge(id: &str, from: &str, to: &str, kind: RelationKind) -> RelationEdg
 }
 
 fn edge_weight(edge: &str, milli: u16) -> SnapshotEdgeWeight {
-    SnapshotEdgeWeight::new(RelationEdgeId::new(edge).expect("edge id"), milli)
+    SnapshotEdgeWeight::new_at_revision(RelationEdgeId::new(edge).expect("edge id"), milli, 1)
 }
 
 fn verification_binding() -> VerificationBinding {
