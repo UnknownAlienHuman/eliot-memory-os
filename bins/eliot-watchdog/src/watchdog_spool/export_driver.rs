@@ -17,14 +17,27 @@
 //! never removes an intent) so the Kernel record and the Governor's later
 //! canonical Problem/Incident decision stay forensically linked to it.
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_protocol::{
+    MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS, WATCHDOG_SPOOL_BATCH_ROUTE,
+    WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID, WATCHDOG_SPOOL_INTENT_BATCH_WIRE_VERSION,
+    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    watchdog_intent_reconciliation_idempotency_key,
+};
 use eliot_watchdog_core::{
-    WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch, WatchdogSpoolPayloadKind,
+    WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch, WatchdogSpoolExportEntry,
+    WatchdogSpoolPayloadKind, validate_batch, validate_batch_freshness,
 };
 
+use super::WatchdogSpoolPayload;
 use crate::watchdog_spool::intent::{
-    IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentSubmission,
+    IntentSubmissionDisposition, PendingWatchdogIntent, WatchdogIntentClass,
+    WatchdogIntentSubmission,
 };
-use crate::{IndependentKernelSensor, SpoolError, WatchdogSpoolExportLimits, current_unix_ms};
+use crate::{
+    GapRecoveryReason, IndependentKernelSensor, SERVICE_NAME, SpoolError,
+    WatchdogSpoolExportLimits, current_unix_ms,
+};
 
 /// Pure admission-entry projection of one export batch, in batch order.
 ///
@@ -145,6 +158,248 @@ pub fn watchog_entry_views(batch: &WatchdogSpoolExportBatch) -> Vec<WatchdogEntr
     watchdog_entry_views(batch)
 }
 
+fn governor_unavailability_code(
+    reason: GapRecoveryReason,
+) -> Result<&'static str, SpoolError> {
+    match reason {
+        GapRecoveryReason::AdmissionUnavailable => Ok("ADMISSION_UNAVAILABLE"),
+        GapRecoveryReason::LeaseStale => Ok("LEASE_STALE"),
+        GapRecoveryReason::LeaseInvalid => Ok("LEASE_INVALID"),
+        GapRecoveryReason::LeaseFenced => Ok("LEASE_FENCED"),
+        GapRecoveryReason::SpoolPressure
+        | GapRecoveryReason::HostAbsentOrStopped
+        | GapRecoveryReason::HostPidReused
+        | GapRecoveryReason::HostImageSubstituted
+        | GapRecoveryReason::HostIdentityChanged
+        | GapRecoveryReason::HostUnknown => Err(SpoolError::Corrupt(
+            "watchdog intent wire payload carries a non-Governor unavailability reason".to_owned(),
+        )),
+    }
+}
+
+fn build_watchdog_intent_submission(
+    installation_id: &str,
+    entry: &WatchdogSpoolExportEntry,
+    pending: &PendingWatchdogIntent,
+) -> Result<WatchdogSpoolIntentSubmission, SpoolError> {
+    if entry.sequence != pending.record.sequence
+        || entry.observed_at_ms != pending.record.observed_at_ms
+        || entry.payload_kind != WatchdogSpoolPayloadKind::Recovery
+        || entry.record_digest != pending.record_digest
+        || entry.payload_digest != pending.payload_digest
+    {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent does not bind the exact export-window entry".to_owned(),
+        ));
+    }
+
+    let (
+        intent_kind,
+        service,
+        evidence_refs,
+        lineage_installation_id,
+        lineage_generation,
+        lineage_epoch,
+        governor_unavailable_reason,
+    ) = match (pending.intent_class, &pending.record.payload) {
+        (
+            WatchdogIntentClass::Problem,
+            WatchdogSpoolPayload::ProblemIntent {
+                service,
+                evidence_refs,
+                lineage_installation_id,
+                lineage_generation,
+                lineage_epoch,
+                governor_unavailable_reason,
+            },
+        ) => (
+            WatchdogIntentKind::ProblemIntent,
+            service,
+            evidence_refs,
+            lineage_installation_id,
+            *lineage_generation,
+            *lineage_epoch,
+            *governor_unavailable_reason,
+        ),
+        (
+            WatchdogIntentClass::Incident,
+            WatchdogSpoolPayload::IncidentIntent {
+                service,
+                evidence_refs,
+                lineage_installation_id,
+                lineage_generation,
+                lineage_epoch,
+                governor_unavailable_reason,
+            },
+        ) => (
+            WatchdogIntentKind::IncidentIntent,
+            service,
+            evidence_refs,
+            lineage_installation_id,
+            *lineage_generation,
+            *lineage_epoch,
+            *governor_unavailable_reason,
+        ),
+        _ => {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent class does not match its retained spool record".to_owned(),
+            ));
+        }
+    };
+
+    if service != SERVICE_NAME || lineage_installation_id != installation_id {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent record is not bound to the exporting installation".to_owned(),
+        ));
+    }
+    let record = serde_json::to_value(&pending.record)
+        .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+    let submission = WatchdogSpoolIntentSubmission {
+        sequence: pending.record.sequence,
+        intent_kind,
+        record_digest: pending.record_digest.clone(),
+        payload_digest: pending.payload_digest.clone(),
+        observed_at_ms: pending.record.observed_at_ms,
+        idempotency_key: watchdog_intent_reconciliation_idempotency_key(
+            installation_id,
+            pending.record.sequence,
+            &pending.record_digest,
+        ),
+        evidence_refs: evidence_refs.clone(),
+        lineage_installation_id: lineage_installation_id.clone(),
+        lineage_generation,
+        lineage_epoch,
+        lineage_epoch_id: pending.epoch_lineage.as_str().to_owned(),
+        governor_unavailable_reason: governor_unavailability_code(
+            governor_unavailable_reason,
+        )?
+        .to_owned(),
+        record,
+    };
+    submission.validate(installation_id).map_err(|error| {
+        SpoolError::Corrupt(format!(
+            "watchdog intent submission does not satisfy the EBP contract: {error}"
+        ))
+    })?;
+    Ok(submission)
+}
+
+/// Builds the exact typed EBP payload for one bounded Watchdog intent window.
+///
+/// The function performs no transport and grants no authority. It joins the
+/// immutable Watchdog export window, the exact pending intent rows retained in
+/// that window, and the verified supervision lease into the closed
+/// [`WatchdogSpoolIntentBatchPayload`] the Kernel route already admits. Every
+/// intent must match one export entry byte-for-byte by sequence, timestamp and
+/// both digests; a record outside the window, a substituted class, lineage or
+/// unavailability reason, and an expired window fail closed before IPC.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] when the export window is empty, expired or invalid,
+/// the lease is blank, the intent count is outside the protocol bound, an
+/// intent is not covered by the window, or the completed protocol payload does
+/// not validate.
+pub fn build_watchdog_intent_batch_payload(
+    batch: &WatchdogSpoolExportBatch,
+    supervision_lease_id: &str,
+    pending: &[PendingWatchdogIntent],
+) -> Result<WatchdogSpoolIntentBatchPayload, SpoolError> {
+    validate_batch(batch, batch.high_water_sequence).map_err(SpoolError::from)?;
+    validate_batch_freshness(batch, current_unix_ms()?).map_err(SpoolError::from)?;
+    if batch.is_empty_batch {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent wire payload cannot be built from an empty export window".to_owned(),
+        ));
+    }
+    if supervision_lease_id.trim().is_empty() {
+        return Err(SpoolError::InvalidLease(
+            "watchdog intent wire payload requires a verified supervision lease".to_owned(),
+        ));
+    }
+    if pending.is_empty() || pending.len() > MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent wire payload requires a bounded non-empty intent list".to_owned(),
+        ));
+    }
+
+    let mut intents = Vec::with_capacity(pending.len());
+    for intent in pending {
+        let entry = batch
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == intent.record.sequence)
+            .ok_or_else(|| {
+                SpoolError::Corrupt(
+                    "watchdog intent is outside the exact export window".to_owned(),
+                )
+            })?;
+        intents.push(build_watchdog_intent_submission(
+            &batch.installation_id,
+            entry,
+            intent,
+        )?);
+    }
+
+    let payload = WatchdogSpoolIntentBatchPayload {
+        wire_id: WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID.to_owned(),
+        wire_version: WATCHDOG_SPOOL_INTENT_BATCH_WIRE_VERSION,
+        route: WATCHDOG_SPOOL_BATCH_ROUTE.to_owned(),
+        installation_id: batch.installation_id.clone(),
+        watchdog_generation: batch.watchdog_generation,
+        watchdog_epoch: batch.watchdog_epoch,
+        supervision_lease_id: supervision_lease_id.to_owned(),
+        sink_id: batch.predecessor_cursor.sink_id.clone(),
+        predecessor_sequence: batch.predecessor_cursor.acknowledged_sequence,
+        first_sequence: batch.first_sequence,
+        last_sequence: batch.last_sequence,
+        high_water_sequence: batch.high_water_sequence,
+        created_at_ms: batch.created_at_ms,
+        expires_at_ms: batch.expires_at_ms,
+        batch_id: batch.batch_id.clone(),
+        batch_digest: batch.batch_digest.clone(),
+        intents,
+        payload_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+    payload.validate().map_err(|error| {
+        SpoolError::Corrupt(format!(
+            "watchdog intent batch does not satisfy the EBP contract: {error}"
+        ))
+    })?;
+    Ok(payload)
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogIntentBatchWireResponse {
+    status: String,
+    value: WatchdogIntentBatchWireValue,
+    recovery: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogIntentBatchWireValue {
+    accepted: bool,
+    sink_id: String,
+    intents: Vec<WatchdogIntentWireAcknowledgement>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogIntentWireAcknowledgement {
+    sequence: u64,
+    idempotency_key: String,
+    intent_kind: String,
+    record_digest: String,
+    payload_digest: String,
+    operation_id: String,
+    state: eliot_ors::HostRequestState,
+    admitted_now: bool,
+}
+
 /// Kernel acknowledgement of one fenced Watchdog intent submission.
 ///
 /// The acknowledgement proves only that the fenced Kernel intent route
@@ -162,6 +417,71 @@ pub struct WatchdogIntentAcknowledgement {
     pub idempotency_key: String,
     /// Digest over the exact acknowledgement the fenced route returned.
     pub acknowledgement_digest: String,
+}
+
+/// Decodes and binds the Kernel's typed answer for one Watchdog intent batch.
+///
+/// The answer must be the closed `known` response, echo the submitted sink and
+/// contain exactly one acknowledgement per submitted intent in the same order.
+/// Sequence, idempotency key, intent class and both record digests are compared
+/// to the original payload before a submit-once receipt is returned. The
+/// receipt digest covers the exact Kernel projection, including operation id,
+/// durable state and first-admission/replay disposition.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] when the response shape is unknown, partial,
+/// recovered, reordered, substituted or otherwise does not answer the exact
+/// submitted payload.
+pub fn decode_watchdog_intent_batch_acknowledgements(
+    payload: &WatchdogSpoolIntentBatchPayload,
+    response: &serde_json::Value,
+) -> Result<Vec<WatchdogIntentAcknowledgement>, SpoolError> {
+    payload.validate().map_err(|error| {
+        SpoolError::Corrupt(format!(
+            "watchdog intent submit payload is invalid at acknowledgement: {error}"
+        ))
+    })?;
+    let response: WatchdogIntentBatchWireResponse = serde_json::from_value(response.clone())
+        .map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "watchdog intent acknowledgement does not decode: {error}"
+            ))
+        })?;
+    if response.status != "known"
+        || response.recovery.is_some()
+        || !response.value.accepted
+        || response.value.sink_id != payload.sink_id
+        || response.value.intents.len() != payload.intents.len()
+    {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent acknowledgement does not close the submitted batch".to_owned(),
+        ));
+    }
+
+    let mut acknowledgements = Vec::with_capacity(payload.intents.len());
+    for (submitted, acknowledged) in payload.intents.iter().zip(&response.value.intents) {
+        if acknowledged.sequence != submitted.sequence
+            || acknowledged.idempotency_key != submitted.idempotency_key
+            || acknowledged.intent_kind != submitted.intent_kind.as_str()
+            || acknowledged.record_digest != submitted.record_digest
+            || acknowledged.payload_digest != submitted.payload_digest
+            || acknowledged.operation_id.trim().is_empty()
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent acknowledgement substituted a submitted identity".to_owned(),
+            ));
+        }
+        let acknowledgement_bytes = canonical_json_bytes(acknowledged)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        acknowledgements.push(WatchdogIntentAcknowledgement {
+            sequence: acknowledged.sequence,
+            sink_id: response.value.sink_id.clone(),
+            idempotency_key: acknowledged.idempotency_key.clone(),
+            acknowledgement_digest: sha256_hex(&acknowledgement_bytes),
+        });
+    }
+    Ok(acknowledgements)
 }
 
 /// Transport-agnostic fenced Kernel route for one Watchdog intent submission.
