@@ -729,7 +729,7 @@ mod tests {
         let mut ev = evidence();
         ev.outcome_unknown = true;
         match decide(&candidate(), &ev, &policy()) {
-            ImprovementAdmissionDecision::RequiresReconciliation { reason } => {
+            ImprovementAdmissionDecision::RequiresReconciliation { reason, .. } => {
                 assert!(reason.contains("reconcile"));
             }
             other => panic!("unknown must reconcile, got {other:?}"),
