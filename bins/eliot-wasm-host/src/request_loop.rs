@@ -57,7 +57,9 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::time::Duration;
 
 use eliot_wasm_runtime::{
@@ -160,6 +162,26 @@ pub enum LoopError {
         /// Stable field name.
         field: &'static str,
     },
+    /// A command was not accepted because the bounded command queue was full.
+    CommandQueueFull {
+        /// Exact command whose enqueue remains pending.
+        command: &'static str,
+    },
+    /// A command was not accepted because the worker command receiver closed.
+    CommandChannelDisconnected {
+        /// Exact command whose enqueue was refused.
+        command: &'static str,
+    },
+    /// The worker exited before returning the accepted command's outcome.
+    WorkerTerminatedWithoutOutcome {
+        /// Exact accepted command whose outcome remains unknown.
+        command: &'static str,
+    },
+    /// The worker outcome channel disconnected before the accepted command replied.
+    OutcomeChannelDisconnected {
+        /// Exact accepted command whose outcome remains unknown.
+        command: &'static str,
+    },
 }
 
 impl LoopError {
@@ -171,6 +193,12 @@ impl LoopError {
             Self::ChannelUnavailable => "REQUEST_LOOP_CHANNEL_UNAVAILABLE",
             Self::ResultTooLarge => "REQUEST_LOOP_RESULT_TOO_LARGE",
             Self::ResultInvalid { .. } => "REQUEST_LOOP_RESULT_INVALID",
+            Self::CommandQueueFull { .. } => "REQUEST_LOOP_COMMAND_QUEUE_FULL",
+            Self::CommandChannelDisconnected { .. } => "REQUEST_LOOP_COMMAND_CHANNEL_DISCONNECTED",
+            Self::WorkerTerminatedWithoutOutcome { .. } => {
+                "REQUEST_LOOP_WORKER_TERMINATED_WITHOUT_OUTCOME"
+            }
+            Self::OutcomeChannelDisconnected { .. } => "REQUEST_LOOP_OUTCOME_CHANNEL_DISCONNECTED",
         }
     }
 }
@@ -179,6 +207,12 @@ impl fmt::Display for LoopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RequestDenied { field } => write!(formatter, "{}:{field}", self.code()),
+            Self::CommandQueueFull { command }
+            | Self::CommandChannelDisconnected { command }
+            | Self::WorkerTerminatedWithoutOutcome { command }
+            | Self::OutcomeChannelDisconnected { command } => {
+                write!(formatter, "{}:{command}", self.code())
+            }
             other => formatter.write_str(other.code()),
         }
     }
@@ -1276,6 +1310,8 @@ fn command_phase(command: WorkerCommand) -> &'static str {
 struct WorkerOutcome {
     command: WorkerCommand,
     result: Result<InvocationResult, String>,
+    /// Whether this Shutdown request won the runner's P-11 request race.
+    shutdown_request_won: Option<bool>,
 }
 
 /// The tracked engine worker's channels and join handle.
@@ -1308,6 +1344,7 @@ fn spawn_worker(runtime: AdmittedRuntime, bound: usize) -> EngineWorker {
         let mut attempt: Option<InvocationRequest> = None;
         let mut shutdown = false;
         while let Ok(command) = command_rx.recv() {
+            let mut shutdown_request_won = None;
             let result = match command {
                 WorkerCommand::Execute => {
                     attempt = Some(invocation.clone());
@@ -1327,12 +1364,19 @@ fn spawn_worker(runtime: AdmittedRuntime, bound: usize) -> EngineWorker {
                     None => Err("NO_ATTEMPT".to_owned()),
                 },
                 WorkerCommand::Shutdown => {
-                    let _ = runner.request_shutdown();
+                    shutdown_request_won = Some(runner.request_shutdown());
                     shutdown = true;
                     Err("SHUTDOWN".to_owned())
                 }
             };
-            if outcome_tx.send(WorkerOutcome { command, result }).is_err() {
+            if outcome_tx
+                .send(WorkerOutcome {
+                    command,
+                    result,
+                    shutdown_request_won,
+                })
+                .is_err()
+            {
                 break;
             }
             if shutdown {
@@ -1423,6 +1467,8 @@ pub struct BoundedRequestLoop {
     lifecycle: LifecycleFlags,
     published: Option<WasmHostResultFrame>,
     denial: Option<LoopError>,
+    /// Exact observed P-11 request disposition, distinct from join/exit.
+    shutdown_request_won: Option<bool>,
 }
 
 impl BoundedRequestLoop {
@@ -1448,6 +1494,7 @@ impl BoundedRequestLoop {
             },
             published: None,
             denial: None,
+            shutdown_request_won: None,
         }
     }
 
@@ -1559,12 +1606,10 @@ impl BoundedRequestLoop {
             }
             WasmHostRequest::Cancel(control) => {
                 check_control(&self.binding, control)?;
-                self.lifecycle.follow_up = FollowUp::Contained;
                 self.queued = Some(WorkerCommand::Cancel);
             }
             WasmHostRequest::Reconcile(control) => {
                 check_control(&self.binding, control)?;
-                self.lifecycle.follow_up = FollowUp::Reconciled;
                 self.queued = Some(WorkerCommand::Reconcile);
             }
             WasmHostRequest::Shutdown => {
@@ -1594,6 +1639,7 @@ impl BoundedRequestLoop {
     /// owner-side reconciliation record rather than reissued.
     fn on_outcome(&mut self, outcome: WorkerOutcome) -> Option<WasmHostResultFrame> {
         if outcome.command == WorkerCommand::Shutdown {
+            self.shutdown_request_won = outcome.shutdown_request_won;
             return None;
         }
         // The observed command fixes the frame's operation/phase identity:
@@ -1683,11 +1729,26 @@ impl BoundedRequestLoop {
         command: WorkerCommand,
         sender: &SyncSender<WorkerCommand>,
     ) -> Result<(), LoopError> {
-        sender
-            .try_send(command)
-            .map_err(|_| LoopError::ChannelUnavailable)?;
+        match sender.try_send(command) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(LoopError::CommandQueueFull {
+                    command: command_name(command),
+                });
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(LoopError::CommandChannelDisconnected {
+                    command: command_name(command),
+                });
+            }
+        }
         self.queued = None;
         self.lifecycle.outstanding = Some(command);
+        match command {
+            WorkerCommand::Cancel => self.lifecycle.follow_up = FollowUp::Contained,
+            WorkerCommand::Reconcile => self.lifecycle.follow_up = FollowUp::Reconciled,
+            WorkerCommand::Execute | WorkerCommand::Shutdown => {}
+        }
         Ok(())
     }
 }
@@ -1715,7 +1776,13 @@ pub fn run_request_loop(
         Arc::clone(&runtime.live),
     );
     let worker = spawn_worker(runtime, state.max_in_flight);
-    let outcome = drive_loop(&mut state, &mut channel, &worker.commands, &worker.outcomes);
+    let outcome = drive_loop(
+        &mut state,
+        &mut channel,
+        &worker.commands,
+        &worker.outcomes,
+        &worker.handle,
+    );
     // Join-after-drain (#2785 trigger 1): intake returns on close or
     // exhaustion with a command possibly outstanding, so keep polling
     // outcomes until the worker idles and only then shut down and join.
@@ -1723,24 +1790,76 @@ pub fn run_request_loop(
     // worker's Shutdown reply behind the unread outcome on the bound-1
     // channel and the join never returns.
     state.begin_drain();
-    let drained = drain_outstanding(&mut state, &mut channel, &worker.commands, &worker.outcomes);
-    // `Draining` completes only when every accepted command's outcome was
-    // consumed; a failed drain stays `Draining` so the phase never claims a
-    // drain that did not happen. Termination still proceeds below so no
-    // worker thread leaks: every drain error leaves the worker idled or
-    // dead, never wedged behind an unconsumed outcome.
-    if drained.is_ok() {
+    let drained = drain_outstanding(
+        &mut state,
+        &mut channel,
+        &worker.commands,
+        &worker.outcomes,
+        &worker.handle,
+    );
+    // Typed shutdown: only enqueue after accepted work and its outcomes have
+    // settled. The accepted Shutdown remains outstanding until its exact
+    // worker reply is consumed below.
+    state.live.revoke();
+    let mut shutdown_error = None;
+    let shutdown_sent = if state.drain_complete() {
+        state.queued = Some(WorkerCommand::Shutdown);
+        match state.send(WorkerCommand::Shutdown, &worker.commands) {
+            Ok(()) => true,
+            Err(error) => {
+                shutdown_error = Some(error);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let shutdown_drained = if shutdown_sent {
+        drain_outstanding(
+            &mut state,
+            &mut channel,
+            &worker.commands,
+            &worker.outcomes,
+            &worker.handle,
+        )
+    } else {
+        Ok(())
+    };
+    // If Shutdown was not accepted, select sender closure as the termination
+    // protocol. If it was accepted, keep the sender alive and require the
+    // tracked reply; the two protocols are never combined for an accepted
+    // Shutdown.
+    if !shutdown_sent {
+        drop(worker.commands);
+    }
+    let termination_drain =
+        drain_until_worker_exit(&mut state, &mut channel, &worker.outcomes, &worker.handle);
+    let shutdown_observed = shutdown_sent
+        && state.lifecycle.outstanding != Some(WorkerCommand::Shutdown)
+        && state.shutdown_request_won.is_some();
+    if state.drain_complete()
+        && drained.is_ok()
+        && shutdown_drained.is_ok()
+        && termination_drain.is_ok()
+        && shutdown_observed
+    {
         state.mark_drained();
     }
-    // Typed shutdown: close admission, ask the idled worker to stop, and
-    // join it so no guest work is left untracked.
-    state.live.revoke();
-    let shutdown_sent = worker.commands.try_send(WorkerCommand::Shutdown).is_ok();
-    drop(worker.commands);
+    // `JoinHandle::join` is called only after the worker owner confirms
+    // termination. The wait also drains any late bounded outcome before the
+    // handle can be joined.
+    while !worker.handle.is_finished() {
+        std::thread::yield_now();
+    }
     let joined = worker.handle.join().is_ok();
     if joined {
         state.mark_shutdown();
     }
+    if let Some(error) = shutdown_error {
+        return Err(error);
+    }
+    shutdown_drained?;
+    termination_drain?;
     if let Some(error) = state.denial() {
         // The loop recorded the exact admission denial; report that stable
         // field rather than the transport symptom that surfaced it.
@@ -1751,7 +1870,17 @@ pub fn run_request_loop(
     // Explicit termination accounting (#2785): a worker that never took
     // `Shutdown` or never joined left guest work untracked; that is a
     // failed loop, never a silent success.
-    if !shutdown_sent || !joined {
+    if !shutdown_sent {
+        return Err(LoopError::CommandChannelDisconnected {
+            command: "shutdown",
+        });
+    }
+    if !shutdown_observed {
+        return Err(LoopError::WorkerTerminatedWithoutOutcome {
+            command: "shutdown",
+        });
+    }
+    if !joined {
         return Err(LoopError::ChannelUnavailable);
     }
     state.published().cloned().ok_or(denied("no-request"))
@@ -1793,11 +1922,12 @@ fn drive_loop(
     channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
 ) -> Result<(), LoopError> {
     while state.admission_open() {
         state.tick();
         if state.lifecycle.outstanding.is_some() {
-            poll_pending(state, channel, commands, outcomes)?;
+            poll_pending(state, channel, commands, outcomes, handle)?;
             continue;
         }
         // Single-gate intake (#2785 trigger 2): `tick` may have closed
@@ -1858,26 +1988,23 @@ fn poll_pending(
     channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
 ) -> Result<(), LoopError> {
     match outcomes.recv_timeout(CONTROL_POLL) {
-        Ok(outcome) => {
-            // Outcome-consumed confirmation (#2785): the reply must belong
-            // to the outstanding command; an uncorrelated reply means the
-            // completion path is unusable, so fail closed instead of
-            // misattributing it.
-            if state.lifecycle.outstanding != Some(outcome.command) {
-                return Err(denied("uncorrelated-outcome"));
-            }
-            state.lifecycle.outstanding = None;
-            if let Some(frame) = state.on_outcome(outcome) {
-                channel.publish(&frame)?;
-            }
-            if let Some(command) = state.queued {
-                state.send(command, commands)?;
-            }
-            Ok(())
-        }
+        Ok(outcome) => consume_worker_outcome(state, channel, commands, outcome),
         Err(RecvTimeoutError::Timeout) => {
+            if handle.is_finished()
+                && let Some(command) = state.lifecycle.outstanding
+            {
+                // A reply can arrive between the timeout and the termination
+                // observation. Consume that last reply before calling it lost.
+                if let Ok(outcome) = outcomes.try_recv() {
+                    return consume_worker_outcome(state, channel, commands, outcome);
+                }
+                return Err(LoopError::WorkerTerminatedWithoutOutcome {
+                    command: command_name(command),
+                });
+            }
             // Single-gate intake (#2785 trigger 2): while a command is
             // outstanding on the bound-1 channel — or admission has
             // closed — never queue a second command behind it. An
@@ -1901,8 +2028,34 @@ fn poll_pending(
             }
             Ok(())
         }
-        Err(RecvTimeoutError::Disconnected) => Err(LoopError::ChannelUnavailable),
+        Err(RecvTimeoutError::Disconnected) => {
+            let command = state
+                .lifecycle
+                .outstanding
+                .map_or("untracked", command_name);
+            Err(LoopError::OutcomeChannelDisconnected { command })
+        }
     }
+}
+
+fn consume_worker_outcome(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    commands: &SyncSender<WorkerCommand>,
+    outcome: WorkerOutcome,
+) -> Result<(), LoopError> {
+    // An uncorrelated reply cannot settle an accepted command.
+    if state.lifecycle.outstanding != Some(outcome.command) {
+        return Err(denied("uncorrelated-outcome"));
+    }
+    state.lifecycle.outstanding = None;
+    if let Some(frame) = state.on_outcome(outcome) {
+        channel.publish(&frame)?;
+    }
+    if let Some(command) = state.queued {
+        state.send(command, commands)?;
+    }
+    Ok(())
 }
 
 /// Join-after-drain (#2785): after intake closes, keep polling worker
@@ -1917,11 +2070,12 @@ fn drain_outstanding(
     channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
 ) -> Result<(), LoopError> {
     let mut first_error: Option<LoopError> = None;
     while !state.drain_complete() {
         if state.lifecycle.outstanding.is_some() {
-            match poll_pending(state, channel, commands, outcomes) {
+            match poll_pending(state, channel, commands, outcomes, handle) {
                 // The outcome was consumed but its delivery failed: keep
                 // draining — a publication failure must not stop outcome
                 // draining — and report the first such failure once idle.
@@ -1941,6 +2095,59 @@ fn drain_outstanding(
         return Err(error);
     }
     Ok(())
+}
+
+/// Supervises the worker to termination while retaining every outcome still
+/// available on the bounded channel. Used after drain/termination errors so
+/// no return path drops a live `JoinHandle`. An unresolved command or enqueue
+/// remains an explicit error after the worker exits.
+fn drain_until_worker_exit(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
+) -> Result<(), LoopError> {
+    let mut first_error: Option<LoopError> = None;
+    let mut observe = |outcome: WorkerOutcome| {
+        if state.lifecycle.outstanding != Some(outcome.command) {
+            first_error.get_or_insert(denied("uncorrelated-outcome"));
+            return;
+        }
+        state.lifecycle.outstanding = None;
+        if let Some(frame) = state.on_outcome(outcome)
+            && let Err(error) = channel.publish(&frame)
+        {
+            first_error.get_or_insert(error);
+        }
+        if let Some(command) = state.queued {
+            first_error.get_or_insert(LoopError::CommandChannelDisconnected {
+                command: command_name(command),
+            });
+        }
+    };
+
+    while !handle.is_finished() {
+        match outcomes.recv_timeout(CONTROL_POLL) {
+            Ok(outcome) => observe(outcome),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                std::thread::yield_now();
+            }
+        }
+    }
+    while let Ok(outcome) = outcomes.try_recv() {
+        observe(outcome);
+    }
+    if let Some(command) = state.lifecycle.outstanding {
+        first_error.get_or_insert(LoopError::WorkerTerminatedWithoutOutcome {
+            command: command_name(command),
+        });
+    }
+    if let Some(command) = state.queued {
+        first_error.get_or_insert(LoopError::CommandChannelDisconnected {
+            command: command_name(command),
+        });
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Outcome of the ordinary governed path: the canonical correlated frame.
