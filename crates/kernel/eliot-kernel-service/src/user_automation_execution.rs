@@ -13,11 +13,11 @@ use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
     AutomationCapabilityProfile, AutomationExecutionReference, AutomationReconciliationCause,
-    AutomationWorkClass, ProviderFingerprintPolicy, UserAutomationConfigurationState,
-    UserAutomationError, UserAutomationExecutionMode, UserAutomationExecutionProjection,
-    UserAutomationFailureProjection, UserAutomationInvocation, UserAutomationPreflightContext,
-    UserAutomationPreflightDecision, UserAutomationPreflightProjection,
-    UserAutomationPreflightReceipt, UserAutomationRevision,
+    AutomationReconciliationReference, AutomationWorkClass, ProviderFingerprintPolicy,
+    UserAutomationConfigurationState, UserAutomationError, UserAutomationExecutionMode,
+    UserAutomationExecutionProjection, UserAutomationFailureProjection, UserAutomationInvocation,
+    UserAutomationPreflightContext, UserAutomationPreflightDecision,
+    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
@@ -72,6 +72,22 @@ pub enum UserAutomationExecutionError {
     /// A runtime response did not bind to the occurrence/fence that was sent.
     #[error("UserAutomation runtime response mismatch: {0}")]
     RuntimeResponseMismatch(&'static str),
+    /// The declared occurrence denominator was not owner-proven complete, so a
+    /// runtime boundary refused rather than acting on a bounded subset of it.
+    ///
+    /// The whole obligation travels with the refusal, not just its cause. The
+    /// durable owner query handle is the only route by which a caller can finish
+    /// enumerating the denominator, so a refusal that dropped it would be
+    /// strictly worse than the deferral it replaces: the caller would know the
+    /// work is blocked and have no way to unblock it.
+    #[error(
+        "UserAutomation occurrence denominator is not owner-proven complete: \
+         cause={:?} read_revision={} denominator_query_ref={}",
+        .0.cause,
+        .0.read_revision,
+        .0.denominator_query_ref.as_deref().unwrap_or("<none>")
+    )]
+    OccurrenceDenominatorIncomplete(AutomationReconciliationReference),
 }
 
 /// Owner-issued Durable Job material for one admitted UserAutomation
@@ -1443,14 +1459,19 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 fn require_complete_occurrence_view(
     execution: &UserAutomationExecutionProjection,
 ) -> Result<(), UserAutomationExecutionError> {
-    if execution
+    // The obligation itself is the error payload, not just its cause: the
+    // durable `denominator_query_ref` inside it is the caller's only route to
+    // finish enumerating the denominator, and `IncompleteDenominator` is defined
+    // to carry one. Reducing this to a field name would leave the caller knowing
+    // the work is blocked with no way to unblock it.
+    if let Some(obligation) = execution
         .unresolved_reconciliation_refs
         .iter()
-        .any(|obligation| obligation.cause == AutomationReconciliationCause::IncompleteDenominator)
+        .find(|obligation| obligation.cause == AutomationReconciliationCause::IncompleteDenominator)
     {
-        return Err(UserAutomationExecutionError::Contract(
-            UserAutomationError::Invalid("execution.occurrence_denominator"),
-        ));
+        return Err(
+            UserAutomationExecutionError::OccurrenceDenominatorIncomplete(obligation.clone()),
+        );
     }
     Ok(())
 }
