@@ -31,6 +31,14 @@
 //!   composition share one volatile replay handle
 //!   ([`SharedOperatorReplay`]); durable operator identity lives in Kernel
 //!   ORS through the async Governor operator borrow.
+//! - The same port reconciles an already-issued operation
+//!   ([`GovernorOperatorCommand::reconcile`], #1187 piece B). It answers only
+//!   what the process-retained handle can prove — the exact original receipt
+//!   for an operation this process admitted — and refuses with the exact named
+//!   missing read contract ([`MISSING_OPERATOR_RECEIPT_READ`]) for anything
+//!   else, so a possibly submitted command stays `UNKNOWN_OUTCOME`/
+//!   `RECONCILING` and is never blindly repeated. It never resubmits, never
+//!   mints a new identity, and never invents a disposition.
 //! - Action digests, ceilings, capabilities, and targets are enforced by
 //!   `ControlBoard` before and after the port call; the adapters enforce the
 //!   bindings only the live snapshot can check (revision/fence currency and
@@ -63,10 +71,10 @@ use std::sync::{Arc, Mutex};
 use eliot_contracts::{RequestMetadata, SessionId, canonical_json_bytes, sha256_hex};
 use eliot_controlboard::{
     AccessBinding, AccessResolverPort, ActionCapability, CanonicalState, CanonicalStatePort,
-    CommandDisposition, CommandReceipt, CommandRequest, ControlBoard, ControlBoardError,
-    ControlBoardView, OperatorCommandPort, PortError, PrivacyClass, ProjectionBinding,
-    ProjectionProvider, ProposeSkillRequest, ProviderCompleteness, ReadRequest, Role,
-    SkillLifecyclePort, SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
+    CommandDisposition, CommandQuery, CommandReceipt, CommandRequest, ControlBoard,
+    ControlBoardError, ControlBoardView, OperatorCommandPort, PortError, PrivacyClass,
+    ProjectionBinding, ProjectionProvider, ProposeSkillRequest, ProviderCompleteness, ReadRequest,
+    Role, SkillLifecyclePort, SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
 };
 use eliot_governor::ControlBoardGovernorSnapshot;
 use eliot_kernel_core::Notification;
@@ -855,10 +863,14 @@ impl CanonicalStatePort for GovernorCanonicalState {
 ///
 /// Volatile fast path only, never the durability story: it lets a newly
 /// created board replay an admission without a second effecting-port call
-/// while the process lives. Durable operator identity lives in Kernel ORS and
-/// is reconciled through the async Governor operator borrow
+/// while the process lives, and it is what
+/// [`GovernorOperatorCommand::reconcile`] reads to answer the reconnect case
+/// with the original command receipt. Durable operator identity lives in Kernel
+/// ORS and is reconciled through the async Governor operator borrow
 /// (`GovernorComposition::operator_reconciliation`); a restart drops this map
-/// and replays resolve through that receipt route instead.
+/// and a replay resolves through that receipt route instead — which this
+/// adapter cannot yet reach, so it refuses with
+/// [`MISSING_OPERATOR_RECEIPT_READ`] instead of guessing.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SharedOperatorReplay {
     inner: Arc<Mutex<HashMap<String, (CommandRequest, CommandReceipt)>>>,
@@ -882,7 +894,9 @@ impl SharedOperatorReplay {
 /// Admits one exact-view intent after verifying the owner-issued identity
 /// binding against the live snapshot fence. The receipt is candidate-only:
 /// it acknowledges admission, never execution, completion, or a canonical
-/// write.
+/// write. It also owns the reconcile read of one already-issued operation
+/// ([`Self::reconcile`], #1187 piece B), which is the only way a caller learns
+/// an operation's current known disposition without sending it again.
 struct GovernorOperatorCommand {
     snapshot: Arc<ControlBoardGovernorSnapshot>,
     // #1187: exact-replay record keyed by operation_id text, shared through
@@ -991,7 +1005,74 @@ impl OperatorCommandPort for GovernorOperatorCommand {
         replay.insert(operation_key, (command.clone(), receipt.clone()));
         Ok(receipt)
     }
+
+    /// Reconciles one already-issued operation to the disposition this owner
+    /// can actually prove (#1187 piece B).
+    ///
+    /// Two outcomes exist here and nothing else is synthesised:
+    ///
+    /// * **Known** — an operation this process admitted is answered from the
+    ///   same process-retained [`SharedOperatorReplay`] record
+    ///   [`Self::submit`] writes, returning the stored receipt unchanged. That
+    ///   is the exact-replay requirement: same operation identity, same command
+    ///   receipt, no second admission, no re-execution, no new identity. This is
+    ///   precisely the reconnect case — the daemon builds a *fresh* board per
+    ///   operation while the composition retains the handle, so a reconnecting
+    ///   caller reaches the original record instead of resubmitting.
+    /// * **Unresolvable** — an operation this owner holds no record of has no
+    ///   establishable disposition here, so it is refused with
+    ///   [`PortError::Invalid`] carrying [`MISSING_OPERATOR_RECEIPT_READ`]. The
+    ///   command stays `UNKNOWN_OUTCOME`/`RECONCILING`; it is never reported as
+    ///   `Accepted` or `Rejected` and never repeated.
+    fn reconcile(&mut self, query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+        let operation_key = query.operation_id.as_str();
+        // A poisoned replay lock leaves the disposition unknown rather than
+        // inventing an admission or a denial.
+        let replay = self.replay.inner.lock().map_err(|_| PortError::Unknown)?;
+        match replay.get(operation_key) {
+            // The stored binding is read, never compared and never overwritten:
+            // the query carries no action to compare, and a reconcile must not
+            // mutate the record it is reading.
+            Some((_, receipt)) => Ok(receipt.clone()),
+            None => Err(PortError::Invalid(MISSING_OPERATOR_RECEIPT_READ.to_owned())),
+        }
+    }
 }
+
+/// The exact durable read contract this owner cannot reach for a possibly
+/// submitted operator command (#1187 piece B).
+///
+/// The Governor *does* own a typed query-by-operation-identity read:
+/// `eliot_governor`'s `KernelTransitionPort::receipt(OperationId)`, documented
+/// there as "Reconciles one operation by its exact canonical identity", and
+/// borrowed by `GovernorOperatorReconciliation`. It is unreachable from this
+/// adapter: [`GovernorOperatorCommand`] is built from one immutable
+/// [`ControlBoardGovernorSnapshot`], which carries the fence, read revision,
+/// coordination sequence, and the G-11/I-12 bindings only — no command state,
+/// no canonical admission owner, and no Kernel port. Nothing in
+/// [`ControlBoardGovernorSnapshot`] can answer "what is the current disposition
+/// of operation X", and this module never invents a second client to ask.
+///
+/// Reaching the real read means borrowing
+/// `GovernorComposition::operator_reconciliation()` at
+/// [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard)
+/// and forwarding the lookup through a port that takes that borrow. That seam
+/// is in `bins/eliotd/src/lib.rs`, outside #1187 piece B's writable set, and
+/// the Governor's only public entry today is
+/// `GovernorOperatorReconciliation::admit_operator_command` — a *submit*, whose
+/// commit leg would re-admit rather than query, so calling it from a reconcile
+/// would be precisely the blind repeat A8 forbids.
+///
+/// The refusal is therefore exact and typed, and names this contract, instead
+/// of a fabricated success, a zero, or a stringly-typed "unknown".
+const MISSING_OPERATOR_RECEIPT_READ: &str =
+    "eliot_governor::GovernorOperatorReconciliation / KernelTransitionPort::receipt \
+     (operator receipt lookup by OperationId) is unreachable from \
+     GovernorOperatorCommand: ControlBoardGovernorSnapshot carries no command \
+     state, no canonical admission owner, and no Kernel transition port. \
+     DaemonComposition::controlboard must forward the Governor operator borrow \
+     for this disposition to resolve; until then the operation stays \
+     UNKNOWN_OUTCOME/RECONCILING and must not be resubmitted.";
 
 /// Governor-backed Swarm projection reader.
 ///
@@ -1380,6 +1461,10 @@ mod tests {
                 observed_fence: command.expected_fence.clone(),
             })
         }
+
+        fn reconcile(&mut self, _query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            Err(PortError::Unknown)
+        }
     }
 
     fn board_with_counting_command(
@@ -1609,6 +1694,10 @@ mod tests {
         fn submit(&mut self, command: &CommandRequest) -> Result<CommandReceipt, PortError> {
             *self.calls.lock().expect("call count") += 1;
             self.inner.submit(command)
+        }
+
+        fn reconcile(&mut self, query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            self.inner.reconcile(query)
         }
     }
 
