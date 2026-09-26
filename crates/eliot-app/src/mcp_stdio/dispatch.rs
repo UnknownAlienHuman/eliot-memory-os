@@ -1028,14 +1028,14 @@ async fn dispatch_tool_with_recall_scope(
             );
             let response =
                 bound_recall_response_for_agent(response, requested_limit, expected_recall_handles);
-            // Conflict state stays unavailable: `RecallL0Response` carries no
-            // corpus-level conflict observation. The store's per-record
-            // contradiction signal is consumed as a ranking penalty at the
-            // store ranking boundary and is never projected onto the response,
-            // so this owner cannot observe whether conflicting evidence blocked
-            // admission. The typed derivation therefore keeps failing closed to
-            // INCOMPLETE_COVERAGE for that missing fact instead of manufacturing
-            // a false observation from a path that never inspected conflict.
+            // Conflict state is not asserted by this owner. It is read from the
+            // response's own corpus-level observation, which the store ranking
+            // boundary projects from the real per-record contradiction signal
+            // over every candidate it weighed — admitted or not. This owner
+            // therefore has no conflict argument to pass and cannot report a
+            // conflict verdict that retrieval never observed; an unobserved
+            // conflict state still fails closed to INCOMPLETE_COVERAGE instead
+            // of manufacturing `false` from a path that never looked.
             let verdict =
                 eliot_types::ServerRecallVerdict::issue_for_l0_response_with_observations(
                     &response,
@@ -1043,7 +1043,6 @@ async fn dispatch_tool_with_recall_scope(
                     &state_fence,
                     corpus_empty,
                     coverage_complete,
-                    None,
                 )
                 .map_err(|error| anyhow::anyhow!("eliot_recall_l0 recall verdict: {error}"))?;
             // The bridge projection validates the server-issued verdict and
