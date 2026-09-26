@@ -57,13 +57,14 @@ pub const USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION: &str = "eliot.user-automa
 /// database revision therefore cannot silently re-resolve a stored occurrence:
 /// it is part of the record, and of the occurrence identity derived from it.
 ///
-/// The predecessor of this encoding was a local wall clock plus an offset with
-/// none of that evidence. Such a record is a legacy, unverified input and is
-/// refused with [`UserAutomationError::LegacyScheduleEncoding`], so it is never
-/// silently certified under this stronger contract.
-pub const NORMALIZED_OCCURRENCE_ENCODING: &str = "ELIOT/I11.12/OCCURRENCE/V2";
-const OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1";
-const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V1";
+/// The shape-only predecessor and V2 records validated against the old zone
+/// table identity require owner re-normalization. Neither is certified by this
+/// successor encoding.
+pub const NORMALIZED_OCCURRENCE_ENCODING: &str = "ELIOT/I11.12/OCCURRENCE/V3";
+const LEGACY_NORMALIZED_OCCURRENCE_ENCODING: &str = "ELIOT/I11.12/OCCURRENCE/V2";
+const SCHEDULED_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V2";
+const MANUAL_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1";
+const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2";
 const FAILURE_FINGERPRINT_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-FAILURE/V1";
 const WAKE_REASON_PREFIX: &str = "user-automation";
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -105,14 +106,12 @@ pub enum UserAutomationError {
     /// Canonical serialization failed while deriving an identity.
     #[error("UserAutomation canonical serialization failed: {0}")]
     Serialization(String),
-    /// A normalized occurrence still carries the retired shape-only encoding.
+    /// A normalized occurrence still carries a retired encoding.
     ///
-    /// That encoding is a legacy, unverified input: it carries no zone
-    /// identity, no pinned database revision, no resolved instant and no
-    /// applied fold or gap disposition, so it is never certified under the
-    /// versioned calendar contract. The owning calendar adapter must
-    /// re-normalize it into a new revision.
-    #[error("normalized occurrence is legacy shape-only and requires re-normalization: {0}")]
+    /// The shape-only predecessor lacks zone evidence. V2 carries zone evidence
+    /// but does not bind the corrected table format and offset unit. The owning
+    /// calendar adapter must re-normalize either into a new revision.
+    #[error("normalized occurrence uses a retired encoding and requires re-normalization: {0}")]
     LegacyScheduleEncoding(&'static str),
     /// The named zone is not a member of the pinned zone table.
     ///
@@ -121,15 +120,21 @@ pub enum UserAutomationError {
     /// implementation, and a spelled pair that merely resembles a real one are
     /// all refused here. No zone is ever resolved from its spelling.
     ///
-    /// A zone the pinned release does define, but whose pinned offsets cannot be
-    /// stated exactly in this contract's canonical offset unit, is refused here as
-    /// well rather than answered from a truncated offset. `Africa/Monrovia` is
-    /// the one such zone in this release: it applied `-0:44:30` until 1972, and
-    /// minutes cannot hold that value. The zone is reported here because from this
-    /// boundary the two cases are the same answer: this contract has no
-    /// minute-valued zone evidence to offer for it.
     #[error("normalized occurrence names a zone the pinned zone table does not carry: {0}")]
     UnknownZone(&'static str),
+    /// A named zone is present in the pinned table, but its exact historical
+    /// offset cannot be represented by the minute-valued occurrence wire.
+    #[error(
+        "pinned zone {zone} has an unrepresentable offset of {offset_seconds} seconds: {field}"
+    )]
+    SubMinuteZoneOffset {
+        /// The field that requested the zone lookup.
+        field: &'static str,
+        /// The pinned zone that carries the offset.
+        zone: &'static str,
+        /// Exact table value, before any minute conversion.
+        offset_seconds: i32,
+    },
     /// The pinned zone database revision is not the one this build carries.
     ///
     /// A revision is refused rather than read from an ambient database, so a
@@ -292,8 +297,8 @@ impl NormalizedSchedule {
         Ok(())
     }
 
-    /// Returns the immutable compiled digest binding this occurrence projection
-    /// to its declared expression and calendar.
+    /// Returns the immutable digest binding this occurrence projection to its
+    /// declared expression, calendar, and exact pinned zone table semantics.
     ///
     /// The expression language is owned elsewhere, so Kernel never reparses it.
     /// The owner compiles the expression once and every occurrence of the
@@ -305,6 +310,10 @@ impl NormalizedSchedule {
             SCHEDULE_SOURCE_DIGEST_DOMAIN,
             &self.expression,
             &self.calendar,
+            user_automation_zones::ZONE_TABLE_FORMAT,
+            user_automation_zones::ZONE_TABLE_OFFSET_UNIT,
+            user_automation_zones::PINNED_ZONE_DATABASE_RELEASE,
+            user_automation_zones::PINNED_ZONE_TABLE_SHA256,
         ))
         .map_err(|error| UserAutomationError::Serialization(error.to_string()))?;
         Ok(sha256_hex(&bytes))
@@ -449,6 +458,11 @@ impl NormalizedSchedule {
             } else {
                 UserAutomationError::Invalid("schedule.occurrence_key.shape")
             });
+        }
+        if fields[0] == LEGACY_NORMALIZED_OCCURRENCE_ENCODING {
+            return Err(UserAutomationError::LegacyScheduleEncoding(
+                "schedule.next_occurrences",
+            ));
         }
         if fields[0] != NORMALIZED_OCCURRENCE_ENCODING {
             return Err(UserAutomationError::Invalid(
@@ -1082,9 +1096,15 @@ fn map_zone_error(
 ) -> UserAutomationError {
     match error {
         user_automation_zones::ZoneTableError::Integrity => UserAutomationError::ZoneTableIntegrity,
-        user_automation_zones::ZoneTableError::UnknownZone
-        | user_automation_zones::ZoneTableError::SubMinuteOffset(_) => {
+        user_automation_zones::ZoneTableError::UnknownZone => {
             UserAutomationError::UnknownZone(field)
+        }
+        user_automation_zones::ZoneTableError::SubMinuteOffset(evidence) => {
+            UserAutomationError::SubMinuteZoneOffset {
+                field,
+                zone: evidence.zone,
+                offset_seconds: evidence.offset_seconds,
+            }
         }
         user_automation_zones::ZoneTableError::OutsideCoverage => {
             UserAutomationError::ZoneTableWindow {
@@ -1734,7 +1754,18 @@ pub enum UserAutomationTrigger {
 impl UserAutomationTrigger {
     fn validate(&self) -> Result<(), UserAutomationError> {
         match self {
-            Self::Scheduled { occurrence_key } => text(occurrence_key, "trigger.occurrence_key"),
+            Self::Scheduled { occurrence_key } => {
+                text(occurrence_key, "trigger.occurrence_key")?;
+                match occurrence_key.split_once(NORMALIZED_OCCURRENCE_FIELD_SEPARATOR) {
+                    Some((LEGACY_NORMALIZED_OCCURRENCE_ENCODING, _)) => Err(
+                        UserAutomationError::LegacyScheduleEncoding("trigger.occurrence_key"),
+                    ),
+                    Some((NORMALIZED_OCCURRENCE_ENCODING, _)) => Ok(()),
+                    _ => Err(UserAutomationError::Invalid(
+                        "trigger.occurrence_key.encoding",
+                    )),
+                }
+            }
             Self::Manual { nonce } => text(nonce, "trigger.nonce"),
         }
     }
@@ -1905,12 +1936,24 @@ impl UserAutomationInvocation {
         text(automation_id, "automation_id")?;
         text(automation_revision, "automation_revision")?;
         trigger.validate()?;
-        let bytes = canonical_json_bytes(&(
-            OCCURRENCE_IDENTITY_DOMAIN,
-            automation_id,
-            automation_revision,
-            trigger,
-        ))
+        let bytes = match trigger {
+            UserAutomationTrigger::Scheduled { .. } => canonical_json_bytes(&(
+                SCHEDULED_OCCURRENCE_IDENTITY_DOMAIN,
+                user_automation_zones::ZONE_TABLE_FORMAT,
+                user_automation_zones::ZONE_TABLE_OFFSET_UNIT,
+                user_automation_zones::PINNED_ZONE_DATABASE_RELEASE,
+                user_automation_zones::PINNED_ZONE_TABLE_SHA256,
+                automation_id,
+                automation_revision,
+                trigger,
+            )),
+            UserAutomationTrigger::Manual { .. } => canonical_json_bytes(&(
+                MANUAL_OCCURRENCE_IDENTITY_DOMAIN,
+                automation_id,
+                automation_revision,
+                trigger,
+            )),
+        }
         .map_err(|error| UserAutomationError::Serialization(error.to_string()))?;
         Ok(format!("user-automation-occurrence:{}", sha256_hex(&bytes)))
     }
