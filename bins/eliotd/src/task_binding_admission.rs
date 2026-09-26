@@ -753,7 +753,8 @@ pub fn admit_named_mutation_capture(
 /// binding, fails closed with `TASK_SCOPE_INCOMPATIBLE`; the retained
 /// binding, task state, and project memory are untouched. The root is always
 /// explicit — the daemon never infers a workspace from cwd, proximity, or
-/// recency.
+/// recency. Live status: no live caller threads an explicit root yet; awaiting
+/// the attach-transport owner (BLOCKED-BY attach-transport).
 ///
 /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
 ///
