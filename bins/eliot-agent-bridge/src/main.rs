@@ -11,8 +11,8 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveryDisposition,
-    RecoveryView, SessionId,
+    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
+    RecoveryProjectionPage, SessionId,
 };
 use eliot_contracts::{BridgeEventCapacityPressure, EpochId};
 use eliot_mcp::{
@@ -29,7 +29,7 @@ use eliot_mcp::{
 };
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
-use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
+use eliot_protocol::{AckPhase, AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
@@ -197,6 +197,14 @@ enum Request {
     /// owner (I7.19 persist step; the attach-time restore already imports).
     ReactiveSnapshot,
     ReconcileExternal {},
+    /// Reads one bounded page from the imported recovery identity projection.
+    /// The encoded continuation is read-only and checked against the current
+    /// owner window, attach generation, and imported-page revision. It is
+    /// not a completeness receipt.
+    RecoveryProjectionPage {
+        #[serde(default)]
+        cursor: Option<String>,
+    },
     /// Reads one bounded recovery page inside the declared window (issue
     /// #2732).
     ///
@@ -373,6 +381,8 @@ enum Response {
     },
     Reconciled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryProjectionPage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
     /// Typed projection of one bounded recovery page (issue #2732).
@@ -388,7 +398,13 @@ enum Response {
     /// that shape would imply the gate cleared, which a single page never
     /// does by itself.
     RecoveryPage {
-        page: RecoveryPageProjection,
+        page: RecoveryProjectionPage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// Bounded read-only page through all imported recovery identities.
+    RecoveryProjectionPage {
+        page: RecoveryProjectionPage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
@@ -460,89 +476,6 @@ struct ReactiveStatusView {
 #[serde(deny_unknown_fields)]
 struct ResourceRegistryView {
     entries: usize,
-}
-
-/// Read-only projection of one bounded recovery page for the `RecoveryPage`
-/// frame (issue #2732).
-///
-/// Projects only the walk progress the core already holds: the live
-/// generation, per-stream cursor facts and recovered counts, the
-/// unscoped-gap count, scope provenance, and the disposition with its exact
-/// reason. No event payloads cross here; recovered obligations stay
-/// available through the pending view while forwarding is interrupted.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryPageProjection {
-    live_generation: u64,
-    streams: Vec<RecoveryStreamProjection>,
-    unscoped_gaps: u64,
-    unproven_scope_present: bool,
-    stream_list_complete: bool,
-    disposition: &'static str,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    disposition_reason: Option<&'static str>,
-}
-
-/// Per-stream cursor facts and recovered counts inside one recovery page.
-///
-/// `next_after` is the replay-safe continuation the next bounded read must
-/// advance past; `page_complete` marks this stream's page drained. Facts
-/// come from the core's declared window; nothing here admits, delivers, or
-/// acknowledges.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryStreamProjection {
-    stream_id: String,
-    acked_base: u64,
-    durable_cursor: u64,
-    contiguous_frontier: u64,
-    highest_observed: u64,
-    next_after: u64,
-    recovered_events: u64,
-    recovered_gaps: u64,
-    page_complete: bool,
-}
-
-/// Shapes one imported recovery page into its typed response frame.
-///
-/// The disposition is projected losslessly: `complete` carries no reason,
-/// `partial`/`unavailable` carry the exact core reason the gate is held
-/// under. The window key itself never crosses: it is the verified
-/// reconciliation hash that already names the receipt, not host-driving
-/// state — pagination is driven by repeating the operation, with the bridge
-/// deriving each bounded read from its own live window.
-fn recovery_page_response(view: &RecoveryView) -> Response {
-    let (disposition, disposition_reason) = match view.disposition() {
-        RecoveryDisposition::Complete => ("complete", None),
-        RecoveryDisposition::Partial { reason } => ("partial", Some(reason)),
-        RecoveryDisposition::Unavailable { reason } => ("unavailable", Some(reason)),
-    };
-    Response::RecoveryPage {
-        page: RecoveryPageProjection {
-            live_generation: view.live_generation(),
-            streams: view
-                .streams()
-                .iter()
-                .map(|stream| RecoveryStreamProjection {
-                    stream_id: stream.stream_id().to_owned(),
-                    acked_base: stream.acked_base(),
-                    durable_cursor: stream.durable_cursor(),
-                    contiguous_frontier: stream.contiguous_frontier(),
-                    highest_observed: stream.highest_observed(),
-                    next_after: stream.next_after(),
-                    recovered_events: stream.recovered_events(),
-                    recovered_gaps: stream.recovered_gaps(),
-                    page_complete: stream.page_complete(),
-                })
-                .collect(),
-            unscoped_gaps: view.unscoped_gaps(),
-            unproven_scope_present: view.unproven_scope_present(),
-            stream_list_complete: view.stream_list_complete(),
-            disposition,
-            disposition_reason,
-        },
-        bootstrap: None,
-    }
 }
 
 /// Original identity of one durable in-flight delivery pending at Stop.
@@ -909,14 +842,38 @@ fn main() {
             }) => handle_reactive_record_disposition(&mut runner, &item_id, disposition),
             Ok(Request::ReactiveSnapshot) => handle_reactive_snapshot(&runner),
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
-                Ok(_) => Response::Reconciled { bootstrap: None },
+                Ok(_) => match runner.recovery_projection_page(None) {
+                    Ok(page) => {
+                        let has_window = page.summary.is_some();
+                        Response::Reconciled {
+                            recovery: has_window.then_some(page),
+                            bootstrap: None,
+                        }
+                    }
+                    Err(error) => bridge_error(&error),
+                },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
+            Ok(Request::RecoveryProjectionPage { cursor }) => {
+                match runner.recovery_projection_page(cursor.as_deref()) {
+                    Ok(page) => Response::RecoveryProjectionPage {
+                        page,
+                        bootstrap: None,
+                    },
+                    Err(error) => bridge_error(&error),
+                }
+            }
             Ok(Request::RecoverNextPage {}) => match runner.recover_next_page() {
-                Ok(view) => recovery_page_response(&view),
+                Ok(_) => match runner.recovery_projection_page(None) {
+                    Ok(page) => Response::RecoveryPage {
+                        page,
+                        bootstrap: None,
+                    },
+                    Err(error) => bridge_error(&error),
+                },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
@@ -972,7 +929,17 @@ fn main() {
         // I7.17 auto-boot: the first successful ELIOT response in a session
         // carries the bounded bootstrap exactly once. Explicit retrieval
         // through the bootstrap operation stays available afterwards.
-        attach_auto_bootstrap(&mut runner, &mut response);
+        if is_recovery_projection_response(&response) {
+            attach_recovery_bootstrap_if_it_fits(&mut runner, &mut response);
+        } else {
+            attach_auto_bootstrap(&mut runner, &mut response);
+        }
+        if is_recovery_projection_response(&response) && !fits_output_frame(&response) {
+            response = Response::Error {
+                code: "RECOVERY_PROJECTION_TOO_LARGE",
+                detail: "bounded recovery response exceeds the negotiated stdio frame".to_owned(),
+            };
+        }
         // Only the deserialization-failure arm above produces REQUEST_INVALID:
         // every handler, gateway, and runner error path uses a distinct code,
         // so this flag exactly tracks whether a request was dispatched. Valid
@@ -1058,7 +1025,43 @@ fn handle_bootstrap(
 /// separate empty candidate set — so the agent identifies or explicitly
 /// requests the intended task from owner-produced inputs alone.
 fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
-    let slot = match response {
+    let Some(slot) = response_bootstrap_slot(response) else {
+        return;
+    };
+    if slot.is_none() {
+        let tasks = runner.retained_auto_boot_tasks();
+        *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
+    }
+}
+
+fn attach_recovery_bootstrap_if_it_fits(runner: &mut BridgeRunner, response: &mut Response) {
+    if !fits_output_frame(response) {
+        return;
+    }
+    let tasks = runner.retained_auto_boot_tasks();
+    let Some(preview) = runner.preview_first_response_bootstrap(&tasks, CurrentAssessment::Ready)
+    else {
+        return;
+    };
+    let previous_bootstrap = {
+        let Some(slot) = response_bootstrap_slot(response) else {
+            return;
+        };
+        let previous = slot.clone();
+        *slot = Some(preview);
+        previous
+    };
+    let candidate_fits = fits_output_frame(response);
+    if let Some(slot) = response_bootstrap_slot(response) {
+        *slot = previous_bootstrap;
+    }
+    if candidate_fits {
+        attach_auto_bootstrap(runner, response);
+    }
+}
+
+fn response_bootstrap_slot(response: &mut Response) -> Option<&mut Option<UnderstandingBootstrap>> {
+    match response {
         Response::Status { bootstrap, .. }
         | Response::Attached { bootstrap }
         | Response::Reconnected { bootstrap, .. }
@@ -1069,20 +1072,15 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::ReactiveAdmitted { bootstrap, .. }
         | Response::ReactiveRecorded { bootstrap, .. }
         | Response::ReactiveLedger { bootstrap, .. }
-        | Response::Reconciled { bootstrap }
+        | Response::Reconciled { bootstrap, .. }
         | Response::RecoveryPage { bootstrap, .. }
-        | Response::Stopped { bootstrap, .. } => bootstrap,
+        | Response::RecoveryProjectionPage { bootstrap, .. }
+        | Response::Stopped { bootstrap, .. } => Some(bootstrap),
         Response::Bootstrap { .. }
         | Response::Backpressure { .. }
         | Response::Error { .. }
         | Response::ActivationDenied { .. }
-        | Response::DryRun { .. } => {
-            return;
-        }
-    };
-    if slot.is_none() {
-        let tasks = runner.retained_auto_boot_tasks();
-        *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
+        | Response::DryRun { .. } => None,
     }
 }
 /// Fail-closed bounded decode bound to the accepted input profile.
@@ -2157,6 +2155,23 @@ fn frame_response(response: &Response) -> Result<Vec<u8>, StdioBreakCause> {
         return Err(StdioBreakCause::OutputTooLarge);
     }
     Ok(framed)
+}
+
+fn is_recovery_projection_response(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::Reconciled {
+            recovery: Some(_),
+            ..
+        } | Response::RecoveryPage { .. }
+            | Response::RecoveryProjectionPage { .. }
+    )
+}
+
+/// Checks the complete containing JSON response, including the framing
+/// newline, against the negotiated output frame before it reaches the writer.
+fn fits_output_frame(response: &Response) -> bool {
+    frame_response(response).is_ok()
 }
 
 fn write_response(response: &Response) -> StdioWriteReceipt {
@@ -3886,6 +3901,7 @@ mod tests {
                         Request::ReactiveRecordDisposition { .. } => "reactive_record_disposition",
                         Request::ReactiveSnapshot => "reactive_snapshot",
                         Request::ReconcileExternal {} => "reconcile_external",
+                        Request::RecoveryProjectionPage { .. } => "recovery_projection_page",
                         Request::RecoverNextPage {} => "recover_next_page",
                         Request::Reconnect { .. } => "reconnect",
                         Request::Detach { .. } => "detach",
@@ -4593,6 +4609,13 @@ mod tests {
                     "test-forwarder",
                     "reconciliation not exercised",
                 ))
+            }
+
+            fn reconciliation_imported(
+                &mut self,
+                _binding: &AttachBinding,
+                _result: &eliot_agent_bridge_core::ReconciliationPortResult,
+            ) {
             }
         }
 
