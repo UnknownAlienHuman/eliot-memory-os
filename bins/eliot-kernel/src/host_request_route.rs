@@ -57,6 +57,7 @@ use super::{
     ProtocolPayload, Session, TransportError, activation_deadline_expired, sha256_json,
     status_frame, unix_ms,
 };
+use eliot_contracts::RequestId;
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
@@ -69,7 +70,7 @@ use eliot_protocol::{
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, DeliveryClass, EventEnvelope,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestKind, HostRequestResultBody, LocalReadAttempt, RequestId, WatchdogIntentKind,
+    HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
 use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, ScopeId};
@@ -377,7 +378,7 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         envelope
-            .validate()
+            .validate_for_admission()
             .map_err(|_| TransportError::SessionFenced)?;
         if matches!(
             envelope.kind,
@@ -1028,6 +1029,10 @@ impl KernelComposition {
                     || record.payload_digest != payload
                     || record.session_ref.as_ref().map(OpaqueLabel::as_str)
                         != Some(session.as_str())
+                    || record.task_ref.as_ref().map(OpaqueLabel::as_str)
+                        != envelope.identity.task_id.as_deref()
+                    || record.scope_ref.as_ref().map(OpaqueLabel::as_str)
+                        != envelope.identity.work_scope_id.as_deref()
                 {
                     return Ok(host_request_resolve_unresolved_response(
                         "conflict",

@@ -1341,6 +1341,9 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         OrsError::MigrationRequired { reason } => {
             BackupError::UnsupportedFormat(format!("restore journal migration: {reason}"))
         }
+        OrsError::HostRequestLegacyCorrelationUnresolved => BackupError::UnsupportedFormat(
+            "restore journal host-request legacy correlation is unresolved".to_owned(),
+        ),
         OrsError::Encoding(detail) => BackupError::Serialization(detail),
         OrsError::Storage(_) => {
             BackupError::Target("restore journal owner storage failure".to_owned())

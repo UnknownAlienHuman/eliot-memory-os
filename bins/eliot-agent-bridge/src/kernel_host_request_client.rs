@@ -594,16 +594,20 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::Resolved(record) => {
                 verify_resolved_key_commitment(
                     &record,
-                    &logical_key,
-                    correlation,
-                    session_id,
-                    request.tool.canonical_name(),
-                    payload_digest,
-                    None,
-                    request
-                        .correlation_projection
-                        .as_ref()
-                        .ok_or_else(request_failure)?,
+                    ResolvedKeyCommitment {
+                        key: &logical_key,
+                        occurrence: correlation,
+                        session: session_id,
+                        task_ref: None,
+                        scope_ref: None,
+                        capability: request.tool.canonical_name(),
+                        payload_digest,
+                        parent: None,
+                        projection: request
+                            .correlation_projection
+                            .as_ref()
+                            .ok_or_else(request_failure)?,
+                    },
                 )?;
                 Ok(InvocationPreparation::Recovered(record, logical_key))
             }
@@ -861,13 +865,17 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::Resolved(record) => {
                 verify_resolved_key_commitment(
                     &record,
-                    &logical_key,
-                    cancel_correlation,
-                    session_id,
-                    parent.capability.as_str(),
-                    parent.payload_digest.as_str(),
-                    Some(parent.handle.as_str()),
-                    projection,
+                    ResolvedKeyCommitment {
+                        key: &logical_key,
+                        occurrence: cancel_correlation,
+                        session: session_id,
+                        task_ref: None,
+                        scope_ref: None,
+                        capability: parent.capability.as_str(),
+                        payload_digest: parent.payload_digest.as_str(),
+                        parent: Some(parent.handle.as_str()),
+                        projection,
+                    },
                 )
                 .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
                 map_cancel_record_state(record.state)
@@ -1759,6 +1767,10 @@ fn decode_resolve_reply(
     let Some(value) = payload.get("value") else {
         return LogicalOwnerOutcome::Unavailable;
     };
+    decode_resolve_value(value, query)
+}
+
+fn decode_resolve_value(value: &serde_json::Value, query: &ResolveQuery) -> LogicalOwnerOutcome {
     if value.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
         let Some(operation_id) = value
             .get("operation_id")
@@ -1802,35 +1814,25 @@ fn decode_resolve_reply(
         return LogicalOwnerOutcome::Unavailable;
     };
     match (query, disposition) {
-        (ResolveQuery::LogicalKey { key }, "legacy_correlation_unresolved") => {
+        (
+            ResolveQuery::LogicalKey { key } | ResolveQuery::LegacyPresence { key },
+            "legacy_correlation_unresolved",
+        ) => {
             let echo = value.get("logical_key").and_then(serde_json::Value::as_str);
             if echo != Some(key.as_str()) {
                 return LogicalOwnerOutcome::Unavailable;
             }
             LogicalOwnerOutcome::LegacyUnresolved
         }
-        (ResolveQuery::LegacyPresence { key }, "legacy_correlation_unresolved") => {
+        (ResolveQuery::LogicalKey { key } | ResolveQuery::LegacyPresence { key }, "absent") => {
             let echo = value.get("logical_key").and_then(serde_json::Value::as_str);
-            if echo != Some(key.as_str()) {
-                return LogicalOwnerOutcome::Unavailable;
+            if echo == Some(key.as_str()) {
+                LogicalOwnerOutcome::Absent
+            } else {
+                LogicalOwnerOutcome::Unavailable
             }
-            LogicalOwnerOutcome::LegacyUnresolved
         }
-        (ResolveQuery::LegacyPresence { key }, "absent") => {
-            let echo = value.get("logical_key").and_then(serde_json::Value::as_str);
-            if echo != Some(key.as_str()) {
-                return LogicalOwnerOutcome::Unavailable;
-            }
-            LogicalOwnerOutcome::Absent
-        }
-        (ResolveQuery::LogicalKey { key }, "absent") => {
-            let echo = value.get("logical_key").and_then(serde_json::Value::as_str);
-            if echo != Some(key.as_str()) {
-                return LogicalOwnerOutcome::Unavailable;
-            }
-            LogicalOwnerOutcome::Absent
-        }
-        (_, "absent") => LogicalOwnerOutcome::Absent,
+        (ResolveQuery::OperationHandle { .. }, "absent") => LogicalOwnerOutcome::Absent,
         (ResolveQuery::LogicalKey { .. }, "conflict") => LogicalOwnerOutcome::Conflict,
         _ => LogicalOwnerOutcome::Unavailable,
     }
@@ -1845,17 +1847,23 @@ fn decode_resolve_reply(
 /// state, or result is adopted. A missing commitment field, an
 /// unrecognized kind, or a mismatch fails closed as the explicit recovery
 /// limitation — never as a conflict and never as absence.
+struct ResolvedKeyCommitment<'a> {
+    key: &'a str,
+    occurrence: &'a str,
+    session: &'a str,
+    task_ref: Option<&'a str>,
+    scope_ref: Option<&'a str>,
+    capability: &'a str,
+    payload_digest: &'a str,
+    parent: Option<&'a str>,
+    projection: &'a HostCorrelationProjection,
+}
+
 fn verify_resolved_key_commitment(
     record: &AdmittedReplyView,
-    expected_key: &str,
-    expected_occurrence: &str,
-    expected_session: &str,
-    expected_capability: &str,
-    expected_payload_digest: &str,
-    expected_parent: Option<&str>,
-    expected_projection: &HostCorrelationProjection,
+    expected: ResolvedKeyCommitment<'_>,
 ) -> Result<(), PortFailure> {
-    let limitation = || unknown_resolve_outcome(expected_key);
+    let limitation = || unknown_resolve_outcome(expected.key);
     let Some(kind) = &record.kind else {
         return Err(limitation());
     };
@@ -1872,12 +1880,14 @@ fn verify_resolved_key_commitment(
         return Err(limitation());
     };
     if record.request_digest.is_none()
-        || occurrence != expected_occurrence
-        || session != expected_session
-        || capability != expected_capability
-        || payload != expected_payload_digest
-        || record.parent_operation_id.as_deref() != expected_parent
-        || record.correlation_projection.as_ref() != Some(expected_projection)
+        || occurrence != expected.occurrence
+        || session != expected.session
+        || record.task_ref.as_deref() != expected.task_ref
+        || record.scope_ref.as_deref() != expected.scope_ref
+        || capability != expected.capability
+        || payload != expected.payload_digest
+        || record.parent_operation_id.as_deref() != expected.parent
+        || record.correlation_projection.as_ref() != Some(expected.projection)
     {
         return Err(limitation());
     }
@@ -1886,12 +1896,12 @@ fn verify_resolved_key_commitment(
         "CANCELLATION" => LOGICAL_KIND_CANCELLATION,
         _ => return Err(limitation()),
     };
-    if expected_projection.occurrence_text() != *occurrence {
+    if expected.projection.occurrence_text() != *occurrence {
         return Err(limitation());
     }
     let recomputed =
-        projection_key(marker, session, expected_projection).map_err(|_| limitation())?;
-    if recomputed != expected_key {
+        projection_key(marker, session, expected.projection).map_err(|_| limitation())?;
+    if recomputed != expected.key {
         return Err(limitation());
     }
     Ok(())

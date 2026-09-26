@@ -126,6 +126,7 @@ fn frame_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownRequest => "frame_unknown_request",
         TransportError::UnknownOutcome => "frame_unknown_outcome",
         TransportError::IdentityConflict => "frame_identity_conflict",
+        TransportError::LegacyCorrelationUnresolved => "frame_legacy_correlation_unresolved",
         TransportError::Cancelled => "frame_cancelled",
         TransportError::Backpressure => "frame_backpressure",
         TransportError::InvalidLimits => "frame_invalid_limits",

@@ -79,6 +79,7 @@ fn control_request_terminal_code(error: &TransportError) -> &'static str {
         TransportError::PlanGap { .. } => "control_plan_gap",
         TransportError::UnknownRequest => "control_unknown_request",
         TransportError::IdentityConflict => "control_identity_conflict",
+        TransportError::LegacyCorrelationUnresolved => "control_legacy_correlation_unresolved",
         TransportError::RegistryFull => "control_registry_full",
     }
 }
