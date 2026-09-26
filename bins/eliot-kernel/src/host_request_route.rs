@@ -3452,7 +3452,9 @@ impl KernelComposition {
                 // payload handoff before the acknowledgement below.
                 // Digest-only submits keep the legacy shape untouched.
                 let observe_tool = payload.get("tool").cloned();
-                let (receipt, record) = match self.admit_and_queue_observe_submit(envelope, observe_tool.as_ref()) {
+                let (receipt, record) = match self
+                    .admit_and_queue_observe_submit(envelope, observe_tool.as_ref())
+                {
                     Ok(admitted) => admitted,
                     Err(TransportError::IdentityConflict) => {
                         return Self::host_request_identity_conflict_refusal(session, request_id);

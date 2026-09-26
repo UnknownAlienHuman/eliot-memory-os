@@ -14,7 +14,9 @@ use eliot_agent_bridge_core::{
     DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
     RecoveryProjectionPage, SessionId,
 };
-use eliot_contracts::{BridgeEventCapacityPressure, EpochId, HostCorrelationDomain, HostCorrelationProjection};
+use eliot_contracts::{
+    BridgeEventCapacityPressure, EpochId, HostCorrelationDomain, HostCorrelationProjection,
+};
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
