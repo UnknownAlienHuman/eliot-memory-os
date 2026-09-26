@@ -3,14 +3,15 @@ use crate::{
     AdmittedOpenCodeAttempt, AdmittedSlotConsumption, AuthorityCeiling, BasicAuth,
     EnvironmentAllowlist, ExecutableFingerprint, HealthResponse, HttpMethod, HttpRequest,
     LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
-    OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OpenCodeEvent, OpenCodeWireRouteReceipt,
-    PhysicalObservationBody, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest,
-    RunRequestError, RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap,
-    SseConnection, SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields,
-    UsageAvailability, UsageTelemetry, bound_session_identity, committed_message_id,
+    OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
+    OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
+    ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus,
+    SealedRouteDisposition, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
+    SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability,
+    UsageTelemetry, bound_session_identity, committed_message_id, wire_receipt_evidence,
     wire_route_locator,
 };
-use eliot_agent_api::{EventCursor, PhysicalRouteObservationReceipt};
+use eliot_agent_api::{EventCursor, ExecutionOutcome};
 use eliot_contracts::{ClockReading, ResourceGeneration, StateFence};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -223,17 +224,20 @@ pub enum OpenCodeRunError {
 /// The wire result carries the SSE observations for downstream normalization
 /// bound to the exact attempt; the seal carries only attempt/admission/result
 /// digests under the candidate-only ceiling — never launch, process, or
-/// finish authority. `physical_route` is the canonical
-/// provider-neutral physical observation converted from the wire receipt at
-/// seal time (issue #228 W5); it is `None` exactly when no convertible
-/// observation exists (no observed terminal time, or a wire/binding mismatch
-/// that fails closed), in which case the retained wire receipt stays the
-/// downstream normalization evidence.
+/// finish authority. `route` is the typed seal-time route-observation
+/// disposition (issue #2902): either the validated canonical physical
+/// observation converted from the wire receipt, or the exact bounded cause
+/// (conflict, unknown outcome, legacy absence) plus retained wire evidence.
+/// A malformed, stale, mismatched, or otherwise unconvertible wire route can
+/// never appear here as ordinary success with an unexplained absence: the
+/// disposition is computed before candidate sealing, bound into the sealed
+/// candidate digest through the run extra, and finalized before slot
+/// confirmation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdmittedAttemptOutcome {
     pub run: NoAuthorityRunResult,
     pub candidate: AdmittedAttemptCandidate,
-    pub physical_route: Option<PhysicalRouteObservationReceipt>,
+    pub route: SealedRouteDisposition,
 }
 
 pub struct OpenCodeClient {
@@ -1562,53 +1566,152 @@ impl OpenCodeClient {
     }
 }
 
-/// Converts one sealed admitted run into its canonical physical route
-/// observation (issue #228 W5).
+/// Seal-time observation sequence (issue #2902 item 7): exactly one seal
+/// observation exists per admitted attempt/message pair, so the sequence is
+/// constant. Uniqueness across retry/resume/fork comes from the cursor, which
+/// binds the exact attempt identity — a new turn (including resume/fork) is a
+/// new agent attempt with its own cursor (per the #361 binding cardinality),
+/// so no second execution can reset this sequence under a colliding message
+/// text. Exact replay (same attempt, same message) returns the same
+/// cursor/sequence and reconciles idempotently through
+/// [`PhysicalRouteObservationReceipt::validate_replay_against`].
+/// Stream-level resume cursors remain the #371 event owner and are never
+/// minted here.
+const SEAL_OBSERVATION_SEQUENCE: u64 = 1;
+
+/// Computes the typed seal-time route-observation disposition for one
+/// admitted run (issue #2902).
 ///
-/// Terminal-time evidence comes only from the reconciled assistant
-/// completion timestamp (`observed_completed_at_ms` in the run extra); when
-/// absent the run observed no terminal wall time and no `Observed` receipt
-/// can be minted honestly. The causal cursor names the committed
-/// execution-unit message the run reconciled; the sequence marks the single
-/// seal observation. Any conversion failure yields `None` with the wire
-/// receipt retained, never a substituted route.
-fn seal_physical_observation(
+/// No cause is ever discarded: canonical conversion runs through
+/// [`AdmittedOpenCodeAttempt::observe_physical_route`] without `.ok()`, and
+/// every outcome becomes either a validated receipt (`Observed` for asserted
+/// execution, `Unobserved` for honest unavailability with its reason and
+/// recovery reference) or a typed conflict/unknown disposition carrying the
+/// exact bounded `Wire`/`Contract`/`Serialization`/`InvalidInput` cause plus
+/// the retained wire evidence. Terminal-time evidence comes only from the
+/// reconciled assistant completion timestamp (`observed_completed_at_ms` in
+/// the run extra); when absent the run observed no terminal wall time, so no
+/// `Observed` receipt can be minted honestly and the disposition seals
+/// `UnknownOutcome` with the last boundary and the reconciliation handle.
+///
+/// Before conversion, the wire session identity is joined to the exact
+/// execution owner (issue #2902 item 4): an `Observed` wire receipt whose
+/// session disagrees with the admitted binding session or the run session is
+/// a foreign execution and becomes `RejectedConflict`, even when
+/// provider/model/endpoint/version match. Workspace, directory, and endpoint
+/// values stay non-authoritative evidence (endpoint loopback shape is still
+/// enforced by wire validation); they never join as identity.
+fn seal_route_disposition(
     admitted: &AdmittedOpenCodeAttempt,
     run: &NoAuthorityRunResult,
     message_id: &str,
-) -> Option<PhysicalRouteObservationReceipt> {
-    let completed_at_ms = run.extra.get("observed_completed_at_ms")?.as_u64()?;
-    let terminal_ms = i64::try_from(completed_at_ms).ok()?;
+) -> Result<SealedRouteDisposition, AdmittedAttemptError> {
+    let event_cursor = EventCursor::new(format!(
+        "opencode-sealed/{}/{}",
+        admitted.attempt().id.as_str(),
+        message_id
+    ))
+    .map_err(|_| AdmittedAttemptError::SealRejected {
+        reason: "seal observation cursor is not a valid event cursor",
+    })?;
+    if run.actual_route.is_observed() {
+        let bound_session = bound_session_identity(admitted.binding());
+        let session_agrees = match (
+            bound_session.as_deref(),
+            run.actual_route.session_id.as_deref(),
+            run.session_id.as_deref(),
+        ) {
+            (Some(bound), Some(wire), Some(observed)) => bound == wire && wire == observed,
+            _ => false,
+        };
+        if !session_agrees {
+            let (wire_evidence_digest, wire_evidence_ref) =
+                wire_receipt_evidence(&run.actual_route);
+            return Ok(SealedRouteDisposition::RejectedConflict {
+                cause: OpenCodeObservationConversionError::Contract(
+                    eliot_agent_api::ContractError::BindingMismatch,
+                ),
+                wire_evidence_digest,
+                wire_evidence_ref,
+            });
+        }
+    }
+    let terminal_ms = run
+        .extra
+        .get("observed_completed_at_ms")
+        .and_then(Value::as_u64)
+        .and_then(|completed_at_ms| i64::try_from(completed_at_ms).ok());
+    let Some(terminal_ms) = terminal_ms else {
+        let (wire_evidence_digest, wire_evidence_ref) = wire_receipt_evidence(&run.actual_route);
+        return Ok(SealedRouteDisposition::UnknownOutcome {
+            last_cursor: event_cursor,
+            last_sequence: SEAL_OBSERVATION_SEQUENCE,
+            cause: OpenCodeObservationConversionError::InvalidInput("observed_completed_at_ms"),
+            wire_evidence_digest,
+            wire_evidence_ref,
+            reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
+        });
+    };
     let terminal = ClockReading {
         valid_time_ms: Some(terminal_ms),
         known_time_ms: Some(terminal_ms),
         transaction_sequence: None,
         monotonic_ns: None,
     };
-    let event_cursor = EventCursor::new(format!("opencode-sealed/{message_id}")).ok()?;
-    admitted
-        .observe_physical_route(
-            &run.actual_route,
-            PhysicalObservationBody {
-                usage: run.usage.to_usage_receipt(),
-                started: ClockReading::default(),
-                first_byte: ClockReading::default(),
-                first_semantic: ClockReading::default(),
-                terminal,
-                event_cursor,
-                event_sequence: 1,
-                cancellation: None,
-            },
-        )
-        .ok()
+    match admitted.observe_physical_route(
+        &run.actual_route,
+        PhysicalObservationBody {
+            usage: run.usage.to_usage_receipt(),
+            started: ClockReading::default(),
+            first_byte: ClockReading::default(),
+            first_semantic: ClockReading::default(),
+            terminal,
+            event_cursor: event_cursor.clone(),
+            event_sequence: SEAL_OBSERVATION_SEQUENCE,
+            cancellation: None,
+        },
+    ) {
+        Ok(receipt) => Ok(if receipt.execution_outcome == ExecutionOutcome::Observed {
+            SealedRouteDisposition::Observed(receipt)
+        } else {
+            SealedRouteDisposition::Unobserved(receipt)
+        }),
+        Err(cause) => {
+            let (wire_evidence_digest, wire_evidence_ref) =
+                wire_receipt_evidence(&run.actual_route);
+            match &cause {
+                OpenCodeObservationConversionError::Wire(_)
+                | OpenCodeObservationConversionError::Contract(_) => {
+                    Ok(SealedRouteDisposition::RejectedConflict {
+                        cause,
+                        wire_evidence_digest,
+                        wire_evidence_ref,
+                    })
+                }
+                OpenCodeObservationConversionError::Serialization(_)
+                | OpenCodeObservationConversionError::InvalidInput(_) => {
+                    Ok(SealedRouteDisposition::UnknownOutcome {
+                        last_cursor: event_cursor,
+                        last_sequence: SEAL_OBSERVATION_SEQUENCE,
+                        cause,
+                        wire_evidence_digest,
+                        wire_evidence_ref,
+                        reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
+                    })
+                }
+            }
+        }
+    }
 }
 
 /// Seals one admitted execution into its candidate-only outcome: the
 /// fail-closed child gate, the attempt-bound heartbeat/progress/quota
-/// observations, the deterministic edge-proof gate and marker, the seal
-/// against the retained binding, slot confirmation against the observed
-/// session/message, and the terminal observation bound to the sealed
-/// candidate. Pure orchestration over already-reconciled state: no I/O.
+/// observations, the deterministic edge-proof gate and marker, the typed
+/// route-observation disposition computed and digest-bound before sealing
+/// (issue #2902), the seal against the retained binding, slot confirmation
+/// against the observed session/message, and the terminal observation bound
+/// to the sealed candidate. Pure orchestration over already-reconciled state:
+/// no I/O.
 fn seal_admitted_outcome(
     admitted: &AdmittedOpenCodeAttempt,
     slot: AdmittedSlotConsumption,
@@ -1666,6 +1769,23 @@ fn seal_admitted_outcome(
         "edge".to_owned(),
         Value::String(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE.to_owned()),
     );
+    // Canonical route-observation disposition (issue #2902): computed and
+    // validated BEFORE candidate sealing and slot confirmation, so a
+    // malformed, stale, mismatched, or otherwise unconvertible wire route can
+    // never seal as ordinary success with an unexplained absence. A route
+    // conflict does not erase the retained provider output: the candidate
+    // still seals below, but under a digest-bound conflict disposition rather
+    // than an indistinguishable stronger success.
+    let route = seal_route_disposition(admitted, &run, message_id)?;
+    // The disposition summary rides the run extra before sealing, so the
+    // candidate `result_digest` binds the final route disposition, its
+    // evidence/recovery references, and the #2645 staging columns: a consumer
+    // cannot drop the disposition and retain an indistinguishable stronger
+    // candidate.
+    run.extra.insert(
+        "route_disposition".to_owned(),
+        route.summary_value(admitted.admission())?,
+    );
     let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
     slot.confirm(admitted, &session_id, message_id)?;
     // The terminal observation is emitted bound to the exact attempt,
@@ -1688,16 +1808,16 @@ fn seal_admitted_outcome(
         serde_json::to_value(&terminal)
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
     );
-    // Canonical physical observation (issue #228 W5): convert the sealed
-    // wire receipt through the admitted attempt's exact binding/admission.
-    // A wire/binding mismatch or missing terminal evidence fails closed to
-    // `None`; the retained wire receipt stays the downstream evidence and no
-    // route is ever substituted or synthesized.
-    let physical_route = seal_physical_observation(admitted, &run, message_id);
+    // Canonical route-observation disposition (issue #2902): the typed
+    // disposition computed before sealing travels on the outcome. The
+    // retained wire receipt stays the downstream normalization evidence, and
+    // the digest-bound `route_disposition` summary above names exactly why
+    // conversion produced a receipt, a conflict, or an unknown outcome —
+    // including which owner must reconcile it.
     Ok(AdmittedAttemptOutcome {
         run,
         candidate,
-        physical_route,
+        route,
     })
 }
 
