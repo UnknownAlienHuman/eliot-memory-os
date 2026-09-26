@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, CutoverIntentState, EpochEvidence, HostInstallationEpoch, HostState,
-    HostStateRecord, IdempotencyIdentity, RecoveryLineageReason, activation_transition,
+    AppliedOperation, CutoverIntentState, DrainState, EpochEvidence, HostInstallationEpoch,
+    HostState, HostStateRecord, IdempotencyIdentity, RecoveryLineageReason, activation_transition,
     dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
     kernel_transition, store_rebind_transition, wake_transition,
 };
@@ -462,6 +462,48 @@ fn apply(
             state.clean_marker = None;
         }
         HostStateRecord::Drain(next) => {
+            // One attempt link exists per drain attempt, and it is checked
+            // before the transition law, exactly as the `CutoverIntent` arm
+            // checks its `expected_predecessor`. The projection keeps exactly
+            // one `DrainRecord`, so without this the reducer cannot tell
+            // attempt N from attempt N+1 and a stale or concurrent re-arm would
+            // be applied as if it were the current attempt:
+            //  * a `Cancelled -> Requested` re-arm is admitted only when it
+            //    names the exact record checksum of the `Cancelled`
+            //    predecessor it re-arms. An absent link is a typed refusal
+            //    (that edge is a re-arm, so the link is mandatory) and a
+            //    mismatching link is an identity conflict, never a silent
+            //    re-arm of some other attempt;
+            //  * every other drain edge continues the current attempt, so an
+            //    unexpected link there is an identity conflict as well.
+            // `drain_transition` below keeps ownership of the
+            // `drain_generation` equality rule and the legal-transition set;
+            // this is an additional check, not a replacement.
+            if let Some(current) = state.drain.as_ref() {
+                let rearm = matches!(
+                    (current.state, next.state),
+                    (DrainState::Cancelled, DrainState::Requested)
+                );
+                if rearm {
+                    let Some(predecessor) = next.expected_predecessor.as_deref() else {
+                        return Err(JournalError::IllegalTransition {
+                            machine: "drain",
+                            from: format!("{:?}", current.state),
+                            to: format!("{:?}::without-expected-predecessor", next.state),
+                        });
+                    };
+                    let current_checksum =
+                        record_checksum(&HostStateRecord::Drain(current.clone()))?;
+                    if predecessor != current_checksum {
+                        return Err(JournalError::IdempotencyConflict);
+                    }
+                } else if next.expected_predecessor.is_some() {
+                    return Err(JournalError::IdempotencyConflict);
+                }
+            } else if next.expected_predecessor.is_some() {
+                // A first attempt has no predecessor to name.
+                return Err(JournalError::IdempotencyConflict);
+            }
             drain_transition(state.drain.as_ref(), next, state.drain_commit.is_some())?;
             state.drain = Some(next.clone());
             state.clean_marker = None;

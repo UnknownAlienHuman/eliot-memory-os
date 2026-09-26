@@ -47,15 +47,16 @@ use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_host_state::{
     ActivationState, DrainRecord, DrainState, EliotActivationRecord, EpochIdentity,
     EpochTransition, HostState, HostStateRecord, ServiceSafetyClass, WakeDisposition, WakeRecord,
+    record_checksum,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
 
 use super::watchdog_publication::live_supervision_obligation;
 use super::{
-    HostBranchDisposition, HostComposition, HostError, HostTerminalGuard, fresh_identity,
-    host_lifecycle_observe_drain, host_lifecycle_observe_requested, host_lifecycle_observe_scm,
-    operation, record_fence,
+    HostBranchDisposition, HostComposition, HostError, HostTerminalGuard, drain_rearm_operation,
+    fresh_identity, host_lifecycle_observe_drain, host_lifecycle_observe_requested,
+    host_lifecycle_observe_scm, operation, record_fence,
 };
 
 /// Capability every I1.5 observable-use trigger needs: the Host-owned
@@ -155,6 +156,9 @@ pub enum DrainWakeOutcome {
     /// `DrainCommitRecord` already exists: the trigger is queued as the next
     /// activation generation.
     QueueNextGeneration,
+    /// The trigger is a replay of observable use the current attempt already
+    /// consumed, so it neither opens a new attempt nor cancels this one.
+    ReplayAlreadyConsumed,
 }
 
 impl DrainWakeOutcome {
@@ -166,8 +170,30 @@ impl DrainWakeOutcome {
             Self::Proceed => "proceed",
             Self::CancelDrain => "cancel-drain",
             Self::QueueNextGeneration => "queue-next-generation",
+            Self::ReplayAlreadyConsumed => "replay-already-consumed",
         }
     }
+}
+
+/// Durable facts one re-armed pre-commit drain attempt binds both of its
+/// appended records to.
+///
+/// They are returned by [`HostComposition::rearm_cancelled_drain`] so the
+/// `Draining` record of the same attempt gets byte-identical attempt identity
+/// and evidence: the two records of one attempt must agree, and a retry of that
+/// attempt must reproduce them exactly.
+struct DrainRearmAttempt {
+    /// Record checksum of the `Cancelled` predecessor this attempt re-arms.
+    /// It is also the value carried in [`DrainRecord::expected_predecessor`].
+    predecessor_checksum: String,
+    /// `drain_generation` of the predecessor. A re-arm never changes the drain
+    /// generation: the reducer rejects a different one, and the successor stays
+    /// inside the same installation-scoped `activation_generation`.
+    drain_generation: EpochTransition,
+    /// Census code read at the re-arm boundary, never the caller's cached one.
+    census_code: &'static str,
+    /// Attempt evidence, inheriting the predecessor's consumed triggers.
+    evidence_refs: Vec<PlatformHandle>,
 }
 
 /// Result of the generation-scoped lease census that gates idle drain.
@@ -303,27 +329,37 @@ impl HostComposition {
         let outcome = if state.drain_commit.is_some() {
             self.queue_next_generation_wake(&activation, trigger, trigger_class, evidence)?;
             DrainWakeOutcome::QueueNextGeneration
-        } else if state
-            .drain
-            .as_ref()
-            .is_some_and(|drain| drain.state == DrainState::Draining)
-            && matches!(
-                activation.state,
-                ActivationState::Draining | ActivationState::StoppedClean
-            )
-        {
-            let drain_generation = activation
-                .drain_generation
-                .clone()
-                .unwrap_or_else(|| activation.fence.activation_generation.clone());
-            self.append_record(HostStateRecord::Drain(DrainRecord {
-                fence: activation.fence.clone(),
-                operation: operation("host-drain-cancel")?,
-                drain_generation,
-                state: DrainState::Cancelled,
-                evidence_refs: vec![evidence.clone(), trigger_class],
-            }))?;
-            DrainWakeOutcome::CancelDrain
+        } else if let Some(drain) = state.drain.as_ref().filter(|drain| {
+            drain.state == DrainState::Draining
+                && matches!(
+                    activation.state,
+                    ActivationState::Draining | ActivationState::StoppedClean
+                )
+        }) {
+            if drain.evidence_refs.contains(evidence) {
+                // The trigger is correlated to the *current attempt*, not to
+                // the drain generation: after a re-arm the successor inherits
+                // the evidence its predecessor consumed, so a delayed
+                // first-attempt trigger is recognised as a replay of an
+                // already-admitted request and cannot silently cancel the
+                // successor. Generation equality alone cannot express this,
+                // because both attempts share one `drain_generation`.
+                DrainWakeOutcome::ReplayAlreadyConsumed
+            } else {
+                let drain_generation = activation
+                    .drain_generation
+                    .clone()
+                    .unwrap_or_else(|| activation.fence.activation_generation.clone());
+                self.append_record(HostStateRecord::Drain(DrainRecord {
+                    fence: activation.fence.clone(),
+                    operation: operation("host-drain-cancel")?,
+                    drain_generation,
+                    state: DrainState::Cancelled,
+                    evidence_refs: vec![evidence.clone(), trigger_class],
+                    expected_predecessor: None,
+                }))?;
+                DrainWakeOutcome::CancelDrain
+            }
         } else if matches!(
             activation.state,
             ActivationState::Stopped
@@ -349,6 +385,9 @@ impl HostComposition {
             DrainWakeOutcome::Proceed => "host.observable-use coalesced",
             DrainWakeOutcome::CancelDrain => "host.observable-use drain-cancelled",
             DrainWakeOutcome::QueueNextGeneration => "host.observable-use next-generation-queued",
+            DrainWakeOutcome::ReplayAlreadyConsumed => {
+                "host.observable-use replay-already-consumed"
+            }
         };
         host_lifecycle_observe_scm(detail);
         host_terminal.disarm();
@@ -407,16 +446,36 @@ impl HostComposition {
     /// `DrainCommitRecord` — the linearization point after which a wake can no
     /// longer cancel — is still absent and therefore still cancellable.
     ///
-    /// Returns `false` when the current generation cannot open the window,
-    /// including the case where its drain machine already reached a terminal
-    /// state: a cancelled or failed drain belongs to a spent generation, and
-    /// the next drain attempt must be a fresh direct-child generation rather
-    /// than a second drain inside this one.
+    /// A cancelled attempt belongs to *this* generation, not to a spent one.
+    /// I1.5 requires a pre-linearization trigger to "return the same
+    /// generation to `ACTIVE` after readiness revalidation", and the journal
+    /// reducer explicitly admits the successor `Requested` inside that same
+    /// `drain_generation`. A fresh direct-child generation is therefore not an
+    /// alternative rule but a refused one: `activation_transition` admits a new
+    /// generation only as a direct child of `StoppedClean | Failed |
+    /// DegradedRecovery` into `Starting`, and taking it would clear
+    /// `state.drain`, `state.drain_commit`, `state.dependencies` and
+    /// `state.wakes`, destroying exactly the cancelled-attempt history and
+    /// queued wakes this operation must retain. The re-arm instead appends the
+    /// successor `Requested` through this single journal owner and names its
+    /// exact predecessor through [`DrainRecord::expected_predecessor`].
+    ///
+    /// Returns `false` when the current generation cannot open the window
+    /// *yet*: it is not `ACTIVE` (its cancelled predecessor is still awaiting
+    /// readiness revalidation), or the lease census re-read at this boundary is
+    /// not `Idle`. No attempt exists in that case and none is implied.
     ///
     /// # Errors
     ///
-    /// Returns an error when admission is fenced or the journal rejects the
-    /// record.
+    /// Returns an error when admission is fenced, the durable state or census
+    /// cannot be read, the journal rejects the record, or this drain attempt
+    /// cannot be re-armed at all. A `Failed` attempt, a durable
+    /// `DrainCommitRecord` and an unestablished census are reported as
+    /// [`HostError::RecoveryRequired`] / [`HostError::OwnerLeaseRecovery`]
+    /// rather than as a `false`, so an unreconciled shutdown stays a visible
+    /// recovery outcome instead of looking like a spent generation. The rule
+    /// stays narrow: it covers those named cases only, not every terminal
+    /// drain.
     pub fn begin_idle_drain(&mut self, census_code: &'static str) -> Result<bool, HostError> {
         // F-LOG-HOST-1: Requested vs Draining vs committed stay distinct.
         let mut host_terminal = HostTerminalGuard::armed("host-idle-drain-begin-failed");
@@ -429,19 +488,46 @@ impl HostComposition {
         let activation = state.activation.clone().ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
+        let mut rearm: Option<DrainRearmAttempt> = None;
         if state.drain_commit.is_some() {
-            host_terminal.disarm();
-            return Ok(false);
+            // I14.23: after the durable `DrainCommitRecord` the process and
+            // authority fence is linearized, so a wake waits for a fresh
+            // activation generation and this prologue can never re-arm the
+            // current one. That is an actionable blocked result, not a `false`
+            // that reads like a spent generation.
+            return Err(HostError::OwnerLeaseRecovery(
+                "pre-commit drain is already committed; a fresh activation generation is required"
+                    .to_owned(),
+            ));
         }
         match state.drain.as_ref().map(|drain| drain.state) {
             Some(DrainState::Draining) => {
                 host_terminal.disarm();
                 return Ok(true);
             }
-            Some(DrainState::Cancelled | DrainState::Failed) => {
-                host_lifecycle_observe_drain("host.idle-drain generation-spent");
-                host_terminal.disarm();
-                return Ok(false);
+            Some(DrainState::Failed) => {
+                // I1.5: "A failed or timed-out drain leaves `DEGRADED_RECOVERY`
+                // plus a WakeIntent/manual entrypoint rather than reporting
+                // `STOPPED_CLEAN`." A `Failed` attempt is not re-armed here:
+                // its failure direction is unreconciled, so the result names
+                // the recovery obligation instead of resetting a timer.
+                host_lifecycle_observe_drain("host.idle-drain drain-failed blocked");
+                return Err(HostError::RecoveryRequired(
+                    "pre-commit drain is FAILED; drain re-arm requires manual recovery before another attempt"
+                        .to_owned(),
+                ));
+            }
+            Some(DrainState::Cancelled) => {
+                let predecessor = state.drain.as_ref().ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "cancelled pre-commit drain record is absent".to_owned(),
+                    )
+                })?;
+                let Some(attempt) = self.rearm_cancelled_drain(&activation, predecessor)? else {
+                    host_terminal.disarm();
+                    return Ok(false);
+                };
+                rearm = Some(attempt);
             }
             Some(DrainState::Requested) => {}
             None => {
@@ -456,20 +542,149 @@ impl HostComposition {
                     drain_generation: activation.fence.activation_generation.clone(),
                     state: DrainState::Requested,
                     evidence_refs: evidence_refs.clone(),
+                    expected_predecessor: None,
                 }))?;
             }
         }
-        self.append_record(HostStateRecord::Drain(DrainRecord {
-            fence: activation.fence.clone(),
-            operation: operation("host-idle-drain-draining")?,
-            drain_generation: activation.fence.activation_generation.clone(),
-            state: DrainState::Draining,
-            evidence_refs,
-        }))?;
+        self.append_idle_drain_draining(&activation, rearm.as_ref(), evidence_refs)?;
         self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
         host_lifecycle_observe_drain("host.idle-drain pre-commit open");
         host_terminal.disarm();
         Ok(true)
+    }
+
+    /// Appends the `Draining` half of one pre-commit drain attempt.
+    ///
+    /// A re-armed attempt reuses its own deterministic identity, its
+    /// predecessor's `drain_generation` and its inherited evidence, so both
+    /// appended records of that attempt agree and an exact retry reproduces
+    /// them byte-for-byte. A first attempt keeps the existing label and
+    /// generation. The continuation record itself carries no attempt link: only
+    /// the `Cancelled -> Requested` edge does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the journal rejects the record.
+    fn append_idle_drain_draining(
+        &mut self,
+        activation: &EliotActivationRecord,
+        rearm: Option<&DrainRearmAttempt>,
+        evidence_refs: Vec<PlatformHandle>,
+    ) -> Result<(), HostError> {
+        let (operation, drain_generation, evidence_refs) = match rearm {
+            Some(attempt) => (
+                drain_rearm_operation(
+                    &activation.fence,
+                    &attempt.drain_generation,
+                    &attempt.predecessor_checksum,
+                    attempt.census_code,
+                    "draining",
+                )?,
+                attempt.drain_generation.clone(),
+                attempt.evidence_refs.clone(),
+            ),
+            None => (
+                operation("host-idle-drain-draining")?,
+                activation.fence.activation_generation.clone(),
+                evidence_refs,
+            ),
+        };
+        self.append_record(HostStateRecord::Drain(DrainRecord {
+            fence: activation.fence.clone(),
+            operation,
+            drain_generation,
+            state: DrainState::Draining,
+            evidence_refs,
+            expected_predecessor: None,
+        }))
+        .map(|_| ())
+    }
+
+    /// Re-arms a cancelled pre-commit attempt as the successor `Requested` of
+    /// the *same* activation generation, or reports that it cannot yet.
+    ///
+    /// `Ok(None)` is the honest deferral: the activation is not `ACTIVE` again,
+    /// or the lease census re-read at this boundary is not `Idle`. `Ok(Some(_))`
+    /// means the successor `Requested` is durable; the caller then appends the
+    /// matching `Draining` and the activation transition through the same
+    /// journal owner.
+    ///
+    /// Preconditions, all proven here rather than assumed: the activation is
+    /// `ACTIVE` again (only `resume_cancelled_drain` produces that, from an
+    /// owner-backed readiness revalidation); the prior drain is proven
+    /// `Cancelled` by the caller's arm; and no `DrainCommit` exists — the
+    /// caller refuses that case, and the reducer refuses it again through its
+    /// own `COMMITTED` transition law, so no unresolved irreversible action is
+    /// re-armed either.
+    ///
+    /// The attempt carries its own identity instead of a fresh generation:
+    /// [`DrainRecord::expected_predecessor`] names the exact `Cancelled`
+    /// predecessor checksum, so the reducer accepts exactly one successor of
+    /// that record, a repeated identical request replays, and changed bytes
+    /// under the same operation identity conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable state or the census cannot be read or
+    /// the journal rejects the successor record.
+    fn rearm_cancelled_drain(
+        &mut self,
+        activation: &EliotActivationRecord,
+        predecessor: &DrainRecord,
+    ) -> Result<Option<DrainRearmAttempt>, HostError> {
+        if activation.state != ActivationState::Active {
+            host_lifecycle_observe_drain("host.idle-drain rearm-not-active");
+            return Ok(None);
+        }
+        // A cancellation changes the obligation set, so the caller's cached
+        // observation code is not authority for a new attempt: the census is
+        // re-read here (I1.5: "Idle drain starts only when no `RuntimeLease`
+        // remains and no valid `SupervisionLease` requires live
+        // sensing/containment"). This is one read per re-arm attempt, never one
+        // per tick.
+        let census = self.idle_lease_census()?;
+        if !census.admits_drain() {
+            host_lifecycle_observe_drain("host.idle-drain rearm-census-not-idle");
+            return Ok(None);
+        }
+        let predecessor_checksum = record_checksum(&HostStateRecord::Drain(predecessor.clone()))?;
+        // The successor inherits its predecessor's evidence, which is what
+        // keeps a delayed first-attempt trigger recognisable as already
+        // consumed by this attempt (see `note_observable_use`) and keeps this
+        // re-arm a pure function of durable state.
+        let mut evidence_refs = vec![
+            PlatformHandle::new(format!("drain-rearm-predecessor:{predecessor_checksum}"))
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new(census.observation_code())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ];
+        for bound in &predecessor.evidence_refs {
+            if !evidence_refs.contains(bound) {
+                evidence_refs.push(bound.clone());
+            }
+        }
+        let attempt = DrainRearmAttempt {
+            predecessor_checksum,
+            drain_generation: predecessor.drain_generation.clone(),
+            census_code: census.observation_code(),
+            evidence_refs: evidence_refs.clone(),
+        };
+        self.append_record(HostStateRecord::Drain(DrainRecord {
+            fence: activation.fence.clone(),
+            operation: drain_rearm_operation(
+                &activation.fence,
+                &attempt.drain_generation,
+                &attempt.predecessor_checksum,
+                attempt.census_code,
+                "request",
+            )?,
+            drain_generation: attempt.drain_generation.clone(),
+            state: DrainState::Requested,
+            evidence_refs,
+            expected_predecessor: Some(attempt.predecessor_checksum.clone()),
+        }))?;
+        host_lifecycle_observe_drain("host.idle-drain rearm-requested");
+        Ok(Some(attempt))
     }
 
     /// Establishes the generation-scoped lease census that gates idle drain.

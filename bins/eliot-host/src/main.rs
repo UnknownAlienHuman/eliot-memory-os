@@ -1272,9 +1272,20 @@ enum IdleDrainTick {
     PreCommitWindowOpen,
     /// The pre-commit window elapsed unrecovered; run the ordered drain.
     CommitDue,
-    /// The current generation's drain machine is already spent; a fresh
-    /// direct-child generation must be established before another drain.
-    GenerationSpent,
+    /// This drain attempt cannot be re-armed and the installation keeps running
+    /// on a visible recovery obligation: a `Failed` attempt, a durable
+    /// `DrainCommitRecord`, an unestablished census, or a refused append.
+    ///
+    /// The bounded `reason` names the actionable recovery class only (F-LOG-HOST-1
+    /// / I15.4: no lease identity, digest or error text in a diagnostic field);
+    /// the full error is reported on stderr by the caller. This replaces the
+    /// former `GenerationSpent` dead end: a cancelled attempt belongs to the
+    /// *same* activation generation and is re-armed through
+    /// [`HostComposition::begin_idle_drain`], so a terminal attempt state is
+    /// never reported as a timer that merely needs resetting. I1.5: "A failed
+    /// or timed-out drain leaves `DEGRADED_RECOVERY` plus a
+    /// WakeIntent/manual entrypoint rather than reporting `STOPPED_CLEAN`."
+    DrainBlocked { reason: &'static str },
 }
 
 /// I1.5 idle-grace supervisor for the SCM service loop.
@@ -1314,6 +1325,10 @@ impl HostIdleDrainSupervisor {
         self.precommit_opened_at = None;
         match host.note_observable_use(ActivationTriggerClass::AgentBridgeAttach, evidence) {
             Ok(DrainWakeOutcome::CancelDrain) => {
+                // A cancellation ends the drain attempt and changes the
+                // obligation set, so the cached census is no longer authority
+                // for the next decision.
+                self.invalidate_census();
                 let _ = writeln!(
                     io::stderr().lock(),
                     "eliot-host: observable use cancelled the pre-commit drain; readiness revalidation decides the return to ACTIVE"
@@ -1325,6 +1340,14 @@ impl HostIdleDrainSupervisor {
                     "eliot-host: observable use arrived after DrainCommitRecord and was queued as the next activation generation"
                 );
             }
+            Ok(DrainWakeOutcome::ReplayAlreadyConsumed) => {
+                // A delayed trigger of an already-consumed attempt is neither
+                // new work nor a cancellation of the current attempt.
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: observable use repeated a trigger the current drain attempt already consumed; it did not cancel the attempt"
+                );
+            }
             Ok(DrainWakeOutcome::Proceed) => {}
             Err(error) => {
                 let _ = writeln!(
@@ -1333,6 +1356,23 @@ impl HostIdleDrainSupervisor {
                 );
             }
         }
+    }
+
+    /// Drops the cached lease census so the next evaluation re-reads it.
+    ///
+    /// The cache is a cache: it may never create freshness. A cancellation, or a
+    /// generation returning to `ACTIVE` after one, changes the obligation set,
+    /// and a five-second cached zero is explicitly not authority for a changed
+    /// attempt (I1.5: "Idle drain starts only when no `RuntimeLease` remains
+    /// and no valid `SupervisionLease` requires live sensing/containment"). The
+    /// next due time is set to now, so this costs exactly one extra census read
+    /// per real obligation-set change and keeps the read off the 250 ms tick
+    /// cadence in steady state.
+    fn invalidate_census(&mut self) {
+        self.last_census = IdleLeaseCensus::Unavailable {
+            reason: "census-invalidated",
+        };
+        self.next_census_at = std::time::Instant::now();
     }
 
     /// Records a fresh authenticated readiness disposition. A drain cancelled
@@ -1350,6 +1390,9 @@ impl HostIdleDrainSupervisor {
             Ok(true) => {
                 self.precommit_opened_at = None;
                 self.idle_since = Some(std::time::Instant::now());
+                // The generation is serving again under a new attempt, so the
+                // cached census and its next-due time are no longer authority.
+                self.invalidate_census();
                 let _ = writeln!(
                     io::stderr().lock(),
                     "eliot-host: cancelled drain returned the same activation generation to ACTIVE after readiness revalidation"
@@ -1413,6 +1456,8 @@ impl HostIdleDrainSupervisor {
         let Some(opened) = self.precommit_opened_at else {
             return match host.begin_idle_drain(self.last_census.observation_code()) {
                 Ok(true) => {
+                    // Every appended stage returned `Ok`, so the pre-commit
+                    // window is durable: only now may the timer be published.
                     self.precommit_opened_at = Some(now);
                     let _ = writeln!(
                         io::stderr().lock(),
@@ -1421,18 +1466,30 @@ impl HostIdleDrainSupervisor {
                     IdleDrainTick::PreCommitWindowOpen
                 }
                 Ok(false) => {
-                    // The current generation's drain machine is already spent;
-                    // another drain needs a fresh direct-child generation.
+                    // This attempt cannot open a window *yet*: the activation is
+                    // still `Draining` and awaiting the post-cancellation
+                    // readiness revalidation, or the census re-read at the
+                    // re-arm boundary is not `Idle`. No successor attempt
+                    // exists and a timer reset is not progress, so the idle
+                    // grace restarts and the installation keeps running.
                     self.idle_since = None;
-                    IdleDrainTick::GenerationSpent
+                    IdleDrainTick::Idle
                 }
                 Err(error) => {
+                    // A `Failed` attempt, a durable `DrainCommitRecord`, an
+                    // unestablished census or a refused append is a visible
+                    // recovery obligation, not a spent generation and not a
+                    // lease-census leg: a fresh direct-child generation is not
+                    // the remedy, and `activation_transition` would refuse it
+                    // from here while clearing the cancelled-attempt history
+                    // and queued wakes this generation must retain.
+                    let reason = host_error_variant(&error);
                     let _ = writeln!(
                         io::stderr().lock(),
-                        "eliot-host: idle drain could not open its pre-commit window: {error}"
+                        "eliot-host: idle drain is blocked and cannot open a pre-commit window (reason={reason}): {error}"
                     );
                     self.idle_since = None;
-                    IdleDrainTick::CensusDeferred
+                    IdleDrainTick::DrainBlocked { reason }
                 }
             };
         };
