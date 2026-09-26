@@ -434,7 +434,8 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 },
             )
             .await?;
-        let (epistemic, epistemic_readback) = self.acquire_epistemic(ctx, request, &ordering).await?;
+        let (epistemic, epistemic_readback) =
+            self.acquire_epistemic(ctx, request, &ordering).await?;
         let cue = self
             .acquire_projection_inputs(
                 ctx,
