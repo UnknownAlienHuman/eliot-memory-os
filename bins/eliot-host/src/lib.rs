@@ -873,7 +873,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "DrainRecord Requested/drain_generation",
         event: "host.drain requested",
-        caller: "HostComposition::stop",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -881,7 +881,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "DrainRecord Draining/drain_generation",
         event: "host.drain draining",
-        caller: "HostComposition::stop",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -889,7 +889,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "DrainCommitRecord/lease snapshot",
         event: "host.drain commit",
-        caller: "HostComposition::stop",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
