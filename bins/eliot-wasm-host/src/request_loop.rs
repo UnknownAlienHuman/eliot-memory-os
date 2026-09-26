@@ -1301,7 +1301,9 @@ pub fn run_request_loop(
     let shutdown_sent = worker.commands.try_send(WorkerCommand::Shutdown).is_ok();
     drop(worker.commands);
     let joined = worker.handle.join().is_ok();
-    state.mark_shutdown();
+    if joined {
+        state.mark_shutdown();
+    }
     if let Some(error) = state.denial() {
         // The loop recorded the exact admission denial; report that stable
         // field rather than the transport symptom that surfaced it.
@@ -1442,12 +1444,14 @@ fn poll_pending(
                 return Ok(());
             }
             state.containment_step()?;
-            // External control intake while guest work is pending: the
-            // control poll never blocks, so the outstanding command keeps
-            // its outcome wait while a Kernel Cancel/Reconcile/Shutdown
+            // External control intake while the worker is idle (past the
+            // single-gate check above, nothing is outstanding): the control
+            // poll never blocks, so a Kernel Cancel/Reconcile/Shutdown
             // staged beside the delivery set is admitted through the same
             // path. Owner intent wins the single command slot over the
-            // clock-derived containment above.
+            // clock-derived containment above. While a command is
+            // outstanding this whole block is deferred until its outcome
+            // arrives — never stacked behind it.
             admit_external_control(state, channel)?;
             if let Some(command) = state.queued {
                 state.send(command, commands)?;
