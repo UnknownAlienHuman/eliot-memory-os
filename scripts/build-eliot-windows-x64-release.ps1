@@ -12,11 +12,21 @@ param(
     [switch]$PlanOnly,
     [ValidateSet('legacy', 'agent-bridge')]
     [string]$ClaudeCodeFrontDoor = 'legacy',
+    [switch]$RetireGovernor,
     [Alias('VerifyBundle')]
     [string]$BuilderVerifyBundle
 )
 
 $ErrorActionPreference = 'Stop'
+# Issue #1719 option 1 proof: -RetireGovernor (or ELIOT_RETIRE_GOVERNOR=1)
+# forces the retired governor disposition on a tree that still carries the
+# legacy crate, so the retired path is runnable proof without deleting
+# anything. Default behavior is unchanged: retirement arms on cargo-metadata
+# presence alone (the day the legacy crate leaves the workspace, owned by
+# #18). Test-LegacyGovernorPresent honors this flag, and through it the plan,
+# the stage gate, and the staged payload; verification honors the retired
+# disposition carried by RELEASE.json itself.
+$script:ForceRetireGovernor = [bool]$RetireGovernor -or ([string]$env:ELIOT_RETIRE_GOVERNOR -eq '1')
 $repo = Split-Path -Parent $PSScriptRoot
 $surrealCatalogRelativePath = 'docs/release/SURREALDB_WINDOWS_X64.lock.json'
 $runtimeArtifactDefinitions = @(
@@ -224,7 +234,8 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # owner. The client-declaration file itself stays installation-owned
 # (absolute <...>/agent-bridge/client-declaration-v2.json); the bundle
 # never invents it.
-# Retention disposition (explicit, #1719 step 1'): eliot-governor.exe,
+# Retention disposition (explicit, #1719 step 1'): while the legacy
+# `eliot-app` crate is a workspace member, eliot-governor.exe,
 # the governor-gated-legacy include, and the Codex plugin bundled binary
 # stay in this slice: Codex, OpenCode, Claude Desktop, and the default
 # (legacy) Claude Code path still execute that entry point, and
@@ -233,6 +244,35 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # point) lands here: option 1 would break the retained hosts, and option
 # 2 needs the behavior owner (eliot-mcp track per canon; the legacy
 # deletion itself is owned by #18). Full retire/re-home is BLOCKED-BY #18.
+# Retirement disposition (explicit, #1719 option 1): the day the legacy
+# crate leaves the workspace, Test-LegacyGovernorPresent resolves false and
+# the builder retires the artifact instead of failing: no governor build,
+# no gated-legacy include, and the Codex plugin subtree leaves the release
+# together with the binary, so no shipped plugin ever names a missing
+# command. Re-home (option 2) is not implemented here: no current-owner
+# entry point exists for the codex_controller profile, and bins/crates
+# are outside this slice. The decision is recorded per plan/bundle in
+# `governor_disposition`, never by silent repository presence.
+function Test-LegacyGovernorPresent([object]$Metadata) {
+    # Forced retirement (proof switch) wins over repository presence: with
+    # -RetireGovernor (or ELIOT_RETIRE_GOVERNOR=1) the retired path runs on
+    # the branch tree without deleting the legacy crate. Otherwise the
+    # disposition stays presence-driven.
+    if ($script:ForceRetireGovernor) {
+        return $false
+    }
+    if (-not $Metadata) {
+        return $false
+    }
+    $candidates = @(@($Metadata.packages) | Where-Object { [string]$_.name -ceq 'eliot-app' })
+    if ($candidates.Count -ne 1) {
+        return $false
+    }
+    $targets = @($candidates[0].targets | Where-Object {
+            [string]$_.name -ceq 'eliot-governor' -and @($_.kind) -contains 'bin'
+        })
+    return ($targets.Count -eq 1)
+}
 function Get-FrontDoorBridgePlan([object]$Metadata, [string]$Selection) {
     if ([string]::IsNullOrWhiteSpace($Selection)) {
         throw 'Claude Code front-door selection must be legacy or agent-bridge, never empty'
@@ -1217,9 +1257,21 @@ function Get-ToolchainBuildReceipt([string]$Repo, [string]$SourceCommit, [object
     if ($LASTEXITCODE -ne 0) {
         throw 'failed to enumerate pinned cargo build scripts'
     }
+    if (-not (Test-LegacyGovernorPresent $CargoMetadata)) {
+        # Issue #1719 option 1: the retired release does not take the legacy
+        # crate as an input, so its build script is not a release input. A
+        # forced retirement (-RetireGovernor/ELIOT_RETIRE_GOVERNOR=1) simulates
+        # the post-#18 tree, where crates/eliot-app/build.rs no longer exists;
+        # excluding it keeps the forced plan byte-faithful to that tree.
+        $trackedBuildScripts = @($trackedBuildScripts | Where-Object { $_ -notlike 'crates/eliot-app/*' })
+    }
     $dependencyClosure = 'plan-deferred'
     if ($Mode -eq 'stage') {
-        $closureDigests = foreach ($definition in (Get-RuntimeArtifactDefinitions + @([pscustomobject]@{ package = 'eliot-app' }))) {
+        $closureDefinitions = @(Get-RuntimeArtifactDefinitions)
+        if (Test-LegacyGovernorPresent $CargoMetadata) {
+            $closureDefinitions += @([pscustomobject]@{ package = 'eliot-app' })
+        }
+        $closureDigests = foreach ($definition in $closureDefinitions) {
             $tree = (& $cargoInvokePath tree --frozen --offline --edges normal,build -p $definition.package --prefix none 2>$null | Out-String)
             if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tree)) {
                 throw "failed to resolve the frozen dependency closure for package: $($definition.package)"
@@ -1489,7 +1541,7 @@ function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, 
     }
 }
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -1551,16 +1603,18 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         proof_ceiling = 'unsigned-build-evidence'
         gate = $null
     }
-    $entries += [ordered]@{
-        path = 'eliot-governor.exe'
-        selection = 'cargo --frozen -p eliot-app --bin eliot-governor'
-        owner = 'cargo-package:eliot-app'
-        install_destination = './'
-        generation = $SourceCommit
-        proof_ceiling = 'unsigned-build-evidence (retained explicitly by #1719 step 1-prime: Codex/OpenCode/Desktop plus the legacy-Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
-        gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
-        entrypoint_disposition = 'retained-legacy-entrypoint (#1858: once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack, every legacy entrypoint on this binary refuses with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt for every host alike (daemon run, service run, hook, mcp stdio including codex/opencode/claude-desktop); flag absent preserves the legacy path)'
-        cutover_behavior = 'refuse-with-code on every gated entrypoint and host once flagged (no daemon auto-launch, no store start, no ControlWal/WriterActor); legacy path preserved while the flag is absent'
+    if ($LegacyGovernorPresent) {
+        $entries += [ordered]@{
+            path = 'eliot-governor.exe'
+            selection = 'cargo --frozen -p eliot-app --bin eliot-governor'
+            owner = 'cargo-package:eliot-app'
+            install_destination = './'
+            generation = $SourceCommit
+            proof_ceiling = 'unsigned-build-evidence (retained explicitly by #1719 step 1-prime: Codex/OpenCode/Desktop plus the legacy-Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
+            gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
+            entrypoint_disposition = 'retained-legacy-entrypoint (#1858: once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack, every legacy entrypoint on this binary refuses with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt for every host alike (daemon run, service run, hook, mcp stdio including codex/opencode/claude-desktop); flag absent preserves the legacy path)'
+            cutover_behavior = 'refuse-with-code on every gated entrypoint and host once flagged (no daemon auto-launch, no store start, no ControlWal/WriterActor); legacy path preserved while the flag is absent'
+        }
     }
     if ($FrontDoorBridge) {
         $entries += [ordered]@{
@@ -1582,23 +1636,25 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         proof_ceiling = 'owner-attested receipt with passing conformance evidence (same-transaction build is #1137 follow-on)'
         gate = '#1137-operator-build'
     }
-    $entries += [ordered]@{
-        path = 'integrations/codex/marketplace.json'
-        selection = 'pinned source file'
-        owner = 'integrations/codex'
-        install_destination = 'integrations/codex/'
-        generation = $SourceCommit
-        proof_ceiling = 'pinned-blob evidence (provider route scope is Part B after #1217)'
-        gate = '#1217-provider-host-integration-route (GATED: retained explicitly, never wholesale)'
-    }
-    $entries += [ordered]@{
-        path = 'integrations/codex/plugins/eliot-governor/'
-        selection = 'pinned source tree plus built governor binary'
-        owner = 'plugin/eliot-governor'
-        install_destination = 'integrations/codex/plugins/eliot-governor/'
-        generation = $SourceCommit
-        proof_ceiling = 'pinned-blob evidence (provider route scope is Part B after #1217)'
-        gate = '#1217-provider-host-integration-route (GATED: retained explicitly, never wholesale)'
+    if ($LegacyGovernorPresent) {
+        $entries += [ordered]@{
+            path = 'integrations/codex/marketplace.json'
+            selection = 'pinned source file'
+            owner = 'integrations/codex'
+            install_destination = 'integrations/codex/'
+            generation = $SourceCommit
+            proof_ceiling = 'pinned-blob evidence (provider route scope is Part B after #1217)'
+            gate = '#1217-provider-host-integration-route (GATED: retained explicitly, never wholesale)'
+        }
+        $entries += [ordered]@{
+            path = 'integrations/codex/plugins/eliot-governor/'
+            selection = 'pinned source tree plus built governor binary'
+            owner = 'plugin/eliot-governor'
+            install_destination = 'integrations/codex/plugins/eliot-governor/'
+            generation = $SourceCommit
+            proof_ceiling = 'pinned-blob evidence (provider route scope is Part B after #1217)'
+            gate = '#1217-provider-host-integration-route (GATED: retained explicitly, never wholesale)'
+        }
     }
     $entries += [ordered]@{
         path = 'integrations/antigravity/official-plugin/'
@@ -1681,6 +1737,12 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         proof_ceiling = 'owner-attested receipt with passing conformance evidence'
         gate = '#1137-operator-build'
     }
+    $integrationsExclusion = if ($LegacyGovernorPresent) {
+        'integrations/** except codex/marketplace.json, codex/plugins/eliot-governor/, antigravity/official-plugin/'
+    }
+    else {
+        'integrations/** except antigravity/official-plugin/ (the Codex plugin leaves the release with the retired governor binary)'
+    }
     [ordered]@{
         schema = 'eliot-staged-payload-manifest-v1'
         component = 'eliot_windows_x64_staged_payload_manifest'
@@ -1702,7 +1764,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
                 gate = '#1221-schema-migration-disposition'
             }
             [ordered]@{
-                path = 'integrations/** except codex/marketplace.json, codex/plugins/eliot-governor/, antigravity/official-plugin/'
+                path = $integrationsExclusion
                 reason = 'non-Codex integration roots enter only via owning-manifest selection; wholesale integrations copy is forbidden'
                 gate = '#1217-provider-host-integration-route'
             }
@@ -1713,6 +1775,15 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
 function Test-ReleaseBundle([string]$Path) {
     $resolved = (Resolve-Path -LiteralPath $Path).Path
     Assert-NoReleaseSecrets $resolved
+    $release = Get-Content -LiteralPath (Join-Path $resolved 'RELEASE.json') -Raw | ConvertFrom-Json
+    # Issue #1719 option 1: a bundle staged after the legacy crate left the
+    # workspace carries the retired governor disposition and canonically
+    # contains neither the governor executable nor the Codex plugin subtree
+    # (the plugin leaves the release together with the binary so no shipped
+    # plugin ever names a missing command). Presence is still required while
+    # the disposition is retained, and any stray governor/Codex executable in
+    # a retired bundle fails closed here.
+    $governorRetired = ([string]$release.governor_disposition -like 'retired*')
     $required = @(
         'eliot-governor.exe',
         'runtime/eliot.exe',
@@ -1749,74 +1820,87 @@ function Test-ReleaseBundle([string]$Path) {
         'SHA256SUMS.json',
         'SIGNING_REQUIRED.txt'
     )
+    if ($governorRetired) {
+        $required = @($required | Where-Object {
+                $_ -ne 'eliot-governor.exe' -and $_ -notlike 'integrations/codex*'
+            })
+    }
     foreach ($relative in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $resolved $relative))) {
             throw "release bundle is missing required asset: $relative"
         }
     }
+    if ($governorRetired) {
+        foreach ($retiredAbsent in @('eliot-governor.exe', 'integrations/codex')) {
+            if (Test-Path -LiteralPath (Join-Path $resolved $retiredAbsent)) {
+                throw "retired release bundle must not contain the legacy governor surface: $retiredAbsent"
+            }
+        }
+    }
 
     $codexRoot = Join-Path $resolved 'integrations/codex'
     $codexPluginRoot = Join-Path $codexRoot 'plugins/eliot-governor'
-    $marketplace = Get-Content -LiteralPath (Join-Path $codexRoot 'marketplace.json') -Raw | ConvertFrom-Json
-    $marketplacePlugins = @($marketplace.plugins)
-    if ([string]$marketplace.name -ne 'eliot-system' -or
-        $marketplacePlugins.Count -ne 1 -or
-        [string]$marketplacePlugins[0].name -ne 'eliot-governor' -or
-        [string]$marketplacePlugins[0].source.source -ne 'local' -or
-        [string]$marketplacePlugins[0].source.path -ne './plugins/eliot-governor' -or
-        [string]$marketplacePlugins[0].policy.installation -ne 'INSTALLED_BY_DEFAULT' -or
-        [string]$marketplacePlugins[0].policy.authentication -ne 'ON_INSTALL' -or
-        [string]$marketplacePlugins[0].category -ne 'Developer Tools') {
-        throw 'release Codex marketplace does not expose exactly one installed-by-default ELIOT plugin'
-    }
-
-    $release = Get-Content -LiteralPath (Join-Path $resolved 'RELEASE.json') -Raw | ConvertFrom-Json
-    $sourceBoundSurrealCatalog = Get-VerifiedSurrealCatalog $repo ([string]$release.source_commit)
-    if ($release.signed -ne $false -or
-        [string]$release.signature_policy -ne 'pre-release-unsigned' -or
-        [string]$release.signature_evidence -ne 'not-issued' -or
-        $release.public_distribution_ready -ne $false) {
-        throw 'RELEASE.json is missing the explicit pre-release signing boundary'
-    }
-    $plugin = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
-    if ([string]$plugin.name -ne 'eliot-governor' -or
-        [string]$plugin.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$' -or
-        [string]$plugin.version -ne [string]$release.codex_plugin_base_version -or
-        [string]$plugin.author.name -ne 'ELIOT' -or
-        [string]$plugin.skills -ne './skills/' -or
-        [string]$plugin.mcpServers -ne './.mcp.json' -or
-        [string]$plugin.interface.displayName -ne 'ELIOT Governor' -or
-        $plugin.PSObject.Properties.Name -contains 'hooks') {
-        throw 'release Codex plugin manifest does not match the canonical cache-neutral base contract'
-    }
-
-    $mcp = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.mcp.json') -Raw | ConvertFrom-Json
-    $serverProperties = @($mcp.mcpServers.PSObject.Properties)
-    if ($serverProperties.Count -ne 1 -or $serverProperties[0].Name -ne 'eliot') {
-        throw 'release Codex plugin must expose exactly one MCP server named eliot'
-    }
-    $server = $serverProperties[0].Value
-    if ([string]$server.type -ne 'stdio' -or
-        [string]$server.command -ne 'bin/eliot-governor.exe' -or
-        [string]$server.cwd -ne '.' -or
-        $server.enabled -ne $true -or
-        $server.required -ne $false) {
-        throw 'release Codex MCP server transport is not the enabled fail-open local plugin binary'
-    }
-    $expectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
-    $actualArgs = @($server.args)
-    if ($actualArgs.Count -ne $expectedArgs.Count) {
-        throw 'release Codex MCP server has the wrong argument count'
-    }
-    for ($index = 0; $index -lt $expectedArgs.Count; $index++) {
-        if ([string]$actualArgs[$index] -ne $expectedArgs[$index]) {
-            throw "release Codex MCP server argument $index is not canonical"
+    if (-not $governorRetired) {
+        $marketplace = Get-Content -LiteralPath (Join-Path $codexRoot 'marketplace.json') -Raw | ConvertFrom-Json
+        $marketplacePlugins = @($marketplace.plugins)
+        if ([string]$marketplace.name -ne 'eliot-system' -or
+            $marketplacePlugins.Count -ne 1 -or
+            [string]$marketplacePlugins[0].name -ne 'eliot-governor' -or
+            [string]$marketplacePlugins[0].source.source -ne 'local' -or
+            [string]$marketplacePlugins[0].source.path -ne './plugins/eliot-governor' -or
+            [string]$marketplacePlugins[0].policy.installation -ne 'INSTALLED_BY_DEFAULT' -or
+            [string]$marketplacePlugins[0].policy.authentication -ne 'ON_INSTALL' -or
+            [string]$marketplacePlugins[0].category -ne 'Developer Tools') {
+            throw 'release Codex marketplace does not expose exactly one installed-by-default ELIOT plugin'
         }
-    }
-    $rootGovernorHash = (Get-FileHash -LiteralPath (Join-Path $resolved 'eliot-governor.exe') -Algorithm SHA256).Hash
-    $pluginGovernorHash = (Get-FileHash -LiteralPath (Join-Path $codexPluginRoot 'bin/eliot-governor.exe') -Algorithm SHA256).Hash
-    if ($rootGovernorHash -ne $pluginGovernorHash) {
-        throw 'release Codex plugin binary differs from the release Governor binary'
+
+        $sourceBoundSurrealCatalog = Get-VerifiedSurrealCatalog $repo ([string]$release.source_commit)
+        if ($release.signed -ne $false -or
+            [string]$release.signature_policy -ne 'pre-release-unsigned' -or
+            [string]$release.signature_evidence -ne 'not-issued' -or
+            $release.public_distribution_ready -ne $false) {
+            throw 'RELEASE.json is missing the explicit pre-release signing boundary'
+        }
+        $plugin = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
+        if ([string]$plugin.name -ne 'eliot-governor' -or
+            [string]$plugin.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$' -or
+            [string]$plugin.version -ne [string]$release.codex_plugin_base_version -or
+            [string]$plugin.author.name -ne 'ELIOT' -or
+            [string]$plugin.skills -ne './skills/' -or
+            [string]$plugin.mcpServers -ne './.mcp.json' -or
+            [string]$plugin.interface.displayName -ne 'ELIOT Governor' -or
+            $plugin.PSObject.Properties.Name -contains 'hooks') {
+            throw 'release Codex plugin manifest does not match the canonical cache-neutral base contract'
+        }
+
+        $mcp = Get-Content -LiteralPath (Join-Path $codexPluginRoot '.mcp.json') -Raw | ConvertFrom-Json
+        $serverProperties = @($mcp.mcpServers.PSObject.Properties)
+        if ($serverProperties.Count -ne 1 -or $serverProperties[0].Name -ne 'eliot') {
+            throw 'release Codex plugin must expose exactly one MCP server named eliot'
+        }
+        $server = $serverProperties[0].Value
+        if ([string]$server.type -ne 'stdio' -or
+            [string]$server.command -ne 'bin/eliot-governor.exe' -or
+            [string]$server.cwd -ne '.' -or
+            $server.enabled -ne $true -or
+            $server.required -ne $false) {
+            throw 'release Codex MCP server transport is not the enabled fail-open local plugin binary'
+        }
+        $expectedArgs = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
+        $actualArgs = @($server.args)
+        if ($actualArgs.Count -ne $expectedArgs.Count) {
+            throw 'release Codex MCP server has the wrong argument count'
+        }
+        for ($index = 0; $index -lt $expectedArgs.Count; $index++) {
+            if ([string]$actualArgs[$index] -ne $expectedArgs[$index]) {
+                throw "release Codex MCP server argument $index is not canonical"
+            }
+        }
+        $rootGovernorHash = (Get-FileHash -LiteralPath (Join-Path $resolved 'eliot-governor.exe') -Algorithm SHA256).Hash
+        $pluginGovernorHash = (Get-FileHash -LiteralPath (Join-Path $codexPluginRoot 'bin/eliot-governor.exe') -Algorithm SHA256).Hash
+        if ($rootGovernorHash -ne $pluginGovernorHash) {
+            throw 'release Codex plugin binary differs from the release Governor binary'
+        }
     }
 
     # Issue #1719 Claude Code front door: the bundle provisions exactly the
@@ -2351,6 +2435,12 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
 $frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
+# Issue #1719 option 1: the legacy crate's absence (post-#18 tree) retires
+# the governor artifact instead of failing the plan. -RetireGovernor (or
+# ELIOT_RETIRE_GOVERNOR=1) forces the same retired path on a tree that still
+# carries the crate, as runnable proof. Presence keeps today's retained
+# slice byte-identical.
+$legacyGovernorPresent = Test-LegacyGovernorPresent $cargoMetadata
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
@@ -2377,12 +2467,15 @@ else {
 $planToolchain = Get-ToolchainBuildReceipt $repo $sourceCommit $cargoMetadata 'plan'
 $resolvedSurrealExe = (Resolve-Path -LiteralPath $SurrealExe).Path
 $codexPluginSource = Join-Path $repo 'plugin/eliot-governor'
-$codexPluginManifestPath = Join-Path $codexPluginSource '.codex-plugin/plugin.json'
-$codexPluginManifest = Get-Content -LiteralPath $codexPluginManifestPath -Raw | ConvertFrom-Json
-$codexPluginBaseVersion = [string]$codexPluginManifest.version
-if ([string]$codexPluginManifest.name -ne 'eliot-governor' -or
-    $codexPluginBaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
-    throw 'Codex release source must use a cache-neutral base SemVer without +codex metadata'
+$codexPluginBaseVersion = $null
+if ($legacyGovernorPresent) {
+    $codexPluginManifestPath = Join-Path $codexPluginSource '.codex-plugin/plugin.json'
+    $codexPluginManifest = Get-Content -LiteralPath $codexPluginManifestPath -Raw | ConvertFrom-Json
+    $codexPluginBaseVersion = [string]$codexPluginManifest.version
+    if ([string]$codexPluginManifest.name -ne 'eliot-governor' -or
+        $codexPluginBaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
+        throw 'Codex release source must use a cache-neutral base SemVer without +codex metadata'
+    }
 }
 # Item 1228 generation_binding (v1 single-generation semantics): one release
 # generation built from one isolated immutable source tree pinned by
@@ -2414,25 +2507,37 @@ $plan = [ordered]@{
     payload_denominator = 'registry-selected-only-no-wholesale (STAGED_PAYLOAD_MANIFEST.json; config/migrations excluded; integrations allowlisted)'
     operator_binding = 'locked-build-receipt-required (OPERATOR_BUILD_RECEIPT.json pinned to source commit; arbitrary OperatorSource rejected)'
     output = $bundle
-    governor = $governorPath
+    governor = if ($legacyGovernorPresent) { $governorPath } else { $null }
+    governor_disposition = if ($legacyGovernorPresent) {
+        'retained-legacy-entrypoint (step 1-prime: Codex/OpenCode/Desktop plus the flag-absent Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
+    }
+    else {
+        'retired (#1719 option 1: legacy crate absent from cargo metadata, or retirement forced via -RetireGovernor/ELIOT_RETIRE_GOVERNOR=1; the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge)'
+    }
     claude_code_front_door = [ordered]@{
         selection = $ClaudeCodeFrontDoor
         operator_flag = 'ELIOT_CLAUDE_FRONT_DOOR'
-        legacy_command = 'eliot-governor.exe'
-        legacy_argv = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
+        legacy_available = [bool]$legacyGovernorPresent
+        legacy_command = if ($legacyGovernorPresent) { 'eliot-governor.exe' } else { $null }
+        legacy_argv = if ($legacyGovernorPresent) { @('mcp', 'stdio', '--host', 'claude', '--instance', 'default') } else { $null }
         bridge_command = 'eliot-agent-bridge.exe'
         bridge_build = 'cargo --frozen -p eliot-agent-bridge --bin eliot-agent-bridge'
         bridge_argv = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '<installation-absolute>/agent-bridge/client-declaration-v2.json')
         bridge_path = [string]$frontDoorBridgePlan.path
         bridge_provisioned = [bool]$frontDoorBridgePlan.provisioned
-        other_hosts = 'flag-gated (codex/opencode/claude-desktop refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy entries only while the flag is absent)'
+        other_hosts = if ($legacyGovernorPresent) {
+            'flag-gated (codex/opencode/claude-desktop refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy entries only while the flag is absent)'
+        }
+        else {
+            'retired (no legacy entrypoint exists on any host and the Claude legacy path is unavailable; canonical route: eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence))'
+        }
     }
     operator_source = if ($BuildOperator) { '<generated-by-locked-winui-publish>' } else { $OperatorSource }
     operator_build = if ($BuildOperator) { 'builder-invoked locked WinUI Publish; receipt emitted by the project AfterTargets=Publish target' } else { 'consume externally supplied receipt-bound publish directory' }
-    codex_marketplace_source = (Join-Path $repo 'integrations/codex/marketplace.json')
-    codex_plugin_source = $codexPluginSource
+    codex_marketplace_source = if ($legacyGovernorPresent) { (Join-Path $repo 'integrations/codex/marketplace.json') } else { $null }
+    codex_plugin_source = if ($legacyGovernorPresent) { $codexPluginSource } else { $null }
     codex_plugin_base_version = $codexPluginBaseVersion
-    codex_mcp_profile = 'codex_controller'
+    codex_mcp_profile = if ($legacyGovernorPresent) { 'codex_controller' } else { $null }
     surreal = [ordered]@{
         path = $verifiedPinnedSurreal.path
         sha256 = $verifiedPinnedSurreal.sha256
@@ -2468,8 +2573,18 @@ $plan = [ordered]@{
                 build_path = $_.path
             }
         })
-    includes = @('governor-gated-legacy', 'runtime-artifacts', 'pinned-surrealdb', 'operator-receipt-bound', 'codex-marketplace-gated', 'codex-plugin-gated', 'skills', 'antigravity-official-plugin', 'operations-runbooks', 'release-catalogue') + @(
-        if ($ClaudeCodeFrontDoor -ceq 'agent-bridge') { 'claude-frontdoor-bridge' } else { 'claude-frontdoor-legacy' }
+    includes = @(
+        if ($legacyGovernorPresent) { 'governor-gated-legacy' }
+        'runtime-artifacts'
+        'pinned-surrealdb'
+        'operator-receipt-bound'
+        if ($legacyGovernorPresent) { 'codex-marketplace-gated' }
+        if ($legacyGovernorPresent) { 'codex-plugin-gated' }
+        'skills'
+        'antigravity-official-plugin'
+        'operations-runbooks'
+        'release-catalogue'
+        if ($ClaudeCodeFrontDoor -ceq 'agent-bridge') { 'claude-frontdoor-bridge' } elseif ($legacyGovernorPresent) { 'claude-frontdoor-legacy' } else { 'claude-frontdoor-retired' }
     )
     signing_required_before_public_distribution = $true
 }
@@ -2477,6 +2592,10 @@ $plan = [ordered]@{
 if ($PlanOnly) {
     $plan | ConvertTo-Json -Depth 5
     exit 0
+}
+
+if (-not $legacyGovernorPresent -and $ClaudeCodeFrontDoor -ceq 'legacy') {
+    throw 'the legacy Claude Code front door is unavailable: the governor disposition is retired (legacy crate absent from cargo metadata, or -RetireGovernor/ELIOT_RETIRE_GOVERNOR=1 forced, per #1719 option 1); re-run with -ClaudeCodeFrontDoor agent-bridge'
 }
 
 if ($BuildOperator -and $OperatorSource) {
@@ -2546,9 +2665,11 @@ try {
             throw 'Operator publish receipt tool identity differs from the builder-invoked dotnet executable'
         }
     }
-    & $cargoInvokePath build --frozen --locked --offline --release -p eliot-app --bin eliot-governor
-    if ($LASTEXITCODE -ne 0) {
-        throw "cargo Governor release build failed with exit code $LASTEXITCODE"
+    if ($legacyGovernorPresent) {
+        & $cargoInvokePath build --frozen --locked --offline --release -p eliot-app --bin eliot-governor
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo Governor release build failed with exit code $LASTEXITCODE"
+        }
     }
     if ($frontDoorBridgePlan.provisioned) {
         & $cargoInvokePath build --frozen --locked --offline --release -p eliot-agent-bridge --bin eliot-agent-bridge
@@ -2583,8 +2704,8 @@ try {
         }
     }
 
-    $governor = $governorPath
-    if (-not (Test-Path -LiteralPath $governor -PathType Leaf)) {
+    $governor = if ($legacyGovernorPresent) { $governorPath } else { $null }
+    if ($legacyGovernorPresent -and -not (Test-Path -LiteralPath $governor -PathType Leaf)) {
         throw "release governor executable is missing: $governor"
     }
     $frontDoorBridge = [string]$frontDoorBridgePlan.path
@@ -2605,8 +2726,11 @@ try {
         }
     }
     $verifiedRuntimeArtifacts = @(Get-VerifiedRuntimeArtifacts $runtimeArtifactPlan $Version)
-    $governorLinkerVersion = Get-WindowsPeLinkerVersion $governor 'eliot-governor.exe'
-    $peLinkerVersions = @(@($verifiedRuntimeArtifacts | ForEach-Object { [string]$_.linker_version }) + @($governorLinkerVersion) | Sort-Object -Unique)
+    $peLinkerVersions = @(@($verifiedRuntimeArtifacts | ForEach-Object { [string]$_.linker_version }) | Sort-Object -Unique)
+    if ($legacyGovernorPresent) {
+        $governorLinkerVersion = Get-WindowsPeLinkerVersion $governor 'eliot-governor.exe'
+        $peLinkerVersions = @(@($peLinkerVersions) + @($governorLinkerVersion) | Sort-Object -Unique)
+    }
     if ($frontDoorBridgeStaged) {
         $frontDoorBridgeLinkerVersion = Get-WindowsPeLinkerVersion $frontDoorBridge 'eliot-agent-bridge.exe'
         $peLinkerVersions = @(@($peLinkerVersions) + @($frontDoorBridgeLinkerVersion) | Sort-Object -Unique)
@@ -2623,8 +2747,10 @@ try {
         throw "release bundle already exists; choose another version or output root: $bundle"
     }
     New-Item -ItemType Directory -Path $bundle | Out-Null
-    Assert-NoSecretFile (Get-Item -LiteralPath $governor) 'eliot-governor.exe'
-    Copy-Item -LiteralPath $governor -Destination $bundle
+    if ($legacyGovernorPresent) {
+        Assert-NoSecretFile (Get-Item -LiteralPath $governor) 'eliot-governor.exe'
+        Copy-Item -LiteralPath $governor -Destination $bundle
+    }
     if ($frontDoorBridgeStaged) {
         Copy-Item -LiteralPath $frontDoorBridge -Destination (Join-Path $bundle 'eliot-agent-bridge.exe')
     }
@@ -2708,12 +2834,14 @@ try {
         surreal_version = $verifiedPinnedSurreal.version
         artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal)
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'RUNTIME_ARTIFACTS.json') -Encoding utf8
-    Copy-PinnedSourceFile $repo $sourceCommit 'integrations/codex/marketplace.json' (Join-Path $bundle 'integrations/codex/marketplace.json')
-    $codexPluginRoot = Join-Path $bundle 'integrations/codex/plugins/eliot-governor'
-    Copy-TrackedTree $repo $sourceCommit 'plugin/eliot-governor' $codexPluginRoot
-    $codexPluginBin = Join-Path $codexPluginRoot 'bin'
-    New-Item -ItemType Directory -Path $codexPluginBin -Force | Out-Null
-    Copy-Item -LiteralPath $governor -Destination (Join-Path $codexPluginBin 'eliot-governor.exe')
+    if ($legacyGovernorPresent) {
+        Copy-PinnedSourceFile $repo $sourceCommit 'integrations/codex/marketplace.json' (Join-Path $bundle 'integrations/codex/marketplace.json')
+        $codexPluginRoot = Join-Path $bundle 'integrations/codex/plugins/eliot-governor'
+        Copy-TrackedTree $repo $sourceCommit 'plugin/eliot-governor' $codexPluginRoot
+        $codexPluginBin = Join-Path $codexPluginRoot 'bin'
+        New-Item -ItemType Directory -Path $codexPluginBin -Force | Out-Null
+        Copy-Item -LiteralPath $governor -Destination (Join-Path $codexPluginBin 'eliot-governor.exe')
+    }
     Copy-TrackedTree $repo $sourceCommit 'plugin/eliot-antigravity-official' (Join-Path $bundle 'integrations/antigravity/official-plugin')
     Copy-TrackedTree $repo $sourceCommit 'integrations/agent-skills' (Join-Path $bundle 'skills')
     Copy-TrackedTree $repo $sourceCommit 'docs/operations' (Join-Path $bundle 'docs/operations')
@@ -2746,7 +2874,7 @@ try {
     }
     Copy-OperatorPayload $verifiedOperator.source (Join-Path $bundle 'operator')
     Copy-Item -LiteralPath $verifiedOperator.receipt_path -Destination (Join-Path $bundle 'operator/OPERATOR_BUILD_RECEIPT.json')
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent
     $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     [ordered]@{
@@ -2754,7 +2882,8 @@ try {
         version = $Version
         source_commit = $sourceCommit
         generation_binding = $generationBinding
-        governor_version = $Version
+        governor_version = if ($legacyGovernorPresent) { $Version } else { $null }
+        governor_disposition = [string]$plan.governor_disposition
         claude_code_front_door = [ordered]@{
             selection = $ClaudeCodeFrontDoor
             operator_flag = 'ELIOT_CLAUDE_FRONT_DOOR'
@@ -2762,7 +2891,7 @@ try {
             bridge_provisioned = [bool]$frontDoorBridgeStaged
             bridge_sha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { $null }
             bridge_bytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { $null }
-            legacy_entrypoint_disposition = @(
+            legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(
                 [ordered]@{
                     entrypoint = 'eliot-governor.exe mcp stdio --host <any> --instance default'
                     behavior = 'refuse-with-code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt on every host edge (claude, codex, opencode, claude-desktop) once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy path otherwise'
@@ -2789,7 +2918,21 @@ try {
                     canonical_route = 'same canonical route as above'
                 }
             )
-            observed_behavior = 'once the flag selects the new stack, invoking daemon run, service run, hook, or mcp stdio on any host returns a structured ERROR object with the stable cutover code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER and canonical_route and never auto-launches the daemon, starts a store, or constructs a ControlWal/WriterActor; flag absent preserves the legacy path; no invocation creates an alternate writer'
+            }
+            else {
+                @(
+                    [ordered]@{
+                        disposition = 'retired (#1719 option 1: the legacy crate is absent, or retirement is forced, so no legacy entrypoint exists on any host and the Claude legacy path is unavailable)'
+                        canonical_route = 'eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)'
+                    }
+                )
+            }
+            observed_behavior = if ($legacyGovernorPresent) {
+                'once the flag selects the new stack, invoking daemon run, service run, hook, or mcp stdio on any host returns a structured ERROR object with the stable cutover code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER and canonical_route and never auto-launches the daemon, starts a store, or constructs a ControlWal/WriterActor; flag absent preserves the legacy path; no invocation creates an alternate writer'
+            }
+            else {
+                'the legacy crate is absent, or retirement is forced: no legacy entrypoint exists on any host and the Claude legacy path is unavailable; stage with -ClaudeCodeFrontDoor agent-bridge to provision the new stack'
+            }
         }
         operator_schema_version = $verifiedOperator.schema_version
         operator_protocol_version = $verifiedOperator.protocol_version
