@@ -12,17 +12,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, FinishAttemptError, GovernorActivationOutcome,
-    GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
-    KernelGenerationSnapshotProvider, QueueLimits,
+    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
+    FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
+    KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
     AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding,
+    AgentActivationResolutionTicket, AgentActivationResolvedBinding, RequestIdentity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -47,6 +47,7 @@ pub mod campaign_task_controller;
 pub use campaign_context_owner::build_context_owner_publications;
 pub use campaign_evaluation_owner::build_product_evaluation_publications;
 pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publications;
+pub use finish_attempt::serve_finish_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
@@ -60,6 +61,7 @@ mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
 mod experience_runtime;
+pub mod finish_attempt;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
@@ -1943,6 +1945,31 @@ impl DaemonComposition {
         Ok(task_lifecycle_adapters::ForwardingTaskLifecycle::new(
             self.governor.task_lifecycle(),
         ))
+    }
+
+    /// Runs one strict finish candidate through the Governor finish owner
+    /// (issue #1741).
+    ///
+    /// The composed form of the evidence publish, decision derivation and
+    /// decision persist legs, for the caller that holds `&mut self` and
+    /// accepts that borrow across the exchanges. The identity and operation
+    /// are the exact Kernel-claimed pair; the draft is the exact admitted
+    /// strict candidate. The Finish service rehydrates current durable state —
+    /// never caller proof — and a stale fence, unknown task revision,
+    /// unexecuted verifier or caller-supplied proof fails closed in the
+    /// Governor owner before any decision exists.
+    pub async fn finish_attempt(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .finish_attempt(identity, operation_id, draft)
+            .await
     }
 
     /// Borrows the single Governor Skill lifecycle owner as the provider-neutral

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+    StateFence,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
@@ -22,7 +23,7 @@ use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
+    AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
     RequestIdentity, TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
@@ -422,6 +423,201 @@ pub fn parse_task_controller_submit_outcome(
         return Ok(TaskControllerSubmitOutcome::StaleAttempt);
     }
     Err("Kernel task_controller_result answer is not accepted, expired, or stale".to_owned())
+}
+
+/// Typed outcome of one `finish_result` submit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishSubmitOutcome {
+    /// Kernel persisted the result body or recognized an exact replay.
+    Accepted,
+    /// The admitted attempt expired before the result was committed.
+    Expired,
+    /// The attempt was replaced, revoked or otherwise stale.
+    StaleAttempt,
+}
+
+/// Kernel-derived finish claim. The duplicated envelope, tool, attempt and
+/// identity are checked for exact binding before they reach the Governor.
+#[derive(Clone, Debug)]
+pub struct FinishClaimedInvocation {
+    pub envelope: HostRequestEnvelope,
+    pub tool: serde_json::Value,
+    pub request_identity: RequestIdentity,
+    pub operation_id: OperationId,
+    pub attempt: eliot_protocol::FinishAttempt,
+}
+
+/// Derives the Governor request identity for one admitted finish candidate.
+///
+/// The task binding comes exclusively from the digest-bound admitted draft
+/// plus the admitted envelope fence: the task id from the draft, the task
+/// revision the caller captured, and the envelope's live authority epoch and
+/// resource generation. The Governor finish owner re-proves that claimed
+/// revision against the canonical owner fence before any evaluation, so a
+/// stale or substituted claim fails closed instead of being trusted.
+fn derive_finish_request_identity(
+    draft: &eliot_governor::FinishAttemptDraft,
+    envelope: &HostRequestEnvelope,
+) -> Result<RequestIdentity, String> {
+    draft
+        .validate()
+        .map_err(|error| format!("claimed finish draft is invalid: {error}"))?;
+    let fence = StateFence::new(
+        envelope.state_fence.authority_epoch.clone(),
+        envelope.state_fence.resource_generation,
+    );
+    let fence = StateFence {
+        task_revision: Some(
+            eliot_contracts::TaskRevision::new(draft.expected_task_revision)
+                .map_err(|error| format!("claimed finish revision is invalid: {error}"))?,
+        ),
+        ..fence
+    };
+    let session_id = envelope
+        .identity
+        .session_id
+        .clone()
+        .map(|value| SessionId::new(value).map_err(|error| error.to_string()))
+        .transpose()?;
+    let metadata = RequestMetadata {
+        request_id: envelope.identity.request_id.clone(),
+        session_id,
+        task_id: Some(
+            eliot_contracts::TaskId::new(draft.task_id.clone())
+                .map_err(|error| format!("claimed finish task id is invalid: {error}"))?,
+        ),
+        product_id: ProductId::new("eliotd").map_err(|error| error.to_string())?,
+        source_id: SourceId::new("eliotd-finish-lane").map_err(|error| error.to_string())?,
+        state_fence: fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: fence,
+        },
+        idempotency_key: envelope.identity.idempotency_key.clone(),
+        deadline_unix_ms: envelope.identity.deadline_unix_ms,
+        cancellation_id: envelope.identity.cancellation_id.clone(),
+    };
+    identity
+        .validate()
+        .map_err(|error| format!("derived finish identity is invalid: {error}"))?;
+    Ok(identity)
+}
+
+/// Parses one unwrapped finish poll answer into its exact admitted envelope,
+/// tool, Kernel-issued attempt and derived owner request identity.
+pub fn parse_finish_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<FinishClaimedInvocation>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel finish_claim answer omits pair".to_owned())?;
+    if pair.is_null() {
+        return Ok(None);
+    }
+    if !pair.is_object() {
+        return Err("Kernel finish_claim pair is neither an object nor null".to_owned());
+    }
+    let decode = |field: &str| {
+        pair.get(field)
+            .cloned()
+            .ok_or_else(|| format!("Kernel finish_claim pair omits {field}"))
+    };
+    let envelope: HostRequestEnvelope = serde_json::from_value(decode("envelope")?)
+        .map_err(|error| format!("Kernel finish envelope does not decode: {error}"))?;
+    envelope
+        .validate()
+        .map_err(|error| format!("Kernel finish envelope is invalid: {error}"))?;
+    let tool = decode("tool")?;
+    let arguments = tool
+        .get("arguments")
+        .cloned()
+        .ok_or_else(|| "Kernel finish pair omits the admitted draft".to_owned())?;
+    let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
+        .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
+    draft
+        .validate()
+        .map_err(|error| format!("admitted finish draft is invalid: {error}"))?;
+    let attempt: eliot_protocol::FinishAttempt = serde_json::from_value(decode("attempt")?)
+        .map_err(|error| format!("Kernel finish attempt does not decode: {error}"))?;
+    attempt
+        .validate()
+        .map_err(|error| format!("Kernel finish attempt is invalid: {error}"))?;
+    let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
+        .map_err(|error| format!("Kernel finish operation id does not decode: {error}"))?;
+    let expected_operation = host_request_operation_id(&envelope);
+    let request_identity = match pair.get("identity") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("Kernel finish identity does not decode: {error}"))?,
+        None => derive_finish_request_identity(&draft, &envelope)?,
+    };
+    request_identity
+        .validate()
+        .map_err(|error| format!("Kernel finish identity is invalid: {error}"))?;
+    let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
+    if envelope.kind != eliot_protocol::HostRequestKind::Invocation
+        || envelope.identity.capability != "eliot.finish"
+        || envelope.identity.payload_schema_id != eliot_protocol::FINISH_INVOKE_PAYLOAD_SCHEMA_ID
+        || tool_name != Some("eliot.finish")
+        || request_identity.request.state_fence != envelope.state_fence
+        || request_identity.request.metadata.state_fence != envelope.state_fence
+        || request_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .is_none_or(|task| task.as_str() != draft.task_id.as_str())
+        || request_identity
+            .request
+            .metadata
+            .state_fence
+            .task_revision
+            .is_none_or(|revision| revision.value() != draft.expected_task_revision)
+        || operation_id.as_str() != expected_operation
+        || attempt.operation_id != expected_operation
+        || attempt.session_id != envelope.identity.session_id.as_deref().unwrap_or_default()
+        || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+    {
+        return Err("Kernel finish pair does not bind its admitted envelope".to_owned());
+    }
+    Ok(Some(FinishClaimedInvocation {
+        envelope,
+        tool,
+        request_identity,
+        operation_id,
+        attempt,
+    }))
+}
+
+/// Parses one unwrapped finish result submit answer.
+pub fn parse_finish_submit_outcome(
+    value: &serde_json::Value,
+) -> Result<FinishSubmitOutcome, String> {
+    let accepted = value
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "Kernel finish_result answer omits accepted outcome".to_owned())?;
+    if accepted {
+        return Ok(FinishSubmitOutcome::Accepted);
+    }
+    if value
+        .get("expired")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(FinishSubmitOutcome::Expired);
+    }
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(FinishSubmitOutcome::StaleAttempt);
+    }
+    Err("Kernel finish_result answer is not accepted, expired, or stale".to_owned())
 }
 
 /// Parses one unwrapped `local_read_claim` answer value into the claimed
@@ -1776,6 +1972,48 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_task_controller_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one queued admitted `eliot.finish` pair and its distinct
+    /// Kernel-issued attempt capability (issue #1741).
+    ///
+    /// Mirrors [`claim_task_controller_pair_async`](Self::claim_task_controller_pair_async):
+    /// the call travels as the single-`operation`-key `"finish_claim"` payload
+    /// and a null `pair` is the empty-queue backoff signal, not an error. The
+    /// claimed pair carries the Kernel-minted fenced attempt capability,
+    /// which the caller must present back on the submit leg.
+    #[cfg(windows)]
+    pub async fn claim_finish_pair_async(
+        &self,
+    ) -> Result<Option<FinishClaimedInvocation>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "finish_claim",
+                serde_json::json!({ "operation": "finish_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_finish_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Submits one daemon-produced finish result body for its waiting host
+    /// request (issue #1741).
+    ///
+    /// Mirrors [`submit_task_controller_result_async`](Self::submit_task_controller_result_async):
+    /// the body travels as the single-`result`-key `"finish_result"` payload
+    /// and is validated before any transport is touched.
+    #[cfg(windows)]
+    pub async fn submit_finish_result_async(
+        &self,
+        body: &FinishResultBody,
+    ) -> Result<FinishSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async("finish_result", serde_json::json!({ "result": body }))
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_finish_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
     /// Executes one closed local read through the authenticated Kernel route.

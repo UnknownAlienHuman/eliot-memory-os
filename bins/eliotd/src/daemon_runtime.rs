@@ -78,10 +78,10 @@ use eliotd::testd_terminal_completion::{
 };
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonError, DaemonKernelClient,
-    DaemonStatus, KernelContextReadClient, LocalReadSubmitOutcome, MaintenanceObservation,
-    MaintenanceTriggerOrigin, ObserveDeferOutcome, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY,
-    SERVICE_NAME, TaskControllerSubmitOutcome, forward_admitted_local_read, serve_admitted_observe,
-    terminal_for_invalid_ticket,
+    DaemonStatus, FinishSubmitOutcome, KernelContextReadClient, LocalReadSubmitOutcome,
+    MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome, PROTOCOL_VERSION,
+    SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome, forward_admitted_local_read,
+    serve_admitted_observe, serve_finish_claim, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -1203,6 +1203,10 @@ async fn run_loop(
     // real and independent: one authenticated claim, one Governor transition,
     // and one fenced result submit per tick.
     let mut task_controller_flight = TaskControllerFlight::Idle;
+    // Finish candidates ride the same bounded cadence with their own queue and
+    // attempt type (issue #1741): one authenticated claim, one Governor finish
+    // evaluation, and one fenced result submit per tick.
+    let mut finish_flight = FinishFlight::Idle;
     // #2100: O1 owner-feed trigger state. The runtime retains one trigger
     // across passes so an unchanged provider performs no IO, while a
     // revision advance or a recovery re-presentation republishes through the
@@ -1276,6 +1280,7 @@ async fn run_loop(
                 // bounded budgets after the shared flights settle.
                 drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
                 drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
+                drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
@@ -1305,6 +1310,9 @@ async fn run_loop(
                     &composition,
                     &mut task_controller_flight,
                 );
+                // Finish uses a separate queue and attempt type; start it on the
+                // same cadence without sharing the local-read completion branch.
+                maybe_start_finish_poll(&kernel, &composition, &mut finish_flight);
                 // #1688 (I14.22): the idle trigger rides this cadence branch
                 // because it is the one place that observes the activation
                 // flight, so the `idle` gate the evaluator consumes is a real
@@ -1354,6 +1362,9 @@ async fn run_loop(
                         &mut task_controller_flight,
                     )?;
                 }
+            finish_completion = next_finish_completion(&mut finish_flight) => {
+                settle_finish_completion(finish_completion, &mut finish_flight)?;
+            }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
             }
@@ -3235,6 +3246,132 @@ fn settle_task_controller_completion(
             Ok(())
         }
         TaskControllerCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// What one completed finish poll resolves to before the loop acts (issue
+/// #1741). A null claim backs off until the next tick; a claimed pair serves
+/// through the Governor finish owner and submits one fenced result body.
+enum FinishPollOutcome {
+    IdleBackoff,
+    Accepted,
+    Expired,
+    StaleAttempt,
+}
+
+/// Completion of one in-flight finish poll step.
+enum FinishCompletion {
+    Settled(Result<FinishPollOutcome, String>),
+}
+
+struct FinishFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = FinishCompletion>>>,
+}
+
+/// Sole owner of finish poll state in `run_loop`, mirroring
+/// [`TaskControllerFlight`]. `Idle` means no finish work is outstanding;
+/// `InFlight` holds the one pending poll step.
+enum FinishFlight {
+    Idle,
+    InFlight(FinishFlightState),
+}
+
+/// Pure tick gate: the finish timer starts work only when the flight is idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_finish_tick(flight: &FinishFlight) -> FinishTickDecision {
+    match flight {
+        FinishFlight::Idle => FinishTickDecision::StartPoll,
+        FinishFlight::InFlight(_) => FinishTickDecision::SkipInFlight,
+    }
+}
+
+fn start_finish_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = FinishCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        FinishCompletion::Settled(Box::pin(run_finish_poll(&kernel_clone, composition)).await)
+    })
+}
+
+fn maybe_start_finish_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut FinishFlight,
+) {
+    if decide_finish_tick(flight) == FinishTickDecision::StartPoll {
+        *flight = FinishFlight::InFlight(FinishFlightState {
+            future: start_finish_poll(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+async fn next_finish_completion(flight: &mut FinishFlight) -> FinishCompletion {
+    match flight {
+        FinishFlight::Idle => std::future::pending::<FinishCompletion>().await,
+        FinishFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+fn settle_finish_completion(
+    completion: FinishCompletion,
+    flight: &mut FinishFlight,
+) -> Result<(), String> {
+    match completion {
+        FinishCompletion::Settled(Ok(_)) => {
+            *flight = FinishFlight::Idle;
+            Ok(())
+        }
+        FinishCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+async fn run_finish_poll(
+    kernel: &DaemonKernelClient,
+    composition: SharedComposition,
+) -> Result<FinishPollOutcome, String> {
+    let _span = tracing::info_span!("eliotd.finish_poll").entered();
+    let claimed = kernel
+        .claim_finish_pair_async()
+        .await
+        .map_err(|error| format!("Kernel finish pair claim: {error}"))?;
+    let Some(claimed) = claimed else {
+        return Ok(FinishPollOutcome::IdleBackoff);
+    };
+    let mut guard = composition.lock().await;
+    let body = Box::pin(eliotd::serve_finish_claim(&mut guard, claimed))
+        .await
+        .map_err(|error| format!("daemon finish dispatch: {error}"))?;
+    drop(guard);
+    match kernel.submit_finish_result_async(&body).await {
+        Ok(FinishSubmitOutcome::Accepted) => Ok(FinishPollOutcome::Accepted),
+        Ok(FinishSubmitOutcome::Expired) => Ok(FinishPollOutcome::Expired),
+        Ok(FinishSubmitOutcome::StaleAttempt) => Ok(FinishPollOutcome::StaleAttempt),
+        Err(first_error) => match kernel.submit_finish_result_async(&body).await {
+            Ok(FinishSubmitOutcome::Accepted) => Ok(FinishPollOutcome::Accepted),
+            Ok(FinishSubmitOutcome::Expired) => Ok(FinishPollOutcome::Expired),
+            Ok(FinishSubmitOutcome::StaleAttempt) => Ok(FinishPollOutcome::StaleAttempt),
+            Err(second_error) => Err(format!(
+                "Kernel finish result submit: {first_error}; retry: {second_error}"
+            )),
+        },
+    }
+}
+
+async fn drain_finish_on_shutdown(flight: &mut FinishFlight) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, FinishFlight::Idle);
+    let FinishFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(FinishCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
     }
 }
 

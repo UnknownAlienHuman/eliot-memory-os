@@ -447,13 +447,6 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             missing_capability: "kernel.host-request.bind-dispatch".to_owned(),
             reason: format!("host contract is invalid: {error}"),
         })?;
-        if matches!(request.tool, ToolRequest::Finish(_)) {
-            return Err(PortFailure::Unsupported {
-                capability: "kernel.host-request.finish-task-binding".to_owned(),
-                reason: "finish requires Governor task admission; no Kernel task binding exists"
-                    .to_owned(),
-            });
-        }
         check_tool_linkage(request, envelope)?;
         let now_ms = unix_ms();
         let staged = self.admit_and_stage(service, envelope, peer_receipt, resolution, now_ms)?;

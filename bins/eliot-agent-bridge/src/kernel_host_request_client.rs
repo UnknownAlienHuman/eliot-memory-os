@@ -35,12 +35,13 @@ use eliot_mcp::{
     ToolRequest,
 };
 use eliot_protocol::{
-    EncodingProfile, Frame, FrameKind, HARD_STRUCTURED_RESPONSE_BYTES,
-    HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
-    HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody, MessageType,
-    ProtocolPayload, ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
-    REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
-    RequestIdentity, host_request_operation_id, restore_correlation,
+    EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
+    HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID,
+    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
+    HostRequestResultBody, MessageType, ProtocolPayload, ProtocolVersion,
+    REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID,
+    ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity, host_request_operation_id,
+    restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -487,13 +488,6 @@ fn plan_gap_unknown_handle() -> PortFailure {
         missing_capability: "kernel.host-request.cancel".to_owned(),
         reason: "unknown operation handle for this bridge connection; the bridge that admitted the operation reconciles it"
             .to_owned(),
-    }
-}
-
-fn unsupported_finish() -> PortFailure {
-    PortFailure::Unsupported {
-        capability: "kernel.host-request.finish-task-binding".to_owned(),
-        reason: "finish requires Governor task admission; no Kernel task binding exists".to_owned(),
     }
 }
 
@@ -1050,7 +1044,13 @@ fn build_invocation_envelope(
         session_id: Some(session_id.to_owned()),
         task_id: None,
         work_scope_id: None,
-        payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
+        payload_schema_id: match &request.tool {
+            // The finish candidate rides its own payload schema so the Kernel
+            // finish lane can bind the exact admitted draft bytes (issue
+            // #1741); every other tool keeps the shared tool-request schema.
+            ToolRequest::Finish(_) => FINISH_INVOKE_PAYLOAD_SCHEMA_ID.to_owned(),
+            _ => HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
+        },
         payload_sha256: payload_digest.to_owned(),
     };
     finish_envelope(facts, HostRequestKind::Invocation, identity)
@@ -1454,7 +1454,7 @@ fn host_request_observe_submit_frame(
 /// | `eliot.act` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; action-model/authority gate + effect dispatch missing (#1742) |
 /// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
 /// | `eliot.coordinate` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; execution-fabric join missing (#1740) |
-/// | `eliot.finish` | refused | — | refused until the task-bound Finish route exists (#325); never an optimistic outcome |
+/// | `eliot.finish` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded finish decision receipt from the Governor finish owner; a simulated/stale/unbound/unknown-verifier candidate and a caller-supplied proof never yield `VERIFIED_COMPLETE` |
 /// | `eliot_user_automation` (non-hot) | submit frame (tool bytes) | `agent_host_request_submit` | operator carrier on its own leg; never a hot tool |
 /// | `skill.inject` / `skill.display` (non-hot) | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | Hotset intake served through the linkage-checked leg; never advertised |
 ///
@@ -1512,9 +1512,7 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         ToolRequest::Coordinate(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "execution-fabric owner join with the same durable work/attempt identity (#1740)",
         },
-        ToolRequest::Finish(_) => CanonicalDispatchEntry::RefusedUntilRoute {
-            missing_route: "task-bound Finish owner route: shared draft to the existing Finish service; only its validated result supplies the task outcome (#325)",
-        },
+        ToolRequest::Finish(_) => CanonicalDispatchEntry::InvokeRead,
         ToolRequest::UserAutomation(_) => CanonicalDispatchEntry::SubmitCarryingBytes,
     }
 }
@@ -2408,9 +2406,6 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             }
             CanonicalDispatchEntry::SubmitObservePair => {
                 host_request_observe_submit_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::RefusedUntilRoute { .. } => {
-                return Err(unsupported_finish());
             }
         };
         let Ok(reply) = self.exchange(&frame) else {
