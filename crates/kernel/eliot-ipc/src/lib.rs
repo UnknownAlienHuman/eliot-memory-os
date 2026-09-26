@@ -421,6 +421,8 @@ pub enum TransportError {
     UnknownRequest,
     #[error("request or cancellation identity conflicts with a prior operation")]
     IdentityConflict,
+    #[error("legacy host-request correlation cannot be resolved to a typed identity")]
+    LegacyCorrelationUnresolved,
     #[error("bounded transport registry is full")]
     RegistryFull,
 }

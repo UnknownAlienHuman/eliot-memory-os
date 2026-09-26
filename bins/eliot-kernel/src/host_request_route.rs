@@ -69,7 +69,7 @@ use eliot_protocol::{
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, DeliveryClass, EventEnvelope,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
+    HostRequestKind, HostRequestResultBody, LocalReadAttempt, RequestId, WatchdogIntentKind,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
 use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, ScopeId};
@@ -453,6 +453,9 @@ impl KernelComposition {
             .resolve_or_stage_host_request_with_identity_bindings(&requested, &identity_bindings)
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                OrsError::HostRequestLegacyCorrelationUnresolved => {
+                    TransportError::LegacyCorrelationUnresolved
+                }
                 _ => TransportError::SessionFenced,
             })?;
 
@@ -957,6 +960,18 @@ impl KernelComposition {
                 let occurrence = resolve_text_field(object, "occurrence")?;
                 let capability = resolve_text_field(object, "capability")?;
                 let payload = resolve_digest_field(object, "payload_digest")?;
+                let parent = object
+                    .get("parent_operation_id")
+                    .filter(|value| !value.is_null())
+                    .map(|value| value.as_str().ok_or(TransportError::SessionFenced))
+                    .transpose()?;
+                let projection = object
+                    .get("correlation_projection")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .map(serde_json::from_value::<eliot_contracts::HostCorrelationProjection>)
+                    .transpose()
+                    .map_err(|_| TransportError::SessionFenced)?;
                 let stored = self
                     .generation_gateway
                     .ors
@@ -975,7 +990,22 @@ impl KernelComposition {
                 if recomputed != key {
                     return Err(TransportError::SessionFenced);
                 }
+                if record.correlation_projection.is_none() {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "legacy_correlation_unresolved",
+                        Some(&key),
+                        None,
+                    ));
+                }
+                if projection.is_none() || record.correlation_projection != projection {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "conflict",
+                        Some(&key),
+                        None,
+                    ));
+                }
                 if record.request_id.as_str() != occurrence
+                    || record.parent_operation_id.as_ref().map(OpaqueLabel::as_str) != parent
                     || record.capability_ref.as_str() != capability
                     || record.payload_digest != payload
                     || record.session_ref.as_ref().map(OpaqueLabel::as_str)
@@ -988,6 +1018,70 @@ impl KernelComposition {
                     ));
                 }
                 Ok(host_request_resolved_response(&record, Some(&key)))
+            }
+            Some("legacy-presence") => {
+                if envelope.identity.parent_operation_id.is_some() {
+                    return Err(TransportError::SessionFenced);
+                }
+                let key = resolve_digest_field(object, "logical_key")?;
+                let occurrence = resolve_text_field(object, "occurrence")?;
+                let capability = resolve_text_field(object, "capability")?;
+                let payload = resolve_digest_field(object, "payload_digest")?;
+                let parent = object
+                    .get("parent_operation_id")
+                    .filter(|value| !value.is_null())
+                    .map(|value| value.as_str().ok_or(TransportError::SessionFenced))
+                    .transpose()?;
+                let stored = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request_by_logical_key(&key)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let Some(record) = stored else {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "absent",
+                        Some(&key),
+                        None,
+                    ));
+                };
+                let recomputed = RedbRecoveryStore::host_request_logical_key_for_record(&record)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                if recomputed != key {
+                    return Err(TransportError::SessionFenced);
+                }
+                if record.correlation_projection.is_some() {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "conflict",
+                        Some(&key),
+                        None,
+                    ));
+                }
+                let expected_kind = if parent.is_some() {
+                    OrsHostRequestKind::Cancellation
+                } else {
+                    OrsHostRequestKind::Invocation
+                };
+                if record.kind == expected_kind
+                    && record.parent_operation_id.as_ref().map(OpaqueLabel::as_str) == parent
+                    && record.request_id.as_str() == occurrence
+                    && record.capability_ref.as_str() == capability
+                    && record.payload_digest == payload
+                    && record.session_ref.as_ref().map(OpaqueLabel::as_str)
+                        == Some(session.as_str())
+                {
+                    Ok(host_request_resolve_unresolved_response(
+                        "legacy_correlation_unresolved",
+                        Some(&key),
+                        None,
+                    ))
+                } else {
+                    Ok(host_request_resolve_unresolved_response(
+                        "conflict",
+                        Some(&key),
+                        None,
+                    ))
+                }
             }
             Some("operation-handle") => {
                 let handle = resolve_text_field(object, "operation_handle")?;
@@ -3132,6 +3226,7 @@ pub(crate) fn requested_host_request_record(
             HostRequestKind::Reconciliation => OrsHostRequestKind::Reconciliation,
         },
         request_id: label(envelope.identity.request_id.as_str())?,
+        correlation_projection: envelope.identity.correlation_projection.clone(),
         idempotency_key: label(&envelope.identity.idempotency_key)?,
         cancellation_id: label(&envelope.identity.cancellation_id)?,
         parent_operation_id: optional_label(envelope.identity.parent_operation_id.as_ref())?,
@@ -3313,6 +3408,13 @@ impl KernelComposition {
         if frame.request_id.as_ref() != Some(&envelope.identity.request_id) {
             return Err(TransportError::SessionFenced);
         }
+        if matches!(
+            envelope.kind,
+            HostRequestKind::Invocation | HostRequestKind::Cancellation
+        ) && envelope.identity.correlation_projection.is_none()
+        {
+            return self.host_request_legacy_correlation_refusal(session, request_id);
+        }
         let value = match operation {
             AGENT_HOST_REQUEST_SUBMIT_OPERATION => {
                 // Observe bytes ride this same entry (issue #2565): when the
@@ -3322,12 +3424,29 @@ impl KernelComposition {
                 // payload handoff before the acknowledgement below.
                 // Digest-only submits keep the legacy shape untouched.
                 let observe_tool = payload.get("tool").cloned();
-                let (receipt, record) =
-                    self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref())?;
+                let (receipt, record) = match self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref()) {
+                    Ok(admitted) => admitted,
+                    Err(TransportError::IdentityConflict) => {
+                        return self.host_request_identity_conflict_refusal(session, request_id);
+                    }
+                    Err(TransportError::LegacyCorrelationUnresolved) => {
+                        return self.host_request_legacy_correlation_refusal(session, request_id);
+                    }
+                    Err(error) => return Err(error),
+                };
                 host_request_admitted_response(&receipt, &record)
             }
             AGENT_HOST_REQUEST_CANCEL_OPERATION => {
-                let (receipt, record) = self.cancel_host_request(&envelope)?;
+                let (receipt, record) = match self.cancel_host_request(&envelope) {
+                    Ok(admitted) => admitted,
+                    Err(TransportError::IdentityConflict) => {
+                        return self.host_request_identity_conflict_refusal(session, request_id);
+                    }
+                    Err(TransportError::LegacyCorrelationUnresolved) => {
+                        return self.host_request_legacy_correlation_refusal(session, request_id);
+                    }
+                    Err(error) => return Err(error),
+                };
                 host_request_admitted_response(&receipt, &record)
             }
             AGENT_HOST_REQUEST_RECONCILE_OPERATION => {
@@ -3348,7 +3467,16 @@ impl KernelComposition {
             }
             AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
                 let tool = host_request_tool_from_payload(&payload)?;
-                let (receipt, record) = self.invoke_read_host_request(&envelope, &tool)?;
+                let (receipt, record) = match self.invoke_read_host_request(&envelope, &tool) {
+                    Ok(admitted) => admitted,
+                    Err(TransportError::IdentityConflict) => {
+                        return self.host_request_identity_conflict_refusal(session, request_id);
+                    }
+                    Err(TransportError::LegacyCorrelationUnresolved) => {
+                        return self.host_request_legacy_correlation_refusal(session, request_id);
+                    }
+                    Err(error) => return Err(error),
+                };
                 // The durable record carries the result pair when the
                 // operation already received its bounded answer, so the
                 // admitted shape is the result-bearing response: no second
@@ -3358,6 +3486,42 @@ impl KernelComposition {
             _ => return Err(TransportError::SessionFenced),
         };
         let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
+    fn host_request_legacy_correlation_refusal(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+    ) -> Result<KernelFrameAction, TransportError> {
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            host_request_resolve_unresolved_response("legacy_correlation_unresolved", None, None),
+        )?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
+    fn host_request_identity_conflict_refusal(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+    ) -> Result<KernelFrameAction, TransportError> {
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            host_request_resolve_unresolved_response("conflict", None, None),
+        )?;
         reply.request_id = Some(request_id);
         reply
             .validate()
@@ -4422,6 +4586,7 @@ fn watchdog_intent_projection_record(
         // The request identity is the derived reconciliation key: one spool
         // record, one durable request identity, forever.
         request_id: label(&intent.idempotency_key)?,
+        correlation_projection: None,
         idempotency_key: label(&intent.idempotency_key)?,
         cancellation_id: label(&format!(
             "{WATCHDOG_INTENT_OPERATION_ID_PREFIX}{}:cancel",
@@ -5346,6 +5511,13 @@ pub(crate) fn host_request_resolve_unresolved_response(
         "accepted": false,
         "resolve": disposition,
     });
+    if disposition == "legacy_correlation_unresolved" {
+        value["reason_code"] =
+            serde_json::Value::String("LEGACY_CORRELATION_UNRESOLVED".to_owned());
+        value["recovery"] = serde_json::json!({
+            "directive": "reconcile_existing_operation_no_handle_issued",
+        });
+    }
     if let Some(key) = logical_key {
         value["logical_key"] = serde_json::Value::String(key.to_owned());
     }
@@ -5626,6 +5798,7 @@ mod invoke_read_tool_tests {
             identity: HostRequestIdentity {
                 request_id: eliot_contracts::RequestId::new("host-request-1")
                     .expect("valid request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,
