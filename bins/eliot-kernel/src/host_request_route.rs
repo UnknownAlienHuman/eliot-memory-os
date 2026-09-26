@@ -2398,7 +2398,13 @@ impl KernelComposition {
     /// stage entry re-verifies the decision before any durable write),
     /// answers the determined conflict on changed bytes under a known
     /// identity, stages-then-times-out on an elapsed absolute deadline, and
-    /// records the idempotent intake handoff before answering `DURABLE`.
+    /// confirms the idempotent intake handoff before answering `DURABLE`.
+    /// The pending handoff is staged atomically with the event row in the
+    /// same ORS transaction (issue #2731), so the expired-submit early
+    /// return below still leaves a recoverable handoff: a timeout after
+    /// stage is never proof of non-acceptance, and the duplicate/reconcile
+    /// recovery legs report the exact pending phase instead of a blanket
+    /// safe-to-resubmit answer.
     fn stage_bridge_event_durable(
         &self,
         session: &Session,
@@ -2500,6 +2506,13 @@ impl KernelComposition {
             .record_bridge_event_handoff_checked(&handoff)
             .map_err(|error| match error {
                 OrsError::DuplicateConflict => TransportError::IdentityConflict,
+                // Capacity exhaustion is typed backpressure with the
+                // exhausted dimension (issue #2731, item 6): the handoff
+                // table is a bounded delivery budget, never an
+                // authentication failure.
+                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                    TransportError::Backpressure
+                }
                 _ => TransportError::SessionFenced,
             })?;
         Ok(bridge_event_forward_response(&outcome, true))
@@ -2673,6 +2686,13 @@ impl KernelComposition {
     /// handoff reconcile is a separate idempotent step with no cross-store
     /// atomicity claim. A lost answer replays safely: acknowledgement
     /// advances monotonically and handoff reconcile converges.
+    ///
+    /// Issue #2731 runs the bounded handoff maintenance after the reconcile
+    /// loop on the same recovery path: per presented namespace it retires
+    /// terminal handoffs (freeing the lifetime charge while #2730 replay
+    /// identity stands) and repairs retained events missing their handoff
+    /// under the original identity, each with a finite budget and a
+    /// continuation the next legitimate recovery entry resumes.
     fn answer_bridge_event_reconcile(
         &self,
         session: &Session,
@@ -2708,7 +2728,8 @@ impl KernelComposition {
         // mutating: any foreign, stale, or ambiguous item rejects the
         // whole scope with nothing changed.
         let mut batch_items: Vec<serde_json::Value> = Vec::with_capacity(scope.consumed.len());
-        let mut batch_namespaces: Vec<(String, u64)> = Vec::with_capacity(scope.consumed.len());
+        let mut batch_namespaces: Vec<(String, String, u64, u64, u64)> =
+            Vec::with_capacity(scope.consumed.len());
         for (stream_id, sequence) in &scope.consumed {
             let item = self
                 .generation_gateway
@@ -2727,7 +2748,13 @@ impl KernelComposition {
                 .get("incarnation")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or(TransportError::SessionFenced)?;
-            batch_namespaces.push((namespace.to_owned(), *sequence));
+            batch_namespaces.push((
+                namespace.to_owned(),
+                stream_id.clone(),
+                *sequence,
+                revision,
+                incarnation,
+            ));
             batch_items.push(serde_json::json!({
                 "namespace": namespace,
                 "expected_revision": revision,
@@ -2765,7 +2792,7 @@ impl KernelComposition {
         let reconcile_key = eliot_contracts::sha256_hex(&key_bytes);
         reconciliation["reconcile_key"] = serde_json::Value::String(reconcile_key.clone());
         let mut handoffs_reconciled = 0_u64;
-        for (namespace, sequence) in &batch_namespaces {
+        for (namespace, _, sequence, _, _) in &batch_namespaces {
             let marked = self
                 .generation_gateway
                 .ors
@@ -2777,10 +2804,72 @@ impl KernelComposition {
                 .unwrap_or(0);
         }
         reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
+        let handoff_maintenance = self.maintain_bridge_event_handoffs(&batch_namespaces)?;
+        reconciliation["handoff_maintenance"] = serde_json::Value::Array(handoff_maintenance);
         Ok(serde_json::json!({ "status": "known", "value": {
             "accepted": true,
             "reconciliation": reconciliation,
         } }))
+    }
+
+    /// Runs the bounded handoff maintenance for one reconciled scope on the
+    /// existing owner recovery path (issue #2731, items 3 and 5): per
+    /// presented namespace it retires terminal handoffs first so eligible
+    /// rows free their charge before the repair slice accounts its bounded
+    /// inserts, then restores missing handoffs for retained events under
+    /// their original identities. Both steps are idempotent with finite
+    /// per-call budgets and continuations, so a lost answer replays safely
+    /// and successive legitimate recovery entries converge. Maintenance
+    /// pressure answers typed backpressure (never a cursor reset or a
+    /// declaration that missing evidence is complete); any other
+    /// maintenance failure fails the frame closed.
+    fn maintain_bridge_event_handoffs(
+        &self,
+        batch_namespaces: &[(String, String, u64, u64, u64)],
+    ) -> Result<Vec<serde_json::Value>, TransportError> {
+        let mut handoff_maintenance: Vec<serde_json::Value> =
+            Vec::with_capacity(batch_namespaces.len());
+        for (namespace, stream_id, _, revision, incarnation) in batch_namespaces {
+            let maintenance_request = serde_json::json!({
+                "namespace": namespace,
+                "expected_revision": revision,
+                "expected_incarnation": incarnation,
+            });
+            let retired = self
+                .generation_gateway
+                .ors
+                .retire_bridge_event_handoffs_checked(&maintenance_request)
+                .map_err(|error| match error {
+                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                        TransportError::Backpressure
+                    }
+                    _ => TransportError::SessionFenced,
+                })?;
+            let repaired = self
+                .generation_gateway
+                .ors
+                .repair_bridge_event_handoffs_checked(&maintenance_request)
+                .map_err(|error| match error {
+                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                        TransportError::Backpressure
+                    }
+                    _ => TransportError::SessionFenced,
+                })?;
+            handoff_maintenance.push(serde_json::json!({
+                "stream_id": stream_id,
+                "retired": retired.get("retired").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                "retirement_continuation": retired
+                    .get("retirement_continuation")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                "repaired": repaired.get("repaired").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                "repair_continuation": repaired
+                    .get("repair_continuation")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }));
+        }
+        Ok(handoff_maintenance)
     }
     /// The caller ([`crate::KernelComposition::dispatch_frame`]) has already run
     /// the closed gateway gates; those joins are re-checked here so a direct
