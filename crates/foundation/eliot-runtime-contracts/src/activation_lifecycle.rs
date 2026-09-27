@@ -71,8 +71,8 @@ impl ActivationContourState {
 }
 
 /// One explicit lifecycle record binding the seven identity families of an
-/// activation (I18.53: every scenario records exact Product, Activation and
-/// WorkScope identities): Product, Activation, WorkScope, runtime lease,
+/// activation (I18.53: every scenario records exact `Product`, `Activation` and
+/// `WorkScope` identities): `Product`, `Activation`, `WorkScope`, runtime lease,
 /// supervision lease, epoch/generation, and descendant registration.
 ///
 /// The record binds identities only. Liveness, readiness, coverage and
