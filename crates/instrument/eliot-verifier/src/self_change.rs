@@ -10,6 +10,14 @@
 //! rollback-capable; cutover happens only on independent evidence plus a
 //! new generation receipt.
 //!
+//! The independent evidence a cutover requires is the machine-observed
+//! program identity of the two passes. The shadow comparison carries both
+//! observed program digests, and the bootstrap refuses a candidate that
+//! observed the same program as the last-known-good generation: comparing one
+//! implementation with itself matches every axis while proving nothing, which
+//! is precisely the "changed verifier as sole authority" case the bootstrap
+//! exists to refuse.
+//!
 //! Refusal is terminal under the oracle rule (W3): a refused cutover is
 //! rejected by the old generation, and a diverged shadow comparison
 //! escalates to a Human or independent route. The old generation can
@@ -719,6 +727,19 @@ impl AxisVerdicts {
 }
 
 /// Shadow comparison record over the same raw fixture/tool evidence.
+///
+/// The two program identities are the independence evidence of this record.
+/// `last_known_good_program` and `candidate_program` are the machine-computed
+/// content digests of the two executables the two passes really ran, observed
+/// by the driver from the file bytes — not a bundle-supplied path, name, or
+/// string. I18.31 requires cutover to occur only on independent evidence, and
+/// "a changed verifier cannot be the sole authority proving its own
+/// correctness" is exactly the case a comparison of one implementation with
+/// itself fails to catch: every axis matches because there is only one side.
+/// Carrying the two observed program identities on the record makes that
+/// independence an observed, compared fact of the comparison itself, so
+/// [`SelfChangeBootstrap::record_comparison`] can refuse a candidate that is
+/// not a distinct program before any receipt can be minted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ShadowComparisonRecord {
     /// The changed surface under comparison (W5 scope).
@@ -727,6 +748,10 @@ pub struct ShadowComparisonRecord {
     pub old_generation: u64,
     /// Candidate generation producing the shadow side.
     pub candidate_generation: u64,
+    /// Machine-observed program identity the last-known-good pass really ran.
+    pub last_known_good_program: EvidenceDigest,
+    /// Machine-observed program identity the candidate shadow pass really ran.
+    pub candidate_program: EvidenceDigest,
     /// Per-axis verdicts.
     pub verdicts: AxisVerdicts,
     /// Digest of the comparison evidence.
@@ -734,16 +759,22 @@ pub struct ShadowComparisonRecord {
 }
 
 impl ShadowComparisonRecord {
-    /// Records one comparison. Generations must advance.
+    /// Records one comparison. Generations must advance, and the candidate
+    /// program identity must be a machine-observed program distinct from the
+    /// last-known-good one.
     ///
     /// # Errors
     ///
     /// Returns [`SelfChangeError::NonAdvancingGeneration`] when the
-    /// candidate does not advance past the old generation.
+    /// candidate does not advance past the old generation, or
+    /// [`SelfChangeError::CandidateNotIndependent`] when both passes observed
+    /// the same program.
     pub fn new(
         surface: SelfChangeSurface,
         old_generation: u64,
         candidate_generation: u64,
+        last_known_good_program: EvidenceDigest,
+        candidate_program: EvidenceDigest,
         verdicts: AxisVerdicts,
         evidence: EvidenceDigest,
     ) -> Result<Self, SelfChangeError> {
@@ -753,10 +784,17 @@ impl ShadowComparisonRecord {
                 candidate: candidate_generation,
             });
         }
+        if last_known_good_program == candidate_program {
+            return Err(SelfChangeError::CandidateNotIndependent {
+                program: candidate_program,
+            });
+        }
         Ok(Self {
             surface,
             old_generation,
             candidate_generation,
+            last_known_good_program,
+            candidate_program,
             verdicts,
             evidence,
         })
@@ -766,6 +804,13 @@ impl ShadowComparisonRecord {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.verdicts.is_clean()
+    }
+
+    /// Whether the two passes really observed distinct programs, which is the
+    /// independent evidence I18.31 requires before a cutover.
+    #[must_use]
+    pub fn is_independent(&self) -> bool {
+        self.last_known_good_program != self.candidate_program
     }
 }
 
@@ -1073,6 +1118,19 @@ pub enum SelfChangeError {
         /// The diverging axes.
         axes: Vec<ComparisonAxis>,
     },
+    /// The candidate shadow pass observed the same program as the
+    /// last-known-good pass, so the comparison is not independent evidence
+    /// (I18.31: "cutover occurs only after independent evidence"). A changed
+    /// verifier can never be the sole authority proving its own correctness,
+    /// and a candidate that runs the identical program image proves nothing a
+    /// receipt could bind.
+    #[error(
+        "candidate observed program is not independent of the last-known-good program: {program:?}"
+    )]
+    CandidateNotIndependent {
+        /// The machine-observed program identity both passes really ran.
+        program: EvidenceDigest,
+    },
     /// The canary task count is zero or above [`MAX_CANARY_TASKS`].
     #[error("canary task count {bounded_tasks} is not within 1..=1024")]
     CanaryTaskBound {
@@ -1282,16 +1340,22 @@ impl SelfChangeBootstrap {
         Ok(())
     }
 
-    /// Records the shadow comparison. It must be in scope, name the
-    /// admitted generations, and match on every axis. Use
-    /// [`SelfChangeBootstrap::record_comparison_or_escalate`] when a
-    /// diverged comparison must escalate under the oracle rule instead
-    /// of returning [`SelfChangeError::ComparisonDiverged`].
+    /// Records the shadow comparison. It must be in scope, name the admitted
+    /// generations, carry independent evidence, and match on every axis. Use
+    /// [`SelfChangeBootstrap::record_comparison_or_escalate`] when a diverged
+    /// comparison must escalate under the oracle rule instead of returning
+    /// [`SelfChangeError::ComparisonDiverged`].
+    ///
+    /// The independence check runs here, in the owner that mints the receipt,
+    /// rather than only in [`ShadowComparisonRecord::new`]: a record can also
+    /// arrive through deserialization, and a record whose two passes observed
+    /// the same program is refused here before the phase can advance.
     ///
     /// # Errors
     ///
     /// Returns [`SelfChangeError::PhaseOrder`], [`SelfChangeError::SurfaceMismatch`],
-    /// [`SelfChangeError::GenerationMismatch`], or [`SelfChangeError::ComparisonDiverged`].
+    /// [`SelfChangeError::GenerationMismatch`], [`SelfChangeError::CandidateNotIndependent`],
+    /// or [`SelfChangeError::ComparisonDiverged`].
     pub fn record_comparison(
         &mut self,
         record: ShadowComparisonRecord,
@@ -1299,6 +1363,11 @@ impl SelfChangeBootstrap {
         self.require_phase(BootstrapPhase::Comparison)?;
         self.require_scope(record.surface)?;
         self.require_generations(record.old_generation, record.candidate_generation)?;
+        if !record.is_independent() {
+            return Err(SelfChangeError::CandidateNotIndependent {
+                program: record.candidate_program.clone(),
+            });
+        }
         if !record.is_clean() {
             return Err(SelfChangeError::ComparisonDiverged {
                 axes: record.verdicts.diverged_axes(),
@@ -1319,10 +1388,17 @@ impl SelfChangeBootstrap {
     /// terminal [`BootstrapPhase::OracleConflict`], and stores the
     /// [`ResolvedOracleConflict`] for [`SelfChangeBootstrap::oracle_conflict`].
     ///
+    /// A candidate that is not independent is not a disagreement between two
+    /// generations, so it never escalates: there is no second generation whose
+    /// view could resolve it. It surfaces as
+    /// [`SelfChangeError::CandidateNotIndependent`] and leaves the machine
+    /// untouched.
+    ///
     /// # Errors
     ///
     /// Returns [`SelfChangeError::PhaseOrder`], [`SelfChangeError::SurfaceMismatch`],
-    /// or [`SelfChangeError::GenerationMismatch`] for driver-side misuse;
+    /// [`SelfChangeError::GenerationMismatch`], or
+    /// [`SelfChangeError::CandidateNotIndependent`] for driver-side misuse;
     /// the machine is untouched then. Divergence never errors: it
     /// escalates.
     pub fn record_comparison_or_escalate(
