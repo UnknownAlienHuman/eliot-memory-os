@@ -249,7 +249,6 @@ pub const MAX_HELD_CONTROL_LOSS_RECORDS: usize = 1024;
 #[derive(Clone, Debug)]
 struct HeldRecord {
     record: CriticalEventRecord,
-    attempts: Vec<UnavailableReason>,
 }
 
 /// The I16.11 fallback state machine.
@@ -334,37 +333,24 @@ impl CriticalPath {
         // I16.11: every path unavailable. Hold the record and expose the
         // durable, visible control-loss state rather than a success
         // indication. The reported state carries the *actual* typed reason
-        // each stage returned; a reason is never substituted by a generic one.
-        self.hold(record, attempts);
-        outcome(
-            &event_id,
-            CriticalEventState::ControlLoss {
-                attempts: self.control_loss_attempts(),
-            },
-        )
+        // each stage returned for *this* record; a reason is never
+        // substituted by a generic one nor borrowed from another record.
+        self.hold(record);
+        outcome(&event_id, CriticalEventState::ControlLoss { attempts })
     }
 
-    /// The exact typed reason the most recent hold recorded.
-    ///
-    /// Read under the same lock as the hold, so the reported control-loss
-    /// state and the retained record cannot disagree.
-    fn control_loss_attempts(&self) -> Vec<UnavailableReason> {
-        self.held
-            .lock()
-            .ok()
-            .and_then(|held| held.back().map(|entry| entry.attempts.clone()))
-            .unwrap_or_default()
-    }
-
-    fn hold(&self, record: CriticalEventRecord, attempts: Vec<UnavailableReason>) {
+    fn hold(&self, record: CriticalEventRecord) {
         let Ok(mut held) = self.held.lock() else {
             return;
         };
+        // The total counts every record that reached the control-loss state,
+        // including one the bounded buffer had to refuse: I16.11 forbids
+        // silent loss, so a refused record is still a counted loss.
+        self.control_loss_total.fetch_add(1, Ordering::Relaxed);
         if held.len() >= MAX_HELD_CONTROL_LOSS_RECORDS {
             return;
         }
-        held.push_back(HeldRecord { record, attempts });
-        self.control_loss_total.fetch_add(1, Ordering::Relaxed);
+        held.push_back(HeldRecord { record });
     }
 
     /// Replays every held control-loss record against the currently returning
