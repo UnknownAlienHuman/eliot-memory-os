@@ -155,6 +155,8 @@ const P07_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
 const P07_DISPOSITION_RECOVERY_REQUIRED: &str = "RECOVERY_REQUIRED";
 const P07_DISPOSITION_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const P07_DISPOSITION_FAILED: &str = "FAILED";
+const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
+
 /// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
 ///
 /// This is the exact string published as `USER_AUTOMATION_ROUTE` in
@@ -892,7 +894,8 @@ fn p07_cause_classification(
         // retried as presented.
         Cause::StateFenceUnvalidated
         | Cause::AuthorityEpochDisagreesWithFence
-        | Cause::SessionSubjectUnbindable => (
+        | Cause::SessionSubjectUnbindable
+        | Cause::InvalidOwnerField => (
             eliot_kernel_service::REASON_INVALID_ARGUMENT,
             P07_DISPOSITION_INVALID_REQUEST,
             Directive::RepairPresentedBinding,
@@ -906,6 +909,18 @@ fn p07_cause_classification(
             P07_DISPOSITION_STALE_OR_CONFLICT,
             Directive::StaleFenceFailClosed,
             TransportError::IdentityConflict,
+        ),
+        Cause::StaleAuthorityEpoch | Cause::CrossLineageAuthorityEpoch => (
+            eliot_kernel_service::REASON_STALE_AUTHORITY_EPOCH,
+            P07_DISPOSITION_STALE_OR_CONFLICT,
+            Directive::RefreshAuthorityEpoch,
+            TransportError::IdentityConflict,
+        ),
+        Cause::P07OwnerUnavailable => (
+            eliot_kernel_service::REASON_CAPABILITY_UNAVAILABLE,
+            P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
         ),
         // The answered frame is not the receipt kind this operation returns, or
         // the refusal frame cannot be classified at all: the Kernel cannot serve
@@ -1134,7 +1149,9 @@ impl KernelComposition {
             .lock()
             .map_err(|_| eliot_authority::P07PortError::Unavailable)?;
         let Some(bound) = guard.as_ref() else {
-            return Err(eliot_authority::P07PortError::Unavailable);
+            return Err(eliot_authority::P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::P07OwnerUnavailable,
+            });
         };
         let current_revision = bound.bound_revision();
         if current_revision == 0 || bound.source().revision() != current_revision {
