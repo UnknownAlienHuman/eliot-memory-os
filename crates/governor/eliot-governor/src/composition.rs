@@ -852,9 +852,11 @@ pub enum CompositionError {
     /// Durable recovery did not prove the complete owner set.
     #[error("Governor recovery failed: {0}")]
     Recovery(String),
-    /// A canonical write failed its observed `WorkScope` guard; the structured
-    /// report preserves the exact identity legs and any owner-issued receipt.
-    #[error("scope guard withheld canonical write ({identity:?}, {verdict:?}) at {trigger:?}")]
+    /// A scope-sensitive operation failed its observed `WorkScope` guard; the
+    /// structured report preserves the exact identity legs and receipt.
+    #[error(
+        "scope guard withheld scope-sensitive operation ({identity:?}, {verdict:?}) at {trigger:?}"
+    )]
     ScopeGuardWithheld {
         claimed_scope: String,
         observed_scope: String,
@@ -862,6 +864,13 @@ pub enum CompositionError {
         identity: IdentityLegOutcome,
         verdict: GuardVerdict,
         report: Box<TriggerReport>,
+    },
+    /// A scope-sensitive operation lacked one or both caller-supplied inputs.
+    #[error("scope-sensitive operation lacks required guard inputs at {trigger:?}")]
+    ScopeSensitiveGuardInputsMissing {
+        trigger: GuardTrigger,
+        missing_observed_binding: bool,
+        missing_source_closure: bool,
     },
     /// A startup transition was attempted out of order.
     #[error("startup order violation: expected {expected}, observed {observed}")]
@@ -5453,16 +5462,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// receipt fails even when it agrees with its own fence (re-evaluation
     /// on fence change is owned here, not delegated to the presenter).
     ///
-    /// An admission is then bound to the retained authenticated instance:
-    /// the presented receipt must name exactly the live `WorkScope` binding
-    /// read at the retained fence. Without a retained binding there is no
-    /// authenticated instance to bind, so the write fails closed. A denial
-    /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
-    /// the typed directive token; nothing is committed on any failure.
+    /// For admitted [`RequestedEffect::CanonicalWrite`] and
+    /// [`RequestedEffect::MaterialEffect`], this also requires the caller's
+    /// actual observed binding and a full governing-source closure check at
+    /// their respective mandatory guard triggers against the current owner
+    /// snapshot at the retained Kernel fence. The observation is never derived
+    /// from the receipt or retained binding. Other effects may pass `None` for
+    /// either scope input, preserving safe read-only and cold-capture behavior.
+    /// The presented receipt must name exactly the live `WorkScope` binding
+    /// read at that fence. A readiness denial preserves its typed directive; a
+    /// scope-guard failure preserves the structured guard report.
     pub fn check_material_readiness_for_effect(
         &self,
         effect: RequestedEffect,
         readiness: &MaterialReadinessInputs<'_>,
+        observed: Option<&ScopeBinding>,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
     ) -> Result<MaterialAdmission, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -5491,6 +5506,42 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     readiness.receipt.scope.scope_ref, snapshot.binding.scope.scope_ref,
                 )));
             }
+            let trigger = match effect {
+                RequestedEffect::CanonicalWrite => Some(GuardTrigger::CanonicalWrite),
+                RequestedEffect::MaterialEffect => Some(GuardTrigger::MaterialEffect),
+                _ => None,
+            };
+            if let Some(trigger) = trigger {
+                let missing_observed_binding = observed.is_none();
+                let missing_source_closure = source_closure.is_none();
+                let (Some(observed), Some((sources, privacy))) = (observed, source_closure) else {
+                    return Err(CompositionError::ScopeSensitiveGuardInputsMissing {
+                        trigger,
+                        missing_observed_binding,
+                        missing_source_closure,
+                    });
+                };
+                observed
+                    .validate()
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+                ensure_snapshot_fresh(&snapshot, "scope-sensitive WorkScope is not fresh")?;
+                let report = check_at_trigger(
+                    &snapshot.binding,
+                    observed,
+                    Some((sources, privacy)),
+                    trigger,
+                );
+                if !report.is_matched() {
+                    return Err(CompositionError::ScopeGuardWithheld {
+                        claimed_scope: readiness.receipt.scope.scope_ref.clone(),
+                        observed_scope: observed.scope.scope_ref.clone(),
+                        trigger: report.trigger,
+                        identity: report.identity,
+                        verdict: report.verdict,
+                        report: Box::new(report),
+                    });
+                }
+            }
         }
         Ok(admission)
     }
@@ -5516,8 +5567,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn check_material_readiness_for_write(
         &self,
         readiness: &MaterialReadinessInputs<'_>,
+        observed: &ScopeBinding,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
     ) -> Result<MaterialAdmission, CompositionError> {
-        self.check_material_readiness_for_effect(RequestedEffect::CanonicalWrite, readiness)
+        self.check_material_readiness_for_effect(
+            RequestedEffect::CanonicalWrite,
+            readiness,
+            Some(observed),
+            Some((sources, privacy)),
+        )
     }
 
     /// Applies one Canonical-admitted transition only after material
@@ -5538,8 +5597,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
         readiness: &MaterialReadinessInputs<'_>,
+        observed: &ScopeBinding,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
     ) -> Result<WriteReceipt, CompositionError> {
-        match self.check_material_readiness_for_write(readiness)? {
+        match self.check_material_readiness_for_write(readiness, observed, sources, privacy)? {
             MaterialAdmission::Admitted { .. } => self.commit_canonical(identity, envelope).await,
             MaterialAdmission::Denied {
                 directive,
@@ -9372,10 +9434,20 @@ mod tests {
             "op-1789-no-task",
         );
         let bundle = readiness_bundle(&fence, eliot_workscope::TaskBindingInput::NoTask);
+        let observed = eliot_workscope::ScopeBinding {
+            scope: readiness_scope(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
+            governing_source_generation: 1,
+        };
+        let sources = readiness_sources(&fence);
+        let privacy = readiness_privacy();
         let denied = block_on(composition.commit_canonical_with_readiness(
             &identity,
             envelope,
             &bundle.inputs(&fence),
+            &observed,
+            &sources,
+            &privacy,
         ));
         assert!(
             matches!(denied, Err(CompositionError::Recovery(ref message)) if message.contains("TASK_SELECTION_REQUIRED")),
@@ -9404,10 +9476,20 @@ mod tests {
                 acceptance_digest: "digest:acceptance:one".to_owned(),
             },
         );
+        let observed = eliot_workscope::ScopeBinding {
+            scope: readiness_scope(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
+            governing_source_generation: 1,
+        };
+        let sources = readiness_sources(&fence);
+        let privacy = readiness_privacy();
         let receipt = block_on(composition.commit_canonical_with_readiness(
             &identity,
             envelope,
             &bundle.inputs(&fence),
+            &observed,
+            &sources,
+            &privacy,
         ))
         .expect("grounded write commits");
         assert_eq!(receipt.operation_id.as_str(), "op-1789-grounded");
