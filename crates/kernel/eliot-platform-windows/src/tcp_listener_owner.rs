@@ -1,4 +1,4 @@
-//! Fail-closed Windows TCP listener ownership observation.
+//! Fail-closed Windows TCP listener and established-peer ownership observations.
 //!
 //! `GetExtendedTcpTable` is isolated here so provider-neutral callers never
 //! parse shell output or infer ownership from endpoint liveness. Only the
@@ -9,11 +9,13 @@ mod tcp_listener_owner_models;
 
 #[cfg(windows)]
 use tcp_listener_owner_models::OwnerTable;
-pub use tcp_listener_owner_models::{TcpListenerOwnerError, TcpListenerOwnerObservation};
+pub use tcp_listener_owner_models::{
+    TcpConnectionPeerOwnerObservation, TcpListenerOwnerError, TcpListenerOwnerObservation,
+};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/// Hard upper bound for one IP Helper listener table allocation.
+/// Existing hard upper bound for one IP Helper TCP owner table allocation.
 const MAX_TCP_TABLE_BYTES: usize = 1024 * 1024;
 
 /// Observes the unique PID owning one exact IPv4 or IPv6 localhost listener.
@@ -39,12 +41,58 @@ pub fn observe_loopback_tcp_listener_owner(
     Ok(TcpListenerOwnerObservation::new(endpoint, process_id))
 }
 
+/// Observes the unique PID for the established server-side row whose local
+/// and remote endpoints reverse one exact connected loopback client's pair.
+///
+/// The connection endpoints must come from the actual connected client socket.
+/// The result is a point-in-time OS observation; callers must bracket it with
+/// retained process identity checks before using credentials.
+///
+/// # Errors
+///
+/// Returns a typed fail-closed error for invalid endpoints, missing or
+/// duplicate rows, access denial, sizing races, malformed/unbounded tables,
+/// unsupported platforms, and unclassified Win32 failures.
+#[cfg(windows)]
+pub fn observe_loopback_tcp_connection_peer_owner(
+    client_local_endpoint: SocketAddr,
+    peer_endpoint: SocketAddr,
+) -> Result<TcpConnectionPeerOwnerObservation, TcpListenerOwnerError> {
+    validate_endpoint(client_local_endpoint)?;
+    validate_endpoint(peer_endpoint)?;
+    let process_id = match (client_local_endpoint, peer_endpoint) {
+        (SocketAddr::V4(client_local), SocketAddr::V4(peer)) => {
+            query_ipv4_connection_peer_owner(client_local, peer)?
+        }
+        (SocketAddr::V6(client_local), SocketAddr::V6(peer)) => {
+            query_ipv6_connection_peer_owner(client_local, peer)?
+        }
+        _ => return Err(TcpListenerOwnerError::InvalidEndpoint),
+    };
+    Ok(TcpConnectionPeerOwnerObservation::new(
+        client_local_endpoint,
+        peer_endpoint,
+        process_id,
+    ))
+}
+
 /// Off-Windows builds retain the typed API but never claim ownership.
 #[cfg(not(windows))]
 pub fn observe_loopback_tcp_listener_owner(
     endpoint: SocketAddr,
 ) -> Result<TcpListenerOwnerObservation, TcpListenerOwnerError> {
     validate_endpoint(endpoint)?;
+    Err(TcpListenerOwnerError::UnsupportedPlatform)
+}
+
+/// Off-Windows builds retain the typed API but never claim connection ownership.
+#[cfg(not(windows))]
+pub fn observe_loopback_tcp_connection_peer_owner(
+    client_local_endpoint: SocketAddr,
+    peer_endpoint: SocketAddr,
+) -> Result<TcpConnectionPeerOwnerObservation, TcpListenerOwnerError> {
+    validate_endpoint(client_local_endpoint)?;
+    validate_endpoint(peer_endpoint)?;
     Err(TcpListenerOwnerError::UnsupportedPlatform)
 }
 
@@ -66,10 +114,10 @@ fn validate_endpoint(endpoint: SocketAddr) -> Result<(), TcpListenerOwnerError> 
 #[cfg(windows)]
 fn query_ipv4(address: Ipv4Addr, port: u16) -> Result<u32, TcpListenerOwnerError> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
     };
 
-    let table = query_owner_table(2)?;
+    let table = query_owner_table(2, TCP_TABLE_OWNER_PID_LISTENER)?;
     let rows = decode_rows::<MIB_TCPROW_OWNER_PID>(
         &table.words,
         table.byte_len,
@@ -103,10 +151,10 @@ fn select_ipv4_owner(
 #[cfg(windows)]
 fn query_ipv6(address: Ipv6Addr, port: u16) -> Result<u32, TcpListenerOwnerError> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+        MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
     };
 
-    let table = query_owner_table(23)?;
+    let table = query_owner_table(23, TCP_TABLE_OWNER_PID_LISTENER)?;
     let rows = decode_rows::<MIB_TCP6ROW_OWNER_PID>(
         &table.words,
         table.byte_len,
@@ -138,15 +186,111 @@ fn select_ipv6_owner(
 }
 
 #[cfg(windows)]
-fn query_owner_table(address_family: u32) -> Result<OwnerTable, TcpListenerOwnerError> {
+fn query_ipv4_connection_peer_owner(
+    client_local: std::net::SocketAddrV4,
+    peer: std::net::SocketAddrV4,
+) -> Result<u32, TcpListenerOwnerError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
+    };
+
+    let table = query_owner_table(2, TCP_TABLE_OWNER_PID_CONNECTIONS)?;
+    let rows = decode_rows::<MIB_TCPROW_OWNER_PID>(
+        &table.words,
+        table.byte_len,
+        std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+    )?;
+    select_ipv4_connection_peer_owner(&rows, client_local, peer)
+}
+
+#[cfg(windows)]
+fn query_ipv6_connection_peer_owner(
+    client_local: std::net::SocketAddrV6,
+    peer: std::net::SocketAddrV6,
+) -> Result<u32, TcpListenerOwnerError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
+    };
+
+    let table = query_owner_table(23, TCP_TABLE_OWNER_PID_CONNECTIONS)?;
+    let rows = decode_rows::<MIB_TCP6ROW_OWNER_PID>(
+        &table.words,
+        table.byte_len,
+        std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+    )?;
+    select_ipv6_connection_peer_owner(&rows, client_local, peer)
+}
+
+#[cfg(windows)]
+fn select_ipv4_connection_peer_owner(
+    rows: &[windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID],
+    client_local: std::net::SocketAddrV4,
+    peer: std::net::SocketAddrV4,
+) -> Result<u32, TcpListenerOwnerError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_ESTAB;
+
+    let mut matches = Vec::new();
+    for row in rows {
+        if row.dwState != u32::try_from(MIB_TCP_STATE_ESTAB).unwrap_or(5) {
+            continue;
+        }
+        let local_port = decode_port(row.dwLocalPort)?;
+        let remote_port = decode_port(row.dwRemotePort)?;
+        let local_address = Ipv4Addr::from(u32::from_be(row.dwLocalAddr));
+        let remote_address = Ipv4Addr::from(u32::from_be(row.dwRemoteAddr));
+        if local_address == *peer.ip()
+            && local_port == peer.port()
+            && remote_address == *client_local.ip()
+            && remote_port == client_local.port()
+        {
+            matches.push(row.dwOwningPid);
+        }
+    }
+    unique_process_id(&matches)
+}
+
+#[cfg(windows)]
+fn select_ipv6_connection_peer_owner(
+    rows: &[windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP6ROW_OWNER_PID],
+    client_local: std::net::SocketAddrV6,
+    peer: std::net::SocketAddrV6,
+) -> Result<u32, TcpListenerOwnerError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_ESTAB;
+
+    let mut matches = Vec::new();
+    for row in rows {
+        if row.dwState != u32::try_from(MIB_TCP_STATE_ESTAB).unwrap_or(5)
+            || row.dwLocalScopeId != 0
+            || row.dwRemoteScopeId != 0
+        {
+            continue;
+        }
+        let local_port = decode_port(row.dwLocalPort)?;
+        let remote_port = decode_port(row.dwRemotePort)?;
+        let local_address = Ipv6Addr::from(row.ucLocalAddr);
+        let remote_address = Ipv6Addr::from(row.ucRemoteAddr);
+        if local_address == *peer.ip()
+            && local_port == peer.port()
+            && remote_address == *client_local.ip()
+            && remote_port == client_local.port()
+        {
+            matches.push(row.dwOwningPid);
+        }
+    }
+    unique_process_id(&matches)
+}
+
+#[cfg(windows)]
+fn query_owner_table(
+    address_family: u32,
+    table_class: windows_sys::Win32::NetworkManagement::IpHelper::TCP_TABLE_CLASS,
+) -> Result<OwnerTable, TcpListenerOwnerError> {
     use std::ffi::c_void;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA, ERROR_NOT_SUPPORTED,
     };
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
-    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable;
 
     let mut requested = 0_u32;
     // SAFETY: the null buffer sizing call supplies a valid writable size pointer.
@@ -156,7 +300,7 @@ fn query_owner_table(address_family: u32) -> Result<OwnerTable, TcpListenerOwner
             &raw mut requested,
             0,
             address_family,
-            TCP_TABLE_OWNER_PID_LISTENER,
+            table_class,
             0,
         )
     };
@@ -196,7 +340,7 @@ fn query_owner_table(address_family: u32) -> Result<OwnerTable, TcpListenerOwner
             &raw mut returned,
             0,
             address_family,
-            TCP_TABLE_OWNER_PID_LISTENER,
+            table_class,
             0,
         )
     };
