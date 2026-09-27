@@ -36,8 +36,9 @@ use eliot_process::{
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
-    AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
-    RequestIdentity, TaskControllerResultBody, host_request_operation_id,
+    AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
+    HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt, RequestIdentity,
+    TaskControllerResultBody, host_request_operation_id,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -7051,10 +7052,12 @@ impl KernelComposition {
                 return Ok(Self::store_read_failure_response("local_read", &error));
             }
         };
-        if response.operation != NamedReadOperation::GetEvidencePack {
+        if response.operation != NamedReadOperation::GetEvidencePack
+            || response.state_fence != envelope.state_fence
+        {
             return Ok(Self::store_error_response_text(
                 "local_read",
-                "named-read operation does not match request",
+                "named-read operation or State Fence does not match request",
             ));
         }
         let (digest, body) = AuthenticatedHostSession::build_local_read_result_body(
@@ -7063,9 +7066,35 @@ impl KernelComposition {
             &selectors.subject,
             selectors.max_records,
             &selectors.intent_mode,
-            response.payload,
+            response.payload.clone(),
+            Some(&response),
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        let lineage = HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: digest.clone(),
+            producer_ref: None,
+            source_revisions: Some(
+                response
+                    .revision_heads
+                    .iter()
+                    .map(|head| HostRequestResultSourceRevision {
+                        key: head.key.as_str().to_owned(),
+                        revision: head.revision,
+                        state_fence: head.state_fence.clone(),
+                    })
+                    .collect(),
+            ),
+            source_state_fence: Some(response.state_fence),
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        };
         // The sync leg completes through the shared submit gate, never
         // through a private persist: attempt currency, deadline, fence, and
         // staleness joins are identical to the async submit leg. A concurrent
@@ -7079,9 +7108,10 @@ impl KernelComposition {
             result_digest: digest,
             response: body,
             attempt: Some(attempt),
+            lineage: Some(lineage),
         };
         submission
-            .validate()
+            .validate_local_read_submission()
             .map_err(|_| TransportError::SessionFenced)?;
         let resulted = match self.submit_local_read_result(session, &submission)? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,

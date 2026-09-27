@@ -521,6 +521,7 @@ pub fn skill_result_body(
         result_digest: sha256_hex(&bytes),
         response,
         attempt: Some(attempt.clone()),
+        lineage: None,
     };
     body.validate()
         .map_err(|error| SkillDispatchError::Body(error.to_string()))?;
@@ -559,6 +560,7 @@ fn skill_refusal_body(
         result_digest: sha256_hex(response.to_string().as_bytes()),
         response,
         attempt: Some(attempt.clone()),
+        lineage: None,
     })
 }
 

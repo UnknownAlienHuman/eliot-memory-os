@@ -133,6 +133,7 @@ fn result_body_for(
         result_digest: digest,
         response,
         attempt,
+        lineage: None,
     }
 }
 

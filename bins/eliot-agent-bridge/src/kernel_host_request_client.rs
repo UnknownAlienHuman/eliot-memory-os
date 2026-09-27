@@ -2361,6 +2361,7 @@ fn decode_record_view(
             // so no attempt is presented here. Submissions always carry the
             // current attempt, enforced by the Kernel legs.
             attempt: None,
+            lineage: None,
         }
         .validate()
         .ok()?;

@@ -70,7 +70,7 @@ use eliot_protocol::{
 };
 use eliot_receipts::{ProofCeiling, RequestBinding, SessionBinding};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
-use eliot_store_api::EVIDENCE_PACK_MAX_RECORDS;
+use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, NamedReadResponse};
 
 use crate::protocol::AgentBridgeAdmissionDescriptor;
 use crate::{KernelService, KernelServiceError, KernelServiceState};
@@ -278,7 +278,8 @@ impl AuthenticatedHostSession {
     /// Runs the existing evidence-pack planning half
     /// (`plan_evidence_pack_query`) over the explicit `scope_id`/`subject`/
     /// `max_records` selectors, projects the exact store payload unchanged
-    /// through `project_evidence_pack_projection`, wraps the projection as a
+    /// through `project_evidence_pack_projection`, carries the Store's read
+    /// fence and revision heads in that projection when provided, and wraps it as a
     /// read-only `Projection` response under the `ScopedVerification` ceiling,
     /// and returns the canonical digest binding the exact bounded bytes. The
     /// caller persists the pair with `persist_host_request_result` and serves
@@ -305,6 +306,7 @@ impl AuthenticatedHostSession {
         max_records: u32,
         intent_mode: &str,
         store_payload: serde_json::Value,
+        read_metadata: Option<&NamedReadResponse>,
     ) -> Result<(String, serde_json::Value), String> {
         if envelope.identity.capability != "eliot.query" {
             return Err("presented capability is not the admitted local-read query".to_owned());
@@ -342,7 +344,27 @@ impl AuthenticatedHostSession {
         };
         let plan = plan_evidence_pack_query(&input, scope_id, &max_records.to_string())
             .map_err(|error| error.to_string())?;
-        let projection = project_evidence_pack_projection(&plan, store_payload);
+        let mut projection = project_evidence_pack_projection(&plan, store_payload);
+        if let Some(read) = read_metadata {
+            read.validate().map_err(|error| error.to_string())?;
+            if read.operation != eliot_store_api::NamedReadOperation::GetEvidencePack
+                || read.state_fence != envelope.state_fence
+            {
+                return Err("named-read metadata does not match the admitted query".to_owned());
+            }
+            let content = projection
+                .content
+                .as_object_mut()
+                .ok_or_else(|| "evidence projection must be a JSON object".to_owned())?;
+            content.insert(
+                "source_revision_heads".to_owned(),
+                serde_json::to_value(&read.revision_heads).map_err(|error| error.to_string())?,
+            );
+            content.insert(
+                "source_state_fence".to_owned(),
+                serde_json::to_value(&read.state_fence).map_err(|error| error.to_string())?,
+            );
+        }
         let request_id = envelope.identity.request_id.as_str().to_owned();
         let idempotency_key = envelope.identity.idempotency_key.clone();
         let canonical_request_sha256 = sha256_hex(
@@ -382,6 +404,7 @@ impl AuthenticatedHostSession {
             // Digest-binding validation vehicle only: the attempt binding is
             // minted by the Kernel claim record at poll time, never here.
             attempt: None,
+            lineage: None,
         }
         .validate()
         .map_err(|error| error.to_string())?;
@@ -1745,6 +1768,7 @@ mod local_read_build_tests {
             10,
             "verification",
             payload.clone(),
+            None,
         )
         .expect("admitted query must build its bounded body");
 
@@ -1792,6 +1816,7 @@ mod local_read_build_tests {
             10,
             "verification",
             payload.clone(),
+            None,
         )
         .expect("first build must succeed");
         let second = AuthenticatedHostSession::build_local_read_result_body(
@@ -1801,6 +1826,7 @@ mod local_read_build_tests {
             10,
             "verification",
             payload,
+            None,
         )
         .expect("second build must succeed");
         assert_eq!(
@@ -1833,6 +1859,7 @@ mod local_read_build_tests {
                     max,
                     mode,
                     payload.clone(),
+                    None,
                 )
             };
 
