@@ -32,8 +32,9 @@ pub use process_owner::{
     KernelInstrumentRequestPort, UnprovisionedKernelAdmission,
 };
 pub use profile::{
-    AdmissionError, AdmittedProfile, AdmittedStage, BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION,
-    COMPILER_PROFILE, CompiledProfile, InstrumentClass, InstrumentKindId, InstrumentProfile,
+    ADMITTED_SCOPE_CLASS, ADMITTED_WORKTREE_CLASS, AdmissionError, AdmittedProfile, AdmittedStage,
+    BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION, COMPILER_PROFILE, CompiledProfile,
+    ISOLATED_PROCESS_CLASS, InstrumentClass, InstrumentKindId, InstrumentProfile,
     InstrumentProfileResolver, InstrumentRegistry, InstrumentSpec, InstrumentSpecParams,
     ProfileCompiler, ProfileError, ProfileScopeClasses, ResolvedProfile, ResolvedStage,
     ResourceLimits, StageDag, StageDecl, StageEnvironment, TEST_PROFILE, TargetLayout, WorkScope,
