@@ -76,7 +76,9 @@ use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RE
 
 mod daemon_claim_queue;
 
-use self::daemon_claim_queue::{campaign_packet_admission, check_task_controller_admission};
+use self::daemon_claim_queue::{
+    campaign_packet_admission, check_finish_admission, check_task_controller_admission,
+};
 
 /// Prefix of the deterministic opaque operation handle derived by
 /// [`host_request_operation_id`]. A parent operation reference carries the
@@ -269,6 +271,14 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) task_controller_envelope: Option<HostRequestEnvelope>,
     pub(crate) task_controller_tool: Option<serde_json::Value>,
     pub(crate) task_controller_attempt: LocalReadAttemptState,
+    /// Finish candidate pair queued for the authenticated daemon finish
+    /// poller (issue #1741). The exact admitted envelope plus the exact
+    /// digest-bound strict finish draft travel together; the daemon flight
+    /// claims the pair under a Kernel-minted fenced attempt and serves the
+    /// Governor finish owner's typed result.
+    pub(crate) finish_envelope: Option<HostRequestEnvelope>,
+    pub(crate) finish_tool: Option<serde_json::Value>,
+    pub(crate) finish_attempt: LocalReadAttemptState,
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -801,6 +811,13 @@ impl KernelComposition {
                 Err(_) => {
                     if check_task_controller_admission(envelope, tool).is_ok() {
                         self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
+                    } else if check_finish_admission(envelope, tool).is_ok() {
+                        // #1741 finish lane: the admitted strict finish draft
+                        // rides the same invoke-read admission as the query
+                        // and packet lanes but enters its own daemon-claimable
+                        // queue, so a finish result can never complete a
+                        // query, packet or task-controller claim.
+                        self.enqueue_finish_pair_under_transition(envelope, tool)?;
                     } else if check_local_state_admission(envelope, tool).is_ok() {
                         // #2564 I4 state-carrier seam: validated `eliot.state`
                         // pairs attempt the shared local-read carrier for the
@@ -1469,6 +1486,9 @@ impl KernelComposition {
                 task_controller_envelope: None,
                 task_controller_tool: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
+                finish_envelope: None,
+                finish_tool: None,
+                finish_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -1605,6 +1625,9 @@ impl KernelComposition {
                 task_controller_envelope: None,
                 task_controller_tool: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
+                finish_envelope: None,
+                finish_tool: None,
+                finish_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -2327,6 +2350,9 @@ impl KernelComposition {
                 task_controller_envelope: None,
                 task_controller_tool: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
+                finish_envelope: None,
+                finish_tool: None,
+                finish_attempt: LocalReadAttemptState::default(),
             });
         Ok(ObserveQueueReservation::Reserved {
             token,
