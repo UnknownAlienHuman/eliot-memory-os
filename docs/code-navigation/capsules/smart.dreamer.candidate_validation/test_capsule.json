@@ -1,0 +1,244 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.candidate_validation",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-dreamer-candidate-validation",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [],
+    "inline_cfg_test_modules": 0
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "invented handle",
+        "unsupported confirmation or promotion",
+        "false merge with lost minority evidence",
+        "budget exhaustion",
+        "scope or fence mismatch"
+      ]
+    },
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/handoff.rs",
+        "bytes": 7914,
+        "sha256": "996ab85b182ca232ae59a51bf1fad70d1d786d5b8274c0c9843a65d99b8cb679",
+        "test_attributes": 2,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/validation.rs",
+        "bytes": 9961,
+        "sha256": "1a88337af2eddfdc3f83c64da54eb774c1a1ded1c0bab64742605ca1729e5fe7",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_a.rs",
+        "bytes": 25177,
+        "sha256": "2121efadce7fd65fbec96daf9db6785936471c04ddba2d258c636c3fb20583f6",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_b.rs",
+        "bytes": 18947,
+        "sha256": "753ea76870f012fb198f098234b17b47a7d17d1fb8b344ede67e068ebff1fc8a",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_c.rs",
+        "bytes": 17800,
+        "sha256": "afba2771c79c3fec6df94d9e59befe517c08dbd3bff39838b578e9bb7d3f645e",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_d.rs",
+        "bytes": 18568,
+        "sha256": "b0498221765519ae1c7d8e3423527154c6372083f84ab7cfe9e347a2018606bf",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_e.rs",
+        "bytes": 19220,
+        "sha256": "11e7261bd33488356ad027f6ced73630ec0d014f5acd53bd2cb4846e049e2fa7",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_f.rs",
+        "bytes": 14851,
+        "sha256": "b81a7220767be3f32a100bbba4e87c6f8a69f4a4ea86b9842445ce6717714dbf",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "test_attribute_count": 60
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "bins/eliot-dreamer",
+      "bins/eliotd"
+    ],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "all specialized Dreamer handlers"
+      ]
+    },
+    "edge_profile_tests": []
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Reject the candidate draft with exact violations while leaving all source state unchanged."
+    },
+    "selected_cases": [
+      "crates/smart/eliot-dreamer-candidate-validation/tests/handoff.rs",
+      "crates/smart/eliot-dreamer-candidate-validation/tests/validation.rs",
+      "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_a.rs",
+      "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_b.rs",
+      "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_c.rs",
+      "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_d.rs",
+      "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_e.rs",
+      "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_f.rs"
+    ]
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 60,
+    "test_stu": 44146,
+    "nonzero": true
+  },
+  "bound_contract_digest": "916f5d1a704b1a55e23653297c53723f8f1980764a6e7e5052bc91666abfab0f",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/Cargo.toml",
+        "sha256": "f16ef4140d83d7af761c2d2829c8f7a9be5ef6049146c396928ffdf8d47f9a1b"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/module.toml",
+        "sha256": "114234711a777e359712daf8e17fc4d5dfbc92a865d9a0d1019c041ecc0009d7"
+      },
+      "selected_source": {
+        "path_count": 18,
+        "sha256": "a7de43a18b4d95b139a9ba1d4c43938337a9f799f743085b7bf8da42f108b272"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "f9fb5ffcc8ffba18a86a8af449bfe84fd8752d300731e7a23e743d64fa633b2c",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "f9fb5ffcc8ffba18"
+  }
+}

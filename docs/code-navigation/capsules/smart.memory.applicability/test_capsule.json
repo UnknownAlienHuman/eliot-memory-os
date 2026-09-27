@@ -1,0 +1,166 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.memory.applicability",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-memory-applicability",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "STATIC_CONTRACT_REGISTRATION_ONLY"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [],
+    "inline_cfg_test_modules": 0
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "stale/conflicted/protected/negative/precondition/missing-denominator cases",
+        "cue-hit-but-not-applicable adversarial",
+        "shared-fence fixtures with the provider"
+      ]
+    },
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-memory-applicability/tests/applicability.rs",
+        "bytes": 9709,
+        "sha256": "c4c64eb82c95bbcecfe7034cee8901669a38c18496c10e889195cf7ec1846de7",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "test_attribute_count": 9
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "context candidates memory slot"
+      ]
+    },
+    "edge_profile_tests": []
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return a typed error on invalid input or missing denominator; per-record failures become explicit exclusions, never silent drops."
+    },
+    "selected_cases": [
+      "crates/smart/eliot-memory-applicability/tests/applicability.rs"
+    ]
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 9,
+    "test_stu": 3237,
+    "nonzero": true
+  },
+  "bound_contract_digest": "b657af714859a708a42cb1af70f9c6b2f728730e7fe470be5d1359bb3afa1d5e",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-memory-applicability/Cargo.toml",
+        "sha256": "935cb71242905b452f1ccf41cb8b5e941752b6a0df59eabb2b89b77d71ac6460"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-memory-applicability/module.toml",
+        "sha256": "ec878b60210774f5a4d86a9630a85c06ca171365e8530b560afa5ce6692b9c59"
+      },
+      "selected_source": {
+        "path_count": 2,
+        "sha256": "30cc2c967ff405fe797fcc387ec977dc5ea9f1b5cc2c2a43179ef8a82df781c2"
+      },
+      "excluded_disposition": {
+        "path": "workstreams/security/standalone-crate-dispositions.toml",
+        "sha256": "4a5ce7ef7ee19bd18e4d106dbcd3218c7d950e461ea8b9d039ab854bffb3884d"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "524eb5da0cd1296d4acd41dd4c040621c799a8ab4a038fdcd3eac56fa176e4f5",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "524eb5da0cd1296d"
+  }
+}

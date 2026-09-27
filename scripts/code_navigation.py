@@ -20,6 +20,13 @@ from code_navigation_lib import (
     route_payload,
     self_test,
 )
+from code_navigation_lib.capsules import (
+    CAPSULE_ROOT,
+    INDEX_PATH,
+    build_capsules,
+    check_capsules,
+    emit_capsules,
+)
 from code_navigation_lib.package_docs import (
     check as check_package_docs,
     self_test as package_docs_self_test,
@@ -60,6 +67,25 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     route_parser.add_argument("--path", required=True)
     route_parser.add_argument("--topic")
     route_parser.add_argument("--format", choices=("text", "json"), default="text")
+
+    capsules_parser = sub.add_parser(
+        "capsules",
+        help=(
+            "Generate the mandatory I2.20 ModuleContractKit + CrateContextCapsule "
+            "+ ModuleTestCapsule triad for every declared functional capability cell"
+        ),
+    )
+    add_root(capsules_parser)
+    capsules_parser.add_argument(
+        "--emit",
+        action="store_true",
+        help=f"write every artifact and the index under {CAPSULE_ROOT}/",
+    )
+    capsules_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="fail closed when any artifact is absent or stale",
+    )
     return parser.parse_args(argv)
 
 
@@ -100,6 +126,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
             else:
                 print(render_route(payload))
+        elif args.command == "capsules":
+            if args.check:
+                failures = check_capsules(root)
+                if failures:
+                    print(f"CAPSULE_TRIAD_CHECK: FAIL issues={len(failures)}")
+                    for failure in failures:
+                        print(f"  - {failure}")
+                    return 1
+                print(f"CAPSULE_TRIAD_CHECK: PASS index={INDEX_PATH}")
+                return 0
+            summary = emit_capsules(root) if args.emit else None
+            registry = build_capsules(root)["registry"]
+            coverage = registry["capability_coverage"]
+            header = [
+                "CAPSULE_TRIAD: "
+                f"cells={coverage['declared_capability_cells']} "
+                f"artifacts={coverage['declared_capability_cells'] * 3} "
+                f"reachable={coverage['reachable_packages']} "
+                f"excluded={coverage['excluded_standalone_packages']} "
+                f"ceiling={registry['support_ceiling_with_complete_triad']}"
+            ]
+            if summary is not None:
+                header.append(f"written={summary['files_written']}")
+            if registry["registry_defects"]:
+                header.append(f"registry_defects={len(registry['registry_defects'])}")
+            print(" ".join(header))
+            for cell in registry["cells"]:
+                support = cell["implementation_support"]
+                defects = ",".join(support["blocking_codes"]) or "-"
+                print(
+                    f"  {support['implementation_support']} "
+                    f"{cell['reachability']:<11} {cell['cell_id']} "
+                    f"blocking={defects}"
+                )
+            if summary is not None:
+                print(f"CAPSULE_TRIAD_WRITE: PASS index={INDEX_PATH} digest={summary['registry_digest'][:16]}")
         else:
             raise NavigationError(f"unsupported command: {args.command}")
     except NavigationError as exc:

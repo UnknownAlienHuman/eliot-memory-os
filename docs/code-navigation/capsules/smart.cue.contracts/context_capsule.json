@@ -1,0 +1,298 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.cue.contracts",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Exact world/task cues can be represented once and consumed consistently by capture and reactive delivery."
+  },
+  "functional_capability_cell_refs": [
+    "smart.cue.contracts"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.cue.contracts",
+  "primary_source_package": {
+    "package": "eliot-cue-contracts",
+    "root_path": "crates/smart/eliot-cue-contracts",
+    "manifest_path": "crates/smart/eliot-cue-contracts/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-cue-contracts/module.toml",
+    "description": "Own the minimal provider-neutral cue, binding, snapshot, activation and invalidation schemas."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 71783,
+    "test_stu": 52672,
+    "selected_file_count": 22,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/activation.rs",
+        "bytes": 33394,
+        "sha256": "44377e2ffd730fac646c1b088ca3c365e5aa56eb8969728620a77040e980232a",
+        "stu": 11132,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/binding.rs",
+        "bytes": 3394,
+        "sha256": "857be3f7181e1c0d0dce80dd04e630c779cda7d75107f006fc9edad53f1cc674",
+        "stu": 1132,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/bounds.rs",
+        "bytes": 2153,
+        "sha256": "fd24cd0be7ef8310be85085c7405bffa10b805ca9acfbc93d9fdd426428c604c",
+        "stu": 718,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/context.rs",
+        "bytes": 3263,
+        "sha256": "69984519b591e0c4fbac83ba3910799694b2e85b32f62e7bdd4ab1a24d8e7e3e",
+        "stu": 1088,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/diagnostic.rs",
+        "bytes": 8265,
+        "sha256": "af8e0c81485bc472146e91acd96579316fe292689e9527f7835e44136d69d3e9",
+        "stu": 2755,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/error.rs",
+        "bytes": 2265,
+        "sha256": "a8a457c2d9bda0ae9b0f21ad5903e8d3e5e896124d4c508426da76e4d28e765b",
+        "stu": 755,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/identity.rs",
+        "bytes": 4489,
+        "sha256": "338f44ff32a3bf76e6f5ede62e21da5d433fb4deedd97892b9ba11336ed3d350",
+        "stu": 1497,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/index_bounds.rs",
+        "bytes": 12847,
+        "sha256": "38ece60f3a3c3798add4145841cff683050b633193543842fcd5a10fcd600bce",
+        "stu": 4283,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/index_candidate.rs",
+        "bytes": 19687,
+        "sha256": "5570b157dcf87b1b54d18be16a402988a138105bdbce64b85f976ab7a7c72277",
+        "stu": 6563,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/index_projection.rs",
+        "bytes": 5149,
+        "sha256": "6ad7f85b0f6e1415931fd94cbb6dc0953d12179c83dcae1a9fb00698d308ea26",
+        "stu": 1717,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/invalidation.rs",
+        "bytes": 10856,
+        "sha256": "2fc815cdbb80ba44fb0068615895af70e44df841126bf55f24811ed17bdc024e",
+        "stu": 3619,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/lib.rs",
+        "bytes": 5708,
+        "sha256": "7929c33a90b7606678533c8e59408e0522b185dc575f5aeb1fd492a2ac7f536d",
+        "stu": 1903,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/lineage.rs",
+        "bytes": 9541,
+        "sha256": "aaa7fc6547b630eb0ef6e3b31486307127126ca8175d4f2576e7fbb218714549",
+        "stu": 3181,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/normalization.rs",
+        "bytes": 16656,
+        "sha256": "592d630ed4f52fe82b8e6d3aea01074cb24f0e5163bf84628029570f55f0b91b",
+        "stu": 5552,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/observation.rs",
+        "bytes": 4233,
+        "sha256": "3a17833a3183945868118d712875a0056edb795e498fb9b221ae6f0d2ccd2104",
+        "stu": 1411,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/relation.rs",
+        "bytes": 2960,
+        "sha256": "3a7e12a12e3881d693c8b6d7038e52731158938a64a05e4178064001f0b5071c",
+        "stu": 987,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/snapshot.rs",
+        "bytes": 25194,
+        "sha256": "d9740ca5efc90dbc2305f8f67f2a1f800b4e136cdcf24ca195f228e11b9f1536",
+        "stu": 8398,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/src/version.rs",
+        "bytes": 45294,
+        "sha256": "46fbbb7fb09213fe6663940de70cbcf469d9a36b56f9254f8e0f2f2409ff2513",
+        "stu": 15098,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs",
+        "bytes": 106143,
+        "sha256": "36dde5c728a66d5429e70e6281bf35abab5da7c1bbb0cc74323536c55f310e65",
+        "test_attributes": 42,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/contract_shape.rs",
+        "bytes": 24863,
+        "sha256": "36baa035dfc47bf6bdc20c157b3baf6600217cdcc9577f9abf854a67212270c0",
+        "test_attributes": 18,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/index_projection.rs",
+        "bytes": 11039,
+        "sha256": "0a28293293f53d30ec8a5debb7104eec82da134b8797c38ef660a2769763b2f3",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/version.rs",
+        "bytes": 15970,
+        "sha256": "0079ed3e2af95cb01a614ba69cb876eef98595f14b8e025ad8ecfc6a58033feb",
+        "test_attributes": 11,
+        "inline_cfg_test": false,
+        "classes": [
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "8f56fb36d2e582dec2e261fb2f8870773e18a83119d7e3f7944cc7eb77904400"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-evidence",
+    "eliot-receipts",
+    "eliot-security-contracts",
+    "schemars",
+    "serde",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-agent-bridge",
+    "bins/eliot-dreamer",
+    "crates/governor/eliot-governor",
+    "crates/smart/eliot-context",
+    "crates/smart/eliot-context-candidates",
+    "crates/smart/eliot-cue-activation",
+    "crates/smart/eliot-cue-activation-wasm",
+    "crates/smart/eliot-cue-binding",
+    "crates/smart/eliot-cue-index",
+    "crates/smart/eliot-cue-normalizer",
+    "crates/smart/eliot-cues",
+    "crates/smart/eliot-reactive-context-plan"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [
+    "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs",
+    "crates/smart/eliot-cue-contracts/tests/contract_shape.rs"
+  ],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3B_REACTIVE_CONTEXT_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "9455de4ab393ce271959b6dca3fa885998ba6e4bd226fa5f7aa322d919abc017",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-cue-contracts/Cargo.toml",
+        "sha256": "f6da30076aca69c1c256ca9a8911ca7089160dd19efe129e64b9f5f7bb547141"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-cue-contracts/module.toml",
+        "sha256": "4b70388d1bdcfa1253bded827f4a0c3a9485229e755f7bc76eb0db1a1e65c952"
+      },
+      "selected_source": {
+        "path_count": 22,
+        "sha256": "8f56fb36d2e582dec2e261fb2f8870773e18a83119d7e3f7944cc7eb77904400"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "69b1149df0a6a33d6f9c0d6725e7652f170bb778e037955f0e4cbafaf7580af4",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "69b1149df0a6a33d"
+  }
+}

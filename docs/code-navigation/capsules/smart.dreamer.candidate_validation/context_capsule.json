@@ -1,0 +1,269 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.candidate_validation",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Every specialized Dreamer handler receives one validated draft with explicit lineage, preservation, fence and authority ceiling."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.candidate_validation"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.candidate_validation",
+  "primary_source_package": {
+    "package": "eliot-dreamer-candidate-validation",
+    "root_path": "crates/smart/eliot-dreamer-candidate-validation",
+    "manifest_path": "crates/smart/eliot-dreamer-candidate-validation/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-candidate-validation/module.toml",
+    "description": "Common lineage, fence, authority-ceiling, preservation, and budget validation for Dreamer model drafts"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 19949,
+    "test_stu": 44146,
+    "selected_file_count": 18,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/bounds.rs",
+        "bytes": 208,
+        "sha256": "ce9dfdf28ad61cef3b040c9e464473d5201644b5b10f9542093f22c2dac64bf5",
+        "stu": 70,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/error.rs",
+        "bytes": 3241,
+        "sha256": "1d1785cfe4a248fbf1456a1b4af7954b3377e2350a2d789a5d9d24288de03fef",
+        "stu": 1081,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/input.rs",
+        "bytes": 17213,
+        "sha256": "6982eca7558fcdec3f88279bf9e5bb89f991dce1b42bf4f96f5068fc845eb19e",
+        "stu": 5738,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/lib.rs",
+        "bytes": 891,
+        "sha256": "b6577cb7f4069437ab638b790b0fb876ab331b12af7a80e575a1ca29c4494b89",
+        "stu": 297,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/receipt.rs",
+        "bytes": 3272,
+        "sha256": "10bce7a56185f7f0285c59fea8a87c7dcc3ef4102fa94891f64efa6d4626ad46",
+        "stu": 1091,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/structured/bounds.rs",
+        "bytes": 2953,
+        "sha256": "d59a76ae5fe689de5db026955802dee2e1bbe2407b70f5a29a4e324f37452640",
+        "stu": 985,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs",
+        "bytes": 4226,
+        "sha256": "51fabb9be2029ea5db684ddae6fcdd557be644bd2e423aa3dbaf277f6a1b9a12",
+        "stu": 1409,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/structured/receipt.rs",
+        "bytes": 3338,
+        "sha256": "427687df51ecde7adc5b2ff16942dd0954faa07db5144f3191378a519d8eec7d",
+        "stu": 1113,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/structured/validate.rs",
+        "bytes": 24032,
+        "sha256": "8e235616021195c7d602bccc436798203de115d8aacb40f42eda4904d18b05a4",
+        "stu": 8011,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/src/validate.rs",
+        "bytes": 471,
+        "sha256": "6d44a5aa243ee9aa15558ca41d9f5b9e0f81a6887bcda686c40e57565218bd4d",
+        "stu": 157,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/handoff.rs",
+        "bytes": 7914,
+        "sha256": "996ab85b182ca232ae59a51bf1fad70d1d786d5b8274c0c9843a65d99b8cb679",
+        "test_attributes": 2,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/validation.rs",
+        "bytes": 9961,
+        "sha256": "1a88337af2eddfdc3f83c64da54eb774c1a1ded1c0bab64742605ca1729e5fe7",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_a.rs",
+        "bytes": 25177,
+        "sha256": "2121efadce7fd65fbec96daf9db6785936471c04ddba2d258c636c3fb20583f6",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_b.rs",
+        "bytes": 18947,
+        "sha256": "753ea76870f012fb198f098234b17b47a7d17d1fb8b344ede67e068ebff1fc8a",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_c.rs",
+        "bytes": 17800,
+        "sha256": "afba2771c79c3fec6df94d9e59befe517c08dbd3bff39838b578e9bb7d3f645e",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_d.rs",
+        "bytes": 18568,
+        "sha256": "b0498221765519ae1c7d8e3423527154c6372083f84ab7cfe9e347a2018606bf",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_e.rs",
+        "bytes": 19220,
+        "sha256": "11e7261bd33488356ad027f6ced73630ec0d014f5acd53bd2cb4846e049e2fa7",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/tests/wu595_f.rs",
+        "bytes": 14851,
+        "sha256": "b81a7220767be3f32a100bbba4e87c6f8a69f4a4ea86b9842445ce6717714dbf",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "a7de43a18b4d95b139a9ba1d4c43938337a9f799f743085b7bf8da42f108b272"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-dreamer-contracts",
+    "schemars",
+    "serde",
+    "serde_json",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-dreamer",
+    "bins/eliotd"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_ORIENTATION_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "916f5d1a704b1a55e23653297c53723f8f1980764a6e7e5052bc91666abfab0f",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/Cargo.toml",
+        "sha256": "f16ef4140d83d7af761c2d2829c8f7a9be5ef6049146c396928ffdf8d47f9a1b"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-candidate-validation/module.toml",
+        "sha256": "114234711a777e359712daf8e17fc4d5dfbc92a865d9a0d1019c041ecc0009d7"
+      },
+      "selected_source": {
+        "path_count": 18,
+        "sha256": "a7de43a18b4d95b139a9ba1d4c43938337a9f799f743085b7bf8da42f108b272"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "b55682995ae02f0372c35b90a33d8ae1f1ab49408e50b8e8af7d641e8da4e73d",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "b55682995ae02f03"
+  }
+}

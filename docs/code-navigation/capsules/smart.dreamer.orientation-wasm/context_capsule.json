@@ -1,0 +1,162 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.orientation-wasm",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "The accepted native Orientation projector is invocable as a thin typed wasm32-wasip2 guest without a second Orientation owner."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.orientation-wasm"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.orientation-wasm",
+  "primary_source_package": {
+    "package": "eliot-dreamer-orientation-wasm",
+    "root_path": "crates/smart/eliot-dreamer-orientation-wasm",
+    "manifest_path": "crates/smart/eliot-dreamer-orientation-wasm/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-orientation-wasm/module.toml",
+    "description": "Thin typed wasm32-wasip2 adapter over the native Dreamer Orientation projector"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 7844,
+    "test_stu": 13141,
+    "selected_file_count": 5,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/src/conversion.rs",
+        "bytes": 11927,
+        "sha256": "89a73af485376840bdb49e88997c8b128bf5e7fba0ce46a3827b841c74955fe6",
+        "stu": 3976,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/src/descriptor.rs",
+        "bytes": 7619,
+        "sha256": "5ead13e285fd0ea0e6f5d001a71eaa9875ddd9fa1520f0a9ba73498a6ab413cd",
+        "stu": 2540,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/src/export.rs",
+        "bytes": 1731,
+        "sha256": "7621cf9f610367ba637b3e0e8fcf3b1969bee76856ce191fca4d26b19b4dce5f",
+        "stu": 577,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/src/lib.rs",
+        "bytes": 2253,
+        "sha256": "af8b18c2ad814aa5b806270b06dda60103d07d6619705b1f0926467af0e4899e",
+        "stu": 751,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/tests/proof.rs",
+        "bytes": 39423,
+        "sha256": "b0f0a3ec34d028e2dc51b2322554789cefac59b0a1f906643bfe9ee65d355152",
+        "test_attributes": 15,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "fa9451dcee3fe54f48fefd6ab0f8b740948058b006c78b68102462b696f8e7b1"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-dreamer-contracts",
+    "eliot-dreamer-orientation",
+    "eliot-epistemic-contracts",
+    "eliot-evidence",
+    "schemars",
+    "serde",
+    "serde_json",
+    "thiserror",
+    "wasmparser"
+  ],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_ORIENTATION_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "c4688a99e55f437a34881729792bf499d5134d6a345c8899bcdf419c22b16a41",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/Cargo.toml",
+        "sha256": "bce0ebba3cf16f8501858d90e3c2e2b5096e4df53abd7aa431ff3747906c6e9e"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/module.toml",
+        "sha256": "1c790e4204c91a7bfc20538b5b4658740c228ce4136be9ffc1e6741898b3106f"
+      },
+      "selected_source": {
+        "path_count": 5,
+        "sha256": "fa9451dcee3fe54f48fefd6ab0f8b740948058b006c78b68102462b696f8e7b1"
+      },
+      "excluded_disposition": {
+        "path": "workstreams/security/standalone-crate-dispositions.toml",
+        "sha256": "4a5ce7ef7ee19bd18e4d106dbcd3218c7d950e461ea8b9d039ab854bffb3884d"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "257d970db6109cb547a5b89fd85b36892705bd94a6d633572c70c35d3695436b",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "257d970db6109cb5"
+  }
+}

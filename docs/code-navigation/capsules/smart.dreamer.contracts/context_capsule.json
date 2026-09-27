@@ -1,0 +1,834 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.contracts",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "All Dreamer jobs share provider-neutral candidate-only schemas while distinct job classes and authority domains remain explicit."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.contracts"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.contracts",
+  "primary_source_package": {
+    "package": "eliot-dreamer-contracts",
+    "root_path": "crates/smart/eliot-dreamer-contracts",
+    "manifest_path": "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-contracts/module.toml",
+    "description": "Own provider-neutral job, bundle, draft, candidate, preservation and result schemas shared by all Dreamer handlers."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 554953,
+    "test_stu": 106686,
+    "selected_file_count": 89,
+    "inline_cfg_test_modules": 10,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/assembly/material.rs",
+        "bytes": 98816,
+        "sha256": "34e7ec61e2a91ae4a1706c5ae6d16816b1ca8691b4a5c9d75b07b0426b154c94",
+        "stu": 32939,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/assembly/mod.rs",
+        "bytes": 3346,
+        "sha256": "d929cfbe5b0a4466ca8eb96291e244a3c0024aa83061b59b8b67b28ce1aa6a38",
+        "stu": 1116,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/assembly/recipe.rs",
+        "bytes": 49075,
+        "sha256": "4df36e6267e4870cd584335a30f6ca6da33f36690ec7adf605f8981640ec400c",
+        "stu": 16359,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/assembly/result.rs",
+        "bytes": 66148,
+        "sha256": "aaa8b8dccb3a029b5c31879d7eca3b86bc3c825fb9f86ec9653a588a25a8bb95",
+        "stu": 22050,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/budget.rs",
+        "bytes": 27123,
+        "sha256": "11c5e988fdc204c89cfa485ca2122c2c1700bf52c00c600cb85a6a96fd97be0b",
+        "stu": 9041,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/bundle.rs",
+        "bytes": 19242,
+        "sha256": "15667d76d22c4d48ad950c17a20d631cfa2920a5cada13d8e8f9c1d9aa9bc166",
+        "stu": 6414,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/candidate.rs",
+        "bytes": 17251,
+        "sha256": "1af8a63c122d096dab36269074bb5846751c3329935c45719703812f9bcd7311",
+        "stu": 5751,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/classification/input.rs",
+        "bytes": 29588,
+        "sha256": "ee1513c33e318dfce4e5ceb733fb7aad90e6f846ee39515fb927eaa687f3e7f6",
+        "stu": 9863,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/classification/mod.rs",
+        "bytes": 1214,
+        "sha256": "42520ed87f6075c370f12c4f3f80a385851e71cd1bcb8a76cba303b203151a02",
+        "stu": 405,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/classification/result.rs",
+        "bytes": 23560,
+        "sha256": "11a3715067d1018960b4f37cd7d17d3c17a87d750c3ccb693fc94cf5293034d6",
+        "stu": 7854,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/classification/taxonomy.rs",
+        "bytes": 22506,
+        "sha256": "b06e6aab23b625fddadde4de2d201bc88082b6e56e0db6ea5f0018fbfc9a1673",
+        "stu": 7502,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/concept/input.rs",
+        "bytes": 35734,
+        "sha256": "7ccf6ef563d7714be06b542cc2ea520c093d9375e4ba6e82cc04e55f98daebb1",
+        "stu": 11912,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/concept/mod.rs",
+        "bytes": 883,
+        "sha256": "9b80c381dc943f0d472c27e62d2522d08cee6ff14b479c061ed1f8b85d504b50",
+        "stu": 295,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/concept/proposal.rs",
+        "bytes": 25250,
+        "sha256": "0c533144d3c0daf296fbb66c7278caea6939518613117215704d7add20a3a70b",
+        "stu": 8417,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/concept/result.rs",
+        "bytes": 14198,
+        "sha256": "ab11385c22f59ddc1fb2c52da0f574a95f44bbdc4c1be5434f5ae288392b0c9f",
+        "stu": 4733,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/curation.rs",
+        "bytes": 32978,
+        "sha256": "248946569fde9bc5de448c2c7e2c17ab0e2e23052effad4657a952ddcd1bbf2a",
+        "stu": 10993,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/curation_invocation.rs",
+        "bytes": 20429,
+        "sha256": "a300e026495e123cf112e639d684110b2ed8bd76fe38574e391fef5dbad252df",
+        "stu": 6810,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/diagnosis/discriminator.rs",
+        "bytes": 52373,
+        "sha256": "09c5e4e3562dc47244285756c8994f8ec6c8b8f0616e6204a3d61773f90cfaa6",
+        "stu": 17458,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/diagnosis/identity.rs",
+        "bytes": 37242,
+        "sha256": "a6324f619d60fabc37008460b6b8e8502744abd17ce98914f14675d09209167a",
+        "stu": 12414,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/diagnosis/mod.rs",
+        "bytes": 1396,
+        "sha256": "40e1084f8dbd02a0b8235195872083febd5636b709b0225ce17ddc8248c77f37",
+        "stu": 466,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/diagnosis/repair.rs",
+        "bytes": 58843,
+        "sha256": "fa01dad23b61f58c1626b59d8918fc804343906aec82d63ad0d08a134b7f116c",
+        "stu": 19615,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/diagnosis/validation.rs",
+        "bytes": 4133,
+        "sha256": "6e02a2151f924a3fd3807bede112798736a0be2862b8d3028cbce9892c186c47",
+        "stu": 1378,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/draft.rs",
+        "bytes": 60417,
+        "sha256": "b2edf252b0cfe8c92f1e148f37433785eb2f66934f5ca22b771f06ae103e8ff3",
+        "stu": 20139,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/encoding.rs",
+        "bytes": 13345,
+        "sha256": "b38d50a6efc31c6e753d4c255776176136fa7c857519a05c02d86686355f9859",
+        "stu": 4449,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/error.rs",
+        "bytes": 8792,
+        "sha256": "0f4998c09d5d33ae5debfefba9e556d66062fb66483546b79014b27dd57f58d4",
+        "stu": 2931,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/failure/input.rs",
+        "bytes": 68358,
+        "sha256": "5301fc4ebf95bdc1c89fcaf84350b4e87a7c11b65ebe0c4733c8d65a6bd58424",
+        "stu": 22786,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/failure/mod.rs",
+        "bytes": 1494,
+        "sha256": "12518432183bd0724e3557f252a9dab4a68aa370571ce7cb9f97db90f9f4a85c",
+        "stu": 498,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/failure/records.rs",
+        "bytes": 71909,
+        "sha256": "b9306741fe9cd4da81fa1f04a8a82a7ff86320f3c93b4f6c76fa3a896e31cc70",
+        "stu": 23970,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/failure/result.rs",
+        "bytes": 16921,
+        "sha256": "e11e0fd38507072c3d42adff85bf8da1cb4ea67268667507b247d199777830fd",
+        "stu": 5641,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/grounding/claims.rs",
+        "bytes": 25520,
+        "sha256": "32c3008d2e83df37d00362a3268ebab345cae491979af2b26cfe2660adb0e636",
+        "stu": 8507,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/grounding/encoding.rs",
+        "bytes": 1609,
+        "sha256": "f5e2c105ee12556ee4491cb0b0fab8919558e54398c36d7d2397a8d24082e41f",
+        "stu": 537,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/grounding/ledger.rs",
+        "bytes": 18118,
+        "sha256": "310207fd0d8ff34c646062578c8ef99f2c83749c0886c0d7cae52462b011a317",
+        "stu": 6040,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/grounding/manifest.rs",
+        "bytes": 20794,
+        "sha256": "e8eb7cf550fa7873dfb1ebc84dbf38bf0a6d093e197ab381ffb2dd6d5dce4546",
+        "stu": 6932,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/grounding/mod.rs",
+        "bytes": 36917,
+        "sha256": "f501573bcc44bbf306eb961a12571f985b91498006755a81ccb44a55f345e880",
+        "stu": 12306,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/grounding/policy.rs",
+        "bytes": 4173,
+        "sha256": "543c65c99525c63b54cf13caf51e3763e708f60aa68b25bc866b79302fa9f6a7",
+        "stu": 1391,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/job.rs",
+        "bytes": 27247,
+        "sha256": "2654781fa4201a8a84488e1a6d2639b6082f2f4ab1e19715acb6360818040087",
+        "stu": 9083,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/lib.rs",
+        "bytes": 10875,
+        "sha256": "5bc27114238aa51cf28748ad62bd4e65914a64abb5e7d228924312fac63fea30",
+        "stu": 3625,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/model_route.rs",
+        "bytes": 20944,
+        "sha256": "bd2602cd0856cd32b454f7114b86f074e976f1126c563a14b530f48f7a74d121",
+        "stu": 6982,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/affordance.rs",
+        "bytes": 44726,
+        "sha256": "48a687f55b53346a3eb835b1948eab96f41161ed825096e7fc9d7620abd1d6da",
+        "stu": 14909,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/bounds.rs",
+        "bytes": 1068,
+        "sha256": "f064ddcc966ec13b431477037bd8355d231752152bc93a44b5e30fbf2cc8d2ac",
+        "stu": 356,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/input.rs",
+        "bytes": 30835,
+        "sha256": "186c221245bd9a2fb361ac1c6ccdb87b204c94484876093f5f055ce8ec2b7351",
+        "stu": 10279,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/mod.rs",
+        "bytes": 1815,
+        "sha256": "017215bff9596b7463a5acbb8affe4ff9314223d64f99b5e8f03c01e79407322",
+        "stu": 605,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/objective.rs",
+        "bytes": 18861,
+        "sha256": "5f43a32880f3a484fb2d21fc077edab936895f74623de9bd0dcca659835729a4",
+        "stu": 6287,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/policy.rs",
+        "bytes": 5161,
+        "sha256": "99d7b017425541e2297dfca354fd243ac48eabafa06d1ad2b82bf02b9d4f159a",
+        "stu": 1721,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/result.rs",
+        "bytes": 24187,
+        "sha256": "23e01c285136e3a3003ae1bbf512fb8b3d61b2ba9a5c1132238c07f98ccc524c",
+        "stu": 8063,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/probe/validation.rs",
+        "bytes": 1735,
+        "sha256": "3e774db03e0ab3e5fa404c335e2135bb444c3ff39bd8734168ce77fe45705e20",
+        "stu": 579,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/registry.rs",
+        "bytes": 54827,
+        "sha256": "dc663d65f4b0d59cc5826f757c78b3cc91621f1795471ea47679d24a43f8ba4e",
+        "stu": 18276,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/rejection.rs",
+        "bytes": 5572,
+        "sha256": "34c53714902c8cc558634afd88fd471f33e7446316182de01cceda6caedee4fd",
+        "stu": 1858,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/relation/input.rs",
+        "bytes": 44504,
+        "sha256": "457a77b092ba601bea71f79df9f243acb98ab8b0adb775844dafc402a81e75f1",
+        "stu": 14835,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/relation/mod.rs",
+        "bytes": 1014,
+        "sha256": "d2cd0ab5e9636fe54eed21623753d4f092b04d0dd883fcf60c2fab97fab4b980",
+        "stu": 338,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/relation/registry.rs",
+        "bytes": 17254,
+        "sha256": "1ea01d29cc2adcc676f9065c1545dc59f69806d2a859034e9e67b0cc8dcd4989",
+        "stu": 5752,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/relation/result.rs",
+        "bytes": 28977,
+        "sha256": "d442871e0824b8486b74f788bd48591318d551ea432e7a5bba4fa173c3c4409a",
+        "stu": 9659,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/rival/mod.rs",
+        "bytes": 1574,
+        "sha256": "b2fbdd3fc5625b54a1321bde80e9a027ded64d07c2ea90949a3fa8630d89513d",
+        "stu": 525,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/rival/model.rs",
+        "bytes": 91915,
+        "sha256": "150f6adf7ee7c04f861bae6b6c8bc99c274b6ce2f36c8af810cc38a78f4ad861",
+        "stu": 30639,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/rival/prediction.rs",
+        "bytes": 13978,
+        "sha256": "a2d6fd603e41a06913708ef834ad8799c0d85a8d347e5ee308b23fcfcb9ab291",
+        "stu": 4660,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/rival/projection.rs",
+        "bytes": 26998,
+        "sha256": "f24338c4bb5f3a82d6655827ab2266526061709c022ecf5ad576677ad76d3f26",
+        "stu": 9000,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/rival/set.rs",
+        "bytes": 16190,
+        "sha256": "d0976c85999613e2d397599984a3de47dbfdfcf657ddd51451d69f090370ccb2",
+        "stu": 5397,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/rival/validation.rs",
+        "bytes": 34707,
+        "sha256": "d805fb47ae06949c18f3ee8d3f1199705774ea3f8b7847459b0ccd50705b3996",
+        "stu": 11569,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/screen.rs",
+        "bytes": 12617,
+        "sha256": "78f5674f6f7b3aff9fe120773ab0b5fae88bbaef4e049552fedfd946f7d50ac8",
+        "stu": 4206,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/self_query/accepted.rs",
+        "bytes": 8838,
+        "sha256": "69367c4e34a092ce6a5c7b4df20343682e8686388b648663a563607fe2acaf06",
+        "stu": 2946,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/self_query/input.rs",
+        "bytes": 22267,
+        "sha256": "efaad936442eb244d7afbdbbce8338b5305bb7b5d6fbe2c0b4f3f9499048619a",
+        "stu": 7423,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/self_query/mod.rs",
+        "bytes": 1420,
+        "sha256": "120a42353ba5a07954fafe7a1c33996267368f8c79def3fad18300570b3fcaf8",
+        "stu": 474,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/self_query/result.rs",
+        "bytes": 40543,
+        "sha256": "a809eb880a0dcb6ed48442a7ef5813321e0b2ebb192426c852960b85ab267535",
+        "stu": 13515,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/self_query/source.rs",
+        "bytes": 20069,
+        "sha256": "e2bddde339969a63c5e3663cdf348543d156eb2fbefe40f3702374476d769652",
+        "stu": 6690,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/bounds.rs",
+        "bytes": 4396,
+        "sha256": "b9456a66b8885645812cada7056643dcd3c1a7e0ea56849274b8353bcec67e43",
+        "stu": 1466,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/encoding.rs",
+        "bytes": 4324,
+        "sha256": "aee12c99ad1e9d3f6b8be9001ee336426d10fddc00d990fdae40226c516ab832",
+        "stu": 1442,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/error.rs",
+        "bytes": 2309,
+        "sha256": "420dc453f2849f60bdc20b823c6ca001ca07404c9cff69a1c9d74496e82e1cea",
+        "stu": 770,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/mod.rs",
+        "bytes": 8134,
+        "sha256": "e46a3ce3755dab7bb6983098ec7369e661123f2e8fed2d32d0684babb08647b8",
+        "stu": 2712,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/policy.rs",
+        "bytes": 4897,
+        "sha256": "c2cae2e09a9608ed9c1a90f959b1a505bc428d43d2661f7f8ed2b6e535582d80",
+        "stu": 1633,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/structured/binding.rs",
+        "bytes": 8104,
+        "sha256": "7c21e1fb8de0c89e2aa87e4286ab0ce2b6863116c072b6636a1da4d354912aa2",
+        "stu": 2702,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/structured/encoding.rs",
+        "bytes": 6886,
+        "sha256": "2e271ff0d8a0dac52eb3bc7c497ef568250756f37ef31bb9f0b43b5c7d8977e0",
+        "stu": 2296,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/validation/structured/mod.rs",
+        "bytes": 5396,
+        "sha256": "820b5925037d9328a4c530b27cb4e86cacea0711a3489c3d1604ae406c54d6ce",
+        "stu": 1799,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/assembly.rs",
+        "bytes": 18736,
+        "sha256": "cc04906a882496ece24a47bd1992208e4b8c0d6b38c83c386818dcf25e65f00b",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/classification_contracts.rs",
+        "bytes": 32778,
+        "sha256": "c075050dd9306e8a8baed09e864077bd08bb5d25483cf147cbbbd59022dba344",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/concept_contracts.rs",
+        "bytes": 23622,
+        "sha256": "54ae3907e1aa2ff4107b9f8273e9379f11cb9ded4a9bbdb43c932d8b94f8697c",
+        "test_attributes": 4,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/consumer_and_source_proof.rs",
+        "bytes": 25280,
+        "sha256": "3387c72bcc72992222622b6158c296d8e6dbfa80bd6c2fdc5e84e0c4ca6cb9b5",
+        "test_attributes": 2,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/curation_invocation.rs",
+        "bytes": 20461,
+        "sha256": "df726966e79a2c7a4848540ee6e56f05a04417e2aba31758d19deb0bf6096119",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/failure_contracts.rs",
+        "bytes": 7520,
+        "sha256": "1e2433910bbbe96510a786381ec6793ee704f279be1066d859a8a8d5a6936376",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/grounding_handoff.rs",
+        "bytes": 7635,
+        "sha256": "0b618955031351f1cdf1aa09b401eff72ae52e755c04ad6f2510483ac30f1ac5",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/inquiry_affordance_contracts.rs",
+        "bytes": 20262,
+        "sha256": "4191a53f155b6094e6d18ed92920c62ab274f64a4645fa90ffdce8913a74728c",
+        "test_attributes": 12,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/model_route_contracts.rs",
+        "bytes": 10757,
+        "sha256": "26044c94a5b7d3b87c451547e91eca05a53459cf7ed3b7998c1a0a5a6bf318d9",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/probe_input_contracts.rs",
+        "bytes": 15989,
+        "sha256": "86fce0c5dcedf2861c30c247b258ad11bf71ad07cd613987a5ddaa73f5230bf5",
+        "test_attributes": 8,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/rejection_vocab.rs",
+        "bytes": 4743,
+        "sha256": "4da4af6a2d312903308ec4cef7babf4053902d64e1f0af3fbc6cb637076cf14c",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/relation_contracts.rs",
+        "bytes": 25003,
+        "sha256": "e10fef904d852135f16e529739be126e69203cc744f0bdd065a61133baf6f3f9",
+        "test_attributes": 5,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/rival_declaration_contracts.rs",
+        "bytes": 61551,
+        "sha256": "c0303b2b6564b0ddb56538d760a7047076b21dd2743f4779d4a276c148755e26",
+        "test_attributes": 24,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/rival_projection_contracts.rs",
+        "bytes": 19743,
+        "sha256": "55567b5f98d2c3a13c2827b3d2f83d86ddce07c06944715316a6cd0a476cbff9",
+        "test_attributes": 12,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/support/grounding.rs",
+        "bytes": 16829,
+        "sha256": "d02dec343f67dcb3153235f5b4b1d410b562f69244bd02c8998c19b3d20eded8",
+        "test_attributes": 0,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/update_set_equivalence.rs",
+        "bytes": 8572,
+        "sha256": "29725abe7a702d429009bfb32f79ead8e6b54c984d89bb4f2f8d25e0aa24fcab",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/tests/validated_draft.rs",
+        "bytes": 575,
+        "sha256": "5a1f79dc2a0f9e3a737d44a2eceb8f65a6c98d0ccef9884b23fb50ac864ba08e",
+        "test_attributes": 1,
+        "inline_cfg_test": false,
+        "classes": []
+      }
+    ],
+    "source_selection_digest": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
+  },
+  "one_hop_providers": [
+    "blake3",
+    "eliot-context-contracts",
+    "eliot-contracts",
+    "eliot-epistemic-contracts",
+    "eliot-evaluation-contracts",
+    "eliot-evidence",
+    "eliot-receipts",
+    "eliot-security-contracts",
+    "schemars",
+    "serde",
+    "serde_json",
+    "sha2",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-dreamer",
+    "bins/eliotd",
+    "crates/smart/eliot-dreamer-accessibility",
+    "crates/smart/eliot-dreamer-architecture-brief",
+    "crates/smart/eliot-dreamer-bundle",
+    "crates/smart/eliot-dreamer-candidate-validation",
+    "crates/smart/eliot-dreamer-claim-grounding",
+    "crates/smart/eliot-dreamer-clarification",
+    "crates/smart/eliot-dreamer-classification",
+    "crates/smart/eliot-dreamer-concept",
+    "crates/smart/eliot-dreamer-configuration-plan",
+    "crates/smart/eliot-dreamer-conflict-analysis",
+    "crates/smart/eliot-dreamer-core",
+    "crates/smart/eliot-dreamer-curation",
+    "crates/smart/eliot-dreamer-curation-wasm",
+    "crates/smart/eliot-dreamer-cycle",
+    "crates/smart/eliot-dreamer-cycle-wasm",
+    "crates/smart/eliot-dreamer-development-diagnosis",
+    "crates/smart/eliot-dreamer-episode",
+    "crates/smart/eliot-dreamer-failure",
+    "crates/smart/eliot-dreamer-implementation-brief",
+    "crates/smart/eliot-dreamer-maintenance-plan",
+    "crates/smart/eliot-dreamer-memory-repair",
+    "crates/smart/eliot-dreamer-memory-revision",
+    "crates/smart/eliot-dreamer-orchestration-plan",
+    "crates/smart/eliot-dreamer-orientation",
+    "crates/smart/eliot-dreamer-orientation-wasm",
+    "crates/smart/eliot-dreamer-probe-plan",
+    "crates/smart/eliot-dreamer-procedure",
+    "crates/smart/eliot-dreamer-reconsolidation",
+    "crates/smart/eliot-dreamer-relation",
+    "crates/smart/eliot-dreamer-research-wasm",
+    "crates/smart/eliot-dreamer-rival-model",
+    "crates/smart/eliot-dreamer-self-query",
+    "crates/smart/eliot-dreamer-structure-repair",
+    "crates/smart/eliot-understanding-assessment"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [
+    "crates/smart/eliot-dreamer-contracts/tests/curation_invocation.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/rejection_vocab.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/rival_declaration_contracts.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/rival_projection_contracts.rs"
+  ],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_ORIENTATION_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "b9506fc83d6cff000e432500ef5210ca03a3359817e2b0a77787a7e8e1934720",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+        "sha256": "a65d44513c701ba3476107d77aea296a69271e88087b004fae1a8c90931dc084"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-contracts/module.toml",
+        "sha256": "43f57649b8ad6949fa793e1d99854bfc8a917b82a7c93671ce560bf70ef31b45"
+      },
+      "selected_source": {
+        "path_count": 89,
+        "sha256": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "7d2ce2476adb571443fe1f136865745559bd407002ac45a0f87259aa48d50a74",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "7d2ce2476adb5714"
+  }
+}

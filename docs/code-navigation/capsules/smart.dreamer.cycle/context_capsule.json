@@ -1,0 +1,200 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.cycle",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "All Dreamer jobs share provider-neutral candidate-only schemas while distinct job classes and authority domains remain explicit."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.cycle"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.cycle",
+  "primary_source_package": {
+    "package": "eliot-dreamer-cycle",
+    "root_path": "crates/smart/eliot-dreamer-cycle",
+    "manifest_path": "crates/smart/eliot-dreamer-cycle/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-cycle/module.toml",
+    "description": "Pure bounded one-step Dreamer controller transition"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 64078,
+    "test_stu": 26235,
+    "selected_file_count": 11,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/bounds.rs",
+        "bytes": 23455,
+        "sha256": "dd58c2cdd05b84821b3277c2e819fa5f58199809b3c747ce0eec58825f72bf86",
+        "stu": 7819,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/contract.rs",
+        "bytes": 30495,
+        "sha256": "f52cee574c4f1ab1c74af244360f8875fb6cf0b9404bb42bd5e813b943eed1c0",
+        "stu": 10165,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/durable.rs",
+        "bytes": 64226,
+        "sha256": "2c74ce6829418577df850a9762d69f89b94beff7bc436384c191a0e2d8995fee",
+        "stu": 21409,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/error.rs",
+        "bytes": 2347,
+        "sha256": "207e13c2a34a11f28dbfc3e401e7c15ad21b88a5b56ae40ed6ba60dd942b8823",
+        "stu": 783,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/lib.rs",
+        "bytes": 1499,
+        "sha256": "eef8b9b382f797bd148ee0da4f852186aac479ac67ba05d72fe8045c564ce0f0",
+        "stu": 500,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/plan.rs",
+        "bytes": 16642,
+        "sha256": "ce1b4e58d906ef86b7c826c3d078fc366a42aacae9fb11ac3825a19f1aa5390c",
+        "stu": 5548,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/policy.rs",
+        "bytes": 2998,
+        "sha256": "876bd4266fd71daaf8927c9b5441b64c0299d5cbf5692f8f010cc8d82747aaab",
+        "stu": 1000,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/receipt.rs",
+        "bytes": 19303,
+        "sha256": "093327b1227161f480767bfb58aa7138b125cea3d3ad72f178941db0805af158",
+        "stu": 6435,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/sample.rs",
+        "bytes": 14032,
+        "sha256": "d4fe77b1c139990678ce52deec641235658af65706570ad5b0d6e8001276e7ea",
+        "stu": 4678,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/src/step.rs",
+        "bytes": 17236,
+        "sha256": "e8b9bb590eec1d3c0db41fdf69b5261fc2d22bdfec422857cc1c8e496f9ae7c5",
+        "stu": 5746,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-cycle/tests/cycle.rs",
+        "bytes": 78705,
+        "sha256": "1cfde4d49e425e2b89bcc9e3ed9883226b6f2fe938e01630dc2987826fdab9ef",
+        "test_attributes": 26,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "3b528c1ae92e411d61365d4532d544605e02241d9568f37ab845d15ddb159d6d"
+  },
+  "one_hop_providers": [
+    "eliot-agent-contracts",
+    "eliot-contracts",
+    "eliot-dreamer-contracts",
+    "eliot-receipts",
+    "schemars",
+    "serde",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-dreamer",
+    "crates/smart/eliot-dreamer-cycle-wasm"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_ORIENTATION_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "b22ea7d4c6a02095a319bf91f12525a1273682ec92717fd36bdb8bee3d58133d",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-cycle/Cargo.toml",
+        "sha256": "c8cb5f2973ef0bbe262bcf2753ff4bb4dd849853501f5db46371378298c82f71"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-cycle/module.toml",
+        "sha256": "c170641c359f9b27e8cef11b498be1e3fb7a4d83e50e7e131e58da6c8cef9d13"
+      },
+      "selected_source": {
+        "path_count": 11,
+        "sha256": "3b528c1ae92e411d61365d4532d544605e02241d9568f37ab845d15ddb159d6d"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "f2a300421ba9752270a9a1d63fa884e6068475546934781a0a3b493b747736a0",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "f2a300421ba97522"
+  }
+}

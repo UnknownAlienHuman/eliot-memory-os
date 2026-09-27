@@ -1,0 +1,207 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.clarification",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "One material ambiguity yields one discriminative question and safe fallback without becoming part of basic Orientation or owning delivery."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.clarification"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.clarification",
+  "primary_source_package": {
+    "package": "eliot-dreamer-clarification",
+    "root_path": "crates/smart/eliot-dreamer-clarification",
+    "manifest_path": "crates/smart/eliot-dreamer-clarification/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-clarification/module.toml",
+    "description": "One-question clarification candidate with task-local or Human routing recommendation"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 44013,
+    "test_stu": 1825,
+    "selected_file_count": 13,
+    "inline_cfg_test_modules": 1,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/error.rs",
+        "bytes": 2477,
+        "sha256": "aa1e9b1989af6d43b40d755046aba4e17243ba7c988b8364826fc68d623436e1",
+        "stu": 826,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/lib.rs",
+        "bytes": 2155,
+        "sha256": "8cf6a0410d0cc15cb407a4108dcd6fabd6686689b9423700330ef50888adf8fa",
+        "stu": 719,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/model.rs",
+        "bytes": 180,
+        "sha256": "b7959ab278aac5fb7730ef74d5d144730d4d44a32cc6e9ec58a3768a9f4bb1ac",
+        "stu": 60,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/model/part_01.rs",
+        "bytes": 10177,
+        "sha256": "15628bb4808c0dad22d6ca92019dbcfc06836c8417a15382dac5c0c6ffc89ca4",
+        "stu": 3393,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/model/part_02.rs",
+        "bytes": 12476,
+        "sha256": "d208602f8969f8b02399e8b8a02c8452ce776e3fea3318542f4e777cf431288a",
+        "stu": 4159,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/model/part_03.rs",
+        "bytes": 12497,
+        "sha256": "d1a2c3500dbcaeef73e4ece7d50df191479fc2a0c67f5bc63828a76a8f9f9088",
+        "stu": 4166,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/model/part_04.rs",
+        "bytes": 10500,
+        "sha256": "bffc815c89f9cae70b512c3ff97587a5cbec0590e98b289e49133d728e4ce0b3",
+        "stu": 3500,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/model/part_05.rs",
+        "bytes": 7553,
+        "sha256": "672b4a9bc5bbe65a28b2d675534514c54b3c8f8581068b02a9223019b08d681b",
+        "stu": 2518,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/model/part_06.rs",
+        "bytes": 16044,
+        "sha256": "2cc9034cf00aca9ad9e383b71d23e8597f3a73247ad0c9c03d739e9fe5d9ca86",
+        "stu": 5348,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/select.rs",
+        "bytes": 20618,
+        "sha256": "63636416aee69e97314b7146718f1fa825c701211ce27a4d29f4616874d4d190",
+        "stu": 6873,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/strict.rs",
+        "bytes": 6952,
+        "sha256": "167e35189e49f3e038b26c25dfd3ba2c899fba8e63956a36498db1718b6beada",
+        "stu": 2318,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/tests.rs",
+        "bytes": 30408,
+        "sha256": "e15407fbdd85c8d7be70aa7bc097ad451f4d967a3e2b8ab16eb07a47d36eb11a",
+        "stu": 10136,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/tests/strict_regressions.rs",
+        "bytes": 5475,
+        "sha256": "d18869c7d9693c252ab1a2db5ab42ff55f7a3f7410565b01cdde720d47be679e",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": []
+      }
+    ],
+    "source_selection_digest": "6be4e76a7745b2677be11395626f68f6a0f92740da8cba90fbe8f8b772fe31a3"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-dreamer-contracts",
+    "schemars",
+    "serde",
+    "thiserror"
+  ],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_CLARIFICATION_EDGE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "62ea110ff4063d6f1f27f7a87c7fedf06515029ba56348cb483ab6413e850d59",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-clarification/Cargo.toml",
+        "sha256": "9d94820ca618343c6f2a5a43a48cba1305a344a0a0f20539b4d035f36a4085e4"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-clarification/module.toml",
+        "sha256": "978c5d533813ad550252bca5cc004e6aaa9f974eee383b87e3d3c7b3ff377530"
+      },
+      "selected_source": {
+        "path_count": 13,
+        "sha256": "6be4e76a7745b2677be11395626f68f6a0f92740da8cba90fbe8f8b772fe31a3"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "ad9c22fc72558c41950cabe5232faca9284813af7726cac99f9999d61d7598ef",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "ad9c22fc72558c41"
+  }
+}

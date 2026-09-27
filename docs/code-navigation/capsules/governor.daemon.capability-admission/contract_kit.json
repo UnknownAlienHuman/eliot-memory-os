@@ -1,0 +1,311 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "governor.daemon.capability-admission",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "governor.daemon.capability-admission",
+    "source_package": "eliotd",
+    "source_manifest": "bins/eliotd/Cargo.toml",
+    "source_root_path": "bins/eliotd",
+    "module_manifest": null,
+    "workspace_member": true,
+    "bins_reachable": true,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Compose the production Governor daemon from an authenticated Kernel-generation port: own the process composition, the declared startup capability binding ledger, the poll contour, the Kernel transport client, the volatile operator replay handle, the Skill catalogue handle, the capability admission view and the durable learning-closure owner. It owns no Kernel, canonical store client, store adapter or physical process executor."
+    },
+    "causal_property": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|causal_property",
+      "value": null
+    },
+    "invariants": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|invariants",
+      "value": null
+    },
+    "non_goals": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|non_goals",
+      "value": null
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [
+      "ARCH-AUTH-01",
+      "ARCH-FIN-01",
+      "ARCH-MOD-03",
+      "ARCH-OBS-01",
+      "ARCH-SEC-02",
+      "ELIOT_IMPLEMENTATION:I1.8",
+      "ELIOT_IMPLEMENTATION:I2.23",
+      "ELIOT_IMPLEMENTATION:I5.19",
+      "ELIOT_IMPLEMENTATION:I6.10"
+    ],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "governor-semantic-control",
+        "title": "Governor semantic control",
+        "responsibility": "Semantic admission, task/workscope ownership, coordination, canonical transitions, module registry, maintenance, and finish.",
+        "documentation_handles": [
+          "I5.19"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": null
+    },
+    "source_maintenance_owner": {
+      "state": "DECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": "governor.daemon"
+    },
+    "state_class": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|state_class",
+      "value": null
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": null
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|inputs",
+      "value": null
+    },
+    "outputs": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|outputs",
+      "value": null
+    },
+    "providers": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|providers",
+      "value": null
+    },
+    "depends_on": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|depends_on",
+      "value": null
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "UNDECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": null
+      },
+      "runtime_bundle": {
+        "state": "UNDECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": null
+      },
+      "runtime_root_rules": [
+        {
+          "package": "eliotd",
+          "issue": "18",
+          "forbidden_exact": [
+            "eliot-app",
+            "eliot-engine",
+            "eliot-store-surreal-adapter",
+            "surrealdb"
+          ],
+          "forbidden_prefix": [
+            "eliot-dreamer",
+            "eliot-model",
+            "eliot-research",
+            "eliot-researcher"
+          ]
+        }
+      ],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": null
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": null
+    },
+    "split_trigger": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": null
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "DECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": "eliotd"
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|discriminator",
+      "value": null
+    },
+    "old_failure_or_missing_capability": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": null
+    },
+    "forbidden_patterns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": null
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [
+      "ARCH-AUTH-01",
+      "ARCH-FIN-01",
+      "ARCH-MOD-03",
+      "ARCH-OBS-01",
+      "ARCH-SEC-02"
+    ],
+    "contract_ref_failures": [
+      "ARCH-AUTH-01 is unresolvable",
+      "ARCH-FIN-01 is unresolvable",
+      "ARCH-MOD-03 is unresolvable",
+      "ARCH-OBS-01 is unresolvable",
+      "ARCH-SEC-02 is unresolvable"
+    ],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I1.8",
+        "resolved_as": "documentation_handle",
+        "handle": "I1.8",
+        "path": "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+        "anchor": "i18-exact-ownership-and-call-paths",
+        "sha256": "9585782187e155a239911388a0ed5ca489b9e8808cd95b159dcaf7fa71bedf28"
+      },
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I2.23",
+        "resolved_as": "documentation_handle",
+        "handle": "I2.23",
+        "path": "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+        "anchor": "i223-capability-family-topology-and-crate-extraction-decisions",
+        "sha256": "e003d8e17b414ee0715028d7d3997d1b109c18df20ad0294ae2856d3e21e4e49"
+      },
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I5.19",
+        "resolved_as": "documentation_handle",
+        "handle": "I5.19",
+        "path": "docs/architecture/I05-19-write-submission-execution-and-receipts.md",
+        "anchor": "i519-write-submission-execution-and-receipts",
+        "sha256": "7f40be7a9152aadc654b2780959903a7147561b1372866d5490389d632e89ddf"
+      },
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I6.10",
+        "resolved_as": "documentation_handle",
+        "handle": "I6.10",
+        "path": "docs/architecture/I06-10-authority-records.md",
+        "anchor": "i610-authority-records",
+        "sha256": "8c757e585ac36fc380ed464fad990648fe470378039e6fe5fe27c7164ecb2f70"
+      }
+    ],
+    "contract_refs_source": "bins/eliotd/Cargo.toml",
+    "donor_records": []
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "bins/eliotd/Cargo.toml",
+        "sha256": "955e74e5d5c038ad9fbbe09e0df4788d2b870251cfe86a676b63c50fa78b6cab"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 71,
+        "sha256": "5a76115fb9ed94c84092f5819ca7889bfe34f5b3f91c387cdfd2fabefaa8b2e9"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "af65a3e4c34e6441252acce41b30c6626fc98b1b0693afdb574a496470039439",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "af65a3e4c34e6441"
+  }
+}

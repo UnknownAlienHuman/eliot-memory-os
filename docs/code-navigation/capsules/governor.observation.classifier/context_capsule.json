@@ -1,0 +1,157 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "governor.observation.classifier",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Own Governor observation admission, safe capture fallback, active-plan compilation and the rebuildable journal projection."
+  },
+  "functional_capability_cell_refs": [
+    "governor.observation.admission",
+    "governor.observation.classifier",
+    "governor.observation.journal_projection",
+    "governor.observation.plan_compilation"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/governor.observation.classifier",
+  "primary_source_package": {
+    "package": "eliot-observation",
+    "root_path": "crates/governor/eliot-observation",
+    "manifest_path": "crates/governor/eliot-observation/Cargo.toml",
+    "module_manifest": null,
+    "description": "Governor-owned observation admission, plan compilation and journal projection"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 46614,
+    "test_stu": 4153,
+    "selected_file_count": 4,
+    "inline_cfg_test_modules": 1,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/governor/eliot-observation/src/bank_admission.rs",
+        "bytes": 68555,
+        "sha256": "52e6bbe3d2f0a981173f6f9eed87f81ea33b5f2e2f440d4d541ec024c590ac23",
+        "stu": 22852,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/governor/eliot-observation/src/classifier.rs",
+        "bytes": 4262,
+        "sha256": "3d00ee48f9ce0797bcb9399c9c67675676b21b39a8feb091ade083e303ee26b0",
+        "stu": 1421,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/governor/eliot-observation/src/lib.rs",
+        "bytes": 67024,
+        "sha256": "21867d229f5dd22b7ebb7b1c0fc362f29ed85701068d94a0ddcfc3d0e25acce2",
+        "stu": 22342,
+        "inline_cfg_test": true
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/governor/eliot-observation/tests/classifier_first_pass.rs",
+        "bytes": 12459,
+        "sha256": "71c8fd3d1a91c6cf1aca3002f7fef95a3eb64734a60ce3bd80fc7eedf1a9da71",
+        "test_attributes": 5,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "ec91475890cad29045ec85ac8ce90c519f330e0378b419c206169f0d20905695"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-evidence",
+    "eliot-observation-contracts",
+    "schemars",
+    "serde",
+    "serde_json",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliotd",
+    "crates/governor/eliot-governor",
+    "crates/smart/eliot-cue-binding",
+    "crates/smart/eliot-cues"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "governor-semantic-control",
+      "title": "Governor semantic control",
+      "responsibility": "Semantic admission, task/workscope ownership, coordination, canonical transitions, module registry, maintenance, and finish.",
+      "documentation_handles": [
+        "I5.19"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [
+      "ARCH-LIFE-01",
+      "ARCH-MEM-01",
+      "ARCH-SEC-02",
+      "ELIOT_IMPLEMENTATION:I5.5-I5.6"
+    ],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "183d5be48ad8b5802f711ee2986c72f117c7a5d8ea96850965287ec9caf72d78",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/governor/eliot-observation/Cargo.toml",
+        "sha256": "a0eb01d9b0685e1c17bc68ab19af2e221cbc431e8460e3758a5bf630992072b2"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 4,
+        "sha256": "ec91475890cad29045ec85ac8ce90c519f330e0378b419c206169f0d20905695"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "2f22aa348079f2c68c6159c886973229da052297eb82d22442d6314f4f357322",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "2f22aa348079f2c6"
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.experience.provider",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Governor-admitted journal envelopes read through the canonical store bridge become frozen V1 owner projections and Smart read-aid views with honest coverage, never completeness claims."
+  },
+  "functional_capability_cell_refs": [
+    "smart.experience.provider"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.experience.provider",
+  "primary_source_package": {
+    "package": "eliot-experience-provider",
+    "root_path": "crates/smart/eliot-experience-provider",
+    "manifest_path": "crates/smart/eliot-experience-provider/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-experience-provider/module.toml",
+    "description": "Audit-bridge experience provider: V1 journal projections over durable reads (#223)"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 14691,
+    "test_stu": 0,
+    "selected_file_count": 1,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-experience-provider/src/lib.rs",
+        "bytes": 44071,
+        "sha256": "06723a6ada73647ed2e21c7239eb307ed9561b0cac923681eab3c5ee38921a36",
+        "stu": 14691,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [],
+    "source_selection_digest": "f7cadd5f6cb5361bb4d2a6e42b2ae696e55134c5c2b1518cc3fe67df493ea517"
+  },
+  "one_hop_providers": [
+    "eliot-cognitive-quality",
+    "eliot-contracts",
+    "eliot-epistemic-contracts",
+    "eliot-experience-projection",
+    "eliot-learning-contracts",
+    "eliot-memory-quality",
+    "eliot-observation-contracts",
+    "eliot-receipts",
+    "eliot-store-api",
+    "eliot-understanding-assessment",
+    "schemars",
+    "serde",
+    "serde_json",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliotd"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "W9_COGNITIVE_QUALITY_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "a5e3172c808b4ee29b3613726348e9259843048c83bb4bf305886150b932c7d8",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-experience-provider/Cargo.toml",
+        "sha256": "65169410a605c76633ecfc4b676e9801b7f74d9bb17e56adef9fa4a9574eca9f"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-experience-provider/module.toml",
+        "sha256": "688bf8adbd31c80e0decd438e5e5c3de21f8852720d795f6a2904d70b80068af"
+      },
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "f7cadd5f6cb5361bb4d2a6e42b2ae696e55134c5c2b1518cc3fe67df493ea517"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "c1d8eedd8e44076afa395bf3af70daf1759c05fbcad0f48dacb2c65cc853b112",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "c1d8eedd8e44076a"
+  }
+}

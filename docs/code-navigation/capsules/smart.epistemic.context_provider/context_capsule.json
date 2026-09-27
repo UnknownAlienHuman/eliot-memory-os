@@ -1,0 +1,137 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.epistemic.context_provider",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "The owner-neutral ProviderContribution reaches context candidates framed by this package's provider identity, with no parallel contribution schema."
+  },
+  "functional_capability_cell_refs": [
+    "smart.epistemic.context_provider"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.epistemic.context_provider",
+  "primary_source_package": {
+    "package": "eliot-epistemic-context-provider",
+    "root_path": "crates/smart/eliot-epistemic-context-provider",
+    "manifest_path": "crates/smart/eliot-epistemic-context-provider/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-epistemic-context-provider/module.toml",
+    "description": "Epistemic Context provider contribution over the admitted Current Epistemic Position (#223)"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 2489,
+    "test_stu": 1928,
+    "selected_file_count": 3,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-epistemic-context-provider/src/context_projection.rs",
+        "bytes": 7087,
+        "sha256": "58f985ee2fc6e20b0df0acdddefe4365b533458f55f9208a18d6d29ddb4eced9",
+        "stu": 2363,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-context-provider/src/lib.rs",
+        "bytes": 380,
+        "sha256": "23dba90b225836baf2f93da8d1a26e198961fb0fc0652099b5071aa3c8da677f",
+        "stu": 127,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-epistemic-context-provider/tests/context_provider.rs",
+        "bytes": 5782,
+        "sha256": "1fb0d40090ced570ba40ba2f993320baa4da57e585f2ecd0df5bba99533626f3",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "classes": []
+      }
+    ],
+    "source_selection_digest": "d6cf153f0a5cef0de8d99eb2643da0b56ff49b8ca6788b7a75ebc6a77d7a5c76"
+  },
+  "one_hop_providers": [
+    "eliot-context-contracts",
+    "eliot-epistemic-contracts",
+    "schemars",
+    "serde",
+    "thiserror"
+  ],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3B_REACTIVE_CONTEXT_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "0ae5ab5ae85b19be250d114f18559a49f9f9d87901e3f59de7b4c2e69817b3af",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-epistemic-context-provider/Cargo.toml",
+        "sha256": "5b03284683bface54e71becb893bdba689fa3df69b3bfaa4e34447960f9a3b5b"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-epistemic-context-provider/module.toml",
+        "sha256": "3f4b66c3bcebe8ed9f347b5773fb4251d28f5c6101f8185df6cfcaffe8bd5566"
+      },
+      "selected_source": {
+        "path_count": 3,
+        "sha256": "d6cf153f0a5cef0de8d99eb2643da0b56ff49b8ca6788b7a75ebc6a77d7a5c76"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "dcb7bc42509cad69d0432f999fe83e82d7eb3c9ab6ae777cfc0b1e54292f9d95",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "dcb7bc42509cad69"
+  }
+}
