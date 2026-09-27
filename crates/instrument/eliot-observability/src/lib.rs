@@ -8,8 +8,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cost_profile;
 pub mod field_policy;
 pub mod influence;
+
+pub use cost_profile::{
+    BlindInterval, CaptureMode, CompleteEvidenceCoverage, PartialCaptureEvidence,
+    QUALIFICATION_EXPIRY_MS, QualificationExpiry, SamplingRate, TelemetryBoundary,
+    TelemetryCostProfile, TelemetryCoverage, TelemetryImpactClass, TelemetryKillCondition,
+    cost_profile_for, cost_profile_inventory, cost_profiles_for, enforce_capture_mode,
+    validate_cost_profile_inventory,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -71,6 +80,21 @@ pub enum ObservabilityError {
     /// A bounded buffer cannot retain a protected event.
     #[error("protected telemetry capacity is exhausted")]
     ProtectedCapacityExhausted,
+    /// A full-evidence boundary would be retained without complete capture.
+    #[error("family {family} is a full-evidence boundary and cannot be captured partially")]
+    IncompleteCriticalEvidence {
+        /// The family that would lose required evidence.
+        family: field_policy::TelemetryFieldFamily,
+    },
+    /// A partial capture was about to report complete coverage.
+    #[error("partial telemetry coverage cannot report complete coverage")]
+    CoverageOverstated,
+    /// A family's cost-profile qualification is no longer justified.
+    #[error("family {family} is past its telemetry qualification expiry")]
+    QualificationExpired {
+        /// The family whose collection must be re-justified or stopped.
+        family: field_policy::TelemetryFieldFamily,
+    },
     /// Canonical serialization failed before an identity could be derived.
     #[error("cannot canonicalize observability record")]
     Serialization,
@@ -906,6 +930,23 @@ impl ObservabilityBuffer {
             metrics: BTreeMap::new(),
             gaps: BTreeMap::new(),
         })
+    }
+
+    /// Creates a bounded projection only after the published telemetry cost
+    /// profiles are re-justified for the route about to run.
+    ///
+    /// A route that cannot justify its capture configuration gets a typed
+    /// rejection instead of a facade that silently collects past its
+    /// qualification.
+    pub fn new_for_route(
+        limits: BufferLimits,
+        observed_at_ms: i64,
+    ) -> Result<Self, ObservabilityError> {
+        validate_cost_profile_inventory()?;
+        for boundary in TelemetryBoundary::all() {
+            cost_profile::enforce_capture_mode(boundary, observed_at_ms)?;
+        }
+        Self::new(limits)
     }
 
     /// Appends an event with idempotent replay and protected-capacity fencing.
