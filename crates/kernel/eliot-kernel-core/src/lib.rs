@@ -94,7 +94,7 @@ pub use module::process_health::{
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
 pub use module::runtime_health::{
     CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
-    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
+    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence, runtime_supervision_coverage,
 };
 pub use user_automation::{
     AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,
