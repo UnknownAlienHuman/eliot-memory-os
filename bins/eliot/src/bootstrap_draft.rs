@@ -12,7 +12,7 @@ use std::{
 use eliot_agent_api::AgentWorkUnitBrief;
 use eliot_bootstrap::{
     BootstrapBrief, BootstrapBriefCompiler, BootstrapDraftInput, BootstrapImprovementDraft,
-    DraftImportDisposition,
+    BootstrapRecoveryFinding, DraftImportDisposition,
     capture::{capture_snapshot, load_normative_pair},
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
@@ -76,9 +76,11 @@ pub(crate) struct BootstrapCommandSuccess {
 pub(crate) fn execute(
     work_unit_path: &Path,
     repo_root: &Path,
+    finding_path: &Path,
 ) -> Result<BootstrapCommandSuccess, BootstrapCommandError> {
     validate_absolute(work_unit_path, "work-unit")?;
     validate_absolute(repo_root, "repo-root")?;
+    validate_absolute(finding_path, "finding")?;
 
     let work_unit_bytes = fs::read(work_unit_path).map_err(|error| {
         BootstrapCommandError::SourceUnavailable(format!("read work-unit seed: {error}"))
@@ -89,6 +91,17 @@ pub(crate) fn execute(
         })?;
     work_unit.validate().map_err(|error| {
         BootstrapCommandError::InvalidInput(format!("validate AgentWorkUnitBrief: {error}"))
+    })?;
+
+    let finding_bytes = fs::read(finding_path).map_err(|error| {
+        BootstrapCommandError::SourceUnavailable(format!("read recovery finding: {error}"))
+    })?;
+    let finding: BootstrapRecoveryFinding =
+        serde_json::from_slice(&finding_bytes).map_err(|error| {
+            BootstrapCommandError::InvalidInput(format!("decode recovery finding: {error}"))
+        })?;
+    finding.validate().map_err(|error| {
+        BootstrapCommandError::InvalidInput(format!("validate recovery finding: {error}"))
     })?;
 
     let snapshot_artifact = capture_snapshot(repo_root).map_err(|error| {
@@ -113,8 +126,7 @@ pub(crate) fn execute(
             normative_pair: snapshot.normative_pair.clone(),
             snapshot_ref: brief.snapshot_sha256.clone(),
             catalogue_ref: brief.catalogue_sha256.clone(),
-            owner: "eliot-cli".to_owned(),
-            discriminator: "bootstrap_brief_compiles_and_validates".to_owned(),
+            finding,
             import_disposition: DraftImportDisposition::CandidateOnly,
         },
         &work_unit,
