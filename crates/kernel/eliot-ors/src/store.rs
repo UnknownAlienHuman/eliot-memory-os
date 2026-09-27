@@ -9714,7 +9714,7 @@ impl RedbRecoveryStore {
     /// so it stays proportional to the namespace's live window, which
     /// position-prefix compaction drains. A namespace already at
     /// [`MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE`] fails closed with typed
-    /// backpressure ([`OrsError::ProjectionLimitExceeded`]) instead of growing
+    /// backpressure ([`OrsError::BridgeEventCapacityExceeded`]) instead of growing
     /// the index without bound; the next legitimate compaction entry retires
     /// the certified prefix and reopens the window.
     fn check_bridge_position_budget_in(
@@ -9740,7 +9740,11 @@ impl RedbRecoveryStore {
             let _position: BridgeEventPosition = decode(value.value())?;
             live += 1;
             if live >= MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeEventCapacityExceeded(
+                    eliot_contracts::BridgeEventCapacityPressure::position_rows(
+                        eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                    ),
+                ));
             }
         }
         Ok(())
