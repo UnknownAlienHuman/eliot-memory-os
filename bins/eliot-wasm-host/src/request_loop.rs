@@ -281,7 +281,8 @@ pub enum LoopError {
     },
     /// A result frame was observed and retained but its publication failed.
     /// The observation itself stays available through the loop's retained
-    /// sequence; only the delivery failed, and it never reopens admission.
+    /// sequence and rides the error return to the process owner; only the
+    /// delivery failed, and it never reopens admission.
     ResultPublicationFailed {
         /// Exact observation whose delivery failed.
         observation: &'static str,
@@ -2211,10 +2212,10 @@ impl WasmHostRequestChannel for DeliverySetChannel {
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError> {
         // Internal consistency first: a frame that cannot prove itself is
         // never emitted, and a publication failure retains the observed
-        // result through the loop's drain accounting, never an ad hoc
-        // fallback. A successful write plus flush below is an observed
-        // local stream write, not proof the owner durably accepted the
-        // result.
+        // result through the loop's drain accounting and the error return,
+        // never an ad hoc fallback. A successful write plus flush below is
+        // an observed local stream write, not proof the owner durably
+        // accepted the result.
         validate_frame(frame)?;
         if self.emission_broken {
             // A previous emission confirmed its write failed; the stream
@@ -2613,6 +2614,17 @@ impl BoundedRequestLoop {
     #[must_use]
     pub fn published(&self) -> Option<&WasmHostResultFrame> {
         self.published.as_ref()
+    }
+
+    /// Returns the last observed result frame: the terminal evidence when
+    /// one closed, otherwise the latest retained observation. A failed
+    /// publication or drain hands this to the process owner through the
+    /// error return, so the observation survives even when its delivery
+    /// failed.
+    fn last_observed(&self) -> Option<WasmHostResultFrame> {
+        self.published
+            .clone()
+            .or_else(|| self.retained.values().flatten().next_back().cloned())
     }
 
     /// Returns the terminal denial, when the loop refused before executing.
@@ -3075,10 +3087,14 @@ fn install_interrupt_handle(
 /// Every return path — success, denial, drain failure, and the
 /// process-level containment path — runs all three steps, so no return path
 /// can leave a live join handle unreported.
+///
+/// A failure never drops the observation it already made: the error return
+/// carries the last observed result frame (if any) to the process owner
+/// for #2785 recovery, never an ad hoc fallback and never a replay.
 pub fn run_request_loop(
     runtime: AdmittedRuntime,
     material: &ValidatedDispatchMaterial,
-) -> Result<WasmHostResultFrame, LoopError> {
+) -> Result<WasmHostResultFrame, RequestLoopFailure> {
     let binding = AdmittedBinding::from_material(material, &runtime.invocation);
     let request_frame = WasmHostRequestFrame::admitted_invoke(&binding);
     let mut channel = DeliverySetChannel::new(request_frame);
@@ -3100,8 +3116,43 @@ pub fn run_request_loop(
         &worker.outcomes,
         &worker.handle,
     );
-    drain_and_shutdown_request_worker(&mut state, &mut channel, worker, drive)
+    match drain_and_shutdown_request_worker(&mut state, &mut channel, worker, drive) {
+        Ok(frame) => Ok(frame),
+        // The observation stays, only its delivery failed (#2787 step 6):
+        // the last observed result rides the error return instead of being
+        // dropped with the loop state. No fallback, no replay.
+        Err(error) => Err(RequestLoopFailure {
+            error,
+            retained: state.last_observed().map(Box::new),
+        }),
+    }
 }
+
+/// Failed ordinary request loop: the loop error plus the observed result
+/// retained at failure (#2787 step 6).
+///
+/// `retained` carries the last observed result frame — the terminal
+/// evidence when one closed, otherwise the nonterminal observation whose
+/// delivery failed — and is `None` when the loop failed before observing
+/// anything. There is no second result object: this is the same
+/// [`WasmHostResultFrame`] schema the wire carries, handed over in-process
+/// for #2785 recovery. It is never republished and never replayed here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestLoopFailure {
+    /// The loop error that failed the drive.
+    pub error: LoopError,
+    /// Last observed result frame retained at failure, if any. Boxed: the
+    /// frame is hundreds of bytes and must not ride the error enum inline.
+    pub retained: Option<Box<WasmHostResultFrame>>,
+}
+
+impl fmt::Display for RequestLoopFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl std::error::Error for RequestLoopFailure {}
 
 /// Drains accepted work, shuts down and joins the worker, then returns the
 /// exact terminal result of the ordinary request loop.
@@ -3864,8 +3915,9 @@ pub enum OrdinaryDriveError {
     /// The delivery set, installation binding, permit, or admitted world
     /// failed closed before the loop could start.
     Drive(DriveError),
-    /// The bounded request loop failed closed.
-    Loop(LoopError),
+    /// The bounded request loop failed closed, retaining the last observed
+    /// result (if any) for owner recovery.
+    Loop(RequestLoopFailure),
 }
 
 impl fmt::Display for OrdinaryDriveError {
@@ -3874,7 +3926,7 @@ impl fmt::Display for OrdinaryDriveError {
             Self::NoDeliverySet => formatter.write_str("ORDINARY_NO_ADMITTED_DELIVERY_SET"),
             Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
             Self::Drive(error) => write!(formatter, "{error}"),
-            Self::Loop(error) => write!(formatter, "{error}"),
+            Self::Loop(failure) => write!(formatter, "{failure}"),
         }
     }
 }
@@ -4035,10 +4087,11 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
     // another identity cannot borrow that result. Cross-restart
     // terminal-unacknowledged state remains explicitly in-progress because
     // its marker carries identity, not a result payload. Only a drive that
-    // observed nothing staged reports absence.
+    // observed nothing staged reports absence. Every returned frame
+    // re-proves itself through the readback consumer gate below.
     match (outcome, replayed) {
-        (Some(frame), None) => Ok(frame),
-        (Some(frame), Some(identity)) if served.last() == Some(&identity) => Ok(frame),
+        (Some(frame), None) => readback(frame),
+        (Some(frame), Some(identity)) if served.last() == Some(&identity) => readback(frame),
         (_, Some(identity)) => Err(OrdinaryDriveError::DeliveryInProgress {
             operation_id: identity.operation_id,
             generation: identity.generation,
@@ -4046,6 +4099,20 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         }),
         (None, None) => Err(OrdinaryDriveError::NoDeliverySet),
     }
+}
+
+/// Returns one retained terminal frame to the process owner after it
+/// re-proves itself (#2787 step 7): the in-process readback consumer
+/// rejects a corrupted frame instead of returning it. A rejected frame is
+/// unproven, so nothing is retained with the failure.
+fn readback(frame: WasmHostResultFrame) -> Result<OrdinaryOutcome, OrdinaryDriveError> {
+    if let Err(error) = validate_frame(&frame) {
+        return Err(OrdinaryDriveError::Loop(RequestLoopFailure {
+            error,
+            retained: None,
+        }));
+    }
+    Ok(frame)
 }
 
 /// Consumes the staged delivery set beside this installation — but only

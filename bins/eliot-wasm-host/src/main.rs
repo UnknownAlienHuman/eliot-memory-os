@@ -4,9 +4,10 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use eliot_wasm_host::{
-    CliError, PrototypeContourDecision, TypedWorld, admit_generation, admit_prototype,
-    default_experimental_limits, execute_describe_experimental, experimental_manifest, parse_args,
-    read_bounded_artifact, run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
+    CliError, OrdinaryDriveError, PrototypeContourDecision, TypedWorld, WasmHostResultFrame,
+    admit_generation, admit_prototype, default_experimental_limits, execute_describe_experimental,
+    experimental_manifest, parse_args, read_bounded_artifact, run_guest_exec,
+    run_ordinary_request_loop, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -55,6 +56,42 @@ fn emit_receipt(fields: &[(&str, &str)]) {
     let _ = stdout.write_all(&bytes);
     let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
+}
+
+/// Emits one bounded JSON handover line on `stderr` for a result the loop
+/// observed but could not publish (#2787 step 6).
+///
+/// Digest/identity evidence only — never the output payload — so the line
+/// always fits the receipt budget; unobserved fields serialize as explicit
+/// `null`, keeping absence distinct per I5.16. This is a stderr diagnostic
+/// for owner recovery, not a result object: stdout gains nothing.
+fn emit_retained_observation(frame: &WasmHostResultFrame) {
+    let line = serde_json::to_vec(&serde_json::json!({
+        "retained_observation": {
+            "wire_id": frame.wire_id,
+            "wire_version": frame.wire_version,
+            "operation_id": frame.operation_id,
+            "request_digest": frame.request_digest,
+            "phase": frame.phase,
+            "worker_command": frame.worker_command,
+            "sequence": frame.sequence,
+            "terminal": frame.terminal,
+            "disposition": frame.disposition,
+            "output_digest": frame.output_digest,
+            "output_bytes": frame.output_bytes,
+            "output_omitted": frame.output_omitted,
+        }
+    }));
+    let Ok(bytes) = line else {
+        return;
+    };
+    if bytes.len() > RECEIPT_MAX_BYTES {
+        return;
+    }
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(&bytes);
+    let _ = stderr.write_all(b"\n");
+    let _ = stderr.flush();
 }
 
 fn main() {
@@ -117,6 +154,14 @@ fn main() {
         Ok(_) => {}
         Err(error) => {
             emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());
+            // A publication failure retains its observed result: hand the
+            // digest/identity evidence to the process owner on stderr for
+            // #2785 recovery. Never a stdout object, never a replay.
+            if let OrdinaryDriveError::Loop(failure) = &error {
+                if let Some(retained) = failure.retained.as_ref() {
+                    emit_retained_observation(retained);
+                }
+            }
             std::process::exit(ADMISSION_REQUIRED_EXIT);
         }
     }
