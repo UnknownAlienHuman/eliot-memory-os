@@ -110,7 +110,6 @@ Named-owner KEEP rows:
 | `crates/meta/eliot-learning-activation-assessment` | eliot-learning-activation-assessment | meta.learning.activation_assessment (admitted via #967 T8-AL1) |
 | `crates/meta/eliot-self-quality` | eliot-self-quality | meta.self_quality.diagnosis (admitted via #967 T8-AL1) |
 | `crates/storage/eliot-store-memory` | eliot-store-memory | storage plane owner #19 (non-runtime reference per #1715) |
-| `workspace/tools/eliot-campaign-executor` | eliot-campaign-executor | workspace tooling owner (developer tool, not production runtime) |
 | `workspace/tools/eliot-runtime-compiler` | eliot-runtime-compiler | workspace tooling owner (developer tool, not production runtime) |
 
 ## Excluded scope (11 standalone rows, verbatim #1811)
