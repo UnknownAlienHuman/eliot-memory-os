@@ -411,6 +411,12 @@ enum InstallationCommand {
     /// overwriting the running executable. `eliot-kernel` and `eliot-host`
     /// are release-level and require `--release-approved`; optional modules
     /// stage as generation updates with rollback metadata.
+    ///
+    /// The running state is observed from a live Windows process snapshot and
+    /// reported as `running_target`. On a non-Windows build the observation
+    /// owner is unavailable, so this command always refuses with
+    /// `INSTALLATION_UPDATE_RUNNING_OBSERVATION_FAILED` rather than assuming
+    /// the target is idle.
     StageUpdate {
         /// Absolute installation root; `<root>/<package>/<version>` is created new.
         #[arg(long, value_parser = absolute_path)]
@@ -430,7 +436,10 @@ enum InstallationCommand {
         /// Absolute payload executable file staged into the versioned directory.
         #[arg(long, value_parser = absolute_path)]
         payload: PathBuf,
-        /// Optional running executable; staging fails closed on collision.
+        /// Optional exact path of an executable the operator declares running;
+        /// staging fails closed on collision. This is an independent fact from
+        /// the `running_target` observation, which is recorded from a live
+        /// Windows process snapshot and is not derived from this flag.
         #[arg(long, value_parser = absolute_path)]
         running_exe: Option<PathBuf>,
         /// Optional previous versioned directory recorded for module rollback.
@@ -2102,6 +2111,9 @@ fn update_installer_error_code(error: &update_installer::UpdateInstallerError) -
         update_installer::UpdateInstallerError::RunningBinaryWouldBeOverwritten { .. } => {
             "INSTALLATION_UPDATE_RUNNING_GUARD"
         }
+        update_installer::UpdateInstallerError::RunningObservationFailed { .. } => {
+            "INSTALLATION_UPDATE_RUNNING_OBSERVATION_FAILED"
+        }
         update_installer::UpdateInstallerError::VersionedDirExists { .. } => {
             "INSTALLATION_UPDATE_VERSION_EXISTS"
         }
@@ -2210,6 +2222,7 @@ fn run_installation_stage_update(
             "release_approval_required": record.kind.requires_release_approval(),
             "installed_dir": record.installed_dir,
             "executable": record.executable_path,
+            "running_target": record.running_target,
             "generation": record.generation,
             "rollback_from": record.rollback_from,
             "scope": INSTALLATION_SCOPE,
