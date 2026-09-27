@@ -82,9 +82,9 @@ pub struct JobEnvelope {
 /// Requires the explicit job envelope for one admitted presentation.
 ///
 /// Runs the production registration/claim binding validation, then binds
-/// the handshake to the claim (epoch, fence, generation, bounded deadline,
-/// non-empty requested capabilities, join route when a v2 join is
-/// present). Any disagreement is a refused presentation before any
+/// the handshake to the claim (epoch, fence, generation, handshake deadline
+/// bounded and inside the claim window, non-empty requested capabilities,
+/// join route when a v2 join is present). Any disagreement is a refused presentation before any
 /// lifecycle submit or process start. Pure projection otherwise.
 ///
 /// # Errors
@@ -126,6 +126,16 @@ pub fn require_job_envelope(
     if hello.deadline_unix_ms == 0 {
         return Err(NativeWorkerError::KernelAdmissionRequired(
             "job envelope deadline missing: the hello carries no bounded deadline".to_owned(),
+        ));
+    }
+    // The worker-originated handshake deadline sits strictly inside the
+    // claim window (the kernel-file reader caps it there): a hello that
+    // outlives the admitted claim could complete after the unit expired,
+    // so the presentation is refused before any lifecycle submit.
+    if hello.deadline_unix_ms > claim.deadline_unix_ms {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "job envelope deadline disagrees: the hello handshake deadline outlives the admitted claim window"
+                .to_owned(),
         ));
     }
     if hello.requested_capabilities.is_empty() {
