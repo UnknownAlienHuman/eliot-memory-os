@@ -70,8 +70,16 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
             };
             let config = load_portable_dev_config(&root, &config_path)?;
             if initialize_schema_only {
+                // Schema initialization is a provider write, so it must pass
+                // the same installation-visible compatibility gate as the
+                // long-running canonical writer before the provider starts.
+                super::enforce_store_compatibility(&config)?;
                 let composition = StoreComposition::new(&config)?;
                 composition.connect().await?;
+                // Bind the recorded decision to the connected provider's live
+                // identity before allowing the migration to mutate its schema.
+                super::enforce_store_compatibility(&config)?;
+                super::bind_observed_identity(&composition, &config)?;
                 let clock = read_portable_dev_clock(&config)?;
                 let receipt = composition
                     .apply_initial_schema_migration(&clock)
