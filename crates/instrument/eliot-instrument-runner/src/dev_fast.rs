@@ -29,7 +29,9 @@ pub const DEV_FAST_PROFILE: &str = "dev-fast";
 pub const DEV_FAST_PROFILE_REVISION: u64 = 1;
 /// First-slice completeness label: partial until every retained I18.6
 /// obligation (live discovery dispatch, frozen selection execution,
-/// admitted evidence persistence) is present.
+/// admitted evidence persistence) is present. Final disposition already
+/// binds the complete candidate/configuration identity, so this label
+/// records the remaining assembly obligations, not an unbound identity.
 pub const DEV_FAST_SLICE_PARTIAL: &str = "partial:first-slice";
 /// Discovery stage: source-bound nextest inventory (I18.6 step 3).
 pub const DEV_FAST_STAGE_LIST: &str = "nextest-list";
@@ -70,11 +72,14 @@ pub enum DevFastError {
         field: &'static str,
     },
     /// The candidate identity drifted after the selection froze.
-    #[error("candidate drift: selection is frozen for '{expected}', not '{observed}'")]
+    #[error("candidate drift: {coordinate} is frozen as '{expected}', not '{observed}'")]
     CandidateDrift {
-        /// Frozen candidate.
+        /// Coordinate that drifted (`candidate` revision or
+        /// `candidate_identity` complete build configuration).
+        coordinate: &'static str,
+        /// Frozen value of that coordinate.
         expected: String,
-        /// Observed candidate.
+        /// Observed value of that coordinate.
         observed: String,
     },
     /// An expected-nonzero selection executed zero tests.
@@ -232,6 +237,11 @@ impl DevFastCandidate {
     }
 
     /// Deterministic identity over every bound field.
+    ///
+    /// This is the single complete candidate/configuration identity: it is
+    /// the value frozen in [`FrozenSelection`], quoted by
+    /// [`TestSelectionReceipt`], and compared against the observed identity
+    /// at final disposition. It is not a second fingerprint scheme.
     pub fn digest(&self) -> String {
         let material = format!(
             "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
@@ -671,7 +681,12 @@ pub fn check_zero_execution(expected: u64, executed: u64) -> Result<(), DevFastE
 /// `Ready` or exact `Empty` (never `WidenedTier` or `Incomplete`), the
 /// receipt's selected and omitted rows match that frozen selection, its
 /// coverage is complete, its expected and observed execution counts match,
-/// and the observed candidate equals the frozen candidate. A substituted
+/// the observed candidate revision equals the frozen revision, and the
+/// observed complete candidate/configuration identity
+/// ([`DevFastCandidate::digest`]) equals the identity frozen in the
+/// selection and quoted by the receipt. The same source commit verified
+/// under a different target triple, feature set, or configuration is a
+/// different verification result and is refused here. A substituted
 /// executable, changed candidate, missing mandatory stage, unmatched
 /// output, or incomplete cleanup never returns Pass.
 pub fn dev_fast_disposition(
@@ -746,8 +761,23 @@ pub fn dev_fast_disposition(
     }
     if candidate.candidate != frozen.candidate || candidate.candidate != receipt.candidate {
         return Err(DevFastError::CandidateDrift {
+            coordinate: "candidate",
             expected: frozen.candidate.clone(),
             observed: candidate.candidate.clone(),
+        });
+    }
+    // The bare revision is not the verification identity: the same source
+    // commit built for another target triple, feature set, or configuration
+    // is a different result. Bind the observed complete identity to the one
+    // frozen in the selection and quoted by the receipt.
+    let observed_identity = candidate.digest();
+    if observed_identity != frozen.candidate_identity
+        || observed_identity != receipt.candidate_identity
+    {
+        return Err(DevFastError::CandidateDrift {
+            coordinate: "candidate_identity",
+            expected: frozen.candidate_identity.clone(),
+            observed: observed_identity,
         });
     }
     check_zero_execution(receipt.expected_count, receipt.executed_count)?;
