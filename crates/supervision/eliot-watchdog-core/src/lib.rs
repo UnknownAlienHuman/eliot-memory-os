@@ -387,6 +387,15 @@ pub fn unix_timestamp(now: SystemTime) -> u64 {
 }
 
 mod reconciliation;
+mod signals;
+
+pub use signals::{
+    AcknowledgementFact, ClockDomain, CoverageRef, EvidenceRef, ExpectedRevision, ObservedTime,
+    ProfileRevision, RecordedValue, ReopenCondition, ResolutionFact, RuleRevision, Signal,
+    SignalAttribution, SignalDelivery, SignalDisposition, SignalId, SignalProcessing,
+    SignalReferences, SignalRevision, SignalSeverity, SignalTarget, SignalValidationError,
+    SourceEventRef, TimeUnit,
+};
 
 pub use reconciliation::{
     WatchdogSpoolAcknowledgement, WatchdogSpoolCursor, WatchdogSpoolEntryDisposition,
