@@ -294,7 +294,9 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # trust policy; none of them is read out of the candidate tree. The neutral
 # contract constants and the independent closure verifier live in
 # scripts/lib/governor-retirement-approval.ps1, which is dot-sourced above.
-$script:GovernorRetainedDisposition = 'retained-legacy-entrypoint (step 1-prime: Codex/OpenCode/Desktop plus the flag-absent Claude default still execute this entry; full retire/re-home BLOCKED-BY #18; no owner-issued detached retirement approval R(C) was supplied for this candidate)'
+# Byte-identical retained slice: this string is exactly the pre-#2968 retained
+# disposition. Approval absence is reported in the plan, never in staged bytes.
+$script:GovernorRetainedDisposition = 'retained-legacy-entrypoint (step 1-prime: Codex/OpenCode/Desktop plus the flag-absent Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
 function Read-ObjectProperty([object]$Object, [string]$Name) {
     # Strict-safe property read for external objects (cargo metadata,
     # receipts, manifests): a missing property is $null data, never a
@@ -447,8 +449,9 @@ function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$
         # the legacy source is already absent, source absence with no detached
         # approval is broken/blocked, not retired.
         if ([string]$cargo.status -ceq 'present') {
+            # No nested approval block: retained evidence stages byte-identically
+            # to the pre-#2968 form, and absence is reported in the plan.
             $retainedEvidence = New-RetainedGovernorEvidence $SourceCommit $pinned $cargo
-            $retainedEvidence.retirement_approval = New-GovernorRetirementAbsentApprovalEvidence $SourceCommit $pinned
             return [pscustomobject]@{ Kind = 'Retained'; Reason = $null; Identity = $cargo; Evidence = $retainedEvidence; Disposition = $script:GovernorRetainedDisposition; ApprovalReference = $null }
         }
         return [pscustomobject]@{ Kind = 'MalformedOrAmbiguous'; Reason = 'package eliot-app is absent from cargo metadata and no detached owner retirement approval was supplied for this candidate (source absence is not authority to retire)'; Identity = $null; Evidence = $null; Disposition = $null; ApprovalReference = $null }
@@ -579,8 +582,9 @@ function Resolve-PinnedGovernorEvidence([string]$Repo, [string]$SourceCommit, [o
     $pinned = Get-GovernorRetirementPinnedLegacyIdentity $Repo $SourceCommit
     if (-not [bool]$ApprovalInput.supplied) {
         if ([string]$pinned.status -ceq 'present') {
+            # No nested approval block: recomputed retained evidence matches the
+            # staged pre-#2968 form byte for byte.
             $retainedEvidence = New-RetainedGovernorEvidence $SourceCommit $pinned $null
-            $retainedEvidence.retirement_approval = New-GovernorRetirementAbsentApprovalEvidence $SourceCommit $pinned
             return [pscustomobject]@{ kind = 'retained'; evidence = $retainedEvidence; live_references = @() }
         }
         throw 'governor retirement evidence is unverifiable: the legacy identity is absent from the pinned commit and no detached owner approval was supplied'
@@ -2437,7 +2441,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
     else {
         'integrations/** except antigravity/official-plugin/ (the Codex plugin leaves the release with the retired governor binary)'
     }
-    [ordered]@{
+    $stagedManifest = [ordered]@{
         schema = 'eliot-staged-payload-manifest-v1'
         component = 'eliot_windows_x64_staged_payload_manifest'
         version = $Version
@@ -2472,6 +2476,13 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             }
         )
     }
+    if (-not $GovernorApproval) {
+        # Retained slice stages byte-identically: no approval identity is
+        # carried unless a detached approval was admitted (removal preserves
+        # the exact pre-#2968 field order).
+        [void]$stagedManifest.Remove('governor_approval')
+    }
+    return $stagedManifest
 }
 
 function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) {
@@ -3374,6 +3385,12 @@ $plan = [ordered]@{
     )
     signing_required_before_public_distribution = $true
 }
+if (-not $governorApprovalReference) {
+    # The plan carries the approval identity if, and only if, a detached
+    # approval was admitted; absence is reported by the dedicated
+    # governor_retirement_approval_input block, not by a null field.
+    [void]$plan.Remove('governor_approval')
+}
 
 if ($PlanRetiredGovernor) {
     # Issue #2892/#2968 simulation sketch: -PlanOnly is already enforced at the
@@ -3385,7 +3402,9 @@ if ($PlanRetiredGovernor) {
     $plan.governor = $null
     $plan.governor_disposition = 'SIMULATED_NOT_ADMITTED (issue #2892/#2968 proof sketch: -PlanRetiredGovernor renders the retired layout for inspection only; it is not an accepted retirement, it carries no detached owner approval identity, it writes no bundle, and it cannot stage, verify, sign, or publish)'
     $plan.governor_evidence = $null
-    $plan.governor_approval = $null
+    if ($plan.Contains('governor_approval')) {
+        [void]$plan.Remove('governor_approval')
+    }
     $plan.simulation = 'SIMULATED_NOT_ADMITTED'
     $plan.claude_code_front_door.legacy_available = $false
     $plan.claude_code_front_door.legacy_command = $null
@@ -3777,7 +3796,7 @@ try {
     $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory
     $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
-    [ordered]@{
+    $release = [ordered]@{
         component = 'eliot_windows_x64_release'
         version = $Version
         source_commit = $sourceCommit
@@ -3934,7 +3953,17 @@ try {
             dotnet_sha256 = $verifiedOperator.dotnet_sha256
             msbuild_version = $verifiedOperator.msbuild_version
         }
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Encoding utf8
+    }
+    if (-not $governorApprovalReference) {
+        # Retained slice stages byte-identically: the approval identity and
+        # the retirement-approval report blocks are carried if, and only if, a
+        # detached approval was admitted (removal preserves the exact
+        # pre-#2968 field order).
+        [void]$release.Remove('governor_approval')
+        [void]$release.Remove('governor_retirement_approval')
+        [void]$release.Remove('governor_retirement_approval_trust')
+    }
+    $release | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Encoding utf8
 
     @'
 This bundle is intentionally unsigned. Before public distribution:
@@ -3955,7 +3984,7 @@ This bundle is intentionally unsigned. Before public distribution:
                 bytes = $_.Length
             }
         }
-    [ordered]@{
+    $checksums = [ordered]@{
         component = 'eliot_windows_x64_release_manifest'
         version = $Version
         source_commit = $sourceCommit
@@ -3964,7 +3993,14 @@ This bundle is intentionally unsigned. Before public distribution:
         governor_evidence = $plan.governor_evidence
         governor_approval = $governorApprovalReference
         files = @($hashes)
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS.json') -Encoding utf8
+    }
+    if (-not $governorApprovalReference) {
+        # Retained slice stages byte-identically: no approval identity is
+        # carried unless a detached approval was admitted (removal preserves
+        # the exact pre-#2968 field order).
+        [void]$checksums.Remove('governor_approval')
+    }
+    $checksums | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS.json') -Encoding utf8
     $verification = Test-ReleaseBundle $bundle $GovernorRetirementApproval
     $plan.status = 'STAGED_UNSIGNED'
     $plan.verification = $verification
