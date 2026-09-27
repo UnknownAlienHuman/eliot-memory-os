@@ -107,6 +107,19 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Checked-out Source SHA=$checkedOut tree=$tree"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Target branch=$targetBranch (main only)"
 
+      - name: Verify shared documentation evidence
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: pwsh
+        run: |
+          $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+          $baseSha = [string]$event.pull_request.base.sha
+          $candidateSha = ((git rev-parse HEAD) | Out-String).Trim()
+          $prBodyPath = Join-Path $env:RUNNER_TEMP 'merge-compile-pr-body.txt'
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText($prBodyPath, [string]$event.pull_request.body, $utf8NoBom)
+          python -m scripts.work_unit_gate doc-read-evidence --base $baseSha --candidate $candidateSha --pr-body $prBodyPath
+          exit $LASTEXITCODE
+
       # Quarantined legacy lane (issue #1813 W6): the MergeCompile gates
       # execute cargo/dotnet directly with no governed profile receipt.
       # Thin-invoker migration awaits W4 stage-execution provisions.

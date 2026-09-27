@@ -644,9 +644,34 @@ pub struct PreparedDestination {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReconcileDisposition {
     /// No intent recorded: safe to prepare (or absent entirely).
+    ///
+    /// Reachable ONLY when the journal holds no record for the operation. A
+    /// recorded intent is never reported as `Absent`, whatever the state of its
+    /// root: the operation was admitted, and `Absent` is a claim that it never
+    /// was.
     Absent,
     /// Recorded result re-verified against the live root: reuse, do not duplicate.
     Current(PreparedDestination),
+    /// Intent is durable but no result was ever recorded, and the derived root
+    /// is not observable: the operation is admitted and its outcome is UNKNOWN.
+    ///
+    /// This is deliberately distinct from both [`Self::Absent`] and
+    /// [`Self::Uncertain`]. It is not absent because the intent proves the
+    /// operation was admitted; it is not `Uncertain` because no receipt exists to
+    /// be uncertain *about* — there is no recorded outcome at all, only a
+    /// recorded admission whose effect may or may not have happened before the
+    /// process stopped. I14.21 requires an unknown to pause the Ordering Scope
+    /// and preserve the operation; reporting it as absent would let a second
+    /// preparation run under the same operation id and overwrite the recorded
+    /// intent, destroying the only evidence that the first one was admitted.
+    AdmittedWithoutResult {
+        /// The admission digest the durable intent binds, carried so the recorded
+        /// operation identity survives reconciliation instead of being discarded
+        /// as "nothing happened". A caller may compare it against its own
+        /// admission to prove it is retrying the same operation, never to adopt
+        /// a destination from it.
+        admission_digest: String,
+    },
     /// State cannot be established: preserved as-is, never deleted, never retried blindly.
     Uncertain { reason: String },
 }
@@ -672,9 +697,11 @@ pub struct CleanupReport {
 /// A durable implementation is possible over `HostStateJournal::append` and
 /// `HostStateJournal::snapshot`, but it requires a **new** `HostStateRecord`
 /// variant in `crates/kernel/eliot-host-state`, which is outside issue #958's
-/// declared Exclusive mutable scope; that owner correction is the exact blocker,
-/// and it is why [`reconcile_preparation`] can still report an unknown effect as
-/// [`ReconcileDisposition::Absent`] when the process restarted (I14.21).
+/// declared Exclusive mutable scope; that owner correction is the exact blocker.
+/// It is no longer the reason an unknown can be reported as absent:
+/// [`ReconcileDisposition::AdmittedWithoutResult`] now keeps a recorded intent
+/// out of [`ReconcileDisposition::Absent`] on every path, so a restart loses the
+/// destination only, never the fact that the operation was admitted.
 ///
 /// Synchronous narrow port: record intent before effects, result after;
 /// load-before-act for idempotency.
@@ -1354,26 +1381,37 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             ));
         }
         // Intent without result: a crash between intent and result recording.
-        // Root absent means nothing exists: fall through and prepare fresh
-        // (the intent is overwritten below). Root present means unverified
-        // effects: refuse here; reconcile first.
+        // The operation was already admitted under this id, and the digest
+        // above proved the retry carries identical inputs — so proceeding would
+        // not be a first attempt, it would be a SECOND preparation under the
+        // same operation id that overwrites the recorded intent and loses the
+        // original one. A4 requires a repeated request to return the same
+        // verified destination or a conflict, never another installation, and
+        // I14.21 requires an unknown to pause rather than retry. Root present
+        // additionally means unverified effects exist. Both cases therefore
+        // refuse and preserve, whatever the root shows; the way out is the
+        // owner-governed cancel/cleanup path, not a blind retry.
         let intent_root = intent
             .get("root")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        if !intent_root.is_empty() && Path::new(intent_root).exists() {
-            return Err(note_prepare_error(
-                OP_PREPARE,
-                "replay_check",
-                PreparationError::UnknownState {
-                    operation: admission.operation_id.clone(),
-                    reason:
-                        "intent without verifiable result and root present; reconcile before retry"
-                            .to_owned(),
+        let root_present = !intent_root.is_empty() && Path::new(intent_root).exists();
+        return Err(note_prepare_error(
+            OP_PREPARE,
+            "replay_check",
+            PreparationError::UnknownState {
+                operation: admission.operation_id.clone(),
+                reason: if root_present {
+                    "intent without verifiable result and root present; reconcile before retry"
+                        .to_owned()
+                } else {
+                    "intent recorded without result and root unobservable; the outcome is \
+                     unknown, so the recorded intent is preserved rather than overwritten"
+                        .to_owned()
                 },
-                generation,
-            ));
-        }
+            },
+            generation,
+        ));
     }
     let canonical_parent = admit_staging_parent(admission)
         .map_err(|error| note_prepare_error(OP_PREPARE, "admit_parent", error, generation))?;
@@ -1434,12 +1472,21 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
 
 /// Reconciles one operation without duplicating effects (cases 958/12, 958/14).
 ///
-/// Absent (no intent, or intent whose root never materialized) → `Absent` and
-/// retry may proceed. Intent + verifiable result → `Current`, and only after
-/// the recorded root is re-proved through the real protected-root owner
-/// ([`reverify_recorded_destination`]): a receipt alone is not a live root.
-/// Anything else → `Uncertain`: preserved as-is, never deleted, never blindly
-/// retried. Reconciliation never deletes.
+/// No intent at all → `Absent` and retry may proceed. Intent + verifiable result
+/// → `Current`, and only after the recorded root is re-proved through the real
+/// protected-root owner ([`reverify_recorded_destination`]): a receipt alone is
+/// not a live root. Intent without a result → `AdmittedWithoutResult` when the
+/// root is unobservable and `Uncertain` when it is present, because the
+/// operation was admitted either way and only a recorded result may be
+/// reconciled into a destination. A result that cannot be re-proved → `Uncertain`.
+///
+/// `Absent` is reachable only when the journal holds no record. Reporting a
+/// recorded intent as absent would let a second preparation run under the same
+/// operation id and overwrite the recorded intent, which I14.21 forbids
+/// ("unknown → pause Ordering Scope, preserve operation, open Problem State")
+/// and which A4's own repeated-request rule forbids ("the same verified
+/// destination or a conflict, not another installation"). Reconciliation never
+/// deletes.
 pub fn reconcile_preparation<J: PreparationJournal>(
     journal: &J,
     operation_id: &str,
@@ -1456,20 +1503,30 @@ pub fn reconcile_preparation<J: PreparationJournal>(
     };
     let Some(result) = result else {
         // Intent without result: a crash between intent recording and effect
-        // completion. Root absent means nothing exists (a fresh prepare may
-        // proceed and overwrites the intent); root present means unverified
-        // effects (preserve, never duplicate).
-        let root_absent = intent
+        // completion. The operation WAS admitted — the durable intent is the
+        // proof — so it is never reported as absent, whatever the root shows.
+        // Root present means unverified effects (preserve, never duplicate);
+        // root absent means the outcome is simply unknown, because a root that
+        // never materialized and a root that was created and later removed are
+        // indistinguishable from here. I14.21: an unknown pauses the Ordering
+        // Scope and preserves the operation; it is not an absence.
+        let root_present = intent
             .get("root")
             .and_then(|value| value.as_str())
-            .is_none_or(|root| !Path::new(root).exists());
-        if root_absent {
-            observe_prepare_progress(OP_RECONCILE, "outcome", "absent", 0, 0);
-            return Ok(ReconcileDisposition::Absent);
+            .is_some_and(|root| Path::new(root).exists());
+        if root_present {
+            observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
+            return Ok(ReconcileDisposition::Uncertain {
+                reason: "intent recorded without result and root present; effects unverified"
+                    .to_owned(),
+            });
         }
-        observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
-        return Ok(ReconcileDisposition::Uncertain {
-            reason: "intent recorded without result and root present; effects unverified"
+        observe_prepare_progress(OP_RECONCILE, "outcome", "admitted_unknown", 0, 0);
+        return Ok(ReconcileDisposition::AdmittedWithoutResult {
+            admission_digest: intent
+                .get("admission_digest")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
                 .to_owned(),
         });
     };
@@ -1505,7 +1562,9 @@ pub fn reconcile_preparation<J: PreparationJournal>(
 ///
 /// Only a currently `Current` preparation may cancel; the cancel envelope
 /// embeds the prior receipt so no evidence is destroyed. Absent operations
-/// cannot be cancelled; uncertain ones must reconcile first.
+/// cannot be cancelled; uncertain ones must reconcile first, and so must
+/// admitted-but-unrecorded ones, which have no receipt to embed and are
+/// preserved rather than released.
 pub fn cancel_preparation<J: PreparationJournal>(
     journal: &mut J,
     operation_id: &str,
@@ -1529,6 +1588,17 @@ pub fn cancel_preparation<J: PreparationJournal>(
             PreparationError::UnknownState {
                 operation: operation_id.to_owned(),
                 reason: "nothing recorded; nothing to cancel".to_owned(),
+            },
+            0,
+        )),
+        ReconcileDisposition::AdmittedWithoutResult { .. } => Err(note_prepare_error(
+            OP_CANCEL,
+            "outcome",
+            PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "admitted without a recorded result; there is no receipt to embed, so the \
+                          operation is preserved for inspection"
+                    .to_owned(),
             },
             0,
         )),
@@ -1654,6 +1724,20 @@ pub fn cleanup_preparations<J: PreparationJournal>(
                 report
                     .preserved
                     .push((operation_id.clone(), "nothing recorded".to_owned()));
+            }
+            ReconcileDisposition::AdmittedWithoutResult { admission_digest } => {
+                // No result and no observable root: there is nothing to re-prove
+                // and nothing that may be deleted by inference. The operation is
+                // preserved, and the digest travels with the reason so the owner
+                // can prove which recorded admission is unresolved.
+                observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);
+                report.preserved.push((
+                    operation_id.clone(),
+                    format!(
+                        "admitted without a recorded result; outcome unknown, intent preserved \
+                         (admission digest {admission_digest})"
+                    ),
+                ));
             }
             ReconcileDisposition::Uncertain { reason } => {
                 observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);

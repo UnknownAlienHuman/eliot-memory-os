@@ -315,13 +315,16 @@ impl ExactJsonBytes {
     ///
     /// The disposition is explicit and provenance-gated, never guessed from
     /// bytes alone: truncated bytes are indistinguishable from short
-    /// legitimate values, so only provenance decides. With exact
+    /// legitimate values, and absence of a truncation-signature match is not
+    /// evidence that a pre-fix value survived unchanged, so only provenance
+    /// plus positive preservation evidence decides. With exact
     /// canonical/external source bytes available the authority binds the
     /// source and the stored bytes are never trusted; a pre-fix record with
-    /// no exact source whose value tree matches the historical truncation
-    /// signature is refused as corrupted/stale; every other record replays
-    /// its stored bytes verbatim. The returned authority always carries
-    /// [`PayloadSource::MigrationReplay`] provenance.
+    /// no exact source is quarantined — corrupted/stale when its value tree
+    /// matches the historical truncation signature, unverified otherwise —
+    /// and never replayed into a new authority; only a post-fix record
+    /// replays its stored bytes verbatim. The returned authority always
+    /// carries [`PayloadSource::MigrationReplay`] provenance.
     pub fn replay_historical_record(
         stored: &[u8],
         provenance: HistoricalRecordProvenance,
@@ -343,6 +346,16 @@ impl ExactJsonBytes {
                     reason: "historical record matches the pre-fix record-truncation signature with no exact source; quarantined as corrupted/stale, suffix never guessed",
                 });
             }
+            if value_holds_unverified_pre_fix(&value) {
+                return Err(StoreError::InvalidField {
+                    field: "payload.history",
+                    reason: "historical pre-fix record holds values outside the evidence-backed truncation signature with no exact source; quarantined as unverified, never replayed as intact authority",
+                });
+            }
+            return Err(StoreError::InvalidField {
+                field: "payload.history",
+                reason: "historical pre-fix record with no exact source and no positive preservation evidence; quarantined as unverified, never replayed as intact authority",
+            });
         }
         Self::parse(PayloadSource::MigrationReplay, stored)
     }
@@ -435,9 +448,16 @@ pub enum HistoricalRecordDisposition {
     /// Exact canonical/external source bytes exist: replay from them; the
     /// stored bytes are never trusted.
     ReplayFromExactSource,
-    /// The value provably survived (post-fix authority, or a shape the
-    /// historical matrix proves was preserved): replay the stored bytes.
+    /// The value provably survived: written through the post-fix path, which
+    /// carries the binding codec and fragment envelope as positive
+    /// preservation evidence. Never assigned to a pre-fix record merely
+    /// because the corruption predicate did not match.
     PreservedIntact,
+    /// Pre-fix record with no exact source whose value does not match the
+    /// evidence-backed truncation signature: integrity unproven. Absence of a
+    /// signature match is not preservation evidence, so the value stays
+    /// quarantined/non-authoritative and is never replayed as intact.
+    UnverifiedPreFix,
     /// Pre-fix record with no exact source whose value matches the
     /// historical truncation signature: corrupted/stale with provenance. The
     /// dropped suffix is unknowable and must never be guessed.
@@ -456,8 +476,9 @@ pub enum HistoricalRecordDisposition {
 /// rows (`alpha-beta` and bare UUIDs have no colon; URLs and Windows paths
 /// carry slashes or backslashes). Multi-colon shortened forms (the
 /// `collective:<task>:<message>` trace) have no specified truncated output
-/// and stay outside this predicate: without an exact output shape they are
-/// handled only through exact-source replay, never classification.
+/// and stay outside this predicate: without an exact output shape they
+/// dispose to `UnverifiedPreFix` and stay quarantined, so only exact-source
+/// replay can ever authorize them, never a stored-bytes classification.
 pub const HISTORICAL_TRUNCATION_SIGNATURE: &str =
     "record-like prefix:single-token (first-hyphen truncation)";
 
@@ -466,11 +487,16 @@ pub const HISTORICAL_TRUNCATION_SIGNATURE: &str =
 /// Evidence-backed predicate over the retained issue matrix plus provenance:
 /// exact source always wins (replay from it); a pre-fix record with no exact
 /// source that matches [`HISTORICAL_TRUNCATION_SIGNATURE`] is
-/// corrupted/stale and unreconstructable; everything else is preserved
-/// intact. Consumed per string by the migration-replay entry
-/// ([`ExactJsonBytes::replay_historical_record`]), which additionally walks
-/// nested objects and arrays because the historical run corrupted record-like
-/// strings recursively.
+/// corrupted/stale and unreconstructable; a pre-fix record with no exact
+/// source that does not match is
+/// [`HistoricalRecordDisposition::UnverifiedPreFix`], never intact.
+/// [`HistoricalRecordDisposition::PreservedIntact`] requires positive
+/// preservation evidence — a record written through the post-fix path
+/// (`written_before_record_coercion_fix == false`) — never the complement of
+/// the corruption predicate. Consumed per string position by the
+/// migration-replay entry ([`ExactJsonBytes::replay_historical_record`]),
+/// which walks root, nested objects and arrays because the historical run
+/// corrupted record-like strings recursively.
 #[must_use]
 pub fn dispose_historical_record(
     candidate: &str,
@@ -479,12 +505,13 @@ pub fn dispose_historical_record(
     if provenance.exact_source_bytes_available {
         return HistoricalRecordDisposition::ReplayFromExactSource;
     }
-    if provenance.written_before_record_coercion_fix
-        && matches_historical_truncation_signature(candidate)
-    {
-        return HistoricalRecordDisposition::CorruptedStaleUnreconstructable {
-            signature: HISTORICAL_TRUNCATION_SIGNATURE,
-        };
+    if provenance.written_before_record_coercion_fix {
+        if matches_historical_truncation_signature(candidate) {
+            return HistoricalRecordDisposition::CorruptedStaleUnreconstructable {
+                signature: HISTORICAL_TRUNCATION_SIGNATURE,
+            };
+        }
+        return HistoricalRecordDisposition::UnverifiedPreFix;
     }
     HistoricalRecordDisposition::PreservedIntact
 }
@@ -525,6 +552,31 @@ fn value_holds_truncation_signature(value: &Value) -> bool {
         ),
         Value::Array(items) => items.iter().any(value_holds_truncation_signature),
         Value::Object(fields) => fields.values().any(value_holds_truncation_signature),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Reports whether any string in one decoded value tree disposes to
+/// [`HistoricalRecordDisposition::UnverifiedPreFix`] under pre-fix provenance
+/// with no exact source, recursing through nested objects and arrays exactly
+/// as the historical run corrupted them.
+///
+/// Multi-colon and other unsupported pre-fix forms never match the narrow
+/// truncation predicate, so without this walk they would silently pass as
+/// intact; every string position (root, array item, object value) is instead
+/// classified by [`dispose_historical_record`].
+fn value_holds_unverified_pre_fix(value: &Value) -> bool {
+    const PREFINISH: HistoricalRecordProvenance = HistoricalRecordProvenance {
+        written_before_record_coercion_fix: true,
+        exact_source_bytes_available: false,
+    };
+    match value {
+        Value::String(text) => matches!(
+            dispose_historical_record(text, PREFINISH),
+            HistoricalRecordDisposition::UnverifiedPreFix
+        ),
+        Value::Array(items) => items.iter().any(value_holds_unverified_pre_fix),
+        Value::Object(fields) => fields.values().any(value_holds_unverified_pre_fix),
         Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }

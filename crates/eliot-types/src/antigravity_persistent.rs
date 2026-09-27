@@ -312,30 +312,18 @@ impl AntigravityPersistentFrame {
                 max_frame_bytes
             ));
         }
-        // Explicit per-kind payload disposition (#934): no owner-defined Eliot
-        // payload schema exists for any frame kind — the only producer is the
-        // fake runtime, which emits ad-hoc objects — so every kind retains its
-        // payload as inert bounded vendor data. The payload must be a JSON
-        // object (the documented wire shape); the payload is never interpreted
-        // as session/permission/terminal authority. The pre-existing drift-key
-        // rejection below is preserved byte-for-byte: existing behavior (pinned
-        // by the engine's schema_drift_fails_closed test) must not be weakened
-        // by this decoder-closure slice; redesigning that policy is out of scope.
-        match self.kind {
-            AntigravityFrameKind::Request
-            | AntigravityFrameKind::Response
-            | AntigravityFrameKind::Event
-            | AntigravityFrameKind::Error => {
-                if !self.payload.is_object() {
-                    return Err("frame payload must be a JSON object".to_owned());
-                }
-            }
-        }
-        if let Some(obj) = self.payload.as_object()
-            && (obj.contains_key("schema_drift") || obj.contains_key("unknown_field_that_drifts"))
-        {
-            return Err("schema drift marker rejected".to_owned());
-        }
+        // Explicit per-kind payload disposition (#934): Eliot currently owns
+        // no payload schema for any frame kind, so each retains its payload as
+        // opaque, bounded vendor JSON:
+        // - Request: retain as inert data.
+        // - Response: retain as inert data.
+        // - Event: retain as inert data; this does not certify a normalized event.
+        // - Error: retain as inert data.
+        // No payload key or value grants session, permission, or terminal
+        // authority. The serialized-frame bound above limits the retained
+        // content; from_ndjson_line separately bounds raw-line bytes before
+        // parsing. Cumulative stream bounds and acquisition deadlines belong
+        // to their upstream owners.
         Ok(())
     }
 

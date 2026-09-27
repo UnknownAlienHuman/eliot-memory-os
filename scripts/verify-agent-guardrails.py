@@ -87,11 +87,58 @@ ONBOARDING_PROHIBITION_HINTS = (
     "managers and workers never",
 )
 
+# Issue #1231. Line-scoped negation, deliberately no narrower than the
+# pre-existing prohibition exemption: "no writer or manager merges its own work"
+# and "never merges its own work" state the rule and must pass, while a bare
+# "merges its own verified PR" is the forbidden instruction.
+ONBOARDING_NEGATION_RE = re.compile(
+    r"\b(?:no|never|not|nobody|none|cannot|can't|without|else|separate|different)\b"
+)
+
+# Issue #1231. Naming a principal other than the subject is a statement of
+# separated duty, so it is exempt from the prose self-merge rule.
+ONBOARDING_SEPARATION_RE = re.compile(
+    r"\b(?:integration owner|root|controller|reviewer|another|other|independent)\b"
+)
+
 ONBOARDING_CARGO_EVIDENCE = (
     "cargo metadata",
     "cargo check",
     "cargo test",
     "cargo build",
+)
+
+# Issue #1231. Two onboarding regressions were prose-only and therefore
+# previously unmachine-enforced, so they are now reported with the offending
+# token at `path:line` like every other onboarding rule.
+ONBOARDING_PROSE_SELF_MERGE = re.compile(
+    r"\b(?:merge|merges|merged|merging)\b[^.\n]{0,60}?\b(?:its|his|her|their)\s+own\b"
+)
+ONBOARDING_PHASE_DEFERRAL_TOKENS = (
+    "exhaustive negative matrices",
+    "before the capability exists",
+    "before the code exists",
+)
+ONBOARDING_NEGATIVE_TOKENS = (
+    "negative",
+    "edge",
+    "security",
+    "fault-injection",
+    "fault injection",
+)
+
+# Issue #1231. A deferral is only permitted to be *described* as forbidden, so
+# the exemption is narrow: the clause immediately preceding the deferral token
+# must both name the skipped proof and negate it. `no role may skip security
+# checks before the code exists` is exempt; the bare instruction `skip the
+# security and edge proof before the code exists` is not, and neither is
+# `do not build ... exhaustive negative matrices before the capability exists`.
+ONBOARDING_DEFERRAL_VERB_RE = re.compile(
+    r"\b(?:skip|skips|skipping|defer|defers|deferring|deferred|postpone|postponed"
+    r"|waive|waived|waiving|omit|omitted|omitting)\b"
+)
+ONBOARDING_DEFERRAL_NEGATION_RE = re.compile(
+    r"\b(?:never|no|nobody|none|cannot|can't|must\s+not|without|forbidden|prohibited)\b"
 )
 
 ONBOARDING_COUNT_PATTERNS = (
@@ -124,6 +171,64 @@ def has_canonical_boundary(normalized: str) -> bool:
 
 def _is_prohibition(line_lower: str) -> bool:
     return any(hint in line_lower for hint in ONBOARDING_PROHIBITION_HINTS)
+
+
+def _self_merge_offender(line_lower: str) -> str:
+    """Return the matched self-merge phrase, or empty when the line is clean.
+
+    The prohibition exemption is not narrowed below the pre-existing line-scoped
+    one this rule extends: `never runs fetch or pull, and merges its own verified
+    PR` mixes a legitimate prohibition with the forbidden instruction, and that
+    line is already exempt. Any negation or separated duty on the line before the
+    phrase therefore exempts it; a bare `merges its own` still fails, which is
+    the prose self-merge this issue removes.
+    """
+    match = ONBOARDING_PROSE_SELF_MERGE.search(line_lower)
+    if not match:
+        return ""
+    # A negation or separated duty anywhere before the phrase on the same line
+    # exempts it, matching the pre-existing line-scoped prohibition exemption
+    # rather than narrowing it.
+    leading = line_lower[: match.end()]
+    if ONBOARDING_NEGATION_RE.search(leading) or ONBOARDING_SEPARATION_RE.search(leading):
+        return ""
+    return match.group(0)
+
+
+def _preceding_clause(text: str, position: int) -> str:
+    start = 0
+    for boundary in re.finditer(r"[,;:.\n]", text):
+        if boundary.start() >= position:
+            break
+        start = boundary.end()
+    return text[start:position]
+
+
+def _phase_deferral_offenders(text_lower: str) -> list[tuple[int, str]]:
+    """Locate proof deferred to a project phase, honouring negations.
+
+    Scoping is clause-level: the sentence holding the token is enough to
+    establish the deferral, but only an explicitly negated deferral verb in the
+    clause immediately before the token is exempt. A neighbouring bare
+    `Do not build ... exhaustive negative matrices before the capability exists`
+    therefore still fails, while `no role may skip security checks before the
+    code exists` passes.
+    """
+    offenders: list[tuple[int, str]] = []
+    for token in ONBOARDING_PHASE_DEFERRAL_TOKENS:
+        start = text_lower.find(token)
+        while start != -1:
+            sentence = text_lower[
+                max(0, text_lower.rfind(".", 0, start) + 1) : start
+            ] + token
+            preceding = _preceding_clause(text_lower, start)
+            negated = ONBOARDING_DEFERRAL_NEGATION_RE.search(preceding)
+            skipped = ONBOARDING_DEFERRAL_VERB_RE.search(preceding)
+            named = any(negative in sentence for negative in ONBOARDING_NEGATIVE_TOKENS)
+            if named and not (negated and skipped):
+                offenders.append((text_lower.count("\n", 0, start) + 1, token))
+            start = text_lower.find(token, start + 1)
+    return offenders
 
 
 def _onboarding_lines(root: Path, rel: str) -> tuple[list[tuple[int, str]] | None, str | None]:
@@ -183,6 +288,11 @@ def verify_onboarding(root: Path) -> list[Finding]:
                 findings.append(
                     Finding("onboarding_self_merge", f"{rel}:{lineno}", f"onboarding self-merge instruction is forbidden: {raw.strip()[:120]}")
                 )
+            prose_self_merge = _self_merge_offender(low)
+            if prose_self_merge:
+                findings.append(
+                    Finding("onboarding_self_merge", f"{rel}:{lineno}", f"prose self-merge instruction is forbidden: '{prose_self_merge}'")
+                )
             for cargo in ONBOARDING_CARGO_EVIDENCE:
                 if cargo in low and "--locked" not in low:
                     findings.append(
@@ -208,6 +318,14 @@ def verify_onboarding(root: Path) -> list[Finding]:
                     Finding("onboarding_mutable_count", rel, f"hand-maintained count is forbidden: '{match.group(0)}'")
                 )
                 break
+        for line, token in _phase_deferral_offenders(full_lower):
+            findings.append(
+                Finding(
+                    "onboarding_proof_phase_deferred",
+                    f"{rel}:{line}",
+                    f"proof deferred by project phase is forbidden: '{token}'",
+                )
+            )
     return findings
 
 
@@ -458,6 +576,39 @@ def self_test() -> None:
             raise AssertionError("readme self-merge fixture did not fail")
         readme_path.write_text(good_readme, encoding="utf-8")
 
+        prose_merge = good_start + (
+            "\n- **Manager:** works in its own worktree and merges its own\n"
+            "  verified PR only after the standing gate passes.\n"
+        )
+        start_path.write_text(prose_merge, encoding="utf-8")
+        if not any(item.code == "onboarding_self_merge" for item in verify_onboarding(root)):
+            raise AssertionError("prose self-merge fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        merge_prohibition = good_start + (
+            "\n- **Writer:** implements one owning issue inside the claimed scope only, and never merges its own work.\n"
+            "No writer or manager merges its own work; the integration owner reviews and merges.\n"
+        )
+        start_path.write_text(merge_prohibition, encoding="utf-8")
+        merge_prohibition_findings = [
+            item
+            for item in verify_onboarding(root)
+            if item.code == "onboarding_self_merge"
+        ]
+        if merge_prohibition_findings:
+            raise AssertionError(
+                f"self-merge prohibition must not fail: {merge_prohibition_findings}"
+            )
+        start_path.write_text(good_start, encoding="utf-8")
+
+        readme_prose_merge = good_readme + (
+            "\nEvery role owns the merge of its own verified PR.\n"
+        )
+        readme_path.write_text(readme_prose_merge, encoding="utf-8")
+        if not any(item.code == "onboarding_self_merge" for item in verify_onboarding(root)):
+            raise AssertionError("readme prose self-merge fixture did not fail")
+        readme_path.write_text(good_readme, encoding="utf-8")
+
         start_path.write_text(good_start + "\ncargo check -p foo --all-targets\n", encoding="utf-8")
         if not any(item.code == "onboarding_unlocked_cargo" for item in verify_onboarding(root)):
             raise AssertionError("unlocked-cargo fixture did not fail")
@@ -487,11 +638,51 @@ def self_test() -> None:
             raise AssertionError("mutable-count fixture did not fail")
         start_path.write_text(good_start, encoding="utf-8")
 
+        phase_deferral = good_start + (
+            "\n## 1. Priority — code first\n\n"
+            "The product is a draft: write the missing code and land it on `main`. Do not build\n"
+            "ceremony, exhaustive negative matrices, or projections before the capability exists.\n"
+        )
+        start_path.write_text(phase_deferral, encoding="utf-8")
+        if not any(
+            item.code == "onboarding_proof_phase_deferred"
+            for item in verify_onboarding(root)
+        ):
+            raise AssertionError("phase-deferral fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        edge_deferral = good_readme + (
+            "\nSkip the security and edge proof before the code exists.\n"
+        )
+        readme_path.write_text(edge_deferral, encoding="utf-8")
+        if not any(
+            item.code == "onboarding_proof_phase_deferred"
+            for item in verify_onboarding(root)
+        ):
+            raise AssertionError("edge phase-deferral fixture did not fail")
+        readme_path.write_text(good_readme, encoding="utf-8")
+
+        deferral_prohibition = good_start + (
+            "\nNegative and edge proof is required from the first change and is never deferred to a later\n"
+            "phase, and no role may skip security checks before the code exists.\n"
+        )
+        start_path.write_text(deferral_prohibition, encoding="utf-8")
+        deferral_prohibition_findings = [
+            item
+            for item in verify_onboarding(root)
+            if item.code == "onboarding_proof_phase_deferred"
+        ]
+        if deferral_prohibition_findings:
+            raise AssertionError(
+                f"phase-deferral prohibition must not fail: {deferral_prohibition_findings}"
+            )
+        start_path.write_text(good_start, encoding="utf-8")
+
         final = verify(root)
         if final:
             raise AssertionError(f"restored onboarding fixture failed: {final}")
 
-    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=17")
+    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=24")
 
 
 def parse_args() -> argparse.Namespace:

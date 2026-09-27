@@ -15,8 +15,10 @@
 //!
 //! ```text
 //! latest row for the skill, by commit order, binds the presented digest
-//!   action in {keep, patch, split, merge, restore} ΓåÆ Accepted
-//!   action in {suppress, archive, quarantine}      ΓåÆ Revoked
+//!   action in {keep, patch, split, merge, restore, rollback} ΓåÆ Accepted
+//!   action in {suppress, archive, quarantine, expiry}        ΓåÆ Revoked
+//! Rollback's bound digest is the previously receipted revision selected for
+//! restoration; expiry revokes its bound revision from Material use.
 //! latest row binds another digest, or no row binds the digest
 //!                                                  ΓåÆ Unknown (provisional only)
 //!   truncated history                              ΓåÆ Unresolvable (refuse)
@@ -54,10 +56,13 @@ const LIFECYCLE_SCOPE: &str = "governor";
 /// Capability-evidence payload version served by the store adapter.
 const CAPABILITY_EVIDENCE_VERSION: u64 = 1;
 
-/// Committed actions confirming the package digest.
-const ACCEPT_ACTIONS: [&str; 5] = ["keep", "patch", "split", "merge", "restore"];
-/// Committed actions revoking the package digest.
-const REVOKE_ACTIONS: [&str; 3] = ["suppress", "archive", "quarantine"];
+/// Committed actions confirming the package digest. A rollback confirms only
+/// the exact package digest bound by the committed row for the restored
+/// previously receipted revision.
+const ACCEPT_ACTIONS: [&str; 6] = ["keep", "patch", "split", "merge", "restore", "rollback"];
+/// Committed actions revoking the package digest. Expiry retires its bound
+/// revision from Material use while preserving its evidence for restoration.
+const REVOKE_ACTIONS: [&str; 4] = ["suppress", "archive", "quarantine", "expiry"];
 
 /// Fail-closed errors for the canonical acceptance lookup.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

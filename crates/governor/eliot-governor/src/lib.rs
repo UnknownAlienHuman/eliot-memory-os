@@ -61,6 +61,7 @@ mod controlboard_projection;
 mod learning_admission;
 mod learning_closure;
 mod learning_delta_integration;
+mod learning_promotion;
 mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_closure_feed;
@@ -132,6 +133,11 @@ pub use learning_delta_integration::{
     derive_delta_at_boundary, emit_activation_receipt_at_attempt_close, issue_delta_admission,
     retry_canonical_evidence_for_delta, retry_lineage_for_delta, store_attempt_close,
     store_derived_delta, verify_delta_delivery,
+};
+pub use learning_promotion::{
+    LearningPromotionError, LearningPromotionOutcome, PromotionAdmissionReceipt,
+    PromotionBoundaryInput, PromotionEvaluationInput, PromotionRefusal, evaluate_promotion,
+    rollback_promotion,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
