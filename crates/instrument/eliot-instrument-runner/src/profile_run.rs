@@ -20,7 +20,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use eliot_contracts::{ModuleRuntimeClass, sha256_hex};
-use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation, InstrumentKind};
+use eliot_instrument_api::{
+    ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
+};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
 use thiserror::Error;
 
@@ -276,6 +278,13 @@ pub struct InstrumentRun {
     pub evidence: StageEvidence,
     /// Machine-derived executable identity digest, when observed.
     pub executable_digest: Option<String>,
+    /// Process grant digest sealed by pre-launch admission, when admitted.
+    ///
+    /// The digest binds the matched spec revision, profile revision, and
+    /// parser generation (I10.8.3): a run that never passed admission
+    /// carries no grant. It travels into the aggregate digest so a changed
+    /// executable/argument combination can never reuse an earlier receipt.
+    pub grant_digest: Option<String>,
 }
 
 impl InstrumentRun {
@@ -284,7 +293,11 @@ impl InstrumentRun {
     ///
     /// A malformed sealed operation identity fails closed into an explicit
     /// missing proof instead of an unbound launched run.
-    pub fn launched(route: &TestExecutionPlaneRoute, operation_id: String) -> Self {
+    pub fn launched(
+        route: &TestExecutionPlaneRoute,
+        operation_id: String,
+        grant: &InstrumentAdmissionGrant,
+    ) -> Self {
         let Ok(stage) = route.stage().clone().bound(operation_id) else {
             return Self::missing(route, "sealed operation identity is malformed");
         };
@@ -298,6 +311,7 @@ impl InstrumentRun {
                     .to_owned(),
             },
             executable_digest: None,
+            grant_digest: Some(grant.grant_digest.clone()),
         }
     }
 
@@ -312,6 +326,7 @@ impl InstrumentRun {
                 reason: reason.into(),
             },
             executable_digest: None,
+            grant_digest: None,
         }
     }
 
@@ -426,6 +441,8 @@ impl ProfileAggregate {
             }
             material.push('\0');
             material.push_str(run.executable_digest.as_deref().unwrap_or(""));
+            material.push('\0');
+            material.push_str(run.grant_digest.as_deref().unwrap_or(""));
             material.push('\0');
         }
         Self {
@@ -617,6 +634,16 @@ impl StageOrchestrator {
                 "stage admission refused: invocation profile differs from admitted stage",
             );
         }
+        let admission = planned.stage.admission_request(&invocation, None);
+        let grant = match planned
+            .stage
+            .admit(&admission, None, route.stage().profile_revision)
+        {
+            Ok(grant) => grant,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+            }
+        };
         let mut binding = match InstrumentBinding::bind(invocation, launcher.port(planned)) {
             Ok(binding) => binding,
             Err(error) => {
@@ -626,7 +653,7 @@ impl StageOrchestrator {
         match runner.launch(&mut binding, launcher.sink(planned)).await {
             Ok(receipt) => {
                 let operation = receipt.process.operation_id().as_str().to_owned();
-                InstrumentRun::launched(route, operation)
+                InstrumentRun::launched(route, operation, &grant)
             }
             Err(error) => InstrumentRun::missing(route, format!("stage launch failed: {error}")),
         }
