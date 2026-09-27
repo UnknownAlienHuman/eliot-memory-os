@@ -2295,6 +2295,7 @@ dependencies = [
  "eliot-kernel-core",
  "eliot-kernel-service",
  "eliot-observability",
+ "eliot-observability-runtime",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",

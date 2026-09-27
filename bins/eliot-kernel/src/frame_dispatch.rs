@@ -40,6 +40,7 @@ use eliot_kernel_core::{
     KernelRuntimeHealthEvidence, NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector,
     RouteScope, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
 };
+use eliot_observability_runtime::{ModuleIdentity, WorkClass, WorkTerminationOutcome};
 use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
 use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
@@ -118,6 +119,44 @@ fn observe_frame(event: &'static str, outcome: &'static str) {
         outcome = outcome_bound.text(),
         "frame dispatch observation"
     );
+}
+
+/// Stable name of the route one admitted action actually took.
+///
+/// I16.5 asks for requested-vs-actual route, so the actual route is named in one
+/// place and used by both the dispatch observation and the bounded route metric;
+/// two independent matches could drift apart and report a mismatch that the
+/// dispatch never had.
+fn actual_route_name(action: &KernelFrameAction) -> &'static str {
+    match action {
+        KernelFrameAction::Reply(_) => "reply_admitted",
+        KernelFrameAction::Daemon { .. } => "daemon_admitted",
+        KernelFrameAction::Process { .. } => "process_admitted",
+        KernelFrameAction::Doctor { .. } => "doctor_admitted",
+        KernelFrameAction::Testd { .. } => "testd_admitted",
+        KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+        KernelFrameAction::Research { .. } => "research_provider_admitted",
+        KernelFrameAction::Fence(_) => "fenced_reply",
+    }
+}
+
+/// Reads the requested route name out of one frame, if the frame carries one.
+///
+/// The read is the same closed selector input `dispatch_frame_inner` uses; a
+/// frame that is not an execute request, or whose payload is not JSON, yields
+/// `None` so the caller records an unreadable request rather than a fabricated
+/// route name.
+fn requested_route_name(frame: &Frame) -> Option<String> {
+    if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+        return None;
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return None;
+    };
+    payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn frame_terminal_code(error: &TransportError) -> &'static str {
@@ -547,18 +586,23 @@ impl KernelComposition {
     ) -> Result<KernelFrameAction, TransportError> {
         observe_frame("kernel.frame_received", "attempt");
         let result = self.dispatch_frame_inner(session, frame);
+        // I16.5 (issue #1841): the requested route is read from the same closed
+        // payload the selector reads, and the actual route is the admitted
+        // action, so drift is a comparison of two observed values rather than an
+        // assertion. A frame whose payload is not a readable execute request
+        // records "unreadable" instead of inventing a requested route.
+        let requested = requested_route_name(frame);
+        if let Some(metrics) = super::execution_metrics::kernel_metrics() {
+            metrics.record(metrics.record_route(
+                ModuleIdentity::LocalHttpAdapter,
+                WorkClass::Interactive,
+                requested.as_deref().unwrap_or("unreadable"),
+                result.as_ref().ok().map(actual_route_name),
+            ));
+        }
         match &result {
             Ok(action) => {
-                let outcome = match action {
-                    KernelFrameAction::Reply(_) => "reply_admitted",
-                    KernelFrameAction::Daemon { .. } => "daemon_admitted",
-                    KernelFrameAction::Process { .. } => "process_admitted",
-                    KernelFrameAction::Doctor { .. } => "doctor_admitted",
-                    KernelFrameAction::Testd { .. } => "testd_admitted",
-                    KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
-                    KernelFrameAction::Research { .. } => "research_provider_admitted",
-                    KernelFrameAction::Fence(_) => "fenced_reply",
-                };
+                let outcome = actual_route_name(action);
                 observe_frame("kernel.frame_validated", "success");
                 observe_frame("kernel.frame_admitted", "success");
                 observe_frame("kernel.frame_dispatched", outcome);
@@ -586,6 +630,17 @@ impl KernelComposition {
                     // request (`kernel.frame_cancel_requested`). Info only;
                     // the terminal below stays the single designated terminal.
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
+                    // I16.5 (issue #1841): the same observation as a bounded
+                    // termination metric, so cancellation latency work has a
+                    // real producer instead of a comment.
+                    if let Some(metrics) = super::execution_metrics::kernel_metrics() {
+                        metrics.record(metrics.record_work_termination(
+                            ModuleIdentity::LocalHttpAdapter,
+                            WorkClass::Interactive,
+                            requested.as_deref().unwrap_or("unreadable"),
+                            WorkTerminationOutcome::Cancelled,
+                        ));
+                    }
                 }
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
                 observe_frame("kernel.frame_cleanup", "fenced");

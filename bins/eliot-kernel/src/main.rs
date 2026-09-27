@@ -37,7 +37,8 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use eliot_kernel::kernel_diagnostics::{
-    EntrypointStage, install_kernel_diagnostics, observe_entrypoint, observe_terminal_error,
+    EntrypointStage, install_kernel_diagnostics, observe_entrypoint,
+    observe_entrypoint_with_detail, observe_terminal_error,
 };
 use eliot_kernel::{
     EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
@@ -156,6 +157,22 @@ async fn main() {
     kernel_config = kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
+    // I16.2/I16.5 (issue #1841): install the bounded-label OpenMetrics stack
+    // and publish the local scrape surface. Best-effort by contract (A13.10):
+    // a refused configuration is reported and the launch funnel continues, so
+    // telemetry can never become a reason the Kernel refuses to run. The
+    // install is placed after the authority contour is known, because the
+    // installation profile is that admitted contour and not an inference.
+    match eliot_kernel::execution_metrics::install_kernel_execution_metrics(
+        &kernel_config,
+        &authority_contour,
+    ) {
+        Ok(observability) => {
+            observability.publish_runtime_counters();
+            observe_entrypoint_with_detail(EntrypointStage::Composition, observability.describe());
+        }
+        Err(error) => observe_terminal_error(&error.to_string()),
+    }
     let kernel = Arc::new(
         match KernelComposition::new_with_authority_descriptor(
             kernel_config,
