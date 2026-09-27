@@ -1807,6 +1807,7 @@ dependencies = [
  "eliot-instrument-rustc",
  "eliot-observability",
  "eliot-process",
+ "eliot-skills",
  "eliot-store",
  "eliot-types",
  "eliot-verifier",
@@ -3109,6 +3110,7 @@ dependencies = [
 name = "eliot-skills"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "eliot-contracts",
  "eliot-evidence",
  "eliot-receipts",

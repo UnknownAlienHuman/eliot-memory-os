@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -69,19 +70,15 @@ SENSITIVE_KEY_FRAGMENTS = (
 )
 TEXT_SUFFIXES = {".json", ".md", ".txt", ".js", ".mjs", ".ts", ".toml", ".yaml", ".yml", ".py", ".sh", ".ps1"}
 IDENTITY_VERSION = "eliot.agent-host-bundle-identity.v2"
-# Skill-pack declaration contract. The BLAKE3 content/pack recipe is owned by
-# SkillPackService in crates/eliot-engine/src/host.rs (`canonical_skill_content_hash`
-# plus `name:content_hash\n` pack material in manifest order, final LF included).
-# Python packaging never reimplements that primitive: it calls the reference BLAKE3
-# primitive (same algorithm lineage as the `blake3` crate pinned in Cargo.lock) with
-# the exact owner recipe, guarded by the normative empty-input test vector below and
-# by the committed manifest pins as parity vectors on every run. Any deviation in
-# either direction fails closed before publication. If the primitive is unavailable,
-# verification fails explicitly instead of degrading to shape-only metadata.
+# Skill-pack declaration contract. Canonical BLAKE3 content and pack verification is
+# owned by the shared eliot-skills package used by SkillPackService. Packaging sends the
+# exact manifest text and captured body snapshots to its read-only CLI and preserves
+# the source bytes independently.
 SKILL_PACK_SCHEMA_VERSION = "eliot-agent-skill-pack-v1"
 SKILL_PACK_HASH_ALGORITHM = "blake3(name:content_blake3 joined with LF in manifest order)"
+SKILL_PACK_SNAPSHOT_INPUT_SCHEMA_VERSION = "eliot.skill-pack-snapshot.v1"
+SKILL_PACK_SNAPSHOT_RESULT_SCHEMA_VERSION = "eliot.skill-pack-snapshot-result.v1"
 SKILL_REFERENCE_ASSETS_SCHEMA = "sha256-path-list-v1"
-BLAKE3_EMPTY_INPUT_HEX = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 # Structural cap for manifest parses whose own limits live inside the manifest.
 MANIFEST_PARSE_BYTES_MAX = 1024 * 1024
 # Declared payload copy modes. A file payload must be a verbatim byte copy; a tree
@@ -126,41 +123,6 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-_BLAKE3_SELF_CHECKED = False
-
-
-def _blake3_hex(data: bytes) -> str:
-    """Hash with the reference BLAKE3 primitive under the owner recipe.
-
-    The algorithm stays authoritative: the primitive must reproduce the normative
-    empty-input digest on first use, and every caller compares recomputation
-    against manifest pins committed by the Rust owner, so neither a foreign
-    primitive nor recipe drift can pass silently. SHA-256 is never substituted.
-    """
-    global _BLAKE3_SELF_CHECKED
-    try:
-        from blake3 import blake3 as _reference_blake3
-    except ImportError as error:
-        raise BundleError(
-            "skill pack BLAKE3 verifier support is unavailable: "
-            "refusing shape-only verification"
-        ) from error
-    if not _BLAKE3_SELF_CHECKED:
-        if _reference_blake3(b"").hexdigest() != BLAKE3_EMPTY_INPUT_HEX:
-            raise BundleError("skill pack BLAKE3 primitive failed its identity self-check")
-        _BLAKE3_SELF_CHECKED = True
-    return _reference_blake3(data).hexdigest()
-
-
-def _canonical_skill_content_hash(body_text: str) -> str:
-    """Reproduce `canonical_skill_content_hash` from crates/eliot-engine/src/host.rs.
-
-    BLAKE3 over the UTF-8 encoding after CRLF→LF normalization. Normalization
-    feeds the identity digest only; source and staged bytes are preserved raw.
-    """
-    return _blake3_hex(body_text.replace("\r\n", "\n").encode("utf-8"))
-
-
 def _load_json_exact(path: Path, label: str) -> dict[str, Any]:
     """Parse a bounded manifest object, rejecting duplicate JSON keys.
 
@@ -199,6 +161,120 @@ def _require_hex_digest(value: Any, location: str, *, label: str = "digest") -> 
     if not isinstance(value, str) or len(value) != 64 or _HEX_DIGEST_RE.match(value) is None:
         raise BundleError(f"{location}: malformed {label} (expected 64 lowercase hex chars)")
     return value
+
+
+def _verify_skill_pack_snapshot(
+    manifest_bytes: bytes,
+    bodies: list[tuple[str, bytes]],
+    expected_order: list[str],
+    expected_pins: dict[str, str],
+) -> dict[str, Any]:
+    """Ask the Rust Skill-pack owner to verify one exact captured input snapshot."""
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise BundleError("canonical Skill manifest: unreadable UTF-8") from error
+    if [name for name, _ in bodies] != expected_order:
+        raise BundleError("Skill body snapshot order differs from the canonical manifest")
+    try:
+        skill_inputs = [
+            {"name": name, "body_text": body_bytes.decode("utf-8")}
+            for name, body_bytes in bodies
+        ]
+    except UnicodeDecodeError as error:
+        raise BundleError("Skill body snapshot contains invalid UTF-8") from error
+
+    request_bytes = json.dumps(
+        {
+            "schema_version": SKILL_PACK_SNAPSHOT_INPUT_SCHEMA_VERSION,
+            "manifest_text": manifest_text,
+            "skills": skill_inputs,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    repository_root = Path(__file__).resolve().parents[1]
+    try:
+        completed = subprocess.run(
+            [
+                "cargo",
+                "run",
+                "--locked",
+                "--quiet",
+                "-p",
+                "eliot-skills",
+                "--bin",
+                "skill_pack_snapshot_verify",
+            ],
+            cwd=repository_root,
+            input=request_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        raise BundleError("canonical Skill snapshot verifier could not be started") from error
+    if completed.returncode != 0:
+        raise BundleError("canonical Skill snapshot verifier failed")
+
+    def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise BundleError("canonical Skill snapshot verifier returned duplicate JSON keys")
+            result[key] = value
+        return result
+
+    try:
+        response = json.loads(
+            completed.stdout.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BundleError("canonical Skill snapshot verifier returned malformed JSON") from error
+    if not isinstance(response, dict) or set(response) != {
+        "schema_version",
+        "manifest_sha256",
+        "pack_hash",
+        "skills",
+    }:
+        raise BundleError("canonical Skill snapshot verifier returned an invalid result shape")
+    if response["schema_version"] != SKILL_PACK_SNAPSHOT_RESULT_SCHEMA_VERSION:
+        raise BundleError("canonical Skill snapshot verifier result schema mismatch")
+    manifest_sha256 = _require_hex_digest(
+        response["manifest_sha256"], "canonical Skill snapshot result", label="manifest SHA-256"
+    )
+    if manifest_sha256 != sha256_bytes(manifest_bytes):
+        raise BundleError("canonical Skill snapshot manifest digest differs from captured bytes")
+
+    verified_skills = response["skills"]
+    if not isinstance(verified_skills, list) or len(verified_skills) != len(bodies):
+        raise BundleError("canonical Skill snapshot verifier returned an invalid Skill list")
+    for index, (name, body_bytes) in enumerate(bodies):
+        entry = verified_skills[index]
+        if not isinstance(entry, dict) or set(entry) != {
+            "name",
+            "source_sha256",
+            "content_blake3",
+        }:
+            raise BundleError("canonical Skill snapshot verifier returned an invalid Skill entry")
+        if entry["name"] != name:
+            raise BundleError("canonical Skill snapshot result order differs from captured bodies")
+        source_sha256 = _require_hex_digest(
+            entry["source_sha256"], f"canonical Skill snapshot {name!r}", label="source SHA-256"
+        )
+        if source_sha256 != sha256_bytes(body_bytes):
+            raise BundleError(f"canonical Skill snapshot source digest differs from captured bytes: {name!r}")
+        content_blake3 = _require_hex_digest(
+            entry["content_blake3"], f"canonical Skill snapshot {name!r}", label="content BLAKE3"
+        )
+        if content_blake3 != expected_pins.get(name):
+            raise BundleError(f"canonical Skill snapshot content pin mismatch: {name!r}")
+
+    response["pack_hash"] = _require_hex_digest(
+        response["pack_hash"], "canonical Skill snapshot result", label="pack BLAKE3"
+    )
+    return response
 
 
 def _safe_relative(value: str, field: str) -> PurePosixPath:
@@ -506,12 +582,13 @@ def _snapshot_skill_pack(
     Selection and order come only from the manifest list: unrelated top-level
     directories are never opened, hashed, or copied. Returns per-Skill snapshots
     mapping paths relative to the Skill directory to validated bytes (including
-    SKILL.md and only explicitly pinned reference assets), plus the verified
-    pack hash. The body pin never approves an adjacent file.
+    SKILL.md and only explicitly pinned reference assets), plus the pack hash
+    returned by the canonical Rust owner. The body pin never approves an adjacent
+    file.
     """
     canonical_root = skill_root.resolve()
     snapshots: dict[str, dict[str, bytes]] = {}
-    material: list[str] = []
+    bodies: list[tuple[str, bytes]] = []
     for name in skill_pack["order"]:
         skill_dir = skill_root / name
         resolved_dir = skill_dir.resolve()
@@ -535,16 +612,15 @@ def _snapshot_skill_pack(
             if sha256_bytes(files[relative]) != expected_sha256:
                 raise BundleError(f"{name}: reference asset bytes differ from declared pin: {relative}")
         try:
-            body_text = body_data.decode("utf-8")
+            body_data.decode("utf-8")
         except UnicodeDecodeError as error:
             raise BundleError(f"{name}/SKILL.md: text payload is not UTF-8") from error
-        observed = _canonical_skill_content_hash(body_text)
-        if observed != skill_pack["pins"][name]:
-            raise BundleError(f"declared Skill content does not match its pin: {name!r}")
-        material.append(f"{name}:{observed}\n")
+        bodies.append((name, body_data))
         snapshots[name] = files
-    pack_hash = _blake3_hex("".join(material).encode("utf-8"))
-    return snapshots, pack_hash
+    owner_result = _verify_skill_pack_snapshot(
+        skill_pack["bytes"], bodies, skill_pack["order"], skill_pack["pins"]
+    )
+    return snapshots, owner_result["pack_hash"]
 
 
 def _read_snapshot(root: Path, relative: PurePosixPath, limits: dict[str, int]) -> bytes:
