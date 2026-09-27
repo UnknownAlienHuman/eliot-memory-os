@@ -156,7 +156,7 @@ fn preconditions(
     .expect("preconditions")
 }
 
-fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> AuthorizedManifest {
+fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> AuditReferenceBinding {
     let mut sources = BTreeMap::new();
     for (handle, entry) in &portfolio.records {
         sources.insert(
@@ -179,7 +179,7 @@ fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> Autho
         })
         .collect();
     let allowlist: Vec<String> = portfolio.records.keys().cloned().collect();
-    AuthorizedManifest::freeze(AuthorizedManifestParams {
+    let authorized = AuthorizedManifest::freeze(AuthorizedManifestParams {
         inquiry_digest: inquiry.digest.clone(),
         denominator_digest: inquiry.denominator_digest(),
         sources,
@@ -189,13 +189,27 @@ fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> Autho
         counterevidence: Vec::new(),
         conflicts: Vec::new(),
         unknowns: Vec::new(),
-        allowlist,
+        allowlist: allowlist.clone(),
         revoked: Vec::new(),
         disclosure: DisclosureClass::ProjectBound,
         expires_ms: 1_900_000_000_000,
         revision: 1,
     })
-    .expect("manifest")
+    .expect("manifest");
+    // The audit job's run-bound allowlist admits exactly the handles the
+    // authorized manifest makes citable, under the inquiry's own State Fence, so
+    // the two agree exactly as `AuditReferenceBinding::bind` requires.
+    let run_manifest = eliot_researcher::manifest(
+        format!("run-{}", inquiry.digest),
+        inquiry.fence.clone(),
+        allowlist,
+        format!("root-{}", inquiry.digest),
+        "evidence-portfolio-suite",
+        "project-bound-suite",
+    )
+    .expect("run reference manifest");
+    AuditReferenceBinding::bind(authorized, run_manifest, inquiry.fence.clone())
+        .expect("audit reference binding")
 }
 
 // WORK_UNIT_CASE: 700/1
