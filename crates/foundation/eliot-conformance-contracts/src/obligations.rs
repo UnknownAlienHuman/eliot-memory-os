@@ -267,14 +267,16 @@ impl ActiveConformanceObligationSet {
 
     /// Projects the `ACTIVE` rows into the runtime hotset. The projection
     /// carries no source issue ID and no donor handle, so historical names never
-    /// reach the agent hotset through it.
+    /// reach the agent hotset through it. A row that is not `ACTIVE`, or that
+    /// lacks the exact discriminator or selected proof profile an `ACTIVE` row
+    /// must carry, is refused rather than projected with invented content.
     #[must_use]
     pub fn hotset(&self) -> ActiveObligationHotset {
         ActiveObligationHotset {
             entries: self
                 .active_obligations()
                 .into_iter()
-                .map(ActiveObligationHotsetEntry::from_obligation)
+                .filter_map(ActiveObligationHotsetEntry::from_obligation)
                 .collect(),
         }
     }
@@ -314,22 +316,30 @@ pub struct ActiveObligationHotsetEntry {
 }
 
 impl ActiveObligationHotsetEntry {
-    /// Reduces one `ACTIVE` obligation to its runtime-hotset content. A
-    /// non-active row is never projected, so the fields are present.
-    fn from_obligation(obligation: &ActiveConformanceObligation) -> Self {
-        Self {
+    /// Reduces one `ACTIVE` obligation to its runtime-hotset content. Returns
+    /// `None` for a row whose actual status is not executable, or whose exact
+    /// discriminator or selected proof profile is missing, so only exact
+    /// `ACTIVE` content reaches a module capsule or product evaluation plan.
+    fn from_obligation(obligation: &ActiveConformanceObligation) -> Option<Self> {
+        if !obligation.status.is_executable() {
+            return None;
+        }
+        let (Some(discriminator), Some(selected_proof_profile_ref)) = (
+            obligation.discriminator.clone(),
+            obligation.selected_proof_profile_ref.clone(),
+        ) else {
+            return None;
+        };
+        Some(Self {
             obligation_id: obligation.obligation_id.clone(),
             owner: obligation.owner.clone(),
             property: obligation.property.clone(),
             capability_ref: obligation.capability_ref.clone(),
-            discriminator: obligation.discriminator.clone().unwrap_or_default(),
-            selected_proof_profile_ref: obligation
-                .selected_proof_profile_ref
-                .clone()
-                .unwrap_or_default(),
+            discriminator,
+            selected_proof_profile_ref,
             proof_ceiling_ref: obligation.proof_ceiling_ref.clone(),
             expires_at_ms: obligation.expires_at_ms,
-        }
+        })
     }
 }
 
