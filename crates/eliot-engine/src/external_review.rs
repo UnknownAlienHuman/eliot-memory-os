@@ -5,7 +5,7 @@ use crate::{
 use eliot_store::BlobStore;
 use eliot_types::{
     AdapterCapability, AdapterContext, AdapterObservation, AdapterRequest, AgentId, AgentSessionId,
-    BlackboardItem, CommandContext, ExternalCitationStatus, ExternalClaimStatus,
+    BlackboardItem, BlobRef, CommandContext, ExternalCitationStatus, ExternalClaimStatus,
     ExternalFindingSeverity, ExternalForbiddenAction, ExternalOutputSchemaKind,
     ExternalProposedChange, ExternalProposedChangeKind, ExternalProviderAuthority,
     ExternalProviderKind, ExternalProviderLimits, ExternalProviderProfile,
@@ -95,6 +95,66 @@ pub enum ExternalReviewDocumentOrigin {
     /// was already collapsed before this value was built. Such a document can
     /// never be cited as proof that a raw external ingress is closed.
     InternalConstructed,
+}
+
+/// Standing of the retained raw evidence behind one normalized result.
+///
+/// Only a document strictly decoded from exact provider bytes qualifies its
+/// retained handle as byte proof of what was normalized. An internally
+/// constructed `Value`, a missing handle, or a historical record read back
+/// without the live strict-decode binding is explicitly unqualified legacy
+/// evidence: it may be revalidated for consistency, but that revalidation can
+/// never silently upgrade it to provider-byte proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalReviewEvidenceStanding {
+    /// Exact provider bytes were strictly decoded at ingress and those same
+    /// bytes are retained: the handle is byte proof of what was normalized.
+    StrictProviderBytes,
+    /// No exact original bytes are bound to this evidence: an internally
+    /// constructed or historical lossy `Value`, never provider-byte proof.
+    UnqualifiedLegacy,
+}
+
+impl ExternalReviewEvidenceStanding {
+    /// Standing of the live document being normalized.
+    ///
+    /// This is the production reader of
+    /// [`ValidatedExternalReviewDocument::origin`]: only
+    /// [`ExternalReviewDocumentOrigin::StrictProviderBytes`] qualifies the
+    /// retained handle as byte proof.
+    #[must_use]
+    pub fn of_document(document: &ValidatedExternalReviewDocument) -> Self {
+        match document.origin() {
+            ExternalReviewDocumentOrigin::StrictProviderBytes => Self::StrictProviderBytes,
+            ExternalReviewDocumentOrigin::InternalConstructed => Self::UnqualifiedLegacy,
+        }
+    }
+
+    /// Historical readback over a retained raw-output handle without the live
+    /// strict-decode binding.
+    ///
+    /// A bare handle never qualifies on its own: without the live binding, a
+    /// byte handle cannot prove pre-collapse lexical integrity, so every arm
+    /// returns [`Self::UnqualifiedLegacy`] with the reason naming the retained
+    /// shape. Revalidation stays permitted for consistency; it is never a
+    /// silent upgrade to provider-byte proof.
+    #[must_use]
+    pub fn read_back_historical(retained: Option<&BlobRef>) -> (Self, &'static str) {
+        match retained {
+            None => (
+                Self::UnqualifiedLegacy,
+                "raw evidence unqualified legacy: no retained raw-output handle and no exact original bytes; lossy value evidence stays explicitly unqualified",
+            ),
+            Some(handle) if handle.algorithm != "blake3" => (
+                Self::UnqualifiedLegacy,
+                "raw evidence unqualified legacy: retained handle is not content-addressed provider bytes; lossy value evidence stays explicitly unqualified",
+            ),
+            Some(_) => (
+                Self::UnqualifiedLegacy,
+                "raw evidence unqualified legacy: byte handle without the live strict-decode binding; revalidation cannot recover pre-collapse lexical proof",
+            ),
+        }
+    }
 }
 
 impl ValidatedExternalReviewDocument {
@@ -575,6 +635,35 @@ impl ExternalReviewNormalizer {
                 ),
                 result: None,
             };
+        // Production provenance reader: the standing decides which
+        // retained-evidence reference the accepted result may carry and how
+        // the receipt qualifies it. Strict provider bytes keep the job's
+        // retained handle as byte proof; an internally constructed value has
+        // no exact original bytes, so the result carries no byte-proof
+        // reference and the retained handle is read back as explicitly
+        // unqualified legacy evidence.
+        let standing = ExternalReviewEvidenceStanding::of_document(raw_output);
+        let (raw_output_blob_ref, standing_reason) = match standing {
+            ExternalReviewEvidenceStanding::StrictProviderBytes => {
+                // The sole Strict producer retains the exact decoded bytes, so a
+                // Strict document without a retained handle is a caller bug that
+                // would over-claim byte proof; fail loudly in debug/test builds.
+                debug_assert!(
+                    job.raw_output_blob_ref.is_some(),
+                    "strict provider document paired with a job lacking the retained byte handle"
+                );
+                (
+                    job.raw_output_blob_ref.clone(),
+                    "raw evidence qualified: exact provider bytes strictly decoded and retained",
+                )
+            }
+            ExternalReviewEvidenceStanding::UnqualifiedLegacy => {
+                let (_, reason) = ExternalReviewEvidenceStanding::read_back_historical(
+                    job.raw_output_blob_ref.as_ref(),
+                );
+                (None, reason)
+            }
+        };
         // The document is bound to the exact bytes it was decoded from, so the
         // value below is duplicate-clean by construction. The four
         // `serde_json::from_value` sites that follow still apply the T07 DTO
@@ -662,7 +751,7 @@ impl ExternalReviewNormalizer {
             status: ExternalReviewResultStatus::AcceptedCandidate,
             candidate_only: true,
             taint: TaintClass::ExternalAgent,
-            raw_output_blob_ref: job.raw_output_blob_ref.clone(),
+            raw_output_blob_ref,
             findings,
             proposed_changes,
             verifier_suggestions,
@@ -678,7 +767,10 @@ impl ExternalReviewNormalizer {
                 job,
                 true,
                 ExternalReviewResultStatus::AcceptedCandidate,
-                vec!["external result accepted as tainted candidate only".to_owned()],
+                vec![
+                    "external result accepted as tainted candidate only".to_owned(),
+                    standing_reason.to_owned(),
+                ],
             ),
             result: Some(result),
         }
