@@ -1,0 +1,121 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.accessibility",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Dreamer curation proposes one reversible, lineage-preserving memory transformation without changing canonical state."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.accessibility"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.accessibility",
+  "primary_source_package": {
+    "package": "eliot-dreamer-accessibility",
+    "root_path": "crates/smart/eliot-dreamer-accessibility",
+    "manifest_path": "crates/smart/eliot-dreamer-accessibility/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-accessibility/module.toml",
+    "description": "Propose one reversible accessibility or influence adjustment independently of support and physical erasure."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 57769,
+    "test_stu": 0,
+    "selected_file_count": 1,
+    "inline_cfg_test_modules": 1,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-accessibility/src/lib.rs",
+        "bytes": 173305,
+        "sha256": "4d293f7fc1551160ceee08d82c89c4ad5b34940b8372e8cc44025cfc48093042",
+        "stu": 57769,
+        "inline_cfg_test": true
+      }
+    ],
+    "selected_tests": [],
+    "source_selection_digest": "8928be20d45df960b6019d01876741c1a09bb6285ea87421891dc1a24c67bb8a"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-dreamer-contracts",
+    "eliot-evidence",
+    "schemars",
+    "serde"
+  ],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_CURATION_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "3f7d9076fa298cd7d3c09b6c4b719c08c7e67641b7c8978fd666bc49185f478c",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-accessibility/Cargo.toml",
+        "sha256": "eb5d7e89d4a556e94631d0a31d2aa496f2a03fa064bb106f2f20337744eae310"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-accessibility/module.toml",
+        "sha256": "0ecc2556fe89e617694d5852f2cedcba50f767501f78894bdea6ceacf4cb9453"
+      },
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "8928be20d45df960b6019d01876741c1a09bb6285ea87421891dc1a24c67bb8a"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "327a3c0a7b829ffc9fc0b75e28f3680fa43196eedec6c61558a08e7d91495643",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "327a3c0a7b829ffc"
+  }
+}

@@ -1,0 +1,229 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.rival_model",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.rival_model"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.rival_model",
+  "primary_source_package": {
+    "package": "eliot-dreamer-rival-model",
+    "root_path": "crates/smart/eliot-dreamer-rival-model",
+    "manifest_path": "crates/smart/eliot-dreamer-rival-model/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-rival-model/module.toml",
+    "description": "Candidate-only preservation and structuring of rival models for ELIOT Dreamer"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 100221,
+    "test_stu": 37003,
+    "selected_file_count": 15,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/analysis.rs",
+        "bytes": 45628,
+        "sha256": "31c854ed63753ec1caf3ffd04c498ae34e3ddf56f2e84bae5e8fd0c9ce617415",
+        "stu": 15210,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/bounds.rs",
+        "bytes": 29903,
+        "sha256": "e65d902f8289587da13f4c64424941a2ec6cba7d47e8374d3ce96e060856971f",
+        "stu": 9968,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/comparison.rs",
+        "bytes": 35692,
+        "sha256": "b02775e3d144f56141696c42d4ef99201547bfa9af2f84dac13bfa58b6569125",
+        "stu": 11898,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/dependencies.rs",
+        "bytes": 7802,
+        "sha256": "5eafeb95fdd776b36754260f0b32541bd55a52cfe9eff0a5b9449eab93675e21",
+        "stu": 2601,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/equivalence.rs",
+        "bytes": 24957,
+        "sha256": "619594a46c04915dd6e6afbb020f57eb650f76a8d9e91d18b787dfb536121380",
+        "stu": 8319,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/error.rs",
+        "bytes": 1599,
+        "sha256": "dca5047ccb372f1f3fe0e6a183b39ab022957de44b349c5fc43ac2eaedf40c63",
+        "stu": 533,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/lib.rs",
+        "bytes": 18036,
+        "sha256": "c01c4562c9f237615a1f59b0940958f5972e1dbba4b84e5f9f15ac4e625f7b0b",
+        "stu": 6012,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/meter.rs",
+        "bytes": 10671,
+        "sha256": "1cf2bfbd7d785b513db56f68845c5340e90d90b384aa320262d342097a7d807f",
+        "stu": 3557,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/model_detail.rs",
+        "bytes": 1181,
+        "sha256": "e7c471bf7d64b0cfd84506a7e80fa79ff2049762eb36a896e8c9d881ced98da9",
+        "stu": 394,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/packing.rs",
+        "bytes": 22270,
+        "sha256": "fa023c4532f61d688c47aae2bd28448d9c00280cd764ef1625b2346cd21a2ce2",
+        "stu": 7424,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/policy.rs",
+        "bytes": 10587,
+        "sha256": "ea42aaf6e922088d560225709d6a5ff78771b6f7ac4f83a56345aadc9afdeb55",
+        "stu": 3529,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/result.rs",
+        "bytes": 69260,
+        "sha256": "5b78a5c372f9396e09029b8ba04766336e5eb7d2c924173a6c188e9bcb8a777f",
+        "stu": 23087,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/states.rs",
+        "bytes": 2574,
+        "sha256": "1da059899925b4e450dd8a8c747a4830f649f2a62b0b06f9ff255bd11b91d016",
+        "stu": 858,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/src/unknown.rs",
+        "bytes": 20502,
+        "sha256": "64f3e550bbaac5a1a79adb080c606e63c153e176b1b2c61898e95ebd6b210cd5",
+        "stu": 6834,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-rival-model/tests/rival_proof.rs",
+        "bytes": 111007,
+        "sha256": "63f2c072563b170c8eefcff7377306eb9d7a96cd69df968ffc0d4bc2a9147ae5",
+        "test_attributes": 43,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "06fc5390cafb9eb2540b17ac0fe7b3b2969da19337ba6000f2c76b39e4c01700"
+  },
+  "one_hop_providers": [
+    "eliot-dreamer-contracts",
+    "eliot-epistemic-contracts",
+    "eliot-evaluation-contracts",
+    "serde",
+    "serde_json"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-dreamer",
+    "bins/eliotd"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [
+    "crates/smart/eliot-dreamer-rival-model/tests/rival_proof.rs"
+  ],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "7ca9cb6c3bcd2aad6a1c9bef59945d77adcc2ec2c3010bf9180ad4c9bdf91510",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-rival-model/Cargo.toml",
+        "sha256": "b43bcda169a609f1555c9d83af07af7ad4934df442d17e5888013fd35ec67470"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-rival-model/module.toml",
+        "sha256": "f98aab4c6f3e2a652fc11d9a2dd0e112c4edde4ca2de5284825e1dae4cf6c826"
+      },
+      "selected_source": {
+        "path_count": 15,
+        "sha256": "06fc5390cafb9eb2540b17ac0fe7b3b2969da19337ba6000f2c76b39e4c01700"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "82def84c7abaa3754ef8107630d3c5c7766d35eeee623abbcbd2fd45b3d9c86a",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "82def84c7abaa375"
+  }
+}

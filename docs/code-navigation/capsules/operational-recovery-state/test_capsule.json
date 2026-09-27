@@ -1,0 +1,215 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "operational-recovery-state",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "DECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": "cargo test -p eliot-ors"
+    },
+    "package": "eliot-ors",
+    "executable": true,
+    "state": "EXECUTABLE",
+    "runnable": "the declared command is independently invocable for this package"
+  },
+  "proof_level_ceiling": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": null
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": null
+    },
+    "forbidden_patterns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": null
+    },
+    "forbidden_pattern_hits": [],
+    "inline_cfg_test_modules": 6
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": null
+    },
+    "selected_tests": [
+      {
+        "path": "crates/kernel/eliot-ors/tests/doctor-ledger.rs",
+        "bytes": 6258,
+        "sha256": "c7390ae92b7d917440ab7f3721749e32a7b0513edc562346920c91f9e269ee31",
+        "test_attributes": 4,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-ors/tests/doctor-lineage-cutover.rs",
+        "bytes": 9744,
+        "sha256": "c37bee015644b46e61f460f82585811d4fec00bb7490fd11b3bbfd90de018af9",
+        "test_attributes": 1,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-ors/tests/doctor_redb.rs",
+        "bytes": 24869,
+        "sha256": "6816574bec81fbdf7deac08db8d40b501337e43270025edeaf2441b1e1ba4a72",
+        "test_attributes": 2,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-ors/tests/kernel_route_fixture.rs",
+        "bytes": 6093,
+        "sha256": "d098f2b4ffd18e0813fda7adb99516fd7e4a28d6f9be19e3e2e5269ebf4df797",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-ors/tests/restore_journal.rs",
+        "bytes": 25734,
+        "sha256": "a76c9df87187b9492e37d4ebc1ebd2c5eb3622becdf0a2656f57d2bf2fafb18d",
+        "test_attributes": 16,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "test_attribute_count": 119
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "bins/eliot",
+      "bins/eliot-doctor",
+      "bins/eliot-host",
+      "bins/eliot-kernel",
+      "bins/eliot-watchdog",
+      "crates/governor/eliot-governor",
+      "crates/kernel/eliot-kernel-core",
+      "crates/kernel/eliot-kernel-service",
+      "crates/kernel/eliot-ors",
+      "crates/meta/eliot-runtime-status"
+    ],
+    "declared_consumers": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|consumers",
+      "value": null
+    },
+    "edge_profile_tests": [
+      "crates/kernel/eliot-ors/tests/doctor-ledger.rs",
+      "crates/kernel/eliot-ors/tests/doctor-lineage-cutover.rs",
+      "crates/kernel/eliot-ors/tests/doctor_redb.rs",
+      "crates/kernel/eliot-ors/tests/kernel_route_fixture.rs",
+      "crates/kernel/eliot-ors/tests/restore_journal.rs"
+    ]
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": null
+    },
+    "selected_cases": [
+      "crates/kernel/eliot-ors/tests/doctor-ledger.rs",
+      "crates/kernel/eliot-ors/tests/doctor-lineage-cutover.rs",
+      "crates/kernel/eliot-ors/tests/doctor_redb.rs",
+      "crates/kernel/eliot-ors/tests/kernel_route_fixture.rs",
+      "crates/kernel/eliot-ors/tests/restore_journal.rs"
+    ]
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 119,
+    "test_stu": 24233,
+    "nonzero": true
+  },
+  "bound_contract_digest": "a0bef8572ee87228bc0d64e2e51b983660b7c9e3cb8723195d42e319d628153e",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/kernel/eliot-ors/Cargo.toml",
+        "sha256": "ff06bbf312d777ea88ac76f537ec6c57bab19c3a28a86a7f430ec39a99b0d9a9"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 26,
+        "sha256": "a39de6e13a6d3808b8414fdbd302ad1aeed88b8432bf4308b7992de914a934b7"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "5bd0216ef6c657b84a085122978f719f3f04d304d0970f52aeb9eee4b85e7b3e",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "5bd0216ef6c657b8"
+  }
+}

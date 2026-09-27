@@ -1,0 +1,164 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.cue.index",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-cue-index",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [],
+    "inline_cfg_test_modules": 0
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "deterministic rebuild",
+        "candidate-bypass rejection",
+        "duplicate row",
+        "stale generation",
+        "invalid endpoint",
+        "zero-edge snapshot"
+      ]
+    },
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-cue-index/tests/build.rs",
+        "bytes": 91474,
+        "sha256": "0b692751bbc8c415feb4e8703887f86bcea2d51fc0f94d22c7f58948954d271e",
+        "test_attributes": 50,
+        "inline_cfg_test": false,
+        "classes": []
+      }
+    ],
+    "test_attribute_count": 50
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "crates/governor/eliot-governor",
+      "crates/smart/eliot-cues"
+    ],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "cue activation"
+      ]
+    },
+    "edge_profile_tests": []
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return partial or failed publication with exact rejected rows; the previous current snapshot remains visible."
+    },
+    "selected_cases": []
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 50,
+    "test_stu": 30492,
+    "nonzero": true
+  },
+  "bound_contract_digest": "f7e12ec995b6157e5fca77f120046ba1a775e1cab47025e9897e3254d93b8d83",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-cue-index/Cargo.toml",
+        "sha256": "aeef7dfec4e7752b3314816d857def9930b9e069bea394a8597571b53ef02f2e"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-cue-index/module.toml",
+        "sha256": "6559682a4478de585f4035dbce1f0cef85ff3a12215a26eb9745e34fd69b8736"
+      },
+      "selected_source": {
+        "path_count": 4,
+        "sha256": "f69c26eb176fe3910e9f2be6a4721f5f61508ad4f31d4fd0a1939d28a5ac96d5"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "893df227e7af04f8d1e8fc3f8535058b3670294ce20bf98f885d374a990dfea9",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "893df227e7af04f8"
+  }
+}

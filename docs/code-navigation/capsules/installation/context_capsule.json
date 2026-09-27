@@ -1,0 +1,331 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "installation",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "installation"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/installation",
+  "primary_source_package": {
+    "package": "eliot-installation",
+    "root_path": "crates/kernel/eliot-installation",
+    "manifest_path": "crates/kernel/eliot-installation/Cargo.toml",
+    "module_manifest": null,
+    "description": "Provider-neutral governed installation profiles, discovery and transaction state"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 661225,
+    "test_stu": 50779,
+    "selected_file_count": 25,
+    "inline_cfg_test_modules": 9,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/kernel/eliot-installation/src/activation.rs",
+        "bytes": 28543,
+        "sha256": "3b7179bc520586d9def38fcfc54d456682393e05e795fffa4bc24e944f18c6b3",
+        "stu": 9515,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/agent_bridge_profile.rs",
+        "bytes": 62698,
+        "sha256": "3743603f0d249cc02fa47f5769abac6dde7e2a2e254b44a53bd168fdf1eb4e89",
+        "stu": 20900,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/approved_generation_registry.rs",
+        "bytes": 219530,
+        "sha256": "e8be7c9281cad1e64fb5bb0f2d4a8943c93ed6a5a690651c79a99f85e4f9c721",
+        "stu": 73177,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/credential_provision.rs",
+        "bytes": 69594,
+        "sha256": "a68095fd24b5bfada8cd12c2a0b1c5770c02938c11d37fbdbfc8de74daa7eef4",
+        "stu": 23198,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/installation_registry.rs",
+        "bytes": 62614,
+        "sha256": "a94b25ba733e6e42baaffc221dfc4497f25c245855b3507a1d59033464fa20d3",
+        "stu": 20872,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/integration_discovery.rs",
+        "bytes": 9760,
+        "sha256": "1ec4d46bc7d44f507f416941705af320db1fbc4271c1bc8f6d878cb82d958747",
+        "stu": 3254,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/lib.rs",
+        "bytes": 464086,
+        "sha256": "2798915306ddb8b3ac0473bb1ea1f9802b56c49ee352b2c30c5b8e095921f832",
+        "stu": 154696,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/package.rs",
+        "bytes": 42988,
+        "sha256": "d24ff7684709a9c0637afec3c30dbb6887c6fbab014392b587647e1e82daab09",
+        "stu": 14330,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/package_planner.rs",
+        "bytes": 192809,
+        "sha256": "f2dc63db557734848cc79740a713fe909997d2dd6c85e8b2bbd8a438f103b342",
+        "stu": 64270,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/plan.rs",
+        "bytes": 35517,
+        "sha256": "3cfa60aba4b1742ce0bea0107cfb072966972c254bafd07dea906633a22c8d5b",
+        "stu": 11839,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/plan/contract_models.rs",
+        "bytes": 6963,
+        "sha256": "34045603bd62854c532a3ed95d4a85b5edd544f734ef86f5061427bf11d0e0dc",
+        "stu": 2321,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/profile_roots.rs",
+        "bytes": 3620,
+        "sha256": "fa98b6153383d4e9259cdf9f2fbb92094ef4e066cdff9d468f9b84dee54eda12",
+        "stu": 1207,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/redb_state.rs",
+        "bytes": 152608,
+        "sha256": "edbbad08d39f0cfe236e5da908d8ad7f213d7cc47711565f19cf6ef17d1f6323",
+        "stu": 50870,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/registry_wire.rs",
+        "bytes": 25948,
+        "sha256": "70c606cbc25c3b407ac6e7df543f03df4304246d58c0120ccf2b158ad2942e2a",
+        "stu": 8650,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/registry_wire/current_models.rs",
+        "bytes": 10756,
+        "sha256": "6dcd5cae6b5e37d120ceb17eea3ec080804bed8cd7399f9063ee186140c52c31",
+        "stu": 3586,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/runtime_root_contract.rs",
+        "bytes": 28695,
+        "sha256": "7ecae08d36e9b1201a1c2a1162cdabf9715329f85a51516be30990b367999258",
+        "stu": 9565,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/scm_approval.rs",
+        "bytes": 18538,
+        "sha256": "fe54afb7c047bae33bc72714eec81df3c6bb137ed99c5681688859502303edec",
+        "stu": 6180,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/signed_activation.rs",
+        "bytes": 40634,
+        "sha256": "3e01ecf99f219815ae49db340a8d00b70428b592705ee17f5925cd67e6dd42d0",
+        "stu": 13545,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/tests.rs",
+        "bytes": 387459,
+        "sha256": "23ac91f04a82841c6ec3ed57e1db35d87e6dc8c5280af60110dca106e43e6f57",
+        "stu": 129153,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/transaction.rs",
+        "bytes": 120315,
+        "sha256": "91108c1ec352fd5879182fc176d47c79ca843db87212513aad1d85e8f4da6fdf",
+        "stu": 40105,
+        "inline_cfg_test": true
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/kernel/eliot-installation/src/tests/registry_concurrent_read.rs",
+        "bytes": 20023,
+        "sha256": "500146c7cf978c4dadc3bab8a6591efa281ba77b29feb3a6b27918de3c0d2086",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/tests/registry_wire_launch.rs",
+        "bytes": 44222,
+        "sha256": "4e65f5d81e7b18d4ed358bc87dd4efbf9817cc422a55e3abcaeae0857399063e",
+        "test_attributes": 30,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/tests/rollback_recovery.rs",
+        "bytes": 35994,
+        "sha256": "d411d6d2c63dbef580842da537531cece7de8f77f18713fa97570db8b09b8338",
+        "test_attributes": 4,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/tests/service_start_recovery.rs",
+        "bytes": 48939,
+        "sha256": "69024670db8f6d31778225735171edace9d9dd0e197ae14e465284f4fbe0cb48",
+        "test_attributes": 13,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-installation/src/tests/transaction_recovery.rs",
+        "bytes": 3158,
+        "sha256": "447ffcc6f18dd79cc5d48a2901d5ba783e012d14785781d619f10f7cb08bd66c",
+        "test_attributes": 1,
+        "inline_cfg_test": false,
+        "classes": [
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "93c5d746310278d97727ce18d02b071d122dfa7281ca8ace2145ff6c7218ef00"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-ipc",
+    "eliot-platform",
+    "eliot-platform-windows",
+    "eliot-protocol",
+    "eliot-runtime-contracts",
+    "redb",
+    "schemars",
+    "serde",
+    "serde_json",
+    "sha2",
+    "thiserror",
+    "tokio"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot",
+    "bins/eliot-host",
+    "bins/eliot-kernel",
+    "bins/eliot-store-surreal",
+    "bins/eliot-watchdog",
+    "crates/instrument/eliot-r13-harness",
+    "crates/meta/eliot-runtime-status",
+    "workspace/tools/eliot-live-canary"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "host-kernel-runtime",
+      "title": "Host and Kernel runtime",
+      "responsibility": "Installation and Host journal, identity, epochs, fencing, ORS, IPC, platform, process, generation, and lifecycle control.",
+      "documentation_handles": [
+        "I1.8"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [
+    "crates/kernel/eliot-installation/src/tests/registry_concurrent_read.rs",
+    "crates/kernel/eliot-installation/src/tests/registry_wire_launch.rs",
+    "crates/kernel/eliot-installation/src/tests/rollback_recovery.rs",
+    "crates/kernel/eliot-installation/src/tests/service_start_recovery.rs"
+  ],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "36ccb3042591ef896607d109f05da9c2ce80c92ec70ee5ba17555614663a7d15",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/kernel/eliot-installation/Cargo.toml",
+        "sha256": "2417ba33e5628c492e1af0384613055c9c714a3df1e992738e75ae9324708862"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 25,
+        "sha256": "93c5d746310278d97727ce18d02b071d122dfa7281ca8ace2145ff6c7218ef00"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "9c34bb175128a521258c352f92a22c07c419ff7f29dc7dae33dccdab99acb4eb",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "9c34bb175128a521"
+  }
+}

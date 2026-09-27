@@ -1,0 +1,192 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "host-service",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "host-service"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/host-service",
+  "primary_source_package": {
+    "package": "eliot-host-service",
+    "root_path": "crates/kernel/eliot-host-service",
+    "manifest_path": "crates/kernel/eliot-host-service/Cargo.toml",
+    "module_manifest": null,
+    "description": "External Host Supervisor lifecycle and recovery boundary"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 73904,
+    "test_stu": 21324,
+    "selected_file_count": 9,
+    "inline_cfg_test_modules": 2,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/kernel/eliot-host-service/src/lib.rs",
+        "bytes": 4358,
+        "sha256": "d4d1be7c8fbbf18c5dd0531eb7e1d12b146d19376dd9ed13ae915ab26205e2ed",
+        "stu": 1453,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-host-service/src/reactive_context_delivery.rs",
+        "bytes": 56170,
+        "sha256": "c6efdc8580fb91b13346fb8fd2953ac73bb4e0b8c20e59e02da831a006c2f3f1",
+        "stu": 18724,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-host-service/src/runtime_control.rs",
+        "bytes": 76972,
+        "sha256": "162328ce9916b15c254bf2d7f7cfe517d306f200eae4ecc0cffa3fd4940358bd",
+        "stu": 25658,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-host-service/src/service.rs",
+        "bytes": 60193,
+        "sha256": "accec30fb36467a3b79cda06526f0455df7baca060dae636445be224408122fd",
+        "stu": 20065,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-host-service/src/user_automation_durable_job.rs",
+        "bytes": 5677,
+        "sha256": "ba3d2e8ec61cec404478b9c9663c0543a0fe2a1dea76f1119780959d03471471",
+        "stu": 1893,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-host-service/src/user_automation_execution.rs",
+        "bytes": 7466,
+        "sha256": "651d7fc57568aac99de5504dec5f48dfe47dace5b0f07ae4d998548d1df39d3b",
+        "stu": 2489,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-host-service/src/user_automation_wake.rs",
+        "bytes": 10874,
+        "sha256": "90df1cc3f69f126710fd0ce9382751cd44aa2fb05cb8e3bf69211f9144da7084",
+        "stu": 3625,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/kernel/eliot-host-service/tests/reactive_context_delivery.rs",
+        "bytes": 53676,
+        "sha256": "48b1d27c97bef0e377977e180ab23c186952c1bae70e913fd5469e4b397c9e65",
+        "test_attributes": 38,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/kernel/eliot-host-service/tests/user_automation_execution.rs",
+        "bytes": 10296,
+        "sha256": "cbde66468625624da3737c2d5aed3de84f5fa0ec11f508ecd6bc47df2566441c",
+        "test_attributes": 1,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "fa08fc0700a27a3cdee118a0f22c5041d85c36e65d013cc9589007faba9f4c22"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-host-state",
+    "eliot-kernel-service",
+    "eliot-platform",
+    "eliot-platform-windows",
+    "eliot-protocol",
+    "eliot-receipts",
+    "eliot-runtime-contracts",
+    "schemars",
+    "serde",
+    "serde_json",
+    "sha2",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-host",
+    "crates/kernel/eliot-host-control-endpoint",
+    "workspace/tools/eliot-live-canary"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "host-kernel-runtime",
+      "title": "Host and Kernel runtime",
+      "responsibility": "Installation and Host journal, identity, epochs, fencing, ORS, IPC, platform, process, generation, and lifecycle control.",
+      "documentation_handles": [
+        "I1.8"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "aad80450e740e2a42ae8c6791428e55eb7bff2d829ef7e12c538e88935685a70",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/kernel/eliot-host-service/Cargo.toml",
+        "sha256": "63e4631364efa40781793bbe271f19b93866650ea0b98ebb24cd13fc78aed4df"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 9,
+        "sha256": "fa08fc0700a27a3cdee118a0f22c5041d85c36e65d013cc9589007faba9f4c22"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "9afa468e430f3fb9938ed558655b0f05f246470c88cc27cc7d9ed6668696fce2",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "9afa468e430f3fb9"
+  }
+}

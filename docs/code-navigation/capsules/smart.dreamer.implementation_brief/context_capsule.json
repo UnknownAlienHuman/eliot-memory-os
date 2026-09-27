@@ -1,0 +1,199 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.implementation_brief",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "ELIOT self-query exposes accepted Implementation intent and separately qualified current conformance evidence without upgrading prose or lower-level tests into higher-level support."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.implementation_brief"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.implementation_brief",
+  "primary_source_package": {
+    "package": "eliot-dreamer-implementation-brief",
+    "root_path": "crates/smart/eliot-dreamer-implementation-brief",
+    "manifest_path": "crates/smart/eliot-dreamer-implementation-brief/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-implementation-brief/module.toml",
+    "description": "ImplementationBrief candidate from exact accepted Implementation handles and current conformance evidence"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 35411,
+    "test_stu": 18005,
+    "selected_file_count": 11,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/error.rs",
+        "bytes": 1449,
+        "sha256": "e58cfafbb437bf5d05116032a8962805c20c8b6ff24200aabccc92e69e089292",
+        "stu": 483,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/implementation.rs",
+        "bytes": 29866,
+        "sha256": "00e89705899201a9bc68999210b49b4bd286e567ba6e8faf844e3cb604ab1c67",
+        "stu": 9956,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/lib.rs",
+        "bytes": 1406,
+        "sha256": "569f0ef47ee711524000df3c3721ceb74e3569fa2757863bc6cbf4935d3a9ab2",
+        "stu": 469,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/model/evidence.rs",
+        "bytes": 10099,
+        "sha256": "ce817875019631c6039b9724d0c81556d4bd8ec6e20dc8767d189ad1d62920bf",
+        "stu": 3367,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/model/input.rs",
+        "bytes": 29197,
+        "sha256": "a66e44281880acdeee30dc072a7ca4d4ccf23b98dc7b66c4477bef907f70ca41",
+        "stu": 9733,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/model/mod.rs",
+        "bytes": 985,
+        "sha256": "273097dbeb4bef2ed6061a1a3758defae165203fc7a23f48fa8efa8511843ac7",
+        "stu": 329,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/model/output.rs",
+        "bytes": 17585,
+        "sha256": "15f28ce5f0f54c773de9624a4822eea461f0de42a2c5a3423e8f814f1e4d2b5f",
+        "stu": 5862,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/model/source.rs",
+        "bytes": 11794,
+        "sha256": "1e70c8254cbe46022c471f2e3227c29d7b5e7b10a0dba36f63cf907975efb8c2",
+        "stu": 3932,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/src/validation.rs",
+        "bytes": 3851,
+        "sha256": "6f66f9a68b3f88be40642a2cd12e4c3a7176ba1e2dcc29a861da150e291a56f5",
+        "stu": 1284,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/tests/implementation_brief.rs",
+        "bytes": 31120,
+        "sha256": "7d20a73ca5a567f27c59bff0b45cd20ea3848301189f3aa3373d379ec1d07ba0",
+        "test_attributes": 39,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/tests/support/mod.rs",
+        "bytes": 22893,
+        "sha256": "c4cb7423ac7b1121a7a4cc26003a53c1cb82b7bb7a1c2f4a3d3157bc6960d6a0",
+        "test_attributes": 0,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "7ab229d3b7f44b41a096bebe37c8f4132e05f20c90597103b3c4a5eb2629cabd"
+  },
+  "one_hop_providers": [
+    "eliot-conformance-contracts",
+    "eliot-contracts",
+    "eliot-dreamer-contracts",
+    "serde",
+    "serde_json",
+    "thiserror"
+  ],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_SELF_QUERY_EDGE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "0da3e1c7a05599d77bdbb07897fd8b3ec6cf9448b5487b48530e1f21ecfe8a87",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/Cargo.toml",
+        "sha256": "a894304d55081cf0f1fc48b12e6c9a06a91bcf349fb2d18cd0ed19382f397949"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/module.toml",
+        "sha256": "577b7cb529bfecab086690310fa7bc946f91d612a9c1e2fb1f8822219f33b723"
+      },
+      "selected_source": {
+        "path_count": 11,
+        "sha256": "7ab229d3b7f44b41a096bebe37c8f4132e05f20c90597103b3c4a5eb2629cabd"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "eb7e2d79e01f866789b13b78c4dd69d48791c52ba87a6f7890574c6102228f85",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "eb7e2d79e01f8667"
+  }
+}

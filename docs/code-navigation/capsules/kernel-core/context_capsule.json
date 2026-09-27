@@ -1,0 +1,278 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "kernel-core",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "kernel-core"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/kernel-core",
+  "primary_source_package": {
+    "package": "eliot-kernel-core",
+    "root_path": "crates/kernel/eliot-kernel-core",
+    "manifest_path": "crates/kernel/eliot-kernel-core/Cargo.toml",
+    "module_manifest": null,
+    "description": "P-07 authority activation, fencing, generation routing, control reserve and recovery decision core"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 296212,
+    "test_stu": 0,
+    "selected_file_count": 20,
+    "inline_cfg_test_modules": 12,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/authority.rs",
+        "bytes": 20352,
+        "sha256": "8df3a9f3537e33ea99c7e7306f4a2436f139fc77f332540962289dda69a6ab9e",
+        "stu": 6784,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/authority_controller.rs",
+        "bytes": 17864,
+        "sha256": "3d2e93aa3e59174854d5613cd88b0511264d8c50cdec2a6b4a3c568cc41927a4",
+        "stu": 5955,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/authority_snapshot.rs",
+        "bytes": 10498,
+        "sha256": "689c2455eb8a002e349ef9054919875f7caced8b0d17b260ab269b9757ec4bdb",
+        "stu": 3500,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/durable_owner_bootstrap.rs",
+        "bytes": 16929,
+        "sha256": "dcbc0ea9361457051b8f99665f34a99867004f1cda30b7dd313eab5f6cf77999",
+        "stu": 5643,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/error.rs",
+        "bytes": 10196,
+        "sha256": "cd70fb75c077af97a92d962ea8d61be85efc87506df801511d7c238e19eb4575",
+        "stu": 3399,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/governor_closure_source.rs",
+        "bytes": 52284,
+        "sha256": "adf9ff638f7c11bd97d82d8ae0a106969912073edf5ace2ede5e75a9dea0d0db",
+        "stu": 17428,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/grant_activation_port.rs",
+        "bytes": 379339,
+        "sha256": "ed78fa7fcaf1d6044a771efb119f68772fe1d49014830b9a64d454e09f6acafc",
+        "stu": 126447,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/introduction_lifecycle.rs",
+        "bytes": 7539,
+        "sha256": "faac10b99c5f70db1971d0bb9ebe4393b136beb768e0adfc269d0e4713fa3c25",
+        "stu": 2513,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/lib.rs",
+        "bytes": 9691,
+        "sha256": "027409ae1e515dfdc4351e244ab9f295ac5291e119ac9d48a33a20b28df1141f",
+        "stu": 3231,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/compatibility_handshake.rs",
+        "bytes": 33424,
+        "sha256": "6d1fba895b45e00f35614b636d5b00db7c7867de63d9bc7485a90f35244b57e5",
+        "stu": 11142,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs",
+        "bytes": 44825,
+        "sha256": "9a447bb46b2b102fb7bc8652b2271da03b35ceef986b4c78014b4ed0d7a87345",
+        "stu": 14942,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/epoch_and_fence.rs",
+        "bytes": 25492,
+        "sha256": "5c1073aaf36059e733c1add952e6e881a4be4c370f02e86b326c0960da32cace",
+        "stu": 8498,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/generation_routing.rs",
+        "bytes": 27775,
+        "sha256": "610e525b8d3489717a8e28cdb5bf94122d5a6a2184877b7f853399e43b0073fd",
+        "stu": 9259,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/mod.rs",
+        "bytes": 1230,
+        "sha256": "e318d61860d533e7f76a465a51a697225cf869df001c618b90e42ecf96b3e5f8",
+        "stu": 410,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/notification_state.rs",
+        "bytes": 35097,
+        "sha256": "d5e3c7ce93594479774df669e488bd23a598816f80dab9dfa27f944d4f60659e",
+        "stu": 11699,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/process_health.rs",
+        "bytes": 11167,
+        "sha256": "dfd9d1383b483a134f632930ea04f8209e2859cf5734fa5c9daffa56186bd2d9",
+        "stu": 3723,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/recovery_state_view.rs",
+        "bytes": 10000,
+        "sha256": "5e32324b70b78da8754f7ffed2d8ee57dc54a329638c45a5236b8114a6c98d47",
+        "stu": 3334,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/module/runtime_health.rs",
+        "bytes": 8163,
+        "sha256": "dba5b7a6dbe8fa3368c12531c606e2e3a18888a36f117cfabaf4ffbc68229e3b",
+        "stu": 2721,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/user_automation.rs",
+        "bytes": 137183,
+        "sha256": "4244b19d5ce84cadcf4f3042a1b89645cfbaa5e406341e2713590f30b2ddbc94",
+        "stu": 45728,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/kernel/eliot-kernel-core/src/user_automation_zones.rs",
+        "bytes": 29587,
+        "sha256": "a61a48eb2f6279d1c2b106be4459136fb72f1213cb6d90a08e93a3906bbfed55",
+        "stu": 9863,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [],
+    "source_selection_digest": "6aa9d26d8928d28565ac795ca27b34bc3278c6d434c9a8f67e3df269b271bf44"
+  },
+  "one_hop_providers": [
+    "blake3",
+    "eliot-authority",
+    "eliot-config",
+    "eliot-contracts",
+    "eliot-influence",
+    "eliot-ors",
+    "eliot-platform",
+    "eliot-process",
+    "eliot-protocol",
+    "eliot-receipts",
+    "eliot-runtime-contracts",
+    "schemars",
+    "serde",
+    "serde_json",
+    "sha2",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot",
+    "bins/eliot-agent-bridge",
+    "bins/eliot-host",
+    "bins/eliot-kernel",
+    "bins/eliot-native-worker",
+    "bins/eliotd",
+    "crates/agent/eliot-agent-coordinator",
+    "crates/governor/eliot-governor",
+    "crates/kernel/eliot-kernel-service",
+    "crates/meta/eliot-runtime-status",
+    "crates/storage/eliot-store-memory",
+    "crates/storage/eliot-store-surreal-adapter",
+    "crates/surfaces/eliot-cli",
+    "crates/surfaces/eliot-controlboard",
+    "crates/surfaces/eliot-mcp",
+    "crates/surfaces/eliot-notify-core"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "host-kernel-runtime",
+      "title": "Host and Kernel runtime",
+      "responsibility": "Installation and Host journal, identity, epochs, fencing, ORS, IPC, platform, process, generation, and lifecycle control.",
+      "documentation_handles": [
+        "I1.8"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "b4827155f10845f4c2b601b2141bdf6a3292e971cc9790aa13ba9c9a7ff28544",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/kernel/eliot-kernel-core/Cargo.toml",
+        "sha256": "272364c8efe68f9ca8f8fed6ebc693e45e590e0c7f5a87c0ed64c124bcdab81d"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 20,
+        "sha256": "6aa9d26d8928d28565ac795ca27b34bc3278c6d434c9a8f67e3df269b271bf44"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "4e7f38af5ba0b0275557be2d481d3e94eeb8bed673c1b7942f983c61d437b3ef",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "4e7f38af5ba0b027"
+  }
+}

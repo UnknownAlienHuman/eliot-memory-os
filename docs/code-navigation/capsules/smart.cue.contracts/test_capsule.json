@@ -1,0 +1,298 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.cue.contracts",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-cue-contracts",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [
+      {
+        "pattern": "serde_json::Value",
+        "path": "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"
+      },
+      {
+        "pattern": "todo!",
+        "path": "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"
+      },
+      {
+        "pattern": "unimplemented!",
+        "path": "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"
+      }
+    ],
+    "inline_cfg_test_modules": 0
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "schema roundtrip",
+        "matching-mode validity",
+        "lifecycle/invalidation compatibility",
+        "consumer compile fixtures"
+      ]
+    },
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs",
+        "bytes": 106143,
+        "sha256": "36dde5c728a66d5429e70e6281bf35abab5da7c1bbb0cc74323536c55f310e65",
+        "test_attributes": 42,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/contract_shape.rs",
+        "bytes": 24863,
+        "sha256": "36baa035dfc47bf6bdc20c157b3baf6600217cdcc9577f9abf854a67212270c0",
+        "test_attributes": 18,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/index_projection.rs",
+        "bytes": 11039,
+        "sha256": "0a28293293f53d30ec8a5debb7104eec82da134b8797c38ef660a2769763b2f3",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-cue-contracts/tests/version.rs",
+        "bytes": 15970,
+        "sha256": "0079ed3e2af95cb01a614ba69cb876eef98595f14b8e025ad8ecfc6a58033feb",
+        "test_attributes": 11,
+        "inline_cfg_test": false,
+        "classes": [
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "test_attribute_count": 77
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [
+    "crates/smart/eliot-cue-contracts/tests/version.rs"
+  ],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "bins/eliot-agent-bridge",
+      "bins/eliot-dreamer",
+      "crates/governor/eliot-governor",
+      "crates/smart/eliot-context",
+      "crates/smart/eliot-context-candidates",
+      "crates/smart/eliot-cue-activation",
+      "crates/smart/eliot-cue-activation-wasm",
+      "crates/smart/eliot-cue-binding",
+      "crates/smart/eliot-cue-index",
+      "crates/smart/eliot-cue-normalizer",
+      "crates/smart/eliot-cues",
+      "crates/smart/eliot-reactive-context-plan"
+    ],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "cue normalizer",
+        "cue binding",
+        "cue index",
+        "cue activation",
+        "context candidates"
+      ]
+    },
+    "edge_profile_tests": [
+      "crates/smart/eliot-cue-contracts/tests/acceptance_804.rs",
+      "crates/smart/eliot-cue-contracts/tests/contract_shape.rs"
+    ]
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Reject incompatible schema explicitly; no untyped string fallback."
+    },
+    "selected_cases": [
+      "crates/smart/eliot-cue-contracts/tests/version.rs"
+    ]
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": [
+        "cue_kind_covers_the_declared_vocabulary",
+        "cue_kind_is_defined_once_without_eliot_types_dependency",
+        "observed_cue_supports_every_current_kind",
+        "unknown_schema_field_variant_mode_and_status_are_rejected",
+        "missing_empty_and_unknown_source_identity_are_distinct",
+        "canonical_identity_differs_from_comparison_key",
+        "identical_text_in_different_cue_kinds_remains_distinct",
+        "exact_mode_rejects_fuzzy_embedding_substring_and_semantic_matching",
+        "normalization_outcomes_cover_lossless_authorized_loss_ambiguous_and_unsupported",
+        "lossy_or_ambiguous_normalization_cannot_prove_exact_match",
+        "valid_binding_candidate_preserves_immutable_target",
+        "binding_rejects_target_source_scope_fence_and_revision_mismatch",
+        "binding_candidate_cannot_carry_canonical_action_or_status_mutation",
+        "complete_snapshot_is_rebuildable_from_exact_inputs",
+        "snapshot_denominator_arithmetic_reconciles",
+        "snapshot_digest_is_stable_under_set_like_input_order",
+        "profile_source_or_fence_change_invalidates_snapshot_identity",
+        "snapshot_states_keep_complete_partial_unavailable_stale_and_unknown_distinct",
+        "invalidation_causes_require_exact_owner_evidence",
+        "invalidation_preserves_prior_history_and_predecessor",
+        "relation_edge_requires_registry_direction_revision_digest_and_evidence",
+        "broken_reordered_and_disconnected_paths_are_rejected",
+        "depth_zero_direct_only_profile_request_and_result_are_valid",
+        "direct_activation_valid_with_zero_edges",
+        "direct_and_derived_are_not_interchangeable",
+        "one_hop_and_bounded_multi_hop_candidates_preserve_shape",
+        "every_independent_activation_bound_enforces_boundary_and_one_over",
+        "zero_unknown_and_invalid_limits_are_not_unlimited",
+        "duplicate_target_preserves_bounded_multiple_path_evidence",
+        "cycles_duplicates_paths_and_members_do_not_inflate_arithmetic",
+        "direct_complete_and_derived_partial_are_representable_together",
+        "complete_partial_truncated_blocked_unavailable_stale_and_unknown_are_distinct",
+        "truncation_preserves_frontier_omission_and_continuation",
+        "complete_result_cannot_carry_frontier",
+        "known_empty_differs_from_unavailable",
+        "retrieval_stage_lineage_is_exact",
+        "activation_candidate_cannot_claim_delivery_visibility_use_adherence_or_outcome",
+        "activation_candidate_cannot_mutate_support_accessibility_influence_or_lifecycle",
+        "privacy_authority_effect_and_proof_escalation_is_rejected",
+        "canonical_round_trip_and_digest_are_deterministic",
+        "semantic_path_and_transformation_order_are_preserved",
+        "legacy_payload_is_rejected_by_current_decoder",
+        "every_variable_field_enforces_its_declared_bound",
+        "sensitive_diagnostics_are_redacted",
+        "malformed_input_never_panics",
+        "derived_paths_are_contiguous_bounded_and_start_from_direct_seeds",
+        "complete_denominator_member_and_frontier_arithmetic_reconciles",
+        "every_identity_bearing_mutation_changes_digest_or_is_rejected",
+        "consumer_fixture_compiles_standalone",
+        "source_api_contains_no_algorithm_io_store_provider_model_mutation_authority_effect_or_finish"
+      ]
+    },
+    "declared_required_exports": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": [
+        "ObservedCue",
+        "NormalizedCue",
+        "CanonicalCueIdentity",
+        "ComparisonKey",
+        "MatchMode",
+        "NormalizationProfile",
+        "NormalizationOutcome",
+        "CueBindingCandidate",
+        "CueSnapshot",
+        "SnapshotMember",
+        "RebuildIdentity",
+        "ActivationRequest",
+        "ActivationBounds",
+        "ActivationResult",
+        "DirectActivation",
+        "DerivedActivation",
+        "Completeness",
+        "BoundKind",
+        "CueContractError"
+      ]
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 77,
+    "test_stu": 52672,
+    "nonzero": true
+  },
+  "bound_contract_digest": "9455de4ab393ce271959b6dca3fa885998ba6e4bd226fa5f7aa322d919abc017",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-cue-contracts/Cargo.toml",
+        "sha256": "f6da30076aca69c1c256ca9a8911ca7089160dd19efe129e64b9f5f7bb547141"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-cue-contracts/module.toml",
+        "sha256": "4b70388d1bdcfa1253bded827f4a0c3a9485229e755f7bc76eb0db1a1e65c952"
+      },
+      "selected_source": {
+        "path_count": 22,
+        "sha256": "8f56fb36d2e582dec2e261fb2f8870773e18a83119d7e3f7944cc7eb77904400"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "458773258dc1c028ad4169635fe5c60be24712937e1f6d76acd8c1771acda229",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "458773258dc1c028"
+  }
+}

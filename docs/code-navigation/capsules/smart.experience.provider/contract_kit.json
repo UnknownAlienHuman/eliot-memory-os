@@ -1,0 +1,312 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.experience.provider",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "smart.experience.provider",
+    "source_package": "eliot-experience-provider",
+    "source_manifest": "crates/smart/eliot-experience-provider/Cargo.toml",
+    "source_root_path": "crates/smart/eliot-experience-provider",
+    "module_manifest": "crates/smart/eliot-experience-provider/module.toml",
+    "workspace_member": true,
+    "bins_reachable": true,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Fetch one scoped GetAuditRange bridge read, shape admitted V1 journal envelopes into a frozen JournalProjection plus a journal-family coverage echo, resolve admitted bank/feedback records to owner-issued view refs with retention postures, and invoke the Smart consumer edges (view revalidation, self-quality assess-plus-recheck, memory-quality assessment, scoped understanding assessment)."
+    },
+    "causal_property": {
+      "state": "DECLARED",
+      "origin": "module.toml|causal_property",
+      "value": "audit-bridge journal projection with live presence binding"
+    },
+    "invariants": {
+      "state": "DECLARED",
+      "origin": "module.toml|invariants",
+      "value": [
+        "V1 envelopes only: record_v2 is never collapsed into V1",
+        "every carried record presence-checks against live handles or the read fails closed",
+        "coverage binds owner-issued revision heads; Complete posture only on exact count with no omissions or blinds",
+        "views echo coverage with Partial posture and never establish completeness",
+        "unavailable bridges and stale refs report RETENTION_BLOCKED/coverage-gap posture; no expiry or permission is invented",
+        "no new state, no writes, no second owner"
+      ]
+    },
+    "non_goals": {
+      "state": "DECLARED",
+      "origin": "module.toml|non_goals",
+      "value": [
+        "experience bank ownership",
+        "feedback record ownership",
+        "store writes",
+        "retention scheduling",
+        "V2 record carriage",
+        "completeness establishment"
+      ]
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "smart-memory-context",
+        "title": "Smart memory, context, and understanding",
+        "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+        "documentation_handles": [
+          "I12.13",
+          "I17.11"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "DECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": "smart.experience.provider"
+    },
+    "source_maintenance_owner": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": null
+    },
+    "state_class": {
+      "state": "DECLARED",
+      "origin": "module.toml|state_class",
+      "value": "stateless"
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "DECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": [
+        "scoped read-only canonical store bridge reads (GetAuditRange only)"
+      ]
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Reject non-audit responses, fence drift, head-fence inequality, stale revisions, malformed payloads, malformed members, scope/fence drift, and presence drift explicitly. Bridge outage surfaces as BridgeUnavailable with no hold claimed; per-record retention resolves through the owner resolver with caller-carried holds only, and withheld members carry gap postures. Malformed bridge bytes fail closed as integrity errors, never as partial projections."
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|inputs",
+      "value": [
+        "store-neutral CanonicalReadClient",
+        "scoped GetAuditRange read with fence and consistency",
+        "live journal admitted-handle set read at call time",
+        "admitted bank/feedback records plus live owner envelopes",
+        "retention schedule attestation with caller-carried holds",
+        "edge-supplied assessment position, receipts, and obligation handles"
+      ]
+    },
+    "outputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|outputs",
+      "value": [
+        "JournalProjection (V1, frozen digest)",
+        "ExperienceView per family (owner-issued refs or ref-less echo)",
+        "WithheldMember gap postures",
+        "QualityAssessmentCandidate (frozen closure)",
+        "MemoryEcologyAssessment (advisory sections)",
+        "ScopedUnderstandingAssessment (finding-free candidate)"
+      ]
+    },
+    "providers": {
+      "state": "DECLARED",
+      "origin": "module.toml|providers",
+      "value": [
+        "canonical Store bridge (durable audit reads)",
+        "Governor observation owner (live presence handles, bank/feedback envelopes, admitted records)"
+      ]
+    },
+    "depends_on": {
+      "state": "DECLARED",
+      "origin": "module.toml|depends_on",
+      "value": [
+        "eliot-store-api",
+        "eliot-observation-contracts",
+        "eliot-contracts",
+        "eliot-experience-projection",
+        "eliot-cognitive-quality",
+        "eliot-epistemic-contracts",
+        "eliot-learning-contracts",
+        "eliot-receipts",
+        "eliot-memory-quality",
+        "eliot-understanding-assessment"
+      ]
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": "R6"
+      },
+      "runtime_bundle": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": "eliot-dreamer"
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "DECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "DECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": "merge back when no independent consumer, proof, dependency or replacement seam remains"
+    },
+    "split_trigger": {
+      "state": "DECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": null
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "DECLARED",
+      "origin": "module.toml|discriminator",
+      "value": "every projection is assembled from bytes actually returned by a GetAuditRange bridge read with owner-issued revision heads bound into coverage; every carried record presence-checks against caller-supplied live journal handles; unavailable bridges report RETENTION_BLOCKED posture, never invented schedules"
+    },
+    "old_failure_or_missing_capability": {
+      "state": "DECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": "Experience projections exist only as test fixtures: no production path reads admitted envelopes through the canonical bridge, binds them to live journal presence, and hands typed V1 envelopes to the Smart consumer edge (CC-W9-COGNITIVE-QUALITY)."
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [],
+    "contract_refs_source": "crates/smart/eliot-experience-provider/Cargo.toml",
+    "donor_records": [
+      {
+        "path": "crates/foundation/eliot-observation-contracts/src/experience_projection.rs",
+        "disposition": "owner envelope reused unchanged: JournalProjection assembly/validation, V1 record shapes, closed omission classes; no contract edits"
+      },
+      {
+        "path": "crates/governor/eliot-read/src/lib.rs",
+        "disposition": "bridge contract reused: scoped GetAuditRange named read with fence/consistency gating; this package adds no operations and no facade"
+      },
+      {
+        "path": "crates/smart/cognitive-rev12-contract-schema-freeze.toml",
+        "disposition": "wave authority: freeze r5 denominator doctrine; V1 envelope kept as declared, no r6 requested"
+      },
+      {
+        "path": "crates/smart/eliot-experience-projection/src/lib.rs",
+        "disposition": "Smart consumer surface reused: ExperienceView assembly plus journal-presence revalidation; this package is its bridge-fed caller"
+      },
+      {
+        "path": "crates/storage/eliot-store-api/src/lib.rs",
+        "disposition": "store-neutral bridge types reused: CanonicalReadClient, NamedReadRequest/Response, revision heads; payload bytes typed at this consumer boundary"
+      }
+    ]
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-experience-provider/Cargo.toml",
+        "sha256": "65169410a605c76633ecfc4b676e9801b7f74d9bb17e56adef9fa4a9574eca9f"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-experience-provider/module.toml",
+        "sha256": "688bf8adbd31c80e0decd438e5e5c3de21f8852720d795f6a2904d70b80068af"
+      },
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "f7cadd5f6cb5361bb4d2a6e42b2ae696e55134c5c2b1518cc3fe67df493ea517"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "a5e3172c808b4ee29b3613726348e9259843048c83bb4bf305886150b932c7d8",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "a5e3172c808b4ee2"
+  }
+}

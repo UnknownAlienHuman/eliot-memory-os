@@ -1,0 +1,312 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.epistemic.contracts",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "smart.epistemic.contracts"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.epistemic.contracts",
+  "primary_source_package": {
+    "package": "eliot-epistemic-contracts",
+    "root_path": "crates/smart/eliot-epistemic-contracts",
+    "manifest_path": "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-epistemic-contracts/module.toml",
+    "description": "Versioned store-neutral contracts for ELIOT Current Epistemic Position"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 136210,
+    "test_stu": 4722,
+    "selected_file_count": 24,
+    "inline_cfg_test_modules": 1,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/absence.rs",
+        "bytes": 15484,
+        "sha256": "4cb2859cc4f5e764b7a642dc1c2d69d528aca66c2b63d6738847cafae422e311",
+        "stu": 5162,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/admitted.rs",
+        "bytes": 14158,
+        "sha256": "be3784ea8815506a8e40f8b72b78130684c150477427e1bcaccbb0c869443639",
+        "stu": 4720,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/assertability.rs",
+        "bytes": 11977,
+        "sha256": "8f14c6150bd940e6bf20a4ebbf09a45c3809f43b585fe419fb1c44a0928e3ca3",
+        "stu": 3993,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/assumption.rs",
+        "bytes": 10298,
+        "sha256": "7569c445250e7a2c56ca6656c258c77ead50afa66cc3fd608f7464ca0f816de3",
+        "stu": 3433,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/candidate.rs",
+        "bytes": 41987,
+        "sha256": "65b24dfccce31f0ae64157206f052dd7a3e98e3211ede4adfee12269537ac5bf",
+        "stu": 13996,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/causal.rs",
+        "bytes": 11398,
+        "sha256": "2aa820109c779ad7b63105eaab323e1bbb4e2fb7f66c17522668f272f9097ae8",
+        "stu": 3800,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/claim_map.rs",
+        "bytes": 21691,
+        "sha256": "78fb0589746964cd2fa8b3b56cee05f9ac3acf9674286d90bf2c54dd8b65ab8a",
+        "stu": 7231,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/conflict.rs",
+        "bytes": 12783,
+        "sha256": "633d90c16210d668cb6407e97a06267ef61765d1d15c2fbe4701693ca24deae6",
+        "stu": 4261,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/contribution.rs",
+        "bytes": 6825,
+        "sha256": "9ace7de99844aa3484822e7037257c782336a6dd38ca9ca00669e4e47752b35f",
+        "stu": 2275,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/coverage.rs",
+        "bytes": 15672,
+        "sha256": "c2eef9167a867487c7e4c5e9a506262802456e5c80e95d0b89760376f476b617",
+        "stu": 5224,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/error.rs",
+        "bytes": 6662,
+        "sha256": "7e1f39e2693e7bffd0c8b02065cf2555767f21cba290865b2b2fd68d3ef5aa7e",
+        "stu": 2221,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/grade.rs",
+        "bytes": 6270,
+        "sha256": "388b5980c0d56f9224bfeb0e05e48cbc6f5858acf3c2ed6765faa0af02ab2967",
+        "stu": 2090,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/identity.rs",
+        "bytes": 9557,
+        "sha256": "f0553db4df6af2f150ba5f568c19f349837ce54de7396fe4b2c03e31106ab841",
+        "stu": 3186,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/investigation.rs",
+        "bytes": 5234,
+        "sha256": "808503b3fff54000fcca2a661cc8cbabb9e80bf135de31a61679ca5ecbc18078",
+        "stu": 1745,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/lib.rs",
+        "bytes": 5912,
+        "sha256": "db4a6367f1e856b946717acd1677ffaae6284856a2c0a9ba0602c4848ed349c1",
+        "stu": 1971,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/provenance.rs",
+        "bytes": 14451,
+        "sha256": "faa426cf2b916edfb8b86ad1b33236fcc36f638f0d501d4cd41c022055e94bfb",
+        "stu": 4817,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/receipt.rs",
+        "bytes": 11928,
+        "sha256": "d53ddc88e09856face636335b82d7bf1533c1d647cc9e90b72a529061594ec0d",
+        "stu": 3976,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/request.rs",
+        "bytes": 8543,
+        "sha256": "ac442189fd2279cfe6d24cc3f3526515592cc06a3f0114cb925fca0eb08a6aae",
+        "stu": 2848,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/support.rs",
+        "bytes": 13367,
+        "sha256": "4154a80f6726bff377be8b6e99ea65b43561a9cc6ddf5bec6b81dc9ea431a8e0",
+        "stu": 4456,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/temporal.rs",
+        "bytes": 3976,
+        "sha256": "618df136a3a6273ea7938aa6695e206ca19285f63501e2581c18f2b84d53a018",
+        "stu": 1326,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/tests.rs",
+        "bytes": 123443,
+        "sha256": "6f2c3f686aa98c97399098c0922e7fbe38b31a7a3fc71f586c2a5143cd0cf850",
+        "stu": 41148,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/transition.rs",
+        "bytes": 28122,
+        "sha256": "0645fff142500d4f9107bab047cee715e5e4a63558d2370b83e24761f858072a",
+        "stu": 9374,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/src/verifier.rs",
+        "bytes": 8891,
+        "sha256": "feba2c4785c1f16259deafe75bcd2dbe375f41e0b92b83564eaa1db2d0d80f87",
+        "stu": 2964,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/tests/consumer_fixtures.rs",
+        "bytes": 14166,
+        "sha256": "648d11908965a0ecdf8eefa6ae3af209ac850fe751b0e3bbedf86e8ed64dc0ca",
+        "test_attributes": 1,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "004f197687b84bffc2bb8e193dde8625fd799712e2c40d5507457a1e140df31e"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-evidence",
+    "eliot-receipts",
+    "schemars",
+    "serde",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-dreamer",
+    "bins/eliotd",
+    "crates/governor/eliot-canonical",
+    "crates/governor/eliot-governor",
+    "crates/kernel/eliot-kernel-service",
+    "crates/smart/eliot-cognitive-quality",
+    "crates/smart/eliot-context-candidates",
+    "crates/smart/eliot-dreamer-architecture-brief",
+    "crates/smart/eliot-dreamer-classification",
+    "crates/smart/eliot-dreamer-conflict-analysis",
+    "crates/smart/eliot-dreamer-contracts",
+    "crates/smart/eliot-dreamer-episode",
+    "crates/smart/eliot-dreamer-implementation-brief",
+    "crates/smart/eliot-dreamer-orientation",
+    "crates/smart/eliot-dreamer-orientation-wasm",
+    "crates/smart/eliot-dreamer-relation",
+    "crates/smart/eliot-dreamer-rival-model",
+    "crates/smart/eliot-epistemic",
+    "crates/smart/eliot-epistemic-context-provider",
+    "crates/smart/eliot-experience-provider",
+    "crates/smart/eliot-understanding-assessment",
+    "crates/storage/eliot-store-api",
+    "crates/storage/eliot-store-memory",
+    "crates/storage/eliot-store-surreal-adapter"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "3427a2c2f8a7613157827503c770fd12e9b56129e6b701819435277e674ffe7b",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+        "sha256": "326ea2aa5c8b1101fc3ed4cbb85fb154b021f8dd5705e1a4cd529cdf9b3022a3"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-epistemic-contracts/module.toml",
+        "sha256": "b1f6a6a4fcb2378cbbafe06d01b5029f9ccf97d91ff7b4505b86b4e7045d0a66"
+      },
+      "selected_source": {
+        "path_count": 24,
+        "sha256": "004f197687b84bffc2bb8e193dde8625fd799712e2c40d5507457a1e140df31e"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "df4ca62a35657213c07f51dab0d1fe6d733992090b00e92a76529c5052b647d3",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "df4ca62a35657213"
+  }
+}

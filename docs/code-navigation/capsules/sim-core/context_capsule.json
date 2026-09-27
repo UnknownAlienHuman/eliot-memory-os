@@ -1,0 +1,217 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "sim-core",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "sim-core"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/sim-core",
+  "primary_source_package": {
+    "package": "eliot-sim-core",
+    "root_path": "crates/eliot-sim-core",
+    "manifest_path": "crates/eliot-sim-core/Cargo.toml",
+    "module_manifest": null,
+    "description": "Pure deterministic simulation boundary: commands, events, state, seeded scheduler, fault injection, seed artifacts, mandatory scenarios"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 42844,
+    "test_stu": 6668,
+    "selected_file_count": 15,
+    "inline_cfg_test_modules": 4,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/eliot-sim-core/src/adapters.rs",
+        "bytes": 4400,
+        "sha256": "8cfa1162697dc37d00798d31bdba25ad358b8822ec8752e4d78d9ed8df0eb9d3",
+        "stu": 1467,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/eliot-sim-core/src/command.rs",
+        "bytes": 9450,
+        "sha256": "9c3a650e1aeb62dd4d4d3b2377553cc11c1c0e35bb63df4cd67ec0ce457d584a",
+        "stu": 3150,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/eliot-sim-core/src/digest.rs",
+        "bytes": 4185,
+        "sha256": "0f1899fd7916c2a0473981de15fad710d3f77abba15387e5cbb0642693b9aa22",
+        "stu": 1395,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/eliot-sim-core/src/event.rs",
+        "bytes": 9164,
+        "sha256": "1f817e4d1be81bc68a23de5319103c4b8a2edbbf4862f59601f8da72124768b2",
+        "stu": 3055,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/eliot-sim-core/src/fault.rs",
+        "bytes": 7721,
+        "sha256": "a9e242326ebd1bc5614942d6552747686c7bb0f779b87b36886018c5a16de43c",
+        "stu": 2574,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/eliot-sim-core/src/lib.rs",
+        "bytes": 2436,
+        "sha256": "5100f3fcc56b9d18cc4298baccd3a286bd011ad0e486b7df06b43b204d71caed",
+        "stu": 812,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/eliot-sim-core/src/rng.rs",
+        "bytes": 2106,
+        "sha256": "7491e23f0bde414fa406750a7110d550270c4ae8882f8f2f34a4467bff9e7710",
+        "stu": 702,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/eliot-sim-core/src/run.rs",
+        "bytes": 28153,
+        "sha256": "a73399a012a2c2b8dd81042aa5ecf63733d632ce2d0c958b19c0eec10625a570",
+        "stu": 9385,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/eliot-sim-core/src/scenario.rs",
+        "bytes": 23833,
+        "sha256": "f9df3ba72a84dd13ca93a402929b10a02078c03ab835df02575fae1826be97e4",
+        "stu": 7945,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/eliot-sim-core/src/scheduler.rs",
+        "bytes": 13088,
+        "sha256": "a783ddb0a4e3b5143a98dbdfe74a0ad53175eac7866f2fa4363b629b7530ccfe",
+        "stu": 4363,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "crates/eliot-sim-core/src/seed.rs",
+        "bytes": 4742,
+        "sha256": "00af31ca8ae687549256b7ff96eaa67c1f006b8191577895efd3bb9fee66cc0b",
+        "stu": 1581,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/eliot-sim-core/src/state.rs",
+        "bytes": 19252,
+        "sha256": "c0a4263521b61e3ac63a0d10ff7fa1b7502e4a0be9d410a00d5daf51ca43149e",
+        "stu": 6418,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/eliot-sim-core/tests/determinism.rs",
+        "bytes": 2973,
+        "sha256": "4dd9e61073c8d81f569fad0cc468314d186fda636f4f623f3a582f0c152aa4c1",
+        "test_attributes": 2,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/eliot-sim-core/tests/disposition.rs",
+        "bytes": 4065,
+        "sha256": "d9708eb77220e4ea1436ef833038f3592247ca2809cd938d68390d9f6245f659",
+        "test_attributes": 4,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/eliot-sim-core/tests/mandatory_scenarios.rs",
+        "bytes": 12965,
+        "sha256": "edcb4b47a723e9dc5f9bef9f3992af99f127265d887db88b8b454e9d7e8be1d0",
+        "test_attributes": 18,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "fa933136514a3d10b14465c7faebb73e5aef4e2a298602bdfc1d1e62b2f0cab0"
+  },
+  "one_hop_providers": [],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "instrument-code-intelligence",
+      "title": "Instrumentation, verification, and code intelligence",
+      "responsibility": "Instrument execution, Code Cortex/Code Graph, build-test graph, diagnostics, verification, test selection, reports, and product evaluation.",
+      "documentation_handles": [
+        "I10.8.17",
+        "I18.18",
+        "I18.41"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "4162d8504a868ba13fb75cbc4d61ec045ae3b5308a98ae4f051148bebb24d008",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/eliot-sim-core/Cargo.toml",
+        "sha256": "18fa271492a9750732dc883a67b6e6b6aa28126bd1a964b86d31e96ad1c9f664"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 15,
+        "sha256": "fa933136514a3d10b14465c7faebb73e5aef4e2a298602bdfc1d1e62b2f0cab0"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "c43766f47ff1b1732a3dae9bb372194b480b2e8730269386f7e0916512445061",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "c43766f47ff1b173"
+  }
+}
