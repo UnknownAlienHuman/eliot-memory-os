@@ -93,11 +93,33 @@ COMPILE_ONLY_PROFILE_MARKER = "-Profile MergeCompile"
 # Operator harness execution identity (issue #1225 N_step5). A non-compile-only
 # workflow that builds Eliot.Operator must EXECUTE the Eliot.Operator.Tests
 # harness: an explicit `dotnet run` (or `dotnet exec`) invocation whose target
-# is the harness project. A `dotnet restore`/`dotnet build` line, a step name,
-# quoted prose, or a run-summary execution claim is not execution. Quoted
-# string literals and `#` comments are stripped before matching, so only real
-# invocations count (same technique as check_dotnet_restore_lock).
+# is the harness project, with `dotnet` standing at command position on its
+# code line. A `dotnet restore`/`dotnet build` line, a step name, quoted
+# prose, a run-summary execution claim, or a harness-shaped mention passed as
+# an argument to a print builtin (`echo`, `Write-Host`, `Write-Output`,
+# `printf`) is not execution. Quoted string literals and `#` comments are
+# stripped before matching, so only real invocations count (same technique as
+# check_dotnet_restore_lock).
 OPERATOR_HARNESS_EXECUTION_RE = re.compile(r"dotnet\s+(run|exec)\b[^\n]*Eliot\.Operator\.Tests")
+# Print/forward builtins whose arguments are prose, not invoked commands.
+# Matched case-insensitively as whole tokens in the code before the `dotnet`
+# token, so `echo dotnet run ...` and `Write-Host dotnet run ...` never count
+# as harness execution even when unquoted.
+NON_EXECUTION_COMMAND_RE = re.compile(r"(?<![\w.-])(echo|write-host|write-output|printf)(?![\w-])", re.IGNORECASE)
+# What may legally precede the invoked `dotnet` token on one code line: YAML
+# step framing (`- run:`), block-scalar/chaining separators, the PowerShell
+# call operator, and explicit shell wrappers (`pwsh -Command`, `sh -c`, ...).
+HARNESS_COMMAND_PREFIX_RE = re.compile(
+    r"""(?ix)^
+    [\s|>&;]*
+    (?:-\s+)?
+    (?:run:\s*)?
+    (?:[|>&;]+\s*|&&\s*|\|\|\s*)*
+    (?:&\s*)?
+    (?:(?:pwsh(?:\.exe)?|powershell(?:\.exe)?|sh|bash|cmd(?:\.exe)?|/bin/(?:sh|bash))
+       (?:\s+[^\s|>&;]+)*\s+(?:-c(?:ommand)?\s+)?)?
+    $"""
+)
 # Run-summary wording that asserts the harness ran. The claim is never compared
 # with anything on its own: it satisfies the coverage rule only together with
 # an execution invocation above, and it fails the rule without one.
@@ -117,10 +139,25 @@ def workflow_code_line(line: str) -> str:
 
 
 def operator_harness_executed(content: str) -> bool:
-    """True when the workflow text executes the Operator test harness."""
+    """True when the workflow text executes the Operator test harness.
+
+    The harness mention counts only when `dotnet` is the invoked command:
+    a print builtin (`echo`, `Write-Host`, ...) before it on the same code
+    line makes the mention its argument (prose, not execution), and anything
+    else before it outside YAML framing, chaining separators, or an explicit
+    shell wrapper means `dotnet` is not at command position.
+    """
     for line in content.splitlines():
-        if OPERATOR_HARNESS_EXECUTION_RE.search(workflow_code_line(line)):
-            return True
+        code = workflow_code_line(line)
+        match = OPERATOR_HARNESS_EXECUTION_RE.search(code)
+        if match is None:
+            continue
+        before = code[: match.start()]
+        if NON_EXECUTION_COMMAND_RE.search(before):
+            continue
+        if not HARNESS_COMMAND_PREFIX_RE.match(before):
+            continue
+        return True
     return False
 
 
@@ -1066,6 +1103,13 @@ def run_self_tests() -> int:
         # even when nothing is built: zero/nonexecuted checks cannot satisfy an
         # execution claim.
         ("operator_claim_without_execution_rejected", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests (exit 0)\"\n", "GWF-006"),
+        # An `echo` of the harness command is prose, not execution: the
+        # invocation-shaped substring is an argument to echo, so the build
+        # plus the terminal claim still fail without a real invocation.
+        ("operator_echo_bypass_rejected", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore\n      - run: echo dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests (exit 0)\"\n", "GWF-006"),
+        # Same bypass through the PowerShell print builtin, unquoted: still
+        # prose, so the build still fails without a real invocation.
+        ("operator_write_host_bypass_rejected", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore\n      - run: Write-Host dotnet run tests/Eliot.Operator.Tests please\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests (exit 0)\"\n", "GWF-006"),
         # The true shape passes: build plus an explicit dotnet run of the
         # harness project plus the terminal execution claim.
         ("operator_execution_accepted", "test.yml", "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore\n      - run: dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests (exit 0)\"\n", None),
@@ -1308,7 +1352,7 @@ def run_self_tests() -> int:
             print(f"SELF_TEST_FAILURE: hash-locked pip install produced unexpected findings: {findings}", file=sys.stderr)
             return 1
 
-    # 29 single-file workflow cases + 2 cross-workflow divergence cases
+    # 31 single-file workflow cases + 2 cross-workflow divergence cases
     # + 1 derived-identity case + 7 rule-level cases below.
     case_count = len(test_cases) + len(divergence_cases) + 1 + 7
     print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")

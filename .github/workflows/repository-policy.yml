@@ -308,18 +308,40 @@ jobs:
                       return children
               return []
 
+          harness_execution_re = re.compile(r'dotnet\s+(run|exec)\b[^\n]*Eliot\.Operator\.Tests')
+          non_execution_command_re = re.compile(r'(?<![\w.-])(echo|write-host|write-output|printf)(?![\w-])', re.IGNORECASE)
+          harness_command_prefix_re = re.compile(
+              r'''(?ix)^
+              [\s|>&;]*
+              (?:-\s+)?
+              (?:run:\s*)?
+              (?:[|>&;]+\s*|&&\s*|\|\|\s*)*
+              (?:&\s*)?
+              (?:(?:pwsh(?:\.exe)?|powershell(?:\.exe)?|sh|bash|cmd(?:\.exe)?|/bin/(?:sh|bash))
+                 (?:\s+[^\s|>&;]+)*\s+(?:-c(?:ommand)?\s+)?)?
+              $''')
+
           def operator_harness_executed(text):
               # Issue #1225 N_step5: execution is an explicit dotnet run/exec
-              # of the Eliot.Operator.Tests harness. A restore/build line, a
-              # step name, quoted prose, or a run-summary claim is not
-              # execution: quoted literals and comments are stripped so only
-              # real invocations count.
+              # of the Eliot.Operator.Tests harness with dotnet at command
+              # position. A step name, quoted prose, a run-summary claim, or
+              # a harness-shaped mention passed to a print builtin
+              # (echo/Write-Host bypass, quoted or not) is not execution:
+              # quoted literals and comments are stripped so only real
+              # invocations count.
               for line in text.splitlines():
                   code = re.sub(r'"[^"]*"', '', line)
                   code = re.sub(r"'[^']*'", '', code)
                   code = code.split('#', 1)[0]
-                  if re.search(r'dotnet\s+(run|exec)\b[^\n]*Eliot\.Operator\.Tests', code):
-                      return True
+                  match = harness_execution_re.search(code)
+                  if match is None:
+                      continue
+                  before = code[:match.start()]
+                  if non_execution_command_re.search(before):
+                      continue
+                  if not harness_command_prefix_re.match(before):
+                      continue
+                  return True
               return False
 
           workflow_dir = pathlib.Path('.github/workflows')
