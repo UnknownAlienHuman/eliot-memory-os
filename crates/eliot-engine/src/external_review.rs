@@ -644,10 +644,19 @@ impl ExternalReviewNormalizer {
         // unqualified legacy evidence.
         let standing = ExternalReviewEvidenceStanding::of_document(raw_output);
         let (raw_output_blob_ref, standing_reason) = match standing {
-            ExternalReviewEvidenceStanding::StrictProviderBytes => (
-                job.raw_output_blob_ref.clone(),
-                "raw evidence qualified: exact provider bytes strictly decoded and retained",
-            ),
+            ExternalReviewEvidenceStanding::StrictProviderBytes => {
+                // The sole Strict producer retains the exact decoded bytes, so a
+                // Strict document without a retained handle is a caller bug that
+                // would over-claim byte proof; fail loudly in debug/test builds.
+                debug_assert!(
+                    job.raw_output_blob_ref.is_some(),
+                    "strict provider document paired with a job lacking the retained byte handle"
+                );
+                (
+                    job.raw_output_blob_ref.clone(),
+                    "raw evidence qualified: exact provider bytes strictly decoded and retained",
+                )
+            }
             ExternalReviewEvidenceStanding::UnqualifiedLegacy => {
                 let (_, reason) = ExternalReviewEvidenceStanding::read_back_historical(
                     job.raw_output_blob_ref.as_ref(),
