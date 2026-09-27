@@ -121,8 +121,9 @@ pub use purge_ledger::{
     PurgeLedgerRevisionBinding,
 };
 pub use reservation_model::{
-    ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
-    ScopeReservationRequest, WriterReservationToken,
+    PoisonAttemptClassification, PoisonAttemptRecord, ReservationRecord, ReservationRequest,
+    ReservationState, ReservedScope, ScopeReservationRequest, SequenceGapReconciliation,
+    WriterReservationToken,
 };
 pub use restore_journal::{
     JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES,
