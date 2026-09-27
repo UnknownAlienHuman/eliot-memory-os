@@ -35,7 +35,7 @@ class TestExcludedDispositionsGate1811(unittest.TestCase):
     def test_every_row_has_disposition_verb_and_named_owner(self) -> None:
         data = tomllib.loads(INVENTORY.read_text(encoding="utf-8"))
         rows = data.get("crate", [])
-        self.assertGreaterEqual(len(rows), 11, "must cover the standalone denominator")
+        self.assertEqual(len(rows), data.get("standalone_package_count"), "must cover the standalone denominator")
         for row in rows:
             with self.subTest(crate=row.get("path")):
                 self.assertIn(str(row.get("disposition")), ALLOWED)
