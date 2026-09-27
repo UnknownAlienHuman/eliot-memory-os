@@ -52,6 +52,7 @@ pub use backup_io::{
 };
 pub mod demand;
 pub mod key_ports;
+pub mod stream_sink;
 pub use demand::{
     ApprovedBlobView, BlobGenerationProbe, BlobProbeError, StoreBlobDemand,
     classify_capture_payload, garbage_collection_demand, probe_blob_generation,
@@ -75,6 +76,7 @@ use eliot_receipts::{
 pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+pub use stream_sink::{BlobStoreStreamSink, BlobStreamSinkStoreBinding};
 
 const FORMAT_ID: &str = "eliot-blob-envelope";
 const FORMAT_VERSION: u32 = 1;

@@ -899,6 +899,7 @@ dependencies = [
  "eliot-blob-api",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
  "eliot-receipts",
  "eliot-security-contracts",
  "serde",
