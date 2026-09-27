@@ -195,6 +195,7 @@ mod research_provider_route;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
+mod wasm_runtime_port_grant;
 /// Kernel-owned I14.1 work-class admission seam (issue #1920).
 ///
 /// The admission API and its frozen pool semantics live in
@@ -203,7 +204,6 @@ mod startup_coordinator;
 /// submission path and binds an audit-critical event through the single
 /// Kernel audit chain.
 pub mod work_class_admission;
-mod wasm_runtime_port_grant;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
@@ -440,8 +440,8 @@ pub use wasm_runtime_port_grant::{
     WasmPortGrant, handle_wasm_port_grant, issue_wasm_port_grant, validate_wasm_port_grant,
 };
 pub use work_class_admission::{
-    AdmittedWork, AdmissionClass, CancellationState, ExecutionState, PoolLimit,
-    SHEDDING_ORDER, WorkAdmissionRefusal, WorkAdmissionRequest, WorkClassBudgets, WorkPoolBudget,
+    AdmissionClass, AdmittedWork, CancellationState, ExecutionState, PoolLimit, SHEDDING_ORDER,
+    WorkAdmissionRefusal, WorkAdmissionRequest, WorkClassBudgets, WorkPoolBudget,
 };
 
 #[cfg(all(test, windows))]

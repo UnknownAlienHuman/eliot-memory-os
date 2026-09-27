@@ -98,7 +98,7 @@ pub use module::runtime_health::{
     CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
 };
 pub use module::work_class_admission::{
-    AdmittedWork, AdmittedWorkRecord, AdmissionClass, CancellationState, ExecutionState,
+    AdmissionClass, AdmittedWork, AdmittedWorkRecord, CancellationState, ExecutionState,
     PoolAvailability, PoolLimit, SHEDDING_ORDER, WorkAdmissionRefusal, WorkAdmissionRequest,
     WorkClassBudgets, WorkClassScheduler, WorkPool, WorkPoolBudget,
 };

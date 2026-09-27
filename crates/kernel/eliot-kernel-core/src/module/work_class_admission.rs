@@ -256,8 +256,7 @@ impl WorkClassBudgets {
             .validate("work_class_budgets.canonical_write")?;
         self.normal_background
             .validate("work_class_budgets.normal_background")?;
-        self.model_jobs
-            .validate("work_class_budgets.model_jobs")?;
+        self.model_jobs.validate("work_class_budgets.model_jobs")?;
         self.swarm.validate("work_class_budgets.swarm")?;
         self.reporting.validate("work_class_budgets.reporting")?;
         self.maintenance
@@ -387,12 +386,12 @@ impl WorkAdmissionRefusal {
     fn invalid(error: KernelError) -> Self {
         match error {
             KernelError::InvalidField { field, reason } => Self::InvalidRequest { field, reason },
-            KernelError::Foundation(_) | KernelError::Receipt(_) | KernelError::RuntimeContract(_) => {
-                Self::InvalidRequest {
-                    field: "work_admission.request",
-                    reason: "identity is not an accepted Kernel opaque identity",
-                }
-            }
+            KernelError::Foundation(_)
+            | KernelError::Receipt(_)
+            | KernelError::RuntimeContract(_) => Self::InvalidRequest {
+                field: "work_admission.request",
+                reason: "identity is not an accepted Kernel opaque identity",
+            },
             _ => Self::InvalidRequest {
                 field: "work_admission.request",
                 reason: "request identity is not admissible",
@@ -652,12 +651,12 @@ impl AdmittedWork {
     /// admitted in its pool.
     pub fn record(&self) -> Result<AdmittedWorkRecord, WorkAdmissionRefusal> {
         let records = self.pool.lock();
-        let record = records
-            .get(self.work_id.as_str())
-            .ok_or_else(|| WorkAdmissionRefusal::NotAdmitted {
+        let record = records.get(self.work_id.as_str()).ok_or_else(|| {
+            WorkAdmissionRefusal::NotAdmitted {
                 class: self.pool.class,
                 work_id: self.work_id.clone(),
-            })?;
+            }
+        })?;
         Ok(AdmittedWorkRecord {
             class: record.class,
             work_id: self.work_id.clone(),
@@ -684,12 +683,12 @@ impl AdmittedWork {
     /// its pool.
     pub fn start_running(&mut self) -> Result<(), WorkAdmissionRefusal> {
         let mut records = self.pool.lock();
-        let record = records
-            .get_mut(self.work_id.as_str())
-            .ok_or_else(|| WorkAdmissionRefusal::NotAdmitted {
+        let record = records.get_mut(self.work_id.as_str()).ok_or_else(|| {
+            WorkAdmissionRefusal::NotAdmitted {
                 class: self.pool.class,
                 work_id: self.work_id.clone(),
-            })?;
+            }
+        })?;
         if record.cancellation == CancellationState::CancelRequested {
             return Err(WorkAdmissionRefusal::Cancelled {
                 class: self.pool.class,
@@ -724,12 +723,12 @@ impl AdmittedWork {
     /// never observes a budget that was not actually charged.
     pub fn consume_retry(&mut self) -> Result<u32, WorkAdmissionRefusal> {
         let mut records = self.pool.lock();
-        let record = records
-            .get_mut(self.work_id.as_str())
-            .ok_or_else(|| WorkAdmissionRefusal::NotAdmitted {
+        let record = records.get_mut(self.work_id.as_str()).ok_or_else(|| {
+            WorkAdmissionRefusal::NotAdmitted {
                 class: self.pool.class,
                 work_id: self.work_id.clone(),
-            })?;
+            }
+        })?;
         if record.retries_remaining == 0 {
             return Err(WorkAdmissionRefusal::RetryBudgetExhausted {
                 class: self.pool.class,
@@ -752,12 +751,12 @@ impl AdmittedWork {
     /// left its pool.
     pub fn cancel(&mut self) -> Result<(), WorkAdmissionRefusal> {
         let mut records = self.pool.lock();
-        let record = records
-            .get_mut(self.work_id.as_str())
-            .ok_or_else(|| WorkAdmissionRefusal::NotAdmitted {
+        let record = records.get_mut(self.work_id.as_str()).ok_or_else(|| {
+            WorkAdmissionRefusal::NotAdmitted {
                 class: self.pool.class,
                 work_id: self.work_id.clone(),
-            })?;
+            }
+        })?;
         record.cancellation = CancellationState::CancelRequested;
         Ok(())
     }
@@ -894,11 +893,7 @@ fn totals(records: &BTreeMap<String, PoolRecord>) -> (usize, u64, usize) {
     records.values().fold(
         (0_usize, 0_u64, 0_usize),
         |(items, bytes, running), record| match record.execution {
-            ExecutionState::Queued => (
-                items + 1,
-                bytes.saturating_add(record.bytes),
-                running,
-            ),
+            ExecutionState::Queued => (items + 1, bytes.saturating_add(record.bytes), running),
             ExecutionState::Running => (items, bytes, running + 1),
         },
     )

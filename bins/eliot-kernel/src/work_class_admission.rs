@@ -18,13 +18,11 @@
 use std::sync::Mutex;
 
 use eliot_kernel_core::{
-    AdmittedWork, AdmissionClass, PoolAvailability, WorkAdmissionRefusal, WorkAdmissionRequest,
+    AdmissionClass, AdmittedWork, PoolAvailability, WorkAdmissionRefusal, WorkAdmissionRequest,
     WorkClassScheduler,
 };
 
-use crate::{
-    KernelComposition, KernelConfig, kernel_audit::AuditEventDraft,
-};
+use crate::{KernelComposition, KernelConfig, kernel_audit::AuditEventDraft};
 
 /// The composition's single I14.1 admission handle.
 ///
@@ -80,9 +78,9 @@ impl KernelComposition {
             Ok(admitted) => Ok(admitted),
             Err(refusal) => {
                 drop(scheduler);
-                self.audit_observe(
-                    AuditEventDraft::work_class_admission_refused(class, request, &refusal),
-                );
+                self.audit_observe(AuditEventDraft::work_class_admission_refused(
+                    class, request, &refusal,
+                ));
                 Err(refusal)
             }
         }
@@ -94,10 +92,7 @@ impl KernelComposition {
     /// Returns `None` when no operator budget profile was injected, so an
     /// unconstructed scheduler can never report a fabricated capacity.
     #[must_use]
-    pub fn work_class_pool_availability(
-        &self,
-        class: AdmissionClass,
-    ) -> Option<PoolAvailability> {
+    pub fn work_class_pool_availability(&self, class: AdmissionClass) -> Option<PoolAvailability> {
         let scheduler = self.work_class_admission()?;
         let scheduler = scheduler
             .lock()
