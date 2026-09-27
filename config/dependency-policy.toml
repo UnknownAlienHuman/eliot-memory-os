@@ -177,6 +177,15 @@ features = ["derive", "env"]
 public_exposure = "CLI binary only"
 removal_plan = "manual args parsing"
 
+[direct_dependencies.crossterm]
+ecosystem = "rust"
+consumer = "bins/eliot dashboard"
+owner = "bins/eliot"
+reason = "terminal input and screen control for the optional dashboard"
+features = ["events", "windows"]
+public_exposure = "CLI binary only"
+removal_plan = "remove the optional terminal dashboard surface"
+
 [direct_dependencies.ed25519-dalek]
 ecosystem = "rust"
 consumer = "eliot-authority"
