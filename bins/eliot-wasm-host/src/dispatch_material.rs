@@ -59,10 +59,10 @@ pub const WASM_HOST_CONTROL_FILE_NAME: &str = "eliot-wasm-host.control-request.j
 /// accumulation is possible, and a stale marker (naming a replaced set)
 /// never matches the staged identity.
 pub const WASM_HOST_SERVED_FILE_NAME: &str = "eliot-wasm-host.served.json";
-/// Durable pre-execution InFlight marker (#2786 step 7): written atomically
+/// Durable pre-execution `InFlight` marker (#2786 step 7): written atomically
 /// after claim and before any guest effect, cleared only once the served
 /// marker above is durable. A crash or failed served write after the effect
-/// settled still leaves this claim, so restart classifies InFlight or
+/// settled still leaves this claim, so restart classifies `InFlight` or
 /// terminal-unacknowledged as replay instead of re-executing. Single fixed
 /// name, overwritten by every claim: no accumulation is possible, and a
 /// stale marker (naming a replaced set) never matches the staged identity.
@@ -1581,7 +1581,7 @@ pub fn reclaim_claimed_delivery(
 /// not arbitrary files alone. Legacy v1 fixed-name sets are an explicit
 /// compatibility state — consumed only under full admission with the staged
 /// identity verbatim, never reinterpreted as a fresh generation with new
-/// identity. InFlight sets reconcile through the durable pre-execution
+/// identity. `InFlight` sets reconcile through the durable pre-execution
 /// claim marker and terminal-unacknowledged sets through the durable
 /// served marker; cross-operation owner ack/retirement stays with the
 /// kernel publisher half.
@@ -1600,7 +1600,7 @@ pub enum StagedDeliveryState {
 /// re-staged after a newer serve still replays instead of re-executing. The
 /// durable markers extend the same rule across restart: a staged set the
 /// served marker names is terminal-unacknowledged (a crash between publish
-/// and reclaim), and a staged set the InFlight marker names was claimed for
+/// and reclaim), and a staged set the `InFlight` marker names was claimed for
 /// execution (a crash between claim and served durability), so both replay
 /// instead of re-executing.
 #[must_use]
@@ -1786,7 +1786,7 @@ impl InFlightDeliveryMarker {
     }
 }
 
-/// Reads the durable InFlight marker, if any. Only an absent marker answers
+/// Reads the durable `InFlight` marker, if any. Only an absent marker answers
 /// `Ok(None)`; read failures, oversize files, and malformed records fail
 /// closed so callers cannot treat an uncertain claim as a fresh delivery.
 /// The bounded read accepts a few hundred bytes for a legitimate marker.
@@ -1835,7 +1835,7 @@ pub fn read_inflight_marker(
     Ok(Some(marker))
 }
 
-/// Writes the InFlight marker atomically (process-scoped partial, flushed,
+/// Writes the `InFlight` marker atomically (process-scoped partial, flushed,
 /// then renamed): the reader never observes partial JSON. Callers must
 /// propagate a write failure and refuse execution without durable claim
 /// evidence.
@@ -1859,7 +1859,7 @@ pub fn write_inflight_marker(
     Ok(())
 }
 
-/// Clears the InFlight marker once the served marker is durable: only a
+/// Clears the `InFlight` marker once the served marker is durable: only a
 /// marker naming exactly this identity is removed, so a successor claim is
 /// never touched. Best-effort by contract — the served marker remains the
 /// primary replay guard, so a leftover only replays, never re-executes.
@@ -1873,7 +1873,7 @@ pub fn clear_inflight_marker(
         Ok(Some(mark)) if mark.names(identity) => {
             std::fs::remove_file(install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).is_ok()
         }
-        Ok(Some(_)) | Ok(None) => true,
+        Ok(Some(_) | None) => true,
         Err(_) => false,
     }
 }
