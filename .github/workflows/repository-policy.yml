@@ -308,6 +308,20 @@ jobs:
                       return children
               return []
 
+          def operator_harness_executed(text):
+              # Issue #1225 N_step5: execution is an explicit dotnet run/exec
+              # of the Eliot.Operator.Tests harness. A restore/build line, a
+              # step name, quoted prose, or a run-summary claim is not
+              # execution: quoted literals and comments are stripped so only
+              # real invocations count.
+              for line in text.splitlines():
+                  code = re.sub(r'"[^"]*"', '', line)
+                  code = re.sub(r"'[^']*'", '', code)
+                  code = code.split('#', 1)[0]
+                  if re.search(r'dotnet\s+(run|exec)\b[^\n]*Eliot\.Operator\.Tests', code):
+                      return True
+              return False
+
           workflow_dir = pathlib.Path('.github/workflows')
           workflows = sorted(workflow_dir.glob('*.yml'))
           if not workflows:
@@ -498,7 +512,7 @@ jobs:
           for marker in ('persist-credentials: false', '--locked-mode', 'rustup show active-toolchain'):
               if marker not in sc_text:
                   fail('CANDIDATE', f'source-candidate.yml lost locked-input marker: {marker}')
-          if 'apps/Eliot.Operator/Eliot.Operator.csproj' in sc_text and 'tests/Eliot.Operator.Tests' not in sc_text:
+          if 'apps/Eliot.Operator/Eliot.Operator.csproj' in sc_text and not operator_harness_executed(sc_text):
               fail('CANDIDATE', 'source-candidate.yml builds Eliot.Operator without executing the Operator harness')
           if 'SOURCE_CANDIDATE_ONLY' not in sc_text:
               fail('CANDIDATE', 'source-candidate.yml lost its source-only proof ceiling marker')
