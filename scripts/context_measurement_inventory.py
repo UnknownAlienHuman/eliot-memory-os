@@ -1432,6 +1432,7 @@ def _build_consumer_worksets(
     bytes_by_path = {str(r["path"]): int(r["bytes"]) for r in file_records}  # type: ignore[arg-type]
     worksets: list[dict[str, object]] = []
     test_owner: dict[str, str] = {}
+    source_owner: dict[str, str] = {}
     for owner in sorted(CONSUMER_SEAMS):
         owned_rows = [row for row in rows if row["owner"] == owner]
         writable = [row for row in owned_rows if row["write_scope"] == "writable"]
@@ -1451,6 +1452,15 @@ def _build_consumer_worksets(
         else:
             test_records = []
             reading_records = []
+        for path in source_paths:
+            if path in source_owner:
+                raise InventoryError(
+                    "SOURCE_PATH_COLLISION",
+                    f"shared mutable source path {path} is allocated to "
+                    f"{source_owner[path]} and {owner}; the inventory grants no write "
+                    f"access to a path another consumer already owns",
+                )
+            source_owner[path] = owner
         for record in test_records:
             path = str(record["path"])
             if path in test_owner:
@@ -2202,8 +2212,18 @@ def run_self_tests() -> int:
     assert len(BASELINE_CASES) == EXPECTED_BASELINE_COUNT, "baseline must hold 31 cases"
     assert len(DENOMINATOR_CASES) == EXPECTED_DENOMINATOR_COUNT, "denominator count drifted"
     measured: dict[str, int] = {}
+    writable_paths: dict[str, str] = {}
     for _ref, owner, _path, _sig in DENOMINATOR_CASES:
         measured[owner] = measured.get(owner, 0) + 1
+    for case_ref, owner, path, _signal in DENOMINATOR_CASES:
+        if owner == UNRESOLVED_OWNER:
+            continue
+        if _write_scope_of(owner, _tier_of(case_ref)) != "writable":
+            continue
+        if writable_paths.setdefault(path, owner) != owner:
+            raise AssertionError(
+                f"declared denominator grants two consumers write access to {path}"
+            )
     assert tuple(sorted(measured.items())) == tuple(
         sorted(EXPECTED_OWNER_ALLOCATIONS)
     ), "declared owner allocation drifted"
