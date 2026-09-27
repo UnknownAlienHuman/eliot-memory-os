@@ -148,7 +148,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Runner: os=$env:RUNNER_OS image=$env:ImageOS arch=$env:RUNNER_ARCH"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: $rustcIdentity / $cargoIdentity / dotnet $dotnetIdentity / $pythonIdentity"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Inputs: Cargo.lock=$lockHash rust-toolchain=$toolHash ci.yml=$ciHash verify.ps1=$profileHash"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Actions: checkout@11bd7190, cache@1bd1e32a"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Actions: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683, actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Python dependencies: hash-locked requirements-verification.txt"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- NuGet: locked-mode restore of Eliot.Operator and Eliot.Operator.Tests packages.lock.json files"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Operator harness: built, zero execution; no Operator test claim"

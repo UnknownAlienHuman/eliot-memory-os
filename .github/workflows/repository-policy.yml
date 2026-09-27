@@ -459,3 +459,25 @@ jobs:
               raise SystemExit(1)
           print(f'REPOSITORY_POLICY_WIRING: PASS workflows={len(workflows)} candidate=structural')
           PY
+
+      - name: Record repository-policy run manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          workflow_sha="$(sha256sum .github/workflows/repository-policy.yml | cut -d' ' -f1)"
+          pair_sha="$(sha256sum docs/normative-pair.toml | cut -d' ' -f1)"
+          active_sha="$(sha256sum workstreams/ACTIVE.toml | cut -d' ' -f1)"
+          inventory_sha="$(sha256sum workstreams/core-daemons/inventory.json | cut -d' ' -f1)"
+          {
+            echo '### Manual Repository Policy Run Manifest'
+            echo "- Repository: $GITHUB_REPOSITORY event=$GITHUB_EVENT_NAME ref=$GITHUB_REF run=$GITHUB_RUN_ID"
+            echo "- Source SHA: $source_sha"
+            echo "- Workflow: .github/workflows/repository-policy.yml sha256=$workflow_sha"
+            echo '- Actions: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
+            echo "- Policy inputs: normative-pair=$pair_sha ACTIVE=$active_sha inventory=$inventory_sha"
+            echo '- Ordered checks: branch identity, authority receipts, retired-surface rejection, normative identity, stale-link rejection, trigger/profile/privilege/cache/candidate wiring'
+            echo '- Gate states: fail-fast job; this manifest runs only after every prior step passed'
+            echo '- Cache: no cache block; nothing is restored or saved'
+            echo '- Proof ceiling: source/repository policy evidence only; no runtime, Store, release, or Product-Pulse claim'
+          } >> "$GITHUB_STEP_SUMMARY"
