@@ -11,6 +11,8 @@ mod admission_reservation;
 mod backup_snapshot;
 mod cutover_ownership;
 mod doctor;
+mod effect_operation_lease;
+mod execution_manifest;
 mod model;
 mod process_stream_recovery;
 mod reservation_model;
@@ -47,6 +49,20 @@ pub use cutover_ownership::{
     OldDaemonProposalFence, OperationContinuationPermit, StateMigrationDecision,
 };
 pub use doctor::*;
+pub use effect_operation_lease::{
+    ActiveEffectOperationLease, EFFECT_OPERATION_LEASE_SCHEMA_VERSION, EffectAuthorizationView,
+    EffectDispatchAuthority, EffectOperationLease, EffectOperationLeaseAdmission,
+    EffectReplayDecision, EffectReplayRequest, ShadowEffectDiagnostics, authorize_effect_replay,
+};
+pub use execution_manifest::{
+    AdmittedModuleGeneration, BoundKernelExecutionManifest, CatalogPolicyView,
+    EffectDeliveryAcknowledgement, KERNEL_EXECUTION_MANIFEST_SCHEMA_VERSION,
+    KernelExecutionManifest, KernelExecutionProjection, KernelExecutionRestartRequest,
+    KernelLaunchBinding, KernelReconciliationItem, KernelReconciliationKind, KernelRestartDecision,
+    KernelRestartEvidence, KernelServiceAdmission, ManifestDependencyEntry, ManifestEffectCeiling,
+    ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
+    RevocationAcknowledgement, verify_kernel_execution_restart,
+};
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
 pub use process_stream_recovery::{
