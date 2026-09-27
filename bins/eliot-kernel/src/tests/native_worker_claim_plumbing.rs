@@ -202,7 +202,10 @@ fn test_executable_join() -> NativeWorkerExecutableBinding {
         adapter_revision: 3,
         config_digest: "b".repeat(64),
         facet_manifest_ref: "facet-manifest-7".to_owned(),
+        capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
+            .expect("cell id"),
         grant_graph_revision: 5,
+        module_catalog_revision: 7,
         replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
         launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
         process_invocation_digest: "d".repeat(64),
@@ -223,6 +226,9 @@ fn test_executable_join() -> NativeWorkerExecutableBinding {
 fn route_expectation(request: &NativeWorkerClaimRequest) -> NativeWorkerExecutableExpectation {
     let registration = serde_json::json!({
         "worker_config_digest": "b".repeat(64),
+        "module_catalog_revision": 7,
+        "capability_cell": eliot_contracts::CapabilityCellId::new("native-worker-core")
+            .expect("cell id"),
     });
     KernelComposition::build_executable_expectation(
         request.executable_binding.as_ref(),

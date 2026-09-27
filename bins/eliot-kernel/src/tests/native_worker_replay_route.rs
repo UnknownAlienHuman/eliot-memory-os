@@ -142,7 +142,10 @@ fn test_join(
         adapter_revision: 3,
         config_digest: config_digest.to_owned(),
         facet_manifest_ref: "facet-manifest-7".to_owned(),
+        capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
+            .expect("cell id"),
         grant_graph_revision: 5,
+        module_catalog_revision: 7,
         replay_stream_id: format!("{claim_id}/gen-1"),
         launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
         process_invocation_digest: "d".repeat(64),

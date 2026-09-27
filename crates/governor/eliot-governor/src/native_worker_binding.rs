@@ -10,7 +10,9 @@
 //! protocol/facet revisions; supporting introductions/grants and effective
 //! ceilings; credential/resource references without values; replay stream;
 //! nonce relationship; process invocation digest; generation/epoch/fence;
-//! deadlines and current invalidation evidence.
+//! deadlines and current invalidation evidence. The admitted Module Catalog
+//! revision and FunctionalCapabilityCell identity are explicit required
+//! owner inputs; neither is inferred from grant refs or package names.
 //!
 //! Governor hard boundary (`crates/governor/AGENTS.md`): this module composes a
 //! pure projection only. It never opens a store, constructs a provider
@@ -38,7 +40,9 @@
 //!   `generation` must equal `state_fence.resource_generation`; the fence is
 //!   the binding authority, not a parallel epoch/generation claim.
 
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_store_api::EffectClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -154,12 +158,16 @@ pub struct NativeWorkerExecutableBinding {
     pub command_ref: String,
     /// Facet manifest reference.
     pub facet_manifest_ref: String,
+    /// Functional capability cell admitted for this worker generation.
+    pub capability_cell: CapabilityCellId,
     /// Supporting introduction references (refs only).
     pub introduction_refs: Vec<String>,
     /// Supporting grant references (refs only).
     pub supporting_grant_refs: Vec<String>,
     /// Grant-graph revision the refs were compiled against (nonzero).
     pub grant_graph_revision: u64,
+    /// Admitted Module Catalog revision this generation was compiled against.
+    pub module_catalog_revision: u64,
     /// Effective capability ceiling.
     pub effective_ceiling: EffectClass,
     /// Credential references (refs only, never values).
@@ -259,6 +267,7 @@ impl NativeWorkerExecutableBinding {
             (self.process_generation, "process_generation"),
             (self.adapter_revision, "adapter_revision"),
             (self.grant_graph_revision, "grant_graph_revision"),
+            (self.module_catalog_revision, "module_catalog_revision"),
             (self.task_revision, "task_revision"),
         ] {
             if value == 0 {

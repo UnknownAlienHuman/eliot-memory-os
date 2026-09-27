@@ -5330,7 +5330,10 @@ mod tests {
             adapter_revision: 3,
             config_digest: "b".repeat(64),
             facet_manifest_ref: "facet-manifest-7".to_owned(),
+            capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
+                .expect("cell id"),
             grant_graph_revision: 5,
+            module_catalog_revision: 7,
             replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
             launch_nonce: nonce.to_owned(),
             process_invocation_digest: invocation_digest,

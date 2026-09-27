@@ -49,7 +49,7 @@ use super::{
     native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json, status_frame,
     unix_ms,
 };
-use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{CapabilityCellId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
 use eliot_kernel_service::{
     KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -948,6 +948,19 @@ impl KernelComposition {
         }
         require_op_id(payload, "renewal_id")?;
         let worker_generation = require_nonzero_u64(payload, "worker_generation")?;
+        require_nonzero_u64(payload, "module_catalog_revision")?;
+        let capability_cell_value =
+            payload
+                .get("capability_cell")
+                .cloned()
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "capability_cell",
+                })?;
+        serde_json::from_value::<CapabilityCellId>(capability_cell_value).map_err(|_| {
+            NativeWorkerRouteError::Shape {
+                field: "capability_cell",
+            }
+        })?;
         require_nonzero_u64(payload, "process_id")?;
         require_nonzero_u64(payload, "process_start_100ns")?;
         require_nonzero_u64(payload, "lease_expires_at_unix_ms")?;
@@ -1304,32 +1317,55 @@ impl KernelComposition {
         live_epoch: &EpochId,
     ) -> Result<NativeWorkerExecutableExpectation, NativeWorkerRouteError> {
         let config_digest = require_digest(registration, "worker_config_digest")?;
+        let capability_cell: CapabilityCellId =
+            serde_json::from_value(registration.get("capability_cell").cloned().ok_or(
+                NativeWorkerRouteError::Shape {
+                    field: "capability_cell",
+                },
+            )?)
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "capability_cell",
+            })?;
+        let module_catalog_revision = require_nonzero_u64(registration, "module_catalog_revision")?;
         let current = match presented {
-            Some(join) => NativeWorkerExecutableBinding {
-                route_ref: join.route_ref.clone(),
-                adapter_id: join.adapter_id.clone(),
-                adapter_revision: join.adapter_revision,
-                config_digest,
-                facet_manifest_ref: join.facet_manifest_ref.clone(),
-                grant_graph_revision: join.grant_graph_revision,
-                replay_stream_id: join.replay_stream_id.clone(),
-                launch_nonce: join.launch_nonce.clone(),
-                process_invocation_digest: join.process_invocation_digest.clone(),
-                authority_epoch: live_epoch.clone(),
-                generation: registration_fence.resource_generation,
-                state_fence: registration_fence.clone(),
-                deadline_unix_ms: join.deadline_unix_ms,
-                expires_at_unix_ms: join.expires_at_unix_ms,
-                executable_wire_version: join.executable_wire_version,
-                executable_binding_digest: join.executable_binding_digest.clone(),
-            },
+            Some(join) => {
+                if join.capability_cell != capability_cell
+                    || join.module_catalog_revision != module_catalog_revision
+                {
+                    return Err(NativeWorkerRouteError::Fence {
+                        field: "native_worker_executable_binding",
+                    });
+                }
+                NativeWorkerExecutableBinding {
+                    route_ref: join.route_ref.clone(),
+                    adapter_id: join.adapter_id.clone(),
+                    adapter_revision: join.adapter_revision,
+                    config_digest,
+                    facet_manifest_ref: join.facet_manifest_ref.clone(),
+                    capability_cell: join.capability_cell.clone(),
+                    grant_graph_revision: join.grant_graph_revision,
+                    module_catalog_revision: join.module_catalog_revision,
+                    replay_stream_id: join.replay_stream_id.clone(),
+                    launch_nonce: join.launch_nonce.clone(),
+                    process_invocation_digest: join.process_invocation_digest.clone(),
+                    authority_epoch: live_epoch.clone(),
+                    generation: registration_fence.resource_generation,
+                    state_fence: registration_fence.clone(),
+                    deadline_unix_ms: join.deadline_unix_ms,
+                    expires_at_unix_ms: join.expires_at_unix_ms,
+                    executable_wire_version: join.executable_wire_version,
+                    executable_binding_digest: join.executable_binding_digest.clone(),
+                }
+            }
             None => NativeWorkerExecutableBinding {
                 route_ref: String::new(),
                 adapter_id: String::new(),
                 adapter_revision: 0,
                 config_digest,
                 facet_manifest_ref: String::new(),
+                capability_cell,
                 grant_graph_revision: 0,
+                module_catalog_revision,
                 replay_stream_id: String::new(),
                 launch_nonce: String::new(),
                 process_invocation_digest: String::new(),
@@ -2334,7 +2370,9 @@ mod single_shape_proof {
             "adapter_revision": 3,
             "config_digest": "b".repeat(64),
             "facet_manifest_ref": "facet-manifest-7",
+            "capability_cell": eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id"),
             "grant_graph_revision": 5,
+            "module_catalog_revision": 7,
             "replay_stream_id": replay_stream_id,
             "launch_nonce": nonce,
             "process_invocation_digest": invocation_digest,
@@ -2402,6 +2440,8 @@ mod single_shape_proof {
             "installation_id": "installation-1",
             "worker_artifact_digest": "a".repeat(64),
             "worker_config_digest": "b".repeat(64),
+            "module_catalog_revision": 7,
+            "capability_cell": eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id"),
             "protocol_version": NATIVE_WORKER_PROTOCOL_VERSION,
             "worker_generation": 1,
             "process_id": 4242,
