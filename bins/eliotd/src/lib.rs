@@ -62,6 +62,7 @@ mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
 mod experience_runtime;
+pub mod external_attach_reconciliation;
 pub mod finish_attempt;
 mod first_run_wiring;
 mod freshness_admission;
@@ -179,6 +180,14 @@ pub use experience_runtime::{
     UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
     produce_journal_projection, propose_memory_extinction_candidate, read_current_position,
     run_experience_quality_event, run_experience_quality_event_with_revision,
+};
+pub use external_attach_reconciliation::{
+    AutomaticLaunchRefusal, CredentialDisposition, EXTERNAL_ATTACH_RECONCILIATION_REQUIRED,
+    ExternalAttachObservation, ExternalAttachReconciliationReceipt, ExternalEffectDisposition,
+    ImportedPreAttachCoverage, ObservedAttachCandidates, PendingAttachAction,
+    PreAttachBlindInterval, PreAttachStanding, ScopeAuthorityDisposition, UnownedContinuation,
+    WorkspaceArtifactDelta, admit_automatic_agent_launch, admit_material_continuation,
+    reconcile_external_attach,
 };
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
@@ -562,6 +571,19 @@ pub struct DaemonComposition {
     /// performs no transport, and is never read on the readiness path: closure
     /// must not block or fail the finish ceremony.
     learning_closure: eliot_governor::LearningClosureService,
+    /// Retained reconciliation receipt for an attach of an already-running
+    /// external agent (issue #1782, I11.11 lines 27-42).
+    ///
+    /// `None` until [`Self::record_external_attach_reconciliation`] installs a
+    /// caller-observed receipt, which is what an empty supply honestly means:
+    /// no external agent has attached, so there is nothing to reconcile. It is
+    /// never defaulted to a reconciled attach and never derived from this
+    /// process's own config/state directories, which are not a user
+    /// `WorkScope`. Read by
+    /// [`Self::admit_material_continuation_after_attach`], which is the only
+    /// consumer and refuses a Material effect whenever the retained receipt has
+    /// no attributed continuation.
+    external_attach: Option<Box<ExternalAttachReconciliationReceipt>>,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -830,6 +852,7 @@ impl DaemonComposition {
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
             learning_closure: eliot_governor::LearningClosureService::new(),
+            external_attach: None,
         })
     }
 
@@ -900,6 +923,17 @@ impl DaemonComposition {
         // `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`,
         // which also has zero call sites. See `task_binding_admission`'s
         // "Measured reachability" section for the full measurement.
+        // Issue #1782 (I11.11 line 42): a Material canonical write is refused
+        // while a retained external-attach receipt has no attributed
+        // continuation, so an unreconciled attach of an already-running
+        // external agent cannot be laundered into a write. The refusal keeps
+        // the existing `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED` identity and
+        // changes nothing else: the retained binding, task state, and project
+        // memory are untouched and the write never reaches the store.
+        self.admit_material_continuation_after_attach(
+            eliot_workscope::RequestedEffect::CanonicalWrite,
+        )
+        .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
         let admission = crate::task_binding_admission::admit_canonical_write(
             envelope.operation_id.as_str().to_owned(),
             &identity.request.metadata,
@@ -2649,6 +2683,84 @@ impl DaemonComposition {
             .install_admitted_work_scope_owner(owner)
             .map_err(DaemonError::Composition)?;
         Ok((receipt, snapshot))
+    }
+
+    /// Compiles and retains the reconciliation receipt for one attach of an
+    /// already-running external agent (issue #1782, I11.11 lines 27-42).
+    ///
+    /// I11.11 line 27: "Attaching an already-running external agent does not
+    /// retroactively make its earlier activity observed or authorized. ELIOT
+    /// creates an `ExternalAttachReconciliationReceipt`." The composition owns
+    /// only the retention of the already-compiled receipt: it validates it
+    /// through [`ExternalAttachReconciliationReceipt::validate`] and installs
+    /// it as this composition's single retained attach state. It mints no
+    /// receipt, adopts no pre-attach effect, and derives nothing from a process
+    /// name, PID, executable path, current directory or discovery order.
+    ///
+    /// # Not yet reached (issue #1782)
+    ///
+    /// This method currently has zero call sites. The live attach transport for
+    /// an already-running external agent is `eliot-agent-bridge-core`
+    /// (`AttachRequest::external` requires an explicit pre-attach blind
+    /// interval, and `AttachView::reconciliation_required` is what refuses
+    /// forwarding until the bridge's own recovery disposition completes); the
+    /// daemon-side ingress that would report the attach to this composition does
+    /// not exist yet. A startup attach was deliberately not added to manufacture
+    /// a caller, and the daemon's own config/state directories were never used
+    /// as a stand-in `WorkScope`. The receipt is still enforced on the live
+    /// Material paths through
+    /// [`Self::admit_material_continuation_after_attach`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from
+    /// [`ExternalAttachReconciliationReceipt::validate`] when the presented
+    /// receipt does not validate, leaving the previously retained receipt
+    /// untouched.
+    pub fn record_external_attach_reconciliation(
+        &mut self,
+        receipt: &ExternalAttachReconciliationReceipt,
+    ) -> Result<(), eliot_agent_bridge_core::BridgeError> {
+        receipt.validate()?;
+        self.external_attach = Some(Box::new(receipt.clone()));
+        Ok(())
+    }
+
+    /// Borrows the retained external-attach reconciliation receipt, if any.
+    ///
+    /// `None` means no external agent has attached: not "reconciled", and never
+    /// a synthesized read-only or attributed disposition.
+    #[must_use]
+    pub fn external_attach_reconciliation(&self) -> Option<&ExternalAttachReconciliationReceipt> {
+        self.external_attach.as_deref()
+    }
+
+    /// Admits one requested effect against the retained external-attach
+    /// disposition (issue #1782, I11.11 line 42).
+    ///
+    /// I11.11 line 42: "Any request to continue Material work before that
+    /// disposition returns `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED`." I14.24
+    /// line 23: "read-only inspection and unrelated tasks continue". A
+    /// non-Material effect is therefore always admitted, and a Material effect
+    /// is admitted only when the retained receipt reached an attributed
+    /// continuation; a read-only attach or a new bounded attempt refuses with
+    /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`].
+    ///
+    /// Live callers: the `eliot.finish` claim path through
+    /// [`serve_finish_claim`](crate::serve_finish_claim), which the daemon
+    /// runtime drives, and [`Self::commit_canonical_and_refresh`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`eliot_agent_bridge_core::BridgeError::InvalidContract`] when
+    /// the retained receipt does not validate, and
+    /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`]
+    /// when a Material effect is requested before an attributed continuation.
+    pub fn admit_material_continuation_after_attach(
+        &self,
+        effect: eliot_workscope::RequestedEffect,
+    ) -> Result<(), eliot_agent_bridge_core::BridgeError> {
+        admit_material_continuation(effect, self.external_attach.as_deref())
     }
 
     /// Borrows the Governor reconstruction read composition over the retained
