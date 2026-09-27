@@ -504,15 +504,13 @@ impl ImpersonationRestoreStage {
 /// Exact typed restoration failure of the named-pipe impersonation guard.
 ///
 /// Issue #860 test-matrix case 8 requires the exact Windows error of a failed
-/// `RevertToSelf` to survive the explicit restoration attempt. The coarse
-/// `WindowsAdapterError` vocabulary carries no code, so
-/// `windows_adapter_from_io` mapped every Win32 code it does not recognize
-/// onto `WindowsAdapterError::Failed` and two different explicit failures
-/// surfaced as the same value; the raw evidence an error must preserve (I2.6
-/// "An error preserves: ... raw evidence handle") was unobservable. This
-/// variant keeps the bounded stage and the raw code of the failed call, the
-/// same shape as `InstallerRootError::Win32` and
-/// `HostOwnerLeaseReleaseError`.
+/// `RevertToSelf` to survive the explicit restoration attempt. This variant
+/// keeps the bounded stage and the raw code of the failed call, the same shape
+/// as `InstallerRootError::Win32` and `HostOwnerLeaseReleaseError`, and the
+/// peer-authentication boundary forwards the code unmapped in
+/// [`WindowsAdapterError::RevertToSelf`], so the raw evidence an error must
+/// preserve (I2.6 "An error preserves: ... raw evidence handle") stays
+/// observable instead of collapsing onto `WindowsAdapterError::Failed`.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ImpersonationRestoreError {
@@ -572,23 +570,20 @@ fn last_revert_to_self_failure() -> ImpersonationRestoreError {
     }
 }
 
-/// Projects one exact restoration failure onto the coarse adapter vocabulary
-/// this crate returns from peer authentication.
+/// Projects one exact restoration failure onto the adapter error this crate
+/// returns from peer authentication.
 ///
-/// BLOCKED-BY (#860, outside this row's mutable file set): the public
-/// `WindowsAdapterError` enum in `src/lib.rs` has no code-carrying variant, and
-/// adding one requires naming that variant in the two exhaustive matches in
-/// `src/installer_authority_key.rs`, which this row does not own. Until that
-/// owner resolution exists, this is the same faithful code-to-class mapping
-/// every other raw Win32 failure in this cell already uses, and the exact stage
-/// and code stay in the typed value [`ImpersonationGuard::revert`] returned and
-/// in the bounded evidence the guard records.
+/// The code is not classified and not substituted: it rides the
+/// code-carrying [`WindowsAdapterError::RevertToSelf`] variant unchanged, so
+/// two different explicit failures (for example 1008 and 1314) surface as two
+/// different values and the raw evidence I2.6 requires stays observable to the
+/// caller. The exact stage and code also stay in the typed value
+/// [`ImpersonationGuard::revert`] returned and in the bounded evidence the
+/// guard records.
 #[cfg(windows)]
 fn impersonation_restore_adapter_error(failure: ImpersonationRestoreError) -> WindowsAdapterError {
     let ImpersonationRestoreError::Win32 { code, .. } = failure;
-    windows_adapter_from_io(&std::io::Error::from_raw_os_error(
-        i32::try_from(code).unwrap_or(i32::MAX),
-    ))
+    WindowsAdapterError::RevertToSelf { win32_error: code }
 }
 
 #[cfg(windows)]

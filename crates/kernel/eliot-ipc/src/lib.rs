@@ -610,7 +610,8 @@ fn map_platform_error(error: eliot_platform_windows::WindowsAdapterError) -> Tra
         WindowsAdapterError::NotFound
         | WindowsAdapterError::AlreadyExists
         | WindowsAdapterError::PermissionDenied
-        | WindowsAdapterError::Failed => TransportError::Io(error.to_string()),
+        | WindowsAdapterError::Failed
+        | WindowsAdapterError::RevertToSelf { .. } => TransportError::Io(error.to_string()),
     }
 }
 
