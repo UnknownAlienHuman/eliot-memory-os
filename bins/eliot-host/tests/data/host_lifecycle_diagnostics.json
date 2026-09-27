@@ -109,8 +109,8 @@
   },
   "boundary_table": {
   "source": "bins/eliot-host/src/lib.rs::HOST_LIFECYCLE_BOUNDARY_TABLE",
-  "rows": 97,
-  "emitting": 94,
+  "rows": 116,
+  "emitting": 113,
   "propagated": 3,
   "propagated_exclusions": [
     "propagated.phase-b-rollback",
@@ -214,7 +214,26 @@
     "lifecycle-context.admitted",
     "propagated.phase-b-rollback",
     "propagated.activation-transitions",
-    "propagated.cutover-candidate-arm"
+    "propagated.cutover-candidate-arm",
+    "activation-admission.requested",
+    "observable-use.terminal",
+    "observable-use.coalesced",
+    "observable-use.drain-cancelled",
+    "observable-use.next-generation-queued",
+    "observable-use.replay-already-consumed",
+    "drain-resume.terminal",
+    "drain-resume.active-restored",
+    "idle-drain.terminal",
+    "idle-drain.drain-failed-blocked",
+    "idle-drain.not-active",
+    "idle-drain.pre-commit-open",
+    "idle-drain-rearm.not-active",
+    "idle-drain-rearm.census-not-idle",
+    "idle-drain-rearm.requested",
+    "lease-census.requested",
+    "wake-revalidation.observed",
+    "wake-satisfy.terminal",
+    "wake-satisfied.observed"
   ]
 },
   "deferred_cases": [

@@ -105,6 +105,19 @@ fn host_lifecycle_observe_terminal(boundary: &'static HostLifecycleBoundary) {
     host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(boundary));
 }
 
+/// Observes one identity bundle for a boundary the entrypoint records
+/// cannot correlate alone (#891 case 15).
+///
+/// Observation only: the projection carries identities already held at the
+/// call site; slots without a fitting taxonomy value stay explicitly
+/// missing, never guessed. Emits one `INFO` subordinate record, never a
+/// terminal, and returns `()` without touching results, order, locks, or
+/// cleanup.
+fn host_lifecycle_observe_identity(projection: &host_diagnostics::HostRequestProjection) {
+    note_event_log_sink_status();
+    host_diagnostics::observe_host_request(projection);
+}
+
 /// Single-terminal guard for one public fallible operation.
 ///
 /// Armed on entry; the single outermost boundary disarms on success. Any
@@ -1405,6 +1418,63 @@ const BOUNDARY_WAKE_SATISFY_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-wake-satisfy-failed");
 const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
     boundary_by_event("host.wake-satisfied observed");
+
+/// Static identifiers for the propagated-to-boundary exclusions (#891 case
+/// 1): the table rows that own no emission because a coordinated child
+/// boundary emits instead. Every `propagated:` row has exactly one
+/// identifier here, so the exclusion set is explicit and compiler-checked
+/// alongside the emitting `BOUNDARY_*` identifiers above.
+const PROPAGATED_PHASE_B_ROLLBACK: &HostLifecycleBoundary = boundary_by_event(
+    "propagated: emitted by host_composition_phase_b::rollback_uncommitted_phase_b",
+);
+const PROPAGATED_ACTIVATION_TRANSITIONS: &HostLifecycleBoundary =
+    boundary_by_event("propagated: inner edges observed at decision boundaries only");
+const PROPAGATED_CUTOVER_CANDIDATE_ARM: &HostLifecycleBoundary =
+    boundary_by_event("propagated: candidate launch observed at start-manifest boundary");
+
+/// Compile-time `propagated:` prefix test over raw bytes, so exclusion
+/// coverage can run in `const` context like [`boundary_str_eq`].
+const fn boundary_event_is_propagated(event: &str) -> bool {
+    let bytes = event.as_bytes();
+    let prefix = "propagated:".as_bytes();
+    if bytes.len() < prefix.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len() {
+        if bytes[i] != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Compile-time proof that the exclusion identifiers above cover every
+/// propagated row and nothing else: a new `propagated:` row fails the
+/// build until it gains an explicit exclusion identifier, and an
+/// identifier rebound to an emitting row fails the membership check.
+const fn propagated_exclusions_cover_table() -> bool {
+    let mut count = 0;
+    let mut i = 0;
+    while i < HOST_LIFECYCLE_BOUNDARY_TABLE.len() {
+        if boundary_event_is_propagated(HOST_LIFECYCLE_BOUNDARY_TABLE[i].event) {
+            count += 1;
+        }
+        i += 1;
+    }
+    if count != 3 {
+        return false;
+    }
+    boundary_event_is_propagated(PROPAGATED_PHASE_B_ROLLBACK.event)
+        && boundary_event_is_propagated(PROPAGATED_ACTIVATION_TRANSITIONS.event)
+        && boundary_event_is_propagated(PROPAGATED_CUTOVER_CANDIDATE_ARM.event)
+}
+
+const _: () = assert!(
+    propagated_exclusions_cover_table(),
+    "propagated exclusion drift in HOST_LIFECYCLE_BOUNDARY_TABLE",
+);
 /// Returns the frozen `event` spelling for the selected boundary row.
 ///
 /// Every production observation passes its static [`HOST_LIFECYCLE_BOUNDARY_TABLE`]
@@ -7043,6 +7113,16 @@ impl HostComposition {
         // One terminal per Unknown outcome; inner `execute` shares correlation
         // and never emits its own terminal.
         host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_REQUESTED);
+        // F-LOG-HOST-1 case 15: the restart sighting carries the admitted
+        // installation/generation so SCM restart records correlate; the
+        // operation/process slots stay missing (no fitting taxonomy value
+        // on this path, never a guessed one).
+        host_lifecycle_observe_identity(
+            &host_diagnostics::HostRequestProjection::observed(
+                host_diagnostics::EntrypointStage::ScmDispatch,
+            )
+            .with_launch_options(&self.launch_options),
+        );
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
             // Reconcile is query-only replay, not another restart commit.
             host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK);
