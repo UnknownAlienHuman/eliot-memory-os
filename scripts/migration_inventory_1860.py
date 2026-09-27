@@ -129,11 +129,6 @@ WRAP_PATHS = {
 }
 
 UNKNOWN_PATHS = {
-    "crates/security/eliot-erasure": (
-        "security.erasure (component owner TBD); coordinated by bins/eliotd (#1860)",
-        "Governed privacy-erasure orchestration with no admitted production consumer. UNKNOWN: "
-        "requires owner experiment before any KEEP/REPLACE/RETIRE decision; no retirement inferred.",
-    ),
     "crates/security/eliot-influence": (
         "security.influence (component owner TBD); coordinated by bins/eliotd (#1860)",
         "Origin-bound influence/provenance policy owner with no admitted production consumer. "

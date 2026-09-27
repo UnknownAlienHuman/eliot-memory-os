@@ -66,8 +66,10 @@ const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
 ///
 /// Local intent/outcome model only: the store depends solely on existing
 /// `eliot-store-api` types plus this local model (the neutral purge port is
-/// defined in a parallel subtask and is not yet on this base; the store never
-/// imports `eliot-erasure`). Protocol order mirrors the erasure owner:
+/// defined in a parallel subtask and is not yet on this base; the canonical
+/// erasure path lives in `eliot-store-api` `erasure_admission` and
+/// `ErasureIntentRecord`, not in a separate crate). Protocol order mirrors
+/// the erasure owner:
 /// [`MemoryStore::record_erasure_intent`] before
 /// [`MemoryStore::apply_erasure`]; `apply_erasure` names only a recorded
 /// operation id, so no destructive path exists without a recorded intent;

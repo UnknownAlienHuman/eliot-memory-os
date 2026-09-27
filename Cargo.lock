@@ -1859,19 +1859,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eliot-erasure"
-version = "0.1.0"
-dependencies = [
- "eliot-contracts",
- "eliot-evidence",
- "eliot-security-contracts",
- "eliot-store-api",
- "schemars",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "eliot-evaluation-contracts"
 version = "0.1.0"
 dependencies = [

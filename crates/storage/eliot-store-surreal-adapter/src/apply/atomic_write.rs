@@ -1066,9 +1066,10 @@ pub(super) fn ordering_write_template(initial_state: bool, exists: bool) -> &'st
 ///
 /// Local model only: depends solely on existing `eliot-store-api` types plus
 /// this module (the neutral purge port is defined in a parallel subtask and
-/// is not yet on this base; the adapter never imports `eliot-erasure`). All
-/// `SurrealQL` stays in `apply`/`schema` modules; the public boundary carries
-/// store-api types only.
+/// is not yet on this base; the canonical erasure path lives in
+/// `eliot-store-api` `erasure_admission` and `ErasureIntentRecord`, not in a
+/// separate crate). All `SurrealQL` stays in `apply`/`schema` modules; the
+/// public boundary carries store-api types only.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
 )]

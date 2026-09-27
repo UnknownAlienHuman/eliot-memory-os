@@ -167,7 +167,6 @@
     "crates/research/eliot-research-exchange",
     "crates/research/eliot-research-exchange-api",
     "crates/research/eliot-researcher",
-    "crates/security/eliot-erasure",
     "crates/security/eliot-influence",
     "crates/smart/eliot-cognitive-quality",
     "crates/smart/eliot-context",

@@ -108,7 +108,6 @@
       "crates/research/eliot-research-exchange-api/Cargo.toml",
       "crates/research/eliot-research-exchange/Cargo.toml",
       "crates/research/eliot-researcher/Cargo.toml",
-      "crates/security/eliot-erasure/Cargo.toml",
       "crates/security/eliot-influence/Cargo.toml",
       "crates/security/eliot-source-assurance/Cargo.toml",
       "crates/smart/eliot-context/Cargo.toml",
@@ -9127,8 +9126,6 @@
       "cell_id": null,
       "cell_id_state": "UNDECLARED",
       "cell_id_origin": "[package.metadata.eliot].functional_cell_refs, [package.metadata.eliot].functional_cell, or module.toml|module_id",
-      "crate": "eliot-erasure",
-      "source_manifest": "crates/security/eliot-erasure/Cargo.toml",
       "reachability": "UNREACHABLE",
       "workspace_admission": {
         "workspace_member": true,
