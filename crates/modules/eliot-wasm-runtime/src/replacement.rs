@@ -1,11 +1,12 @@
-//! Exact neutral generation preparation, drain, switch, rollback, and reconciliation.
+//! Exact neutral generation preparation, drain, switch, and reconciliation.
 //!
 //! This module is Slice B of issue #760 (cases 13-39). It owns the local,
 //! provider-neutral replacement state machine for `eliot-wasm-runtime`: one
 //! exclusive replacement operation at a time, atomic drain linearization, one
-//! compare-and-swap admission switch, explicit rollback as its own operation,
-//! reconciliation of unknown outcomes, and pure rehydration from
-//! owner-supplied lifecycle evidence.
+//! compare-and-swap admission switch, reconciliation of unknown outcomes, and
+//! pure rehydration from owner-supplied lifecycle evidence. Local rollback is
+//! refused because this coordinator cannot consume a Kernel/ORS cutover receipt
+//! or issue the required newer authority epoch.
 //!
 //! Authority boundaries (enforced, not merely documented):
 //!
@@ -38,10 +39,11 @@
 //! local-only linearization evidence plus later external publication (17);
 //! exclusive operation admits exactly one switch (18); stale expectations
 //! change nothing (19); post-switch calls acquire the new generation only
-//! (20); retention until references clear (21); safe pre-admission rollback
-//! (22) versus reconcile-first on possible new calls or unknown receipts (23);
-//! explicit rollback with drain and atomic restore (24); rollback replay
-//! versus changed payload (25); incompatibility families (26) including
+//! (20); retention until references clear (21); typed local rollback refusal
+//! pending a Kernel/ORS cutover (22); reconcile-first for possible new calls or
+//! unknown receipts (23);
+//! Kernel-owned rollback refusal pending a newer-epoch cutover (24-25);
+//! incompatibility families (26) including
 //! same-version ABI drift (27); per-stage typed failures (28); rehydration
 //! with fabricated-durability rejection (29); late old output isolation (30);
 //! lost-lease disposal block (31); cancellation before/after acquisition and
@@ -162,6 +164,9 @@ pub enum ReplacementError {
     /// New calls may exist or the switch receipt is unknown: reconcile first.
     #[error("reconciliation required before rollback")]
     ReconciliationRequired,
+    /// Rollback must be committed by Kernel/ORS as a newer-epoch cutover.
+    #[error("rollback requires a Kernel/ORS cutover with a newer authority epoch")]
+    KernelCutoverRequired,
     /// Rollback replay carried a different payload than the retained record.
     #[error("rollback payload changed")]
     RollbackPayloadChanged,
@@ -583,23 +588,23 @@ pub enum CallCompletion {
     DuplicateReplay,
 }
 
-/// Explicit rollback request. Rollback is its own exact operation with its own
-/// identity: the rechecked current generation, the retained target, and the
-/// target payload digest used to distinguish replay from changed payload.
+/// Requested rollback identity and retained target evidence. This local
+/// coordinator validates the request shape but refuses execution because a
+/// rollback must be a Kernel/ORS cutover with a newer authority epoch.
 #[derive(Clone, Debug)]
 pub struct RollbackRequest {
     /// Caller-chosen exclusive rollback operation identity.
     pub operation_id: String,
     /// Rechecked currently active generation number.
     pub expected_current: u64,
-    /// Retained generation number to restore.
+    /// Retained generation number proposed to Kernel/ORS for cutover.
     pub target_generation: u64,
-    /// Expected retained target artifact digest.
+    /// Expected retained target artifact digest, used only for local validation.
     pub target_artifact: Sha256Digest,
 }
 
-/// Summary returned when a rollback is armed (validated, exclusive operation
-/// held, drain of the current generation required next).
+/// Legacy summary shape for a rollback arm. Current local rollback requests
+/// return [`ReplacementError::KernelCutoverRequired`] and never produce it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackArmed {
@@ -607,13 +612,12 @@ pub struct RollbackArmed {
     pub operation_id: String,
     /// Generation being drained and retired.
     pub current_generation: u64,
-    /// Retained generation to restore.
+    /// Retained generation proposed for a Kernel/ORS cutover.
     pub target_generation: u64,
 }
 
-/// Rollback receipt. New-call history is retained, never rewritten: the
-/// `new_calls_retained` count proves the rolled-back generation's accepted
-/// calls survived as evidence.
+/// Historical rollback receipt shape. This coordinator does not mint rollback
+/// receipts; Kernel/ORS owns the newer-epoch cutover record and receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackReceipt {
@@ -623,9 +627,9 @@ pub struct RollbackReceipt {
     pub operation_id: String,
     /// Generation retired by the rollback.
     pub from_generation: u64,
-    /// Restored generation.
+    /// Generation that previously became active under an older rollback record.
     pub restored_generation: u64,
-    /// Restored artifact digest.
+    /// Artifact digest recorded by the older rollback record.
     pub restored_artifact: Sha256Digest,
     /// Accepted calls on the retired generation retained as history.
     pub new_calls_retained: u64,
@@ -677,7 +681,7 @@ pub enum LifecycleEventKind {
     DrainBegan,
     /// Admission target switched to `generation`.
     Switched,
-    /// Explicit rollback restored `generation`.
+    /// Owner-supplied history says rollback completed to `generation`.
     RollbackCompleted,
     /// A retained generation was retired.
     Retired,
@@ -731,14 +735,6 @@ struct PreparedCandidate {
 }
 
 #[derive(Clone, Debug)]
-struct PendingRollback {
-    operation_id: String,
-    current: u64,
-    target: u64,
-    current_fence_digest: Sha256Digest,
-}
-
-#[derive(Clone, Debug)]
 struct DrainState {
     operation_id: String,
     generation: u64,
@@ -770,7 +766,6 @@ struct CoordinatorState {
     active: Option<GenerationRecord>,
     adoption: Option<AdoptionInfo>,
     candidate: Option<PreparedCandidate>,
-    pending_rollback: Option<PendingRollback>,
     operation: Option<String>,
     draining: Option<DrainState>,
     inflight: BTreeMap<String, CallLease>,
@@ -790,7 +785,6 @@ impl CoordinatorState {
             active: None,
             adoption: None,
             candidate: None,
-            pending_rollback: None,
             operation: None,
             draining: None,
             inflight: BTreeMap::new(),
@@ -813,12 +807,6 @@ impl CoordinatorState {
         self.candidate
             .as_ref()
             .is_some_and(|candidate| candidate.operation_id == operation_id)
-    }
-
-    fn rollback_held_by(&self, operation_id: &str) -> bool {
-        self.pending_rollback
-            .as_ref()
-            .is_some_and(|pending| pending.operation_id == operation_id)
     }
 
     fn unresolved_on(&self, generation: u64) -> Vec<String> {
@@ -852,9 +840,6 @@ impl CoordinatorState {
         self.candidate
             .as_ref()
             .is_some_and(|candidate| candidate.record.generation_number() == generation)
-            || self.pending_rollback.as_ref().is_some_and(|pending| {
-                pending.current == generation || pending.target == generation
-            })
     }
 
     fn evictible_retained(&self) -> Option<u64> {
@@ -898,7 +883,8 @@ impl GenerationCoordinator {
     }
 
     /// Records the first externally admitted generation. Later generations
-    /// arrive only through prepare/switch; rollback restores retained ones.
+    /// arrive through prepare/switch; local rollback is refused pending a
+    /// Kernel/ORS newer-epoch cutover.
     ///
     /// # Errors
     ///
@@ -966,8 +952,7 @@ impl GenerationCoordinator {
     /// # Errors
     ///
     /// Returns a typed failure when the operation is unknown, drain is not
-    /// armed by a prepared candidate (or armed rollback), or the deadline is
-    /// unbounded.
+    /// armed by a prepared candidate, or the deadline is unbounded.
     pub fn begin_drain(
         &self,
         operation_id: &str,
@@ -986,8 +971,7 @@ impl GenerationCoordinator {
         if state.draining.is_some() {
             return Err(ReplacementError::DrainAlreadyActive);
         }
-        let armed = state.candidate_held_by(operation_id) || state.rollback_held_by(operation_id);
-        if !armed {
+        if !state.candidate_held_by(operation_id) {
             return Err(ReplacementError::DrainNotArmed);
         }
         let Some(active) = state.active.as_ref() else {
@@ -1240,22 +1224,22 @@ impl GenerationCoordinator {
         }
     }
 
-    /// Arms an explicit rollback as its own exclusive operation. Before any
-    /// new-call admission on the current generation (and with the adopting
-    /// switch published) this proceeds directly; once new calls may exist or
-    /// the adopting switch is unconfirmed, a reconcile receipt for the
-    /// adopting operation is required first.
+    /// Refuses local rollback. A rollback must be committed by Kernel/ORS as a
+    /// new cutover with a newer authority epoch; this coordinator has no
+    /// authenticated cutover receipt and cannot safely restore a retained
+    /// generation's old fence. This refusal leaves operation, drain, call
+    /// history, and reconciliation evidence unchanged.
     ///
     /// # Errors
     ///
-    /// Returns a typed failure when another operation runs, expectations or
-    /// payloads mismatch, compatibility fails, or reconciliation is required.
+    /// Returns a typed failure for invalid expectations or when Kernel/ORS
+    /// cutover authority is required. No local rollback operation is armed.
     pub fn arm_rollback(
         &self,
         request: &RollbackRequest,
     ) -> Result<RollbackArmed, ReplacementError> {
         check_text(&request.operation_id, "replacement.operation_id")?;
-        let mut state = self.lock_state()?;
+        let state = self.lock_state()?;
         if state.operation.is_some() {
             return Err(ReplacementError::ReplacementInProgress);
         }
@@ -1287,104 +1271,26 @@ impl GenerationCoordinator {
                 return Err(ReplacementError::ReconciliationRequired);
             }
         }
-        let fence_digest = canonical_digest(&active.generation.state_fence)
-            .map_err(|_| external_contract("fence-seal-failed"))?;
-        state.operation = Some(request.operation_id.clone());
-        state.pending_rollback = Some(PendingRollback {
-            operation_id: request.operation_id.clone(),
-            current: request.expected_current,
-            target: request.target_generation,
-            current_fence_digest: fence_digest,
-        });
-        Ok(RollbackArmed {
-            operation_id: request.operation_id.clone(),
-            current_generation: request.expected_current,
-            target_generation: request.target_generation,
-        })
+        Err(ReplacementError::KernelCutoverRequired)
     }
 
-    /// Drains the current generation and atomically restores the retained
-    /// target. All new-call history is retained as evidence.
+    /// Refuses local rollback even if stale or internally supplied state says
+    /// one was armed. Only a Kernel/ORS newer-epoch cutover may change the
+    /// active generation. Existing local history and reconciliation evidence
+    /// are preserved.
     ///
     /// # Errors
     ///
-    /// Returns a typed failure when the operation, expectation, fence, or
-    /// drain state does not validate, or new-generation calls are unresolved.
+    /// Returns [`ReplacementError::InvalidField`] for an invalid operation ID
+    /// or [`ReplacementError::KernelCutoverRequired`] because local rollback
+    /// cannot authorize a newer-epoch Kernel/ORS cutover.
     pub fn complete_rollback(
         &self,
         operation_id: &str,
-        expected_current: u64,
+        _expected_current: u64,
     ) -> Result<RollbackReceipt, ReplacementError> {
         check_text(operation_id, "replacement.operation_id")?;
-        let mut state = self.lock_state()?;
-        if !state.holds_operation(operation_id) {
-            return Err(ReplacementError::UnknownOperation);
-        }
-        let Some(pending) = state.pending_rollback.clone() else {
-            return Err(ReplacementError::UnknownOperation);
-        };
-        if pending.operation_id != operation_id || pending.current != expected_current {
-            return Err(ReplacementError::StaleExpectedGeneration);
-        }
-        let Some(active) = state.active.clone() else {
-            return Err(ReplacementError::NoActiveGeneration);
-        };
-        if active.generation_number() != expected_current {
-            return Err(ReplacementError::StaleExpectedGeneration);
-        }
-        let fence_digest = canonical_digest(&active.generation.state_fence)
-            .map_err(|_| external_contract("fence-seal-failed"))?;
-        if fence_digest != pending.current_fence_digest {
-            return Err(ReplacementError::StaleExpectedGeneration);
-        }
-        if state
-            .draining
-            .as_ref()
-            .is_none_or(|drain| drain.operation_id != operation_id)
-        {
-            return Err(ReplacementError::DrainNotArmed);
-        }
-        if !state.unresolved_on(expected_current).is_empty() {
-            return Err(ReplacementError::DrainUnresolved);
-        }
-        let Some(target) = state.retained.remove(&pending.target) else {
-            return Err(ReplacementError::UnknownGeneration);
-        };
-        if let Err(error) = state.retain_old(active) {
-            state.retained.insert(pending.target, target);
-            return Err(error);
-        }
-        let mut new_calls_retained: u64 = 0;
-        for entry in &state.history {
-            if entry.generation == expected_current {
-                new_calls_retained = new_calls_retained.saturating_add(1);
-            }
-        }
-        state.active = Some(target.clone());
-        state.adoption = Some(AdoptionInfo {
-            operation_id: operation_id.to_owned(),
-            calls_accepted_since: 0,
-            confirmed: false,
-        });
-        state.draining = None;
-        state.pending_rollback = None;
-        state.operation = None;
-        let sequence = state.next_sequence()?;
-        let prev = state.chain_prev();
-        let receipt = seal_rollback_receipt(
-            sequence,
-            operation_id,
-            expected_current,
-            &target,
-            new_calls_retained,
-            &prev,
-        )?;
-        if state.rollback_log.len() >= MAX_RECEIPTS {
-            state.rollback_log.pop_front();
-        }
-        state.rollback_log.push_back(receipt.clone());
-        state.chain_head = Some(receipt.receipt_digest.clone());
-        Ok(receipt)
+        Err(ReplacementError::KernelCutoverRequired)
     }
 
     /// Reconciles an unknown switch to exactly one observed active generation
@@ -1604,8 +1510,9 @@ impl GenerationCoordinator {
         Ok(self.lock_state()?.retained.len())
     }
 
-    /// Returns the total sequenced receipts retained across switch, rollback,
-    /// and reconcile logs.
+    /// Returns retained switch, rollback, and reconciliation receipt counts.
+    /// Existing rollback receipts remain part of history; new rollback
+    /// receipts require a Kernel/ORS newer-epoch cutover.
     ///
     /// # Errors
     ///
@@ -2106,17 +2013,6 @@ struct SwitchSeal<'a> {
 }
 
 #[derive(Serialize)]
-struct RollbackSeal<'a> {
-    sequence: u64,
-    operation_id: &'a str,
-    from_generation: u64,
-    restored_generation: u64,
-    restored_artifact: &'a Sha256Digest,
-    new_calls_retained: u64,
-    prev_receipt_digest: &'a Sha256Digest,
-}
-
-#[derive(Serialize)]
 struct ReconcileSeal<'a> {
     sequence: u64,
     operation_id: &'a str,
@@ -2162,37 +2058,6 @@ fn seal_switch_receipt(
         receipt_digest,
         durable_published: false,
         external_evidence: None,
-    })
-}
-
-fn seal_rollback_receipt(
-    sequence: u64,
-    operation_id: &str,
-    from_generation: u64,
-    target: &GenerationRecord,
-    new_calls_retained: u64,
-    prev: &Sha256Digest,
-) -> Result<RollbackReceipt, ReplacementError> {
-    let seal = RollbackSeal {
-        sequence,
-        operation_id,
-        from_generation,
-        restored_generation: target.generation_number(),
-        restored_artifact: &target.artifact_digest,
-        new_calls_retained,
-        prev_receipt_digest: prev,
-    };
-    let receipt_digest =
-        canonical_digest(&seal).map_err(|_| external_contract("receipt-seal-failed"))?;
-    Ok(RollbackReceipt {
-        sequence,
-        operation_id: operation_id.to_owned(),
-        from_generation,
-        restored_generation: target.generation_number(),
-        restored_artifact: target.artifact_digest.clone(),
-        new_calls_retained,
-        prev_receipt_digest: prev.clone(),
-        receipt_digest,
     })
 }
 
