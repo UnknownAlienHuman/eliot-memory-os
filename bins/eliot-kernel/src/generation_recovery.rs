@@ -51,6 +51,28 @@ fn observe_recovery(event: &'static str, outcome: &'static str) {
     );
 }
 
+/// F-LOG-KERNEL-4 (#903 W7): cutover-scoped persistence observations.
+///
+/// Same #895-only shape as [`observe_recovery`] plus the cutover call's own
+/// validated operation identity (already echoed on the authenticated
+/// `GenerationCutoverOutcome` reply; I15.4, I07.20, W6), policy-screened and
+/// bounded by `bound_field` before formatting. Deferred phase records of
+/// concurrent cutovers correlate by identity with no dedup cache, no new
+/// probe, and no lock-held emission.
+fn observe_recovery_cutover(event: &'static str, outcome: &'static str, cutover_id: &str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    let cutover_bound = bound_field(cutover_id);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        cutover_id = cutover_bound.text(),
+        "generation recovery observation"
+    );
+}
+
 #[derive(Clone, Copy)]
 enum HandshakePolicyObservation {
     Projected,
@@ -66,6 +88,23 @@ impl HandshakePolicyObservation {
             Self::Absent => observe_recovery("kernel.recovery.handshake_absent", "absent"),
         }
     }
+
+    /// Cutover-scoped handshake observation: the same subordinate record,
+    /// correlated to its cutover call by the validated operation identity (W7).
+    fn emit_for_cutover(self, cutover_id: &str) {
+        match self {
+            Self::Projected => {
+                observe_recovery_cutover(
+                    "kernel.recovery.handshake_projected",
+                    "success",
+                    cutover_id,
+                );
+            }
+            Self::Absent => {
+                observe_recovery_cutover("kernel.recovery.handshake_absent", "absent", cutover_id);
+            }
+        }
+    }
 }
 
 /// Fixed-size record of the persistence phases reached by one cutover.
@@ -73,7 +112,9 @@ impl HandshakePolicyObservation {
 /// The owner performs each phase synchronously while it holds the generation,
 /// service, policy, and poison guards. The caller emits this record only after
 /// those guards have been released, preserving the phase order without adding
-/// a queue or another state owner.
+/// a queue or another state owner. Every emitted record carries the cutover's
+/// own validated operation identity, so concurrent cutovers correlate by
+/// identity as well as by order (W7).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PersistAndPublishObservations {
     cutover_staged: bool,
@@ -88,24 +129,24 @@ pub(crate) struct PersistAndPublishResult {
 }
 
 impl PersistAndPublishObservations {
-    pub(crate) fn emit(self, succeeded: bool) {
-        observe_recovery("kernel.recovery.persist_requested", "attempt");
+    pub(crate) fn emit(self, succeeded: bool, cutover_id: &str) {
+        observe_recovery_cutover("kernel.recovery.persist_requested", "attempt", cutover_id);
         if self.cutover_staged {
-            observe_recovery("kernel.recovery.cutover_staged", "success");
+            observe_recovery_cutover("kernel.recovery.cutover_staged", "success", cutover_id);
         }
         if self.cutover_committed {
-            observe_recovery("kernel.recovery.cutover_committed", "success");
+            observe_recovery_cutover("kernel.recovery.cutover_committed", "success", cutover_id);
         }
         if let Some(observation) = self.handshake_policy {
-            observation.emit();
+            observation.emit_for_cutover(cutover_id);
         }
         if self.cutover_applied {
-            observe_recovery("kernel.recovery.cutover_applied", "success");
+            observe_recovery_cutover("kernel.recovery.cutover_applied", "success", cutover_id);
         }
         if succeeded {
-            observe_recovery("kernel.recovery.persist_completed", "success");
+            observe_recovery_cutover("kernel.recovery.persist_completed", "success", cutover_id);
         } else {
-            observe_recovery("kernel.recovery.persist_failed", "rejected");
+            observe_recovery_cutover("kernel.recovery.persist_failed", "rejected", cutover_id);
         }
     }
 }
