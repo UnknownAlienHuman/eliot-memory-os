@@ -24,16 +24,31 @@ use crate::error::{KernelError, validate_id};
 /// Versioned envelope wire revision for the I1.12 handshake.
 pub const HANDSHAKE_ENVELOPE_VERSION: u32 = 1;
 
-/// Seal domain separating normative-pair tags from every other digest.
-pub const NORMATIVE_SEAL_DOMAIN: &str = "eliot.architecture.normative-pair.v1";
+/// Seal domain from the accepted external normative-pair receipt
+/// (`docs/normative-pair.toml`, `pair_key_algorithm =
+/// "sha256-domain-separated-v1"`).
+pub const NORMATIVE_SEAL_DOMAIN: &str = "eliot-normative-pair-v1";
 
-/// Computes the expected externally sealed tag for an Architecture digest.
+/// Computes the externally sealed pair tag expected for an Architecture digest.
 ///
-/// The tag binds the seal domain to the exact Architecture source digest, so
-/// a receipt sealed against one source tree never verifies against another.
+/// The tag is the `NormativePairIdentity` pair key of the accepted external
+/// receipt: SHA-256 over the seal domain and the lowercase Architecture and
+/// Implementation digests, separated and terminated by NUL bytes
+/// (`docs/normative-pair.toml`, `pair_key_input`; I0.14). The Implementation
+/// half is the accepted receipt value owned by [`super::runtime_health`],
+/// never a peer-supplied string, so a receipt sealed against one normative
+/// pair never verifies as another. The Kernel never mints seals; it only
+/// verifies a presented tag against this function and the operation's durable
+/// state.
 #[must_use]
 pub fn expected_seal_tag(architecture_source_digest: &str) -> String {
-    sha256_hex(format!("{NORMATIVE_SEAL_DOMAIN}:{architecture_source_digest}").as_bytes())
+    sha256_hex(
+        format!(
+            "{NORMATIVE_SEAL_DOMAIN}\0{architecture_source_digest}\0{}\0",
+            super::runtime_health::CURRENT_IMPLEMENTATION_SOURCE_DIGEST
+        )
+        .as_bytes(),
+    )
 }
 
 fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelError> {
@@ -231,9 +246,10 @@ impl std::error::Error for CompatibilityMismatch {}
 
 /// The externally sealed `NormativePairIdentity` receipt.
 ///
-/// The receipt binds an Architecture source digest to a seal tag issued
-/// outside the Kernel. The Kernel never mints seals; it only verifies the
-/// presented tag against [`expected_seal_tag`].
+/// The receipt binds an Architecture source digest to the external pair-key
+/// seal tag issued with the accepted normative pair outside the Kernel. The
+/// Kernel never mints seals; it only verifies the presented tag against
+/// [`expected_seal_tag`].
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormativePairReceipt {
@@ -280,7 +296,8 @@ impl NormativePairReceipt {
         &self.seal_tag
     }
 
-    /// Returns `true` only when the tag is the expected seal for the digest.
+    /// Returns `true` only when the tag is the external pair key sealing
+    /// this digest under the accepted normative pair.
     #[must_use]
     pub fn verifies(&self) -> bool {
         self.seal_tag == expected_seal_tag(&self.architecture_source_digest)
