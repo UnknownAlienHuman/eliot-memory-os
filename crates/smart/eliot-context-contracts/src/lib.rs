@@ -10,6 +10,7 @@
 mod admission;
 mod admission_input;
 mod atom;
+mod boundary;
 mod canonical_projections;
 mod decision_lineage;
 mod economy;
@@ -41,6 +42,13 @@ pub use atom::{
     CapacityLimits, ContextCandidate, ContextRecipe, LearningProvenance, LossPolicy,
     MeasurementRef, PrivacyClass, ProviderDisposition, ProviderRoleDenominator, RepresentationKind,
     RoleLossRule,
+};
+pub use boundary::{
+    BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
+    BoundaryDenominator, BoundaryGap, BoundaryGapReason, BoundaryMember, BoundaryMemberCoverage,
+    BoundaryMemberReference, BoundaryMemberRole, BoundaryMetadataEnvelope, BoundaryMetadataSet,
+    BoundaryPrecision, BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits,
+    ExactSourceRange,
 };
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
