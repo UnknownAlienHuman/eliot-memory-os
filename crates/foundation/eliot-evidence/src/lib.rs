@@ -20,7 +20,7 @@ use thiserror::Error;
 pub mod evidentiary_reference;
 
 pub use evidentiary_reference::{
-    EvidenceAnchor, EvidentiaryReference, FaithfulnessEvaluation, FragmentKind,
+    EvidenceAnchor, EvidenceInspection, EvidentiaryReference, FaithfulnessEvaluation, FragmentKind,
     FrozenEvidenceProjection, RevalidationDisposition, RevalidationRoute, SourceCorrection,
     open_revalidation_route,
 };
