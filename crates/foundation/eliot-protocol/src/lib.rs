@@ -479,6 +479,8 @@ pub enum MessageType {
     Result,
     /// Publish an event.
     Event,
+    /// Acknowledge one event at an explicit receipt phase.
+    EventAck,
     /// Cancel an operation.
     Cancel,
     /// Quiesce a module.
@@ -552,6 +554,10 @@ pub enum ProtocolPayload {
     VerificationRun(VerificationRun),
     /// Public bounded peer delta owned and validated by C0-06.
     AgentMessage(LivePeerMessage),
+    /// Lifecycle event with stable replay identity and ordering.
+    Event(Box<EventEnvelope>),
+    /// Explicit receiver receipt for a lifecycle event.
+    EventAck(Box<EventAckReceipt>),
 }
 
 impl ProtocolPayload {
@@ -574,6 +580,8 @@ impl ProtocolPayload {
             Self::AgentMessage(message) => message
                 .validate()
                 .map_err(|error| provider_error("eliot-agent-contracts", error)),
+            Self::Event(event) => event.validate(),
+            Self::EventAck(receipt) => receipt.validate(),
         }
     }
 }
@@ -600,6 +608,54 @@ pub struct Frame {
     pub payload: ProtocolPayload,
     /// Non-authoritative trace correlation values.
     pub trace_context: BTreeMap<String, String>,
+}
+
+fn validate_event_message(
+    kind: FrameKind,
+    message_type: MessageType,
+    payload: &ProtocolPayload,
+) -> Result<(), ProtocolError> {
+    match (kind, message_type, payload) {
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Event(_))
+        | (FrameKind::Control, MessageType::EventAck, ProtocolPayload::EventAck(_)) => Ok(()),
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Json(value)) => {
+            let event: EventEnvelope =
+                serde_json::from_value(value.clone()).map_err(|_| ProtocolError::InvalidField {
+                    field: "payload",
+                    reason: "lifecycle Event JSON must encode an EventEnvelope",
+                })?;
+            event.validate()
+        }
+        (_, _, ProtocolPayload::Event(_)) => Err(ProtocolError::InvalidField {
+            field: "kind/message_type",
+            reason: "EventEnvelope payloads require the lifecycle Event frame",
+        }),
+        (_, _, ProtocolPayload::EventAck(_)) => Err(ProtocolError::InvalidField {
+            field: "kind/message_type",
+            reason: "EventAckReceipt payloads require the EventAck control frame",
+        }),
+        (FrameKind::Event, MessageType::Event, _) => Err(ProtocolError::InvalidField {
+            field: "payload",
+            reason: "lifecycle Event frames require an EventEnvelope",
+        }),
+        (FrameKind::Event, _, _) => Err(ProtocolError::InvalidField {
+            field: "message_type",
+            reason: "Event frames require the lifecycle Event message type",
+        }),
+        (_, MessageType::Event, _) => Err(ProtocolError::InvalidField {
+            field: "kind",
+            reason: "lifecycle Event messages require an Event frame",
+        }),
+        (FrameKind::Control, MessageType::EventAck, _) => Err(ProtocolError::InvalidField {
+            field: "payload",
+            reason: "event acknowledgement frames require an EventAckReceipt",
+        }),
+        (_, MessageType::EventAck, _) => Err(ProtocolError::InvalidField {
+            field: "kind",
+            reason: "event acknowledgement messages require a Control frame",
+        }),
+        _ => Ok(()),
+    }
 }
 
 impl Frame {
@@ -631,6 +687,7 @@ impl Frame {
                 });
             }
         }
+        validate_event_message(self.kind, self.message_type, &self.payload)?;
         self.payload.validate()?;
         for (key, value) in &self.trace_context {
             text(key, "trace_context.key")?;
@@ -2896,6 +2953,7 @@ fn is_known_message_type(value: &str) -> bool {
             | "Execute"
             | "Result"
             | "Event"
+            | "EventAck"
             | "Cancel"
             | "Quiesce"
             | "Checkpoint"
