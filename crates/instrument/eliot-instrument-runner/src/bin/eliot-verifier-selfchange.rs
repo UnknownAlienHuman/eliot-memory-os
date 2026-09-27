@@ -23,12 +23,13 @@
 //!
 //! Value discipline: nothing compositional is hardcoded. The recorded bundle
 //! carries the authority epoch, dispatch generation, permit expiry, session,
-//! normative pair, child limits, and launch identities; the machine clock,
-//! executable bytes, process observations, and per-process authority material
-//! are observed; everything else is derived from those two. The per-process
-//! dispatch authority id, wall clock readings, and fresh key bytes follow the
-//! `eliot-testd` composition-root pattern; the permit window follows its
-//! issue/consume shape with the bundle standing in for the grant.
+//! normative pair, the unchanged external discriminator, the candidate
+//! generation's own discriminator, child limits, and launch identities; the
+//! machine clock, executable bytes, process observations, and per-process
+//! authority material are observed; everything else is derived from those two.
+//! The per-process dispatch authority id, wall clock readings, and fresh key
+//! bytes follow the `eliot-testd` composition-root pattern; the permit window
+//! follows its issue/consume shape with the bundle standing in for the grant.
 
 #![forbid(unsafe_code)]
 // The cutover report on stdout and its fail-closed refusal on stderr are this
@@ -150,8 +151,13 @@ struct BootstrapEvidence {
     /// change can never reach cutover without a real scenario run.
     outer_guardian_scenario: Option<GuardianScenarioRecord>,
     /// The unchanged external discriminator, run for real on this machine by
-    /// the last-known-good pass, the candidate shadow pass, and the canary.
+    /// the last-known-good pass and the canary.
     discriminator: DiscriminatorCommand,
+    /// The candidate generation's own discriminator executable, run for real
+    /// on this machine by the shadow pass alone. It is what makes the
+    /// comparison a changed implementation against the last-known-good one
+    /// instead of one implementation compared with itself.
+    candidate_discriminator: DiscriminatorCommand,
     /// The instrument launch admitted only under the freshly minted receipt.
     launch: LaunchCommand,
     /// The finish-gate run whose verdict the same receipt must also cover.
@@ -331,18 +337,21 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
 
     // Phases 1 and 2 are produced by real runs on this machine, never by a
     // recorded claim: the unchanged external discriminator runs over the
-    // identical command first as the last-known-good pass, then again as the
-    // candidate's shadow pass over the same raw tool evidence. The two live
-    // observations are then compared axis by axis, exactly the raw capture,
+    // identical command first as the last-known-good pass, then the recorded
+    // candidate generation's own discriminator runs as the shadow pass over
+    // the same raw tool evidence. The two sides are two different
+    // implementations, so the five-axis comparison is exactly the raw capture,
     // normalized meaning, selection, omissions, and outcome checks I18.31
-    // requires before a cutover. The passes are NOT required to produce equal
-    // whole-run digests: each pass activates its own one-shot dispatch
-    // authority, so the run's own evidence digest legitimately differs between
-    // them, and that per-activation permit identity is deliberately excluded
-    // from the compared axes (see `compare_axes`).
+    // requires before a cutover, and a candidate that normalizes differently
+    // from the last-known-good one diverges for real. The passes are NOT
+    // required to produce equal whole-run digests: each pass activates its own
+    // one-shot dispatch authority, so the run's own evidence digest
+    // legitimately differs between them, and that per-activation permit
+    // identity is deliberately excluded from the compared axes (see
+    // `compare_axes`).
     let (last_known_good, last_known_good_pass) =
         run_discriminator(&evidence.discriminator, &admission)?;
-    let (shadow, shadow_pass) = run_discriminator(&evidence.discriminator, &admission)?;
+    let (shadow, shadow_pass) = run_discriminator(&evidence.candidate_discriminator, &admission)?;
     let verdicts = compare_axes(&last_known_good_pass, &shadow_pass);
 
     let mut bootstrap = SelfChangeBootstrap::admit(
@@ -440,8 +449,19 @@ struct DiscriminatorPass {
     retained: Vec<String>,
 }
 
-/// Computes the I18.31 comparison between the last-known-good pass and the
-/// candidate's shadow pass over the same command.
+/// Compares the last-known-good pass against the candidate's shadow pass.
+///
+/// The two sides are two different implementations, not two runs of one: the
+/// shadow pass runs `&evidence.candidate_discriminator` while the
+/// last-known-good pass runs `&evidence.discriminator`, both through the same
+/// `run_child` observation path. A candidate whose own parser or evidence
+/// normalization differs therefore produces a real difference here, and that
+/// difference reaches
+/// [`SelfChangeBootstrap::record_comparison`], which refuses it through
+/// [`SelfChangeError::ComparisonDiverged`] before any receipt can be minted.
+/// I18-31's candidate-runner/module side is realized by loading the recorded
+/// candidate executable; this function then decides, per axis, whether it
+/// behaves like the last-known-good generation over the same raw evidence.
 ///
 /// I18.31 requires the comparison to check raw capture, normalized meaning,
 /// selection, omissions and outcome; it never requires the two passes to mint
@@ -504,14 +524,13 @@ struct DiscriminatorPass {
 /// code and signal, and the retained record count. All of it stays inside each
 /// run's own bound evidence digest as well.
 ///
-/// Known limitation, recorded rather than papered over: both passes run the
-/// same `&evidence.discriminator` through the same `run_child`, so this
-/// binary can re-run one implementation twice but cannot load and run a
-/// genuinely different candidate module. I18-31's candidate-runner/module
-/// side is therefore not realized here, and these five axes prove what five
-/// observations of the same command must agree on, not that a changed
-/// implementation was compared against the old one. Realizing that needs a
-/// candidate-load seam that is far outside this driver.
+/// The candidate side is loaded, not assumed: the shadow pass runs the
+/// recorded `candidate_discriminator`, so a clean verdict here is a statement
+/// about the candidate generation's own observed behaviour over the same raw
+/// fixture/tool evidence, compared against the last-known-good generation's.
+/// A bundle that names no candidate executable is refused by
+/// [`read_bundle`], so the comparison can never silently fall back to
+/// comparing the last-known-good generation with itself.
 ///
 /// No axis is fabricated: an axis is recorded as diverging only on a real
 /// difference between two observed values, and an empty list means every axis
@@ -820,7 +839,12 @@ fn read_bundle(bundle: &Path) -> Result<BootstrapEvidence, CliError> {
             Some(scenario) => Some(guardian_scenario(&scenario)?),
             None => None,
         },
-        discriminator: discriminator(required(object, "discriminator")?)?,
+        discriminator: discriminator(object, "discriminator", "discriminator")?,
+        candidate_discriminator: discriminator(
+            object,
+            "candidate_discriminator",
+            "candidate_discriminator",
+        )?,
         launch: launch(required(object, "launch")?)?,
         finish: match optional_field::<serde_json::Value>(object, "finish")? {
             Some(finish) => {
@@ -913,15 +937,24 @@ fn guardian_scenario(value: &serde_json::Value) -> Result<GuardianScenarioRecord
     })
 }
 
-/// Decodes the recorded discriminator command.
-fn discriminator(value: &serde_json::Value) -> Result<DiscriminatorCommand, CliError> {
-    let object = value
+/// Decodes one recorded discriminator command.
+///
+/// The recorded field is required and never defaulted: a bundle that names no
+/// candidate executable has no candidate to shadow-run, so the shadow pass
+/// cannot be produced at all and the run fails closed here.
+fn discriminator(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<DiscriminatorCommand, CliError> {
+    let value = required(object, key)?;
+    let command = value
         .as_object()
-        .ok_or_else(|| CliError::Bundle("'discriminator' is not an object".to_owned()))?;
+        .ok_or_else(|| CliError::Bundle(format!("'{key}' is not an object")))?;
     Ok(DiscriminatorCommand {
-        executable: absolute_path(object, "discriminator", "executable")?,
-        argv: string_list(object, "argv")?,
-        working_directory: absolute_path(object, "discriminator", "working_directory")?,
+        executable: absolute_path(command, context, "executable")?,
+        argv: string_list(command, "argv")?,
+        working_directory: absolute_path(command, context, "working_directory")?,
     })
 }
 
