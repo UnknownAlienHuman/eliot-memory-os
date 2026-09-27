@@ -654,6 +654,10 @@ impl CoordinationOwner {
 
     /// Rebuilds an owner and binds every current record to one authenticated
     /// authority epoch and fence.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "frozen public API: by-value EpochId at the coordination boundary; taking &EpochId would break downstream callers"
+    )]
     pub fn from_snapshot_at(
         snapshot: Self,
         authority_epoch: EpochId,
@@ -731,6 +735,10 @@ impl CoordinationOwner {
     /// resolver-facing boundary: the supplied epoch and fence must match the
     /// stored records exactly, and the heartbeat deadline must still be live.
     /// The returned record is a clone, never a reference into owner state.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "frozen public API: by-value EpochId at the coordination boundary; taking &EpochId would break downstream callers"
+    )]
     pub fn read_active_session(
         &self,
         session_id: &str,
@@ -767,6 +775,10 @@ impl CoordinationOwner {
     /// The session, work item and lease all have to agree on the supplied
     /// authority epoch and complete fence.  The owner and lease links are
     /// checked in both directions before any cloned projection is returned.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "frozen public API: by-value EpochId at the coordination boundary; taking &EpochId would break downstream callers"
+    )]
     pub fn read_active_work_lease(
         &self,
         work_item_id: &str,
@@ -860,6 +872,10 @@ impl CoordinationOwner {
     /// Every active session and every nonterminal work item is validated before
     /// the result is counted.  Malformed or orphaned active-looking state is a
     /// hard error; map order is never used to select a result.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "frozen public API: by-value EpochId at the coordination boundary; taking &EpochId would break downstream callers"
+    )]
     pub fn read_active_work_lease_selection(
         &self,
         now: u64,
@@ -947,6 +963,10 @@ impl CoordinationOwner {
     }
 
     /// Reads the sole active work lease through the complete selection boundary.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "frozen public API: by-value EpochId at the coordination boundary; taking &EpochId would break downstream callers"
+    )]
     pub fn read_unique_active_work_lease(
         &self,
         now: u64,
@@ -962,7 +982,7 @@ impl CoordinationOwner {
         }
     }
 
-    /// Reads the exact descendant/artifact projection used by FinishAttempt.
+    /// Reads the exact descendant/artifact projection used by `FinishAttempt`.
     ///
     /// The owner only reports a complete descendant receipt when at least one
     /// work item for the task exists and every such item is terminal.  A
@@ -1051,7 +1071,7 @@ impl CoordinationOwner {
         artifact_refs.dedup();
         unresolved_refs.sort();
         unresolved_refs.dedup();
-        terminal_event_bindings.sort();
+        terminal_event_bindings.sort_unstable();
         terminal_event_bindings.dedup();
         let descendant_receipt_ref =
             if found && unresolved_refs.is_empty() && !terminal_event_bindings.is_empty() {
@@ -1201,7 +1221,7 @@ impl CoordinationOwner {
             actor_id: actor,
             predecessor,
             state_fence: fence,
-            authority_epoch: epoch.clone(),
+            authority_epoch: epoch,
             payload_digest: digest,
             observed_at: observed,
         })
