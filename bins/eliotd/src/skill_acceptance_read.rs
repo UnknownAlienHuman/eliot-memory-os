@@ -270,22 +270,45 @@ fn latest_skill_rows(
     Ok((latest_overall, latest_match))
 }
 
-/// Resolves the canonical acceptance verdict for one package digest.
+/// Owner binding of one presented package digest for evidence ingress
+/// (issue #2663).
 ///
-/// Validates operation, fence, scope, skill, and payload-version identity
-/// against the planned read, then takes the latest committed row (by commit
-/// order) for the skill. Only the digest bound by that latest row can decide
-/// Accepted or Revoked: a newer row binding a different package digest
-/// supersedes the presented one, resolving Unknown even when an older row
-/// accepted it. Absence of any row for the digest resolves Unknown as well  --
-/// never acceptance. A truncated history cannot prove currency and fails
-/// closed: the error refuses the drive rather than installing on a possibly
-/// revoked digest.
-pub fn resolve_acceptance(
+/// Unlike [`AcceptanceVerdict`], which answers "may this digest bind material
+/// now", this answers "did the owner ever commit this digest, and is it still
+/// current". Activation/execution evidence for a superseded-but-committed
+/// digest stays usable at its historical identity; it just cannot reactivate
+/// the superseded revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoricalBinding {
+    /// The latest committed row binds this digest with an accepting action.
+    Current(AcceptanceRecord),
+    /// A committed row bound this digest, but a newer committed row binds
+    /// another digest: historical evidence only, never reactivation.
+    Historical {
+        /// The digest's own latest committed row.
+        record: AcceptanceRecord,
+        /// Commit order of the newer row that superseded it.
+        superseded_by_revision: u64,
+    },
+    /// The digest's latest committed row revokes it.
+    Revoked(AcceptanceRecord),
+    /// No committed row ever bound this digest: foreign evidence.
+    NeverCommitted,
+}
+
+/// Validates one canonical evidence response against its planned read and
+/// scans the served lifecycle-policy rows.
+///
+/// Shared preamble for [`resolve_acceptance`] and
+/// [`resolve_historical_binding`]: operation, fence, scope, skill and
+/// payload-version identity are re-verified, a truncated history fails
+/// closed, and the scan returns the latest committed row overall plus the
+/// latest row binding the presented digest.
+fn validated_binding_rows(
     request: &NamedReadRequest,
     response: &NamedReadResponse,
     package_digest: &str,
-) -> Result<AcceptanceVerdict, AcceptanceReadError> {
+) -> Result<(String, LatestSkillRows), AcceptanceReadError> {
     if response.operation != NamedReadOperation::GetCapabilityEvidenceState
         || response.operation != request.operation
     {
@@ -334,7 +357,28 @@ pub fn resolve_acceptance(
         .get("records")
         .and_then(serde_json::Value::as_array)
         .ok_or(AcceptanceReadError::Payload("records"))?;
-    let (latest_overall, latest_match) = latest_skill_rows(records, planned_skill, package_digest)?;
+    let rows = latest_skill_rows(records, planned_skill, package_digest)?;
+    Ok((planned_skill.to_owned(), rows))
+}
+
+/// Resolves the canonical acceptance verdict for one package digest.
+///
+/// Validates operation, fence, scope, skill, and payload-version identity
+/// against the planned read, then takes the latest committed row (by commit
+/// order) for the skill. Only the digest bound by that latest row can decide
+/// Accepted or Revoked: a newer row binding a different package digest
+/// supersedes the presented one, resolving Unknown even when an older row
+/// accepted it. Absence of any row for the digest resolves Unknown as well  --
+/// never acceptance. A truncated history cannot prove currency and fails
+/// closed: the error refuses the drive rather than installing on a possibly
+/// revoked digest.
+pub fn resolve_acceptance(
+    request: &NamedReadRequest,
+    response: &NamedReadResponse,
+    package_digest: &str,
+) -> Result<AcceptanceVerdict, AcceptanceReadError> {
+    let (planned_skill, (latest_overall, latest_match)) =
+        validated_binding_rows(request, response, package_digest)?;
     // Currency first: a newer committed row for another digest supersedes the
     // presented one -- the owner moved on, so the older acceptance no longer
     // decides. Absence of any row resolves Unknown the same way.
@@ -346,7 +390,7 @@ pub fn resolve_acceptance(
         return Ok(AcceptanceVerdict::Unknown);
     };
     let record = AcceptanceRecord {
-        skill_id: planned_skill.to_owned(),
+        skill_id: planned_skill,
         package_digest: package_digest.to_owned(),
         revision,
         action: action.clone(),
@@ -359,6 +403,58 @@ pub fn resolve_acceptance(
         Ok(AcceptanceVerdict::Revoked(record))
     } else {
         Err(AcceptanceReadError::Payload("action"))
+    }
+}
+
+/// Resolves one presented package digest to its owner binding for evidence
+/// ingress (issue #2663).
+///
+/// Runs the same validated canonical read as [`resolve_acceptance`], but a
+/// superseded-but-committed digest resolves to [`HistoricalBinding::Historical`]
+/// instead of collapsing to unknown: the committed row proves the digest was
+/// owner-accepted at its revision, so activation/execution evidence observed
+/// there stays usable at that historical identity. Only a digest no committed
+/// row ever bound resolves [`HistoricalBinding::NeverCommitted`] (foreign
+/// evidence, refused), and a digest whose own latest row revokes it resolves
+/// [`HistoricalBinding::Revoked`] even when a newer row moved on.
+pub fn resolve_historical_binding(
+    request: &NamedReadRequest,
+    response: &NamedReadResponse,
+    package_digest: &str,
+) -> Result<HistoricalBinding, AcceptanceReadError> {
+    let (planned_skill, (latest_overall, latest_match)) =
+        validated_binding_rows(request, response, package_digest)?;
+    let Some((revision, action, verifier_ref, candidate_digest)) = latest_match else {
+        return Ok(HistoricalBinding::NeverCommitted);
+    };
+    let record = AcceptanceRecord {
+        skill_id: planned_skill,
+        package_digest: package_digest.to_owned(),
+        revision,
+        action: action.clone(),
+        verifier_ref,
+        candidate_digest,
+    };
+    if REVOKE_ACTIONS.contains(&action.as_str()) {
+        return Ok(HistoricalBinding::Revoked(record));
+    }
+    if !ACCEPT_ACTIONS.contains(&action.as_str()) {
+        return Err(AcceptanceReadError::Payload("action"));
+    }
+    match latest_overall {
+        Some((_, current_digest)) if current_digest == package_digest => {
+            Ok(HistoricalBinding::Current(record))
+        }
+        Some((overall_revision, _)) => Ok(HistoricalBinding::Historical {
+            record,
+            superseded_by_revision: overall_revision,
+        }),
+        // Unreachable: a digest match implies at least one scanned row, so an
+        // overall row exists. Kept total rather than panicking on owner data.
+        None => Ok(HistoricalBinding::Historical {
+            superseded_by_revision: record.revision,
+            record,
+        }),
     }
 }
 

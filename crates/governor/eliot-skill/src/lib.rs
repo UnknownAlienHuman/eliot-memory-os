@@ -1040,8 +1040,19 @@ impl SkillRegistry {
     /// quarantined Skills stay blocked until governed review or restore. The
     /// returned summary keeps delivered, retrieved, activated, adhered and
     /// useful distinct; absent adherence evidence stays unknown,
-    /// never compliance, and usefulness additionally requires verifier-backed
-    /// outcome refs — never installation, retrieval, repetition or agreement.
+    /// never compliance.
+    ///
+    /// Qualification boundary (issue #2663): the structural fold
+    /// [`derive_attempt_summary`] reports a non-empty `verified_outcome_refs`
+    /// as structurally useful, but this admission publishes `useful` only when
+    /// every outcome ref resolves to owner-held step/artifact evidence of this
+    /// same skill view — a real-but-unrelated outcome, or refs dangling
+    /// outside the view's execution evidence, leave usefulness unestablished
+    /// (`false`), never a fabricated benefit. Unresolvable refs downgrade the
+    /// usefulness claim; they are not a negative fact and do not refuse the
+    /// admission. Causal credit is untouched: even a qualified useful
+    /// participation never claims the Skill alone caused success
+    /// (`NoCausalCredit` preserved).
     pub fn admit_material_attempt(
         &self,
         receipt: &SkillHarnessActivationReceipt,
@@ -1062,7 +1073,36 @@ impl SkillRegistry {
                 reason: "stale or quarantined Skills are blocked from Material use until governed review or restore",
             });
         }
-        Ok(derive_attempt_summary(receipt))
+        let mut summary = derive_attempt_summary(receipt);
+        if summary.useful
+            && !Self::outcome_refs_resolve_to_held_evidence(
+                &view.execution_evidence,
+                &receipt.verified_outcome_refs,
+            )
+        {
+            summary.useful = false;
+        }
+        Ok(summary)
+    }
+
+    /// Whether every verified outcome ref names step/artifact evidence the
+    /// owner holds for this skill: an exact `execution_ref` or `artifact_ref`
+    /// in the view's execution evidence. Outcome refs pointing outside the
+    /// held evidence are unrelated to this skill's observed executions, so
+    /// they cannot qualify a usefulness claim.
+    fn outcome_refs_resolve_to_held_evidence(
+        executions: &[SkillExecutionEvidence],
+        refs: &[String],
+    ) -> bool {
+        refs.iter().all(|reference| {
+            executions.iter().any(|execution| {
+                execution.execution_ref == *reference
+                    || execution
+                        .artifact_refs
+                        .iter()
+                        .any(|artifact| artifact == reference)
+            })
+        })
     }
 
     /// Explicit fields mirror the public lifecycle/API contract.

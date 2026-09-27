@@ -8,9 +8,11 @@
 //! acceptance over the authenticated Kernel route, and drive install→receipt
 //! only for owner-accepted material (issue #1191); display pairs decode to
 //! the wire display request and drive ack→display; activation pairs decode to
-//! the wire harness receipt and fold it into the per-attempt stage summary
-//! (issue #1191); execution pairs decode to the wire evidence ingest and
-//! reconcile unknown effects before retry (issue #1191).
+//! a private candidate, bind it to its committed lifecycle row outside the
+//! composition mutex, and admit or report it at commit after the fence and
+//! owner-revision recheck (issue #2663); execution pairs decode to a private
+//! candidate, bind the header the same way, and reconcile unknown effects
+//! before retry only after the recheck (issue #2663).
 //! Every claimed pair settles through a result body — including refusals,
 //! which persist as typed refusal outcomes — so no skill pair can poison the
 //! poller into a crash loop. `WorkScope` guard withholding retains typed identity
@@ -33,7 +35,9 @@ use thiserror::Error;
 
 use super::DaemonComposition;
 use super::daemon_kernel_client::DaemonKernelClient;
-use super::skill_acceptance_read::{AcceptanceRecord, AcceptanceResolution, AcceptanceVerdict};
+use super::skill_acceptance_read::{
+    AcceptanceRecord, AcceptanceResolution, AcceptanceVerdict, HistoricalBinding,
+};
 ///
 /// Driver refusals (stale, drift, unavailable, fence) are NOT errors here —
 /// they persist as typed refusal outcomes through [`SkillResultEnvelope`],
@@ -75,14 +79,113 @@ pub struct SkillPairPlan {
     action: PlannedSkillPair,
 }
 
+/// Authenticated ingestion request versus observed historical subject
+/// (issue #2663).
+///
+/// The collector that submits evidence over the present [`LocalReadAttempt`]
+/// is not the agent execution being observed: a current authorized collector
+/// may report an older attempt, so the ingest attempt id and the observed
+/// subject refs are carried as separate identities and never equated. The
+/// commit leg binds the plan to the live ingest attempt through the fence
+/// check; the observed refs only ever resolve against owner records, never
+/// against the ingest attempt.
+struct IngestSubject {
+    /// Authenticated collector attempt that submitted this ingest.
+    ingest_attempt_id: String,
+    /// Historical subject refs under observation (activation attempt ref, or
+    /// the presented execution refs in first-presented order).
+    observed_subject_refs: Vec<String>,
+}
+
+impl IngestSubject {
+    /// Whether this candidate still binds the live ingest attempt and names
+    /// its historical subject: the commit-leg candidate half of the
+    /// plan/attempt binding. An empty observed set is a malformed candidate,
+    /// never an anonymous one.
+    fn binds_live_ingest(&self, attempt: &LocalReadAttempt) -> bool {
+        self.ingest_attempt_id == attempt.attempt_id && !self.observed_subject_refs.is_empty()
+    }
+}
+
+/// Currency of the committed lifecycle row behind one evidence candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindingCurrency {
+    /// The row still holds the current owner position: material admission
+    /// may proceed after the commit-leg fence and revision recheck.
+    Current,
+    /// The row was superseded by a newer committed revision: the evidence
+    /// stays usable at its historical identity and can never reactivate the
+    /// superseded revision.
+    Historical,
+}
+
+/// Owner qualification carried by one activation/execution candidate.
+///
+/// Binds the decoded caller payload to the exact committed lifecycle row for
+/// its skill and package digest, resolved through the canonical acceptance
+/// read outside the composition mutex. Stages without a production owner
+/// read (subject-attempt, packet/delivery, route, task/scope, verifier run,
+/// outcome/utility records) stay unqualified: they are reported as observed
+/// structure, never as owner-backed positives, and `useful` stays false
+/// without the owner-backed outcome relation.
+struct EvidenceQualification {
+    /// Exact committed lifecycle row binding the presented skill/package.
+    record: AcceptanceRecord,
+    /// Whether that row is still current or already superseded.
+    currency: BindingCurrency,
+}
+
+impl EvidenceQualification {
+    /// Whether the activation receipt still matches the plan's owner record:
+    /// the commit-leg recheck of the load-bearing owner revision before
+    /// publishing.
+    fn matches_receipt(&self, receipt: &eliot_skill::SkillHarnessActivationReceipt) -> bool {
+        receipt.skill_id == self.record.skill_id
+            && receipt.package_digest == self.record.package_digest
+    }
+
+    /// Whether the execution header still matches the plan's owner record:
+    /// the commit-leg recheck of the load-bearing owner revision before
+    /// publishing.
+    fn matches_execution_header(
+        &self,
+        payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+    ) -> bool {
+        payload.skill_id == self.record.skill_id
+            && payload.package_digest == self.record.package_digest
+    }
+}
+
 enum PlannedSkillPair {
     /// The request is fully resolved without further composition state.
     Resolved(SkillResultEnvelope),
     /// Display consumes the live composition owner synchronously.
     Display(eliot_agent_bridge_core::SkillDisplayPayload),
-    /// Material-use evidence is admitted against the live catalogue and
-    /// Governor standing only after the plan's fence is rechecked.
-    Activation(Box<eliot_skill::SkillHarnessActivationReceipt>),
+    /// Activation evidence decoded to a private candidate and bound to its
+    /// owner lifecycle row. Current bindings admit against the live catalogue
+    /// and Governor standing only after the plan's fence is rechecked;
+    /// historical bindings report at their historical identity without
+    /// admission and can never reactivate the superseded revision.
+    ActivationCandidate {
+        /// Decoded caller receipt; qualified only through `qualification`.
+        receipt: Box<eliot_skill::SkillHarnessActivationReceipt>,
+        /// Authenticated ingest attempt kept distinct from the observed one.
+        subject: IngestSubject,
+        /// Committed-row binding plus its currency.
+        qualification: EvidenceQualification,
+    },
+    /// Execution evidence decoded to a private candidate and bound to its
+    /// owner lifecycle row. The unknown-effects fold runs at commit only
+    /// after the plan's fence is rechecked; the report carries presented
+    /// counts, never an admission or promotion claim.
+    ExecutionCandidate {
+        /// Decoded caller payload; qualified only through `qualification`.
+        payload: Box<eliot_agent_bridge_core::SkillExecutionPayload>,
+        /// Authenticated ingest attempt kept distinct from the observed refs.
+        subject: IngestSubject,
+        /// Committed-row binding plus its currency.
+        qualification: EvidenceQualification,
+    },
     /// The acceptance read returned an owner-backed record at this fence.
     AcceptedIntake {
         /// Decoded candidate the Skill owner will validate and ingest.
@@ -157,15 +260,16 @@ pub async fn plan_skill_pair(
                 error.as_ref(),
             ))),
         },
-        SkillToolKind::Activate => match decode_activation(&arguments) {
-            Ok(receipt) => plan(PlannedSkillPair::Activation(Box::new(receipt))),
-            Err(error) => plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
-                error.as_ref(),
-            ))),
-        },
-        SkillToolKind::Execute => plan(PlannedSkillPair::Resolved(drive_execution_evidence(
-            &arguments,
-        ))),
+        SkillToolKind::Activate => {
+            let action =
+                plan_activation_candidate(kernel, &admitted_fence, &arguments, attempt).await;
+            plan(action)
+        }
+        SkillToolKind::Execute => {
+            let action =
+                plan_execution_candidate(kernel, &admitted_fence, &arguments, attempt).await;
+            plan(action)
+        }
     }
 }
 
@@ -261,6 +365,244 @@ async fn plan_accepted_inject(
     }
 }
 
+/// Resolves the owner qualification for one evidence header without holding
+/// the composition lock (issue #2663).
+///
+/// Runs the canonical committed-lifecycle read over the authenticated Kernel
+/// route and binds the presented skill/package to its row. Foreign digests
+/// (never committed), revoked digests, contradictory bindings, and lost reads
+/// return the refusal envelope: only a committed row qualifies the candidate,
+/// current or historical.
+async fn read_canonical_binding(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+    skill_id: &str,
+    package_digest: &str,
+) -> Result<HistoricalBinding, String> {
+    let resolution = super::skill_acceptance_read::resolve_intake_acceptance(
+        kernel,
+        admitted_fence,
+        skill_id,
+        package_digest,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    super::skill_acceptance_read::resolve_historical_binding(
+        &resolution.request,
+        &resolution.response,
+        package_digest,
+    )
+    .map_err(|error| error.to_string())
+}
+
+async fn resolve_evidence_qualification(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+    skill_id: &str,
+    package_digest: &str,
+    digest_field: &'static str,
+) -> Result<EvidenceQualification, SkillResultEnvelope> {
+    let refused = |error: &eliot_skill::SkillError| SkillResultEnvelope::refused(error);
+    let binding =
+        match read_canonical_binding(kernel, admitted_fence, skill_id, package_digest).await {
+            Ok(binding) => binding,
+            Err(detail) => return Err(refused(&eliot_skill::SkillError::Surface(detail))),
+        };
+    let (record, currency) = match binding {
+        HistoricalBinding::Current(record) => (record, BindingCurrency::Current),
+        HistoricalBinding::Historical { record, .. } => (record, BindingCurrency::Historical),
+        HistoricalBinding::Revoked(_) => {
+            return Err(refused(&eliot_skill::SkillError::InvalidField {
+                field: digest_field,
+                reason: "canonical lifecycle revoked this package revision",
+            }));
+        }
+        HistoricalBinding::NeverCommitted => {
+            return Err(refused(&eliot_skill::SkillError::IdentityMismatch));
+        }
+    };
+    if skill_id != record.skill_id || package_digest != record.package_digest {
+        return Err(refused(&eliot_skill::SkillError::IdentityMismatch));
+    }
+    Ok(EvidenceQualification { record, currency })
+}
+
+/// Plans one activation receipt as an owner-qualified candidate without
+/// holding the composition lock (issue #2663).
+///
+/// Decodes the private candidate, then qualifies its skill/package against
+/// the canonical committed lifecycle rows. A current receipt must sit at the
+/// admitted fence; a historical receipt keeps its own fence and is never
+/// re-stamped with today's. The ingest attempt and the observed attempt are
+/// carried as distinct identities — an observed ref that differs from the
+/// ingest attempt is expected, never a mismatch.
+async fn plan_activation_candidate(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+    arguments: &Value,
+    attempt: &LocalReadAttempt,
+) -> PlannedSkillPair {
+    let receipt = match decode_activation(arguments) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(error.as_ref()));
+        }
+    };
+    let qualification = match resolve_evidence_qualification(
+        kernel,
+        admitted_fence,
+        &receipt.skill_id,
+        &receipt.package_digest,
+        "receipt.package_digest",
+    )
+    .await
+    {
+        Ok(qualification) => qualification,
+        Err(outcome) => return PlannedSkillPair::Resolved(outcome),
+    };
+    if qualification.currency == BindingCurrency::Current && receipt.state_fence != *admitted_fence
+    {
+        return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::FenceMismatch,
+        ));
+    }
+    let subject = IngestSubject {
+        ingest_attempt_id: attempt.attempt_id.clone(),
+        observed_subject_refs: vec![receipt.attempt_ref.clone()],
+    };
+    PlannedSkillPair::ActivationCandidate {
+        receipt: Box::new(receipt),
+        subject,
+        qualification,
+    }
+}
+
+/// Plans one execution-evidence ingest as an owner-qualified candidate
+/// without holding the composition lock (issue #2663).
+///
+/// The header skill/package binds to the canonical committed lifecycle rows
+/// exactly like activation: foreign, revoked, contradictory, and unreadable
+/// headers refuse before any record folds, and the unknown-effects fold runs
+/// only at commit after the fence recheck. Per-record step/artifact/verifier
+/// provenance has no production owner read, so records fold as presented
+/// structure once the header binds; the reconciliation report carries counts,
+/// never an admission or promotion claim.
+/// STITCH (issue #2663): header-vs-record provenance is BLOCKED-BY
+/// per-record skill/attempt linkage in the execution wire shape plus named
+/// owner reads for step/artifact records and verifier contracts/runs; that
+/// wire change shares one coherent revision with #2664 and is not made here.
+async fn plan_execution_candidate(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+    arguments: &Value,
+    attempt: &LocalReadAttempt,
+) -> PlannedSkillPair {
+    let payload = match decode_execution(arguments) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(error.as_ref()));
+        }
+    };
+    let qualification = match resolve_evidence_qualification(
+        kernel,
+        admitted_fence,
+        &payload.skill_id,
+        &payload.package_digest,
+        "execute.package_digest",
+    )
+    .await
+    {
+        Ok(qualification) => qualification,
+        Err(outcome) => return PlannedSkillPair::Resolved(outcome),
+    };
+    let mut observed_subject_refs = Vec::new();
+    for execution in &payload.executions {
+        if !observed_subject_refs.contains(&execution.execution_ref) {
+            observed_subject_refs.push(execution.execution_ref.clone());
+        }
+    }
+    let subject = IngestSubject {
+        ingest_attempt_id: attempt.attempt_id.clone(),
+        observed_subject_refs,
+    };
+    PlannedSkillPair::ExecutionCandidate {
+        payload: Box::new(payload),
+        subject,
+        qualification,
+    }
+}
+
+/// Commits one owner-qualified activation candidate under a fresh short
+/// composition borrow (issue #2663).
+///
+/// Rechecks the admitted fence, the candidate's live-ingest binding, and the
+/// load-bearing owner record before publishing. Current bindings admit
+/// against the live catalogue and Governor standing (refusing on any drift
+/// since the plan); historical bindings report at their historical identity
+/// without admission and can never reactivate the superseded revision.
+fn commit_activation_candidate(
+    composition: &DaemonComposition,
+    admitted_fence: &StateFence,
+    attempt: &LocalReadAttempt,
+    receipt: &eliot_skill::SkillHarnessActivationReceipt,
+    subject: &IngestSubject,
+    qualification: &EvidenceQualification,
+) -> SkillResultEnvelope {
+    if composition.kernel_snapshot().state_fence() != *admitted_fence
+        || !subject.binds_live_ingest(attempt)
+        || !qualification.matches_receipt(receipt)
+    {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch);
+    }
+    match qualification.currency {
+        // Current binding: the live catalogue revision, Governor standing,
+        // and owner-backed outcome relation recheck inside admission, which
+        // refuses on any drift since the plan.
+        BindingCurrency::Current => match composition.skill_admit_material_attempt(receipt) {
+            Ok(summary) => SkillResultEnvelope::attempt(summary),
+            Err(error) => SkillResultEnvelope::refused(&error),
+        },
+        // Historical binding: report the observed structure at its
+        // historical identity without material admission, so a superseded
+        // revision can never reactivate. Usefulness stays unestablished: no
+        // admission ran, so no owner-backed outcome relation qualified a
+        // benefit claim.
+        // STITCH (issue #2663): recording this qualified historical
+        // observation through the lifecycle owner is BLOCKED-BY a governed
+        // daemon→registry mutation port — `GovernorComposition` exposes
+        // `owners(&self)` only, and minting a second write path needs owner
+        // review, not a repair-lane edit.
+        BindingCurrency::Historical => {
+            let mut summary = eliot_skill::derive_attempt_summary(receipt);
+            summary.useful = false;
+            SkillResultEnvelope::attempt(summary)
+        }
+    }
+}
+
+/// Commits one owner-qualified execution candidate under a fresh short
+/// composition borrow (issue #2663).
+///
+/// Rechecks the admitted fence, the candidate's live-ingest binding, and the
+/// load-bearing owner record before the unknown-effects fold publishes its
+/// reconciliation report.
+fn commit_execution_candidate(
+    composition: &DaemonComposition,
+    admitted_fence: &StateFence,
+    attempt: &LocalReadAttempt,
+    payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+    subject: &IngestSubject,
+    qualification: &EvidenceQualification,
+) -> SkillResultEnvelope {
+    if composition.kernel_snapshot().state_fence() != *admitted_fence
+        || !subject.binds_live_ingest(attempt)
+        || !qualification.matches_execution_header(payload)
+    {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch);
+    }
+    drive_execution_evidence(payload)
+}
+
 /// Commits the accepted intake against the current composition owner, then
 /// binds the final outcome to the exact local-read attempt.
 ///
@@ -301,16 +643,30 @@ pub fn commit_skill_pair(
                     SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
                 }
             }
-            PlannedSkillPair::Activation(receipt) => {
-                if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
-                    match composition.skill_admit_material_attempt(&receipt) {
-                        Ok(summary) => SkillResultEnvelope::attempt(summary),
-                        Err(error) => SkillResultEnvelope::refused(&error),
-                    }
-                } else {
-                    SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
-                }
-            }
+            PlannedSkillPair::ActivationCandidate {
+                receipt,
+                subject,
+                qualification,
+            } => commit_activation_candidate(
+                composition,
+                &plan.admitted_fence,
+                attempt,
+                &receipt,
+                &subject,
+                &qualification,
+            ),
+            PlannedSkillPair::ExecutionCandidate {
+                payload,
+                subject,
+                qualification,
+            } => commit_execution_candidate(
+                composition,
+                &plan.admitted_fence,
+                attempt,
+                &payload,
+                &subject,
+                &qualification,
+            ),
             PlannedSkillPair::AcceptedIntake {
                 payload,
                 record,
@@ -434,17 +790,15 @@ fn decode_activation(
     Ok(payload.receipt)
 }
 
-/// Drives one decoded execution-evidence ingest through unknown-effects
-/// reconciliation.
+/// Decodes one execution-evidence ingest for owner qualification at plan
+/// time (issue #2663).
 ///
-/// Every presented record is validated (observed executions require exact
-/// step refs; causal credit stays denied) and folded by outcome. A clean
-/// window carries its exact counts back; any still-uncertain execution
-/// refuses retry with the pending refs named, so unknown effects are
-/// reconciled by exact evidence before the next attempt. Absent records
-/// prove nothing — only presented evidence folds, and uninstrumented
-/// executions stay unknown instead of proving success.
-fn drive_execution_evidence(arguments: &Value) -> SkillResultEnvelope {
+/// Decode verifies the header binding plus every record shape from the wire
+/// bytes; the plan leg then binds the header to its committed lifecycle row
+/// before the commit leg folds anything.
+fn decode_execution(
+    arguments: &Value,
+) -> Result<eliot_agent_bridge_core::SkillExecutionPayload, Box<eliot_skill::SkillError>> {
     let payload = match canonical_json_bytes(&arguments)
         .map_err(|error| error.to_string())
         .and_then(|bytes| {
@@ -453,11 +807,27 @@ fn drive_execution_evidence(arguments: &Value) -> SkillResultEnvelope {
         }) {
         Ok(payload) => payload,
         Err(detail) => {
-            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+            return Err(Box::new(eliot_skill::SkillError::Surface(format!(
                 "execution arguments fail their shape: {detail}"
-            )));
+            ))));
         }
     };
+    Ok(payload)
+}
+
+/// Drives one owner-qualified execution-evidence candidate through
+/// unknown-effects reconciliation.
+///
+/// Every presented record is validated (observed executions require exact
+/// step refs; causal credit stays denied) and folded by outcome. A clean
+/// window carries its exact counts back; any still-uncertain execution
+/// refuses retry with the pending refs named, so unknown effects are
+/// reconciled by exact evidence before the next attempt. Absent records
+/// prove nothing — only presented evidence folds, and uninstrumented
+/// executions stay unknown instead of proving success.
+fn drive_execution_evidence(
+    payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+) -> SkillResultEnvelope {
     match eliot_skill::reconcile_unknown_effects(&payload.executions) {
         Ok(verdict) => {
             if verdict.retry_permitted() {
