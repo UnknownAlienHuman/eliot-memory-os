@@ -72,7 +72,8 @@
 #   if needed, exact-owned-tree termination of the verified tree; never by
 #   name, port, or unverified PID. A stale or foreign receipt is refused
 #   without signalling any process, and forced termination is refused when
-#   the observed descendant closure is explicitly incomplete.
+#   the observed descendant closure is explicitly incomplete; a failed Job-handle
+#   close is recorded as jobCloseWarning without changing the stop outcome.
 # - VerifyCleanup checks the owner marker, process descendants, port, locks,
 #   secrets, and roots; it is idempotent and never deletes foreign state.
 #   Unbound process/port observers default to real observation, an
@@ -2618,10 +2619,10 @@ function Close-StoreJobBinding {
         [string]$JobName
     )
     if ([string]::IsNullOrWhiteSpace($JobName) -or $JobName -ceq 'inherited') {
-        return @{ jobName = $JobName; closed = $false }
+        return @{ jobName = $JobName; closed = $false; reason = 'inherited' }
     }
     if (-not $Script:StoreJobHandles.ContainsKey($JobName)) {
-        return @{ jobName = $JobName; closed = $false }
+        return @{ jobName = $JobName; closed = $false; reason = 'untracked' }
     }
     $job = $Script:StoreJobHandles[$JobName]
     [void]$Script:StoreJobHandles.Remove($JobName)
@@ -2630,9 +2631,9 @@ function Close-StoreJobBinding {
         if ($null -ne $api -and $job -is [System.IntPtr] -and $job -ne [System.IntPtr]::Zero) {
             [void]$api::CloseHandle($job)
         }
-        return @{ jobName = $JobName; closed = $true }
+        return @{ jobName = $JobName; closed = $true; reason = 'closed' }
     } catch {
-        return @{ jobName = $JobName; closed = $false }
+        return @{ jobName = $JobName; closed = $false; reason = 'close-failed' }
     }
 }
 
@@ -3778,8 +3779,13 @@ function New-StoreProviderOperationTable {
                 $receipt = $args['startReceipt']
                 if ($null -ne $receipt['observed'] -and $receipt['observed'] -is [hashtable] -and $receipt['observed'].ContainsKey('jobName')) {
                     try {
-                        [void](Close-StoreJobBinding -JobName ([string]$receipt['observed']['jobName']))
-                    } catch { }
+                        $close = Close-StoreJobBinding -JobName ([string]$receipt['observed']['jobName'])
+                        if ($null -ne $close -and [string]$close['reason'] -ceq 'close-failed') {
+                            $result['jobCloseWarning'] = 'close-failed'
+                        }
+                    } catch {
+                        $result['jobCloseWarning'] = 'close-unknown'
+                    }
                 }
             }
             return $result
