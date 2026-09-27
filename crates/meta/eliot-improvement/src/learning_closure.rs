@@ -1891,7 +1891,7 @@ pub struct CampaignLearningClosure {
 /// bounded further-evidence disposition the decision core returned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClosureRecordAssembly {
-    Closed(CampaignLearningClosure),
+    Closed(Box<CampaignLearningClosure>),
     Disposition(LearningClosureDisposition),
 }
 
@@ -1908,7 +1908,6 @@ pub enum ClosureRecordAssembly {
 /// Returns [`ClosureRecordAssembly::Closed`] with the evidence stored on the
 /// record and bound into both `evidence_digest` and the record `digest`, or the
 /// bounded [`LearningClosureDisposition`] the decision core produced.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_campaign_learning_closure_with_evidence(
     exact_campaign_and_target: CampaignAndTarget,
     exact_attempt_outcomes_and_deltas: AttemptOutcomesAndDeltas,
@@ -1941,17 +1940,19 @@ pub fn assemble_campaign_learning_closure_with_evidence(
     };
     let evidence_digest = evidence_refs_digest(&canonical_evidence_refs);
     let digest = closure_record_digest(&candidate, &evidence_digest);
-    Ok(ClosureRecordAssembly::Closed(CampaignLearningClosure {
-        closure_id: format!("closure-{}-{}", candidate.campaign_id, &digest[..16]),
-        campaign_id: candidate.campaign_id.clone(),
-        target_id: candidate.target_id.clone(),
-        task_id,
-        state_fence_ref,
-        candidate,
-        evidence: canonical_evidence_refs,
-        evidence_digest,
-        digest,
-    }))
+    Ok(ClosureRecordAssembly::Closed(Box::new(
+        CampaignLearningClosure {
+            closure_id: format!("closure-{}-{}", candidate.campaign_id, &digest[..16]),
+            campaign_id: candidate.campaign_id.clone(),
+            target_id: candidate.target_id.clone(),
+            task_id,
+            state_fence_ref,
+            candidate,
+            evidence: canonical_evidence_refs,
+            evidence_digest,
+            digest,
+        },
+    )))
 }
 
 /// Full closure-record digest: the candidate digest (already bound to the four
