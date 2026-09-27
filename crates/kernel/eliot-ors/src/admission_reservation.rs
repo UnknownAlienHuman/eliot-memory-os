@@ -3,6 +3,11 @@
 //! The record is operational evidence only. Claim references remain opaque
 //! owner references; this module does not interpret policy or issue canonical
 //! work-admission authority.
+//!
+//! The read-only launch prerequisite at the end of this module is the one
+//! narrow verification surface over that state. It grants nothing itself: it
+//! re-derives the current disposition and issues a sealed active typestate that
+//! only this module can construct.
 
 use serde::{Deserialize, Serialize};
 
@@ -307,4 +312,246 @@ pub struct AdmissionReservationTransitionRequest {
     pub state_fence: StateFenceSnapshot,
     /// Observed transition time in Unix milliseconds.
     pub now_ms: i64,
+}
+
+/// Closed read-only verification result for one launch prerequisite.
+///
+/// The variants are exactly the dispositions a launch consumer must be able to
+/// tell apart. Only [`Self::Active`] carries launch authority, and it carries
+/// an [`ActiveAdmissionReservation`] that an ordinary caller can neither build
+/// nor deserialize. Every other variant is inert durable evidence naming the
+/// exact reason the prerequisite does not hold.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AdmissionReservationLaunchPrerequisite {
+    /// No durable reservation covers the expected work item and attempt.
+    Missing {
+        /// Work item whose admission reservation was expected.
+        work_item_id: OperationIdentity,
+        /// Proposed attempt whose admission reservation was expected.
+        proposed_attempt_id: OperationIdentity,
+    },
+    /// Claims are durable but were never activated. This holds even when a
+    /// canonical admission receipt is already present and activation has not
+    /// happened.
+    Staged {
+        /// Exact durable staged record.
+        reservation: AdmissionReservationRecord,
+    },
+    /// The exact reservation is active under the caller's current authority.
+    Active(ActiveAdmissionReservation),
+    /// Claims were explicitly released with a durable disposition.
+    Released {
+        /// Exact durable released record with its retained disposition evidence.
+        reservation: AdmissionReservationRecord,
+    },
+    /// Claims are expired: either the durable `Expired` transition exists, or
+    /// the declared `expires_at_ms` boundary already elapsed without a new
+    /// activation.
+    Expired {
+        /// Exact durable record read at the expiry boundary.
+        reservation: AdmissionReservationRecord,
+    },
+    /// An uncertain transition is held for exact reconciliation only and
+    /// cannot create a new effect.
+    Reconciling {
+        /// Exact durable reconciling record with its retained evidence.
+        reservation: AdmissionReservationRecord,
+    },
+    /// The reservation was written under a different State Fence than the
+    /// caller's current one, so the world moved since it was staged.
+    StaleFence {
+        /// Exact durable record observed under the other fence.
+        reservation: AdmissionReservationRecord,
+        /// State Fence the caller verified against.
+        expected_state_fence: StateFenceSnapshot,
+    },
+    /// The reservation is owned by a different Authority Epoch lineage, so the
+    /// caller does not own the proposal it would have to launch.
+    ForeignOwner {
+        /// Exact durable record owned by the other epoch.
+        reservation: AdmissionReservationRecord,
+        /// Authority Epoch lineage the caller verified against.
+        expected_authority_epoch: EpochLineage,
+    },
+    /// The reservation names a different work item or proposed attempt than the
+    /// caller verified against.
+    IdentityConflict {
+        /// Exact durable record whose identity conflicts.
+        reservation: AdmissionReservationRecord,
+        /// Work item the caller verified against.
+        expected_work_item_id: OperationIdentity,
+        /// Proposed attempt the caller verified against.
+        expected_proposed_attempt_id: OperationIdentity,
+    },
+}
+
+/// Sealed active launch prerequisite.
+///
+/// This is the only value a launch consumer may treat as active reservation
+/// authority. It is produced exclusively by
+/// [`verify_admission_reservation_launch_prerequisite`]: its authorising fields
+/// are private, it has no public constructor, and it deliberately has no
+/// `Deserialize` implementation, so an ordinary caller can neither assemble an
+/// accepted "active" typestate from public fields nor recover one from
+/// serialized bytes. The verifier is the single issuance point, and it issues
+/// only after the durable record, the epoch, the State Fence and the work and
+/// attempt identities have all been checked.
+///
+/// #1701 obtains one by calling the verifier with the reservation snapshot it
+/// read back from ORS, plus its own current Authority Epoch lineage, State
+/// Fence, work-item and proposed-attempt identities, and current time.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActiveAdmissionReservation {
+    reservation: AdmissionReservationRecord,
+    receipt: OperationalMutationReceipt,
+}
+
+impl ActiveAdmissionReservation {
+    /// Issues the sealed prerequisite. Only this module's verifier may call it.
+    const fn verified(
+        reservation: AdmissionReservationRecord,
+        receipt: OperationalMutationReceipt,
+    ) -> Self {
+        Self {
+            reservation,
+            receipt,
+        }
+    }
+
+    /// Exact active reservation record the verifier accepted.
+    pub const fn record(&self) -> &AdmissionReservationRecord {
+        &self.reservation
+    }
+
+    /// Store-issued ORS mutation receipt bound to the exact persisted row.
+    pub const fn receipt(&self) -> &OperationalMutationReceipt {
+        &self.receipt
+    }
+
+    /// Owner-issued ORS activation receipt reference bound by the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidTransition`] when the sealed value does not
+    /// carry an activation receipt. That cannot happen for a value issued by
+    /// the verifier; the check stays a typed refusal so no consumer can read the
+    /// absence as a panic it is entitled to trust.
+    pub fn activation_receipt(&self) -> Result<&ReceiptIdentity, OrsError> {
+        self.reservation
+            .activation_receipt
+            .as_ref()
+            .ok_or(OrsError::InvalidTransition)
+    }
+
+    /// Owner-issued canonical admission receipt reference bound by the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidTransition`] when the sealed value does not
+    /// carry a canonical admission receipt, for the same reason as
+    /// [`Self::activation_receipt`].
+    pub fn canonical_admission_receipt(&self) -> Result<&ReceiptIdentity, OrsError> {
+        self.reservation
+            .canonical_admission_receipt
+            .as_ref()
+            .ok_or(OrsError::InvalidTransition)
+    }
+}
+
+/// Verifies one read-back reservation as the launch prerequisite #1701 must
+/// hold before any launch.
+///
+/// The check is a pure read. It provisions nothing, launches nothing, mutates
+/// no durable state, and changes no lifecycle position: it re-derives the
+/// current disposition of the reservation it is given. The caller's current
+/// Authority Epoch lineage, State Fence, work-item and proposed-attempt
+/// identities and time are the launch authority being checked against, so an
+/// active reservation under a different epoch, fence, work item, attempt or a
+/// passed expiry boundary is refused rather than accepted.
+///
+/// Only an exact `Active` record carrying both its activation receipt and its
+/// canonical admission receipt returns [`AdmissionReservationLaunchPrerequisite::Active`];
+/// every other disposition returns its own typed variant and cannot be turned
+/// into active authority.
+///
+/// # Errors
+///
+/// Returns [`OrsError`] when the expected epoch/fence pair does not hold
+/// together, when `now_ms` is not a positive Unix millisecond value, or when
+/// the observed durable record violates
+/// [`AdmissionReservationRecord::validate`].
+pub fn verify_admission_reservation_launch_prerequisite(
+    current: Option<&AdmissionReservationSnapshot>,
+    expected_work_item_id: &OperationIdentity,
+    expected_proposed_attempt_id: &OperationIdentity,
+    expected_authority_epoch: &EpochLineage,
+    expected_state_fence: &StateFenceSnapshot,
+    now_ms: i64,
+) -> Result<AdmissionReservationLaunchPrerequisite, OrsError> {
+    expected_authority_epoch.validate()?;
+    expected_state_fence.validate_against_lineage(expected_authority_epoch)?;
+    if now_ms <= 0 {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation_launch_prerequisite.now_ms",
+            reason: "must be greater than zero",
+        });
+    }
+    let Some(snapshot) = current else {
+        return Ok(AdmissionReservationLaunchPrerequisite::Missing {
+            work_item_id: expected_work_item_id.clone(),
+            proposed_attempt_id: expected_proposed_attempt_id.clone(),
+        });
+    };
+    let record = snapshot.record();
+    record.validate()?;
+    let reservation = record.clone();
+    match reservation.state {
+        AdmissionReservationState::StagedInactive => {
+            Ok(AdmissionReservationLaunchPrerequisite::Staged { reservation })
+        }
+        AdmissionReservationState::Released => {
+            Ok(AdmissionReservationLaunchPrerequisite::Released { reservation })
+        }
+        AdmissionReservationState::Expired => {
+            Ok(AdmissionReservationLaunchPrerequisite::Expired { reservation })
+        }
+        AdmissionReservationState::Reconciling => {
+            Ok(AdmissionReservationLaunchPrerequisite::Reconciling { reservation })
+        }
+        AdmissionReservationState::Active => {
+            if reservation.canonical_admission_receipt.is_none()
+                || reservation.activation_receipt.is_none()
+            {
+                return Err(OrsError::InvalidTransition);
+            }
+            if &reservation.work_item_id != expected_work_item_id
+                || &reservation.proposed_attempt_id != expected_proposed_attempt_id
+            {
+                return Ok(AdmissionReservationLaunchPrerequisite::IdentityConflict {
+                    reservation,
+                    expected_work_item_id: expected_work_item_id.clone(),
+                    expected_proposed_attempt_id: expected_proposed_attempt_id.clone(),
+                });
+            }
+            if &reservation.authority_epoch != expected_authority_epoch {
+                return Ok(AdmissionReservationLaunchPrerequisite::ForeignOwner {
+                    reservation,
+                    expected_authority_epoch: expected_authority_epoch.clone(),
+                });
+            }
+            if &reservation.state_fence != expected_state_fence {
+                return Ok(AdmissionReservationLaunchPrerequisite::StaleFence {
+                    reservation,
+                    expected_state_fence: expected_state_fence.clone(),
+                });
+            }
+            if now_ms >= reservation.expires_at_ms {
+                return Ok(AdmissionReservationLaunchPrerequisite::Expired { reservation });
+            }
+            Ok(AdmissionReservationLaunchPrerequisite::Active(
+                ActiveAdmissionReservation::verified(reservation, snapshot.receipt().clone()),
+            ))
+        }
+    }
 }
