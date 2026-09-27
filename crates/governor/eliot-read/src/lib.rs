@@ -114,6 +114,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Executable owner inventory and owner/Store read-model comparison.
+pub mod owner_inventory;
 /// Scoped, candidate-only provider-memory feed contracts and read outcomes.
 pub mod provider_memory_feed;
 
