@@ -18,6 +18,7 @@ use eliot_process::{
 };
 use thiserror::Error;
 
+pub mod build_projection;
 pub mod cache_lane;
 pub mod process_owner;
 pub mod profile;
@@ -27,6 +28,13 @@ pub mod registry;
 pub mod testd_port;
 pub mod work_envelope;
 
+pub use build_projection::{
+    AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
+    BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,
+    CleanupDecision, DeclaredWorkItem, PreemptionClass, ProducerClaim, ProducerCompletion,
+    ProducerOutcome, ProjectedBuild, QuarantinedArtifact, TargetClass, TargetRootBuildCoordinator,
+    restrict_agent_argv,
+};
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
