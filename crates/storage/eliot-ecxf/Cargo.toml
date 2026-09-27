@@ -7,7 +7,7 @@ license.workspace = true
 description = "Canonical ECXF/1 interchange source for ELIOT storage"
 
 [package.metadata.eliot]
-workspace_admission = "unreachable pending explicit owner disposition per #1716 (governed export path: #1871); not a selectable production fallback"
+workspace_admission = "reachable production interchange source per #1871 (single governed builder eliot_backup::export_ecxf_package in eliot-backup, reached from the eliot/eliot-host/eliot-kernel runtime roots through eliot-backup); not a selectable storage fallback"
 
 [dependencies]
 eliot-blob-api.workspace = true
