@@ -22,7 +22,9 @@ pub use eliot_observation_contracts::{
     BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
 pub use eliot_process::{FencingToken, Generation};
-pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
+pub use eliot_protocol::{
+    AckPhase, AgentHostRequestFailure, DeliveryClass, EventDisposition, EventEnvelope,
+};
 use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
 use eliot_skill::{
     ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt,
@@ -4746,6 +4748,8 @@ impl ProviderFailure {
 /// Fail-closed bridge contract errors.
 #[derive(Debug, Error)]
 pub enum BridgeError {
+    #[error("agent host request failed")]
+    AgentHostRequestFailure(Box<AgentHostRequestFailure>),
     #[error("{PLAN_GAP}: missing admitted provider {0:?}")]
     PlanGap(PlanGap),
     #[error("invalid bridge contract field {field}: {reason}")]
