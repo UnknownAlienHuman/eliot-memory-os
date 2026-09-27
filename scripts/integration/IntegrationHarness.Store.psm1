@@ -152,6 +152,188 @@ $Script:StoreFailureClasses = @(
 $Script:StoreReconciliationTable = @{}
 $Script:StoreJobHandles = @{}
 $Script:StoreLaunchDrains = @()
+$Script:StorePortReservations = @{}
+
+function Get-StorePortReservationId {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)] [string]$RunId,
+        [Parameter(Mandatory)] [string]$Owner,
+        [Parameter(Mandatory)] [int]$Generation,
+        [Parameter(Mandatory)] [string]$AllocationSeed,
+        [Parameter(Mandatory)] [string]$Endpoint
+    )
+    $builder = [System.Text.StringBuilder]::new()
+    foreach ($part in @($RunId, $Owner, [string]$Generation, $AllocationSeed, $Endpoint)) {
+        [void]$builder.Append($part.Length).Append(':').Append($part)
+    }
+    return $builder.ToString()
+}
+
+function Register-StorePortReservation {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)] [hashtable]$Reservation,
+        [Parameter(Mandatory)] [string]$RunId,
+        [Parameter(Mandatory)] [string]$Owner,
+        [Parameter(Mandatory)] [int]$Generation,
+        [Parameter(Mandatory)] [string]$AllocationSeed,
+        [Parameter(Mandatory)] [string]$ReservationHost,
+        [Parameter(Mandatory)] [int]$Port
+    )
+    $listener = $null
+    if ($Reservation.ContainsKey('listener')) { $listener = $Reservation['listener'] }
+    if ($null -eq $listener -or $listener -isnot [System.Net.Sockets.TcpListener]) {
+        throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: a live listener handle is required for an ownership-safe reservation.')
+    }
+    if ($null -ne $listener) {
+        try {
+            $local = [System.Net.IPEndPoint]$listener.LocalEndpoint
+            if ([string]$local.Address -cne $ReservationHost -or [int]$local.Port -ne $Port) {
+                throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation listener does not own the requested loopback endpoint.')
+            }
+        } catch {
+            if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
+            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation listener is not active.')
+        }
+    }
+    $endpoint = ('{0}:{1}' -f $ReservationHost, $Port)
+    $id = Get-StorePortReservationId -RunId $RunId -Owner $Owner -Generation $Generation `
+        -AllocationSeed $AllocationSeed -Endpoint $endpoint
+    if ($Script:StorePortReservations.ContainsKey($id)) {
+        throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation identity has already been used for this endpoint.')
+    }
+    $record = @{
+        reservationId = $id
+        runId = $RunId
+        owner = $Owner
+        generation = $Generation
+        allocationSeed = $AllocationSeed
+        endpoint = $endpoint
+        listener = $listener
+        state = 'Pending'
+    }
+    $Script:StorePortReservations[$id] = $record
+    return $record
+}
+
+function Close-StoreSuppliedReservationListener {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [AllowNull()]$Reservation)
+    if ($null -eq $Reservation) {
+        return $true
+    }
+    $listener = $null
+    if ($Reservation -is [System.Net.Sockets.TcpListener]) {
+        $listener = $Reservation
+    } elseif ($Reservation -is [hashtable] -and $Reservation.ContainsKey('listener')) {
+        $listener = $Reservation['listener']
+    } else {
+        return $true
+    }
+    if ($null -eq $listener) { return $true }
+    if ($listener -isnot [System.Net.Sockets.TcpListener]) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-CLEANUP-UNKNOWN: supplied listener handle has an unsupported type.')
+    }
+    try { $listener.Stop() } catch {
+        throw [System.InvalidOperationException]::new("STORE-RESERVATION-CLEANUP-UNKNOWN: supplied listener release failed: $($_.Exception.Message)")
+    }
+    return $true
+}
+
+function Throw-StoreAllocationFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$PrimaryMessage,
+        [Parameter(Mandatory)] [AllowNull()] [hashtable]$ReservationIdentity,
+        [Parameter(Mandatory)] [AllowNull()]$Reservation,
+        [Parameter(Mandatory)] [string]$RunId,
+        [Parameter(Mandatory)] [string]$Owner,
+        [Parameter(Mandatory)] [int]$Generation,
+        [Parameter(Mandatory)] [string]$Endpoint
+    )
+    try {
+        if ($null -ne $ReservationIdentity) {
+            [void](Complete-StorePortReservation -Identity $ReservationIdentity -RunId $RunId -Owner $Owner `
+                -Generation $Generation -Endpoint $Endpoint -Disposition 'cleanup')
+        } else {
+            [void](Close-StoreSuppliedReservationListener -Reservation $Reservation)
+        }
+    } catch {
+        throw [System.InvalidOperationException]::new(
+            "STORE-ALLOCATION-RECONCILIATION-REQUIRED: failure='$PrimaryMessage'; cleanup='$($_.Exception.Message)' owner='$RunId'.")
+    }
+    throw [System.InvalidOperationException]::new($PrimaryMessage)
+}
+
+function Complete-StorePortReservation {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)] [hashtable]$Identity,
+        [Parameter(Mandatory)] [string]$RunId,
+        [Parameter(Mandatory)] [string]$Owner,
+        [Parameter(Mandatory)] [int]$Generation,
+        [Parameter(Mandatory)] [string]$Endpoint,
+        [Parameter(Mandatory)] [ValidateSet('launch-handoff', 'cleanup')] [string]$Disposition
+    )
+    foreach ($field in @('reservationId', 'runId', 'owner', 'generation', 'allocationSeed', 'endpoint')) {
+        if (-not $Identity.ContainsKey($field)) {
+            throw [System.InvalidOperationException]::new("STORE-RESERVATION-FOREIGN: reservation identity is missing '$field'.")
+        }
+    }
+    $id = [string]$Identity['reservationId']
+    if ([string]$Identity['runId'] -cne $RunId -or [string]$Identity['owner'] -cne $Owner -or
+        [int]$Identity['generation'] -ne $Generation -or [string]$Identity['endpoint'] -cne $Endpoint) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-FOREIGN: reservation identity does not match its binding.')
+    }
+    $expectedId = Get-StorePortReservationId -RunId $RunId -Owner $Owner -Generation $Generation `
+        -AllocationSeed ([string]$Identity['allocationSeed']) -Endpoint $Endpoint
+    if ($id -cne $expectedId -or -not $Script:StorePortReservations.ContainsKey($id)) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-UNKNOWN: pending reservation owner is unavailable.')
+    }
+    $registered = $Script:StorePortReservations[$id]
+    if ([string]$registered['runId'] -cne $RunId -or [string]$registered['owner'] -cne $Owner -or
+        [int]$registered['generation'] -ne $Generation -or [string]$registered['endpoint'] -cne $Endpoint -or
+        [string]$registered['allocationSeed'] -cne [string]$Identity['allocationSeed']) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-FOREIGN: reservation identity does not match its registered owner.')
+    }
+    if ([string]$registered['state'] -ceq 'Released') {
+        if ($Disposition -ceq 'cleanup') { return $true }
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-REUSED: released reservation cannot authorize another launch.')
+    }
+    if (-not $Identity.ContainsKey('listener') -or -not [object]::ReferenceEquals($registered['listener'], $Identity['listener'])) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-FOREIGN: pending reservation handle does not match its registered listener.')
+    }
+    if ($null -ne $registered['listener']) {
+        try { $registered['listener'].Stop() } catch {
+            throw [System.InvalidOperationException]::new("STORE-RESERVATION-CLEANUP-FAILED: owned listener release failed: $($_.Exception.Message)")
+        }
+    }
+    $registered['state'] = 'Released'
+    $registered['listener'] = $null
+    $Identity['state'] = 'Released'
+    $Identity['listener'] = $null
+    return $true
+}
+
+function Get-StorePortReservationReceipt {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)] [hashtable]$Identity)
+    return @{
+        reservationId = [string]$Identity['reservationId']
+        runId = [string]$Identity['runId']
+        owner = [string]$Identity['owner']
+        generation = [int]$Identity['generation']
+        allocationSeed = [string]$Identity['allocationSeed']
+        endpoint = [string]$Identity['endpoint']
+        state = [string]$Identity['state']
+    }
+}
 
 $Script:StoreClosedOperations = @(
     'ValidateRequirement',
@@ -1014,29 +1196,34 @@ function Invoke-StoreAllocate {
         $reservation = (& $PortReservation @{ runId = $runId; namespace = $namespace; database = $database })
     } catch {
         if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
-        throw [System.InvalidOperationException]::new("STORE-PORT-CONFLICT: reservation failed: $($_.Exception.Message)")
+        throw [System.InvalidOperationException]::new("STORE-PORT-RESERVATION-UNKNOWN: reservation callback failed before returning its owner handle: $($_.Exception.Message)")
     }
     $port = 0
-    if ($reservation -is [hashtable] -and $reservation.ContainsKey('port')) {
+    $host_ = $Script:StoreLoopback
+    $endpoint = 'unresolved'
+    $reservationIdentity = $null
+    try {
+        if ($reservation -isnot [hashtable] -or -not $reservation.ContainsKey('port')) {
+            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation must return a port mapping.')
+        }
         try { $port = [int]$reservation['port'] } catch {
             throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation port is not an integer.')
         }
-    } elseif ($reservation -is [int]) {
-        $port = $reservation
-    } else {
-        throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation must return a port mapping.')
+        if ($port -lt 1024 -or $port -gt 65535) {
+            throw [System.InvalidOperationException]::new("STORE-PORT-CONFLICT: reserved port '$port' is outside the ephemeral bound.")
+        }
+        if ($reservation.ContainsKey('host')) { $host_ = [string]$reservation['host'] }
+        if ($host_ -cne $Script:StoreLoopback) {
+            throw [System.InvalidOperationException]::new("STORE-ENDPOINT-FORBIDDEN: endpoint host '$host_' is not loopback.")
+        }
+        $endpoint = ('{0}:{1}' -f $host_, $port)
+        $reservationIdentity = Register-StorePortReservation -Reservation $reservation `
+            -RunId $runId -Owner $owner -Generation $gen -AllocationSeed $nonce -ReservationHost $host_ -Port $port
+    } catch {
+        $primary = $_.Exception.Message
+        Throw-StoreAllocationFailure -PrimaryMessage $primary -ReservationIdentity $reservationIdentity `
+            -Reservation $reservation -RunId $runId -Owner $owner -Generation $gen -Endpoint $endpoint
     }
-    if ($port -lt 1024 -or $port -gt 65535) {
-        throw [System.InvalidOperationException]::new("STORE-PORT-CONFLICT: reserved port '$port' is outside the ephemeral bound.")
-    }
-    $host_ = $Script:StoreLoopback
-    if ($reservation -is [hashtable] -and $reservation.ContainsKey('host')) {
-        $host_ = [string]$reservation['host']
-    }
-    if ($host_ -cne $Script:StoreLoopback) {
-        throw [System.InvalidOperationException]::new("STORE-ENDPOINT-FORBIDDEN: endpoint host '$host_' is not loopback.")
-    }
-    $endpoint = ('{0}:{1}' -f $host_, $port)
     $fs = $FileSystem
     if ($null -eq $fs) {
         $fs = New-StoreDefaultFileSystem
@@ -1056,8 +1243,10 @@ function Invoke-StoreAllocate {
             generation = $gen
         })
     } catch {
-        if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
-        throw [System.InvalidOperationException]::new("STORE-ALLOCATION-FAILED: owned root creation failed: $($_.Exception.Message)")
+        $primary = $_.Exception.Message
+        if ($primary -notmatch '^STORE-[A-Z0-9-]+:') { $primary = "STORE-ALLOCATION-FAILED: owned root creation failed: $primary" }
+        Throw-StoreAllocationFailure -PrimaryMessage $primary -ReservationIdentity $reservationIdentity `
+            -Reservation $reservation -RunId $runId -Owner $owner -Generation $gen -Endpoint $endpoint
     }
     if ($null -ne $fsResult -and $fsResult -is [hashtable]) {
         if ($fsResult.ContainsKey('created')) { $created = [bool]$fsResult['created'] }
@@ -1072,8 +1261,10 @@ function Invoke-StoreAllocate {
         try {
             [void](& $aclSeam @{ op = 'protect'; path = $protectedRoot; runId = $runId })
         } catch {
-            if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
-            throw [System.InvalidOperationException]::new("STORE-ACL-FAILED: root protection failed for '$protectedRoot': $($_.Exception.Message)")
+            $primary = $_.Exception.Message
+            if ($primary -notmatch '^STORE-[A-Z0-9-]+:') { $primary = "STORE-ACL-FAILED: root protection failed for '$protectedRoot': $primary" }
+            Throw-StoreAllocationFailure -PrimaryMessage $primary -ReservationIdentity $reservationIdentity `
+                -Reservation $reservation -RunId $runId -Owner $owner -Generation $gen -Endpoint $endpoint
         }
     }
     return @{
@@ -1091,6 +1282,7 @@ function Invoke-StoreAllocate {
         endpoint       = $endpoint
         host           = $host_
         port           = $port
+        reservationIdentity = $reservationIdentity
         owner          = $owner
         generation     = $gen
         allocationSeed = $nonce
@@ -1133,6 +1325,12 @@ function Invoke-StoreStart {
             throw [System.ArgumentException]::new("STORE-INVALID-ALLOCATION: allocation is missing '$field'.")
         }
     }
+    if (-not $Allocation.ContainsKey('reservationIdentity') -or $Allocation['reservationIdentity'] -isnot [hashtable]) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-UNKNOWN: allocation carries no owned reservation identity.')
+    }
+    $reservationIdentity = $Allocation['reservationIdentity']
+    $reservationReleased = $false
+    try {
     $storeFs = $FileSystem
     if ($null -eq $storeFs) {
         $storeFs = New-StoreDefaultFileSystem
@@ -1234,6 +1432,9 @@ function Invoke-StoreStart {
         imageDigest      = [string]$receipt['digest']
         provenance       = $provenance
     }
+    [void](Complete-StorePortReservation -Identity $reservationIdentity -RunId $runId -Owner ([string]$Binding['owner']) `
+        -Generation ([int]$Binding['generation']) -Endpoint ([string]$Allocation['endpoint']) -Disposition 'launch-handoff')
+    $reservationReleased = $true
     $observed = $null
     try {
         $observed = (& $Launcher $launchInput)
@@ -1253,6 +1454,8 @@ function Invoke-StoreStart {
                 reconciliationOwner  = $runId
                 reconciliationPath   = [string]$reconciliation['path']
                 reconciliationPersisted = [bool]$reconciliation['persisted']
+                reservationIdentity = (Get-StorePortReservationReceipt -Identity $reservationIdentity)
+                reservationHandoff = 'close-before-launch'
                 failure              = ('lost-response-owned:' + $message)
             }
         }
@@ -1291,6 +1494,14 @@ function Invoke-StoreStart {
         invocation = @{ argvCount = $fixedArgv.Count; bindEndpoint = $launchInput['endpoint']; artifact = $Script:StoreArtifact }
         binary     = @{ version = $version; architecture = $Script:StoreArchitecture; peMachine = $Script:StorePeMachine; digest = [string]$receipt['digest']; provenance = $provenance }
         credentialHandle = [string]$credential['credentialHandle']
+        reservationIdentity = (Get-StorePortReservationReceipt -Identity $reservationIdentity)
+        reservationHandoff = 'close-before-launch'
+    }
+    } finally {
+        if (-not $reservationReleased) {
+            [void](Complete-StorePortReservation -Identity $reservationIdentity -RunId $runId -Owner ([string]$Binding['owner']) `
+                -Generation ([int]$Binding['generation']) -Endpoint ([string]$Allocation['endpoint']) -Disposition 'cleanup')
+        }
     }
 }
 
@@ -1321,11 +1532,16 @@ function Invoke-StoreObserveReadiness {
     if ([string]$StartReceipt['runId'] -cne $runId) {
         throw [System.InvalidOperationException]::new('STORE-RECEIPT-FOREIGN: start receipt run identity is foreign.')
     }
+    if (-not $StartReceipt.ContainsKey('reservationHandoff') -or
+        [string]$StartReceipt['reservationHandoff'] -cne 'close-before-launch') {
+        throw [System.InvalidOperationException]::new('STORE-RECEIPT-STALE: start receipt has no declared reservation handoff mode.')
+    }
     if ($null -eq $StartReceipt['observed'] -or ($StartReceipt['observed'] -isnot [hashtable])) {
         throw [System.InvalidOperationException]::new('STORE-RECEIPT-STALE: start receipt carries no observed process handle.')
     }
     $observed = $StartReceipt['observed']
-    if (-not $observed.ContainsKey('pid') -or -not $observed.ContainsKey('endpoint')) {
+    if (-not $observed.ContainsKey('pid') -or -not $observed.ContainsKey('endpoint') -or
+        -not $observed.ContainsKey('imagePath') -or -not $observed.ContainsKey('startTimeUtc')) {
         throw [System.InvalidOperationException]::new('STORE-RECEIPT-STALE: start receipt observation is incomplete.')
     }
     $ownedPid = [int]$observed['pid']
@@ -1335,10 +1551,13 @@ function Invoke-StoreObserveReadiness {
     }
     $process = (& $ProcessObserver @{ pid = $ownedPid; runId = $runId })
     $port = (& $PortObserver @{ endpoint = $ownedEndpoint; runId = $runId })
-    if ($null -eq $process -or $process -isnot [hashtable] -or -not $process.ContainsKey('alive')) {
+    if ($null -eq $process -or $process -isnot [hashtable] -or
+        -not $process.ContainsKey('alive') -or -not $process.ContainsKey('pid') -or
+        -not $process.ContainsKey('imagePath') -or -not $process.ContainsKey('startTimeUtc')) {
         throw [System.InvalidOperationException]::new('STORE-OBSERVER-FAILED: process observer must return an alive mapping.')
     }
-    if ($null -eq $port -or $port -isnot [hashtable] -or -not $port.ContainsKey('open')) {
+    if ($null -eq $port -or $port -isnot [hashtable] -or
+        -not $port.ContainsKey('open') -or -not $port.ContainsKey('endpoint')) {
         throw [System.InvalidOperationException]::new('STORE-OBSERVER-FAILED: port observer must return an open mapping.')
     }
     $alive = [bool]$process['alive']
@@ -1346,17 +1565,22 @@ function Invoke-StoreObserveReadiness {
     if ($process.ContainsKey('pid') -and ([int]$process['pid'] -ne $ownedPid)) {
         throw [System.InvalidOperationException]::new('STORE-RECEIPT-FOREIGN: process observer returned a foreign pid.')
     }
+    if (-not [string]::Equals([string]$process['imagePath'], [string]$observed['imagePath'], [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]$process['startTimeUtc'] -cne [string]$observed['startTimeUtc']) {
+        throw [System.InvalidOperationException]::new('STORE-RECEIPT-FOREIGN: process image or start identity changed after launch.')
+    }
     if ($port.ContainsKey('endpoint') -and ([string]$port['endpoint'] -cne $ownedEndpoint)) {
         throw [System.InvalidOperationException]::new('STORE-RECEIPT-FOREIGN: port observer returned a foreign endpoint.')
     }
-    if ($port.ContainsKey('ownerPid') -and $null -ne $port['ownerPid']) {
-        $ownerPid = 0
-        try { $ownerPid = [int]$port['ownerPid'] } catch {
-            throw [System.InvalidOperationException]::new('STORE-OBSERVER-FAILED: port observer owner pid is not an integer.')
-        }
-        if ($ownerPid -ne $ownedPid) {
-            throw [System.InvalidOperationException]::new('STORE-RECEIPT-FOREIGN: endpoint listener is owned by a foreign pid.')
-        }
+    if (-not $port.ContainsKey('ownerPid') -or $null -eq $port['ownerPid']) {
+        throw [System.InvalidOperationException]::new('STORE-PORT-OWNER-UNPROVEN: readiness requires an observed listener PID.')
+    }
+    $ownerPid = 0
+    try { $ownerPid = [int]$port['ownerPid'] } catch {
+        throw [System.InvalidOperationException]::new('STORE-OBSERVER-FAILED: port observer owner pid is not an integer.')
+    }
+    if ($ownerPid -ne $ownedPid) {
+        throw [System.InvalidOperationException]::new('STORE-RECEIPT-FOREIGN: endpoint listener is owned by a foreign pid.')
     }
     $client = (& $StoreClient @{ runId = $runId; endpoint = $ownedEndpoint; pid = $ownedPid })
     if ($null -eq $client -or $client -isnot [hashtable]) {
@@ -1423,6 +1647,7 @@ function Invoke-StoreObserveReadiness {
         schemaDigest   = [string]$client['schemaDigest']
         endpoint       = $ownedEndpoint
         pid            = $ownedPid
+        listenerOwnerVerified = $true
         ready          = $ready
     }
 }
@@ -1736,6 +1961,11 @@ function Invoke-StoreVerifyCleanup {
         if (-not $Allocation.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$Allocation[$field])) {
             throw [System.ArgumentException]::new("STORE-INVALID-ALLOCATION: allocation is missing '$field'.")
         }
+    }
+    if ($Allocation.ContainsKey('reservationIdentity') -and $Allocation['reservationIdentity'] -is [hashtable]) {
+        [void](Complete-StorePortReservation -Identity $Allocation['reservationIdentity'] -RunId $runId `
+            -Owner ([string]$Binding['owner']) -Generation ([int]$Binding['generation']) `
+            -Endpoint ([string]$Allocation['endpoint']) -Disposition 'cleanup')
     }
     $runRoot = [System.IO.Path]::GetFullPath([string]$Allocation['runRoot'])
     $runLeaf = [System.IO.Path]::GetFileName($runRoot)
@@ -2582,9 +2812,13 @@ function New-StoreDefaultAcl {
     return $dispatch.GetNewClosure()
 }
 
-# Real port reservation: transient loopback bind hands one ephemeral port to
-# the launch; Start/Observe re-validate bind ownership after the launch.
-# In: {runId,namespace,database}. Out: {port,host}.
+# Real port reservation: hold the loopback bind until Start reaches launch
+# handoff. Windows child launch cannot inherit this socket, so releasing it
+# does not make the later bind atomic; ObserveReadiness must prove that the
+# listener belongs to the exact launched PID before accepting readiness.
+# Allocation carries the listener object and owner identity; cleanup releases
+# only that exact listener.
+# In: {runId,namespace,database}. Out: {port,host,listener}.
 function New-StoreDefaultPortReservation {
     [CmdletBinding()]
     [OutputType([scriptblock])]
@@ -2600,12 +2834,17 @@ function New-StoreDefaultPortReservation {
             if ($port -lt 1024 -or $port -gt 65535) {
                 throw [System.InvalidOperationException]::new("STORE-PORT-CONFLICT: reserved port '$port' is outside the ephemeral bound.")
             }
-            return @{ port = $port; host = $loopback }
+            return @{ port = $port; host = $loopback; listener = $listener }
         } catch {
-            if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
-            throw [System.InvalidOperationException]::new("STORE-PORT-CONFLICT: loopback reservation failed: $($_.Exception.Message)")
-        } finally {
-            if ($null -ne $listener) { $listener.Stop() }
+            $primary = $_.Exception.Message
+            if ($null -ne $listener) {
+                try { $listener.Stop() } catch {
+                    throw [System.InvalidOperationException]::new(
+                        "STORE-PORT-RESERVATION-RECONCILIATION-REQUIRED: failure='$primary'; cleanup='$($_.Exception.Message)'.")
+                }
+            }
+            if ($primary -match '^STORE-[A-Z0-9-]+:') { throw [System.InvalidOperationException]::new($primary) }
+            throw [System.InvalidOperationException]::new("STORE-PORT-CONFLICT: loopback reservation failed: $primary")
         }
     }
     return $reserve.GetNewClosure()
