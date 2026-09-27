@@ -61,13 +61,14 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 pub mod activation;
 
 pub use activation::{
-    AdherenceCheckpoints, AttemptLifecycleSummary, ExecutionFold, InstructionConflict,
-    LifecycleEvidence, OrderingBasis, SkillActivationStatus, SkillAdherenceStatus,
-    SkillDeliveryStatus, SkillHarnessActivationReceipt, SkillRetrievalStatus,
+    AdherenceCheckpoints, AttemptLifecycleSummary, EvidenceCoverage, ExecutionFold,
+    InstructionConflict, LifecycleEvidence, OrderingBasis, OwnerQualifiedCandidate,
+    ResolvedOutcome, SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
+    SkillHarnessActivationReceipt, SkillRetrievalStatus, SkillUsefulness, SourceRevision,
     UnknownEffectsVerdict, apply_dependency_staleness, changed_dependency_names,
     derive_attempt_summary, derive_lifecycle_view, detect_dependency_staleness,
-    fold_execution_evidence, material_use_allowed, reconcile_unknown_effects,
-    record_instruction_conflict,
+    fold_execution_evidence, material_use_allowed, qualify_useful_outcomes,
+    reconcile_unknown_effects, record_instruction_conflict,
 };
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
@@ -1039,9 +1040,14 @@ impl SkillRegistry {
     /// revision and package digest, and gated on review state: stale and
     /// quarantined Skills stay blocked until governed review or restore. The
     /// returned summary keeps delivered, retrieved, activated, adhered and
-    /// useful distinct; absent adherence evidence stays unknown,
-    /// never compliance, and usefulness additionally requires verifier-backed
-    /// outcome refs — never installation, retrieval, repetition or agreement.
+    /// useful distinct; absent adherence evidence stays unknown, never
+    /// compliance. This admission NEVER claims usefulness: the summary it
+    /// returns reports [`SkillUsefulness::Unknown`] unconditionally, because a
+    /// presented `verified_outcome_refs` list is an unverified wire string set.
+    /// Usefulness is established only by
+    /// [`qualify_useful_outcomes`](crate::qualify_useful_outcomes) against
+    /// owner-resolved outcome records — never by installation, retrieval,
+    /// repetition or agreement.
     pub fn admit_material_attempt(
         &self,
         receipt: &SkillHarnessActivationReceipt,
@@ -1063,6 +1069,91 @@ impl SkillRegistry {
             });
         }
         Ok(derive_attempt_summary(receipt))
+    }
+
+    /// Records one window of execution evidence through this lifecycle owner
+    /// and returns only after the owner accepted it (issue #2663, I7.25).
+    ///
+    /// The daemon previously persisted only the outer host-response body and
+    /// returned "accepted" on that basis, discarding the very evidence the
+    /// ingest was admitted to carry. This entry is the existing owner write
+    /// path: the evidence is appended to the stored view's own
+    /// `execution_evidence` and the view is RE-DERIVED from the retained
+    /// records, so no counter can outrun the evidence behind it.
+    ///
+    /// Evidence is HISTORICAL and stays historical: it is bound to the exact
+    /// Skill revision and package digest the caller presented, and a record
+    /// that disagrees with the stored view is refused rather than merged, so
+    /// ingesting evidence now can never reactivate a superseded Skill. Exact
+    /// replay under the same execution identity is idempotent; a CHANGED
+    /// record under that identity is a conflict, never a silent rewrite.
+    ///
+    /// The caller supplies the retained catalogue entry the view is derived
+    /// against, because the registry does not own the catalogue; the identity
+    /// legs it names are still compared against the stored view.
+    ///
+    /// Usefulness is never established here: the derived counters consult each
+    /// receipt's [`SkillUsefulness`], which only
+    /// [`qualify_useful_outcomes`] can raise to `OwnerBacked`.
+    pub fn record_execution_evidence(
+        &self,
+        skill_id: &str,
+        skill_revision: &str,
+        package_digest: &str,
+        entry: &SkillCatalogueEntry,
+        executions: &[SkillExecutionEvidence],
+    ) -> Result<SkillLifecycleView, SkillError> {
+        text(skill_id, "execution.skill_id")?;
+        text(skill_revision, "execution.skill_revision")?;
+        digest(package_digest, "execution.package_digest")?;
+        for evidence in executions {
+            evidence.validate()?;
+        }
+        let key = skill_id.to_owned();
+        let previous = self.views.get(&key).ok_or(SkillError::NotFound)?.clone();
+        // The evidence is bound to the exact Skill identity it was observed
+        // under: a substituted revision or package cannot be filed under the
+        // stored view's identity.
+        if previous.skill_ref.registration.revision != skill_revision
+            || previous.skill_ref.package_digest != package_digest
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let mut retained = previous.execution_evidence.clone();
+        for evidence in executions {
+            // Exact replay under the same execution identity is idempotent; a
+            // changed record under that identity is a conflict, not an
+            // overwrite.
+            match retained
+                .iter()
+                .position(|held| held.execution_ref == evidence.execution_ref)
+            {
+                Some(index) if retained[index] != *evidence => {
+                    return Err(SkillError::RevisionConflict);
+                }
+                Some(_) => {}
+                None => retained.push(evidence.clone()),
+            }
+        }
+        let mut view = derive_lifecycle_view(LifecycleEvidence {
+            skill_ref: previous.skill_ref.clone(),
+            scope: previous.scope.clone(),
+            applies_when: previous.applies_when.clone(),
+            entry,
+            attempts: &previous.attempt_receipts,
+            executions: &retained,
+            conflicts: &[],
+            current_dependencies: &previous.dependencies,
+            observed_decision_or_verifier_delta: previous
+                .observed_decision_or_verifier_delta
+                .clone(),
+            state_fence: previous.state_fence.clone(),
+        })?;
+        // Later evidence is a LINKED revision, never a silent rewrite: the
+        // revision advances so the owner can order the observations.
+        view.lifecycle_revision = previous.lifecycle_revision.saturating_add(1);
+        view.validate()?;
+        Ok(view)
     }
 
     /// Explicit fields mirror the public lifecycle/API contract.
