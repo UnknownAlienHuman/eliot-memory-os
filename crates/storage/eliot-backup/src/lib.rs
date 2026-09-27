@@ -55,6 +55,7 @@ pub use portable_adapters::{
 pub use portable_recovery::{
     BlobRestorationReceipt, FullRecoveryPackage, MAX_WRAPPED_KEY_BYTES, WrappedKeyEntry,
     WrappedKeyManifest, issue_full_recovery, issue_restoration_receipts, verify_key_coverage,
+    verify_portable_key_material,
 };
 pub use product_command::{
     BackupCreateArgs, BackupCreatePreview, RestorePreview, parse_backup_class,

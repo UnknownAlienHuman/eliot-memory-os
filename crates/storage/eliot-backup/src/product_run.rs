@@ -19,7 +19,7 @@ use super::{
     BackupBundle, BackupClass, BackupError, BackupInput, IsolatedRoot, RestoreContext,
     RestoreEvidenceLevel, RestoreObligationState, WrappedKeyManifest, bytes_sha256,
     execute_isolated_restore, issue_full_recovery, issue_restoration_receipts, text,
-    verify_key_coverage,
+    verify_portable_key_material,
 };
 
 /// How the restore target epoch is determined: an explicit caller triple, or
@@ -204,7 +204,7 @@ fn persist_issued(
     let mut receipts = 0_u64;
     let mut key_coverage = None;
     if let Some(manifest) = keys {
-        verify_key_coverage(&bundle.blobs, manifest)?;
+        verify_portable_key_material(bundle, manifest)?;
         key_coverage = Some(true);
         let issued =
             issue_restoration_receipts(&bundle.manifest.backup_id, manifest, &bundle.blobs)?;
