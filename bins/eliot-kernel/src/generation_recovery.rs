@@ -14,7 +14,11 @@ use std::sync::Arc;
 
 use eliot_contracts::{AuthorityEpoch, StateFence};
 use eliot_ipc::ServerHandshakePolicy;
-use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
+use eliot_kernel_core::{
+    CompatibilityMismatch, CutoverDecision, DurableCompatibilityState, GenerationRoute,
+    GenerationRouter, RouteScope, StateMigrationClass, VersionRange, admit_rollback,
+    restore_recorded_evidence,
+};
 use eliot_kernel_service::KernelService;
 use eliot_ors::{CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore};
 use eliot_runtime_contracts::{
@@ -159,12 +163,89 @@ pub(crate) struct OrsGenerationCoordinator {
     pub(crate) cutover_routes: CutoverRouteTable,
 }
 
+/// The current durable compatibility state the Kernel is running under, used
+/// to gate every restored route as a rollback (I1.12, issue #1890 W4).
+///
+/// Built from the SAME live values the runtime handshake binds
+/// (`frame_dispatch::runtime_compatibility_evidence`), so the rollback gate and
+/// the activation handshake are compared against one durable state rather than
+/// two independently derived projections. It is derived from the running
+/// binary's own protocol/format/contract/architecture identity and the service's
+/// current authority epoch; nothing is invented and no evidence is carried over
+/// from a previous process.
+fn current_durable_compatibility_state(
+    service: &KernelService,
+) -> Result<DurableCompatibilityState, String> {
+    let protocol_range = VersionRange::new(1, 1).map_err(|error| error.to_string())?;
+    let canonical_format_range = VersionRange::new(1, 1).map_err(|error| error.to_string())?;
+    let contract_set_digest =
+        super::frame_dispatch::runtime_contract_set_digest().map_err(|error| error.to_string())?;
+    DurableCompatibilityState::new(
+        protocol_range,
+        contract_set_digest,
+        canonical_format_range,
+        eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+        service.authority_epoch(),
+        vec![super::frame_dispatch::RUNTIME_HEALTH_CAPABILITY.to_owned()],
+        StateMigrationClass::NoMigration,
+    )
+    .map_err(|error| error.to_string())
+}
+
 impl OrsGenerationCoordinator {
     pub(crate) fn new(ors: Arc<RedbRecoveryStore>) -> Self {
         Self {
             ors,
             cutover_routes: CutoverRouteTable::new(),
         }
+    }
+
+    /// Re-verifies one retained generation's recorded I1.12 evidence against the
+    /// CURRENT durable compatibility state before that generation may be used as
+    /// a rollback target (I1.12, issue #1890 W4/A2).
+    ///
+    /// This is the production caller of [`admit_rollback`]. "Last known good"
+    /// means verified compatible with current durable formats and Authority
+    /// Epoch lineage, not "it launched once": the verdict persisted with the
+    /// candidate generation is re-read from ORS, projected back into the
+    /// handshake evidence shape, and compared against the durable state the
+    /// Kernel is running under right now.
+    ///
+    /// A previously launched artifact is therefore refused as a rollback target
+    /// after a format, contract, architecture, seal, migration-class or
+    /// epoch-lineage change, even though its own recorded verdict was admitted
+    /// when it first ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact [`CompatibilityMismatch`] produced by
+    /// [`admit_rollback`], or one naming an absent/unreadable record, so the
+    /// caller retains the field label and reason as the structured cause.
+    pub(crate) fn admit_generation_rollback(
+        &self,
+        module_id: &str,
+        generation: u64,
+        durable: &DurableCompatibilityState,
+    ) -> Result<(), CompatibilityMismatch> {
+        let recorded = self
+            .ors
+            .load_versioned_artifact_registry(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| {
+                CompatibilityMismatch::new(
+                    eliot_kernel_core::MismatchField::EnvelopeVersion,
+                    format!("generation registry is unreadable: {error}"),
+                )
+            })?
+            .compatibility(module_id, generation)
+            .cloned()
+            .ok_or_else(|| {
+                CompatibilityMismatch::new(
+                    eliot_kernel_core::MismatchField::EnvelopeVersion,
+                    "no recorded compatibility verdict exists for this generation",
+                )
+            })?;
+        let evidence = restore_recorded_evidence(&recorded)?;
+        admit_rollback(&evidence, durable)
     }
 
     /// Restores the committed I14.14 ownership projection before the Kernel
@@ -271,6 +352,16 @@ impl OrsGenerationCoordinator {
             .map_err(|error| error.to_string())?;
         let active_epoch = service.authority_epoch();
         let mut recovered = GenerationRouter::at_epoch(active_epoch.clone());
+        // I1.12 (issue #1890 W4/A2): a restart rebuilds the route table from the
+        // committed cutover records, which is the one place a retained
+        // generation is re-selected as a live route after it previously ran.
+        // That re-selection is a rollback, so it is gated here: each restored
+        // route's recorded I1.12 evidence must still validate against the
+        // durable compatibility state the Kernel is running under NOW. A
+        // generation that was admitted once is not thereby a valid rollback
+        // target after a format, contract, architecture, seal, migration-class
+        // or epoch-lineage change.
+        let durable = current_durable_compatibility_state(service)?;
         for snapshot in &snapshots {
             let record = snapshot.record();
             // A committed record at any other sequence belongs to a superseded
@@ -282,6 +373,21 @@ impl OrsGenerationCoordinator {
             {
                 continue;
             }
+            // The cutover record names its generation as the typed
+            // `ResourceGeneration`; the ORS versioned-artifact registry keys
+            // the recorded verdict by the same generation value, so the
+            // rollback lookup uses that value rather than a re-derived one.
+            let generation = record.new_generation.value();
+            self.admit_generation_rollback(&record.route_scope, generation, &durable)
+                .map_err(|mismatch| {
+                    format!(
+                        "restored route {} generation {} is not a valid rollback target: {} ({})",
+                        record.route_scope,
+                        generation,
+                        mismatch.field(),
+                        mismatch.reason()
+                    )
+                })?;
             let scope =
                 RouteScope::new(record.route_scope.clone()).map_err(|error| error.to_string())?;
             let route = GenerationRoute::new(scope, record.new_generation, active_epoch.clone())

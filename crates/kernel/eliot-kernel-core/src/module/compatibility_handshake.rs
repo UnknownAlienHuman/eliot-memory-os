@@ -13,8 +13,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU64;
 
-use eliot_contracts::{EpochId, ResourceGeneration, sha256_hex};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -708,6 +709,91 @@ pub fn admit_handshake(
         authority_epoch: candidate.authority_epoch().clone(),
         migration_class: candidate.migration_class(),
     })
+}
+
+/// Restores the recorded evidence a durable Generation Registry row carries.
+///
+/// Issue #1890 persists the whole handshake outcome with the candidate
+/// generation, so a later rollback has something to re-verify instead of a
+/// remembered "it launched once". This is the one way a persisted verdict
+/// becomes an [`AcceptedCompatibilityEvidence`] again.
+///
+/// It reconstructs, it does not decide: every compatibility question is still
+/// answered by [`admit_rollback`] against the caller's current
+/// [`DurableCompatibilityState`]. A row ORS could not have written - a
+/// malformed digest, a non-canonical lineage, a version outside its own
+/// offered range - is refused here as [`MismatchField::EnvelopeVersion`],
+/// meaning the stored record cannot be read as evidence at the current
+/// envelope revision, rather than being repaired into a verdict.
+///
+/// # Errors
+///
+/// Returns a [`CompatibilityMismatch`] when the stored record cannot be
+/// projected onto the current evidence shape.
+pub fn restore_recorded_evidence(
+    recorded: &eliot_ors::CompatibilityEvidence,
+) -> Result<AcceptedCompatibilityEvidence, CompatibilityMismatch> {
+    recorded.validate().map_err(|error| {
+        CompatibilityMismatch::new(MismatchField::EnvelopeVersion, error.to_string())
+    })?;
+    let module_generation =
+        ResourceGeneration::new(recorded.module_generation()).map_err(|error| {
+            CompatibilityMismatch::new(MismatchField::EnvelopeVersion, error.to_string())
+        })?;
+    let lineage_id = EpochLineageId::new(recorded.authority_lineage_id()).map_err(|error| {
+        CompatibilityMismatch::new(MismatchField::AuthorityEpoch, error.to_string())
+    })?;
+    let Some(sequence) = NonZeroU64::new(recorded.authority_sequence()) else {
+        return Err(CompatibilityMismatch::new(
+            MismatchField::AuthorityEpoch,
+            "recorded authority epoch sequence is zero",
+        ));
+    };
+    let authority_epoch = EpochId::new(lineage_id, sequence).map_err(|error| {
+        CompatibilityMismatch::new(MismatchField::AuthorityEpoch, error.to_string())
+    })?;
+    Ok(AcceptedCompatibilityEvidence {
+        envelope_version: recorded.envelope_version(),
+        protocol_version: recorded.admitted_protocol_version().ok_or_else(|| {
+            CompatibilityMismatch::new(
+                MismatchField::ProtocolRange,
+                "recorded evidence never reached protocol negotiation",
+            )
+        })?,
+        contract_set_digest: recorded.contract_set_digest().to_owned(),
+        canonical_format_version: recorded.admitted_canonical_format_version().ok_or_else(
+            || {
+                CompatibilityMismatch::new(
+                    MismatchField::CanonicalFormatRange,
+                    "recorded evidence never reached canonical-format negotiation",
+                )
+            },
+        )?,
+        architecture_source_digest: recorded.architecture_source_digest().to_owned(),
+        seal_tag: recorded.normative_seal_tag().to_owned(),
+        module_generation,
+        authority_epoch,
+        migration_class: recorded_migration_class(recorded.migration_class())?,
+    })
+}
+
+/// Projects the recorded migration-class spelling back onto its closed
+/// vocabulary. The stored value is text so ORS carries no Kernel vocabulary of
+/// its own; an unrecognised spelling is a refusal, never a default.
+fn recorded_migration_class(value: &str) -> Result<StateMigrationClass, CompatibilityMismatch> {
+    let unknown = || {
+        CompatibilityMismatch::new(
+            MismatchField::MigrationClass,
+            format!("recorded migration class {value:?} is not a current handshake class"),
+        )
+    };
+    match value {
+        "NO_MIGRATION" => Ok(StateMigrationClass::NoMigration),
+        "ADDITIVE" => Ok(StateMigrationClass::Additive),
+        "BOUNDED_DRAIN" => Ok(StateMigrationClass::BoundedDrain),
+        "BREAKING_REBASE" => Ok(StateMigrationClass::BreakingRebase),
+        _ => Err(unknown()),
+    }
 }
 
 /// Admits a rollback only when the recorded evidence still matches durable state.
