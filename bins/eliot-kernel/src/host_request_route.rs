@@ -5789,6 +5789,13 @@ pub(crate) fn local_read_admission_from_tool(
         .and_then(|object| object.get("name"))
         .and_then(serde_json::Value::as_str)
         .ok_or(TransportError::SessionFenced)?;
+    // I7.24: expensive-class calls require a valid intent before dispatch.
+    if super::tool_exposure::requires_intent(name) {
+        let request = super::tool_exposure::build_tool_call_request(envelope, tool)
+            .ok_or(TransportError::SessionFenced)?;
+        super::tool_exposure::authorize_pre_dispatch(&request)
+            .map_err(|_| TransportError::SessionFenced)?;
+    }
     match name {
         "eliot.packet" => campaign_packet_admission(envelope, tool),
         "eliot.query" => local_read_selectors_from_tool(envelope, tool)

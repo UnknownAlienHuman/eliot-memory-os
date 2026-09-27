@@ -24,6 +24,12 @@ use thiserror::Error;
 
 pub mod tool_exposure;
 
+pub use tool_exposure::{
+    LoopSignal, ResultDelivery, ToolCallClass, ToolCallIntent, ToolCallRequest, ToolExposureError,
+    ToolExposureReceipt, ToolExposureReceiptV2, authorize_pre_dispatch,
+    detect_repeat_without_progress,
+};
+
 /// Stable wire name for this C0-02 contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.receipts";
 /// Current wire revision for this contract family.

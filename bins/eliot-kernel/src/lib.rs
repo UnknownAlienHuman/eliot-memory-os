@@ -71,6 +71,7 @@ mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
+mod tool_exposure;
 
 /// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
