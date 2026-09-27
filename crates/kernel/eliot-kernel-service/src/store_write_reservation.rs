@@ -124,7 +124,7 @@ use eliot_ors::{
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CanonicalStoreClient, OperationId,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReceiptEnvelope,
@@ -582,6 +582,43 @@ fn refuse_plaintext_payload(
     Ok(())
 }
 
+/// Reduces the admitted per-source instruction taint to the single scalar that
+/// travels with the pending payload.
+///
+/// The value is real admitted metadata, not a default: I5.6 step 8 attaches
+/// instruction-taint metadata to the transition before staging and names the
+/// carried member `privacy_origin_taint_metadata`. This repository spells that
+/// member as per-source
+/// [`SourceAssurance`](eliot_store_api::SourceAssurance) records on the
+/// admitted transition's `security: SecurityContext`, and this read consumes
+/// their `instruction_taint`. The admitted context is already validated by
+/// `validate_admitted` (`PreparedTransition::validate` checks every
+/// `SourceAssurance` against the admitted fence) and is hash-bound by the
+/// canonical request view, so the value cannot be edited after admission.
+///
+/// I5.2 requires that "original privacy, visibility, taint and retention travel
+/// with the pending payload". Staged opaque bytes are at most as clean as the
+/// least clean admitted source they were built from, so the reduction is the
+/// maximum declared taint, taken from the total order `InstructionTaint`
+/// derives. ORS records the admitted verdict and never re-derives or downgrades
+/// it (I5.2: ORS "never parses that payload as project meaning").
+///
+/// An empty `source_assurance` list is constructible and legal here:
+/// `SecurityContext` derives `Default` and no admitted gate requires a source, so
+/// the reduction can face a transition carrying no taint evidence at all. It then
+/// fails closed at the highest taint rather than asserting `Cleared`.
+fn admitted_instruction_taint(transition: &PreparedTransition) -> InstructionTaint {
+    transition
+        .security
+        .source_assurance
+        .iter()
+        .map(|source| source.instruction_taint)
+        .max()
+        // Conservative, not admitted: no source declares taint, so nothing
+        // supports a clean claim and the payload fails closed.
+        .unwrap_or(InstructionTaint::CommandLike)
+}
+
 /// Atomically reserves every admitted scope through the actual ORS operation,
 /// or none.
 ///
@@ -596,6 +633,12 @@ fn refuse_plaintext_payload(
 /// [`refuse_plaintext_payload`] rejects the admitted transition's plaintext
 /// before anything is staged, so `accepted_pending` is never backed by a
 /// payload ORS was told was encrypted and was not.
+///
+/// The envelope carries the admitted instruction taint from
+/// [`admitted_instruction_taint`]; `PrivacyClass::Private` beside it is the
+/// composition's fixed staging floor, not a per-transition admitted class —
+/// [`eliot_security_contracts::PrivacyClass`] declares no severity order, so no
+/// reduction over the admitted per-source classes is derivable here.
 pub fn reserve_for_transition(
     owner: &CompositionReservation,
     seed: &ReservationSeed,
@@ -643,6 +686,7 @@ pub fn reserve_for_transition(
                 privacy: PrivacyClass::Private,
                 visibility: OpaqueLabel::new(seed.visibility.clone())
                     .map_err(ReservationWriteError::Ors)?,
+                instruction_taint: admitted_instruction_taint(transition),
             },
             authority_epoch: owner.writer_epoch.clone(),
             state_fence: fence_snapshot,

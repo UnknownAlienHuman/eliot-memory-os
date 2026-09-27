@@ -19,7 +19,7 @@ use eliot_runtime_contracts::{
     SupervisionLeaseVerificationContext, SupervisionLeaseVerifier, SupervisionObservationScope,
     SupervisionTrustAnchor, VerifiedSupervisionLease, VerifiedSupervisionLeaseTerminalTransition,
 };
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use redb::{ReadableDatabase, ReadableTable};
 use serde_json::{Value, json};
 
@@ -542,6 +542,7 @@ fn access() -> Result<RecoveryAccessClass, OrsError> {
     Ok(RecoveryAccessClass {
         privacy: PrivacyClass::Private,
         visibility: label("owner-only")?,
+        instruction_taint: InstructionTaint::DataOnly,
     })
 }
 
