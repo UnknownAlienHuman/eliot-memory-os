@@ -55,6 +55,7 @@ use eliot_protocol::{
 use eliot_receipts::RequestBinding;
 use eliot_runtime::{Runtime, RuntimeConfig};
 
+mod bridge_contract;
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
@@ -65,6 +66,9 @@ pub mod reactive_runtime_composition;
 pub mod settled_plan_transport;
 mod transport_profile;
 mod understanding_bootstrap;
+pub use bridge_contract::{
+    BridgeContractError, agent_bridge_contract, validate_agent_bridge_contract,
+};
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
@@ -2430,6 +2434,13 @@ pub fn kernel_ports_with_declaration(
 ) -> Result<KernelPorts, RuntimeBuildError> {
     let loaded = load_declaration(declaration_path)?;
     let declaration = &loaded.declaration;
+    // Build and validate the I6.5 bridge contract against the admitted
+    // declaration. The contract is bound to the admitted artifact/config/
+    // generation, not a self-reported version; a mismatch refuses composition.
+    let bridge_contract = agent_bridge_contract(declaration)
+        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
+    validate_agent_bridge_contract(&bridge_contract, declaration)
+        .map_err(|e| RuntimeBuildError::KernelClient(e.to_string()))?;
     let (current_sid, _current_session) = current_os_identity()?;
     let expectation = eliot_platform_windows::KernelFrontDoorServerExpectation::new(
         declaration.expected_kernel_sid.clone(),

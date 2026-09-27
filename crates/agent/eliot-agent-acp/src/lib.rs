@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge_contract;
 mod durable_host_event_ingest;
 pub use durable_host_event_ingest::{
     BestEffortDropGap, BestEffortDropReason, DURABLE_INGEST_TRANSFORMATION_VERSION,

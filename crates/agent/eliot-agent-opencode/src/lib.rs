@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod bridge_contract;
 mod catalogue;
 mod client;
 mod endpoint;
@@ -9,6 +10,9 @@ mod ingress;
 mod sse;
 mod types;
 
+pub use bridge_contract::{
+    BridgeContractError, opencode_adapter_contract, validate_opencode_adapter_contract,
+};
 pub use catalogue::*;
 pub use client::{
     AdmittedAttemptOutcome, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy,

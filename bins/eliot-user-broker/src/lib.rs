@@ -45,11 +45,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod bridge_contract;
 mod kernel_authority_port;
 mod notify_fallback_ensure;
 pub mod notify_launch_callin;
 mod operation_identity;
 mod protected_launch_config;
+use bridge_contract::{user_broker_contract, validate_user_broker_contract};
 use kernel_authority_port::KernelAuthorityPort;
 pub use notify_fallback_ensure::{
     LiveNotifyFallbackEffects, NotifyFallbackEffects, NotifyFallbackEnsure,
@@ -1121,6 +1123,14 @@ impl BrokerComposition {
         issuer: IssuerHandle,
     ) -> Result<Self, CompositionError> {
         config.validate()?;
+        // Build and validate the I6.5 bridge contract for the composed broker.
+        // The contract is bound to the broker's own protocol version and
+        // service identity, not a self-reported version; a mismatch refuses
+        // composition.
+        let bridge_contract = user_broker_contract()
+            .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
+        validate_user_broker_contract(&bridge_contract)
+            .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
         let snapshot = config.data_root.join(config.snapshot_name);
         #[cfg(windows)]
         let mut durable = if launch.is_some() {

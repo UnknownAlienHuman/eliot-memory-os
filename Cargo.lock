@@ -3364,6 +3364,7 @@ name = "eliot-user-broker"
 version = "0.1.0"
 dependencies = [
  "eliot-cli",
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-notify",
  "eliot-platform",
