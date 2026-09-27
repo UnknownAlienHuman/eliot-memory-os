@@ -96,7 +96,7 @@ impl RevocationHistoryEvidence {
     /// This step decodes and shape-checks the history only. It deliberately
     /// does not decide which grants the affected references reach: that is
     /// the origin-bound denominator comparison
-    /// ([`GrantGraph::admit_origin_bound_closure`](crate::grants::GrantGraph::admit_origin_bound_closure)),
+    /// (`GrantGraph::admit_origin_bound_closure`),
     /// which runs before any suppression is derived.
     ///
     /// Missing evidence is expressed by passing `None` at the restore
@@ -142,7 +142,7 @@ pub struct ValidatedRevocationClosure {
     pub closure_id: String,
     /// Origin reference as the record spelled it. It is untyped on the wire
     /// and is resolved against the bound graph by
-    /// [`GrantGraph::resolve_revocation_origin`](crate::grants::GrantGraph::resolve_revocation_origin);
+    /// `GrantGraph::resolve_revocation_origin`;
     /// nothing here reads it as a grant or as an authority root.
     pub root_ref: String,
     /// Exact declared affected references: the origin reference plus every
@@ -229,7 +229,7 @@ impl fmt::Display for AuthorityRootRef {
 /// infers the kind from the spelling of a reference, from a name prefix, or
 /// from "it matches a grant, otherwise it is a root": the kind is resolved
 /// by
-/// [`GrantGraph::resolve_revocation_origin`](crate::grants::GrantGraph::resolve_revocation_origin)
+/// `GrantGraph::resolve_revocation_origin`
 /// against the bound graph, which refuses a name that resolves to no entity
 /// of this graph and a name that resolves to two.
 #[derive(Clone, Debug, Eq, PartialEq)]
