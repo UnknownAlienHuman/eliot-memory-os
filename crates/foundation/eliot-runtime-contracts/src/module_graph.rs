@@ -152,9 +152,10 @@ pub fn resolve_required_capability_graph(
     for contract in sorted_contracts {
         for capability in &contract.required_capabilities {
             let module_providers = providers.get(capability).cloned().unwrap_or_default();
-            let candidates: BTreeSet<&ContractId> = module_providers
+            let candidates: BTreeSet<ContractId> = module_providers
                 .iter()
                 .filter(|provider| **provider != contract.module_id)
+                .cloned()
                 .collect();
             if candidates.is_empty() {
                 if module_providers.contains(&contract.module_id) {
@@ -187,7 +188,7 @@ pub fn resolve_required_capability_graph(
                     providers: provider_list,
                 });
             } else {
-                let provider = candidates.next().expect("exactly one candidate").clone();
+                let provider = candidates.iter().next().cloned().expect("exactly one candidate");
                 edges.push(RequiredCapabilityEdge {
                     consumer: contract.module_id.clone(),
                     capability: capability.clone(),
@@ -341,7 +342,7 @@ fn topological_orders(
 
     let mut ready: BTreeSet<ContractId> = in_degree
         .iter()
-        .filter(|(_, &degree)| degree == 0)
+        .filter(|&(_, &degree)| degree == 0)
         .map(|(id, _)| id.clone())
         .collect();
     let mut startup_order: Vec<ContractId> = Vec::new();
