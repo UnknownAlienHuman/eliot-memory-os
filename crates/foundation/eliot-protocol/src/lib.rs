@@ -3019,7 +3019,7 @@ pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID: &str =
 /// Current bridge process binding wire version.
 pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_VERSION: u16 = 1;
 /// Bounded length for host-request identity text fields.
-const MAX_HOST_REQUEST_TEXT_BYTES: usize = 512;
+pub const MAX_HOST_REQUEST_TEXT_BYTES: usize = 512;
 
 /// Closed P-04 host-request kinds admitted by the Kernel admission gate.
 ///
@@ -3069,12 +3069,16 @@ impl HostRequestKind {
 pub struct HostRequestIdentity {
     /// Exact request identity, unique per envelope.
     pub request_id: RequestId,
+    /// Explicit typed host correlation; absent only on historical envelopes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_projection: Option<eliot_contracts::HostCorrelationProjection>,
     /// Caller-provided idempotency key for exact replay.
     pub idempotency_key: String,
     /// Cancellation identity for the request lifecycle.
     pub cancellation_id: String,
     /// Exact previously admitted operation targeted by Cancellation, Status,
-    /// and Reconciliation kinds; lineage reference otherwise.
+    /// and Reconciliation kinds; absent only for lookup-only Status.
     pub parent_operation_id: Option<String>,
     /// Kernel-owned absolute deadline in Unix milliseconds.
     pub deadline_unix_ms: u64,
@@ -3248,12 +3252,35 @@ impl HostRequestIdentity {
             MAX_HOST_REQUEST_TEXT_BYTES,
         )?;
         lowercase_sha256(&self.payload_sha256, "host_request.payload_sha256")?;
+        if let Some(projection) = &self.correlation_projection {
+            projection
+                .validate()
+                .map_err(|_| ProtocolError::InvalidField {
+                    field: "host_request.correlation_projection",
+                    reason: "must be a bounded explicit correlation projection",
+                })?;
+            if projection.occurrence_text() != self.request_id.as_str() {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request.correlation_projection",
+                    reason: "must encode the exact request_id text",
+                });
+            }
+        }
         Ok(())
     }
 
     /// Validates per-kind identity presence rules.
     pub fn validate_for_kind(&self, kind: HostRequestKind) -> Result<(), ProtocolError> {
         self.validate()?;
+        if matches!(
+            self.correlation_projection.as_ref(),
+            Some(eliot_contracts::HostCorrelationProjection::KernelOperational { .. })
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.correlation_projection",
+                reason: "Kernel operational correlation is not admitted from a host envelope",
+            });
+        }
         let semantic_selected =
             self.session_id.is_some() || self.task_id.is_some() || self.work_scope_id.is_some();
         match kind {
@@ -3272,6 +3299,18 @@ impl HostRequestIdentity {
                 }
             }
             HostRequestKind::Invocation => {
+                if self
+                    .correlation_projection
+                    .as_ref()
+                    .is_some_and(|projection| {
+                        projection.domain() != eliot_contracts::HostCorrelationDomain::Request
+                    })
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "invocation projection must use request domain",
+                    });
+                }
                 if self.session_id.is_none() {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.session_id",
@@ -3282,10 +3321,24 @@ impl HostRequestIdentity {
             HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
-                if self.parent_operation_id.is_none() {
+                if let Some(projection) = &self.correlation_projection
+                    && (kind != HostRequestKind::Cancellation
+                        || projection.domain()
+                            != eliot_contracts::HostCorrelationDomain::Cancellation)
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "only cancellations may carry a cancellation-domain projection",
+                    });
+                }
+                if self.parent_operation_id.is_none()
+                    && !(kind == HostRequestKind::Status
+                        && self.session_id.is_some()
+                        && self.correlation_projection.is_none())
+                {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.parent_operation_id",
-                        reason: "must target one exact previously admitted operation",
+                        reason: "must target one exact previously admitted operation unless this is an untyped lookup-only Status",
                     });
                 }
             }
@@ -3443,6 +3496,21 @@ impl HostRequestEnvelope {
         self.validate_identity_separation()
     }
 
+    /// Validates an envelope that may receive a Kernel admission receipt.
+    ///
+    /// Parentless `Status` envelopes are lookup-only observations and cannot
+    /// be admitted or reconciled as new host-request operations.
+    pub fn validate_for_admission(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.kind == HostRequestKind::Status && self.identity.parent_operation_id.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.parent_operation_id",
+                reason: "lookup-only Status cannot receive an admission receipt",
+            });
+        }
+        Ok(())
+    }
+
     /// Rejects reuse of one string value across distinct identity domains.
     fn validate_identity_separation(&self) -> Result<(), ProtocolError> {
         let mut domains: Vec<(&str, &'static str)> = vec![
@@ -3574,7 +3642,7 @@ impl HostRequestAdmissionReceipt {
 
     /// Issues a receipt for one validated envelope.
     pub fn issue(envelope: &HostRequestEnvelope) -> Result<Self, ProtocolError> {
-        envelope.validate()?;
+        envelope.validate_for_admission()?;
         Self {
             wire_id: HOST_REQUEST_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
             wire_version: Self::CONTRACT_VERSION,
@@ -3674,7 +3742,7 @@ impl HostRequestAdmissionReceipt {
     /// Validates that this receipt was issued for the exact envelope.
     pub fn validate_envelope(&self, envelope: &HostRequestEnvelope) -> Result<(), ProtocolError> {
         self.validate()?;
-        envelope.validate()?;
+        envelope.validate_for_admission()?;
         if self.operation_id != host_request_operation_id(envelope)
             || self.request_id != envelope.identity.request_id
             || self.kind != envelope.kind

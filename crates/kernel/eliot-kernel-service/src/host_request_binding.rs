@@ -573,6 +573,14 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         resolution: Option<&AgentActivationResolutionResult>,
         now_ms: u64,
     ) -> Result<StagedAdmission, PortFailure> {
+        if matches!(
+            envelope.kind,
+            HostRequestKind::Invocation | HostRequestKind::Cancellation
+        ) && (envelope.identity.correlation_projection.is_none()
+            || envelope.identity.session_id.is_none())
+        {
+            return Err(PortFailure::LegacyCorrelationUnresolved);
+        }
         let binding = kernel_bridge_process_binding(
             self.session.descriptor(),
             peer_receipt,
@@ -583,10 +591,20 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             .map_err(|error| kernel_service_failure(&error))?;
         self.bind_operation_identity(envelope)?;
         let staged = requested_host_request_record(envelope)?;
-        let stored = self
-            .store
-            .stage_host_request(&staged)
-            .map_err(|error| ors_failure(&error))?;
+        let stored = if matches!(
+            staged.kind,
+            OrsHostRequestKind::Invocation | OrsHostRequestKind::Cancellation
+        ) {
+            self.store.resolve_or_stage_host_request(&staged)
+        } else {
+            self.store.stage_host_request(&staged)
+        }
+        .map_err(|error| ors_failure(&error))?;
+        if stored.operation_id != staged.operation_id
+            || stored.request_digest != staged.request_digest
+        {
+            return Err(PortFailure::IdempotencyConflict);
+        }
         if now_ms >= envelope.identity.deadline_unix_ms {
             if !stored.state.is_terminal() {
                 let operation_id = ors_operation_id(envelope)?;
@@ -921,6 +939,7 @@ fn requested_host_request_record(
             HostRequestKind::Reconciliation => OrsHostRequestKind::Reconciliation,
         },
         request_id: label(envelope.identity.request_id.as_str())?,
+        correlation_projection: envelope.identity.correlation_projection.clone(),
         idempotency_key: label(&envelope.identity.idempotency_key)?,
         cancellation_id: label(&envelope.identity.cancellation_id)?,
         parent_operation_id: optional_label(envelope.identity.parent_operation_id.as_ref())?,
@@ -1095,6 +1114,9 @@ fn kernel_service_failure(error: &KernelServiceError) -> PortFailure {
 fn ors_failure(error: &OrsError) -> PortFailure {
     match error {
         OrsError::HostRequestIdentityConflict { .. } => PortFailure::IdempotencyConflict,
+        OrsError::HostRequestLegacyCorrelationUnresolved => {
+            PortFailure::LegacyCorrelationUnresolved
+        }
         OrsError::InvalidTransition => PortFailure::TransportBindingRejected {
             reason: "durable operation cannot advance; reconcile the exact operation".to_owned(),
         },
@@ -1433,6 +1455,7 @@ mod local_read_result_tests {
             connection_id: "conn-test-1".to_owned(),
             identity: eliot_protocol::HostRequestIdentity {
                 request_id: RequestId::new("host-request-1").expect("valid test request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,
@@ -1555,6 +1578,7 @@ mod local_read_result_tests {
             operation_id: ors_operation_id_for_test(),
             kind: OrsHostRequestKind::Invocation,
             request_id: label("req-1"),
+            correlation_projection: None,
             idempotency_key: label("req-1:invoke"),
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,
@@ -1666,6 +1690,7 @@ mod local_read_build_tests {
             connection_id: "conn-test-1".to_owned(),
             identity: eliot_protocol::HostRequestIdentity {
                 request_id: RequestId::new("host-request-1").expect("valid test request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,

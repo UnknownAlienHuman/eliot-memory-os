@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::canonical_json_bytes;
+use eliot_contracts::{HostCorrelationProjection, HostJsonRpcCorrelationId, canonical_json_bytes};
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
@@ -1710,11 +1710,13 @@ fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u
 /// (`operation_id`, `request_digest`). Written atomically in the same `RedDB`
 /// write transaction as the winning operation row, never updated, never
 /// deleted: an expired or terminal operation keeps its key bound forever, so
-/// an old key can never be reused as a new effect. Rows staged before this
-/// index existed simply have no entry and are never inferred; they stay
-/// reachable only by exact operation/request identity.
+/// an old key can never be reused as a new effect. Historical unmarked rows
+/// are represented only by a separately versioned presence marker; this
+/// primary link never infers or returns their operation identity.
 const HOST_REQUEST_LOGICAL_KEYS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_logical_keys_v1");
+const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY: &str = "host_request_legacy_presence_schema";
+const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1: &str = "eliot.ors.host-request-legacy-presence.v1";
 /// Authenticated owner namespace for every logical host-request key
 /// (issue #2571).
 ///
@@ -2436,6 +2438,14 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         logical_key: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Checks the owner-maintained, payload-independent presence index for an
+    /// unmarked historical occurrence. A hit never exposes a request row.
+    fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError>;
     /// Durably stages one pending activation ticket before in-memory
     /// publication or daemon claim. A successor is admitted only through the
     /// exact durable `NotReady` predecessor and due-time gate.
@@ -2888,12 +2898,42 @@ impl persistence_codec::PersistedValue for HostRequestRecord {
 /// The link carries identity only: the commitment lives in the operation
 /// row and is re-checked on every resolve and load, so a divergent link can
 /// never silently adopt another operation's result. Links are written once
-/// with their row, never updated, never deleted.
+/// with their row, never updated, never deleted. Historical unmarked rows use
+/// a separate presence-only value in this table without an operation link.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostRequestLogicalLink {
     operation_id: OperationIdentity,
     request_digest: String,
+}
+
+/// A payload-independent presence marker for an untyped historical
+/// occurrence. It intentionally carries no operation identity or handle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostRequestLegacyPresence {
+    kind: crate::HostRequestKind,
+    session: String,
+    occurrence: String,
+}
+
+impl persistence_codec::PersistedValue for HostRequestLegacyPresence {
+    const RECORD_TYPE: &'static str = "host_request_legacy_presence";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        crate::model::validate_text(&self.session, "host_request_legacy_presence_session")?;
+        crate::model::validate_text(&self.occurrence, "host_request_legacy_presence_occurrence")?;
+        if !matches!(
+            self.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_legacy_presence_kind",
+                reason: "legacy presence is limited to invocation and cancellation",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl persistence_codec::PersistedValue for HostRequestLogicalLink {
@@ -4519,6 +4559,18 @@ impl RedbRecoveryStore {
                 reason: "staging requires the requested state",
             });
         }
+        if matches!(
+            record.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) && (record.correlation_projection.is_none()
+            || (record.session_ref.is_none()
+                && !matches!(
+                    record.correlation_projection.as_ref(),
+                    Some(HostCorrelationProjection::KernelOperational { .. })
+                )))
+        {
+            return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+        }
         let write = self.database.begin_write().map_err(storage)?;
         let staged = Self::stage_host_request_in(&write, record)?;
         write.commit().map_err(storage)?;
@@ -4555,6 +4607,100 @@ impl RedbRecoveryStore {
                 .insert(key.as_str(), payload.as_str())
                 .map_err(storage)?;
             Ok(record.clone())
+        }
+    }
+
+    pub fn host_request_legacy_presence_key(
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> String {
+        let kind = match kind {
+            crate::HostRequestKind::Invocation => "INVOCATION",
+            crate::HostRequestKind::Cancellation => "CANCELLATION",
+            _ => "INVALID",
+        };
+        crate::model::sha256_hex(
+            format!(
+                "eliot.host-request.legacy-presence.v1\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}"
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// Refuses a typed request when a prior unmarked row could have used any
+    /// of its historical occurrence spellings. This check shares the owner
+    /// write transaction with logical resolution/admission, so no request can
+    /// be staged in the gap between the check and the claim.
+    fn ensure_no_host_request_legacy_presence_in(
+        write: &redb::WriteTransaction,
+        record: &crate::HostRequestRecord,
+    ) -> Result<(), OrsError> {
+        let Some(session) = record.session_ref.as_ref() else {
+            return Ok(());
+        };
+        let links = write
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        for occurrence in Self::legacy_host_request_occurrences(record) {
+            let presence_key =
+                Self::host_request_legacy_presence_key(record.kind, session.as_str(), &occurrence);
+            if let Some(value) = links.get(presence_key.as_str()).map_err(storage)? {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                if presence.kind != record.kind
+                    || presence.session != session.as_str()
+                    || presence.occurrence != occurrence
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence index diverges from its key".to_owned(),
+                    });
+                }
+                return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads one exact occurrence-presence marker without following it to an
+    /// operation or inferring any wire-ID type.
+    pub fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError> {
+        if !matches!(
+            kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_legacy_presence_kind",
+                reason: "legacy presence is limited to invocation and cancellation",
+            });
+        }
+        crate::model::validate_text(session, "host_request_legacy_presence_session")?;
+        crate::model::validate_text(occurrence, "host_request_legacy_presence_occurrence")?;
+        let key = Self::host_request_legacy_presence_key(kind, session, occurrence);
+        let read = self.database.begin_read().map_err(storage)?;
+        let index = read
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        match index.get(key.as_str()).map_err(storage)? {
+            Some(value) => {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                if presence.kind != kind
+                    || presence.session != session
+                    || presence.occurrence != occurrence
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence key diverges from its occurrence facts".to_owned(),
+                    });
+                }
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -4611,17 +4757,34 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
-        Self::host_request_logical_key(
-            record.kind,
-            session.as_str(),
-            record.request_id.as_str(),
-            record.parent_operation_id.as_ref().map(OpaqueLabel::as_str),
-            record.task_ref.as_ref().map(OpaqueLabel::as_str),
-            record.scope_ref.as_ref().map(OpaqueLabel::as_str),
-            record.capability_ref.as_str(),
-            record.payload_digest.as_str(),
-        )
-        .map(Some)
+        match &record.correlation_projection {
+            None => Ok(Some(Self::host_request_logical_key(
+                record.kind,
+                session.as_str(),
+                record.request_id.as_str(),
+                record.parent_operation_id.as_ref().map(OpaqueLabel::as_str),
+                record.task_ref.as_ref().map(OpaqueLabel::as_str),
+                record.scope_ref.as_ref().map(OpaqueLabel::as_str),
+                record.capability_ref.as_str(),
+                record.payload_digest.as_str(),
+            )?)),
+            Some(projection) => {
+                let kind = match record.kind {
+                    crate::HostRequestKind::Invocation => "INVOCATION",
+                    crate::HostRequestKind::Cancellation => "CANCELLATION",
+                    _ => return Ok(None),
+                };
+                let projection = serde_json::to_string(projection)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                Ok(Some(crate::model::sha256_hex(
+                    format!(
+                        "eliot.host-request.logical.v2\x1fkind={kind}\x1fsession={}\x1fprojection={projection}",
+                        session.as_str()
+                    )
+                    .as_bytes(),
+                )))
+            }
+        }
     }
 
     /// Atomically claims one logical host-request key or returns its durable
@@ -4648,12 +4811,20 @@ impl RedbRecoveryStore {
                 reason: "logical resolution stages the requested state",
             });
         }
+        if matches!(
+            record.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
+        {
+            return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+        }
         let logical_key =
             Self::host_request_logical_key_for_record(record)?.ok_or(OrsError::InvalidField {
                 field: "host_request_logical_key",
                 reason: "only session-bound invocation and cancellation records carry a logical key",
             })?;
         let write = self.database.begin_write().map_err(storage)?;
+        Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let outcome = {
             let mut links = write
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
@@ -4735,8 +4906,16 @@ impl RedbRecoveryStore {
         identity_bindings: &[crate::HostRequestRecord],
     ) -> Result<crate::HostRequestRecord, OrsError> {
         Self::validate_host_request_identity_bindings(record, identity_bindings)?;
+        if matches!(
+            record.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
+        {
+            return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+        }
         let logical_key = Self::host_request_logical_key_for_record(record)?;
         let write = self.database.begin_write().map_err(storage)?;
+        Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let logical_winner =
             Self::host_request_logical_winner_in(&write, logical_key.as_deref(), record)?;
         let missing_bindings = Self::check_host_request_identity_bindings_in(
@@ -5058,6 +5237,54 @@ impl RedbRecoveryStore {
         Ok(staged)
     }
 
+    /// Derives bounded historical occurrence spellings that could represent
+    /// one explicitly typed request. The owner probes payload-independent
+    /// presence keys; no legacy row can be returned as a winner.
+    fn legacy_host_request_occurrences(record: &crate::HostRequestRecord) -> Vec<String> {
+        let Some(projection) = record.correlation_projection.as_ref() else {
+            return Vec::new();
+        };
+        let candidates = match projection {
+            HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                occurrence,
+            } => vec![occurrence.clone()],
+            HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                occurrence,
+            } => vec![occurrence.clone(), format!("cancel:{occurrence}")],
+            HostCorrelationProjection::KernelOperational { .. } => Vec::new(),
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                id: HostJsonRpcCorrelationId::String(value),
+            } => vec![value.clone(), format!("str:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                id: HostJsonRpcCorrelationId::Integer(value),
+            } => vec![value.to_string(), format!("int:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                id: HostJsonRpcCorrelationId::String(value),
+            } => vec![format!("cancel:{value}"), format!("cancel:str:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                id: HostJsonRpcCorrelationId::Integer(value),
+            } => vec![format!("cancel:{value}"), format!("cancel:int:{value}")],
+        };
+        let mut occurrences = Vec::with_capacity(candidates.len());
+        for occurrence in candidates {
+            // A projection candidate longer than the historical opaque-text
+            // contract could never have been retained as a legacy row.
+            if OpaqueLabel::new(occurrence.clone()).is_err() {
+                continue;
+            }
+            if !occurrences.contains(&occurrence) {
+                occurrences.push(occurrence);
+            }
+        }
+        occurrences
+    }
+
     /// Loads one host-request operation by logical key (issue #2571).
     ///
     /// `Ok(None)` is authoritatively absent: no operation was ever staged
@@ -5189,6 +5416,7 @@ impl RedbRecoveryStore {
     ) -> bool {
         left.kind == right.kind
             && left.request_id == right.request_id
+            && left.correlation_projection == right.correlation_projection
             && left.idempotency_key == right.idempotency_key
             && left.cancellation_id == right.cancellation_id
             && left.parent_operation_id == right.parent_operation_id
@@ -5201,12 +5429,10 @@ impl RedbRecoveryStore {
 
     /// Validates every logical link against its operation row (issue #2571).
     ///
-    /// Each index entry must decode, point at an existing validated row, and
-    /// recompute to its own index key. A dangling, divergent, or
-    /// unindexable link fails closed as an integrity problem: links are
-    /// never repaired by choosing a latest row, and pre-index rows without
-    /// links are legacy, not damage, so they are skipped rather than
-    /// backfilled — migration never infers namespace or continuity.
+    /// Every primary link must decode, point at an existing validated row,
+    /// and recompute to its own key. Presence entries are separately checked
+    /// against source rows by the versioned adoption routine below; neither
+    /// index is repaired by selecting an operation winner.
     fn validate_host_request_logical_index(write: &redb::WriteTransaction) -> Result<(), OrsError> {
         let links = write
             .open_table(HOST_REQUEST_LOGICAL_KEYS)
@@ -5214,6 +5440,32 @@ impl RedbRecoveryStore {
         let mut pending = Vec::new();
         for entry in links.iter().map_err(storage)? {
             let (key, value) = entry.map_err(storage)?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(value.value()).map_err(|error| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_index_value",
+                        reason: error.to_string(),
+                    }
+                })?;
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("kind")
+                    && object.contains_key("session")
+                    && object.contains_key("occurrence")
+            }) {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                if Self::host_request_legacy_presence_key(
+                    presence.kind,
+                    &presence.session,
+                    &presence.occurrence,
+                ) != key.value()
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence index key diverges from its stored facts".to_owned(),
+                    });
+                }
+                continue;
+            }
             let link: HostRequestLogicalLink = decode(value.value())?;
             pending.push((key.value().to_owned(), link));
         }
@@ -5246,6 +5498,171 @@ impl RedbRecoveryStore {
             }
         }
         Ok(())
+    }
+
+    /// Adopts and validates the secondary occurrence-presence index in the
+    /// same open transaction. The first adoption derives entries solely from
+    /// durable unmarked rows; after adoption, missing, extra, or divergent
+    /// entries fail closed instead of permitting a fresh operation.
+    fn initialize_host_request_legacy_presence(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let marker = {
+            let meta = write.open_table(META).map_err(storage)?;
+            match meta
+                .get(HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY)
+                .map_err(storage)?
+            {
+                Some(value) if value.value().len() > MAX_ORS_MARKER_BYTES => {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                Some(value) => Some(value.value().to_owned()),
+                None => None,
+            }
+        };
+        if marker
+            .as_deref()
+            .is_some_and(|value| value != HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1)
+        {
+            return Err(OrsError::MigrationRequired {
+                reason: "host-request legacy-presence schema marker is unsupported".to_owned(),
+            });
+        }
+
+        let expected = Self::expected_host_request_legacy_presence(write)?;
+        let actual = Self::read_host_request_legacy_presence_index(write)?;
+        match marker.as_deref() {
+            None if !actual.is_empty() => {
+                return Err(OrsError::MigrationRequired {
+                    reason: "unmarked host-request presence entries lack adoption provenance"
+                        .to_owned(),
+                });
+            }
+            None => {
+                let mut index = write
+                    .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                    .map_err(storage)?;
+                for (key, presence) in &expected {
+                    let payload = encode(presence)?;
+                    if index.get(key.as_str()).map_err(storage)?.is_some() {
+                        return Err(OrsError::MigrationRequired {
+                            reason:
+                                "legacy-presence key overlaps a preexisting logical index value"
+                                    .to_owned(),
+                        });
+                    }
+                    index
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+                let mut meta = write.open_table(META).map_err(storage)?;
+                meta.insert(
+                    HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY,
+                    HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1,
+                )
+                .map_err(storage)?;
+            }
+            Some(HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1) if actual == expected => {}
+            Some(HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_legacy_presence",
+                    reason: "presence index is incomplete or diverges from legacy request rows"
+                        .to_owned(),
+                });
+            }
+            Some(_) => {
+                return Err(OrsError::MigrationRequired {
+                    reason: "host-request legacy-presence schema marker is unsupported".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_host_request_legacy_presence(
+        write: &redb::WriteTransaction,
+    ) -> Result<BTreeMap<String, HostRequestLegacyPresence>, OrsError> {
+        let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+        let mut expected = BTreeMap::new();
+        for entry in operations.iter().map_err(storage)? {
+            let (row_key, value) = entry.map_err(storage)?;
+            let record: crate::HostRequestRecord = decode(value.value())?;
+            if record.record_key() != row_key.value() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_legacy_presence",
+                    reason: "host-request table key diverges from its retained row".to_owned(),
+                });
+            }
+            if record.correlation_projection.is_none()
+                && matches!(
+                    record.kind,
+                    crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+                )
+                && let Some(session) = record.session_ref.as_ref()
+            {
+                let presence = HostRequestLegacyPresence {
+                    kind: record.kind,
+                    session: session.as_str().to_owned(),
+                    occurrence: record.request_id.as_str().to_owned(),
+                };
+                persistence_codec::PersistedValue::validate_persisted(&presence)?;
+                let key = Self::host_request_legacy_presence_key(
+                    presence.kind,
+                    &presence.session,
+                    &presence.occurrence,
+                );
+                if let Some(previous) = expected.insert(key, presence.clone())
+                    && previous != presence
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "distinct legacy occurrences collide in the presence domain"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(expected)
+    }
+
+    fn read_host_request_legacy_presence_index(
+        write: &redb::WriteTransaction,
+    ) -> Result<BTreeMap<String, HostRequestLegacyPresence>, OrsError> {
+        let mut actual = BTreeMap::new();
+        let index = write
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        for entry in index.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(value.value()).map_err(|error| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_index_value",
+                        reason: error.to_string(),
+                    }
+                })?;
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("kind")
+                    && object.contains_key("session")
+                    && object.contains_key("occurrence")
+            }) {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                let stored_key = key.value().to_owned();
+                if Self::host_request_legacy_presence_key(
+                    presence.kind,
+                    &presence.session,
+                    &presence.occurrence,
+                ) != stored_key
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence index key diverges from its stored facts".to_owned(),
+                    });
+                }
+                actual.insert(stored_key, presence);
+            }
+        }
+        Ok(actual)
     }
 
     /// Durably stages one pending activation ticket before it is published in
@@ -16672,6 +17089,7 @@ impl RedbRecoveryStore {
         // #2571: every logical link must resolve to a row that recomputes
         // to its own key. Links are never repaired or backfilled here.
         Self::validate_host_request_logical_index(&write)?;
+        Self::initialize_host_request_legacy_presence(&write)?;
         // #2730: reconcile the bridge position index and replay
         // commitments with the retained owner-bound records under one
         // migration/version contract, then record the contract marker.
@@ -22121,6 +22539,15 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_host_request_by_logical_key(self, logical_key)
     }
 
+    fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError> {
+        RedbRecoveryStore::has_host_request_legacy_presence(self, kind, session, occurrence)
+    }
+
     fn stage_activation_ticket(
         &self,
         record: &ActivationLifecycleRecord,
@@ -22663,6 +23090,17 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         logical_key: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.load_host_request_by_logical_key(logical_key)
+    }
+
+    /// Checks for an untyped historical occurrence without exposing a row.
+    pub fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError> {
+        self.store
+            .has_host_request_legacy_presence(kind, session, occurrence)
     }
 
     /// Durably stages one pending activation ticket before publication.
@@ -23403,6 +23841,7 @@ mod host_request_result_tests {
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
+            correlation_projection: None,
             idempotency_key: label("req-1:invoke"),
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,

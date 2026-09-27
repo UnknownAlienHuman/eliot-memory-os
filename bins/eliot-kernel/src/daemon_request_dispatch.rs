@@ -449,6 +449,7 @@ fn daemon_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownRequest => "daemon_unknown_request",
         TransportError::UnknownOutcome => "daemon_unknown_outcome",
         TransportError::IdentityConflict => "daemon_identity_conflict",
+        TransportError::LegacyCorrelationUnresolved => "daemon_legacy_correlation_unresolved",
         TransportError::Cancelled => "daemon_cancelled",
         TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
             "daemon_backpressure"
@@ -8541,6 +8542,7 @@ mod local_read_dispatch_tests {
             identity: eliot_protocol::HostRequestIdentity {
                 request_id: eliot_contracts::RequestId::new("host-request-1")
                     .expect("valid request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,

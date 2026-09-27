@@ -13,7 +13,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::{OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata, StateFence,
+    canonical_json_bytes, sha256_hex,
+};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::UserAutomationOperation;
@@ -1708,6 +1711,10 @@ impl KernelStoreGateway {
                 }
             },
             request_id: request_id.clone(),
+            correlation_projection: Some(user_automation_obligation_correlation_projection(
+                obligation,
+                request_label.clone(),
+            )),
             idempotency_key: obligation_label(obligation, sealed.identity.idempotency_key.clone())?,
             cancellation_id: obligation_label(
                 obligation,
@@ -4431,6 +4438,25 @@ fn retained_horizon_phase(
                 &reason,
             ))
         }
+    }
+}
+
+/// Selects the disjoint durable identity family for a Kernel-owned obligation.
+fn user_automation_obligation_correlation_projection(
+    obligation: &UserAutomationRuntimeObligation,
+    occurrence: String,
+) -> HostCorrelationProjection {
+    HostCorrelationProjection::KernelOperational {
+        domain: match obligation.kind {
+            UserAutomationRuntimeObligationKind::WakeHorizonPublication
+            | UserAutomationRuntimeObligationKind::WakeTargetEnumerationReceipt => {
+                HostCorrelationDomain::Request
+            }
+            UserAutomationRuntimeObligationKind::WakeCancellation => {
+                HostCorrelationDomain::Cancellation
+            }
+        },
+        occurrence,
     }
 }
 
