@@ -81,9 +81,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    CapabilityIntroductionActivation, CapabilityIntroductionFence, GrantClosureFenceRequest,
-    GrantClosureState, OpaqueLabel, OperationIdentity, OperationalMutationReceipt,
-    OperationalPhase, OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot,
+    CapabilityIntroductionActivation, CapabilityIntroductionFence, EpochIdentity, EpochLineage,
+    GrantClosureFenceRequest, GrantClosureState, OpaqueLabel, OperationIdentity,
+    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
+    OperationalRecoveryStore, RootTransitionCommit, StateFenceSnapshot,
 };
 /// Owner-declared exact-use alternate path retained while the rest of a
 /// grant closure is fenced.
@@ -6442,27 +6443,169 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
 
     /// Mechanically activates one authenticated root crossing (`#2962`).
     ///
-    /// Fail-closed by construction: the presented binding is checked against
-    /// the presented epoch BEFORE the ledger is touched, so inconsistent or
-    /// stale caller material is rejected without any mutation.
+    /// The authenticated P-07 front door binds the subject and fence to its
+    /// current session before reaching this port. This method rechecks the
+    /// binding's internal epoch/fence consistency before ORS access; it does
+    /// not read a separate live epoch.
     ///
-    /// Named missing owner: the durable mechanical record for a root
-    /// crossing. ORS has no admitted `commit_root_transition` operation yet, and
-    /// this port will not synthesize a crossing receipt from process-local
-    /// state — a crossing whose mechanical activation is not durably recorded
-    /// is not activation at all (I6.10: a canonical proposal stays inactive
-    /// until its activation receipt exists). The refusal names the exact owner
-    /// that must be admitted, so the frontend reports
-    /// `P07PortError::Unavailable` and the crossing stays inadmissible until
-    /// that owner exists. A crossing is never authorized by a decoded record,
-    /// a recomputed digest, or a locally recomputed receipt.
+    /// ORS owns the immutable mechanical commit; its exact owner readback is
+    /// required before this port can return transition-specific evidence.
+    /// ORS grants no semantic authority: a decoded record or locally
+    /// recomputed receipt cannot admit a crossing.
     fn activate_root_transition(
         &self,
-        _request: &eliot_authority::RootTransitionActivationRequest,
+        request: &eliot_authority::RootTransitionActivationRequest,
     ) -> Result<eliot_authority::RootTransitionActivationReceipt, eliot_authority::P07PortError>
     {
-        Err(eliot_authority::P07PortError::Unavailable)
+        use eliot_authority::{P07PortError, P07RefusalCause};
+
+        let record = request.record();
+        if let Err(error) = check_binding(&record.binding, &record.binding.authority_epoch) {
+            return Err(map_p07_binding_error(&error, &record.binding));
+        }
+        if request.subject().principal != record.issuer {
+            return Err(P07PortError::Refused {
+                cause: P07RefusalCause::SessionSubjectUnbindable,
+            });
+        }
+
+        let Some(boundary) = self.durable_boundary() else {
+            #[cfg(not(test))]
+            return Err(P07PortError::Refused {
+                cause: P07RefusalCause::P07OwnerUnavailable,
+            });
+            #[cfg(test)]
+            return Err(P07PortError::Unavailable);
+        };
+
+        let operation_id = OperationIdentity::new(record.operation_id.clone())
+            .map_err(|_| P07PortError::NotAdmitted)?;
+        let transition_id = OperationIdentity::new(record.transition_id.clone())
+            .map_err(|_| P07PortError::NotAdmitted)?;
+        let binding = &record.binding;
+        let authority_epoch = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new(binding.authority_epoch.lineage_id.as_str())
+                    .map_err(|_| P07PortError::NotAdmitted)?,
+                epoch: binding.authority_epoch.sequence.get(),
+            },
+            predecessor: None,
+        };
+        let state_fence = StateFenceSnapshot::capture(
+            &binding.state_fence,
+            binding.authority_epoch.sequence.get(),
+        )
+        .map_err(|_| P07PortError::NotAdmitted)?;
+        let canonical_request_bytes = request
+            .canonical_request_bytes()
+            .map_err(|_| P07PortError::NotAdmitted)?;
+
+        // The operation carries a deadline but no trusted creation time. ORS
+        // uses zero for operational records whose creation time was not
+        // observed; this stable sentinel keeps exact replay byte-for-byte
+        // identical and does not reinterpret the deadline as a timestamp.
+        let commit = RootTransitionCommit::new(
+            OperationalRecordContext {
+                record_id: operation_id.clone(),
+                subject_id: transition_id.clone(),
+                authority_epoch,
+                state_fence,
+                created_at_ms: 0,
+                cleanup_after_ms: None,
+            },
+            canonical_request_bytes,
+            request.canonical_request_digest().to_owned(),
+        )
+        .map_err(|_| P07PortError::NotAdmitted)?;
+
+        commit_and_readback_root_transition(
+            boundary.store.as_ref(),
+            &commit,
+            &operation_id,
+            &transition_id,
+            request.snapshot_id(),
+        )?;
+        let unknown_outcome = || P07PortError::UnknownOutcome {
+            snapshot_id: request.snapshot_id().clone(),
+        };
+
+        let ors_record_ref = format!("root_transition:{}", operation_id.as_str());
+        let kernel_activation = AuthorityActivationReceipt {
+            activation_id: format!("activation-{}", operation_id.as_str()),
+            snapshot_id: record.graph_snapshot_id.clone(),
+            authority_epoch: binding.authority_epoch.clone(),
+            state: AuthorityState::Active,
+        };
+        kernel_activation
+            .validate()
+            .map_err(|_| unknown_outcome())?;
+        let receipt = eliot_authority::RootTransitionActivationReceipt {
+            schema: eliot_authority::ROOT_TRANSITION_RECEIPT_SCHEMA.to_owned(),
+            version: eliot_authority::ROOT_TRANSITION_RECEIPT_VERSION,
+            transition_id: record.transition_id.clone(),
+            operation_id: record.operation_id.clone(),
+            canonical_request_digest: request.canonical_request_digest().to_owned(),
+            parent_grant_id: record.parent_grant_id.clone(),
+            child_grant_id: record.child_grant_id.clone(),
+            parent_grant_commitment: record.parent_grant_commitment.clone(),
+            child_grant_commitment: record.child_grant_commitment.clone(),
+            from_authority_root_ref: record.from_authority_root_ref.clone(),
+            to_authority_root_ref: record.to_authority_root_ref.clone(),
+            graph_snapshot_id: record.graph_snapshot_id.clone(),
+            admitted_graph_revision: record.admitted_at_revision,
+            binding: binding.clone(),
+            kernel_activation,
+            ors_record_ref,
+            disposition: eliot_authority::RootTransitionDisposition::Committed,
+        };
+        receipt.validate(request).map_err(|_| unknown_outcome())?;
+        Ok(receipt)
     }
+}
+
+fn commit_and_readback_root_transition(
+    store: &dyn OperationalRecoveryStore,
+    commit: &RootTransitionCommit,
+    operation_id: &OperationIdentity,
+    transition_id: &OperationIdentity,
+    snapshot_id: &eliot_authority::SnapshotId,
+) -> Result<(), eliot_authority::P07PortError> {
+    use eliot_authority::P07PortError;
+
+    let unknown_outcome = || P07PortError::UnknownOutcome {
+        snapshot_id: snapshot_id.clone(),
+    };
+    // ORS performs the identity compare-and-commit atomically: exact replay
+    // returns the retained result, while changed content under the same
+    // operation identity conflicts.
+    let committed = match store.commit_root_transition((*commit).clone()) {
+        Ok(projection) => projection,
+        Err(eliot_ors::OrsError::DuplicateConflict) => {
+            return Err(P07PortError::IdentityConflict);
+        }
+        // A storage or readback failure can follow a durable commit. Reconcile
+        // this original identity instead of retrying under a new one.
+        Err(_) => return Err(unknown_outcome()),
+    };
+
+    let readback = store
+        .load_root_transition(operation_id)
+        .map_err(|_| unknown_outcome())?
+        .ok_or_else(unknown_outcome)?;
+    let receipt = readback.receipt();
+    if committed.commit() != commit
+        || readback.commit() != commit
+        || committed.operation_order() != readback.operation_order()
+        || committed.receipt() != receipt
+        || readback.operation_order() == 0
+        || receipt.record_id() != operation_id
+        || receipt.subject_id() != transition_id
+        || receipt.operation_order() != readback.operation_order()
+        || receipt.phase() != OperationalPhase::Active
+    {
+        return Err(unknown_outcome());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
