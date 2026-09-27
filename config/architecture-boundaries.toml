@@ -69,6 +69,16 @@ issue = 24
 forbidden_exact = ["eliot-app", "eliot-engine", "eliot-store-surreal-adapter", "surrealdb"]
 forbidden_prefix = ["eliot-dreamer", "eliot-agent-", "eliot-model"]
 
+[[runtime_root]]
+package = "eliot-controlboard"
+issue = 1810
+forbidden_exact = ["eliot-store-surreal-adapter", "surrealdb"]
+
+[[runtime_root]]
+package = "eliot-cli"
+issue = 1810
+forbidden_exact = ["eliot-store-surreal-adapter", "surrealdb"]
+
 [[process_owner]]
 path = "crates/instrument/eliot-process-executor"
 issue = 100
