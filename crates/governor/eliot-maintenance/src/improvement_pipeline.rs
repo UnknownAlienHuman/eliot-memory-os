@@ -1667,7 +1667,12 @@ fn join_improvement_inputs(
     let current = current_proposal_of(&normalized, inputs.experiment)?;
     check_proposal_candidate_join(inputs.proposal, inputs.candidate)?;
     check_proposal_experiment_join(inputs.experiment, inputs.proposal, inputs.candidate)?;
-    check_experiment_evaluation_join(inputs.evidence, inputs.proposal, inputs.experiment, inputs.policy)?;
+    check_experiment_evaluation_join(
+        inputs.evidence,
+        inputs.proposal,
+        inputs.experiment,
+        inputs.policy,
+    )?;
     check_admission_evidence_join(
         inputs.admission_evidence,
         inputs.evidence,
