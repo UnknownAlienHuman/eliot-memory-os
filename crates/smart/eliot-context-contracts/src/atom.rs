@@ -113,6 +113,11 @@ impl AtomRepresentation {
 }
 
 /// Atom-specific privacy and disclosure boundary.
+///
+/// The label is carried for downstream enforcement only: no rule in this
+/// cell, `eliot-context-admission`, or `eliot-context-assembly` refuses on
+/// it. The A00.3 privacy boundary is enforced by
+/// `crates/governor/eliot-workscope` (`WorkScopeError::PrivacyDenied`).
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
 )]
