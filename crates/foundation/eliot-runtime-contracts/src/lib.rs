@@ -16,6 +16,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod control_reserve;
+mod i14_backpressure;
 mod installation_activation;
 mod runtime_live;
 mod supervision_authority;
@@ -23,6 +25,19 @@ mod supervision_incarnation;
 mod supervision_lease;
 mod watchdog_admission;
 
+pub use control_reserve::{
+    BottleneckCoverageState, CapacityBottleneck, CapacityClass, CapacityUnit,
+    ControlOperationClass, EmergencyOperationClass, NormalWorkClass,
+};
+pub use i14_backpressure::{
+    AffectedOperationClass, BottleneckAvailability, BottleneckObservationV1,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_CONTRACT_NAME, I14_BACKPRESSURE_CONTRACT_VERSION,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
+    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
+    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
+    I14WorkOutcome, StatePreservationStatus, i14_backpressure_contract_identity,
+};
 pub use installation_activation::{
     Ed25519InstallationActivationApprovalSigner, INSTALLATION_ACTIVATION_CONTRACT_NAME,
     INSTALLATION_ACTIVATION_CONTRACT_VERSION, INSTALLATION_ACTIVATION_PUBLIC_KEY_BYTES,
@@ -939,14 +954,10 @@ impl RecoveryDirective {
 
 /// Backpressure dispositions from I14.4.
 ///
-/// Vocabulary freeze only: this enum fixes the seven frozen wire names an
-/// admission rejection or degradation response must carry once the wiring
-/// slice lands; an unknown wire value fails closed at deserialization. No
-/// rejection path wires a [`RecoveryDirective`] into its response yet and
-/// none claims directive conformance until that wiring slice, so no
-/// current response emits a directive-less payload under false
-/// conformance. The full fourteen-field `RecoveryDirective` shape and the
-/// reserve accounting that produces these responses stay later slices.
+/// Closed I14.4 wire vocabulary. Public I14 response payloads use
+/// [`I14BackpressureResponseV1`] to bind this disposition to the complete
+/// versioned recovery directive; production response wiring remains a later
+/// integration slice.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BackpressureDisposition {
@@ -991,11 +1002,9 @@ impl fmt::Display for BackpressureDisposition {
 /// Commit status from I14.5 (`RecoveryDirective.commit_status`).
 ///
 /// Frozen four-value vocabulary with exact lowercase wire names:
-/// `none | staged | committed | unknown`. Vocabulary freeze only: this
-/// enum fixes the values disposition responses must use; it does not wire
-/// [`RecoveryDirective`] into any rejection path, and no rejection path
-/// claims directive conformance until the wiring slice. The complete
-/// fourteen-field `RecoveryDirective` shape stays a later slice.
+/// `none | staged | committed | unknown`. Versioned I14 responses reuse this
+/// type and validate its relationship to staging, operation identity, and
+/// retry/reconciliation instructions.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub enum RecoveryCommitStatus {
     /// No durable commit exists.
