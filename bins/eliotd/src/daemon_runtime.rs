@@ -3259,18 +3259,18 @@ async fn run_task_controller_poll(
     .await
     .map_err(|error| format!("daemon Task Controller preparation: {error}"))?;
     let body = match prepared {
-        eliotd::campaign_task_controller::TaskControllerClaimPreparation::Rejected(body) => body,
+        eliotd::campaign_task_controller::TaskControllerClaimPreparation::Rejected(body) => *body,
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::Ready(prepared) => {
             let transition = {
                 let guard = composition.lock().await;
                 eliotd::campaign_task_controller::prepare_task_controller_transition(
-                    &guard, prepared,
+                    &guard, *prepared,
                 )
             };
             match transition {
                 eliotd::campaign_task_controller::TaskControllerTransitionPreparation::Rejected(
                     body,
-                ) => body,
+                ) => *body,
                 eliotd::campaign_task_controller::TaskControllerTransitionPreparation::Failed(
                     error,
                 ) => return Err(format!("daemon Task Controller dispatch: {error}")),
@@ -3278,7 +3278,7 @@ async fn run_task_controller_poll(
                     execution,
                 ) => eliotd::campaign_task_controller::exchange_task_controller_transition(
                     kernel.as_ref(),
-                    execution,
+                    *execution,
                 )
                 .await
                 .map_err(|error| format!("daemon Task Controller dispatch: {error}"))?,

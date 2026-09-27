@@ -49,8 +49,8 @@ enum PreparedTaskControllerAction {
 /// Either a bounded rejection body or an owned claim ready for guarded
 /// semantic preparation.
 pub enum TaskControllerClaimPreparation {
-    Rejected(TaskControllerResultBody),
-    Ready(PreparedTaskControllerClaim),
+    Rejected(Box<TaskControllerResultBody>),
+    Ready(Box<PreparedTaskControllerClaim>),
 }
 
 /// Canonical task plan plus the exact claim which will carry its result.
@@ -60,9 +60,9 @@ pub struct PreparedTaskControllerExecution {
 }
 
 pub enum TaskControllerTransitionPreparation {
-    Rejected(TaskControllerResultBody),
+    Rejected(Box<TaskControllerResultBody>),
     Failed(String),
-    Ready(PreparedTaskControllerExecution),
+    Ready(Box<PreparedTaskControllerExecution>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,9 +240,9 @@ pub async fn prepare_task_controller_claim(
         match serde_json::from_value(invocation.learning_state_view_recipe.clone()) {
             Ok(recipe) => recipe,
             Err(_) => {
-                return Ok(TaskControllerClaimPreparation::Rejected(
+                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
                     task_controller_rejection(&claimed, "invalid_recipe")?,
-                ));
+                )));
             }
         };
     if recipe.validate().is_err()
@@ -250,16 +250,16 @@ pub async fn prepare_task_controller_claim(
         || recipe.binding.scope.as_str() != invocation.work_scope_id
         || recipe.binding.state_fence != claimed.envelope.state_fence
     {
-        return Ok(TaskControllerClaimPreparation::Rejected(
+        return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
             task_controller_rejection(&claimed, "invalid_recipe")?,
-        ));
+        )));
     }
     let complete_owner_publications = match invocation.campaign_owner_materials.as_ref() {
         Some(materials) => {
             if reject_caller_owner_material(materials).is_err() {
-                return Ok(TaskControllerClaimPreparation::Rejected(
+                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
                     task_controller_rejection(&claimed, "invalid_owner_materials")?,
-                ));
+                )));
             }
             match read_authenticated_owner_publications(
                 reads,
@@ -270,66 +270,33 @@ pub async fn prepare_task_controller_claim(
             {
                 Ok(publications) => Some(publications),
                 Err(_) => {
-                    return Ok(TaskControllerClaimPreparation::Rejected(
+                    return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
                         task_controller_rejection(&claimed, "owner_read_unavailable")?,
-                    ));
+                    )));
                 }
             }
         }
         None => None,
     };
 
-    let action = match invocation.action {
-        TaskControllerAction::Propose => {
-            let proposal: TaskProposal = match serde_json::from_value(invocation.task_input.clone())
-            {
-                Ok(proposal) => proposal,
-                Err(_) => {
-                    return Ok(TaskControllerClaimPreparation::Rejected(
-                        task_controller_rejection(&claimed, "invalid_task_input")?,
-                    ));
-                }
-            };
-            if proposal.task_id != invocation.task_id {
-                return Ok(TaskControllerClaimPreparation::Rejected(
-                    task_controller_rejection(&claimed, "invalid_task_input")?,
-                ));
-            }
-            PreparedTaskControllerAction::Propose(proposal)
-        }
-        TaskControllerAction::Apply => {
-            let input: ApplyTaskInput = match serde_json::from_value(invocation.task_input.clone())
-            {
-                Ok(input) => input,
-                Err(_) => {
-                    return Ok(TaskControllerClaimPreparation::Rejected(
-                        task_controller_rejection(&claimed, "invalid_task_input")?,
-                    ));
-                }
-            };
-            PreparedTaskControllerAction::Apply(GuardedTaskCommand {
-                task_id: invocation.task_id.clone(),
-                context: input.context,
-                command: input.command,
-            })
-        }
+    let Ok(action) = decode_task_controller_action(&claimed) else {
+        return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+            task_controller_rejection(&claimed, "invalid_task_input")?,
+        )));
     };
-    let source_heads = match kernel
+    let Ok(source_heads) = kernel
         .campaign_source_heads(
             &invocation.task_id,
             recipe.binding.scope.as_str(),
             &claimed.envelope.state_fence,
         )
         .await
-    {
-        Ok(heads) => heads,
-        Err(_) => {
-            return Ok(TaskControllerClaimPreparation::Rejected(
-                task_controller_rejection(&claimed, "transition_rejected")?,
-            ));
-        }
+    else {
+        return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+            task_controller_rejection(&claimed, "transition_rejected")?,
+        )));
     };
-    Ok(TaskControllerClaimPreparation::Ready(
+    Ok(TaskControllerClaimPreparation::Ready(Box::new(
         PreparedTaskControllerClaim {
             claimed,
             recipe,
@@ -337,7 +304,32 @@ pub async fn prepare_task_controller_claim(
             owner_publications: complete_owner_publications,
             action,
         },
-    ))
+    )))
+}
+
+fn decode_task_controller_action(
+    claimed: &TaskControllerClaimedInvocation,
+) -> Result<PreparedTaskControllerAction, ()> {
+    let invocation = &claimed.invocation;
+    match invocation.action {
+        TaskControllerAction::Propose => {
+            let proposal: TaskProposal =
+                serde_json::from_value(invocation.task_input.clone()).map_err(|_| ())?;
+            if proposal.task_id != invocation.task_id {
+                return Err(());
+            }
+            Ok(PreparedTaskControllerAction::Propose(proposal))
+        }
+        TaskControllerAction::Apply => {
+            let input: ApplyTaskInput =
+                serde_json::from_value(invocation.task_input.clone()).map_err(|_| ())?;
+            Ok(PreparedTaskControllerAction::Apply(GuardedTaskCommand {
+                task_id: invocation.task_id.clone(),
+                context: input.context,
+                command: input.command,
+            }))
+        }
+    }
 }
 
 /// Applies the owned semantic preparation synchronously against the current
@@ -355,7 +347,7 @@ pub fn prepare_task_controller_transition(
     } = prepared;
     let Ok(lifecycle) = composition.task_lifecycle() else {
         return match task_controller_rejection(&claimed, "owner_not_ready") {
-            Ok(body) => TaskControllerTransitionPreparation::Rejected(body),
+            Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
             Err(error) => TaskControllerTransitionPreparation::Failed(error),
         };
     };
@@ -397,13 +389,13 @@ pub fn prepare_task_controller_transition(
     };
     match transition {
         Ok(transition) => {
-            TaskControllerTransitionPreparation::Ready(PreparedTaskControllerExecution {
+            TaskControllerTransitionPreparation::Ready(Box::new(PreparedTaskControllerExecution {
                 claimed,
                 transition,
-            })
+            }))
         }
         Err(_) => match task_controller_rejection(&claimed, "transition_rejected") {
-            Ok(body) => TaskControllerTransitionPreparation::Rejected(body),
+            Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
             Err(error) => TaskControllerTransitionPreparation::Failed(error),
         },
     }
@@ -415,9 +407,8 @@ pub async fn exchange_task_controller_transition(
     kernel: &dyn KernelTransitionPort,
     execution: PreparedTaskControllerExecution,
 ) -> Result<TaskControllerResultBody, String> {
-    let receipt = match execution.transition.exchange(kernel).await {
-        Ok(receipt) => receipt,
-        Err(_) => return task_controller_rejection(&execution.claimed, "transition_rejected"),
+    let Ok(receipt) = execution.transition.exchange(kernel).await else {
+        return task_controller_rejection(&execution.claimed, "transition_rejected");
     };
     task_controller_result_body(
         &execution.claimed,
