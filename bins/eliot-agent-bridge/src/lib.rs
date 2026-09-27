@@ -61,9 +61,10 @@ pub mod opencode_host_events;
 pub mod reactive_injection_receipts;
 pub mod reactive_runtime_composition;
 pub mod settled_plan_transport;
+mod transport_profile;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
-pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
+pub use cli_contract::{CliConfig, CliError, Profile, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
@@ -81,6 +82,15 @@ pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
     admit_producer_feed, governor_assess, render_admission_fence,
+};
+/// Agent-facing transport profiles and their admission policy (I7.5): the
+/// stdio shim default route, the optional loopback HTTP profile with its
+/// literal-loopback bind admission, scoped short-lived bearer credential,
+/// per-request `Host`/`Origin` validation, and the admin/database routing
+/// exclusion.
+pub use transport_profile::{
+    LoopbackHttpProfile, TransportAdmissionError, TransportProfile, admit_loopback_http,
+    loopback_http_route, validate_credential, validate_host, validate_origin,
 };
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
