@@ -1765,44 +1765,40 @@ impl KernelComposition {
         reason_code: AgentBridgeActivationDenialCode,
         detail: Option<AgentActivationResolutionDisposition>,
     ) -> Result<Frame, TransportError> {
-        let response = match detail {
-            Some(detail) => {
-                let (code, disposition, directive) =
-                    canonical_activation_denial(&detail).ok_or(TransportError::SessionFenced)?;
-                OpenAgentBridgeActivationResponse::canonical_denied(
-                    &pending.request,
-                    code.to_owned(),
-                    disposition,
-                    directive,
-                    detail,
-                )
-                .map_err(|_| TransportError::SessionFenced)?
-            }
-            None => {
-                let legacy =
-                    AgentBridgeActivationResponse::denied(&pending.request, reason_code, None)
-                        .map_err(|_| TransportError::SessionFenced)?;
-                let eliot_protocol::AgentBridgeActivationDisposition::Denied {
+        let response = if let Some(detail) = detail {
+            let (code, disposition, directive) =
+                canonical_activation_denial(&detail).ok_or(TransportError::SessionFenced)?;
+            OpenAgentBridgeActivationResponse::canonical_denied(
+                &pending.request,
+                code.to_owned(),
+                disposition,
+                directive,
+                detail,
+            )
+            .map_err(|_| TransportError::SessionFenced)?
+        } else {
+            let legacy = AgentBridgeActivationResponse::denied(&pending.request, reason_code, None)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let eliot_protocol::AgentBridgeActivationDisposition::Denied {
+                reason_code,
+                detail,
+            } = legacy.disposition
+            else {
+                return Err(TransportError::SessionFenced);
+            };
+            OpenAgentBridgeActivationResponse {
+                wire_id: legacy.wire_id,
+                wire_version: legacy.wire_version,
+                request_id: legacy.request_id,
+                request_sha256: legacy.request_sha256,
+                disposition: OpenAgentBridgeActivationDisposition::Denied {
                     reason_code,
                     detail,
-                } = legacy.disposition
-                else {
-                    return Err(TransportError::SessionFenced);
-                };
-                OpenAgentBridgeActivationResponse {
-                    wire_id: legacy.wire_id,
-                    wire_version: legacy.wire_version,
-                    request_id: legacy.request_id,
-                    request_sha256: legacy.request_sha256,
-                    disposition: OpenAgentBridgeActivationDisposition::Denied {
-                        reason_code,
-                        detail,
-                    },
-                    response_sha256: String::new(),
-                }
-                .with_computed_digest()
-                .map_err(|_| TransportError::SessionFenced)?
+                },
+                response_sha256: String::new(),
             }
+            .with_computed_digest()
+            .map_err(|_| TransportError::SessionFenced)?
         };
         response
             .validate_request(&pending.request)
