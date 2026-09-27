@@ -12,18 +12,21 @@
 //! Instrument (`#20`/`#1111`, handoff) and production activation stays with
 //! the Kernel generation/canary path (`#11`, handoff). Unknown external
 //! outcomes reconcile before retry; an exact canonical replay of a retained
-//! proposal commitment disposes as no-progress rather than improvement, no
-//! caller-settable boolean and no caller-authored assessment can establish
-//! progress or clear an unknown external effect, and an absent or
-//! non-discriminating retained record establishes nothing at all.
+//! proposal commitment disposes as no-progress rather than improvement, a repeat
+//! of a materially identical experiment disposes as no-progress even when fresh
+//! caller-controlled identities disguise it, no caller-settable boolean and no
+//! caller-authored assessment can establish progress or clear an unknown
+//! external effect, and an absent or non-discriminating retained record
+//! establishes nothing at all.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::improvement_pipeline::{
-    ImprovementCurrentProposal, ImprovementReplayAssessment, ProposalCommitment,
-    RetainedImprovementProposal, UnestablishedPriorCause, assess_improvement_progress,
+    ImprovementCurrentProposal, ImprovementMaterialEquality, ImprovementReplayAssessment,
+    ProposalCommitment, RetainedImprovementProposal, UnestablishedPriorCause,
+    assess_improvement_progress,
 };
 
 /// Improvement closure cell identity (mirrors `meta.learning.closure`).
@@ -523,6 +526,13 @@ fn replay_forced_outcome(
             no_retained_record_reason(commitment),
             owner_id,
         ))),
+        ImprovementReplayAssessment::MaterialNoProgress {
+            commitment,
+            material_equality,
+        } => Some(Ok(no_progress(
+            material_repeat_reason(commitment, material_equality),
+            owner_id,
+        ))),
         ImprovementReplayAssessment::NoProgressEstablished { commitment } => Some(Ok(no_progress(
             unchanged_discriminator_reason(commitment),
             owner_id,
@@ -554,6 +564,31 @@ fn exact_replay_reason(commitment: &ProposalCommitment) -> String {
         commitment.encoding_version,
         commitment.digest,
         commitment.operation_ref
+    )
+}
+
+/// Names the current commitment and the retained experiment it materially
+/// repeats.
+///
+/// The reason is built from the checked material-equality key, so the no-progress
+/// ground is the experiment itself and not a digest: a repeat that arrives under
+/// fresh caller-controlled identities is named as the same experiment it
+/// repeats.
+fn material_repeat_reason(
+    commitment: &ProposalCommitment,
+    material_equality: &ImprovementMaterialEquality,
+) -> String {
+    format!(
+        "material-repeated-experiment: current {}/{} digest {} repeats the retained experiment {} on mechanism {} target {}/{} budget {} deadline {} over the same declared evidence; a materially identical failed experiment without a new discriminator is no-progress evidence, not improvement",
+        commitment.algorithm,
+        commitment.encoding_version,
+        commitment.digest,
+        material_equality.experiment_id,
+        material_equality.mechanism_id,
+        material_equality.target_capability,
+        material_equality.target_generation,
+        material_equality.budget_ref,
+        material_equality.deadline_ref,
     )
 }
 
@@ -756,8 +791,10 @@ mod tests {
 
     use crate::improvement_pipeline::{
         IMPROVEMENT_DISCRIMINATOR_DOMAIN, IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION,
+        IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN, IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION,
         IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN, IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
         IMPROVEMENT_PROPOSAL_ENCODING_VERSION, ImprovementDiscriminatorProjection,
+        ImprovementMaterialEquality,
     };
 
     fn candidate() -> ImprovementCandidateView {
@@ -966,12 +1003,33 @@ mod tests {
         }
     }
 
+    /// Material-equality key of one fixture experiment. The retained records
+    /// below stay shaped by the current identity constants so they can never be
+    /// mistaken for a legacy value, and the two candidates here differ in their
+    /// experiment identity so the "fresh" retained record stays materially
+    /// distinct from the current one.
+    fn material(experiment_id: &str, evidence_ref: &str) -> ImprovementMaterialEquality {
+        ImprovementMaterialEquality {
+            domain: IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN.to_string(),
+            encoding_version: IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION.to_string(),
+            mechanism_id: "mechanism-1145-a".to_string(),
+            target_capability: "capability-1145-a".to_string(),
+            target_generation: "generation-1145-a".to_string(),
+            budget_ref: "budget-1145-a".to_string(),
+            deadline_ref: "deadline-1145-a".to_string(),
+            experiment_id: experiment_id.to_string(),
+            declared_evidence_refs: vec![evidence_ref.to_string()],
+        }
+    }
+
     /// The one current checked record the gate is given: a single commitment
-    /// plus the discriminator projection of the same content.
+    /// plus the discriminator projection and material-equality key of the same
+    /// content and the same experiment.
     fn current() -> ImprovementCurrentProposal {
         ImprovementCurrentProposal {
             commitment: prior_commitment("commitment-1145-a", "op-1145-a"),
             discriminator: projection("hypothesis-1145-a", "evidence-1145-a"),
+            material_equality: material("exp-1145-a", "evidence-1145-a"),
         }
     }
 
@@ -985,6 +1043,7 @@ mod tests {
         ev.retained_prior_proposal = Some(RetainedImprovementProposal {
             commitment: current.commitment.clone(),
             discriminator: current.discriminator.clone(),
+            material_equality: current.material_equality.clone(),
         });
         match admit_improvement_candidate(&candidate(), &ev, &policy(), &current) {
             Ok(ImprovementAdmissionDecision::NoProgress { reason, .. }) => {
@@ -1002,6 +1061,7 @@ mod tests {
         fresh.retained_prior_proposal = Some(RetainedImprovementProposal {
             commitment: prior_commitment("commitment-1144-z", "op-1144-z"),
             discriminator: projection("hypothesis-1144-z", "evidence-1144-z"),
+            material_equality: material("exp-1144-z", "evidence-1144-z"),
         });
         assert!(matches!(
             admit_improvement_candidate(&candidate(), &fresh, &policy(), &current),
