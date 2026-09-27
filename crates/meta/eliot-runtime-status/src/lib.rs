@@ -75,6 +75,13 @@ pub use capability_cell_readback::{
     CellReadbackError, GenerationCellResolution, resolve_generation_via_registry,
 };
 
+mod implementation_deviation_status;
+pub use implementation_deviation_status::{
+    IMPLEMENTATION_DEVIATION_STATUS_CONTRACT, IMPLEMENTATION_DEVIATION_STATUS_VERSION,
+    ImplementationDeviationStatusError, ImplementationDeviationStatusProjection,
+    ImplementationDeviationStatusRow, project_implementation_deviation_status,
+};
+
 mod controlboard_projection;
 pub use controlboard_projection::{
     CONTROLBOARD_CONTOUR_CONTRACT, ControlBoardContour, ControlBoardEntryKind,
