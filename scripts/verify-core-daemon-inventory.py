@@ -21,7 +21,7 @@ from typing import Any
 INVENTORY_RELATIVE = "workstreams/core-daemons/inventory.json"
 ACTIVE_RELATIVE = "workstreams/ACTIVE.toml"
 EXPECTED_SCHEMA = "eliot.core-daemon-workstream.v4"
-EXPECTED_NORMATIVE_PAIR = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+EXPECTED_NORMATIVE_PAIR = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
 EXPECTED_PRODUCT_STATUS = "NOT_ACCEPTED_UNVERIFIED"
 EXPECTED_SOURCE_IDENTITY_RULE = (
     "Resolve exact current main at work start and record base/candidate SHAs in issue/PR evidence; "
