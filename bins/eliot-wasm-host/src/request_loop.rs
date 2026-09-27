@@ -4011,29 +4011,30 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                         claim_id: identity.claim_id,
                     });
                 }
-                // Durable InFlight evidence before any guest effect: a crash
-                // or failed served write after this point still replays on
-                // restart instead of re-executing. A write failure here
-                // fails closed without executing — no effect has settled,
-                // so the staged set stays for the owner to re-drive.
-                if crate::dispatch_material::write_inflight_marker(
-                    &directory,
-                    &identity,
-                    edge_now_ms(),
-                )
-                .is_err()
-                {
-                    return Err(OrdinaryDriveError::DeliveryInProgress {
-                        operation_id: identity.operation_id,
-                        generation: identity.generation,
-                        claim_id: identity.claim_id,
-                    });
-                }
                 let _admitted_operation = identity.operation_id.len();
             }
         }
         let runtime =
             build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
+        // Durable InFlight evidence after admission and before any guest
+        // effect: a crash or failed served write after this point still
+        // replays on restart instead of re-executing. A write failure here
+        // fails closed without executing — admission alone started no
+        // guest, so the staged set stays for the owner to re-drive, and a
+        // denied delivery above leaves no marker at all.
+        if crate::dispatch_material::write_inflight_marker(
+            &directory,
+            claim.identity(),
+            edge_now_ms(),
+        )
+        .is_err()
+        {
+            return Err(OrdinaryDriveError::DeliveryInProgress {
+                operation_id: claim.identity().operation_id.clone(),
+                generation: claim.identity().generation,
+                claim_id: claim.identity().claim_id.clone(),
+            });
+        }
         let frame = run_request_loop(runtime, &material);
         // The delivery set is one-shot: a published terminal outcome reclaims
         // exactly the claimed generation, so a leftover is a fresh-drive
