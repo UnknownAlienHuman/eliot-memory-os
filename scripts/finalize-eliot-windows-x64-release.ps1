@@ -1440,6 +1440,13 @@ function Get-ReleaseDeterministicTestAggregatorWiring {
             nonzero_exact_count_required = $true
         }
         [ordered]@{
+            suite = 'build-sandbox-cache'
+            path = 'tests/release-security/build-sandbox-cache-tests.ps1'
+            kind = 'deterministic'
+            live_cert_required = $false
+            nonzero_exact_count_required = $true
+        }
+        [ordered]@{
             suite = 'trusted-cli-live-signing'
             path = 'tests/release-security/trusted-cli-live-signing-tests.ps1'
             kind = 'live-cert-hsm-gated'
