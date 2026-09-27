@@ -446,9 +446,20 @@ impl fmt::Display for ClosureIdentityConflict {
 /// comparison has succeeded. There is no way to build this value from raw
 /// `dependent_refs` membership, so suppression derivation cannot consume an
 /// unvalidated record and a record-supplied member can never become a second
-/// implicit origin. The admission binds the durable recovery reference the
-/// closure was observed at and the canonical request digest of the exact
-/// presented bytes, so the admitted value identifies its own evidence.
+/// implicit origin. The admission binds closure identity, typed origin,
+/// reason, the expected denominator (members, verified crossings,
+/// quarantined frontier, completeness, revision, and fence), the unfiltered
+/// committed membership, the declared traversal bounds, the durable source
+/// revision, the closure revision, and the canonical request digest of the
+/// exact presented bytes, so the admitted value identifies its own evidence.
+///
+/// Two coordinates stay with the durable history owner and are never minted
+/// here: a wire-carried owner namespace (this crate binds the namespace only
+/// by resolving the declared origin against the bound graph) and a canonical
+/// durable receipt (minting one here would be a second canonical owner).
+/// Both need the durable-history-owner version bump and pre-partition across
+/// the evidence constructors; until then a foreign or unscoped reference
+/// refuses rather than being reinterpreted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedRevocationClosure {
     /// Stable closure identity carried by the evidence.
