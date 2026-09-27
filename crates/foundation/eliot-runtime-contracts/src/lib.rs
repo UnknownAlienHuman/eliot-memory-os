@@ -18,6 +18,7 @@ use thiserror::Error;
 
 mod control_reserve;
 mod hot_path;
+mod hot_path_profile;
 mod i14_backpressure;
 mod installation_activation;
 mod restart_policy;
@@ -37,6 +38,19 @@ pub use hot_path::{
     HotPathDegradation, HotPathExternalCall, HotPathManifest, HotPathManifestSetV1,
     HotPathProfileRef, HotPathQueueBounds, HotPathQueueDeclaration, HotPathSnapshotDependency,
     HotPathUnsupportedOperation, hot_path_contract_identity, hot_spine_membership,
+};
+pub use hot_path_profile::{
+    HOT_PATH_PROFILE_MAX_CLOCK_DOMAINS, HOT_PATH_PROFILE_MAX_EVIDENCE_REFS,
+    HOT_PATH_PROFILE_MAX_INVALIDATION_TRIGGERS, HOT_PATH_PROFILE_VERSION,
+    HotPathAllocationAttribution, HotPathAllocationCoverage, HotPathAllocations,
+    HotPathAttemptDisposition, HotPathBuildEnvironment, HotPathCacheBehaviour, HotPathCacheState,
+    HotPathClockDomain, HotPathCollectionMode, HotPathConcurrencyCondition,
+    HotPathCounterAttributionMethod, HotPathDegradationRate, HotPathDurationMs,
+    HotPathEligiblePopulation, HotPathExecutionConditions, HotPathLockContention,
+    HotPathManifestRevision, HotPathMeasurement, HotPathMeasurementMetrics, HotPathMetricLabels,
+    HotPathObservation, HotPathObservationKind, HotPathObservationWindow, HotPathProfile,
+    HotPathProfileError, HotPathProfileQualification, HotPathQualificationStatus,
+    HotPathSamplePlan, HotPathStage,
 };
 pub use i14_backpressure::{
     AffectedOperationClass, BottleneckAvailability, BottleneckObservationV1,
