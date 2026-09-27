@@ -505,8 +505,16 @@ pub struct FrozenSelection {
     pub frozen_version: String,
     /// Digest of the consumed [`ChangeImpactPlanView`].
     pub plan_digest: String,
-    /// Candidate the selection is frozen for.
+    /// Candidate revision the selection is frozen for.
     pub candidate: String,
+    /// Complete candidate/configuration identity digest the selection is
+    /// frozen for. The owning dev-fast candidate binds product, `WorkScope`,
+    /// base, candidate, checkout, diff, target triple, features,
+    /// source/lock/toolchain/configuration digests, working directory and
+    /// Cargo target root into this one identity; a selection frozen for a
+    /// different identity is a different verification result even at the
+    /// same source revision.
+    pub candidate_identity: String,
     /// Discovery snapshot digest the selection was frozen against.
     pub discovery_digest: String,
     /// Number of discovered tests in the snapshot.
@@ -530,6 +538,7 @@ impl FrozenSelection {
         text(&self.frozen_version, "frozen_version")?;
         text(&self.plan_digest, "plan_digest")?;
         text(&self.candidate, "candidate")?;
+        text(&self.candidate_identity, "candidate_identity")?;
         text(&self.discovery_digest, "discovery_digest")?;
         let mut value = self.clone();
         value.frozen_digest.clear();
@@ -589,14 +598,22 @@ pub struct DiscoveredRow {
 /// explicitly omitted. Ignored tests are omitted with their exact cause.
 /// The freeze is deterministic: identical inputs always yield the identical
 /// frozen selection.
+///
+/// `candidate_identity` carries the complete candidate/configuration
+/// identity the selection is frozen for. The dev-fast owner computes it
+/// from the same candidate binding whose revision is `plan.candidate`, so
+/// the selection and the run it admits cannot disagree about target,
+/// features, or configuration.
 pub fn freeze_selection(
     selection_id: &str,
     plan: &ChangeImpactPlanView,
+    candidate_identity: &str,
     discovery_digest: &str,
     discovered: &[DiscoveredRow],
     budget: SelectionBudget,
 ) -> Result<FrozenSelection, SelectionError> {
     text(selection_id, "selection_id")?;
+    text(candidate_identity, "candidate_identity")?;
     text(discovery_digest, "discovery_digest")?;
     plan.validate()?;
     budget.validate()?;
@@ -663,6 +680,7 @@ pub fn freeze_selection(
         frozen_version: FROZEN_SELECTION_VERSION.to_owned(),
         plan_digest: plan.plan_digest.clone(),
         candidate: plan.candidate.clone(),
+        candidate_identity: candidate_identity.to_owned(),
         discovery_digest: discovery_digest.to_owned(),
         discovered_count: u64::try_from(discovered.len()).unwrap_or(u64::MAX),
         disposition,
@@ -748,8 +766,12 @@ fn collect_frozen_rows(
 pub struct TestSelectionReceipt {
     /// Receipt semantics version.
     pub receipt_version: String,
-    /// Candidate the receipt is bound to.
+    /// Candidate revision the receipt is bound to.
     pub candidate: String,
+    /// Complete candidate/configuration identity digest inherited from the
+    /// frozen selection, so the retained run records the exact build
+    /// configuration whose evidence it holds.
+    pub candidate_identity: String,
     /// Admitted profile name.
     pub profile: String,
     /// Exact admitted profile revision.
@@ -833,6 +855,7 @@ impl TestSelectionReceipt {
         let mut receipt = Self {
             receipt_version: SELECTION_RECEIPT_VERSION.to_owned(),
             candidate,
+            candidate_identity: frozen.candidate_identity.clone(),
             profile,
             profile_revision,
             profile_digest,
@@ -867,6 +890,7 @@ impl TestSelectionReceipt {
     pub fn validate(&self) -> Result<(), SelectionError> {
         text(&self.receipt_version, "receipt_version")?;
         text(&self.candidate, "candidate")?;
+        text(&self.candidate_identity, "candidate_identity")?;
         text(&self.profile, "profile")?;
         text(&self.profile_digest, "profile_digest")?;
         text(&self.dag_digest, "dag_digest")?;
