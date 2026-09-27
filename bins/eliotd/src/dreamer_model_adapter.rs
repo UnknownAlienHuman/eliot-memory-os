@@ -267,9 +267,10 @@ impl<'a> GovernedDreamerModelAdapter<'a> {
             .map_err(|_| CompositionError::NotReady)?;
         // The outcome registry is daemon-held (#1961), not per call: a
         // generation-scope block recorded here must still be refusing the
-        // next attempt, so the guard is taken once for the whole gate and
-        // every eligibility decision reads the same retained view.
-        let mut outcomes = self
+        // next attempt. The handle is borrowed, not locked, so the gate locks
+        // it only for its own synchronous decision and no guard is ever held
+        // across the provider execution await below.
+        let outcomes = self
             .composition
             .capability_outcomes()
             .map_err(|_| CompositionError::NotReady)?;
@@ -278,7 +279,7 @@ impl<'a> GovernedDreamerModelAdapter<'a> {
             &admitted,
             coordinator_config,
             registry,
-            &mut outcomes,
+            outcomes,
             input,
             intake,
             execution,
@@ -478,11 +479,15 @@ const FUNNEL_REFUSAL_CONTEXT: &str = "production admission";
 
 /// Recovery marker recorded on a generation-scoped challenge failure.
 ///
-/// Names the two defined recovery paths of the owning registry view:
-/// explicit requalification of the exact fingerprint, or reaching the
-/// owner-set expiry carried on the outcome.
-const GENERATION_RECOVERY: &str =
-    "requalify-exact-fingerprint-on-fresh-evidence-or-reach-outcome-expiry";
+/// Names the ONE recovery path this crate can actually perform: reaching the
+/// owner-set expiry carried on the outcome. The registry view also exposes
+/// `requalify_generation` as an explicit recovery, and it deliberately is not
+/// named here, because it has no production caller: the block's window is the
+/// evidence record's own `expires_at`, so the negative evidence and the block
+/// expire together and no in-window requalification event exists to trigger
+/// it. Claiming that path in the emitted record would put a recovery in the
+/// data that the daemon cannot perform.
+const GENERATION_RECOVERY: &str = "reach-outcome-expiry-on-the-retained-generation-block";
 
 /// What survives every degradation this gate records (A13.11).
 ///
@@ -575,12 +580,16 @@ fn render_projection(projection: &DegradationProjection) -> String {
 /// port's candidate bound by [`AgentResult::validate_for_binding`] —
 /// requested, logical, and observed identities plus usage, cancellation, and unknown
 /// outcomes cross unchanged and are never rewritten here.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the gate threads the identities the owner requires per invoke plus the held outcome registry handle; a struct would duplicate the owner's own request shape"
+)]
 pub(crate) async fn invoke_admitted_model(
     readiness: CompositionReadiness,
     admitted_fence: &StateFence,
     coordinator_config: &CoordinatorConfig,
     registry: &GovernorCapabilityAdmission,
-    outcomes: &mut CapabilityRegistryView,
+    outcomes: &std::sync::Mutex<CapabilityRegistryView>,
     input: &ModelInvokeInput,
     intake: &mut AttemptReceipt,
     execution: &impl DreamerModelExecution,
@@ -859,20 +868,31 @@ fn refuse_capability_call(
 /// this attempt's receipt so the finding stays visible with its evidence and
 /// current scope, and it is never installation-global state.
 ///
-/// `outcomes` is the daemon's held view, not a per-call one, so the block
-/// outlives the attempt that produced it. It is consulted before any evidence
-/// is re-derived: a later attempt on the same exact fingerprint is refused on
-/// the retained block alone, with no fresh evidence required to keep refusing
-/// and no re-derivation to lose the finding. The block is lifted only by the
-/// owner's own recovery — its expiry (`clear_expired`, the recorded record's
-/// own window) or an explicit requalification — and a new admitted generation
-/// carries a different fingerprint and is therefore unaffected.
+/// `outcomes` is the daemon's held view, not a per-call one, so the recorded
+/// finding outlives the attempt that produced it. It is consulted before any
+/// evidence is re-derived, so a later attempt on the same exact fingerprint
+/// reads the retained block instead of re-deriving one, and the
+/// generation-scope record survives as state instead of a per-call value.
+///
+/// The block is lifted by the owner's expiry, `clear_expired` against the
+/// recorded record's own window, and a new admitted generation carries a
+/// different fingerprint and is therefore unaffected. Stated honestly: the
+/// view also exposes `requalify_generation`, and that explicit recovery is NOT
+/// wired, because the block's window is the evidence record's own
+/// `expires_at` — the negative evidence and the block expire together, so no
+/// in-window requalification event exists. The honest extent of the guarantee
+/// is therefore that the generation finding is RETAINED and re-read, not that
+/// it refuses for longer than the fresh negative evidence already refused.
 ///
 /// Returns the refusal when the bound generation fingerprint is blocked, and
 /// `Ok(None)` when no required capability carries reproduced
 /// exact-fingerprint evidence at that generation — including when the
 /// Kernel-issued projection is unserved, so the generation stays unknown
 /// rather than inferred.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the decision needs the exact operation identities the owner binds per invoke; a struct would duplicate the owner's own outcome request"
+)]
 fn refuse_blocked_generation(
     required: &[String],
     input: &ModelInvokeInput,
@@ -880,9 +900,15 @@ fn refuse_blocked_generation(
     generation_fingerprint: &str,
     generation_owner: &str,
     requested_key: &str,
-    outcomes: &mut CapabilityRegistryView,
+    outcomes: &std::sync::Mutex<CapabilityRegistryView>,
     intake: &mut AttemptReceipt,
 ) -> Result<Option<CompositionError>, CompositionError> {
+    // Locked here, inside the gate's own synchronous body, so no guard is held
+    // across the provider execution await and every eligibility decision in
+    // this call reads the same retained state.
+    let mut outcomes = outcomes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Expiry is the owner's recovery path and runs against the retained view,
     // so a block whose own window has passed stops refusing without any
     // external trigger, and the eligibility decision below reads the same
@@ -1049,7 +1075,7 @@ fn verify_gate_preconditions(
 fn gate_model_capability(
     admitted_fence: &StateFence,
     registry: &GovernorCapabilityAdmission,
-    outcomes: &mut CapabilityRegistryView,
+    outcomes: &std::sync::Mutex<CapabilityRegistryView>,
     input: &ModelInvokeInput,
     generation_fingerprint: &str,
     intake: &mut AttemptReceipt,
@@ -1778,7 +1804,7 @@ mod tests {
             &fence,
             &config,
             &GovernorCapabilityAdmission::new(),
-            &mut CapabilityRegistryView::default(),
+            &std::sync::Mutex::new(CapabilityRegistryView::default()),
             &input,
             &mut intake,
             &execution,
@@ -2083,16 +2109,16 @@ mod tests {
         intake: &mut AttemptReceipt,
         execution: &SucceedingExecution,
     ) -> Result<AgentResult, CompositionError> {
-        // The production caller passes the daemon-held view; a test helper
+        // The production caller borrows the daemon-held handle; a test helper
         // owns an equivalent one so the gate's own state handling is
         // exercised without a composition.
-        let mut outcomes = CapabilityRegistryView::default();
+        let outcomes = std::sync::Mutex::new(CapabilityRegistryView::default());
         invoke_admitted_model(
             CompositionReadiness::Ready,
             &fixtures.fence,
             &fixtures.config,
             registry,
-            &mut outcomes,
+            &outcomes,
             input,
             intake,
             execution,

@@ -571,8 +571,8 @@ pub struct DaemonComposition {
     ///
     /// Constructed empty at [`DaemonComposition::start`] and owned here for
     /// the daemon's lifetime, so a broad degradation outcome recorded by one
-    /// model-invoke attempt keeps refusing later attempts instead of dying
-    /// with the call that observed it. Only evidence-backed broad scopes are
+    /// model-invoke attempt applies to later attempts instead of dying with
+    /// the call that observed it. Only evidence-backed broad scopes are
     /// stored (installation blocks, generation blocks keyed by exact
     /// fingerprint, session blocks keyed by session owner); item-, call- and
     /// attempt-scoped outcomes are never stored here and stay visible on the
@@ -585,8 +585,7 @@ pub struct DaemonComposition {
     /// Semantics stay in [`CapabilityRegistryView`]; this field is only its
     /// owner. It is in-process state: a restart re-derives from evidence
     /// rather than reading a durable record back, and no canonical-store
-    /// persistence is claimed for it here.
-    capability_outcomes: std::sync::Mutex<CapabilityRegistryView>,
+    /// persistence is claimed for it here.    capability_outcomes: std::sync::Mutex<CapabilityRegistryView>,
     /// Governor-owned durable learning-closure owner (issue #1863, I12.24).
     ///
     /// Constructed empty at [`DaemonComposition::start`] and owned by the
@@ -2680,7 +2679,7 @@ impl DaemonComposition {
         Ok(&mut self.capability_admission)
     }
 
-    /// Locks the daemon-held Governor outcome registry view (#1961, I3.4).
+    /// Borrows the daemon-held Governor outcome registry view (#1961, I3.4).
     ///
     /// Post-`start` attach-style accessor, mirroring
     /// [`Self::capability_admission`]: readiness is checked first so a
@@ -2688,18 +2687,22 @@ impl DaemonComposition {
     /// model gate records a broad outcome into this held view and reads
     /// eligibility back from it, which is what makes a generation-scope block
     /// outlive the attempt that observed the reproduced failure: the block is
-    /// dropped by the owner's own expiry or explicit requalification, never
-    /// by the end of a call. Locking mirrors the `skill_catalogue` handle.
+    /// dropped by the owner's own expiry, never by the end of a call.
+    ///
+    /// The handle is borrowed rather than a guard handed out on purpose. The
+    /// gate is reached from an `async fn` that then awaits the provider
+    /// execution port, and a `std::sync::MutexGuard` held across an await would
+    /// make that future `!Send` and would serialise every model invoke for the
+    /// duration of a provider call. Locking is therefore scoped to the gate's
+    /// own synchronous body, and poisoning is recovered the same way the
+    /// `skill_catalogue` handle recovers it.
     pub fn capability_outcomes(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, CapabilityRegistryView>, DaemonError> {
+    ) -> Result<&std::sync::Mutex<CapabilityRegistryView>, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        Ok(self
-            .capability_outcomes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        Ok(&self.capability_outcomes)
     }
 
     /// Consults the held capability admission before route execution (#1957).
