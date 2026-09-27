@@ -5,8 +5,10 @@ mod request_input;
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
-    KernelHostRequestClient, NormalizedCue, Profile, UnderstandingBootstrap, UseOutcome,
-    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
+    KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile, TransportAdmissionError,
+    TransportProfile, UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration,
+    loopback_http_route, parse_args, reactive_runtime_composition, validate_credential,
+    validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -39,7 +41,7 @@ use request_input::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -623,6 +625,7 @@ fn main() {
                 CliError::InvalidClientDeclarationPath(path) => {
                     ("INVALID_CLIENT_DECLARATION_PATH", path)
                 }
+                CliError::TransportRejected(code) => ("TRANSPORT_REJECTED", code),
             };
             emit_error(code, &detail);
             std::process::exit(INVALID_ARGUMENT_EXIT);
@@ -658,6 +661,19 @@ fn main() {
             format!("request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent");
         emit_error("BRIDGE_COMPOSITION_REJECTED", &detail);
         std::process::exit(PROVIDER_PORT_EXIT);
+    }
+    // Transport-profile admission (I7.5): the stdio shim is the default
+    // route and keeps the existing stdio front doors below. The optional
+    // loopback HTTP profile is disabled by default and, once admitted with
+    // its literal loopback bind and scoped short-lived bearer credential,
+    // serves the agent-facing MCP surface over that bind only. Losing this
+    // process removes only the transport binding: the profile holds no
+    // Kernel or canonical state, and the Kernel session and work state stay
+    // intact kernel-side.
+    if let TransportProfile::LoopbackHttp(profile) = config.transport {
+        let code =
+            run_loopback_http_bridge(profile, host_gateway, &mut host_request_client, &mut runner);
+        std::process::exit(code);
     }
     if mcp_mode {
         // The MCP front door owns its stdio loop from here: it never falls
@@ -2503,6 +2519,377 @@ fn run_mcp_front_door(
         PROVIDER_PORT_EXIT
     } else {
         0
+    }
+}
+
+/// Bounded header bytes accepted for one loopback HTTP request.
+const HTTP_HEADER_LIMIT_BYTES: usize = 8 * 1024;
+/// Bounded body bytes accepted for one loopback HTTP request; mirrors the
+/// stdio record ceiling so one transport's bound cannot exceed the other's.
+const HTTP_BODY_LIMIT_BYTES: usize = REQUEST_INPUT_PROFILE.max_record_bytes;
+/// Read timeout for one loopback HTTP request; an idle keep-alive connection
+/// is closed silently once it elapses.
+const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One parsed loopback HTTP request: only the fields the admission policy
+/// reads, all bounded by the reader.
+struct LoopbackHttpRequest {
+    method: String,
+    target: String,
+    host: Option<String>,
+    origin: Option<String>,
+    authorization: Option<String>,
+    body: Vec<u8>,
+}
+
+/// One loopback HTTP intake classification for the connection loop.
+enum LoopbackHttpRead {
+    /// One fully framed request ready for admission.
+    Request(LoopbackHttpRequest),
+    /// The peer closed the connection or the read timeout elapsed.
+    Eof,
+    /// The request bytes are malformed; the detail never echoes request
+    /// content.
+    Rejected(String),
+}
+
+/// Connection flow after one request: serve the next request on the same
+/// keep-alive connection, or close it.
+enum ConnectionFlow {
+    Continue,
+    Close,
+}
+
+/// Serves the admitted loopback HTTP profile until a transport failure.
+///
+/// The listener binds the exact admitted literal loopback endpoint and
+/// nothing else. Every request is admitted through the I7.5 policy before
+/// any dispatch: exact `Host`, exact browser `Origin` when present, and the
+/// scoped short-lived bearer credential presented on this endpoint only.
+/// Only the agent-facing MCP surface is routed; admin and database surfaces
+/// have no route. A provider failure or transport failure ends the bridge
+/// with the provider exit code; the Kernel session and work state are owned
+/// kernel-side and are never mutated by this process's death.
+fn run_loopback_http_bridge(
+    profile: LoopbackHttpProfile,
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+) -> i32 {
+    let listener = match std::net::TcpListener::bind(profile.bind_addr()) {
+        Ok(listener) => listener,
+        Err(error) => {
+            emit_error("HTTP_TRANSPORT_BIND_REJECTED", &error.to_string());
+            return PROVIDER_PORT_EXIT;
+        }
+    };
+    let mut provider_failure = false;
+    loop {
+        let (stream, _peer) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                emit_error("HTTP_TRANSPORT_ACCEPT_FAILED", &error.to_string());
+                return PROVIDER_PORT_EXIT;
+            }
+        };
+        match serve_loopback_http_connection(
+            stream,
+            &profile,
+            gateway,
+            port,
+            runner,
+            &mut provider_failure,
+        ) {
+            Ok(()) => {}
+            Err(error) => {
+                emit_error("HTTP_TRANSPORT_CONNECTION_FAILED", &error);
+                return PROVIDER_PORT_EXIT;
+            }
+        }
+        if provider_failure {
+            return PROVIDER_PORT_EXIT;
+        }
+    }
+}
+
+/// Serves one keep-alive loopback HTTP connection until the peer closes, a
+/// request is rejected, or a provider failure ends the bridge.
+fn serve_loopback_http_connection(
+    mut stream: std::net::TcpStream,
+    profile: &LoopbackHttpProfile,
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    provider_failure: &mut bool,
+) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(STDOUT_WRITE_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let mut state = McpFrontDoor::new();
+    loop {
+        let request = match read_loopback_http_request(&mut stream) {
+            LoopbackHttpRead::Request(request) => request,
+            LoopbackHttpRead::Eof => return Ok(()),
+            LoopbackHttpRead::Rejected(detail) => {
+                write_loopback_http_rejection(&mut stream, 400, "BAD_REQUEST", &detail)?;
+                return Ok(());
+            }
+        };
+        match validate_and_dispatch(
+            &mut stream,
+            request,
+            profile,
+            gateway,
+            port,
+            runner,
+            &mut state,
+            provider_failure,
+        ) {
+            Ok(ConnectionFlow::Continue) => {}
+            Ok(ConnectionFlow::Close) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if *provider_failure {
+            return Ok(());
+        }
+    }
+}
+
+/// Admits one request through the I7.5 policy and dispatches it.
+///
+/// Admission order is deliberate: `Host` on every request first, then the
+/// routing policy (only the agent-facing MCP surface is served), then the
+/// method, then `Origin` for browser-originated requests, then the scoped
+/// bearer credential. Every rejection writes its typed response and closes
+/// the connection; no rejection ever reaches a handler, gateway, port, or
+/// runner call.
+#[allow(
+    clippy::too_many_lines,
+    reason = "loopback HTTP admission mirrors the I7.5 policy step for step"
+)]
+fn validate_and_dispatch(
+    stream: &mut std::net::TcpStream,
+    request: LoopbackHttpRequest,
+    profile: &LoopbackHttpProfile,
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    provider_failure: &mut bool,
+) -> Result<ConnectionFlow, String> {
+    if let Err(error) = validate_host(request.host.as_deref(), profile) {
+        write_loopback_http_rejection(stream, 403, error.code(), "host admission rejected")?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if loopback_http_route(request.target.as_str()).is_none() {
+        write_loopback_http_rejection(
+            stream,
+            404,
+            "SURFACE_NOT_ROUTED",
+            "no admin or database surface is routed",
+        )?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if request.method != "POST" {
+        write_loopback_http_rejection(
+            stream,
+            405,
+            "METHOD_NOT_ADMITTED",
+            "POST is the only admitted method",
+        )?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if let Some(origin) = request.origin.as_deref()
+        && let Err(error) = validate_origin(Some(origin), profile)
+    {
+        write_loopback_http_rejection(stream, 403, error.code(), "origin admission rejected")?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if let Err(error) = validate_loopback_bearer(request.authorization.as_deref(), profile) {
+        write_loopback_http_rejection(stream, 401, error.code(), "credential admission rejected")?;
+        return Ok(ConnectionFlow::Close);
+    }
+    let body = String::from_utf8_lossy(&request.body).into_owned();
+    let outcome = handle_mcp_frame(gateway, port, runner, state, &body, provider_failure);
+    match outcome.response {
+        Some(response) => {
+            let bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+            if bytes.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+                let refusal = serde_json::json!({
+                    "error": "HTTP_RESPONSE_TOO_LARGE",
+                    "detail": format!(
+                        "structured MCP response exceeds {HARD_STRUCTURED_RESPONSE_BYTES} bytes"
+                    ),
+                });
+                let refusal_bytes =
+                    serde_json::to_vec(&refusal).map_err(|error| error.to_string())?;
+                write_loopback_http_response(stream, 503, "Service Unavailable", &refusal_bytes)?;
+                return Ok(ConnectionFlow::Close);
+            }
+            write_loopback_http_response(stream, 200, "OK", &bytes)?;
+        }
+        None => {
+            write_loopback_http_response(stream, 202, "Accepted", b"")?;
+        }
+    }
+    Ok(ConnectionFlow::Continue)
+}
+
+/// Validates the `Authorization` header as the scoped bearer credential,
+/// presented on the exact loopback endpoint it was issued for.
+fn validate_loopback_bearer(
+    authorization: Option<&str>,
+    profile: &LoopbackHttpProfile,
+) -> Result<(), TransportAdmissionError> {
+    let presented = authorization
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(TransportAdmissionError::CredentialMismatch)?;
+    validate_credential(presented, profile.credential_scope(), profile)
+}
+
+/// Reads one bounded loopback HTTP request: headers up to the header
+/// terminator, then exactly `Content-Length` body bytes.
+fn read_loopback_http_request(stream: &mut std::net::TcpStream) -> LoopbackHttpRead {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let header_end = loop {
+        if buffer.len() > HTTP_HEADER_LIMIT_BYTES {
+            return LoopbackHttpRead::Rejected(
+                "request headers exceed the loopback HTTP bound".to_owned(),
+            );
+        }
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => return LoopbackHttpRead::Eof,
+            Ok(read) => read,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return LoopbackHttpRead::Eof;
+            }
+            Err(error) => {
+                return LoopbackHttpRead::Rejected(format!("request header read failed: {error}"));
+            }
+        };
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
+        }
+    };
+    let header_text = match String::from_utf8(buffer[..header_end].to_vec()) {
+        Ok(text) => text,
+        Err(_) => {
+            return LoopbackHttpRead::Rejected("request headers are not valid UTF-8".to_owned());
+        }
+    };
+    let mut body_prefix = buffer[header_end + 4..].to_vec();
+    let mut lines = header_text.split("\r\n");
+    let request_line = match lines.next() {
+        Some(line) => line,
+        None => return LoopbackHttpRead::Rejected("empty request line".to_owned()),
+    };
+    let mut request_parts = request_line.split(' ');
+    let method = request_parts.next().unwrap_or_default().to_owned();
+    let target = request_parts.next().unwrap_or_default().to_owned();
+    let mut host: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut authorization: Option<String> = None;
+    let mut content_length: usize = 0;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return LoopbackHttpRead::Rejected("malformed header line".to_owned());
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "host" => host = Some(value.to_owned()),
+            "origin" => origin = Some(value.to_owned()),
+            "authorization" => authorization = Some(value.to_owned()),
+            "content-length" => match value.parse::<usize>() {
+                Ok(length) => content_length = length,
+                Err(_) => return LoopbackHttpRead::Rejected("malformed content-length".to_owned()),
+            },
+            _ => {}
+        }
+    }
+    if content_length > HTTP_BODY_LIMIT_BYTES {
+        return LoopbackHttpRead::Rejected(
+            "request body exceeds the loopback HTTP bound".to_owned(),
+        );
+    }
+    let buffered = body_prefix.len();
+    if buffered > content_length {
+        return LoopbackHttpRead::Rejected("request body exceeds content-length".to_owned());
+    }
+    body_prefix.resize(content_length, 0);
+    if buffered < content_length {
+        match stream.read_exact(&mut body_prefix[buffered..]) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return LoopbackHttpRead::Eof;
+            }
+            Err(error) => {
+                return LoopbackHttpRead::Rejected(format!("request body read failed: {error}"));
+            }
+        }
+    }
+    LoopbackHttpRead::Request(LoopbackHttpRequest {
+        method,
+        target,
+        host,
+        origin,
+        authorization,
+        body: body_prefix,
+    })
+}
+
+/// Writes one loopback HTTP response and flushes it.
+fn write_loopback_http_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|error| error.to_string())?;
+    stream.write_all(body).map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())
+}
+
+/// Writes one typed loopback HTTP admission rejection.
+fn write_loopback_http_rejection(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    code: &str,
+    detail: &str,
+) -> Result<(), String> {
+    let body = format!("{{\"error\":{code:?},\"detail\":{detail:?}}}");
+    write_loopback_http_response(stream, status, reason_phrase(status), body.as_bytes())
+}
+
+/// Reason phrase for one rejection status.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Rejected",
     }
 }
 
