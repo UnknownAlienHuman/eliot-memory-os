@@ -5210,6 +5210,58 @@ pub enum HostRequestState {
     Terminal,
 }
 
+/// Durable owner for one daemon attempt at an admitted host request.
+///
+/// The attempt is stored on the same ORS row as the operation and its State
+/// Fence. A replacement owner cannot overwrite it: the store moves the row to
+/// `Unknown` and retains this binding for reconciliation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestAttempt {
+    pub attempt_id: OpaqueLabel,
+    pub generation: u64,
+    pub fence_digest: String,
+    pub owner_connection_ref: OpaqueLabel,
+    pub owner_launch_nonce: OpaqueLabel,
+    pub owner_session_epoch: u64,
+    pub phase: HostRequestAttemptPhase,
+}
+
+/// Durable execution phase for a daemon attempt.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestAttemptPhase {
+    /// Claim was persisted before dispatch; effects may have been issued.
+    Claimed,
+    /// The owner explicitly deferred before producing any effect.
+    DeferredNoEffect,
+}
+
+impl HostRequestAttempt {
+    pub(crate) fn validate(&self, fence_digest: &str) -> Result<(), OrsError> {
+        validate_text(self.attempt_id.as_str(), "host_request_attempt_id")?;
+        validate_text(
+            self.owner_connection_ref.as_str(),
+            "host_request_attempt_connection",
+        )?;
+        validate_text(
+            self.owner_launch_nonce.as_str(),
+            "host_request_attempt_launch_nonce",
+        )?;
+        if self.generation == 0 || self.owner_session_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_attempt_generation",
+                reason: "generation and session epoch must be non-zero",
+            });
+        }
+        validate_digest(&self.fence_digest, "host_request_attempt_fence_digest")?;
+        if self.fence_digest != fence_digest {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+}
+
 impl HostRequestState {
     /// Returns whether the state closes the operation.
     pub const fn is_terminal(self) -> bool {
@@ -5308,6 +5360,11 @@ pub struct HostRequestRecord {
     pub generation: u64,
     pub deadline_unix_ms: u64,
     pub state: HostRequestState,
+    /// The current daemon attempt, written atomically with the transition to
+    /// `Routed` before the claim is returned. Retained on `Unknown` so a
+    /// replacement cannot free ownership by losing its local queue entry.
+    #[serde(default)]
+    pub attempt: Option<HostRequestAttempt>,
     pub result_digest: Option<String>,
     /// Exact bounded result body for `ResultReceived`/`Terminal` readback
     /// (Implements #18: local read result).
@@ -5385,6 +5442,9 @@ impl HostRequestRecord {
         }
         validate_digest(&self.request_digest, "host_request_request_digest")?;
         validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        if let Some(attempt) = &self.attempt {
+            attempt.validate(&self.fence_digest)?;
+        }
         validate_text(self.connection_ref.as_str(), "host_request_connection_ref")?;
         for (value, field) in [
             (self.session_ref.as_ref(), "host_request_session_ref"),

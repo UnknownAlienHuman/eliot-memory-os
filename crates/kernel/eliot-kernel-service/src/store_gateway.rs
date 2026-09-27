@@ -1726,6 +1726,7 @@ impl KernelStoreGateway {
             generation: sealed.context.state_fence.resource_generation.value(),
             deadline_unix_ms: observed_unix_ms,
             state: HostRequestState::Requested,
+            attempt: None,
             result_digest: None,
             result_response: None,
             commit_order: 0,
