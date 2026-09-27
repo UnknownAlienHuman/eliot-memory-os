@@ -2246,6 +2246,17 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // Issue #1837: durable audit evidence for the validated daemon
+        // submission. The submission leg causally precedes the Kernel
+        // binding, so its record is fsync-sealed before the ORS completion
+        // below: a crash after completion can never lose it.
+        self.audit_observe(AuditEventDraft::result_daemon_submitted(
+            session,
+            body,
+            &stored,
+            queued_envelope.as_ref(),
+            lane,
+        ));
         let persisted = self
             .generation_gateway
             .ors
@@ -2260,15 +2271,10 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
-        // Issue #1837: durable audit evidence for the daemon result leg
-        // and the Kernel binding.
-        self.audit_observe(AuditEventDraft::result_daemon_submitted(
-            session,
-            body,
-            &stored,
-            queued_envelope.as_ref(),
-            lane,
-        ));
+        // Issue #1837: durable audit evidence for the Kernel binding. This
+        // record evidences the persisted completion above, so it must follow
+        // it; a failed persist leaves submission evidence without binding,
+        // which is the accurate history.
         self.audit_observe(AuditEventDraft::result_kernel_bound(
             session,
             body,
