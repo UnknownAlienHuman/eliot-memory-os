@@ -72,6 +72,14 @@ struct CircuitRecord {
     state: AdapterState,
 }
 
+#[derive(Clone, Copy)]
+enum CircuitEvent {
+    Success,
+    TransportFailure,
+    IntegrityFailure,
+    HalfOpenProbe,
+}
+
 impl Default for CircuitRecord {
     fn default() -> Self {
         Self {
@@ -352,7 +360,10 @@ impl AdapterSupervisor {
         if adapter.manifest().adapter_class == AdapterClass::ExternalCandidate
             && matches!(
                 result.status,
-                AdapterResultStatus::Failed | AdapterResultStatus::Timeout
+                AdapterResultStatus::Failed
+                    | AdapterResultStatus::Timeout
+                    | AdapterResultStatus::TransportFailure
+                    | AdapterResultStatus::IntegrityFailure
             )
             && let Some(persisted) = self
                 .runtime_store
@@ -366,7 +377,10 @@ impl AdapterSupervisor {
         }
         result.duration_ms = millis(started.elapsed());
         Self::enforce_output_limit(adapter.manifest(), &mut result, blob_store)?;
-        checkpoint.phase = if result.status == AdapterResultStatus::Succeeded {
+        checkpoint.phase = if matches!(
+            result.status,
+            AdapterResultStatus::Succeeded | AdapterResultStatus::NoResults
+        ) {
             OperationPhase::Completed
         } else {
             OperationPhase::Failed
@@ -378,14 +392,9 @@ impl AdapterSupervisor {
         checkpoint.last_error_class = result.error.as_ref().map(|error| error.code.clone());
         let terminal_operation_ref = checkpoint.operation_id.clone();
         self.runtime_store.put_checkpoint(checkpoint).await?;
-        if let Some(record) = self.update_circuit(adapter_id, result.status) {
-            self.persist_circuit(
-                adapter_id,
-                &record,
-                result.status,
-                Some(&terminal_operation_ref),
-            )
-            .await?;
+        if let Some((record, event)) = self.update_circuit(adapter_id, result.status) {
+            self.persist_circuit(adapter_id, &record, event, Some(&terminal_operation_ref))
+                .await?;
         }
         Ok(result)
     }
@@ -411,7 +420,7 @@ impl AdapterSupervisor {
         }
         if let Some(record) = self.set_half_open(adapter_id)
             && let Err(error) = self
-                .persist_circuit(adapter_id, &record, AdapterResultStatus::Unavailable, None)
+                .persist_circuit(adapter_id, &record, CircuitEvent::HalfOpenProbe, None)
                 .await
         {
             return match self.registry.adapter(adapter_id) {
@@ -435,7 +444,7 @@ impl AdapterSupervisor {
         if health.healthy {
             if let Some(record) = self.reset_circuit(adapter_id)
                 && let Err(error) = self
-                    .persist_circuit(adapter_id, &record, AdapterResultStatus::Succeeded, None)
+                    .persist_circuit(adapter_id, &record, CircuitEvent::Success, None)
                     .await
             {
                 health.healthy = false;
@@ -513,7 +522,13 @@ impl AdapterSupervisor {
         &self,
         adapter_id: &str,
         status: AdapterResultStatus,
-    ) -> Option<CircuitRecord> {
+    ) -> Option<(CircuitRecord, CircuitEvent)> {
+        let event = match status {
+            AdapterResultStatus::Succeeded => CircuitEvent::Success,
+            AdapterResultStatus::TransportFailure => CircuitEvent::TransportFailure,
+            AdapterResultStatus::IntegrityFailure => CircuitEvent::IntegrityFailure,
+            _ => return None,
+        };
         let Ok(mut circuits) = self.circuits.lock() else {
             return None;
         };
@@ -524,7 +539,7 @@ impl AdapterSupervisor {
                 record.circuit_open = false;
                 record.state = AdapterState::Healthy;
             }
-            AdapterResultStatus::Failed | AdapterResultStatus::Timeout => {
+            AdapterResultStatus::TransportFailure | AdapterResultStatus::IntegrityFailure => {
                 record.consecutive_failures += 1;
                 let threshold = self
                     .registry
@@ -539,7 +554,7 @@ impl AdapterSupervisor {
             }
             _ => {}
         }
-        Some(record.clone())
+        Some((record.clone(), event))
     }
 
     fn circuit_is_open(&self, adapter_id: &str) -> bool {
@@ -617,7 +632,7 @@ impl AdapterSupervisor {
         &self,
         adapter_id: &str,
         record: &CircuitRecord,
-        status: AdapterResultStatus,
+        event: CircuitEvent,
         terminal_operation_ref: Option<&str>,
     ) -> Result<(), EngineError> {
         let now = OffsetDateTime::now_utc();
@@ -643,36 +658,35 @@ impl AdapterSupervisor {
                 .parse::<i64>()
                 .is_ok_and(|observed| observed >= now_epoch.saturating_sub(60))
         });
-        match status {
-            AdapterResultStatus::Failed | AdapterResultStatus::Timeout => {
+        match event {
+            CircuitEvent::TransportFailure => {
                 window.last_failure_at = Some(now_epoch.to_string());
-                window.last_failure_class = Some(format!("{status:?}").to_ascii_lowercase());
+                window.last_failure_class = Some("transport_failure".to_owned());
             }
-            AdapterResultStatus::Succeeded => {
+            CircuitEvent::IntegrityFailure => {
+                window.last_failure_at = Some(now_epoch.to_string());
+                window.last_failure_class = Some("integrity_failure".to_owned());
+            }
+            CircuitEvent::Success => {
                 window.last_success_at = Some(now_epoch.to_string());
             }
-            _ => {}
+            CircuitEvent::HalfOpenProbe => {}
         }
-        if matches!(
-            status,
-            AdapterResultStatus::Succeeded
-                | AdapterResultStatus::Failed
-                | AdapterResultStatus::Timeout
-        ) {
+        if !matches!(event, CircuitEvent::HalfOpenProbe) {
             window.last_terminal_operation_ref = terminal_operation_ref.map(str::to_owned);
         }
         window.consecutive_failures = record.consecutive_failures;
-        window.circuit_state = if record.circuit_open {
-            AdapterCircuitState::Open
-        } else if record.state == AdapterState::Degraded
-            && !matches!(
-                status,
-                AdapterResultStatus::Failed | AdapterResultStatus::Timeout
-            )
-        {
-            AdapterCircuitState::HalfOpen
-        } else {
-            AdapterCircuitState::Closed
+        window.circuit_state = match event {
+            CircuitEvent::HalfOpenProbe => AdapterCircuitState::HalfOpen,
+            CircuitEvent::Success => AdapterCircuitState::Closed,
+            CircuitEvent::TransportFailure | CircuitEvent::IntegrityFailure
+                if record.circuit_open =>
+            {
+                AdapterCircuitState::Open
+            }
+            CircuitEvent::TransportFailure | CircuitEvent::IntegrityFailure => {
+                AdapterCircuitState::Closed
+            }
         };
         window.updated_at = now_epoch.to_string();
         self.runtime_store.put_restart_window(window).await
@@ -780,6 +794,24 @@ pub fn normalize_result_to_observation(result: &AdapterResult) -> AdapterObserva
     let summary = match result.status {
         AdapterResultStatus::Succeeded => {
             format!("adapter {} produced candidate output", result.adapter_id)
+        }
+        AdapterResultStatus::TransportFailure => {
+            format!("adapter {} transport failed", result.adapter_id)
+        }
+        AdapterResultStatus::IntegrityFailure => {
+            format!("adapter {} integrity check failed", result.adapter_id)
+        }
+        AdapterResultStatus::NoResults => {
+            format!("adapter {} returned no results", result.adapter_id)
+        }
+        AdapterResultStatus::StaleIndex => {
+            format!("adapter {} reported a stale index", result.adapter_id)
+        }
+        AdapterResultStatus::UnsupportedCapability => {
+            format!(
+                "adapter {} does not support the requested capability",
+                result.adapter_id
+            )
         }
         AdapterResultStatus::Failed => format!("adapter {} failed", result.adapter_id),
         AdapterResultStatus::Timeout => format!("adapter {} timed out", result.adapter_id),
