@@ -187,10 +187,6 @@ KEEP_PATHS = {
         "Non-runtime implementation-support reference validating admitted named operations. "
         "KEEP as reference only; never a selectable production fallback.",
     ),
-    "workspace/tools/eliot-campaign-executor": (
-        "workspace tooling owner (developer tool, not production runtime)",
-        "Developer campaign tool. KEEP outside the production runtime boundary.",
-    ),
     "workspace/tools/eliot-runtime-compiler": (
         "workspace tooling owner (developer tool, not production runtime)",
         "Developer runtime-compiler tool. KEEP outside the production runtime boundary.",
