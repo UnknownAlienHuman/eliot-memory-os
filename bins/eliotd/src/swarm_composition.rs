@@ -82,6 +82,7 @@
 //! [`CanonicalSwarmPlanAttachmentStore`]: eliot_governor::CanonicalSwarmPlanAttachmentStore
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use eliot_governor::SwarmAttachmentComposition;
 use eliot_swarm::durable_dispatch::MAX_PLAN_DRAIN_CANCELS;
@@ -316,7 +317,8 @@ pub struct DrainOutcome {
     /// the runner reconciles each requested slot to terminal or retains it.
     /// Cancellation never claims rollback of already executed effect (I14.13).
     pub cancel_requested: Vec<String>,
-    /// Active children beyond the pass bound at finish; empty once
+    /// Active children still running when the drain exits, including children
+    /// beyond the pass bound or observed before a pass halted; empty once
     /// `terminal_ready` publishes.
     pub pending: Vec<String>,
     /// Unknown or stale children retained at finish; empty once
@@ -958,6 +960,27 @@ impl DrainBudget {
             passes: self.passes,
         }
     }
+
+    /// Builds a halt snapshot from the portion of the denominator already
+    /// observed in a pass. Terminal kinds have already been accumulated in
+    /// `terminal`; still-running and uncertain slots remain visible too.
+    fn snapshot_observed(&self, observed: &[(String, ChildState)]) -> DrainOutcome {
+        let pending: Vec<_> = observed
+            .iter()
+            .filter_map(|(slot, state)| match state {
+                ChildState::Running => Some(slot.clone()),
+                ChildState::Terminal(_) | ChildState::UnknownBlocked | ChildState::Stale => None,
+            })
+            .collect();
+        let unknown: Vec<_> = observed
+            .iter()
+            .filter_map(|(slot, state)| match state {
+                ChildState::UnknownBlocked | ChildState::Stale => Some(slot.clone()),
+                ChildState::Running | ChildState::Terminal(_) => None,
+            })
+            .collect();
+        self.snapshot(&pending, &unknown)
+    }
 }
 
 /// The single daemon swarm composition.
@@ -988,6 +1011,9 @@ pub struct SwarmComposition<'a, L: LaunchIntentLedger, R: ChildRunner> {
     /// cannot revive stale route authority (A0.3 hard boundary: restoration
     /// of revoked influence after recovery fails closed).
     route_bindings: Vec<RouteBindingPin>,
+    /// Serializes bounded drains and owns their non-authoritative round-robin
+    /// continuation. The ledger and runner remain the source of child truth.
+    drain_cursor: Mutex<usize>,
 }
 
 impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
@@ -1009,6 +1035,7 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             launched: Vec::new(),
             reconciled: false,
             route_bindings: Vec::new(),
+            drain_cursor: Mutex::new(0),
         }
     }
 
@@ -1362,7 +1389,12 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         let mut observed = Vec::with_capacity(self.launched.len());
         for intent in &self.launched {
             match self.runner.observe(&intent.slot) {
-                Ok(state) => observed.push((intent.slot.clone(), state)),
+                Ok(state) => {
+                    if let ChildState::Terminal(kind) = state {
+                        budget.terminal.insert(intent.slot.clone(), kind);
+                    }
+                    observed.push((intent.slot.clone(), state));
+                }
                 Err(error) => match error.drain_failure_scope() {
                     FailureScope::ChildLocal => {
                         budget.local_failures.push(ChildLocalFailure {
@@ -1378,7 +1410,7 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
                     FailureScope::Global => {
                         return Err(SwarmCompositionError::DrainHalted {
                             cause: Box::new(error),
-                            progress: Box::new(budget.snapshot(&[], &[])),
+                            progress: Box::new(budget.snapshot_observed(&observed)),
                         });
                     }
                 },
@@ -1403,11 +1435,22 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         budget: &mut DrainBudget,
     ) -> Result<usize, SwarmCompositionError> {
         let mut served_new = 0_usize;
+        let denominator = self.launched.len();
         for slot in cancel {
+            // Move immediately after each visited candidate so an early
+            // global cancel failure leaves the cursor after the failing slot.
+            if let Some(index) = self.launched.iter().position(|intent| &intent.slot == slot) {
+                budget.cursor = if index + 1 == denominator {
+                    0
+                } else {
+                    index + 1
+                };
+            }
             if budget.cancel_requested.contains(slot) {
                 // Already requested on an earlier pass: the re-observation
                 // already polled that same cancellation identity through the
-                // owner, so poll again next pass rather than reminting.
+                // owner, so poll again next pass rather than reminting. The
+                // frontier still advances past this visited slot.
                 continue;
             }
             match self.runner.cancel(slot) {
@@ -1439,6 +1482,9 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// Drains one attached plan to its terminal aggregate through bounded
     /// passes (issue #2652).
     ///
+    /// Concurrent calls on one composition serialize for the duration of
+    /// each drain, preserving the shared frontier's progression.
+    ///
     /// Each pass re-observes the dispositions of every launched intent through
     /// the owner-side [`ChildRunner::observe`] path — this re-observation is
     /// the poll/reconcile of already-requested cancels: a slot whose cancel
@@ -1462,12 +1508,13 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     ///   [`ChildState::Terminal`] with its exact [`ChildExit`] proves
     ///   settlement, so a lost acknowledgement stays possibly applied until
     ///   re-observation settles that same slot identity;
-    /// - the presented denominator rotates across passes past newly served
-    ///   slots and already-requested slots are polled rather than reminted,
-    ///   so a slow first group cannot starve later eligible children; a zero
-    ///   allowance, or a pass with no new request and no newly observed
-    ///   terminal, returns an explicit bounded partial
-    ///   ([`SwarmCompositionError::DrainBudgetPartial`]) instead of spinning.
+    /// - the presented denominator rotates across passes and bounded calls
+    ///   past each visited cancel candidate, including child-local failures
+    ///   and already-requested slots skipped without reminting, so a slow
+    ///   first group cannot starve later eligible children; a zero allowance,
+    ///   or a pass with no new request and no newly observed terminal, returns
+    ///   an explicit bounded partial ([`SwarmCompositionError::DrainBudgetPartial`])
+    ///   instead of spinning.
     ///
     /// The loop is additionally bounded by [`MAX_DRAIN_PASSES`]
     /// ([`SwarmCompositionError::DrainBoundExhausted`]). A terminal aggregate
@@ -1487,6 +1534,10 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         &self,
         max_cancels_per_pass: usize,
     ) -> Result<DrainOutcome, SwarmCompositionError> {
+        let mut drain_cursor = self
+            .drain_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.plan.is_none() {
             return Err(SwarmCompositionError::PlanNotAttached);
         }
@@ -1499,21 +1550,21 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             terminal: BTreeMap::new(),
             cancel_requested: BTreeSet::new(),
             local_failures: Vec::new(),
-            cursor: 0,
+            cursor: *drain_cursor % denominator,
             passes: 0,
         };
         loop {
-            let mut observed = self.observe_drain_denominator(&mut budget)?;
-            budget.passes += 1;
             let terminals_before = budget.terminal.len();
+            budget.passes += 1;
+            let mut observed = self.observe_drain_denominator(&mut budget)?;
             // Frontier rotation: present the denominator from the cursor so
             // later eligible children are visited even when an earlier group
-            // stays live across passes.
-            observed.rotate_left(budget.cursor % denominator);
+            // stays live across passes or bounded calls.
+            observed.rotate_left(budget.cursor);
             let view = plan_drain(&observed, bound).map_err(|error| {
                 SwarmCompositionError::DrainHalted {
                     cause: Box::new(error),
-                    progress: Box::new(budget.snapshot(&[], &[])),
+                    progress: Box::new(budget.snapshot_observed(&observed)),
                 }
             })?;
             for (slot, kind) in &view.terminal {
@@ -1530,9 +1581,10 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
                     progress: Box::new(budget.snapshot(&view.pending, &view.unknown)),
                 });
             }
-            let served_new =
-                self.serve_drain_cancels(&view.cancel, &view.pending, &view.unknown, &mut budget)?;
-            budget.cursor = (budget.cursor + served_new) % denominator;
+            let served =
+                self.serve_drain_cancels(&view.cancel, &view.pending, &view.unknown, &mut budget);
+            *drain_cursor = budget.cursor;
+            let served_new = served?;
             // Unknown blocks only the terminal aggregate: the authorized
             // cancels above were already served, so the incomplete aggregate
             // returns with every unknown child retained and progress kept.
