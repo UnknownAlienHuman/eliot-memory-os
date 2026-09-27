@@ -241,7 +241,13 @@ pub fn authenticate_named_pipe_client(
                 let process_is_admin = process_token_is_builtin_administrator(process)?;
                 let impersonation = ImpersonationGuard::begin(pipe_handle)?;
                 let thread_is_admin = thread_token_is_builtin_administrator()?;
-                impersonation.revert()?;
+                // The explicit restoration outcome is a typed stage/code, not a
+                // boolean: a failed revert never lets this authentication
+                // report success, and its raw code stays in the returned value
+                // and in the guard's bounded evidence.
+                impersonation
+                    .revert()
+                    .map_err(impersonation_restore_adapter_error)?;
                 // The process token and the impersonated token are checked
                 // independently through TokenGroups. Never pass a primary
                 // process token to CheckTokenMembership.
@@ -379,7 +385,13 @@ pub fn authenticate_named_pipe_client_with_peer_set(
             let process_is_admin = process_token_is_builtin_administrator(process)?;
             let impersonation = ImpersonationGuard::begin(pipe_handle)?;
             let thread_is_admin = thread_token_is_builtin_administrator()?;
-            impersonation.revert()?;
+            // The explicit restoration outcome is a typed stage/code, not a
+            // boolean: a failed revert never lets this authentication report
+            // success, and its raw code stays in the returned value and in the
+            // guard's bounded evidence.
+            impersonation
+                .revert()
+                .map_err(impersonation_restore_adapter_error)?;
             process_is_admin && thread_is_admin && sid != "S-1-5-18"
         } else {
             false
@@ -466,9 +478,128 @@ fn active_interactive_session(session_id: u32) -> Result<bool, WindowsAdapterErr
     Ok(state == WTSActive)
 }
 
+/// Bounded stage at which the named-pipe impersonation guard observes a raw
+/// Win32 result.
+///
+/// The guard makes exactly two Win32 calls and only the explicit
+/// `RevertToSelf` failure has a restoration outcome, so the stage set is
+/// closed. The name is the Win32 entry point verbatim and is the exact string
+/// the bounded evidence record carries, so the record names the stage without
+/// allocating or formatting on a fail-stop path.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImpersonationRestoreStage {
+    RevertToSelf,
+}
+
+#[cfg(windows)]
+impl ImpersonationRestoreStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::RevertToSelf => "RevertToSelf",
+        }
+    }
+}
+
+/// Exact typed restoration failure of the named-pipe impersonation guard.
+///
+/// Issue #860 test-matrix case 8 requires the exact Windows error of a failed
+/// `RevertToSelf` to survive the explicit restoration attempt. The coarse
+/// `WindowsAdapterError` vocabulary carries no code, so
+/// `windows_adapter_from_io` mapped every Win32 code it does not recognize
+/// onto `WindowsAdapterError::Failed` and two different explicit failures
+/// surfaced as the same value; the raw evidence an error must preserve (I2.6
+/// "An error preserves: ... raw evidence handle") was unobservable. This
+/// variant keeps the bounded stage and the raw code of the failed call, the
+/// same shape as `InstallerRootError::Win32` and
+/// `HostOwnerLeaseReleaseError`.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImpersonationRestoreError {
+    /// A raw Win32 failure observed at a bounded restoration stage.
+    Win32 {
+        stage: ImpersonationRestoreStage,
+        code: u32,
+    },
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for ImpersonationRestoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Win32 { stage, code } => {
+                write!(
+                    formatter,
+                    "named-pipe impersonation {} failed (Win32 error {code})",
+                    stage.name()
+                )
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for ImpersonationRestoreError {}
+
+#[cfg(windows)]
+impl ImpersonationRestoreError {
+    /// Bounded evidence pair for one failure: the static stage name and the
+    /// exact numeric code, in the same shape as the installer-root restoration
+    /// evidence helper. Allocates nothing, formats nothing, and carries no
+    /// token or principal value, so the fail-stop path can use it unchanged.
+    fn evidence(self) -> (&'static str, u32) {
+        match self {
+            Self::Win32 { stage, code } => (stage.name(), code),
+        }
+    }
+}
+
+/// Types the raw Win32 code of the `RevertToSelf` call that just failed.
+///
+/// No OS call sits between the failed call and this read, so the thread-local
+/// error it captures is that call's own code. The result is a `Copy` value:
+/// no allocation, no formatting, no panic, so the emergency Drop path uses it
+/// exactly like the explicit path.
+#[cfg(windows)]
+fn last_revert_to_self_failure() -> ImpersonationRestoreError {
+    let code = std::io::Error::last_os_error()
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .unwrap_or(u32::MAX);
+    ImpersonationRestoreError::Win32 {
+        stage: ImpersonationRestoreStage::RevertToSelf,
+        code,
+    }
+}
+
+/// Projects one exact restoration failure onto the coarse adapter vocabulary
+/// this crate returns from peer authentication.
+///
+/// BLOCKED-BY (#860, outside this row's mutable file set): the public
+/// `WindowsAdapterError` enum in `src/lib.rs` has no code-carrying variant, and
+/// adding one requires naming that variant in the two exhaustive matches in
+/// `src/installer_authority_key.rs`, which this row does not own. Until that
+/// owner resolution exists, this is the same faithful code-to-class mapping
+/// every other raw Win32 failure in this cell already uses, and the exact stage
+/// and code stay in the typed value [`ImpersonationGuard::revert`] returned and
+/// in the bounded evidence the guard records.
+#[cfg(windows)]
+fn impersonation_restore_adapter_error(failure: ImpersonationRestoreError) -> WindowsAdapterError {
+    let ImpersonationRestoreError::Win32 { code, .. } = failure;
+    windows_adapter_from_io(&std::io::Error::from_raw_os_error(
+        i32::try_from(code).unwrap_or(i32::MAX),
+    ))
+}
+
 #[cfg(windows)]
 struct ImpersonationGuard {
     active: bool,
+    /// The first restoration failure observed on this guard, written once by
+    /// the explicit attempt and never rewritten. The emergency Drop attempt
+    /// that may follow it reads this field instead of recording its own code,
+    /// so the terminal evidence record names the primary refusal rather than
+    /// the retry that followed it.
+    first_failure: Option<ImpersonationRestoreError>,
 }
 
 #[cfg(windows)]
@@ -478,12 +609,27 @@ impl ImpersonationGuard {
         if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
             return Err(last_windows_adapter_error());
         }
-        Ok(Self { active: true })
+        Ok(Self {
+            active: true,
+            first_failure: None,
+        })
     }
 
-    fn revert(mut self) -> Result<(), WindowsAdapterError> {
+    /// Explicit normal-path restoration with an exact typed outcome.
+    ///
+    /// A failed `RevertToSelf` is never collapsed into a coarse adapter
+    /// variant, never replaced by a boolean, and never reported as a completed
+    /// authentication: the raw Win32 code is returned to the caller and
+    /// recorded as this guard's first failure. The guard stays armed on
+    /// failure because the thread may still hold the client token, so the
+    /// emergency Drop attempt must still run; that attempt reports the
+    /// recorded first failure in its bounded evidence and never overwrites or
+    /// shadows the result returned here.
+    fn revert(mut self) -> Result<(), ImpersonationRestoreError> {
         if unsafe { windows_sys::Win32::Security::RevertToSelf() } == 0 {
-            return Err(last_windows_adapter_error());
+            let failure = last_revert_to_self_failure();
+            self.first_failure = Some(failure);
+            return Err(failure);
         }
         self.active = false;
         Ok(())
@@ -511,16 +657,20 @@ impl Drop for ImpersonationGuard {
         // principal values.
         // ABORT_BOUNDARY site="peer-auth/impersonation-drop" invariant="untrusted-client-token"
         if unsafe { windows_sys::Win32::Security::RevertToSelf() } == 0 {
-            // Safe immediate read of the failed-call code: no OS call sits
-            // between RevertToSelf and this probe, so no new unsafe block is
-            // introduced on the emergency path.
-            let code = std::io::Error::last_os_error()
-                .raw_os_error()
-                .and_then(|code| u32::try_from(code).ok())
-                .unwrap_or(u32::MAX);
+            // The record names the primary failure. When the explicit attempt
+            // already failed, its exact stage/code is the first refusal and the
+            // only one any caller ever saw, so this retry must not shadow it
+            // with its own code. When no explicit attempt ran — Drop after a
+            // panic or unwind that skipped the normal path — this attempt is
+            // the first failure and is the one recorded.
+            let failure = match self.first_failure {
+                Some(first) => first,
+                None => last_revert_to_self_failure(),
+            };
+            let (detail, code) = failure.evidence();
             crate::installer_root::emit_abort_boundary_evidence(
                 "peer-auth/impersonation-drop",
-                "RevertToSelf",
+                detail,
                 code,
             );
             std::process::abort();
