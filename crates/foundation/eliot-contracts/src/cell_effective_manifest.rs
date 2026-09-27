@@ -14,7 +14,8 @@
 //!   `affected_edges` (one-hop providers/consumers).
 //! * Explicit declarations, never inferred from the crate name:
 //!   `lifecycle_owner`, `runtime_bundle`, `execution_contour`,
-//!   `runtime_class`, `state_class`, `replacement_class`, `iteration_lane`
+//!   `runtime_class`, `state_class`, `canonical_semantic`,
+//!   `replacement_class`, `iteration_lane`
 //!   bound to a referenced [`ProofLatencyProfileRef`], `proof_entrypoint` and
 //!   `proof_ceiling`, `recovery_boundary`, `contract_digest` and
 //!   `freshness`. A missing non-derivable field is rejected; a crate-derived
@@ -199,6 +200,38 @@ pub enum IterationLane {
     ManualRelease,
 }
 
+/// Explicit declaration of canonical semantic ownership (`I2.10`).
+///
+/// `I2.10` admits no `canonical_semantic` state class: canonical storage,
+/// semantic admission, and mechanical fencing remain one path with separated
+/// responsibilities. The claim is therefore carried as an explicit declaration
+/// rather than left implicit in a state class, and a `CanonicalSemantic` claim
+/// is refused for every hot-replaceable replacement class with
+/// [`CellManifestError::HotReplaceableCanonicalSemantic`] instead of being
+/// ignored. No value is derived from a crate, bundle, source-layer, or
+/// runtime-layer name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CanonicalSemanticOwnership {
+    /// The cell claims no canonical semantic ownership.
+    NotClaimed,
+    /// The cell claims canonical semantic ownership.
+    CanonicalSemantic,
+}
+
+impl ModuleReplacementClass {
+    /// Returns whether a generation of this class can be replaced while the
+    /// product keeps running (`I2.10`).
+    ///
+    /// `component_generation`, `process_generation`, `daemon_generation`, and
+    /// `host_generation` each name a declared cutover that replaces one
+    /// generation without stopping the product. `offline_release` records that
+    /// no safe online cutover exists yet, so it is not hot-replaceable.
+    pub const fn is_hot_replaceable(self) -> bool {
+        !matches!(self, Self::OfflineRelease)
+    }
+}
+
 /// Declared plus derived inputs for generating one cell manifest.
 ///
 /// Explicit `module.toml` declarations arrive as typed values; a missing
@@ -219,16 +252,22 @@ pub struct CellManifestInput {
     pub lifecycle_owner: Option<CellOwnerRef>,
     /// Named runtime bundle hosting the cell, when execution is delegated.
     pub runtime_bundle: Option<RuntimeBundleId>,
-    /// Where the cell executes.
-    pub execution_contour: ModuleExecutionContour,
-    /// Runtime role of the cell.
-    pub runtime_class: ModuleRuntimeClass,
-    /// State ownership class of the cell.
-    pub state_class: ModuleStateClass,
-    /// Runtime replacement class of the cell.
-    pub replacement_class: ModuleReplacementClass,
-    /// Development loop lane, bound to `proof_latency_profile`.
-    pub iteration_lane: IterationLane,
+    /// Where the cell executes; `None` is rejected, never crate-defaulted.
+    pub execution_contour: Option<ModuleExecutionContour>,
+    /// Runtime role of the cell; `None` is rejected, never crate-defaulted.
+    pub runtime_class: Option<ModuleRuntimeClass>,
+    /// State ownership class of the cell; `None` is rejected, never
+    /// crate-defaulted.
+    pub state_class: Option<ModuleStateClass>,
+    /// Runtime replacement class of the cell; `None` is rejected, never
+    /// crate-defaulted.
+    pub replacement_class: Option<ModuleReplacementClass>,
+    /// Development loop lane, bound to `proof_latency_profile`; `None` is
+    /// rejected, never crate-defaulted.
+    pub iteration_lane: Option<IterationLane>,
+    /// Explicit claim of canonical semantic ownership; `I2.10` refuses it for
+    /// every hot-replaceable replacement class.
+    pub canonical_semantic: CanonicalSemanticOwnership,
     /// Referenced proof-latency profile evidencing the lane.
     pub proof_latency_profile: ProofLatencyProfileRef,
     /// Independently invokable proof entrypoint; `None` is rejected.
@@ -271,6 +310,8 @@ pub struct EffectiveCellManifest {
     pub runtime_class: ModuleRuntimeClass,
     /// State ownership class of the cell.
     pub state_class: ModuleStateClass,
+    /// Explicit claim of canonical semantic ownership of the cell.
+    pub canonical_semantic: CanonicalSemanticOwnership,
     /// Runtime replacement class of the cell.
     pub replacement_class: ModuleReplacementClass,
     /// Development loop lane of the cell.
@@ -336,6 +377,15 @@ pub enum CellManifestError {
         /// Declared state ownership class.
         state: String,
         /// Declared runtime replacement class.
+        replacement: String,
+    },
+    /// A hot-replaceable cell claims canonical semantic ownership. `I2.10`
+    /// admits no `canonical_semantic` ownership for a module whose generation
+    /// can be replaced while the product keeps running.
+    HotReplaceableCanonicalSemantic {
+        /// Cell making the claim.
+        cell: String,
+        /// Replacement class that makes the cell hot-replaceable.
         replacement: String,
     },
     /// One multi-cell generation call mixes inputs from more than one source
@@ -408,6 +458,10 @@ impl fmt::Display for CellManifestError {
                 formatter,
                 "cell '{cell}' state class '{state}' is incompatible with replacement class '{replacement}'"
             ),
+            Self::HotReplaceableCanonicalSemantic { cell, replacement } => write!(
+                formatter,
+                "cell '{cell}' is hot-replaceable through '{replacement}' and must not declare canonical_semantic"
+            ),
             Self::MixedSourceCrates { crates } => write!(
                 formatter,
                 "multi-cell generation mixes source crates: {}",
@@ -462,6 +516,7 @@ struct EffectiveCellManifestDigestBody<'a> {
     execution_contour: &'a ModuleExecutionContour,
     runtime_class: &'a ModuleRuntimeClass,
     state_class: &'a ModuleStateClass,
+    canonical_semantic: &'a CanonicalSemanticOwnership,
     replacement_class: &'a ModuleReplacementClass,
     iteration_lane: &'a IterationLane,
     proof_latency_profile: &'a ProofLatencyProfileRef,
@@ -553,7 +608,7 @@ fn lane_profile_consistent(lane: IterationLane, profile: &ProofLatencyProfileRef
 ///
 /// Every other combination is admitted; source decomposition and runtime
 /// replacement remain independent decisions.
-fn state_replacement_compatible(
+pub(crate) fn state_replacement_compatible(
     state: ModuleStateClass,
     replacement: ModuleReplacementClass,
 ) -> bool {
@@ -570,6 +625,49 @@ fn state_replacement_compatible(
             ModuleReplacementClass::DaemonGeneration,
         )
     )
+}
+
+/// Refuses an absent `I2.10` classification.
+///
+/// The five classifications are explicit declarations of a functional cell; an
+/// absent one fails generation with
+/// [`CellManifestError::MissingField`] naming the exact classification, and is
+/// never synthesized from a crate, bundle, source-layer, or runtime-layer name.
+fn require_classification<T>(
+    cell: &str,
+    field: &'static str,
+    declared: Option<T>,
+) -> Result<T, CellManifestError> {
+    declared.ok_or_else(|| CellManifestError::MissingField {
+        cell: cell.to_owned(),
+        field,
+    })
+}
+
+/// Enforces the `I2.10` rule that no hot-replaceable module declares
+/// `canonical_semantic`.
+///
+/// A cell whose replacement class names a declared online cutover may be
+/// replaced while the product keeps running, so it must not own canonical
+/// semantics; canonical storage, semantic admission, and mechanical fencing
+/// stay one path with separated responsibilities. A non-hot-replaceable
+/// `offline_release` cell keeps its explicit claim. The claim is read only
+/// from the declaration, never from a crate, bundle, source-layer, or
+/// runtime-layer name.
+fn check_canonical_semantic_ownership(
+    cell: &str,
+    ownership: CanonicalSemanticOwnership,
+    replacement: ModuleReplacementClass,
+) -> Result<(), CellManifestError> {
+    if ownership == CanonicalSemanticOwnership::CanonicalSemantic
+        && replacement.is_hot_replaceable()
+    {
+        return Err(CellManifestError::HotReplaceableCanonicalSemantic {
+            cell: cell.to_owned(),
+            replacement: format!("{replacement:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Enforces the cross-field consistency rules shared by generation and
@@ -645,6 +743,7 @@ impl EffectiveCellManifest {
             execution_contour: &self.execution_contour,
             runtime_class: &self.runtime_class,
             state_class: &self.state_class,
+            canonical_semantic: &self.canonical_semantic,
             replacement_class: &self.replacement_class,
             iteration_lane: &self.iteration_lane,
             proof_latency_profile: &self.proof_latency_profile,
@@ -680,8 +779,9 @@ impl EffectiveCellManifest {
     /// the carried digest matches the recomputed canonical digest, no owner
     /// is derived from the hosting crate name, delegated execution names a
     /// runtime bundle, the iteration lane is evidenced by its referenced
-    /// proof-latency profile, and the state/replacement pair is admissible
-    /// under `I2.10`.
+    /// proof-latency profile, the state/replacement pair is admissible
+    /// under `I2.10`, and a hot-replaceable cell declares no
+    /// `canonical_semantic` ownership.
     pub fn validate(&self) -> Result<(), CellManifestError> {
         let expected_id = manifest_identity(&self.functional_cell_ref, self.cell_revision);
         if self.manifest_id.as_str() != expected_id {
@@ -714,18 +814,26 @@ impl EffectiveCellManifest {
             self.state_class,
             self.replacement_class,
         )?;
+        check_canonical_semantic_ownership(
+            self.functional_cell_ref.as_str(),
+            self.canonical_semantic,
+            self.replacement_class,
+        )?;
         Ok(())
     }
 }
 
 /// Generates one effective manifest for one cell input.
 ///
-/// Missing non-derivable declarations (`lifecycle_owner`, `proof_entrypoint`)
-/// are rejected; a crate-derived owner spelling is rejected as inferred
-/// authority instead of being accepted as a default. Delegated execution
-/// without a named `runtime_bundle`, a lane unevidenced by its referenced
-/// proof-latency profile, and an inadmissible `I2.10` state/replacement pair
-/// are rejected fail-closed as well.
+/// Missing non-derivable declarations (`lifecycle_owner`, `proof_entrypoint`,
+/// and the five classifications `execution_contour`, `runtime_class`,
+/// `state_class`, `replacement_class`, `iteration_lane`) are rejected; a
+/// crate-derived owner spelling is rejected as inferred authority instead of
+/// being accepted as a default. Delegated execution without a named
+/// `runtime_bundle`, a lane unevidenced by its referenced proof-latency
+/// profile, an inadmissible `I2.10` state/replacement pair, and a
+/// hot-replaceable cell claiming `canonical_semantic` are rejected
+/// fail-closed as well.
 pub fn generate_effective_manifest(
     input: CellManifestInput,
 ) -> Result<EffectiveCellManifest, CellManifestError> {
@@ -750,15 +858,24 @@ pub fn generate_effective_manifest(
                 cell: cell_name.clone(),
                 field: "proof_entrypoint",
             })?;
+    let execution_contour =
+        require_classification(&cell_name, "execution_contour", input.execution_contour)?;
+    let runtime_class = require_classification(&cell_name, "runtime_class", input.runtime_class)?;
+    let state_class = require_classification(&cell_name, "state_class", input.state_class)?;
+    let replacement_class =
+        require_classification(&cell_name, "replacement_class", input.replacement_class)?;
+    let iteration_lane =
+        require_classification(&cell_name, "iteration_lane", input.iteration_lane)?;
+    check_canonical_semantic_ownership(&cell_name, input.canonical_semantic, replacement_class)?;
     check_cross_field_consistency(
         &cell_name,
-        input.execution_contour,
-        input.runtime_class,
+        execution_contour,
+        runtime_class,
         input.runtime_bundle.as_ref(),
-        input.iteration_lane,
+        iteration_lane,
         &input.proof_latency_profile,
-        input.state_class,
-        input.replacement_class,
+        state_class,
+        replacement_class,
     )?;
     let manifest_id = ManifestId::new(manifest_identity(&input.cell, input.cell_revision))
         .map_err(|error| CellManifestError::DigestFailed {
@@ -771,11 +888,12 @@ pub fn generate_effective_manifest(
         source_crate: input.source_crate,
         lifecycle_owner,
         runtime_bundle: input.runtime_bundle,
-        execution_contour: input.execution_contour,
-        runtime_class: input.runtime_class,
-        state_class: input.state_class,
-        replacement_class: input.replacement_class,
-        iteration_lane: input.iteration_lane,
+        execution_contour,
+        runtime_class,
+        state_class,
+        canonical_semantic: input.canonical_semantic,
+        replacement_class,
+        iteration_lane,
         proof_latency_profile: input.proof_latency_profile,
         proof_entrypoint,
         proof_ceiling: input.proof_ceiling,
@@ -902,11 +1020,12 @@ mod tests {
             source_crate: SourceCrateRef::new("eliot-contracts")?,
             lifecycle_owner: Some(CellOwnerRef::new(owner)?),
             runtime_bundle: None,
-            execution_contour: ModuleExecutionContour::StaticNative,
-            runtime_class: ModuleRuntimeClass::KernelInternal,
-            state_class: ModuleStateClass::Stateless,
-            replacement_class: ModuleReplacementClass::HostGeneration,
-            iteration_lane: IterationLane::Normal,
+            execution_contour: Some(ModuleExecutionContour::StaticNative),
+            runtime_class: Some(ModuleRuntimeClass::KernelInternal),
+            state_class: Some(ModuleStateClass::Stateless),
+            canonical_semantic: CanonicalSemanticOwnership::NotClaimed,
+            replacement_class: Some(ModuleReplacementClass::HostGeneration),
+            iteration_lane: Some(IterationLane::Normal),
             proof_latency_profile: ProofLatencyProfileRef::new("eliot-contracts/profile/normal")?,
             proof_entrypoint: Some(ProofEntrypointRef::new("eliot-contracts proof")?),
             proof_ceiling: ProofCeiling::ModuleEdgeProof,
@@ -989,14 +1108,14 @@ mod tests {
     #[test]
     fn delegated_execution_requires_named_runtime_bundle() -> TestResult {
         let mut native = valid_input("foundation.tool.native", "foundation-tool-owner")?;
-        native.execution_contour = ModuleExecutionContour::NativeProcess;
+        native.execution_contour = Some(ModuleExecutionContour::NativeProcess);
         assert!(matches!(
             generate_effective_manifest(native),
             Err(CellManifestError::MissingRuntimeBundle { .. })
         ));
 
         let mut bundled = valid_input("foundation.tool.native", "foundation-tool-owner")?;
-        bundled.execution_contour = ModuleExecutionContour::NativeProcess;
+        bundled.execution_contour = Some(ModuleExecutionContour::NativeProcess);
         bundled.runtime_bundle = Some(RuntimeBundleId::new("tool-native-bundle")?);
         let bundled_manifest = generate_effective_manifest(bundled)?;
         bundled_manifest
@@ -1013,7 +1132,7 @@ mod tests {
             ModuleRuntimeClass::SupervisorSecurity,
         ] {
             let mut input = valid_input("foundation.service.cell", "foundation-service-owner")?;
-            input.runtime_class = class;
+            input.runtime_class = Some(class);
             assert!(
                 matches!(
                     generate_effective_manifest(input),
@@ -1030,7 +1149,7 @@ mod tests {
             ModuleRuntimeClass::DevelopmentTool,
         ] {
             let mut input = valid_input("foundation.host.cell", "foundation-host-owner")?;
-            input.runtime_class = class;
+            input.runtime_class = Some(class);
             generate_effective_manifest(input).map_err(|error| error.to_string())?;
         }
 
@@ -1052,7 +1171,7 @@ mod tests {
     #[test]
     fn iteration_lane_requires_evidencing_profile() -> TestResult {
         let mut mismatched = valid_input("foundation.contracts.primitives", "foundation-owner")?;
-        mismatched.iteration_lane = IterationLane::Interactive;
+        mismatched.iteration_lane = Some(IterationLane::Interactive);
         assert!(matches!(
             generate_effective_manifest(mismatched),
             Err(CellManifestError::IncompatibleLaneProfile { .. })
@@ -1079,7 +1198,7 @@ mod tests {
             ),
         ] {
             let mut input = valid_input("foundation.contracts.primitives", "foundation-owner")?;
-            input.iteration_lane = lane;
+            input.iteration_lane = Some(lane);
             input.proof_latency_profile = ProofLatencyProfileRef::new(profile)?;
             generate_effective_manifest(input).map_err(|error| error.to_string())?;
         }
@@ -1116,8 +1235,8 @@ mod tests {
             ),
         ] {
             let mut input = valid_input("foundation.contracts.primitives", "foundation-owner")?;
-            input.state_class = state;
-            input.replacement_class = replacement;
+            input.state_class = Some(state);
+            input.replacement_class = Some(replacement);
             assert!(
                 matches!(
                     generate_effective_manifest(input),
@@ -1158,8 +1277,8 @@ mod tests {
             ),
         ] {
             let mut input = valid_input("foundation.contracts.primitives", "foundation-owner")?;
-            input.state_class = state;
-            input.replacement_class = replacement;
+            input.state_class = Some(state);
+            input.replacement_class = Some(replacement);
             generate_effective_manifest(input).map_err(|error| error.to_string())?;
         }
 
