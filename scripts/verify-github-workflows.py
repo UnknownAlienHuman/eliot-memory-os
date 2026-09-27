@@ -13,7 +13,11 @@ Enforces that:
    mutable tags/branches/short SHAs/expressions are rejected, the same action may
    not carry two different pins across workflows, and every reference's
    owner/repository/SHA identity is derived from the files and published in the
-   --json-out payload as the first step toward the run manifest.
+   --json-out payload as the first step toward the run manifest. The reference is
+   read from every YAML spelling GitHub accepts (same-line value, block-mapping
+   value on the following lines, flow-mapping value), so a mutable tag cannot
+   escape the rule by changing only the YAML shape, and the manifest records
+   exactly the references the rules judge.
 3. Top-level permissions remain minimal (contents: read); broad write-all is rejected.
 4. Python verification dependencies are fully version- and hash-locked with --hash=sha256.
 5. NuGet dependencies for Eliot.Operator and the Eliot.Operator.Tests harness
@@ -33,7 +37,8 @@ Enforces that:
    workflow that builds Eliot.Operator executes the Eliot.Operator.Tests
    harness through an explicit dotnet run/exec invocation (issue #1225
    N_step5: a restore line, a step name, quoted prose, or a run-summary
-   claim alone is not execution).
+   claim alone is not execution, and an invocation GitHub may skip or
+   discard is not executed evidence).
 8. Workflow names indicate manual invocation and state bounded proof ceilings.
 9. Referenced local scripts exist on disk.
 10. Workflow pip installs consume only the hash-locked
@@ -55,10 +60,19 @@ from typing import Any
 
 
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-# Step-level `- uses:` and job-level reusable `uses:` (no dash). The capture
-# stops at the first whitespace or `#`, so a trailing `# v4.2.2` release
-# annotation is comment metadata and never becomes part of the ref.
-ACTION_REF_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)")
+# A YAML `uses` KEY, wherever it appears in a workflow: a step-level `- uses:`,
+# a job-level reusable `uses:` (no dash), the same key in a flow mapping
+# (`- { uses: ... }`), and a block mapping whose value sits on later lines
+# (`- uses:` followed by an indented value). Every spelling GitHub accepts is
+# captured here, so the pin, owner and one-pin rules see all of them.
+USES_KEY_RE = re.compile(r"(?:^|[{,\s\[])(?:-)?\s*uses\s*:(?!:)")
+# A `uses` VALUE: a single-quoted or double-quoted scalar, or a plain scalar,
+# terminated at a comment (`# ...` release annotation) or at a flow mapping
+# separator. The value is never taken across a comment, so a release
+# annotation stays comment metadata and never becomes part of the ref.
+USES_VALUE_RE = re.compile(
+    r'''\s*(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<plain>[^\s,\]#}]+))'''
+)
 # Action identity shape: owner/repo[/path...]@ref. A `${{ ... }}` ref fails the
 # full 40-hex ref test, and a reference without an owner segment fails the
 # owner-shape test, so neither can silently reach the pin decision.
@@ -125,6 +139,36 @@ HARNESS_COMMAND_PREFIX_RE = re.compile(
 # an execution invocation above, and it fails the rule without one.
 OPERATOR_EXECUTION_CLAIM = "Operator tests: executed"
 
+# Execution conditions (issue #1225 N_step5). An invocation line is executed
+# evidence only when the step that carries it can actually execute and its
+# result reaches the run, so each of these governing keys is read:
+#   `if:`            a step condition makes the step conditional, so a false
+#                    condition means the step is skipped and nothing executed,
+#                    and any condition that cannot be proven false is still an
+#                    unverifiable execution condition;
+#   `continue-on-error:`
+#                    a failing step is discarded, so its outcome proves nothing
+#                    about the harness having run and passed;
+#   `timeout-minutes:`
+#                    a step that is always killed before the harness finishes
+#                    never reaches terminal harness evidence.
+# GitHub accepts the hyphenated and underscored spellings of the two hyphenated
+# keys, so both are recognized. The keys are compared on the normalized key, and
+# every enclosing job scope is read as well: a skipped job never reaches its
+# steps, and a `continue-on-error` job discards its steps' results.
+
+
+def _strip_expression_braces(body: str) -> str:
+    return body.replace("$", "").replace("{", "").replace("}", "").strip()
+
+
+def _strip_comment(text: str) -> str:
+    return text.split("#", 1)[0]
+
+
+def _strip_quotes(text: str) -> str:
+    return text.strip().strip("'\"")
+
 
 def workflow_code_line(line: str) -> str:
     """A workflow line without quoted prose or a trailing comment.
@@ -138,16 +182,163 @@ def workflow_code_line(line: str) -> str:
     return code.split("#", 1)[0]
 
 
-def operator_harness_executed(content: str) -> bool:
-    """True when the workflow text executes the Operator test harness.
+def _condition_is_falsy(expression: str) -> bool:
+    """True when a GitHub `if:` condition provably evaluates to false.
 
-    The harness mention counts only when `dotnet` is the invoked command:
-    a print builtin (`echo`, `Write-Host`, ...) before it on the same code
-    line makes the mention its argument (prose, not execution), and anything
-    else before it outside YAML framing, chaining separators, or an explicit
-    shell wrapper means `dotnet` is not at command position.
+    Two closed cases: an empty condition (`if:`, `if: ${{ }}`, `if: null`) and a
+    condition whose value is `false` or numeric zero. Any other condition is not
+    proof of a skip, so it stays an unverifiable condition rather than a licence
+    to claim execution.
     """
-    for line in content.splitlines():
+    value = _strip_quotes(_strip_comment(_strip_expression_braces(expression)))
+    text = value.strip()
+    if text in ("", "null"):
+        return True
+    if text.lower() == "false":
+        return True
+    try:
+        return float(text) == 0.0
+    except ValueError:
+        return False
+
+
+def _condition_is_unconditional(expression: str) -> bool:
+    """True when a GitHub `if:` condition runs the step on every dispatch.
+
+    An absent condition, the literals `true`/`always()`, and a comparison whose
+    two sides are identical all run the step whatever the run looks like. Any
+    other condition depends on something the workflow does not fix at authoring
+    time, so it is a condition the claim may not assume holds.
+    """
+    value = _strip_quotes(_strip_comment(_strip_expression_braces(expression)))
+    text = value.strip()
+    if text in ("", "true", "always", "always()"):
+        return True
+    left, separator, right = text.partition("==")
+    if separator and left.strip() and left.strip() == right.strip():
+        return True
+    return False
+
+
+def _yaml_key(line: str) -> str | None:
+    """The YAML mapping key of a line, or None when the line carries none.
+
+    Accepts the ordinary spellings GitHub accepts for a mapping key: an
+    optionally quoted key, any spacing before the `:`, and either a value or a
+    block indicator after it. Block-scalar shell source, list items and
+    comments carry no key and yield None.
+    """
+    match = re.match(r"^\s*(?:-\s+)?(?:\"([^\"]*)\"|'([^']*)'|([^\s#:][^:]*?))\s*:(?:\s|$)", line)
+    if match is None:
+        return None
+    for group in (match.group(1), match.group(2), match.group(3)):
+        if group is not None:
+            return group.strip()
+    return None
+
+
+def _yaml_value(line: str) -> str:
+    """The scalar value written on a mapping line, or "" for a block indicator."""
+    _, separator, tail = line.partition(":")
+    if not separator:
+        return ""
+    tail = tail.strip()
+    if tail in ("|", ">", "|-", ">-", "|+", ">+"):
+        return ""
+    return _strip_quotes(_strip_comment(tail))
+
+
+def _is_yaml_comment(line: str) -> bool:
+    stripped = line.lstrip()
+    return stripped == "" or stripped.startswith("#")
+
+
+def _is_step_entry(line: str) -> bool:
+    """True for a YAML block-sequence entry (`      - name: ...`)."""
+    stripped = line.lstrip(" ")
+    return stripped.startswith("- ") or stripped.rstrip() == "-"
+
+
+def _enclosing_job_block(lines: list[str], index: int, indent: int) -> list[int]:
+    """Line indexes of the job body that owns a step at `indent`.
+
+    `steps:` sits between the job header and its steps, so the owning job's body
+    is every shallower mapping line from the job header up to (and including)
+    the `steps:` container, plus the job header line itself. Every governing
+    `if:`/`continue-on-error:`/`timeout-minutes:` in that body is returned, so a
+    skipped or soft-failure job is seen no matter which key carries it.
+    """
+    governing: list[int] = []
+    for previous in range(index, -1, -1):
+        line = lines[previous]
+        if _is_yaml_comment(line):
+            continue
+        key = _yaml_key(line)
+        if key is None:
+            continue
+        leading = len(line) - len(line.lstrip(" "))
+        if leading >= indent:
+            continue
+        governing.append(previous)
+        if key == "steps":
+            break
+    return governing
+
+
+def _nearest_list_item(lines: list[str], index: int) -> int | None:
+    """The index of the nearest block-sequence entry at or above `index`."""
+    for previous in range(index, -1, -1):
+        if not _is_yaml_comment(lines[previous]) and _is_step_entry(lines[previous]):
+            return previous
+    return None
+
+
+def _own_block_end(lines: list[str], item: int) -> int:
+    """The last line index of the block owned by the sequence entry at `item`.
+
+    The entry owns every following line that is blank, a comment, or indented
+    deeper than the entry's dash. Its first same-indent sibling ends the block.
+    """
+    indent = len(lines[item]) - len(lines[item].lstrip(" "))
+    last = item
+    for index in range(item + 1, len(lines)):
+        line = lines[index]
+        if _is_yaml_comment(line):
+            continue
+        if len(line) - len(line.lstrip(" ")) > indent:
+            last = index
+            continue
+        break
+    return last
+
+
+def _own_block(lines: list[str], item: int) -> list[int]:
+    """Line indexes from the sequence entry at `item` to the end of its block."""
+    return list(range(item, _own_block_end(lines, item) + 1))
+
+
+def _enclosing_step_scope(lines: list[str], index: int) -> int | None:
+    """The index of the sequence entry that owns the invocation at `index`.
+
+    A step's `run`/`uses` body belongs to its own sequence entry, so the owning
+    entry is the nearest one whose block still covers `index`. A mapping line at
+    the entry's own indentation or shallower is that entry's preceding sibling,
+    which ends the walk. The index is resolved to the entry's line rather than
+    kept as a scan point, so an identical repeated mapping line never resolves
+    to a later, unrelated block.
+    """
+    item = _nearest_list_item(lines, index)
+    if item is None:
+        return None
+    if index > _own_block_end(lines, item):
+        return None
+    return item
+
+
+def _harness_invocations(lines: list[str]) -> list[tuple[int, int]]:
+    """(owning sequence entry, invocation line) for every real invocation."""
+    invocations: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
         code = workflow_code_line(line)
         match = OPERATOR_HARNESS_EXECUTION_RE.search(code)
         if match is None:
@@ -157,8 +348,96 @@ def operator_harness_executed(content: str) -> bool:
             continue
         if not HARNESS_COMMAND_PREFIX_RE.match(before):
             continue
+        scope = _enclosing_step_scope(lines, index)
+        if scope is None:
+            continue
+        invocations.append((scope, index))
+    return invocations
+
+
+def _mapping_value_is_falsy(line: str) -> bool:
+    """True when a governing `if:` is provably false (or carries no value)."""
+    value = _yaml_value(line)
+    if value == "":
         return True
-    return False
+    return _condition_is_falsy(value)
+
+
+def _step_executes(scope: int, lines: list[str]) -> bool:
+    """True when the step carrying the invocation can execute and report.
+
+    The step's own `if:`/`continue-on-error:`/`timeout-minutes:` govern it, and
+    so does the job that owns it: a job whose `if:` is false never reaches its
+    steps, and a `continue-on-error` job discards their results. A step timeout
+    is a bound rather than a skip, so only a degenerate bound of zero refuses.
+    An `if:` runs the step on every dispatch only when it is unconditional;
+    any other condition may skip the step, so it cannot carry an execution
+    claim.
+    """
+    indent = len(lines[scope]) - len(lines[scope].lstrip(" "))
+    governing: list[int] = _enclosing_job_block(lines, scope - 1, indent)
+    governing.extend(_own_block(lines, scope))
+    for index in governing:
+        key = _yaml_key(lines[index])
+        if key is None:
+            continue
+        normalized = key.replace("_", "-").lower()
+        if normalized == "continue-on-error":
+            return False
+        if normalized == "timeout-minutes":
+            # A step timeout is a bound, not a skip: only a degenerate bound of
+            # zero (or a missing value) can stop the harness from finishing.
+            # A real bound such as `timeout-minutes: 30` still executes.
+            if _mapping_value_is_falsy(lines[index]):
+                return False
+            continue
+        if key.lower() == "if":
+            value = _yaml_value(lines[index])
+            if _condition_is_falsy(value):
+                return False
+            # A condition that is not provably false is still a condition. It
+            # runs the step on every dispatch only when it is unconditional
+            # (`true`, `always()`, a tautology, or no value at all); anything
+            # else depends on run state the workflow does not fix, so the step
+            # may be skipped and an execution claim may not assume it ran.
+            if not _condition_is_unconditional(value):
+                return False
+            continue
+    return True
+
+
+def operator_harness_executed(content: str) -> bool:
+    """True when the workflow text EXECUTES the Operator test harness.
+
+    The harness mention counts only when `dotnet` is the invoked command: a
+    print builtin (`echo`, `Write-Host`, ...) before it on the same code line
+    makes the mention its argument (prose, not execution), and anything else
+    before it outside YAML framing, chaining separators, or an explicit shell
+    wrapper means `dotnet` is not at command position.
+
+    An invocation is execution evidence only when its step can actually execute
+    and its result can reach the run (issue #1225 N_step5). A step that is
+    conditionally skipped, marked `continue-on-error`, or bounded by a step
+    timeout discards the harness result, so the run-summary claim
+    `Operator tests: executed ...` is compared against a nonzero executed
+    denominator: an invocable line whose step never executes satisfies that
+    claim for nothing.
+    """
+    lines = content.splitlines()
+    invocations = _harness_invocations(lines)
+    if not invocations:
+        return False
+    claim_index = content.find(OPERATOR_EXECUTION_CLAIM)
+    if claim_index < 0:
+        # No execution claim: coverage needs a step that actually executes.
+        return any(_step_executes(scope, lines) for scope, _index in invocations)
+    # A claim is only satisfied by an executing invocation that precedes it: the
+    # evidence must be produced before the summary line asserts the result.
+    claim_line = content.count("\n", 0, claim_index) + 1
+    return any(
+        scope < claim_line and _step_executes(scope, lines)
+        for scope, _index in invocations
+    )
 
 
 @dataclass(frozen=True)
@@ -169,8 +448,36 @@ class Finding:
     detail: str
 
 
+def _on_block_child_key(line: str) -> str | None:
+    """The event name of a block-mapping child of the `on:` section, or None.
+
+    Every YAML spelling of the same key is one key: the name may be single- or
+    double-quoted and the `:` may be written with any spacing before it
+    (`push:`, `"push":`, `'pull_request_target' :`). GitHub parses each of these
+    as the same automatic event, so all of them must be reported; a spelling
+    that is not a mapping key at all (a block sequence item, a comment, a
+    nested value) is not an event and yields None.
+    """
+    if _is_yaml_comment(line):
+        return None
+    match = re.match(r"^ {2}(?:\"([^\"]+)\"|'([^']+)'|([^#\s][^:]*?))\s*:(?:\s|$)", line)
+    if match is None:
+        return None
+    for group in (match.group(1), match.group(2), match.group(3)):
+        if group is not None:
+            name = group.strip()
+            return name or None
+    return None
+
+
 def parse_workflow_events(content: str) -> set[str]:
-    """Extract event triggers defined in an 'on:' section."""
+    """Extract event triggers defined in an 'on:' section.
+
+    The block style accepts every YAML spelling of an event key (optionally
+    quoted, any spacing before the `:`), because GitHub's own YAML semantics
+    carry the event in all of them: an unrecognized spelling must never make
+    an automatic event invisible and let the workflow report no event at all.
+    """
     lines = content.splitlines()
     for index, line in enumerate(lines):
         if not re.fullmatch(r"on:\s*.*", line.strip()):
@@ -191,9 +498,9 @@ def parse_workflow_events(content: str) -> set[str]:
                 continue
             if candidate == candidate.lstrip():
                 break
-            match = re.match(r"^  ([A-Za-z_][A-Za-z0-9_-]*):", candidate)
-            if match:
-                events.add(match.group(1))
+            name = _on_block_child_key(candidate)
+            if name:
+                events.add(name)
         return events
     return set()
 
@@ -234,6 +541,61 @@ def event_scalar_list(content: str, event: str, key: str) -> list[str] | None:
             elif line.strip() and not line.startswith("      ") and not line.strip().startswith("#"):
                 in_list = False
     return values
+
+
+def iter_action_references_in_text(content: str) -> list[tuple[int, str]]:
+    """(line number, reference) for every third-party `uses:` in one workflow.
+
+    The reference is read from every YAML spelling GitHub accepts, not only from
+    a value written on the same physical line as its `uses:` key (issue #1225
+    W2): a same-line value, a block-mapping value on the following lines, and a
+    flow-mapping value. The block form is exactly the supported input in which
+    the human-readable release stays a comment:
+
+        - uses:
+            # v4.2.2
+            actions/checkout@<sha>
+
+    A value that would cross a `#` comment is not a reference at all: the
+    annotation line is comment metadata, and skipping it reaches the real
+    reference underneath, so a mutable tag cannot be hidden behind an
+    annotation, and an `uses:` key that carries no reachable value is reported
+    with an empty reference so it cannot be dropped from the identity record.
+    """
+    lines = content.splitlines()
+    references: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        for key_match in USES_KEY_RE.finditer(line):
+            value_match = USES_VALUE_RE.match(line, key_match.end())
+            if value_match is not None:
+                references.append(
+                    (index + 1, value_match.group("dq") or value_match.group("sq") or value_match.group("plain"))
+                )
+                break
+            if "#" in line[key_match.end() :]:
+                break
+            for follow in range(index + 1, len(lines)):
+                candidate = lines[follow]
+                if _is_yaml_comment(candidate):
+                    continue
+                if not candidate.strip():
+                    continue
+                if len(candidate) - len(candidate.lstrip(" ")) <= len(line) - len(line.lstrip(" ")):
+                    break
+                value_match = USES_VALUE_RE.match(candidate)
+                if value_match is None:
+                    break
+                references.append(
+                    (
+                        follow + 1,
+                        value_match.group("dq") or value_match.group("sq") or value_match.group("plain"),
+                    )
+                )
+                break
+            else:
+                references.append((index + 1, ""))
+            break
+    return references
 
 
 def check_workflows(root: Path) -> list[Finding]:
@@ -305,14 +667,11 @@ def check_workflows(root: Path) -> list[Finding]:
         # is a reviewed full 40-character commit SHA owned by an approved action
         # owner. The capture below is used for the owner decision, not only for
         # the error message, so a well-formed SHA from an unreviewed publisher
-        # still fails. ACTION_REF_RE covers both step-level `- uses:` and
-        # job-level reusable `uses:` (no dash), so a reusable workflow cannot
-        # escape the pin rule.
-        for line_no, line in enumerate(lines, start=1):
-            m = ACTION_REF_RE.match(line)
-            if not m:
-                continue
-            action_ref = m.group(1)
+        # still fails. `iter_action_references_in_text` covers the step-level
+        # `- uses:`, the job-level reusable `uses:` (no dash), and every value
+        # spelling (same line, block mapping, flow mapping), so neither a
+        # reusable workflow nor a re-spelled `uses:` value can escape the rule.
+        for line_no, action_ref in iter_action_references_in_text(content):
             # Local actions (./.github/actions/...) are exempt from remote SHA pinning
             if action_ref.startswith("./"):
                 continue
@@ -539,22 +898,20 @@ def iter_workflow_files(root: Path) -> list[Path]:
 def iter_action_references(root: Path):
     """Yield (rel_path, line_no, action_ref) for every third-party `uses:` ref.
 
-    Derived from the files, never hand-written. Mirrors the ACTION_REF_RE handling
-    in check_workflows, including the `./` local-action exemption, so the
-    identity record and the enforcement decision can never disagree about which
-    references are in scope.
+    Derived from the files, never hand-written. Mirrors the
+    `iter_action_references_in_text` handling in check_workflows, including the
+    `./` local-action exemption, so the identity record and the enforcement
+    decision can never disagree about which references are in scope: every
+    YAML spelling of a `uses:` value the rules judge is also a reference the
+    run manifest records.
     """
     for wf_path in iter_workflow_files(root):
         rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
         try:
-            lines = wf_path.read_text(encoding="utf-8").splitlines()
+            content = wf_path.read_text(encoding="utf-8")
         except Exception:
             continue
-        for line_no, line in enumerate(lines, start=1):
-            match = ACTION_REF_RE.match(line)
-            if not match:
-                continue
-            action_ref = match.group(1)
+        for line_no, action_ref in iter_action_references_in_text(content):
             if action_ref.startswith("./"):
                 continue
             yield rel_path, line_no, action_ref
