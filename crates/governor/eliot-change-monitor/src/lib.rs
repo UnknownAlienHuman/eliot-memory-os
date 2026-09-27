@@ -60,6 +60,9 @@ pub enum ChangeMonitorError {
     /// An observation marked unknown origin while carrying a false exact link.
     #[error("unknown-origin observation cannot claim exact attribution")]
     UnknownOriginAttribution,
+    /// A reconciliation did not identify admitted observations that prove the same change.
+    #[error("unknown-change reconciliation evidence is invalid")]
+    InvalidReconciliation,
     /// A resolver candidate did not carry a valid public anchor.
     #[error("invalid anchor candidate")]
     InvalidAnchor,
@@ -361,16 +364,32 @@ pub struct ObservedChangeRecord {
 pub struct ChangeMonitorSnapshot {
     /// Immutable observation records by change identity.
     pub observations: Vec<ObservedChangeRecord>,
+    /// Explicit links from unknown-origin material changes to admitted evidence.
+    #[serde(default)]
+    pub reconciliations: Vec<UnknownChangeReconciliation>,
     /// Current resource projection by stable resource identity.
     pub current_resources: Vec<ResourceSnapshot>,
     /// Dependencies observed invalidated by any included change.
     pub invalidated_dependencies: Vec<String>,
 }
 
+/// A rebuildable projection link from one immutable unknown-origin change to
+/// a separate admitted observation that proves the same resource transition.
+/// This link is not a canonical observation or an authority decision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownChangeReconciliation {
+    /// Immutable unknown-origin material observation being reconciled.
+    pub unknown_change_id: String,
+    /// Separate immutable evidence observation for the exact same transition.
+    pub evidence_change_id: String,
+}
+
 /// In-memory rebuildable projection over immutable observations.
 #[derive(Clone, Debug, Default)]
 pub struct ChangeMonitor {
     observations: BTreeMap<String, ObservedChangeRecord>,
+    reconciliations: BTreeMap<String, UnknownChangeReconciliation>,
     current_resources: BTreeMap<String, ResourceSnapshot>,
     invalidated_dependencies: BTreeSet<String>,
 }
@@ -386,8 +405,15 @@ impl ChangeMonitor {
             }
             monitor.ingest(observed)?;
         }
+        for reconciliation in &snapshot.reconciliations {
+            monitor.reconcile_unknown_change(
+                &reconciliation.unknown_change_id,
+                &reconciliation.evidence_change_id,
+            )?;
+        }
         if monitor.snapshot().current_resources != snapshot.current_resources
             || monitor.snapshot().invalidated_dependencies != snapshot.invalidated_dependencies
+            || monitor.snapshot().reconciliations != snapshot.reconciliations
         {
             return Err(ChangeMonitorError::IdentityConflict);
         }
@@ -409,8 +435,7 @@ impl ChangeMonitor {
                 change_id,
                 observation_digest: digest,
                 disposition: IngestDisposition::Replayed,
-                acceptance_blocked: existing.observation.unknown_origin
-                    && is_material_mutation(existing.observation.kind),
+                acceptance_blocked: self.has_unknown_material_change(),
                 invalidation_dependencies: existing
                     .observation
                     .invalidations
@@ -419,8 +444,6 @@ impl ChangeMonitor {
                     .collect(),
             });
         }
-        let acceptance_blocked =
-            observation.unknown_origin && is_material_mutation(observation.kind);
         if let Some(after) = &observation.after {
             self.current_resources
                 .insert(after.resource_ref.clone(), after.clone());
@@ -443,6 +466,7 @@ impl ChangeMonitor {
                 observation_digest: digest.clone(),
             },
         );
+        let acceptance_blocked = self.has_unknown_material_change();
         Ok(ObservationAdmission {
             change_id,
             observation_digest: digest,
@@ -456,16 +480,90 @@ impl ChangeMonitor {
     pub fn snapshot(&self) -> ChangeMonitorSnapshot {
         ChangeMonitorSnapshot {
             observations: self.observations.values().cloned().collect(),
+            reconciliations: self.reconciliations.values().cloned().collect(),
             current_resources: self.current_resources.values().cloned().collect(),
             invalidated_dependencies: self.invalidated_dependencies.iter().cloned().collect(),
         }
     }
 
+    /// Reconciles an unknown-origin material change against a separate
+    /// admitted observation only when both prove the exact same before/after
+    /// resource snapshots under the same State Fence. The separate evidence
+    /// must be a Git reconciliation, process/tool receipt, or artifact scan
+    /// carrying an operation or diff/artifact handle and attributable evidence.
+    /// This conservative projection does not treat a host event, human
+    /// observation, or filesystem notification alone as confirmation.
+    /// Repeated exact links are idempotent; a conflicting link is rejected.
+    /// This projection creates no canonical history or acceptance authority;
+    /// callers must supply admitted canonical observations.
+    pub fn reconcile_unknown_change(
+        &mut self,
+        unknown_change_id: &str,
+        evidence_change_id: &str,
+    ) -> Result<(), ChangeMonitorError> {
+        text(unknown_change_id, "reconciliation.unknown_change_id")?;
+        text(evidence_change_id, "reconciliation.evidence_change_id")?;
+        let unknown = self
+            .observations
+            .get(unknown_change_id)
+            .ok_or(ChangeMonitorError::InvalidReconciliation)?;
+        let evidence = self
+            .observations
+            .get(evidence_change_id)
+            .ok_or(ChangeMonitorError::InvalidReconciliation)?;
+        if !unknown.observation.unknown_origin
+            || !is_material_mutation(unknown.observation.kind)
+            || !is_material_mutation(evidence.observation.kind)
+            || evidence.observation.unknown_origin
+            || !matches!(
+                evidence.observation.origin,
+                ChangeOrigin::GitReconciliation
+                    | ChangeOrigin::ProcessToolReceipt
+                    | ChangeOrigin::ArtifactScan
+            )
+            || !matches!(
+                evidence.observation.attribution,
+                Attribution::Exact | Attribution::ReceiptLinked | Attribution::Correlated
+            )
+            || evidence.observation.origin_ref.is_none()
+            || (evidence.observation.operation_ref.is_none()
+                && evidence.observation.diff_or_artifact_ref.is_none())
+            || evidence.observation.kind != unknown.observation.kind
+            || evidence.observation.state_fence != unknown.observation.state_fence
+            || evidence.observation.before != unknown.observation.before
+            || evidence.observation.after != unknown.observation.after
+        {
+            return Err(ChangeMonitorError::InvalidReconciliation);
+        }
+
+        let link = UnknownChangeReconciliation {
+            unknown_change_id: unknown_change_id.to_owned(),
+            evidence_change_id: evidence_change_id.to_owned(),
+        };
+        if let Some(existing) = self.reconciliations.get(unknown_change_id) {
+            if existing == &link {
+                return Ok(());
+            }
+            return Err(ChangeMonitorError::IdentityConflict);
+        }
+        self.reconciliations
+            .insert(unknown_change_id.to_owned(), link);
+        Ok(())
+    }
+
+    fn has_unresolved_unknown_change(&self, change_id: &str) -> bool {
+        self.observations.get(change_id).is_some_and(|record| {
+            record.observation.unknown_origin
+                && is_material_mutation(record.observation.kind)
+                && !self.reconciliations.contains_key(change_id)
+        })
+    }
+
     /// Returns whether any unknown-origin material mutation blocks acceptance.
     pub fn has_unknown_material_change(&self) -> bool {
-        self.observations.values().any(|record| {
-            record.observation.unknown_origin && is_material_mutation(record.observation.kind)
-        })
+        self.observations
+            .keys()
+            .any(|change_id| self.has_unresolved_unknown_change(change_id))
     }
 }
 
