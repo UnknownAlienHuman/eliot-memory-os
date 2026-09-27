@@ -42,6 +42,7 @@ mod receipt_reconciliation;
 mod recovery;
 mod schema_contract;
 pub(crate) mod surreal_automation;
+pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_experience;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;

@@ -40,6 +40,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod backup_io;
+mod blackboard;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
@@ -70,6 +71,12 @@ pub use backup_io::{
     SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
     SnapshotPage, SnapshotSourceIdentity, SnapshotValidationReceipt, classify_restore_conflict,
     is_backup_io_capability, reconcile_same_operation,
+};
+
+pub use blackboard::{
+    BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
+    BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
+    blackboard_item_request, decode_blackboard_item,
 };
 
 pub use dreamer_job::{
@@ -3657,6 +3664,8 @@ pub enum NamedReadOperation {
     /// Canonical agent-feedback range read (issue #223). Same durable
     /// rule as the bank range read.
     GetAgentFeedbackRange,
+    /// Exact, fenced lookup of one immutable blackboard candidate revision.
+    GetBlackboardItem,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -3746,6 +3755,11 @@ pub enum NamedMutationOperation {
     /// Canonical agent-feedback commit (issue #223). Same durable rule
     /// as the bank commit leg.
     CommitAgentFeedback,
+    /// Canonical typed blackboard candidate persistence (issue #1822).
+    /// Persists a Kernel-admitted candidate revision under the candidate-only
+    /// ceiling; it does not perform decisions, truth promotion, acceptance,
+    /// or write-authority changes.
+    ApplyBlackboardItem,
 }
 
 impl NamedMutationOperation {
@@ -3766,7 +3780,7 @@ impl NamedMutationOperation {
                 TransitionClass::ReactiveState
             }
             Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
-            Self::CommitExperienceBank | Self::CommitAgentFeedback => {
+            Self::CommitExperienceBank | Self::CommitAgentFeedback | Self::ApplyBlackboardItem => {
                 TransitionClass::CaptureCandidate
             }
         }

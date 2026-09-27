@@ -21,7 +21,9 @@ use eliot_agent_contracts::{
     CoordinationMapView, DeliveryPolicy, LivePeerMessageKind, LivePeerMessagePayload,
     MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES,
 };
-use eliot_contracts::{ClockReading, EpochId, EpochRelation, StateFence};
+use eliot_contracts::{
+    BoardEntryState, ClockReading, EpochId, EpochRelation, PeerBoardKind, StateFence,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +53,6 @@ pub const MAX_BOARD_REVISIONS_PER_ENTRY: usize = 32;
 pub const MAX_BOARD_PAGE_SIZE: u64 = 50;
 /// Largest retained per-message delivery attempt history.
 pub const MAX_PEER_ATTEMPT_HISTORY: usize = 32;
-
 /// Required raw fields of a peer message envelope.
 pub const REQUIRED_PEER_ENVELOPE_FIELDS: &[&str] = &[
     "message_id",
@@ -219,69 +220,6 @@ const fn live_delta_kind(kind: LivePeerMessageKind) -> LiveDeltaKind {
         LivePeerMessageKind::PlanContradiction => LiveDeltaKind::PlanContradiction,
         LivePeerMessageKind::Obstacle => LiveDeltaKind::Obstacle,
         LivePeerMessageKind::AbandonedDeadEnd => LiveDeltaKind::AbandonedDeadEnd,
-    }
-}
-
-/// Closed blackboard entry vocabulary (I10.18). The board is typed
-/// facts/candidates, never a transcript or group chat.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PeerBoardKind {
-    FindingCandidate,
-    EvidenceHandle,
-    Unknown,
-    HypothesisCandidate,
-    ConflictNotice,
-    DecisionRequest,
-    VerifierResult,
-    ArtifactHandle,
-    Blocker,
-}
-
-impl PeerBoardKind {
-    #[must_use]
-    pub const fn as_wire(&self) -> &'static str {
-        match self {
-            Self::FindingCandidate => "finding_candidate",
-            Self::EvidenceHandle => "evidence_handle",
-            Self::Unknown => "unknown",
-            Self::HypothesisCandidate => "hypothesis_candidate",
-            Self::ConflictNotice => "conflict_notice",
-            Self::DecisionRequest => "decision_request",
-            Self::VerifierResult => "verifier_result",
-            Self::ArtifactHandle => "artifact_handle",
-            Self::Blocker => "blocker",
-        }
-    }
-
-    pub fn decode(text: &str) -> Result<Self, CoordinationError> {
-        match text {
-            "finding_candidate" => Ok(Self::FindingCandidate),
-            "evidence_handle" => Ok(Self::EvidenceHandle),
-            "unknown" => Ok(Self::Unknown),
-            "hypothesis_candidate" => Ok(Self::HypothesisCandidate),
-            "conflict_notice" => Ok(Self::ConflictNotice),
-            "decision_request" => Ok(Self::DecisionRequest),
-            "verifier_result" => Ok(Self::VerifierResult),
-            "artifact_handle" => Ok(Self::ArtifactHandle),
-            "blocker" => Ok(Self::Blocker),
-            _ => Err(CoordinationError::UnknownPeerKind(text.to_owned())),
-        }
-    }
-
-    #[must_use]
-    pub const fn all() -> [&'static str; 9] {
-        [
-            "finding_candidate",
-            "evidence_handle",
-            "unknown",
-            "hypothesis_candidate",
-            "conflict_notice",
-            "decision_request",
-            "verifier_result",
-            "artifact_handle",
-            "blocker",
-        ]
     }
 }
 
@@ -1067,6 +1005,9 @@ fn validate_live_peer_payload(
     payload
         .validate_against_map(map)
         .map_err(|_| CoordinationError::InvalidField("live_peer_payload"))?;
+    // Live-peer payload references are `PublicReference` handles and carry no
+    // blackboard record body. The common checks below bind reference IDs to
+    // the draft's evidence/artifact handle lists.
     if draft.delta_kind != Some(live_delta_kind(payload.kind))
         || draft
             .inline_text
@@ -2226,18 +2167,6 @@ impl CoordinationOwner {
                 id: message_id.to_owned(),
             })
     }
-}
-
-/// Lifecycle of one board entry head. History is retained through
-/// revisions; superseded revisions stay readable, retracted heads stay
-/// visible until a receipted compaction reclaims them.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-#[serde(deny_unknown_fields)]
-pub enum BoardEntryState {
-    Current,
-    Superseded { by_revision: u64 },
-    Retracted { by_session: String, at: u64 },
 }
 
 /// Exact source anchor of one board entry revision.
