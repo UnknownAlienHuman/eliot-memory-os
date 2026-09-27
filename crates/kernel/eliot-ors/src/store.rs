@@ -1148,6 +1148,15 @@ fn bridge_owner_component(value: &str, field: &'static str) -> Result<(), OrsErr
     Ok(())
 }
 
+/// Returns whether a retained owner row's application session admits one
+/// presenter (issue #2729). A bound row admits only its own session; a
+/// legacy row persisted before the binding existed (empty) keeps its
+/// principal-scoped recovery limitation and matches any presenter of its
+/// lineage and principal — preserved, never reassigned.
+fn bridge_owner_session_matches(stored: &str, presented: &str) -> bool {
+    stored.is_empty() || stored == presented
+}
+
 /// Persisted recovery-window authority and finite owner-list cutoff.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1156,6 +1165,11 @@ struct BridgeEventRecoveryWindowRow {
     window_key: String,
     authority_lineage: String,
     principal: String,
+    /// Presenting application session the window was opened for (issue
+    /// #2729). Empty only on windows persisted before the binding
+    /// existed; those expire unrenewed under their short TTL.
+    #[serde(default)]
+    application_session: String,
     owner_scope_digest: String,
     owner_cutoff: u64,
     created_at_ms: u64,
@@ -1175,6 +1189,9 @@ impl BridgeEventRecoveryWindowRow {
         crate::model::validate_digest(&self.window_key, "window_key")?;
         bridge_owner_component(&self.authority_lineage, "owner_authority_lineage")?;
         bridge_owner_component(&self.principal, "owner_principal")?;
+        if !self.application_session.is_empty() {
+            bridge_owner_component(&self.application_session, "owner_application_session")?;
+        }
         crate::model::validate_digest(&self.owner_scope_digest, "owner_scope_digest")?;
         if self.created_at_ms == 0 || self.expires_at_ms <= self.created_at_ms {
             return Err(OrsError::InvalidField {
@@ -1373,6 +1390,12 @@ struct BridgeStreamOwnerRow {
     creating_connection: String,
     creating_launch_nonce: String,
     creating_session_epoch: u64,
+    /// Application-owned continuity identity bound at first admit (issue
+    /// #2729). Empty only on rows persisted before the binding existed;
+    /// those legacy rows keep their principal-scoped recovery limitation
+    /// and are never rewritten with a new session.
+    #[serde(default)]
+    application_session: String,
     incarnation: u64,
     revision: u64,
     created_at_ms: u64,
@@ -1427,6 +1450,9 @@ impl BridgeStreamOwnerRow {
                 field: "creating_session_epoch",
                 reason: "bridge stream owner binds a nonzero creating session epoch",
             });
+        }
+        if !self.application_session.is_empty() {
+            bridge_owner_component(&self.application_session, "application_session")?;
         }
         if self.incarnation != BRIDGE_STREAM_OWNER_INITIAL_INCARNATION {
             return Err(OrsError::InvalidField {
@@ -1504,12 +1530,13 @@ struct BridgeOwnerEvidence {
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
+    application_session: String,
 }
 
 /// One parsed acknowledgement-batch item: the resolved namespace with
-/// its expected owner revision/incarnation, the presenter's lineage and
-/// principal for the in-transaction equality recheck, and the requested
-/// sequence.
+/// its expected owner revision/incarnation, the presenter's lineage,
+/// principal, and application session for the in-transaction equality
+/// recheck, and the requested sequence.
 struct BridgeAckItem {
     namespace: String,
     expected_revision: u64,
@@ -1517,6 +1544,7 @@ struct BridgeAckItem {
     sequence: u64,
     lineage: String,
     principal: String,
+    application_session: String,
 }
 
 /// Parsed inputs for one owner-checked stage (issue #2729): the bound
@@ -1536,8 +1564,8 @@ struct BridgeCheckedStage {
 }
 
 /// Parsed inputs for one owner-checked gap record (issue #2729): the gap
-/// identity and interval with the presenter's lineage, principal, and
-/// creating occurrence.
+/// identity and interval with the presenter's lineage, principal,
+/// application session, and creating occurrence.
 struct BridgeCheckedGap {
     gap_id: String,
     stream_id: String,
@@ -1547,6 +1575,7 @@ struct BridgeCheckedGap {
     staging_connection: String,
     lineage: String,
     principal: String,
+    application_session: String,
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
@@ -8681,17 +8710,20 @@ impl RedbRecoveryStore {
             connection: bridge_text(staged, "owner_connection")?,
             launch_nonce: bridge_text(staged, "owner_launch_nonce")?,
             session_epoch: Self::bridge_owner_epoch(staged)?,
+            application_session: Self::bridge_owner_field(staged, "owner_application_session")?,
         })
     }
 
-    /// Extracts the presenter identity (lineage plus principal) used for
-    /// owner-scoped resolution and enumeration (issue #2729).
+    /// Extracts the presenter identity (lineage, principal, and live
+    /// application session) used for owner-scoped resolution and
+    /// enumeration (issue #2729).
     fn bridge_owner_presenter_from(
         value: &serde_json::Value,
-    ) -> Result<(String, String), OrsError> {
+    ) -> Result<(String, String, String), OrsError> {
         Ok((
             Self::bridge_owner_field(value, "owner_authority_lineage")?,
             Self::bridge_owner_field(value, "owner_principal")?,
+            Self::bridge_owner_field(value, "owner_application_session")?,
         ))
     }
 
@@ -8801,6 +8833,7 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         lineage: &str,
         principal: &str,
+        application_session: &str,
     ) -> Result<BridgeEventRecoveryWindowRow, OrsError> {
         let now_ms = current_unix_ms_u64()?;
         let expired = {
@@ -8893,6 +8926,7 @@ impl RedbRecoveryStore {
         .checked_add(1)
         .ok_or(OrsError::ProjectionLimitExceeded)?;
         let cutoff = Self::bridge_owner_list_cutoff_in(write)?;
+        bridge_owner_component(application_session, "owner_application_session")?;
         let key_material = format!(
             "eliot.bridge-event.recovery-window.v1\x1f{lineage}\x1f{principal}\x1f{now_ms}\x1f{sequence}"
         );
@@ -8902,6 +8936,7 @@ impl RedbRecoveryStore {
             window_key: window_key.clone(),
             authority_lineage: lineage.to_owned(),
             principal: principal.to_owned(),
+            application_session: application_session.to_owned(),
             owner_scope_digest: scope,
             owner_cutoff: cutoff,
             created_at_ms: now_ms,
@@ -8932,6 +8967,7 @@ impl RedbRecoveryStore {
         window_key: &str,
         lineage: &str,
         principal: &str,
+        application_session: &str,
     ) -> Result<Option<BridgeEventRecoveryWindowRow>, OrsError> {
         crate::model::validate_digest(window_key, "window_key")?;
         let windows = database
@@ -8948,7 +8984,10 @@ impl RedbRecoveryStore {
                 reason: "window key does not match its table key".to_owned(),
             });
         }
-        if row.authority_lineage != lineage || row.principal != principal {
+        if row.authority_lineage != lineage
+            || row.principal != principal
+            || !bridge_owner_session_matches(&row.application_session, application_session)
+        {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         Ok(Some(row))
@@ -8959,6 +8998,7 @@ impl RedbRecoveryStore {
         window_key: &str,
         lineage: &str,
         principal: &str,
+        application_session: &str,
     ) -> Result<Option<BridgeEventRecoveryWindowRow>, OrsError> {
         crate::model::validate_digest(window_key, "window_key")?;
         let windows = write
@@ -8975,7 +9015,10 @@ impl RedbRecoveryStore {
                 reason: "window key does not match its table key".to_owned(),
             });
         }
-        if row.authority_lineage != lineage || row.principal != principal {
+        if row.authority_lineage != lineage
+            || row.principal != principal
+            || !bridge_owner_session_matches(&row.application_session, application_session)
+        {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         Ok(Some(row))
@@ -9614,6 +9657,7 @@ impl RedbRecoveryStore {
         owner_kind: &str,
         after_sequence: u64,
         limit: usize,
+        application_session: &str,
     ) -> Result<BridgeRecoveryOwnerPage, OrsError> {
         let mut rows = Vec::with_capacity(limit);
         if after_sequence >= window.owner_cutoff {
@@ -9642,7 +9686,7 @@ impl RedbRecoveryStore {
             for entry in index
                 .range(start.as_str()..=end.as_str())
                 .map_err(storage)?
-                .take(limit.saturating_add(1))
+                .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
             {
                 let (key, value) = entry.map_err(storage)?;
                 let sequence = key
@@ -9672,6 +9716,10 @@ impl RedbRecoveryStore {
                 {
                     return Err(OrsError::RecoveryOwnerMismatch);
                 }
+                if !bridge_owner_session_matches(&row.application_session, application_session) {
+                    last_sequence = Some(sequence);
+                    continue;
+                }
                 if rows.len() == limit {
                     has_more = true;
                     break;
@@ -9692,6 +9740,7 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         window: &BridgeEventRecoveryWindowRow,
         stream_id: &str,
+        application_session: &str,
     ) -> Result<(BridgeStreamOwnerRow, u64), OrsError> {
         let prefix = Self::bridge_owner_list_index_prefix(
             &window.owner_scope_digest,
@@ -9736,6 +9785,9 @@ impl RedbRecoveryStore {
                 || row.principal != window.principal
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
+            }
+            if !bridge_owner_session_matches(&row.application_session, application_session) {
+                continue;
             }
             if row.local_stream == stream_id {
                 if found.is_some() {
@@ -9787,6 +9839,7 @@ impl RedbRecoveryStore {
         read: &redb::ReadTransaction,
         window: &BridgeEventRecoveryWindowRow,
         after_sequence: u64,
+        application_session: &str,
     ) -> Result<Option<(BridgeStreamOwnerRow, u64)>, OrsError> {
         if after_sequence >= window.owner_cutoff {
             return Ok(None);
@@ -9808,37 +9861,40 @@ impl RedbRecoveryStore {
             .open_table(BRIDGE_STREAM_OWNER_LIST_INDEX)
             .map_err(storage)?;
         let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
-        let Some(entry) = index
+        for entry in index
             .range(start.as_str()..=end.as_str())
             .map_err(storage)?
-            .next()
-        else {
-            return Ok(None);
-        };
-        let (key, value) = entry.map_err(storage)?;
-        let sequence = key
-            .value()
-            .strip_prefix(prefix.as_str())
-            .and_then(|suffix| suffix.parse::<u64>().ok())
-            .ok_or(OrsError::IntegrityProblem {
-                record_type: "bridge_stream_owner_list_index",
-                reason: "gap-owner cursor carries a malformed sequence".to_owned(),
-            })?;
-        let namespace = Self::decode_bridge_owner_index_namespace(value.value())?;
-        let Some(owner_value) = owners.get(namespace.as_str()).map_err(storage)? else {
-            return Err(OrsError::RecoveryOwnerMismatch);
-        };
-        let owner: BridgeStreamOwnerRow = decode(owner_value.value())?;
-        owner.validate()?;
-        if owner.namespace != namespace
-            || owner.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP
-            || owner.authority_lineage != window.authority_lineage
-            || owner.principal != window.principal
-            || sequence > window.owner_cutoff
+            .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
         {
-            return Err(OrsError::RecoveryOwnerMismatch);
+            let (key, value) = entry.map_err(storage)?;
+            let sequence = key
+                .value()
+                .strip_prefix(prefix.as_str())
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_stream_owner_list_index",
+                    reason: "gap-owner cursor carries a malformed sequence".to_owned(),
+                })?;
+            let namespace = Self::decode_bridge_owner_index_namespace(value.value())?;
+            let Some(owner_value) = owners.get(namespace.as_str()).map_err(storage)? else {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            };
+            let owner: BridgeStreamOwnerRow = decode(owner_value.value())?;
+            owner.validate()?;
+            if owner.namespace != namespace
+                || owner.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP
+                || owner.authority_lineage != window.authority_lineage
+                || owner.principal != window.principal
+                || sequence > window.owner_cutoff
+            {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            }
+            if !bridge_owner_session_matches(&owner.application_session, application_session) {
+                continue;
+            }
+            return Ok(Some((owner, sequence)));
         }
-        Ok(Some((owner, sequence)))
+        Ok(None)
     }
 
     fn bridge_recovery_unproven_scope_present(
@@ -10057,6 +10113,23 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Returns whether any retained stream owner row predates the
+    /// application-session binding (issue #2729). Such legacy rows keep
+    /// their principal-scoped recovery limitation, so their presence
+    /// marks the recovery scope unproven.
+    fn bridge_sessionless_owner_present(write: &redb::WriteTransaction) -> Result<bool, OrsError> {
+        let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+        for entry in owners.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let row: BridgeStreamOwnerRow = decode(value.value())?;
+            row.validate()?;
+            if row.application_session.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Records whether pre-owner legacy rows exist once at store open. Page
     /// reads consult this bounded metadata bit instead of sweeping event,
     /// cursor, gap, or handoff tables.
@@ -10079,9 +10152,9 @@ impl RedbRecoveryStore {
             }
             None => {}
         }
-        let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
         let unproven = {
-            let mut found = false;
+            let mut found = Self::bridge_sessionless_owner_present(write)?;
+            let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
             {
                 let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
                 for entry in records.iter().map_err(storage)? {
@@ -10152,7 +10225,6 @@ impl RedbRecoveryStore {
             }
             found
         };
-        drop(owners);
         let mut meta = write.open_table(META).map_err(storage)?;
         meta.insert(
             BRIDGE_RECOVERY_LEGACY_UNPROVEN_KEY,
@@ -10221,10 +10293,16 @@ impl RedbRecoveryStore {
     /// #2729): the first admitted bind durably retains the binding with
     /// its store-assigned incarnation and revision, while a later bind
     /// under the same namespace must present the identical binding —
-    /// changed lineage, principal, producer, local scope, or creating
-    /// connection/launch-nonce/session-epoch occurrence fails with
-    /// [`OrsError::DuplicateConflict`] and never overwrites the retained
-    /// owner. Enforces the owner-table bound for fresh namespaces.
+    /// changed lineage, principal, producer, local scope, or application
+    /// session fails with [`OrsError::DuplicateConflict`] and never
+    /// overwrites the retained owner. A presenter of the same application
+    /// session carries proven reconnect continuity (the route verified the
+    /// presenting transport is live-bound to that session), so its
+    /// creating occurrence may differ without rewriting history. A legacy
+    /// row persisted before the session binding keeps the
+    /// creating-occurrence equality floor and is never reassigned to the
+    /// presenting session. Enforces the owner-table bound for fresh
+    /// namespaces.
     fn bind_bridge_stream_owner_in(
         write: &redb::WriteTransaction,
         evidence: &BridgeOwnerEvidence,
@@ -10251,15 +10329,23 @@ impl RedbRecoveryStore {
                 || row.principal != evidence.principal
                 || row.producer != evidence.producer
                 || row.local_stream != evidence.local
-                || row.creating_connection != evidence.connection
-                || row.creating_launch_nonce != evidence.launch_nonce
-                || row.creating_session_epoch != evidence.session_epoch
             {
+                return Err(OrsError::DuplicateConflict);
+            }
+            if row.application_session.is_empty() {
+                if row.creating_connection != evidence.connection
+                    || row.creating_launch_nonce != evidence.launch_nonce
+                    || row.creating_session_epoch != evidence.session_epoch
+                {
+                    return Err(OrsError::DuplicateConflict);
+                }
+            } else if row.application_session != evidence.application_session {
                 return Err(OrsError::DuplicateConflict);
             }
             return Ok(row);
         }
         drop(owners);
+        bridge_owner_component(&evidence.application_session, "owner_application_session")?;
         let row = BridgeStreamOwnerRow {
             contract_version: crate::CONTRACT_VERSION,
             owner_version: BRIDGE_STREAM_OWNER_VERSION,
@@ -10272,6 +10358,7 @@ impl RedbRecoveryStore {
             creating_connection: evidence.connection.clone(),
             creating_launch_nonce: evidence.launch_nonce.clone(),
             creating_session_epoch: evidence.session_epoch,
+            application_session: evidence.application_session.clone(),
             incarnation: BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
             revision: BRIDGE_STREAM_OWNER_INITIAL_REVISION,
             created_at_ms: now_ms,
@@ -11580,7 +11667,7 @@ impl RedbRecoveryStore {
         &self,
         query: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>, OrsError> {
-        let (lineage, principal) = Self::bridge_owner_presenter_from(query)?;
+        let (lineage, principal, application_session) = Self::bridge_owner_presenter_from(query)?;
         let producer = bridge_key_text(query, "producer_id")?;
         let local = bridge_key_text(query, "stream_id")?;
         let event_id = bridge_key_text(query, "event_id")?;
@@ -11601,9 +11688,14 @@ impl RedbRecoveryStore {
                 return Ok(None);
             }
             // The record exists under the derived namespace, so its owner row
-            // must exist too: the checked stage binds both atomically. The
+            // must exist too: the checked stage binds both atomically. A
+            // presenter outside the row's application session learns
+            // nothing: the unknown shape, not foreign facts. The
             // read-grade access object records which right served this view.
             let owner = Self::load_bridge_owner_row_for(&self.database, &namespace)?;
+            if !bridge_owner_session_matches(&owner.application_session, &application_session) {
+                return Ok(None);
+            }
             let access = Self::check_bridge_stream_access(
                 &owner,
                 owner.revision,
@@ -11656,6 +11748,9 @@ impl RedbRecoveryStore {
             return Ok(None);
         }
         let owner = Self::load_bridge_owner_row_for(&self.database, &namespace)?;
+        if !bridge_owner_session_matches(&owner.application_session, &application_session) {
+            return Ok(None);
+        }
         let access = Self::check_bridge_stream_access(
             &owner,
             owner.revision,
@@ -11761,6 +11856,7 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         lineage: &str,
         principal: &str,
+        application_session: &str,
         local: &str,
     ) -> Result<Vec<BridgeStreamOwnerRow>, OrsError> {
         let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
@@ -11773,6 +11869,7 @@ impl RedbRecoveryStore {
                 && row.authority_lineage == lineage
                 && row.principal == principal
                 && row.local_stream == local
+                && bridge_owner_session_matches(&row.application_session, application_session)
             {
                 matched.push(row);
             }
@@ -11787,6 +11884,7 @@ impl RedbRecoveryStore {
         database: &Database,
         lineage: &str,
         principal: &str,
+        application_session: &str,
         local: &str,
     ) -> Result<Vec<BridgeStreamOwnerRow>, OrsError> {
         let read = database.begin_read().map_err(storage)?;
@@ -11800,6 +11898,7 @@ impl RedbRecoveryStore {
                 && row.authority_lineage == lineage
                 && row.principal == principal
                 && row.local_stream == local
+                && bridge_owner_session_matches(&row.application_session, application_session)
             {
                 matched.push(row);
             }
@@ -11809,19 +11908,26 @@ impl RedbRecoveryStore {
 
     /// Resolves one acknowledgement-frontier entry to its admitted owner
     /// namespace without mutating anything (issue #2729, item 3). The
-    /// evidence carries the presenter's lineage and principal plus the
-    /// local stream; the producer comes from the retained binding, never
-    /// from the entry. Zero or ambiguous matches fail the whole batch
-    /// closed at the route: a foreign or stale item changes no cursor.
+    /// evidence carries the presenter's lineage, principal, and live
+    /// application session plus the local stream; the producer comes from
+    /// the retained binding, never from the entry. Zero or ambiguous
+    /// matches fail the whole batch closed at the route: a foreign or
+    /// stale item changes no cursor.
     pub fn resolve_bridge_ack_item(
         &self,
         evidence: &serde_json::Value,
         local_stream: &str,
     ) -> Result<serde_json::Value, OrsError> {
-        let (lineage, principal) = Self::bridge_owner_presenter_from(evidence)?;
+        let (lineage, principal, application_session) =
+            Self::bridge_owner_presenter_from(evidence)?;
         bridge_identity_text(local_stream, "stream_id")?;
-        let matched =
-            Self::find_stream_owners_for(&self.database, &lineage, &principal, local_stream)?;
+        let matched = Self::find_stream_owners_for(
+            &self.database,
+            &lineage,
+            &principal,
+            &application_session,
+            local_stream,
+        )?;
         let [row] = matched.as_slice() else {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
@@ -11834,8 +11940,9 @@ impl RedbRecoveryStore {
 
     /// Applies one accepted acknowledgement batch atomically (issue #2729,
     /// item 3). Every item carries the resolved namespace with its
-    /// expected revision/incarnation plus the presenter's lineage and
-    /// principal and the requested sequence. The single write transaction
+    /// expected revision/incarnation plus the presenter's lineage,
+    /// principal, and application session and the requested sequence. The
+    /// single write transaction
     /// first validates every item — shape, contradictory duplicates,
     /// stored binding, expected revision/incarnation, lineage/principal
     /// equality, and phase/frontier — and only then advances the cursors
@@ -11872,6 +11979,10 @@ impl RedbRecoveryStore {
             if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
                 || owner.authority_lineage != item.lineage
                 || owner.principal != item.principal
+                || !bridge_owner_session_matches(
+                    &owner.application_session,
+                    &item.application_session,
+                )
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
@@ -11919,8 +12030,9 @@ impl RedbRecoveryStore {
 
     /// Parses and deduplicates one acknowledgement batch (issue #2729).
     /// Contradictory duplicate entries — the same namespace twice with a
-    /// different sequence, lineage, principal, or expectation — fail the
-    /// whole batch; exact duplicates collapse to one item.
+    /// different sequence, lineage, principal, application session, or
+    /// expectation — fail the whole batch; exact duplicates collapse to
+    /// one item.
     fn parse_bridge_ack_batch(items: &[serde_json::Value]) -> Result<Vec<BridgeAckItem>, OrsError> {
         let mut parsed: Vec<BridgeAckItem> = Vec::with_capacity(items.len());
         for item in items {
@@ -11959,7 +12071,8 @@ impl RedbRecoveryStore {
                     reason: "acknowledgement sequence must be nonzero",
                 });
             }
-            let (lineage, principal) = Self::bridge_owner_presenter_from(item)?;
+            let (lineage, principal, application_session) =
+                Self::bridge_owner_presenter_from(item)?;
             let candidate = BridgeAckItem {
                 namespace,
                 expected_revision,
@@ -11967,6 +12080,7 @@ impl RedbRecoveryStore {
                 sequence,
                 lineage,
                 principal,
+                application_session,
             };
             if let Some(prior) = parsed
                 .iter()
@@ -11977,6 +12091,7 @@ impl RedbRecoveryStore {
                     || prior.expected_incarnation != candidate.expected_incarnation
                     || prior.lineage != candidate.lineage
                     || prior.principal != candidate.principal
+                    || prior.application_session != candidate.application_session
                 {
                     return Err(OrsError::InvalidField {
                         field: "ack_batch",
@@ -12538,7 +12653,7 @@ impl RedbRecoveryStore {
                 reason: "gap interval must not end before it starts",
             });
         }
-        let (lineage, principal) = Self::bridge_owner_presenter_from(gap)?;
+        let (lineage, principal, application_session) = Self::bridge_owner_presenter_from(gap)?;
         Ok(BridgeCheckedGap {
             gap_id: bridge_text(gap, "gap_id")?,
             stream_id: bridge_gap_stream_text(gap)?,
@@ -12548,6 +12663,7 @@ impl RedbRecoveryStore {
             staging_connection: bridge_text(gap, "staging_connection")?,
             lineage,
             principal,
+            application_session,
             connection: bridge_text(gap, "owner_connection")?,
             launch_nonce: bridge_text(gap, "owner_launch_nonce")?,
             session_epoch: Self::bridge_owner_epoch(gap)?,
@@ -12580,6 +12696,7 @@ impl RedbRecoveryStore {
                 connection: parsed.connection.clone(),
                 launch_nonce: parsed.launch_nonce.clone(),
                 session_epoch: parsed.session_epoch,
+                application_session: parsed.application_session.clone(),
             };
             Self::bind_bridge_stream_owner_in(
                 write,
@@ -12595,6 +12712,7 @@ impl RedbRecoveryStore {
             write,
             &parsed.lineage,
             &parsed.principal,
+            &parsed.application_session,
             &parsed.stream_id,
         )?;
         let [owner] = matched.as_slice() else {
@@ -13353,7 +13471,8 @@ impl RedbRecoveryStore {
         live_generation: u64,
         recovery_scope: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, OrsError> {
-        let (lineage, principal) = Self::bridge_owner_presenter_from(presenter)?;
+        let (lineage, principal, application_session) =
+            Self::bridge_owner_presenter_from(presenter)?;
         if live_generation == 0 {
             return Err(OrsError::InvalidField {
                 field: "live_generation",
@@ -13373,14 +13492,25 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         let (mut window, opening) = match &selector {
             BridgeRecoveryScopeSelector::Open => (
-                Self::create_bridge_recovery_window_in(&write, &lineage, &principal)?,
+                Self::create_bridge_recovery_window_in(
+                    &write,
+                    &lineage,
+                    &principal,
+                    &application_session,
+                )?,
                 true,
             ),
             BridgeRecoveryScopeSelector::Streams { window_key, .. }
             | BridgeRecoveryScopeSelector::Stream { window_key, .. }
             | BridgeRecoveryScopeSelector::UnscopedGaps { window_key, .. } => (
-                Self::load_bridge_recovery_window_in(&write, window_key, &lineage, &principal)?
-                    .ok_or(OrsError::RecoveryOwnerMismatch)?,
+                Self::load_bridge_recovery_window_in(
+                    &write,
+                    window_key,
+                    &lineage,
+                    &principal,
+                    &application_session,
+                )?
+                .ok_or(OrsError::RecoveryOwnerMismatch)?,
                 false,
             ),
         };
@@ -13404,6 +13534,7 @@ impl RedbRecoveryStore {
                     BRIDGE_STREAM_OWNER_KIND_STREAM,
                     0,
                     MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE,
+                    &application_session,
                 )?;
                 stream_owners = page.owners;
                 window.stream_list_continuation = page.continuation;
@@ -13420,6 +13551,7 @@ impl RedbRecoveryStore {
                     BRIDGE_STREAM_OWNER_KIND_STREAM,
                     *after_stream,
                     *stream_limit,
+                    &application_session,
                 )?;
                 stream_owners = page.owners;
                 window.stream_list_continuation = page.continuation;
@@ -13436,8 +13568,12 @@ impl RedbRecoveryStore {
                 gap_limit,
                 ..
             } => {
-                let (owner, position) =
-                    Self::bridge_recovery_owner_by_stream_in(&write, &window, stream_id)?;
+                let (owner, position) = Self::bridge_recovery_owner_by_stream_in(
+                    &write,
+                    &window,
+                    stream_id,
+                    &application_session,
+                )?;
                 let cut = Self::load_bridge_recovery_cut_in(
                     &write,
                     &window.window_key,
@@ -13476,6 +13612,10 @@ impl RedbRecoveryStore {
                 if owner.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP
                     || owner.authority_lineage != lineage
                     || owner.principal != principal
+                    || !bridge_owner_session_matches(
+                        &owner.application_session,
+                        &application_session,
+                    )
                 {
                     return Err(OrsError::RecoveryOwnerMismatch);
                 }
@@ -13516,6 +13656,7 @@ impl RedbRecoveryStore {
                 BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
                 0,
                 1,
+                &application_session,
             )?
             .owners
             .into_iter()
@@ -13534,8 +13675,13 @@ impl RedbRecoveryStore {
         // this one immutable read snapshot; revision checks reject movement
         // between the write and this snapshot.
         let read = self.database.begin_read().map_err(storage)?;
-        let Some(read_window) =
-            Self::load_bridge_recovery_window(&read, &window.window_key, &lineage, &principal)?
+        let Some(read_window) = Self::load_bridge_recovery_window(
+            &read,
+            &window.window_key,
+            &lineage,
+            &principal,
+            &application_session,
+        )?
         else {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
@@ -13561,6 +13707,7 @@ impl RedbRecoveryStore {
             if owner.namespace != listed_owner.namespace
                 || owner.local_stream != listed_owner.local_stream
                 || owner.producer != listed_owner.producer
+                || owner.application_session != listed_owner.application_session
                 || owner.revision != listed_owner.revision
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
@@ -13640,6 +13787,7 @@ impl RedbRecoveryStore {
                 || owner.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP
                 || owner.authority_lineage != lineage
                 || owner.principal != principal
+                || owner.application_session != listed_gap_owner.application_session
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
@@ -13678,7 +13826,12 @@ impl RedbRecoveryStore {
                 if let Some(next_offset) = next_offset {
                     unscoped_gap_cursor = Some((owner.namespace.clone(), next_offset));
                 } else if let Some((next_owner, _next_position)) =
-                    Self::bridge_recovery_next_gap_owner(&read, &read_window, *position)?
+                    Self::bridge_recovery_next_gap_owner(
+                        &read,
+                        &read_window,
+                        *position,
+                        &application_session,
+                    )?
                 {
                     unscoped_gap_cursor = Some((next_owner.namespace, 0));
                 }

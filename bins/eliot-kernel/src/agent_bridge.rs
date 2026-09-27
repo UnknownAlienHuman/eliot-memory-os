@@ -2342,6 +2342,62 @@ impl KernelComposition {
         result.map_err(|_| TransportError::SessionFenced)
     }
 
+    /// Resolves the live application-owned ELIOT session binding one
+    /// presenting bridge transport (issue #2729, item 2; I7.14).
+    ///
+    /// Scans the retained application session authorities for exactly one
+    /// non-terminal session whose transport-binding continuity observations
+    /// name this `(connection_id, session_epoch)` occurrence under the same
+    /// authority as the presenting Session. The returned `session_id` is the
+    /// owner-issued continuity identity the bridge-event owner path binds; it
+    /// survives transport reconnects (which append observations) and dies
+    /// with revocation (which removes the session or moves it terminal), so
+    /// recovery spans reconnects while a foreign session never matches.
+    /// Zero or ambiguous matches fail closed with
+    /// [`TransportError::SessionFenced`].
+    ///
+    /// Callers holding the bridge-transition read guard (bridge-event
+    /// reconcile) are serialized against profile replacement; a future
+    /// application-session revocation caller must take the write guard so it
+    /// cannot interleave resolution and commit unnoticed.
+    #[cfg(windows)]
+    pub(crate) fn resolve_bridge_application_session(
+        &self,
+        session: &Session,
+    ) -> Result<String, TransportError> {
+        if session.connection_id.trim().is_empty() || session.session_epoch == 0 {
+            return Err(TransportError::SessionFenced);
+        }
+        let sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut matched: Option<String> = None;
+        for authority in sessions.values() {
+            if authority.state().is_terminal() {
+                continue;
+            }
+            if !session
+                .authority_epoch
+                .is_same_authority(authority.authority_epoch())
+            {
+                continue;
+            }
+            let bound = authority.transport_bindings().iter().any(|binding| {
+                binding.binding_id == session.connection_id
+                    && binding.session_epoch == session.session_epoch
+            });
+            if !bound {
+                continue;
+            }
+            if matched.is_some() {
+                return Err(TransportError::SessionFenced);
+            }
+            matched = Some(authority.session_id().to_owned());
+        }
+        matched.ok_or(TransportError::SessionFenced)
+    }
+
     /// Explicitly revokes the application-owned ELIOT session for
     /// `session_id` (I7.14).
     ///
@@ -2350,7 +2406,9 @@ impl KernelComposition {
     /// revoked application session authority is returned to the caller and
     /// removed from the live set; a successor session may be established only
     /// under a higher authority epoch via
-    /// [`ApplicationSession::reassign`].
+    /// [`ApplicationSession::reassign`]. A future caller must hold the
+    /// bridge-transition write guard so revocation cannot interleave a
+    /// guarded resolve-and-commit window unnoticed (issue #2729, item 3).
     ///
     /// # Errors
     ///

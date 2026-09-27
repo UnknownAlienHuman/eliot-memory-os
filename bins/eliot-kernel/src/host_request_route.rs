@@ -4157,7 +4157,8 @@ impl KernelComposition {
                         eliot_ipc::BACKPRESSURE_KERNEL_DEGRADED,
                     ));
                 }
-                let evidence = bridge_owner_evidence(session, frame_fence)?;
+                let application_session = self.resolve_bridge_application_session(session)?;
+                let evidence = bridge_owner_evidence(session, frame_fence, application_session)?;
                 self.stage_bridge_event_durable(
                     session,
                     event,
@@ -4238,6 +4239,7 @@ impl KernelComposition {
             "owner_connection": evidence.connection,
             "owner_launch_nonce": evidence.launch_nonce,
             "owner_session_epoch": evidence.session_epoch,
+            "owner_application_session": evidence.application_session,
         });
         let outcome = match self
             .generation_gateway
@@ -4346,6 +4348,7 @@ impl KernelComposition {
         let query = serde_json::json!({
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
+            "owner_application_session": evidence.application_session,
             "producer_id": event.producer_id,
             "stream_id": event.stream_id,
             "event_id": event.event_id,
@@ -4437,7 +4440,8 @@ impl KernelComposition {
         ) {
             return Err(TransportError::SessionFenced);
         }
-        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let application_session = self.resolve_bridge_application_session(session)?;
+        let evidence = bridge_owner_evidence(session, frame_fence, application_session)?;
         let mut gap = gap.clone();
         let object = gap.as_object_mut().ok_or(TransportError::SessionFenced)?;
         object.insert(
@@ -4459,6 +4463,10 @@ impl KernelComposition {
         object.insert(
             "owner_session_epoch".to_owned(),
             serde_json::Value::from(evidence.session_epoch),
+        );
+        object.insert(
+            "owner_application_session".to_owned(),
+            serde_json::Value::String(evidence.application_session),
         );
         let outcome = self
             .generation_gateway
@@ -4559,7 +4567,8 @@ impl KernelComposition {
         if live_generation == 0 {
             return Err(TransportError::SessionFenced);
         }
-        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let application_session = self.resolve_bridge_application_session(session)?;
+        let evidence = bridge_owner_evidence(session, frame_fence, application_session)?;
         // Continuation selectors are pure reads. They cannot carry a
         // consumed frontier because acknowledging one would mutate the
         // durable cursor before the bounded owner page is accepted.
@@ -4572,6 +4581,7 @@ impl KernelComposition {
         let presenter = serde_json::json!({
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
+            "owner_application_session": evidence.application_session,
         });
         let pure_read = scope.recovery_scope.is_some();
         // Resolve every consumed entry to its admitted namespace before
@@ -4616,6 +4626,7 @@ impl KernelComposition {
                     "sequence": sequence,
                     "owner_authority_lineage": evidence.authority_lineage,
                     "owner_principal": evidence.principal,
+                    "owner_application_session": evidence.application_session,
                 }));
             }
         }
@@ -5238,8 +5249,10 @@ const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
 ///
 /// Built from the retained Session and the presenting fence only: the
 /// principal is the platform-verified peer identity, the lineage is the
-/// presenting authority lineage, and the occurrence is the admitted
-/// transport session. No bridge-authored session text is accepted — the
+/// presenting authority lineage, the occurrence is the admitted
+/// transport session, and the application session is the live
+/// application-owned continuity identity resolved from the retained
+/// session authority. No bridge-authored session text is accepted — the
 /// frame carries none by design, and the Kernel builds the sender binding
 /// itself from the retained Session. A matching Windows identity, a
 /// current generation, or an earlier connection alone never satisfies
@@ -5250,16 +5263,20 @@ struct BridgeOwnerEvidence {
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
+    application_session: String,
 }
 
 /// Derives the owner evidence for one bridge-event operation from the
 /// retained Session and the presenting fence (issue #2729, item 2). The
 /// fence already proved compatibility with the retained Session at
 /// dispatch; this entry only projects the Kernel-owned facts the store
-/// binds into the versioned owner namespace.
+/// binds into the versioned owner namespace. The caller resolves
+/// `application_session` from the live application session authority, so
+/// an unbound or revoked transport never reaches the store.
 fn bridge_owner_evidence(
     session: &Session,
     fence: &eliot_contracts::StateFence,
+    application_session: String,
 ) -> Result<BridgeOwnerEvidence, TransportError> {
     let principal = match &session.peer {
         PeerIdentity::Authenticated { user_identity, .. } => {
@@ -5282,12 +5299,16 @@ fn bridge_owner_evidence(
     {
         return Err(TransportError::SessionFenced);
     }
+    if application_session.trim().is_empty() || application_session.chars().any(char::is_control) {
+        return Err(TransportError::SessionFenced);
+    }
     Ok(BridgeOwnerEvidence {
         principal,
         authority_lineage: authority_lineage.to_owned(),
         connection: session.connection_id.clone(),
         launch_nonce: session.launch_nonce.clone(),
         session_epoch: session.session_epoch,
+        application_session,
     })
 }
 
