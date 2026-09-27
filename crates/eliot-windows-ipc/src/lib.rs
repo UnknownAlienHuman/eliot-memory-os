@@ -1508,6 +1508,12 @@ struct ObservedProcess {
 struct JobProcessObserver {
     completion_port: OwnedHandle,
     observed: Arc<Mutex<Vec<ObservedProcess>>>,
+    /// PIDs notified via the completion port but not yet resolved to
+    /// identities. The observer thread pushes; the calling thread drains via
+    /// `drain_pending`. Identity resolution stays off the observer thread so
+    /// `shutdown`'s `join` is bounded by the 10 ms dequeue poll instead of an
+    /// uninterruptible process/image lookup.
+    pending: Arc<Mutex<Vec<u32>>>,
     shutdown_requested: Arc<AtomicBool>,
     history_truncated: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -1543,7 +1549,8 @@ impl JobProcessObserver {
             return Err(io::Error::last_os_error());
         }
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let thread_observed = Arc::clone(&observed);
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let thread_pending = Arc::clone(&pending);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let thread_shutdown_requested = Arc::clone(&shutdown_requested);
         let history_truncated = Arc::new(AtomicBool::new(false));
@@ -1554,7 +1561,7 @@ impl JobProcessObserver {
             .spawn(move || {
                 job_process_observer_loop(
                     raw_port,
-                    &thread_observed,
+                    &thread_pending,
                     &thread_shutdown_requested,
                     &thread_history_truncated,
                 );
@@ -1562,6 +1569,7 @@ impl JobProcessObserver {
         Ok(Self {
             completion_port,
             observed,
+            pending,
             shutdown_requested,
             history_truncated,
             thread: Some(thread),
@@ -1569,6 +1577,9 @@ impl JobProcessObserver {
     }
 
     fn snapshot(&self) -> Vec<ProcessImageIdentity> {
+        // Resolve queued notifications on this thread before cloning so the
+        // returned history includes every notification received so far.
+        self.drain_pending();
         self.observed.lock().map_or_else(
             |_| {
                 // A poisoned lock hides an unknown subset of history, so the
@@ -1584,6 +1595,46 @@ impl JobProcessObserver {
                     .collect()
             },
         )
+    }
+
+    /// Resolves IOCP-notified PIDs on the calling thread.
+    ///
+    /// The observer thread queues raw PIDs instead of resolving them (see
+    /// `job_process_observer_loop`), so every blocking process/image lookup
+    /// happens here, where the caller already accepts blocking enumeration.
+    /// A PID that exits or becomes inaccessible between notification and
+    /// resolution is simply absent from history — the same leniency the loop
+    /// previously applied inline. Only a poisoned lock marks the history
+    /// truncated.
+    fn drain_pending(&self) {
+        let pids = self.pending.lock().map_or_else(
+            |_| {
+                self.history_truncated.store(true, Ordering::Release);
+                Vec::new()
+            },
+            |mut pending| std::mem::take(&mut *pending),
+        );
+        let mut resolved = Vec::with_capacity(pids.len());
+        for pid in pids {
+            if let Ok(process) = open_process_identity(pid) {
+                resolved.push(process);
+            }
+        }
+        if resolved.is_empty() {
+            return;
+        }
+        let Ok(mut observed) = self.observed.lock() else {
+            self.history_truncated.store(true, Ordering::Release);
+            return;
+        };
+        for process in resolved {
+            if !observed
+                .iter()
+                .any(|record| record.identity == process.identity)
+            {
+                observed.push(process);
+            }
+        }
     }
 
     fn history_complete(&self) -> bool {
@@ -1618,6 +1669,9 @@ impl JobProcessObserver {
         // Publish shutdown before posting so the finite dequeue poll can exit
         // even if every idempotent sentinel re-post fails. The port stays live
         // until after join, preserving its ownership across any blocked call.
+        // The join below is bounded: the observer thread never resolves
+        // process identities itself (see `drain_pending`), so its only
+        // blocking call is the 10 ms dequeue poll.
         self.shutdown_requested.store(true, Ordering::Release);
         // A failed Post has unknown submission outcome, so the bounded retries
         // remain safe because each shutdown directive is idempotent.
@@ -1652,7 +1706,7 @@ impl Drop for JobProcessObserver {
 
 fn job_process_observer_loop(
     raw_port: usize,
-    observed: &Arc<Mutex<Vec<ObservedProcess>>>,
+    pending: &Arc<Mutex<Vec<u32>>>,
     shutdown_requested: &AtomicBool,
     history_truncated: &AtomicBool,
 ) {
@@ -1705,13 +1759,17 @@ fn job_process_observer_loop(
         let Ok(pid) = u32::try_from(overlapped as usize) else {
             continue;
         };
-        if let Ok(process) = open_process_identity(pid)
-            && let Ok(mut records) = observed.lock()
-            && !records
-                .iter()
-                .any(|record| record.identity == process.identity)
-        {
-            records.push(process);
+        // Queue the PID for the calling thread instead of resolving it here:
+        // `open_process_identity` performs blocking process/image queries
+        // with no OS cancellation primitive, so resolving inline would leave
+        // `shutdown`'s `join` unbounded while a lookup is in flight. This
+        // keeps the loop's only blocking call the 10 ms dequeue poll above.
+        let Ok(mut pending) = pending.lock() else {
+            history_truncated.store(true, Ordering::Release);
+            break;
+        };
+        if !pending.contains(&pid) {
+            pending.push(pid);
         }
     }
 }
@@ -2230,12 +2288,14 @@ impl SuspendedJobChild {
         }
     }
 
-    /// Returns identities already bound to retained process handles without a
-    /// fresh Job Object or PID lookup.
+    /// Returns identities already bound to retained process handles.
     ///
-    /// The returned history may be truncated when the observer exited
-    /// abnormally; consult [`SuspendedJobChild::observed_history_complete`]
-    /// before treating it as a complete enumeration.
+    /// Pending observer notifications are resolved on the calling thread, so
+    /// this performs blocking process/image lookups for PIDs notified since
+    /// the last call; it issues no fresh Job Object query. The returned
+    /// history may be truncated when the observer exited abnormally;
+    /// consult [`SuspendedJobChild::observed_history_complete`] before
+    /// treating it as a complete enumeration.
     #[must_use]
     pub fn observed_processes(&self) -> Vec<ProcessImageIdentity> {
         let mut processes = self.observer.snapshot();
@@ -2249,7 +2309,7 @@ impl SuspendedJobChild {
     /// [`SuspendedJobChild::observed_processes`] is complete.
     ///
     /// Returns `false` once the observer loop has exited on a failed
-    /// dequeue or the history lock has been poisoned: in either case an
+    /// dequeue or either history lock has been poisoned: in either case an
     /// unknown suffix of job notifications was dropped and the retained
     /// identities must not be reported as a complete observation.
     #[must_use]
