@@ -141,6 +141,14 @@ impl ObservabilityInstallOutcome {
 
 static INSTALL: OnceLock<ObservabilityInstall> = OnceLock::new();
 
+/// Owner of the rolling appender's writer thread for the process lifetime.
+///
+/// `RollingLogHandle` is not cloneable and its `Drop` requests shutdown, so the
+/// handle is owned here — a `OnceLock` dropped only at process exit — rather
+/// than by a local in `install`. The documented `shutdown` path stays the only
+/// thing that stops the appender.
+static APPENDER: OnceLock<RollingLogHandle> = OnceLock::new();
+
 /// Installs the whole observability runtime, or returns the existing one.
 ///
 /// Diagnostics never gate startup (A13.10): a rejected configuration returns a
@@ -173,6 +181,10 @@ pub fn install(
         otlp: otlp_disposition(config.otlp_endpoint.as_deref()),
         profile: config.profile,
     };
+    // The appender handle must outlive this function: dropping it sets the
+    // shared shutdown flag, which would make every later `try_send` drop its
+    // record. Keeping it here ties the writer thread to the process lifetime.
+    let _ = APPENDER.set(log);
     let _ = INSTALL.set(install.clone());
     Ok(ObservabilityInstallOutcome::Installed(install))
 }
