@@ -194,9 +194,22 @@ def cfg_name(conds: frozenset[str], target: str) -> str:
 
 
 def check_files(root: str, table: dict, res: Result) -> tuple[dict[str, dict], dict[str, str]]:
-    records = {f.get("path", ""): f for f in table.get("file", [])}
-    if "" in records:
+    file_rows = table.get("file", [])
+    seen_paths: set[str] = set()
+    duplicate_paths: set[str] = set()
+    for entry in file_rows:
+        path = entry.get("path", "")
+        if path in seen_paths:
+            duplicate_paths.add(path)
+        else:
+            seen_paths.add(path)
+    if "" in seen_paths:
         res.stale.append("file entry with empty path")
+    for path in sorted(duplicate_paths):
+        res.stale.append(f"duplicate file path: {path}")
+    if duplicate_paths:
+        return {}, {}
+    records = {f.get("path", ""): f for f in file_rows}
     actual = iter_src_rs(root)
     missing = [p for p in records if p not in actual]
     extra = [p for p in actual if p not in records]
@@ -322,8 +335,9 @@ def check_files(root: str, table: dict, res: Result) -> tuple[dict[str, dict], d
     return records, texts
 
 
-def check_test_only(root: str, table: dict, res: Result, texts: dict[str, str]) -> None:
-    records = {f.get("path", ""): f for f in table.get("file", [])}
+def check_test_only(
+    root: str, res: Result, texts: dict[str, str], records: dict[str, dict]
+) -> None:
     prod = [p for p, r in records.items() if r.get("cfg") not in ("test", "windows+test")]
     mod_decl = re.compile(r"mod\s+([A-Za-z0-9_]+)\s*;")
     for path, rec in sorted(records.items()):
@@ -399,9 +413,22 @@ def check_boundaries(
     field_ceiling: int | None,
     detail_ceiling: int | None,
 ) -> dict[str, dict]:
-    boundaries = {b.get("id", ""): b for b in table.get("boundary", [])}
-    if "" in boundaries:
+    boundary_rows = table.get("boundary", [])
+    seen_ids: set[str] = set()
+    duplicate_ids: set[str] = set()
+    for entry in boundary_rows:
+        boundary_id = entry.get("id", "")
+        if boundary_id in seen_ids:
+            duplicate_ids.add(boundary_id)
+        else:
+            seen_ids.add(boundary_id)
+    if "" in seen_ids:
         res.stale.append("boundary with empty id")
+    for boundary_id in sorted(duplicate_ids):
+        res.stale.append(f"duplicate boundary id: {boundary_id}")
+    if duplicate_ids:
+        return {}
+    boundaries = {b.get("id", ""): b for b in boundary_rows}
     for bid, bnd in sorted(boundaries.items()):
         if not bid:
             continue
@@ -1327,7 +1354,7 @@ def run(root: str) -> tuple[Result, dict]:
     res.counts["files"] = len(records)
     check_deleted(root, table, res, texts)
     check_added(table, res, records)
-    check_test_only(root, table, res, texts)
+    check_test_only(root, res, texts, records)
     field_ceiling, detail_ceiling = facade_consts(texts, res)
     boundaries = check_boundaries(root, table, res, records, texts, field_ceiling, detail_ceiling)
     res.counts["boundaries"] = len(boundaries)
