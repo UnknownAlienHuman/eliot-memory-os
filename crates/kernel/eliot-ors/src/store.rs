@@ -326,8 +326,8 @@ const BRIDGE_EVENT_HANDOFF_RECONCILED: &str = "reconciled";
 /// Durable bridge-stream owner bindings (issue #2729): one authenticated
 /// owner binding per admitted stream namespace plus one per unscoped-gap
 /// reporter occurrence. Keyed by the versioned namespace digest; the row
-/// carries the full binding (installation/authority lineage, principal,
-/// producer, creating session occurrence, stream incarnation) and its
+/// carries the retained authority lineage, principal, producer, creating
+/// session occurrence, stream incarnation, and its
 /// revision. The last-staging connection stays observation metadata on the
 /// cursor/event rows only — never scope material here.
 const BRIDGE_STREAM_OWNERS: TableDefinition<&str, &str> =
@@ -358,14 +358,13 @@ const BRIDGE_EVENT_RECOVERY_REVISIONS: TableDefinition<&str, &str> =
 /// carries its own current identity while the recovered stream keeps its
 /// original one (mirrors the #2571 logical-key rule).
 const BRIDGE_STREAM_OWNER_NAMESPACE: &str = "eliot.bridge-event.stream-owner.v1";
-/// Owner-namespace domain for connection-level (unscoped) coverage gaps
-/// (issue #2729). Binds this literal, the authority lineage, and the
-/// Kernel-observed principal, with the producer and stream slots fixed to
-/// the explicit unbound marker: the gap has its own admitted
-/// producer/session occurrence even when no stream is known, namespaced
-/// through that owner's explicit continuity rather than a bare global gap
-/// ID or a fabricated task.
-const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v1";
+/// Owner-namespace domain for newly admitted connection-level (unscoped)
+/// coverage-gap occurrences (issue #2729). V2 adds the Kernel-observed
+/// connection, launch nonce, and session epoch to lineage/principal; producer
+/// and stream remain explicit unbound markers. Existing v1 owner rows are
+/// preserved under their original keys; this change does not migrate them or
+/// establish reconnect rights.
+const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v2";
 /// Version of the bridge-stream owner binding carried by every owner row.
 const BRIDGE_STREAM_OWNER_VERSION: u16 = 1;
 /// Incarnation assigned at the first admitted bind of a stream namespace.
@@ -8444,18 +8443,30 @@ impl RedbRecoveryStore {
         Ok(crate::model::sha256_hex(text.as_bytes()))
     }
 
-    /// Computes the versioned owner-namespace digest for one
-    /// connection-level gap reporter occurrence (issue #2729). The producer
-    /// and stream slots are fixed to the explicit unbound marker by
-    /// construction — never taken from caller input — so the namespace
-    /// names the reporter's admitted occurrence without fabricating a
-    /// producer or a task.
-    fn bridge_gap_owner_digest(lineage: &str, principal: &str) -> Result<String, OrsError> {
+    /// Computes the v2 owner-namespace digest for one connection-level gap
+    /// reporter occurrence (issue #2729). The occurrence fields are derived by
+    /// Kernel and validated here; producer and stream stay fixed to the
+    /// explicit unbound marker, so this creates neither a producer nor a task.
+    fn bridge_gap_owner_digest(
+        lineage: &str,
+        principal: &str,
+        connection: &str,
+        launch_nonce: &str,
+        session_epoch: u64,
+    ) -> Result<String, OrsError> {
         bridge_owner_component(lineage, "owner_authority_lineage")?;
         bridge_owner_component(principal, "owner_principal")?;
+        bridge_owner_component(connection, "owner_connection")?;
+        bridge_owner_component(launch_nonce, "owner_launch_nonce")?;
+        if session_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "owner_session_epoch",
+                reason: "unscoped-gap owner occurrence binds a nonzero session epoch",
+            });
+        }
         let unbound = HOST_REQUEST_UNBOUND_MARKER;
         let text = format!(
-            "{BRIDGE_GAP_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fproducer={unbound}\x1fstream={unbound}"
+            "{BRIDGE_GAP_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fconnection={connection}\x1flaunch_nonce={launch_nonce}\x1fsession_epoch={session_epoch}\x1fproducer={unbound}\x1fstream={unbound}"
         );
         Ok(crate::model::sha256_hex(text.as_bytes()))
     }
@@ -9936,7 +9947,8 @@ impl RedbRecoveryStore {
     /// #2729): the first admitted bind durably retains the binding with
     /// its store-assigned incarnation and revision, while a later bind
     /// under the same namespace must present the identical binding —
-    /// changed lineage, principal, producer, or local scope fails with
+    /// changed lineage, principal, producer, local scope, or creating
+    /// connection/launch-nonce/session-epoch occurrence fails with
     /// [`OrsError::DuplicateConflict`] and never overwrites the retained
     /// owner. Enforces the owner-table bound for fresh namespaces.
     fn bind_bridge_stream_owner_in(
@@ -9965,6 +9977,9 @@ impl RedbRecoveryStore {
                 || row.principal != evidence.principal
                 || row.producer != evidence.producer
                 || row.local_stream != evidence.local
+                || row.creating_connection != evidence.connection
+                || row.creating_launch_nonce != evidence.launch_nonce
+                || row.creating_session_epoch != evidence.session_epoch
             {
                 return Err(OrsError::DuplicateConflict);
             }
@@ -12276,7 +12291,13 @@ impl RedbRecoveryStore {
         now_ms: u64,
     ) -> Result<(String, String), OrsError> {
         if parsed.stream_id.is_empty() {
-            let namespace = Self::bridge_gap_owner_digest(&parsed.lineage, &parsed.principal)?;
+            let namespace = Self::bridge_gap_owner_digest(
+                &parsed.lineage,
+                &parsed.principal,
+                &parsed.connection,
+                &parsed.launch_nonce,
+                parsed.session_epoch,
+            )?;
             let evidence = BridgeOwnerEvidence {
                 lineage: parsed.lineage.clone(),
                 principal: parsed.principal.clone(),
