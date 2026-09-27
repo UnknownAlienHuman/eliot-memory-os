@@ -486,13 +486,15 @@ const READ_PROJECTION_PUBLICATIONS_BY_IDS: &str =
 /// canonical transition, so the transition's own receipt is what the gate reads
 /// instead of any second lookup by projection name: the receipt carries the
 /// `projection_refs` it published and the `revision_before_after` heads it
-/// committed. Nothing here names a projection kind, so a reader cannot drift
-/// from the writer's spelling, and nothing here is a stand-in for the Doctor
-/// rebuild path — this only decides whether already-published candidate data
-/// may be served as current.
+/// committed. Nothing here spells a projection kind of its own: the kind is
+/// read from the record the writer committed, and a spelling the store does
+/// not declare has no definition identity and is refused, so a reader cannot
+/// drift from the writer's spelling into a different projection. Nothing here
+/// is a stand-in for the Doctor rebuild path — this only decides whether
+/// already-published candidate data may be served as current.
 ///
-/// Every clause `I5.8` requires of a readable-as-current publication and that
-/// the durable record can carry is enforced through the one shared predicate
+/// Every clause `I5.8` requires of a readable-as-current publication is
+/// enforced through the one shared predicate
 /// [`FencedProjectionPublication::check_record_current`], plus the two clauses
 /// that need the committing transition beside the record:
 ///
@@ -503,20 +505,21 @@ const READ_PROJECTION_PUBLICATIONS_BY_IDS: &str =
 ///   store's retained publications, so a superseded publication is never
 ///   served as current — observable only because the generation advances.
 ///
-/// A transition that published no projection, a missing publication row,
-/// `PENDING`/`STALE`/`FAILED`/`INCONCLUSIVE`, a split view, a source head or
-/// generation that disagrees with the committing transition, and a superseded
-/// publication all fail closed with [`StoreError::InvalidProjection`]: a
-/// projection is never served as current without a publication record that
-/// proves it.
+/// The definition-digest clause is the third value the gate supplies, resolved
+/// per record from the store's CURRENT declaration
+/// ([`eliot_store_api::declared_projection_definition_digest`], the same one
+/// function the planner wrote the record's digest from) and compared by content
+/// against `record.projection_definition_digest`. A publication whose data was
+/// built under a definition that is no longer the declared one is therefore not
+/// readable as current, which is `I5.8`'s stale-definition case.
 ///
-/// The definition-digest clause of
-/// [`FencedProjectionPublication::check_current`] is NOT enforced here and is
-/// NOT waived: it needs a projection definition identity that
-/// [`ProjectionPublicationRecord`](eliot_store_api::ProjectionPublicationRecord)
-/// does not carry and that no admitted transition declares, so enforcing it
-/// here would refuse every read unconditionally. It stays the last clause of
-/// `check_current` for the surface that can supply one.
+/// A transition that published no projection, a missing publication row, a
+/// projection kind the store declares no definition for, a record naming a
+/// different definition than the declared one, `PENDING`/`STALE`/`FAILED`/
+/// `INCONCLUSIVE`, a split view, a source head or generation that disagrees
+/// with the committing transition, and a superseded publication all fail closed:
+/// a projection is never served as current without a publication record that
+/// proves it.
 async fn check_publication_fences_projection(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -582,10 +585,15 @@ async fn check_publication_fences_projection(
         {
             return Err(StoreError::InvalidProjection.into());
         }
+        // Fail closed: a kind with no declared definition is refused here
+        // (typed `StoreError::UnknownOperation`), never treated as matching.
+        let declared_definition_digest =
+            eliot_store_api::declared_projection_definition_digest(&record.projection_kind)?;
         FencedProjectionPublication::check_record_current(
             record,
             &source_heads,
             current.source_generation,
+            &declared_definition_digest,
         )
         .map_err(AdapterError::Store)?;
     }

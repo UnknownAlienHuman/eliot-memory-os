@@ -136,6 +136,10 @@ fn fenced_publication() -> FencedProjectionPublication {
     let record = ProjectionPublicationRecord {
         publication_id: ProjectionPublicationId::new("pub-1931-1").unwrap(),
         projection_kind: "graph/concept".to_owned(),
+        // I5.8 definition digest now lives on the durable record; the fenced
+        // view repeats the same value and `check_current` compares it against
+        // the declared identity the caller supplies.
+        projection_definition_digest: "c".repeat(64),
         projection_generation: 2,
         source_generation: 5,
         source_cursor: 9,

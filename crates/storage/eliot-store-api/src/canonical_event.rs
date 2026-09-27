@@ -346,19 +346,23 @@ impl CommittedCanonicalTransition {
 
 /// A derived projection gated by its publication record (`I5.8`).
 ///
-/// The neutral [`ProjectionPublicationRecord`] carries source heads,
-/// generations, the atomic data commit, and the provenance manifest, but not
-/// the projection definition digest. This fence adds the definition digest and
-/// pins the atomic data/provenance commit reference, so a reader can prove the
-/// candidate data and its provenance became visible atomically at one source
-/// fence. Partial provenance, a stale definition, a mismatched source
-/// generation, or a split view leaves the projection unreadable as current.
+/// The durable [`ProjectionPublicationRecord`] carries source heads,
+/// generations, the definition digest the candidate data was built with, the
+/// atomic data commit, and the provenance manifest. This fence pins the atomic
+/// data/provenance commit reference to the record's own commit, so a reader
+/// can prove the candidate data and its provenance became visible atomically at
+/// one source fence, and repeats the record's definition digest so a fence can
+/// never claim a definition the durable record does not name. Partial
+/// provenance, a stale definition, a mismatched source generation, or a split
+/// view leaves the projection unreadable as current.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FencedProjectionPublication {
     /// Same-fence publication record committed with the source transition.
     pub record: ProjectionPublicationRecord,
-    /// Digest of the projection definition the candidate data was built with.
+    /// Definition digest the candidate data was built with. It must equal the
+    /// record's own `projection_definition_digest`, so the fenced view and the
+    /// durable record can never disagree about which definition is current.
     pub projection_definition_digest: String,
     /// Atomic data/provenance commit both became visible under.
     pub atomic_commit_ref: CommitId,
@@ -372,6 +376,9 @@ impl FencedProjectionPublication {
             &self.projection_definition_digest,
             "projection_definition_digest",
         )?;
+        if self.projection_definition_digest != self.record.projection_definition_digest {
+            return Err(StoreError::InvalidProjection);
+        }
         if self.atomic_commit_ref.as_str() != self.record.atomic_data_commit.as_str() {
             return Err(StoreError::InvalidProjection);
         }
@@ -387,25 +394,26 @@ impl FencedProjectionPublication {
         expected_source_generation: u64,
         expected_definition_digest: &str,
     ) -> Result<(), StoreError> {
-        self.check_published_at(expected_source_heads, expected_source_generation)?;
-        if self.projection_definition_digest != expected_definition_digest {
-            return Err(StoreError::InvalidProjection);
-        }
-        Ok(())
+        self.check_published_at(
+            expected_source_heads,
+            expected_source_generation,
+            expected_definition_digest,
+        )
     }
 
     /// Requires the same readability fence from a bare publication record.
     ///
-    /// [`Self::check_current`] is this predicate plus the projection
-    /// definition digest, which only a [`Self`] can carry. A reader that holds
-    /// the record itself — the durable `projection_record` row a published
-    /// transition committed beside its own receipt — reaches every clause the
-    /// record can actually prove through this one function, so the
-    /// record-carried fence has exactly one implementation and a reader never
-    /// re-spells it. The definition-digest clause stays where it belongs: it
-    /// needs a projection definition identity the record does not carry, and
-    /// it is never dropped from [`Self::check_current`] to make a record look
-    /// sufficient.
+    /// A reader that holds the record itself — the durable `projection_record`
+    /// row a published transition committed beside its own receipt — reaches
+    /// every clause through this one function, so the record-carried fence has
+    /// exactly one implementation (the private `check_published` shared with
+    /// [`Self::check_published_at`]) and neither the write-side nor the
+    /// read-side gate re-spells it. The definition-digest clause now lives
+    /// inside that one implementation, applied to the record's own
+    /// `projection_definition_digest`: `expected_definition_digest` is the
+    /// store's currently declared identity for
+    /// [`declared_projection_definition_digest`](crate::declared_projection_definition_digest),
+    /// so a record naming a stale or undeclared definition is refused.
     ///
     /// The caller owns the one clause a bare record cannot prove against
     /// itself: that its `atomic_data_commit` is the commit whose data the
@@ -414,44 +422,61 @@ impl FencedProjectionPublication {
         record: &ProjectionPublicationRecord,
         expected_source_heads: &[RevisionHead],
         expected_source_generation: u64,
+        expected_definition_digest: &str,
     ) -> Result<(), StoreError> {
         record.validate()?;
-        check_published(record, expected_source_heads, expected_source_generation)
+        check_published(
+            record,
+            expected_source_heads,
+            expected_source_generation,
+            expected_definition_digest,
+        )
     }
 
     /// The record-carried readability fence shared by [`Self::check_current`]
     /// and [`Self::check_record_current`].
     ///
     /// Valid fence and record shape, `CURRENT` status, no split view, the
-    /// expected source generation, and an exact fence-pinned source-head
-    /// match. `validate()` additionally pins `atomic_commit_ref` to the
-    /// record's own atomic data commit, so candidate data and its provenance
-    /// are proved to have become visible under one commit reference.
+    /// expected definition digest, the expected source generation, and an exact
+    /// fence-pinned source-head match. `validate()` additionally pins
+    /// `atomic_commit_ref` to the record's own atomic data commit, so candidate
+    /// data and its provenance are proved to have become visible under one
+    /// commit reference.
     pub fn check_published_at(
         &self,
         expected_source_heads: &[RevisionHead],
         expected_source_generation: u64,
+        expected_definition_digest: &str,
     ) -> Result<(), StoreError> {
         self.validate()?;
         check_published(
             &self.record,
             expected_source_heads,
             expected_source_generation,
+            expected_definition_digest,
         )
     }
 }
 
 /// The one implementation of the record-carried readability fence (`I5.8`).
 ///
-/// `CURRENT` status, no split view, the expected source generation, and an
-/// exact fence-pinned source-head match. Shape and atomic-commit pinning live
-/// in the callers' `validate`, so this is reached only from a validated fence.
+/// `CURRENT` status, no split view, the currently declared definition digest,
+/// the expected source generation, and an exact fence-pinned source-head
+/// match. The definition digest is compared by CONTENT against the declared
+/// identity, never checked for mere presence, so a publication built under a
+/// definition that is no longer the declared one is refused. Shape and
+/// atomic-commit pinning live in the callers' `validate`, so this is reached
+/// only from a validated fence.
 fn check_published(
     record: &ProjectionPublicationRecord,
     expected_source_heads: &[RevisionHead],
     expected_source_generation: u64,
+    expected_definition_digest: &str,
 ) -> Result<(), StoreError> {
     if record.status != ProjectionStatus::Current {
+        return Err(StoreError::InvalidProjection);
+    }
+    if record.projection_definition_digest != expected_definition_digest {
         return Err(StoreError::InvalidProjection);
     }
     if !matches!(record.split_view, SplitView::None) {
