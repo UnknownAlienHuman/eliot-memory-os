@@ -3,8 +3,16 @@
 //! A report is a read-only projection: its canonical JSON is the authority for
 //! report identity, while Markdown is deliberately rendered from that JSON and
 //! carries the same identity and revision fence.
+//!
+//! [`projection`] carries the versioned report families (I16.8) that are
+//! generated from canonical audit/state only, each bound to the immutable
+//! [`projection::ReportInputRevision`] references it was read from. Both
+//! surfaces are read-only: neither exposes a canonical write path nor a
+//! completion, acceptance, or `Finish` decision.
 
 #![forbid(unsafe_code)]
+
+pub mod projection;
 
 use std::fmt::Write as _;
 
@@ -22,6 +30,10 @@ pub const CONTRACT_NAME: &str = "eliot.instrument.reports";
 pub const CONTRACT_VERSION: &str = "0.29";
 
 /// Report categories emitted by the instrument layer.
+///
+/// The families named by I16.8 are projection categories: each is generated
+/// from canonical state only and is bound to the input revisions it was read
+/// from. A category is never an acceptance or completion decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReportKind {
@@ -31,6 +43,20 @@ pub enum ReportKind {
     Health,
     /// A failure or dead-letter projection.
     Incident,
+    /// System Health: observed health of the system under the state fence.
+    SystemHealth,
+    /// Task/Completion: task state projected without a completion decision.
+    TaskCompletion,
+    /// Watchdog Security: watchdog security observations.
+    WatchdogSecurity,
+    /// Backup/Recovery: backup and recovery observations.
+    BackupRecovery,
+    /// Architecture Conformance: anchor-to-observed-mechanism comparison.
+    ArchitectureConformance,
+    /// Release Readiness: release evidence, never a release decision.
+    ReleaseReadiness,
+    /// Product Progress: product identity, objective, deltas, gaps, unproven scope.
+    ProductProgress,
 }
 
 /// Stable report identity and provenance fence.
