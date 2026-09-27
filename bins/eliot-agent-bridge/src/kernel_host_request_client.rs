@@ -1482,9 +1482,6 @@ enum CanonicalDispatchEntry {
     /// Non-hot operator carrier on the submit leg with tool bytes. Only
     /// [`ToolRequest::UserAutomation`] rides here.
     SubmitCarryingBytes,
-    /// Refused until the named task-bound route exists. `missing_route` names
-    /// it; the bridge never generates an optimistic outcome instead.
-    RefusedUntilRoute { missing_route: &'static str },
 }
 
 /// Returns the recorded dispatch row for one invocation (Implements #1739
@@ -1501,7 +1498,11 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         ToolRequest::Packet(_)
         | ToolRequest::Query(_)
         | ToolRequest::SkillInject(_)
-        | ToolRequest::SkillDisplay(_) => CanonicalDispatchEntry::InvokeRead,
+        | ToolRequest::SkillDisplay(_)
+        // #1741: the admitted strict finish draft rides the same linkage-checked
+        // invoke-read lane; the Kernel finish queue binds the exact draft bytes
+        // and the daemon flight claims them under a fenced attempt.
+        | ToolRequest::Finish(_) => CanonicalDispatchEntry::InvokeRead,
         ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitObservePair,
         ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "action-model/authority gate + effect dispatch (#1742 material-context gate)",
@@ -1512,7 +1513,6 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         ToolRequest::Coordinate(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "execution-fabric owner join with the same durable work/attempt identity (#1740)",
         },
-        ToolRequest::Finish(_) => CanonicalDispatchEntry::InvokeRead,
         ToolRequest::UserAutomation(_) => CanonicalDispatchEntry::SubmitCarryingBytes,
     }
 }
