@@ -246,8 +246,10 @@ fn crosses_authority_root(from_root: &str, to_root: &str) -> bool {
 /// Map membership IS the authority check, and that is sound only because the
 /// map holds admitted evidence exclusively: a member entered
 /// `GrantGraph::transitions` only through
-/// [`AdmittedRootTransition::admit`] or its restore-time re-verification,
-/// which read CURRENT owner state. A decoded structural record never reaches
+/// [`AdmittedRootTransition::admit`] or CURRENT-receipt
+/// [`AdmittedRootTransition::admit_restored`], which read CURRENT owner
+/// state. Snapshot-local restore admits nothing. A decoded structural
+/// record never reaches
 /// this map, so this predicate can no longer be satisfied by caller material.
 fn edge_is_authorized(
     parent: &CapabilityGrant,
@@ -1868,7 +1870,8 @@ impl GrantGraph {
 
     /// Partitions a restored full map into admitted authority and migrated
     /// quarantine (#2875 item 9). Roots admit; a grant whose parent edge is
-    /// authorized (same-root or receipt-covered) and whose parent admitted
+    /// authorized (same-root; the transitions map stays empty without
+    /// CURRENT re-admission) and whose parent admitted
     /// admits with it; anything else — an unauthorized crossing or a
     /// descendant below one — migrates to an inert quarantined relation
     /// with its full lineage retained. Deterministic fixpoint over
