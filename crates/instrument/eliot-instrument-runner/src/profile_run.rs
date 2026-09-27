@@ -252,16 +252,14 @@ impl StagePlan {
     ) -> Result<(), ProfileRunError> {
         let candidate_identity = candidate_identity.into();
         validate_digest(&candidate_identity, "candidate_identity")?;
-        match &self.candidate_identity {
-            Some(bound) if bound != &candidate_identity => {
-                Err(ProfileRunError::CandidateIdentityAlreadyBound)
+        if let Some(bound) = &self.candidate_identity {
+            if bound == &candidate_identity {
+                return Ok(());
             }
-            Some(_) => Ok(()),
-            None => {
-                self.candidate_identity = Some(candidate_identity);
-                Ok(())
-            }
+            return Err(ProfileRunError::CandidateIdentityAlreadyBound);
         }
+        self.candidate_identity = Some(candidate_identity);
+        Ok(())
     }
 }
 
@@ -482,14 +480,15 @@ impl ProfileAggregate {
                 plan.revision,
                 planned.route.stage().stage_id.clone(),
             );
-            match observed.remove(&key) {
-                Some(run) => ordered.push(run),
-                None => {
-                    let mut missing =
-                        InstrumentRun::missing(&planned.route, "stage has no observed run");
-                    missing.candidate_identity = plan.candidate_identity.clone();
-                    ordered.push(missing);
-                }
+            if let Some(run) = observed.remove(&key) {
+                ordered.push(run);
+            } else {
+                let mut missing =
+                    InstrumentRun::missing(&planned.route, "stage has no observed run");
+                missing
+                    .candidate_identity
+                    .clone_from(&plan.candidate_identity);
+                ordered.push(missing);
             }
         }
         let status = aggregate_status(plan, &ordered);
@@ -661,13 +660,13 @@ impl StageOrchestrator {
                     route,
                     format!("blocked by unlaunched dependency '{dependency}'"),
                 );
-                run.candidate_identity = plan.candidate_identity.clone();
+                run.candidate_identity.clone_from(&plan.candidate_identity);
                 runs.push(run);
                 unlaunched.insert(route.stage().stage_id.clone());
                 continue;
             }
             let mut run = Self::launch_one(runner, planned, launcher).await;
-            run.candidate_identity = plan.candidate_identity.clone();
+            run.candidate_identity.clone_from(&plan.candidate_identity);
             if run.evidence.is_missing() {
                 unlaunched.insert(route.stage().stage_id.clone());
             }

@@ -1033,8 +1033,8 @@ fn profile_run_id(
 ) -> String {
     sha256_hex(
         format!(
-            "{}\0{}\0{}\0{}\0{}\0{}",
-            candidate, profile, revision, aggregate_digest, receipt_digest, candidate_identity,
+            "{candidate}\0{profile}\0{revision}\0{aggregate_digest}\0{receipt_digest}\0\
+             {candidate_identity}"
         )
         .as_bytes(),
     )
