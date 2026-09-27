@@ -879,8 +879,20 @@ fn refuse_blocked_generation(
             .record(&outcome)
             .map_err(|error| owner_error(format!("dreamer model generation record: {error}")))?;
         view.clear_expired(input.now_unix_ms);
+        // The block verdict stays bound to this operation through the
+        // validated original record: the eligibility key is the digest the
+        // record itself carries (checked by the owner's validate() during
+        // record()), compared by content against the operation-bound
+        // fingerprint. A record naming any other fingerprint fails closed
+        // instead of blocking a foreign generation, and no fresh key is
+        // recomputed for the check.
+        if outcome.generation_fingerprint != generation_fingerprint {
+            return Err(owner_error(format!(
+                "evidenced generation outcome for {capability} does not name the bound generation fingerprint"
+            )));
+        }
         if disposition != OutcomeDisposition::GlobalApplied
-            || view.is_route_eligible(generation_fingerprint, None, input.now_unix_ms)
+            || view.is_route_eligible(&outcome.generation_fingerprint, None, input.now_unix_ms)
         {
             return Err(owner_error(format!(
                 "evidenced generation outcome for {capability} did not block its exact fingerprint"
