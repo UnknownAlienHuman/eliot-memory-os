@@ -735,6 +735,14 @@ impl StoreFailure {
                     StoreRecoveryAction::ResolveWriteReceipt,
                     None,
                 ),
+                StoreError::SnapshotClosePending { .. } => (
+                    StoreFailureDisposition::Unavailable,
+                    "SNAPSHOT_CLOSE_PENDING",
+                    StoreMutationDisposition::NotAttempted,
+                    StoreRetryDirective::RetrySameIdentityAfterBackoff,
+                    StoreRecoveryAction::RestoreStoreConnectivity,
+                    None,
+                ),
                 StoreError::MissingReceiptEnvelope => {
                     return Self::unknown_outcome(&context, "RECEIPT_ENVELOPE_MISSING");
                 }

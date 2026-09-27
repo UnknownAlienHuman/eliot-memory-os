@@ -2886,9 +2886,9 @@ fn resolve_claim(state: &SnapshotState, claim: &CaptureCallClaim) -> Result<(), 
 /// whose logical capture is still being enumerated by its owner (see
 /// [`claim_begin`]): the owning begin has issued no handle yet, so the honest
 /// answer is a pending capture rather than a handle from a second observation.
-/// `eliot_store_api::StoreError` has no pending variant, so the typed conflict it
-/// does offer for a call that does not own the capture's current progress
-/// revision is used instead of inventing one here.
+/// A `RevisionConflict` applies only while another claim owns the current
+/// progress revision. A failed point observation by the owning end claim is a
+/// separate case and returns `SnapshotClosePending` with its recovery identity.
 fn capture_claim_pending() -> StoreError {
     StoreError::RevisionConflict
 }
@@ -2901,14 +2901,18 @@ fn capture_claim_pending() -> StoreError {
 /// able to see, and `end_snapshot` still owes the caller a receipt carrying
 /// them. It is also not evidence that the source moved, which is why the reason
 /// is the transient one and why it is merged into the ledger rather than
-/// replacing whatever the ledger already holds.
+/// replacing whatever the ledger already holds. When the claim is an end call,
+/// the exact issued handle and served member/byte totals are captured under the
+/// same lock before the claim is settled, so the caller can resume this close.
 ///
 /// A poisoned registry lock is not treated as successful cleanup: the claim is
 /// left unsettled, so its `Drop` cannot certify anything either, and the
 /// capture keeps its entry and its evidence.
-fn record_provider_read_failure(claim: &mut CaptureCallClaim) {
+fn record_provider_read_failure(
+    claim: &mut CaptureCallClaim,
+) -> Option<(SnapshotHandle, u64, u64)> {
     let Ok(mut states) = registry().lock() else {
-        return;
+        return None;
     };
     let owned = states
         .get(&claim.digest)
@@ -2916,7 +2920,7 @@ fn record_provider_read_failure(claim: &mut CaptureCallClaim) {
     if !owned {
         // The claim no longer describes this entry's current owner: a replaced
         // or closed capture keeps its own evidence untouched.
-        return;
+        return None;
     }
     merge_interruption(
         &mut states,
@@ -2924,7 +2928,19 @@ fn record_provider_read_failure(claim: &mut CaptureCallClaim) {
         claim.incarnation,
         InterruptionReason::ProviderReadFailed,
     );
+    let recovery_identity = if claim.kind == CaptureCallKind::End {
+        states.get(&claim.digest).map(|state| {
+            (
+                state.issued.clone(),
+                state.members_served,
+                state.bytes_served,
+            )
+        })
+    } else {
+        None
+    };
     claim.settle(&mut states);
+    recovery_identity
 }
 
 /// The typed refusal for a handle that names no open capture.
@@ -3913,7 +3929,7 @@ pub(crate) async fn read_snapshot_page(
     let observed = match observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION).await {
         Ok(point) => point,
         Err(error) => {
-            record_provider_read_failure(&mut claim);
+            let _ = record_provider_read_failure(&mut claim);
             return Err(error);
         }
     };
@@ -4122,9 +4138,18 @@ pub(crate) async fn end_snapshot(
             Err(error) => {
                 // The close read failed, so no receipt can claim the point held
                 // across this close. The exact evidence stays retained under
-                // this claim, the caller may retry `end_snapshot`, and a
+                // this claim, the caller may retry `end_snapshot` with the
+                // original owner-issued handle and exact served counts. A
                 // stable-point receipt is never fabricated from a failed read.
-                record_provider_read_failure(&mut claim);
+                if let Some((handle, members_served, bytes_served)) =
+                    record_provider_read_failure(&mut claim)
+                {
+                    return Err(StoreError::SnapshotClosePending {
+                        handle,
+                        members_served,
+                        bytes_served,
+                    });
+                }
                 return Err(error);
             }
         }
