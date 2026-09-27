@@ -16,10 +16,28 @@
 //! payload byte. A new Tool Definition or payload shape gets a NEW contract
 //! revision — v1 is frozen and rejected; v2 adds the accepted candidate to
 //! the intake payload, while v3 carries typed `WorkScope` guard-withholding
-//! evidence in result outcomes, and v4 carries the owner-qualified
+//! evidence in result outcomes, v4 carries the owner-qualified
 //! [`SkillUsefulness`](eliot_skill::SkillUsefulness) vocabulary plus the
 //! owner-resolved outcome evidence backing a usefulness claim, so `useful` is
-//! no longer a plain boolean that unverified wire strings can set.
+//! no longer a plain boolean that unverified wire strings can set, and v5
+//! retires the unqualified `Evidence` page counters in favour of the explicit
+//! bounded
+//! [`ExecutionReconciliationAssessment`](eliot_skill::ExecutionReconciliationAssessment).
+//!
+//! ## What v5 retires
+//!
+//! v4's `Evidence { observed, failed, uncertain_pending }` result shape
+//! reported counters folded from ONE submitted page and nothing else, so a
+//! page carrying no `Uncertain` row read as a clearance. That shape is
+//! RETIRED, not reinterpreted: a body that still decodes under the v4 spelling
+//! is legacy/unqualified output and must never be read as complete evidence.
+//! v5 carries the assessment instead — its scope, both scopes' statistics, the
+//! completeness state, the owner revision it was read at, the per-operation
+//! disposition and the exact pending references.
+//!
+//! The v4 input shapes (`SkillIntakePayload`, `SkillAckPayload`,
+//! `SkillDisplayPayload`, `SkillActivationPayload`, `SkillExecutionPayload`)
+//! are byte-identical in v5; only the result vocabulary moved.
 
 #![forbid(unsafe_code)]
 
@@ -32,9 +50,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Versioned Skill transport contract identity.
-pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v4";
+pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v5";
 /// Payload contract revision. Decode rejects any other revision.
-pub const SKILL_TRANSPORT_VERSION: u32 = 4;
+pub const SKILL_TRANSPORT_VERSION: u32 = 5;
 /// Maximum encoded intake bytes (I7.2 default frame max). Larger material
 /// must arrive by Blob or handle reference (future extension), never as
 /// giant inline frames; oversize fails closed here.
@@ -405,18 +423,18 @@ pub enum SkillResultOutcome {
     /// is a positive claim, and it is reached only after the ingest compared
     /// the presented outcome references against real owner records.
     Attempt(Box<eliot_skill::AttemptLifecycleSummary>),
-    /// Execution evidence reconciled: exact presented outcome counts with the
-    /// still-uncertain remainder. Retry is permitted only when
-    /// `uncertain_pending` is zero; uncertain effects block retry until
-    /// reconciled by exact evidence.
-    Evidence {
-        /// Presented executions with a fully observed outcome.
-        observed: u64,
-        /// Presented executions with a known failed outcome.
-        failed: u64,
-        /// Presented executions whose effects are still unknown.
-        uncertain_pending: u64,
-    },
+    /// Execution evidence reconciled: the explicit bounded
+    /// [`ExecutionReconciliationAssessment`](eliot_skill::ExecutionReconciliationAssessment)
+    /// over the OWNER-retained attempt-wide set (issue #2664, I7.25 / I14.21).
+    ///
+    /// This variant REPLACES the v4 `Evidence { observed, failed,
+    /// uncertain_pending }` page counters. It is an assessment, not a
+    /// permission: it names the scope it covers, separates page statistics
+    /// from attempt-wide statistics, reports how completely the denominator is
+    /// established, carries the owner revision the position was read at, and
+    /// carries the EXACT pending references rather than a count. It grants
+    /// execution itself to no one — the retry/admission owner consumes it.
+    Assessment(Box<eliot_skill::ExecutionReconciliationAssessment>),
     /// The owner records that established (or failed to establish) the
     /// usefulness claim carried by an `Attempt` outcome above, each with the
     /// owner revision it was read at.
@@ -493,19 +511,17 @@ impl SkillResultEnvelope {
         }
     }
 
-    /// Builds an evidence-reconciliation outcome from one validated ingest.
+    /// Builds an execution-reconciliation outcome from one bounded assessment.
     ///
-    /// Carries the exact presented outcome counts. A non-zero
-    /// `uncertain_pending` means retry stays blocked until those executions
-    /// are reconciled by exact evidence.
-    pub fn evidence(observed: u64, failed: u64, uncertain_pending: u64) -> Self {
+    /// Carries the assessment verbatim: the scope, both scopes' statistics,
+    /// the completeness state, the owner revision, the per-operation
+    /// dispositions and the exact pending references. A consumer decides its
+    /// own admission from that; nothing here grants execution, and the legacy
+    /// v4 counter triple is not reconstructed from it.
+    pub fn assessment(assessment: eliot_skill::ExecutionReconciliationAssessment) -> Self {
         Self {
             contract_version: SKILL_TRANSPORT_VERSION,
-            outcome: SkillResultOutcome::Evidence {
-                observed,
-                failed,
-                uncertain_pending,
-            },
+            outcome: SkillResultOutcome::Assessment(Box::new(assessment)),
         }
     }
 

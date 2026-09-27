@@ -2770,13 +2770,22 @@ async fn run_local_read_poll(
             };
             return Ok(step(outcome, delta));
         }
-        let admitted_fence = {
+        // #2664: the execute leg also reads the owner-retained execution
+        // position, and that read is a plain in-process owner lookup. It runs
+        // under the SAME short composition borrow that snapshots the fence and
+        // the borrow is dropped before the plan runs, so no composition guard
+        // is ever held across the plan's canonical reads or its awaits.
+        let (admitted_fence, execution_owner_read) = {
             let guard = composition.lock().await;
-            guard.kernel_snapshot().state_fence().clone()
+            (
+                guard.kernel_snapshot().state_fence().clone(),
+                eliotd::skill_dispatch::execution_owner_read(&guard, &tool),
+            )
         };
         let plan = Box::pin(eliotd::skill_dispatch::plan_skill_pair(
             kernel,
             admitted_fence,
+            execution_owner_read,
             &envelope,
             &tool,
             &attempt,

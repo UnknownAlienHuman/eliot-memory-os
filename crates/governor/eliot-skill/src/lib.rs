@@ -61,14 +61,17 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 pub mod activation;
 
 pub use activation::{
-    AdherenceCheckpoints, AttemptLifecycleSummary, EvidenceCoverage, ExecutionFold,
-    InstructionConflict, LifecycleEvidence, OrderingBasis, OwnerQualifiedCandidate,
-    ResolvedOutcome, SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
-    SkillHarnessActivationReceipt, SkillRetrievalStatus, SkillUsefulness, SourceRevision,
-    UnknownEffectsVerdict, apply_dependency_staleness, changed_dependency_names,
-    derive_attempt_summary, derive_lifecycle_view, detect_dependency_staleness,
-    fold_execution_evidence, material_use_allowed, qualify_useful_outcomes,
-    reconcile_unknown_effects, record_instruction_conflict,
+    AdherenceCheckpoints, AssessmentCompleteness, AssessmentDisposition, AttemptLifecycleSummary,
+    EvidenceCoverage, ExecutionAssessmentContext, ExecutionAssessmentScope, ExecutionDisposition,
+    ExecutionDispositionEntry, ExecutionFold, ExecutionProjection,
+    ExecutionReconciliationAssessment, ExecutionSetCounts, InstructionConflict, LifecycleEvidence,
+    MAX_ASSESSMENT_REFS, OrderingBasis, OwnerQualifiedCandidate, ResolvedOutcome,
+    SOURCE_EXECUTION_OWNER_SET, SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
+    SkillExecutionOwnerPosition, SkillHarnessActivationReceipt, SkillRetrievalStatus,
+    SkillUsefulness, SourceRevision, apply_dependency_staleness, assess_execution_reconciliation,
+    changed_dependency_names, derive_attempt_summary, derive_lifecycle_view,
+    detect_dependency_staleness, fold_execution_evidence, material_use_allowed,
+    project_execution_outcomes, qualify_useful_outcomes, record_instruction_conflict,
 };
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
