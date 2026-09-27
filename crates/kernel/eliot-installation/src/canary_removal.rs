@@ -1570,9 +1570,10 @@ where
 }
 
 /// Revalidates the durable fence before any destructive action: the exact
-/// installed transaction and its completed stage, the current registry
-/// revision, the target's still-retired position, any pending activation and
-/// the observed activation-owner handoff.
+/// installed transaction and its completed stage, the re-observed drain
+/// evidence (applied effects, no pending external change, no held activation
+/// intent), the current registry revision, the target's still-retired
+/// position, any pending activation and the observed activation-owner handoff.
 #[allow(
     clippy::too_many_lines,
     reason = "the pre-destructive fence keeps every drift check in one auditable boundary"
@@ -1610,6 +1611,26 @@ where
     }
     if install.stage() != InstallationStage::Completed {
         return Err(InstallationError::IdentityConflict);
+    }
+    // Quiesce is re-observed at fence time, not just at plan time: the drain
+    // evidence (every installer effect authoritatively applied, no
+    // unacknowledged external change, no activation intent still held by the
+    // activation owner) must still hold immediately before a dependent
+    // stop/delete, so a drift between planning and execution can never
+    // green-light a destructive call. An incomplete drain stays a refusal and
+    // preserves the durable incomplete recovery; it never forces a green
+    // cleanup.
+    install.require_all_effects_applied()?;
+    if !install.pending_external_changes.is_empty() {
+        return Err(InstallationError::IncompleteObservation(
+            "the installed transaction still carries unacknowledged external changes".to_owned(),
+        ));
+    }
+    if install.has_activation_projection_intent() {
+        return Err(InstallationError::IncompleteObservation(
+            "the activation owner still holds this transaction's pending activation intent"
+                .to_owned(),
+        ));
     }
     let projection = registry.load()?;
     projection.validate()?;
