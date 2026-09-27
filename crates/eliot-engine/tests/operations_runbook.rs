@@ -494,7 +494,7 @@ fn write_governor_config(
 ) -> TestResult<PathBuf> {
     let config_dir = root.join("config");
     std::fs::create_dir_all(&config_dir)?;
-    let config_path = config_dir.join("eliot-governor.toml");
+    let config_path = config_dir.join("governor-operations-fixture.toml");
     let slash = |path: &Path| path.to_string_lossy().replace('\\', "/");
     let config = format!(
         concat!(
