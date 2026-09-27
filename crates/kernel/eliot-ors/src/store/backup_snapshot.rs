@@ -102,6 +102,23 @@
 //! it to `ForensicOnly` alongside the `UnknownCommitRecovery` sibling, so an
 //! exported row lands as forensics and never as an importable answer.
 //!
+//! Issue #1971 registers the versioned-artifact family in that same
+//! denominator. `RowFamilyKind::VersionedArtifacts` carries the
+//! `ors_versioned_artifacts_v1` family — one durable row per
+//! `staged:`/`retained:` `(<module_id>, <generation>)` key holding the exact
+//! artifact hash and path — with the `CutoverOwnership` sibling's
+//! `NonrestorableHistorical` disposition, so restore triage lands its rows as
+//! forensics through the generic disposition match and no restored
+//! installation can reactivate old installation-bound generation authority.
+//! The contract discriminator already names it cursor-paged
+//! (`RowFamilyKind::uses_family_cursor`), because its rows carry no operation
+//! order. Page serialization is not wired here yet: a cursor-paged export
+//! needs a durable monotone family revision the family's single write path
+//! advances inside the same transaction as every row change, and the
+//! versioned-artifact commit path has no such counter — the frozen identity,
+//! movement refusal and pre/post witness for this family stay next-phase work
+//! with that write path, not an approximation here.
+//!
 //! Issue #953 makes the capture coherent and the page binding self-proving:
 //! - ONE `ReadTransaction` is opened per capture and threaded through the
 //!   store-wide fence observation, the pre witness and EVERY page
