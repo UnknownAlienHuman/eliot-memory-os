@@ -653,6 +653,12 @@ pub(crate) const READ_REVISION_HEADS_BY_KEYS: &str =
 pub(crate) const READ_ORDERING_HEADS_BY_SCOPES: &str =
     "SELECT VALUE body FROM ordering_head WHERE ordering_scope IN $scopes;";
 
+/// Reads each Ordering Scope's own chain tip, the `previous_event_hash`/
+/// `event_hash` siblings the closed `SELECT VALUE body` head read cannot see
+/// (issue #1931). `event_hash` is null for a scope whose row predates per-scope
+/// chain links, which the caller reads as the genesis prior.
+pub(crate) const READ_ORDERING_CHAIN_TIPS_BY_SCOPES: &str = "SELECT VALUE { ordering_scope: ordering_scope, event_hash: event_hash } FROM ordering_head WHERE ordering_scope IN $scopes;";
+
 pub(crate) const READ_ALL_REVISION_HEADS: &str = "SELECT VALUE body FROM revision_head;";
 
 pub(crate) const READ_ALL_ORDERING_HEADS: &str = "SELECT VALUE body FROM ordering_head;";

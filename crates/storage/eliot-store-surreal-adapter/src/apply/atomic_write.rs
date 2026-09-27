@@ -415,6 +415,13 @@ fn build_apply_statements(
         let template = ordering_write_template(initial_state, ordering_exists);
         sql.push_str(&schema::indexed(template, index));
         let suffix = index.to_string();
+        // Issue #1931: the per-scope chain tip rides the same CAS-guarded
+        // `CREATE`/`UPDATE ... CONTENT` as the neutral `OrderingHead` body, so
+        // the head and its chain tip advance atomically or not at all. The
+        // shipped `OrderingHead` serde boundary is unchanged: both hashes are
+        // sibling fields on the schemaless record, invisible to every
+        // `SELECT VALUE body` reader.
+        let link = chain_link_for_scope(plan, head)?;
         bindings.insert(
             format!("ordering_table{suffix}"),
             json!(schema::table::ORDERING_HEAD),
@@ -428,6 +435,8 @@ fn build_apply_statements(
             json!({
                 "ordering_scope": head.scope.to_string(),
                 "body": to_value(head)?,
+                "previous_event_hash": link.previous_event_hash,
+                "event_hash": link.event_hash,
             }),
         );
         bindings.insert(
@@ -444,11 +453,18 @@ fn build_apply_statements(
             json!(schema::table::CANONICAL_EVENT),
         );
         bindings.insert(format!("event_id{suffix}"), json!(event_id.to_string()));
+        // Issue #1931: the durable event row now carries the whole canonical
+        // event — one identity, the payload digest, the monotonic ordinal, the
+        // fence, and one hash-chain link per declared Ordering Scope — plus the
+        // transition's audit-chain digest, in the same statement and therefore
+        // the same transaction as the receipt and outbox rows below.
         bindings.insert(
             format!("event{suffix}"),
             json!({
                 "event_id": event_id.to_string(),
                 "operation_id": operation_id,
+                "body": to_value(&plan.canonical_event)?,
+                "audit_chain_digest": plan.audit_chain_digest,
             }),
         );
     }
@@ -571,6 +587,28 @@ fn build_apply_statements(
 
     sql.push_str(schema::TX_COMMIT);
     Ok((sql, bindings))
+}
+
+/// Binds one ordering head to the canonical event's link for the same scope.
+///
+/// The event is issued from the same `next_ordering_heads`, so every head has
+/// exactly one link; a missing link means the plan and the event disagree and
+/// the transaction is refused before it is sent rather than advancing a head
+/// with no chain link.
+fn chain_link_for_scope<'plan>(
+    plan: &'plan ApplyPlan,
+    head: &OrderingHead,
+) -> Result<&'plan eliot_store_api::OrderingLink, AdapterError> {
+    plan.canonical_event
+        .ordering_links
+        .iter()
+        .find(|link| link.ordering_scope == head.scope)
+        .ok_or_else(|| {
+            AdapterError::Serialization(
+                "prepared transition plan has an ordering head without a canonical event link"
+                    .to_owned(),
+            )
+        })
 }
 
 /// Appends the Governor-produced canonical finish-evidence owner image.

@@ -42,6 +42,7 @@ use thiserror::Error;
 mod architecture_self_model;
 mod backup_io;
 mod blackboard;
+pub mod canonical_event;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
@@ -85,6 +86,13 @@ pub use blackboard::{
     BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
     BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
     blackboard_item_request, decode_blackboard_item,
+};
+
+pub use canonical_event::{
+    CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority,
+    FencedProjectionPublication, ORDERING_LINK_GENESIS_HASH, OrderingLink, ProjectionRebuildPlan,
+    SemanticWritePath, ordering_link_hash, request_projection_rebuild,
+    request_rebuild_from_semantic_write,
 };
 
 pub use dreamer_job::{
