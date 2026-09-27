@@ -2345,6 +2345,13 @@ pub fn retry_publication_content(envelope: &StoredPlanEnvelope) -> (&str, &str) 
 /// Revalidates a stored plan against the currently applicable inputs before
 /// execution.  Candidate, target, feature, graph, or source movement
 /// invalidates the revision: the caller must build a new linked revision.
+///
+/// Every currently required source owner must carry the exact same owner,
+/// revision, and content digest in the retained plan, in the current owner
+/// observation, and in the current graph commitments.  Contradictory or
+/// missing required evidence fails even when the graph revision string is
+/// unchanged; owners outside the applicable set are not revalidated here
+/// and explicit non-applicability declarations keep their existing meaning.
 pub fn revalidate_plan(
     plan: &ChangeImpactPlan,
     graph: &BuildTestGraph,
@@ -2372,13 +2379,27 @@ pub fn revalidate_plan(
     }
     for expected in expected_source {
         expected.validate()?;
-        match plan.source_commitments.get(&expected.owner) {
-            Some(retained) if retained.revision == expected.revision => {}
-            _ => {
-                return Err(PlanError::StaleSource {
-                    owner: expected.owner.clone(),
+        let retained_matches =
+            plan.source_commitments
+                .get(&expected.owner)
+                .is_some_and(|retained| {
+                    retained.owner == expected.owner
+                        && retained.revision == expected.revision
+                        && retained.content_digest == expected.content_digest
                 });
-            }
+        let current_matches =
+            graph
+                .source_commitments
+                .get(&expected.owner)
+                .is_some_and(|current| {
+                    current.owner == expected.owner
+                        && current.revision == expected.revision
+                        && current.content_digest == expected.content_digest
+                });
+        if !retained_matches || !current_matches {
+            return Err(PlanError::StaleSource {
+                owner: expected.owner.clone(),
+            });
         }
     }
     Ok(())
