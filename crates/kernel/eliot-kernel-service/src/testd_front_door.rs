@@ -98,6 +98,10 @@ pub const TESTD_CONFLICT_MAX_FIELDS: usize = 32;
 pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
 /// Productive nextest profile mirrored from `eliot-testd-core`.
 pub const TESTD_PRODUCTIVE_PROFILE: &str = "cargo-nextest";
+/// Slotted dev-fast discovery profile mirrored from `eliot-testd-core`.
+pub const TESTD_LIST_PROFILE: &str = "cargo-nextest-list";
+/// Slotted dev-fast scoped-run profile mirrored from `eliot-testd-core`.
+pub const TESTD_SCOPED_PROFILE: &str = "cargo-nextest-scoped";
 /// Relative program for the admitted probe, mirrored from `eliot-testd-core`.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
 /// Relative executable for the productive nextest profile.
@@ -112,6 +116,22 @@ pub const TESTD_PRODUCTIVE_PROFILE_ARGV: &[&str] = &[
     "--message-format-version",
     "0.1",
 ];
+/// Fixed discovery argv prefix mirrored from `eliot-testd-core`.
+pub const TESTD_LIST_PROFILE_ARGV: &[&str] = &["list", "--message-format", "json"];
+/// Slot flag binding one Cargo package, mirrored.
+pub const TESTD_SLOT_PACKAGE: &str = "--package";
+/// Slot flag binding one binary target, mirrored.
+pub const TESTD_SLOT_BINARY: &str = "--bin";
+/// Slot flag binding the scoped retry count, mirrored.
+pub const TESTD_SLOT_RETRIES: &str = "--retries";
+/// Exact-match marker rendered before scoped filters, mirrored.
+pub const TESTD_SLOT_EXACT: &str = "--exact";
+/// Separator between nextest options and exact filters, mirrored.
+pub const TESTD_SLOT_SEPARATOR: &str = "--";
+/// Maximum retries admitted in one scoped slot set, mirrored.
+pub const TESTD_SCOPED_MAX_RETRIES: u32 = 10;
+/// Maximum exact filters admitted in one scoped slot set, mirrored.
+pub const TESTD_SCOPED_MAX_FILTERS: usize = 60;
 /// Exact non-secret environment required by the experimental reporter.
 pub const TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT: &[(&str, &str)] =
     &[("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1")];
@@ -139,6 +159,18 @@ pub const TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 pub const TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 /// Independent productive nextest descendant ceiling.
 pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
+/// Bounded discovery wall timeout in milliseconds, mirrored.
+pub const TESTD_LIST_PROFILE_WALL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+/// Bounded discovery CPU ceiling in milliseconds, mirrored.
+pub const TESTD_LIST_PROFILE_CPU_TIME_MS: u64 = 4 * 60 * 1_000;
+/// Bounded discovery memory ceiling in bytes, mirrored.
+pub const TESTD_LIST_PROFILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Bounded discovery stdout capture in bytes, mirrored.
+pub const TESTD_LIST_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Bounded discovery stderr capture in bytes, mirrored.
+pub const TESTD_LIST_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
+/// Bounded discovery descendant ceiling, mirrored.
+pub const TESTD_LIST_PROFILE_MAX_DESCENDANTS: u32 = 32;
 
 /// Computes the canonical definition digest over the static admitted
 /// profile fields.
@@ -150,7 +182,17 @@ pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
 /// values must agree. Excludes the per-host installed artifact digest,
 /// which binds later at Drive time through the intent's
 /// `executable_sha256`, so this value is stable across hosts.
-fn testd_profile_definition_digest(profile: &str) -> Result<String, KernelServiceError> {
+/// Computes the canonical definition digest for one profile with a
+/// validated slot suffix.
+///
+/// Fixed-argv profiles require an empty suffix; slotted profiles parse
+/// the suffix through the mirrored slot schema and digest the sealed
+/// argv, so this mirror agrees with `eliot-testd-core` without accepting
+/// executable authority from the caller.
+fn testd_profile_definition_digest_for_slots(
+    profile: &str,
+    slot_suffix: &[String],
+) -> Result<String, KernelServiceError> {
     #[derive(Serialize)]
     struct Canonical<'a> {
         cpu_time_ms: Option<u64>,
@@ -165,38 +207,8 @@ fn testd_profile_definition_digest(profile: &str) -> Result<String, KernelServic
         wall_timeout_ms: u64,
     }
     let empty: Vec<(String, String)> = Vec::new();
-    let (argv_source, limits) = if profile == TESTD_ADMITTED_PROFILE {
-        (
-            TESTD_PROFILE_ARGV,
-            (
-                TESTD_PROFILE_WALL_TIMEOUT_MS,
-                Some(TESTD_PROFILE_CPU_TIME_MS),
-                Some(TESTD_PROFILE_MEMORY_BYTES),
-                TESTD_PROFILE_STDOUT_BYTES,
-                TESTD_PROFILE_STDERR_BYTES,
-                TESTD_PROFILE_MAX_DESCENDANTS,
-            ),
-        )
-    } else if profile == TESTD_PRODUCTIVE_PROFILE {
-        (
-            TESTD_PRODUCTIVE_PROFILE_ARGV,
-            (
-                TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS,
-                Some(TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS),
-                Some(TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES),
-                TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES,
-                TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES,
-                TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS,
-            ),
-        )
-    } else {
-        return Err(KernelServiceError::InvalidField {
-            field: "testd_admission.profile",
-            reason: "unknown testd profile",
-        });
-    };
-    let argv: Vec<String> = argv_source.iter().map(ToString::to_string).collect();
-    let environment = if profile == TESTD_PRODUCTIVE_PROFILE {
+    let (argv, limits) = testd_mirrored_argv_and_limits(profile, slot_suffix)?;
+    let environment = if profile == TESTD_PRODUCTIVE_PROFILE || profile == TESTD_SCOPED_PROFILE {
         TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -211,10 +223,10 @@ fn testd_profile_definition_digest(profile: &str) -> Result<String, KernelServic
         max_descendants: limits.5,
         memory_bytes: limits.2,
         profile,
-        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
-            TESTD_PRODUCTIVE_PROFILE_PROGRAM
-        } else {
+        program_path: if profile == TESTD_ADMITTED_PROFILE {
             TESTD_PROFILE_PROGRAM
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
         },
         stderr_bytes: limits.4,
         stdout_bytes: limits.3,
@@ -226,6 +238,289 @@ fn testd_profile_definition_digest(profile: &str) -> Result<String, KernelServic
             field: "testd_admission.profile_binding_digest",
             reason: "cannot canonicalize profile binding",
         })
+}
+
+/// Mirrored resource limits: wall timeout, CPU ceiling, memory ceiling,
+/// stdout bound, stderr bound, and descendant ceiling.
+type TestdMirroredLimits = (u64, Option<u64>, Option<u64>, u64, u64, u32);
+
+/// Resolves the mirrored sealed argv plus resource limits for one
+/// profile with a validated slot suffix.
+fn testd_mirrored_argv_and_limits(
+    profile: &str,
+    slot_suffix: &[String],
+) -> Result<(Vec<String>, TestdMirroredLimits), KernelServiceError> {
+    if profile == TESTD_ADMITTED_PROFILE {
+        if !slot_suffix.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.profile",
+                reason: "the probe profile takes fixed argv",
+            });
+        }
+        return Ok((
+            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect(),
+            (
+                TESTD_PROFILE_WALL_TIMEOUT_MS,
+                Some(TESTD_PROFILE_CPU_TIME_MS),
+                Some(TESTD_PROFILE_MEMORY_BYTES),
+                TESTD_PROFILE_STDOUT_BYTES,
+                TESTD_PROFILE_STDERR_BYTES,
+                TESTD_PROFILE_MAX_DESCENDANTS,
+            ),
+        ));
+    }
+    if profile == TESTD_PRODUCTIVE_PROFILE {
+        if !slot_suffix.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.profile",
+                reason: "the productive profile takes fixed argv",
+            });
+        }
+        return Ok((
+            TESTD_PRODUCTIVE_PROFILE_ARGV
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            productive_mirrored_limits(),
+        ));
+    }
+    if profile == TESTD_LIST_PROFILE {
+        let argv =
+            render_testd_slotted_argv(profile, &parse_testd_slot_suffix(profile, slot_suffix)?)?;
+        return Ok((
+            argv,
+            (
+                TESTD_LIST_PROFILE_WALL_TIMEOUT_MS,
+                Some(TESTD_LIST_PROFILE_CPU_TIME_MS),
+                Some(TESTD_LIST_PROFILE_MEMORY_BYTES),
+                TESTD_LIST_PROFILE_STDOUT_BYTES,
+                TESTD_LIST_PROFILE_STDERR_BYTES,
+                TESTD_LIST_PROFILE_MAX_DESCENDANTS,
+            ),
+        ));
+    }
+    if profile == TESTD_SCOPED_PROFILE {
+        let argv =
+            render_testd_slotted_argv(profile, &parse_testd_slot_suffix(profile, slot_suffix)?)?;
+        return Ok((argv, productive_mirrored_limits()));
+    }
+    Err(KernelServiceError::InvalidField {
+        field: "testd_admission.profile",
+        reason: "unknown testd profile",
+    })
+}
+
+/// Mirrored productive-run resource limits, shared by the unscoped
+/// productive profile and the scoped profile.
+fn productive_mirrored_limits() -> TestdMirroredLimits {
+    (
+        TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS,
+        Some(TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS),
+        Some(TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES),
+        TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES,
+        TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES,
+        TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS,
+    )
+}
+
+/// Validated slot values mirrored from `eliot-testd-core`.
+struct TestdSlotValues {
+    package: Option<String>,
+    binary: Option<String>,
+    retries: Option<u32>,
+    filters: Vec<String>,
+}
+
+/// Parses one slot suffix through the mirrored slot schema.
+///
+/// Grammar and bounds mirror `parse_testd_slot_suffix` in
+/// `eliot-testd-core` exactly; any divergence fails the definition
+/// digest comparison instead of executing.
+fn parse_testd_slot_suffix(
+    profile: &str,
+    suffix: &[String],
+) -> Result<TestdSlotValues, KernelServiceError> {
+    let invalid = |reason: &'static str| KernelServiceError::InvalidField {
+        field: "testd_admission.sealed_slot_suffix",
+        reason,
+    };
+    if profile != TESTD_LIST_PROFILE && profile != TESTD_SCOPED_PROFILE {
+        return Err(invalid(
+            "only the slotted list and scoped profiles take slot arguments",
+        ));
+    }
+    let scoped = profile == TESTD_SCOPED_PROFILE;
+    let mut slots = TestdSlotValues {
+        package: None,
+        binary: None,
+        retries: None,
+        filters: Vec::new(),
+    };
+    let mut index = 0;
+    for flag in [TESTD_SLOT_PACKAGE, TESTD_SLOT_BINARY] {
+        if suffix.get(index).is_some_and(|token| token == flag) {
+            let name = suffix
+                .get(index + 1)
+                .ok_or_else(|| invalid("slot flag is missing its value"))?;
+            validate_slot_name(name)?;
+            if flag == TESTD_SLOT_PACKAGE {
+                slots.package = Some(name.clone());
+            } else {
+                slots.binary = Some(name.clone());
+            }
+            index += 2;
+        }
+    }
+    if scoped
+        && suffix
+            .get(index)
+            .is_some_and(|token| token == TESTD_SLOT_RETRIES)
+    {
+        let token = suffix
+            .get(index + 1)
+            .ok_or_else(|| invalid("slot flag is missing its value"))?;
+        let retries: u32 = token
+            .parse()
+            .map_err(|_| invalid("slot retry count is not a canonical number"))?;
+        if retries > TESTD_SCOPED_MAX_RETRIES || retries.to_string() != *token {
+            return Err(invalid("slot retry count is not a canonical number"));
+        }
+        slots.retries = Some(retries);
+        index += 2;
+    }
+    if scoped
+        && suffix
+            .get(index)
+            .is_some_and(|token| token == TESTD_SLOT_EXACT)
+    {
+        if suffix
+            .get(index + 1)
+            .is_none_or(|token| token != TESTD_SLOT_SEPARATOR)
+        {
+            return Err(invalid("slot filters require the exact separator"));
+        }
+        let filters = &suffix[index + 2..];
+        if filters.is_empty() || filters.len() > TESTD_SCOPED_MAX_FILTERS {
+            return Err(invalid("slot filter set is empty or exceeds its bound"));
+        }
+        for filter in filters {
+            validate_slot_filter(filter)?;
+        }
+        slots.filters = filters.to_vec();
+        index = suffix.len();
+    }
+    if index != suffix.len() {
+        return Err(invalid(
+            "slot suffix carries an unknown, duplicate, or out-of-order token",
+        ));
+    }
+    Ok(slots)
+}
+
+/// Renders the complete sealed argv through the mirrored slot schema.
+fn render_testd_slotted_argv(
+    profile: &str,
+    slots: &TestdSlotValues,
+) -> Result<Vec<String>, KernelServiceError> {
+    let prefix: &[&str] = if profile == TESTD_LIST_PROFILE {
+        TESTD_LIST_PROFILE_ARGV
+    } else if profile == TESTD_SCOPED_PROFILE {
+        TESTD_PRODUCTIVE_PROFILE_ARGV
+    } else {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_admission.profile",
+            reason: "only the slotted list and scoped profiles take slot arguments",
+        });
+    };
+    if let Some(package) = &slots.package {
+        validate_slot_name(package)?;
+    }
+    if let Some(binary) = &slots.binary {
+        validate_slot_name(binary)?;
+    }
+    if profile != TESTD_SCOPED_PROFILE && (slots.retries.is_some() || !slots.filters.is_empty()) {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_admission.sealed_slot_suffix",
+            reason: "retries and filters are scoped-run slots only",
+        });
+    }
+    if slots
+        .retries
+        .is_some_and(|retries| retries > TESTD_SCOPED_MAX_RETRIES)
+    {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_admission.sealed_slot_suffix",
+            reason: "slot retry count is not a canonical number",
+        });
+    }
+    if slots.filters.len() > TESTD_SCOPED_MAX_FILTERS {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_admission.sealed_slot_suffix",
+            reason: "slot filter set is empty or exceeds its bound",
+        });
+    }
+    for filter in &slots.filters {
+        validate_slot_filter(filter)?;
+    }
+    let mut argv: Vec<String> = prefix.iter().map(ToString::to_string).collect();
+    if let Some(package) = &slots.package {
+        argv.push(TESTD_SLOT_PACKAGE.to_owned());
+        argv.push(package.clone());
+    }
+    if let Some(binary) = &slots.binary {
+        argv.push(TESTD_SLOT_BINARY.to_owned());
+        argv.push(binary.clone());
+    }
+    if profile == TESTD_SCOPED_PROFILE {
+        if let Some(retries) = slots.retries {
+            argv.push(TESTD_SLOT_RETRIES.to_owned());
+            argv.push(retries.to_string());
+        }
+        if !slots.filters.is_empty() {
+            argv.push(TESTD_SLOT_EXACT.to_owned());
+            argv.push(TESTD_SLOT_SEPARATOR.to_owned());
+            argv.extend(slots.filters.iter().cloned());
+        }
+    }
+    Ok(argv)
+}
+
+/// Validates one Cargo package/binary slot name through the mirrored rule.
+fn validate_slot_name(value: &str) -> Result<(), KernelServiceError> {
+    if value.is_empty()
+        || value.len() > 64
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        || value.chars().any(char::is_control)
+    {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_admission.sealed_slot_suffix",
+            reason: "slot name is not an admitted Cargo target name",
+        });
+    }
+    Ok(())
+}
+
+/// Validates one exact test filter through the mirrored rule.
+fn validate_slot_filter(value: &str) -> Result<(), KernelServiceError> {
+    if value.trim().is_empty()
+        || value.len() > 512
+        || value.chars().any(char::is_control)
+        || value.chars().any(|char| {
+            matches!(
+                char,
+                ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\\' | '"' | '\''
+            )
+        })
+    {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_admission.sealed_slot_suffix",
+            reason: "slot filter is not an exact discovered test identity",
+        });
+    }
+    Ok(())
 }
 
 /// Returns whether Kernel currently advertises the testd admission operation.
@@ -343,6 +638,12 @@ pub struct TestdAdmissionEnvelope {
     /// identity so the Kernel digest cannot silently downgrade productive
     /// nextest to the harmless probe.
     pub profile: String,
+    /// Validated slot suffix for the slotted list/scoped profiles. Empty
+    /// for the fixed-argv probe and productive profiles. The suffix is
+    /// parsed through the mirrored slot schema before any digest binds
+    /// it, so unvalidated text can never reach the sealed argv.
+    #[serde(default)]
+    pub sealed_slot_suffix: Vec<String>,
     /// Single admitted operation, when the envelope carries execution work.
     /// `None` marks the observation-only path, which binds no process
     /// identity and needs no Kernel admission.
@@ -486,6 +787,13 @@ pub struct TestdAdmission {
     pub operation_id: String,
     /// Admitted testd profile selected by the closed envelope.
     pub profile: String,
+    /// Validated slot suffix sealed into the admitted argv for the slotted
+    /// list/scoped profiles; empty for fixed-argv profiles. The suffix is
+    /// bound transitively: [`TestdAdmission::validate`] recomputes the
+    /// definition digest from it, and the digest rides the canonical
+    /// admission digest, so a substituted suffix fails validation.
+    #[serde(default)]
+    pub sealed_slot_suffix: Vec<String>,
     /// Canonical definition digest over the static admitted profile
     /// fields (relative program, fixed argv, environment allowlist,
     /// timeout/output caps). The per-host installed artifact digest binds
@@ -564,7 +872,10 @@ impl TestdAdmission {
         }
         if !matches!(
             self.profile.as_str(),
-            TESTD_ADMITTED_PROFILE | TESTD_PRODUCTIVE_PROFILE
+            TESTD_ADMITTED_PROFILE
+                | TESTD_PRODUCTIVE_PROFILE
+                | TESTD_LIST_PROFILE
+                | TESTD_SCOPED_PROFILE
         ) {
             return Err(KernelServiceError::InvalidField {
                 field: "testd_admission.profile",
@@ -581,20 +892,23 @@ impl TestdAdmission {
         ] {
             validate_wire_digest(digest, field)?;
         }
-        if self.profile_binding_digest != testd_profile_definition_digest(&self.profile)? {
+        if self.profile_binding_digest
+            != testd_profile_definition_digest_for_slots(&self.profile, &self.sealed_slot_suffix)?
+        {
             return Err(KernelServiceError::InvalidField {
                 field: "testd_admission.profile_binding_digest",
                 reason: "profile binding digest mismatch",
             });
         }
-        let expected_environment = if self.profile == TESTD_PRODUCTIVE_PROFILE {
-            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let expected_environment =
+            if self.profile == TESTD_PRODUCTIVE_PROFILE || self.profile == TESTD_SCOPED_PROFILE {
+                TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
         if self.environment != expected_environment {
             return Err(KernelServiceError::InvalidField {
                 field: "testd_admission.environment",
@@ -964,11 +1278,12 @@ fn testd_job_conflict(
 /// Rebuilding with the durable admission time reproduces the exact same
 /// admission on replay. Cancelled admissions carry the presented operation
 /// but bind no process identity. The admitted profile record is closed:
-/// exactly one profile exists in this slice, so the gate binds it without
-/// taking executable authority from the caller.
+/// the gate binds the envelope-selected profile plus its validated slot
+/// suffix without taking executable authority from the caller.
 fn build_testd_admission(
     request: &TestdAdmissionAttemptRequest,
     profile: &str,
+    sealed_slot_suffix: &[String],
     operation_id: &str,
     cancelled: bool,
     admitted_at_unix_nanos: u64,
@@ -980,8 +1295,12 @@ fn build_testd_admission(
         request_digest: request.request_digest.clone(),
         operation_id: operation_id.to_owned(),
         profile: profile.to_owned(),
-        profile_binding_digest: testd_profile_definition_digest(profile)?,
-        environment: if profile == TESTD_PRODUCTIVE_PROFILE {
+        sealed_slot_suffix: sealed_slot_suffix.to_vec(),
+        profile_binding_digest: testd_profile_definition_digest_for_slots(
+            profile,
+            sealed_slot_suffix,
+        )?,
+        environment: if profile == TESTD_PRODUCTIVE_PROFILE || profile == TESTD_SCOPED_PROFILE {
             TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -1076,6 +1395,7 @@ pub fn handle_testd_admission_attempt(
     let admission = build_testd_admission(
         request,
         &envelope.profile,
+        &envelope.sealed_slot_suffix,
         &operation_id,
         envelope.cancellation,
         now_unix_nanos,
@@ -1169,7 +1489,12 @@ pub fn reconcile_testd_admission(
     if admission.profile != TESTD_ADMITTED_PROFILE {
         return Ok(false);
     }
-    if admission.profile_binding_digest != testd_profile_definition_digest(&admission.profile)? {
+    if admission.profile_binding_digest
+        != testd_profile_definition_digest_for_slots(
+            &admission.profile,
+            &admission.sealed_slot_suffix,
+        )?
+    {
         return Ok(false);
     }
     let Some(operation_id) = envelope.operation_id.as_deref() else {
@@ -1188,6 +1513,7 @@ pub fn reconcile_testd_admission(
     let recomputed = build_testd_admission(
         request,
         &admission.profile,
+        &admission.sealed_slot_suffix,
         operation_id,
         envelope.cancellation,
         admission.admitted_at_unix_nanos,

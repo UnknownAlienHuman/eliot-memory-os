@@ -207,6 +207,11 @@ pub struct TestdMaterialAdmission {
     /// Admitted testd profile. Exactly one profile is admitted in this
     /// slice; anything else is refused.
     pub profile: String,
+    /// Validated slot suffix sealed into the admitted argv for the slotted
+    /// list/scoped profiles; empty for fixed-argv profiles. Mirrors the
+    /// kernel receipt field exactly.
+    #[serde(default)]
+    pub sealed_slot_suffix: Vec<String>,
     /// Canonical definition digest over the static admitted profile
     /// fields. The per-host installed artifact digest binds later at Drive
     /// time through the intent's `executable_sha256`.
@@ -252,6 +257,9 @@ pub struct ValidatedTestdMaterial {
     pub operation_id: String,
     /// Admitted testd profile (exactly one is admitted).
     pub profile: String,
+    /// Validated slot suffix sealed into the admitted argv; empty for
+    /// fixed-argv profiles.
+    pub sealed_slot_suffix: Vec<String>,
     /// Canonical definition digest over the static admitted profile fields.
     pub profile_binding_digest: String,
     /// Exact non-secret environment bindings admitted for this profile.
@@ -469,6 +477,7 @@ fn validate_material(
         job_id: file.request.job_id,
         operation_id: file.admission.operation_id.clone(),
         profile: file.admission.profile.clone(),
+        sealed_slot_suffix: file.admission.sealed_slot_suffix.clone(),
         profile_binding_digest: file.admission.profile_binding_digest.clone(),
         environment: file.admission.environment.clone(),
         request_digest: file.admission.request_digest,
@@ -543,15 +552,29 @@ fn validate_admission(
         &admission.profile_binding_digest,
         "testd_material.profile_binding_digest",
     )?;
-    let expected_binding =
+    let expected_binding = if eliot_testd_core::is_slotted_testd_profile(&admission.profile) {
+        eliot_testd_core::testd_definition_digest_for_slots(
+            &admission.profile,
+            &admission.sealed_slot_suffix,
+        )
+        .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?
+    } else {
+        if !admission.sealed_slot_suffix.is_empty() {
+            return Err(TestdMaterialError::Contract(
+                "fixed-argv profile carries a slot suffix".to_owned(),
+            ));
+        }
         eliot_testd_core::testd_definition_digest_for_profile(&admission.profile)
-            .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
+            .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?
+    };
     if admission.profile_binding_digest != expected_binding {
         return Err(TestdMaterialError::Contract(
             "testd_material.profile_binding_digest mismatch".to_owned(),
         ));
     }
-    let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+    let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+        || admission.profile == eliot_testd_core::TESTD_SCOPED_PROFILE
+    {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))

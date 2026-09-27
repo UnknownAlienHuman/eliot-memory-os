@@ -20,6 +20,7 @@ use thiserror::Error;
 
 pub mod build_projection;
 pub mod cache_lane;
+mod dev_fast;
 pub mod process_owner;
 pub mod profile;
 pub mod profile_run;
@@ -37,6 +38,14 @@ pub use build_projection::{
     restrict_agent_argv,
 };
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
+pub use dev_fast::{
+    DEV_FAST_FIRST_PACKAGE, DEV_FAST_PROFILE, DEV_FAST_PROFILE_REVISION, DEV_FAST_SLICE_PARTIAL,
+    DEV_FAST_STAGE_CLIPPY, DEV_FAST_STAGE_LIST, DEV_FAST_STAGE_RUN, DEV_FAST_STAGE_RUSTFMT,
+    DevFastBudgets, DevFastCandidate, DevFastDispatch, DevFastError, DevFastFailurePolicy,
+    DevFastPreflight, DevFastTargetIdentity, DevFastToolRevisions, VerificationProfileRun,
+    check_zero_execution, dev_fast_caller_plan, dev_fast_disposition, dev_fast_registry,
+    dev_fast_stage_dispatch,
+};
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
     KernelInstrumentRequestPort, UnprovisionedKernelAdmission,

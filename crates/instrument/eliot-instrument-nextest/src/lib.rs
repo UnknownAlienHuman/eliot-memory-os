@@ -29,9 +29,20 @@ pub const NEXTEST_LIBTEST_JSON_FORMAT_VERSION: &str = "0.1";
 pub const NEXTEST_STDOUT_CONTENT_TYPE: &str = "application/x-nextest-libtest-json-plus";
 /// Content type used by TestD for stderr, which is never parsed as events.
 pub const NEXTEST_STDERR_CONTENT_TYPE: &str = "text/plain";
+/// Content type for `cargo nextest list --message-format json` inventory
+/// documents. Inventory is never fed to the run-event parser.
+pub const NEXTEST_LIST_CONTENT_TYPE: &str = "application/x-nextest-list-json";
 /// Maximum complete stream accepted by the bounded parser.
 pub const MAX_NEXTEST_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum inventory document accepted by the bounded list parser.
+pub const MAX_NEXTEST_LIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 256 * 1024;
+/// Maximum discovered tests retained in one normalized inventory.
+pub const MAX_DISCOVERED_TESTS: usize = 100_000;
+/// Maximum selected filters rendered into one scoped run command.
+pub const MAX_SCOPED_FILTERS: usize = 10_000;
+/// Maximum retries rendered into one scoped run command.
+pub const MAX_SCOPED_RETRIES: u32 = 10;
 
 /// A validated nextest command projection.  Arguments are kept as individual
 /// values and are never rendered into a shell command line.
@@ -73,11 +84,135 @@ impl NextestCommand {
         })
     }
 
+    /// Builds the canonical discovery arguments for the admitted
+    /// `cargo-nextest list` executable (`cargo nextest list
+    /// --message-format json`, I18.6 step 3).
+    ///
+    /// Discovery scope is bound by validated slots only: an optional Cargo
+    /// package (`--package`) and an optional binary target (`--bin`). No
+    /// other flag, filter, or caller text is rendered.
+    pub fn list(
+        target: impl Into<String>,
+        package: Option<&str>,
+        binary: Option<&str>,
+    ) -> Result<Self, NextestError> {
+        let target = checked_text(target.into(), "target")?;
+        let mut arguments = vec![
+            "list".to_owned(),
+            "--message-format".to_owned(),
+            "json".to_owned(),
+        ];
+        if let Some(package) = package {
+            arguments.push("--package".to_owned());
+            arguments.push(checked_scope_name(package.to_owned(), "package")?);
+        }
+        if let Some(binary) = binary {
+            arguments.push("--bin".to_owned());
+            arguments.push(checked_scope_name(binary.to_owned(), "binary")?);
+        }
+        Ok(Self {
+            executable: "cargo-nextest".to_owned(),
+            arguments,
+            target,
+            profile: String::new(),
+        })
+    }
+
+    /// Builds the canonical scoped run arguments for the admitted
+    /// `cargo-nextest run` executable.
+    ///
+    /// Scope renders from the validated [`NextestScope`] only: an optional
+    /// package, an optional binary, a bounded retry count, and exact test
+    /// filters after `--` with `--exact`, so every filter matches the
+    /// discovery identity exactly instead of by substring.
+    pub fn run_scoped(
+        target: impl Into<String>,
+        profile: impl Into<String>,
+        scope: &NextestScope,
+    ) -> Result<Self, NextestError> {
+        let target = checked_text(target.into(), "target")?;
+        let profile = checked_text(profile.into(), "profile")?;
+        scope.validate()?;
+        let mut arguments = vec![
+            "run".to_owned(),
+            "--message-format".to_owned(),
+            "libtest-json-plus".to_owned(),
+            "--message-format-version".to_owned(),
+            NEXTEST_LIBTEST_JSON_FORMAT_VERSION.to_owned(),
+        ];
+        if let Some(package) = &scope.package {
+            arguments.push("--package".to_owned());
+            arguments.push(package.clone());
+        }
+        if let Some(binary) = &scope.binary {
+            arguments.push("--bin".to_owned());
+            arguments.push(binary.clone());
+        }
+        if let Some(retries) = scope.retries {
+            arguments.push("--retries".to_owned());
+            arguments.push(retries.to_string());
+        }
+        if !scope.filters.is_empty() {
+            arguments.push("--exact".to_owned());
+            arguments.push("--".to_owned());
+            arguments.extend(scope.filters.iter().cloned());
+        }
+        Ok(Self {
+            executable: "cargo-nextest".to_owned(),
+            arguments,
+            target,
+            profile,
+        })
+    }
+
     /// Checks that a process request contains precisely this command.
     pub fn matches_request(&self, request: &ProcessRequest) -> bool {
         request.executable() == self.executable
             && request.working_directory() == self.target
             && request.argv() == self.arguments
+    }
+}
+
+/// Validated selection scope for one governed nextest run.
+///
+/// Every value originates from the frozen discovery/selection material:
+/// package and binary name admitted Cargo target slots, filters name exact
+/// discovered test identities, and retries carry the declared per-test
+/// policy. Nothing here is caller free text.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NextestScope {
+    /// Optional Cargo package slot (`--package`).
+    pub package: Option<String>,
+    /// Optional binary target slot (`--bin`).
+    pub binary: Option<String>,
+    /// Exact discovered test identities rendered after `--` with `--exact`.
+    pub filters: Vec<String>,
+    /// Declared per-test retry count (`--retries`), when set.
+    pub retries: Option<u32>,
+}
+
+impl NextestScope {
+    /// Validates every slot without rendering anything.
+    pub fn validate(&self) -> Result<(), NextestError> {
+        if let Some(package) = &self.package {
+            checked_scope_name(package.clone(), "package")?;
+        }
+        if let Some(binary) = &self.binary {
+            checked_scope_name(binary.clone(), "binary")?;
+        }
+        if self.filters.len() > MAX_SCOPED_FILTERS {
+            return Err(NextestError::TooManyFilters);
+        }
+        for filter in &self.filters {
+            checked_filter(filter)?;
+        }
+        if self
+            .retries
+            .is_some_and(|retries| retries > MAX_SCOPED_RETRIES)
+        {
+            return Err(NextestError::RetriesOutOfRange);
+        }
+        Ok(())
     }
 }
 
@@ -210,6 +345,134 @@ pub fn parse_test_events(bytes: &[u8]) -> Result<Vec<NextestTestEvent>, NextestE
         events.push(NextestTestEvent::Completed { name, status });
     }
     Ok(events)
+}
+
+/// One normalized discovered test identity from `cargo nextest list
+/// --message-format json` (I18.6 step 3).
+///
+/// The identity is the stable `(package, binary, test)` triple parsed from
+/// the inventory document's `rust-suites` map. It carries no execution
+/// result and no policy; selection and execution join against it.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DiscoveredTest {
+    /// Cargo package owning the test binary.
+    pub package: String,
+    /// Test binary name within the package.
+    pub binary: String,
+    /// Test name as listed by nextest.
+    pub test: String,
+    /// Whether nextest listed the test as ignored.
+    pub ignored: bool,
+}
+
+impl DiscoveredTest {
+    /// Canonical `package/binary/test` identity string.
+    pub fn identity(&self) -> String {
+        format!("{}/{}/{}", self.package, self.binary, self.test)
+    }
+}
+
+/// Normalized inventory parsed from one discovery document.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiscoveredInventory {
+    /// Discovered tests in deterministic sorted identity order.
+    pub tests: Vec<DiscoveredTest>,
+    /// Test count declared by the inventory document.
+    pub declared_count: u64,
+}
+
+impl DiscoveredInventory {
+    /// Number of normalized discovered tests.
+    pub fn len(&self) -> usize {
+        self.tests.len()
+    }
+
+    /// Whether the inventory holds no discovered test.
+    pub fn is_empty(&self) -> bool {
+        self.tests.is_empty()
+    }
+}
+
+/// Parse one `cargo nextest list --message-format json` inventory document.
+///
+/// The inventory is a single JSON document (never JSONL): `rust-suites`
+/// maps binary identities to their package/binary/testcases, and
+/// `test-count` declares the expected total. This parser is disjoint from
+/// [`parse_test_events`]: inventory bytes must never reach the run-event
+/// parser, and run-event bytes never parse here. Duplicate identities,
+/// unlisted suites, unsupported testcase records, a `test-count` mismatch,
+/// or an over-bound document fail closed; the caller retains the exact raw
+/// bytes separately under [`NEXTEST_LIST_CONTENT_TYPE`].
+pub fn parse_list_json(bytes: &[u8]) -> Result<DiscoveredInventory, NextestError> {
+    if bytes.len() > MAX_NEXTEST_LIST_BYTES {
+        return Err(NextestError::OutputTooLarge);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| NextestError::MalformedInventory)?;
+    if text.trim().is_empty() {
+        return Err(NextestError::MalformedInventory);
+    }
+    let document: Value =
+        serde_json::from_str(text).map_err(|_| NextestError::MalformedInventory)?;
+    let declared_count = document
+        .get("test-count")
+        .and_then(Value::as_u64)
+        .ok_or(NextestError::MalformedInventory)?;
+    let suites = document
+        .get("rust-suites")
+        .and_then(Value::as_object)
+        .ok_or(NextestError::MalformedInventory)?;
+    let mut tests = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for suite in suites.values() {
+        let package = suite
+            .get("package-name")
+            .and_then(Value::as_str)
+            .ok_or(NextestError::UnsupportedInventoryRecord)?;
+        let binary = suite
+            .get("binary-name")
+            .and_then(Value::as_str)
+            .ok_or(NextestError::UnsupportedInventoryRecord)?;
+        if suite.get("status").and_then(Value::as_str) != Some("listed") {
+            return Err(NextestError::IncompleteDiscovery);
+        }
+        let testcases = suite
+            .get("testcases")
+            .and_then(Value::as_object)
+            .ok_or(NextestError::UnsupportedInventoryRecord)?;
+        for (name, case) in testcases {
+            if case.get("kind").and_then(Value::as_str) != Some("test") {
+                return Err(NextestError::UnsupportedInventoryRecord);
+            }
+            let ignored = case
+                .get("ignored")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let discovered = DiscoveredTest {
+                package: package.to_owned(),
+                binary: binary.to_owned(),
+                test: name.clone(),
+                ignored,
+            };
+            if !seen.insert(discovered.identity()) {
+                return Err(NextestError::DuplicateInventoryRecord);
+            }
+            tests.push(discovered);
+            if tests.len() > MAX_DISCOVERED_TESTS {
+                return Err(NextestError::OutputTooLarge);
+            }
+        }
+    }
+    tests.sort();
+    if declared_count != tests.len() as u64 {
+        return Err(NextestError::InventoryCountMismatch {
+            declared: declared_count,
+            listed: tests.len() as u64,
+        });
+    }
+    Ok(DiscoveredInventory {
+        tests,
+        declared_count,
+    })
 }
 
 /// Parse nextest's machine-readable JSONL stream into bounded counters.
@@ -383,6 +646,27 @@ pub enum NextestError {
     UnsupportedStatus(String),
     #[error("nextest counter overflowed")]
     CounterOverflow,
+    #[error("nextest inventory document is not a single valid list document")]
+    MalformedInventory,
+    #[error("nextest inventory carries an unsupported suite or testcase record")]
+    UnsupportedInventoryRecord,
+    #[error("nextest inventory lists a duplicate test identity")]
+    DuplicateInventoryRecord,
+    #[error("nextest inventory declares {declared} tests but lists {listed}")]
+    InventoryCountMismatch {
+        /// Declared `test-count`.
+        declared: u64,
+        /// Actually listed testcases.
+        listed: u64,
+    },
+    #[error("nextest inventory holds an unlisted suite; discovery is incomplete")]
+    IncompleteDiscovery,
+    #[error("scoped nextest scope exceeds the bounded filter count")]
+    TooManyFilters,
+    #[error("scoped nextest retries exceed the admitted bound")]
+    RetriesOutOfRange,
+    #[error("nextest scope slot is not an admitted value: {0}")]
+    InvalidSlot(String),
     #[error(transparent)]
     Process(#[from] ProcessExecutionError),
 }
@@ -394,6 +678,48 @@ fn checked_text(value: String, field: &'static str) -> Result<String, NextestErr
         )));
     }
     Ok(value)
+}
+
+/// Validates one Cargo package/binary slot name for argv rendering.
+///
+/// Admitted names are 1..=64 ASCII word characters or `-`: no whitespace,
+/// no shell metacharacter, no leading `-` (so the value can never become a
+/// flag), and no control character.
+fn checked_scope_name(value: String, field: &'static str) -> Result<String, NextestError> {
+    if value.len() > 64
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(NextestError::InvalidSlot(format!(
+            "{field} is not an admitted Cargo target name"
+        )));
+    }
+    checked_text(value, field).map_err(|_| NextestError::InvalidSlot(format!("{field} is blank")))
+}
+
+/// Validates one exact test filter for `--exact --` rendering.
+///
+/// Filters are exact discovered test identities: non-blank, bounded,
+/// control-free, and free of shell metacharacters and newlines, so the
+/// rendered argv carries the identity verbatim.
+fn checked_filter(value: &str) -> Result<(), NextestError> {
+    if value.trim().is_empty()
+        || value.len() > 512
+        || value.chars().any(char::is_control)
+        || value.chars().any(|char| {
+            matches!(
+                char,
+                ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\\' | '"' | '\''
+            )
+        })
+    {
+        return Err(NextestError::InvalidSlot(
+            "filter is not an exact discovered test identity".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn trim_utf8(bytes: &[u8]) -> Result<&str, NextestError> {

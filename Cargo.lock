@@ -2219,6 +2219,7 @@ dependencies = [
  "eliot-process",
  "eliot-process-executor",
  "eliot-receipts",
+ "eliot-test-selection",
  "eliot-verifier",
  "serde",
  "serde_json",
