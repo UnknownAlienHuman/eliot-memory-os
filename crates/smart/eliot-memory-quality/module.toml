@@ -69,3 +69,92 @@ forbid_unsafe = true
 required_exports = []
 required_tests = []
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
+
+# ---------------------------------------------------------------------------
+# Field contract. Same table shape as the W9 catalogue
+# crates/smart/cognitive-wave-09.toml [[field_contract]]; this file is the
+# owning crate's own copy, so the implementation agent reads the contract from
+# the crate it is asked to implement instead of from a remote catalogue.
+# Frozen here under Issue #259; the catalogue row is the wave-level index of
+# the same contract id and is not a second owner of it.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+id = "MemoryEcologyAssessment"
+owner_crate = "eliot-memory-quality"
+family = "memory ecology and memory gravity"
+source_handles = ["I12-21", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["subject_item_and_cluster_refs", "retrieval_acknowledgement_verified_use_and_decision_delta_history", "verification_success_contradiction_stale_hit_and_false_activation_history", "horizon_checkpoint_expiry_eviction_regime_and_workload_exposure_denominators", "representation_path_raw_episode_or_typed_relation_or_compiled_view_or_active_context", "historical_recall_and_current_state_outcomes_separately", "outcome_classes_correct_or_wrong_specific_or_abstained_or_unknown", "evaluator_revision_provenance_comparison_intervention_and_uncertainty", "context_dominance_gravity_and_maintenance_storage_curation_cost", "minority_evidence_and_unresolved_discriminators", "where_applies_and_where_not_applies_and_transfer_evidence", "negative_transfer_poisoned_influence_and_suppression_history", "obsolete_current_reopen_cohorts_and_valid_near_match_positive_controls", "residual_distinctions_lost_or_retained_by_compression", "recommended_action_keep_or_narrow_or_split_or_compress_or_suppress_or_archive_or_reactivate_or_review", "influence_ladder_stored_to_outcome_supported_or_refuted", "lifecycle_economics_capture_ingest_read_write_storage_semantic_reconciliation_freshness_retrieval_curation_attention_prevented_errors_missing_coverage_exclusions_amortization_horizon", "maintenance_aggregates_candidate_backlog_stale_conflicted_superseded_cue_coverage_false_activations_unused_cargo_negative_transfer_poisoned_influence_missing_forgetting_promotion_rate_curation_quality_reconstruction_cost_decision_quality", "cold_capture_ratio_time_to_binding_p50_p95_cold_capture_never_bound_binding_rejection_or_rebind_rate", "weak_claim_rate_with_denominator_task_route_corpus_profile_age_operation_mix_evaluator_revision_exclusions_uncertainty"]
+denominator = "evaluated_memory_items over declared_corpus_scope_at_named_horizon_with_workload_exposure_denominator_and_explicit_exclusions"
+denominator_rule = "RECHECK: count evaluated items from retained evidence refs; re-resolve declared scope digest, horizon/checkpoint, workload/exposure denominator, and exclusions; recompute weak_claim_rate and cold-capture ratios from the same inputs. Any Complete coverage state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; omission list and fence must be present or the assessment is INCONCLUSIVE."
+fence = "StateFence revisions plus horizon/checkpoint; historical-recall and current-state outcomes recorded separately."
+omission_semantics = "Missing evidence is listed per field as unknown with reason; low use never reduces support; retrieval/repetition/agreement never reinforce support."
+invariants = ["low use never reduces factual support and frequent retrieval does not strengthen a record", "popularity does not delete minority evidence", "delivery, citation and confident rationale do not demonstrate contribution without downstream outcome or counterfactual evidence", "negative memory and invariants are not suppressed only because they rarely changed an action", "minority evidence stays addressable until discriminator or applicability resolves", "consume immutable owner-produced projections only", "no aggregate intelligence/confidence/utility score", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish utility or support", "every Complete state requires the exact independently recheckable denominator", "this crate owns no canonical state, lifecycle transition, scheduler, effect, authority or task finish"]
+
+[[field_contract_index]]
+contract_id = "MemoryEcologyAssessment"
+owner_crate = "eliot-memory-quality"
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+catalogue = "crates/smart/cognitive-wave-09.toml"
+denominator_ref = "evaluated_memory_items over declared_corpus_scope_at_named_horizon_with_workload_exposure_denominator_and_explicit_exclusions"
+source_handles = ["I12-21", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+coverage_state_rule = "No Complete coverage state is claimed by this manifest. Implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_MEMORY_QUALITY_PULSE_01 are all NOT_EXECUTED, so no rechecked denominator is claimed as observed; INCONCLUSIVE is the only state this file supports at STATIC_FIELD_CONTRACT_ONLY."
+
+[[ownership]]
+public_type = "MemoryEcologyAssessment"
+owner_crate = "eliot-memory-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.memory.ecology", "smart.memory.gravity", "smart.memory.lifecycle_economics"]
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+contract_index = "MemoryEcologyAssessment"
+consumers = ["eliot-dreamer-accessibility (inputs)", "Governor disposition path (candidate only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[ownership]]
+public_type = "MemoryLifecycleEconomicsProfile"
+owner_crate = "eliot-memory-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.memory.lifecycle_economics"]
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+contract_index = "MemoryEcologyAssessment"
+consumers = ["Governor disposition path (candidate only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[crate_manifest]]
+crate = "eliot-memory-quality"
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+catalogue = "crates/smart/cognitive-wave-09.toml"
+status = "PROTOTYPE"
+functional_cells = ["smart.memory.ecology", "smart.memory.gravity", "smart.memory.lifecycle_economics"]
+field_contract_ids = ["MemoryEcologyAssessment"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+product_pulse_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+[[validation_gate]]
+id = "W9-MQ-COMPLETE-REQUIRES-DENOMINATOR"
+rule = "A Complete coverage state for MemoryEcologyAssessment requires the exact independently recheckable denominator declared in this file; the omission list and the fence must be present, otherwise the state is INCONCLUSIVE."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-MQ-NO-SUPPLY-FROM-FREQUENCY"
+rule = "Low use never reduces factual support, frequent retrieval never strengthens a record, and popularity never deletes minority evidence. Retrieval, popularity, completion, delivery, tool availability and model agreement never establish utility or support, and this crate emits no aggregate intelligence, confidence or utility score."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-MQ-IMMUTABLE-OWNER-PROJECTIONS-ONLY"
+rule = "Every assessment input is an immutable owner-produced projection read by handle. This crate performs no store query, writes no canonical state, starts no lifecycle transition and takes no authority, scheduler, effect or task-finish responsibility."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

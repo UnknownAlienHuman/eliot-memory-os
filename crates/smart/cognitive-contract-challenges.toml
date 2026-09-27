@@ -123,7 +123,7 @@ needed_by = ["eliot-memory-quality"]
 depends_on = ["CC-004", "CC-008", "CC-MEMORY-PROJECTION-SCHEMA"]
 missing_contract = "Versioned owner-neutral MemoryProjectionRecord read set and admitted task/continuity/safety-negative-memory/affordance projections consumed by MemoryEcologyAssessment, with complete denominator, fence, scope and omission semantics."
 forbidden_workaround = "Smart querying storage or treating cue hits, retrieval, popularity, completion, delivery, tool availability, or model agreement as applicability, support, utility, or understanding"
-resolution_evidence = ["versioned owner-neutral projection contract", "bounded provider read-set fixtures", "complete-denominator recheck per cognitive-wave-09 MemoryEcologyAssessment denominator_rule", "Governor/store provider and memory-quality consumer Edge proof"]
+resolution_evidence = ["versioned owner-neutral projection contract", "bounded provider read-set fixtures", "complete-denominator recheck per cognitive-wave-09 MemoryEcologyAssessment denominator_rule", "crates/smart/eliot-memory-quality/module.toml owner-located MemoryEcologyAssessment copy carrying that denominator_rule", "Governor/store provider and memory-quality consumer Edge proof"]
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
@@ -136,7 +136,7 @@ needed_by = ["eliot-dreamer-memory-revision"]
 depends_on = ["CC-004", "CC-FAILURE-OBSERVATION-SCHEMA", "CC-MEMORY-PROJECTION-SCHEMA"]
 missing_contract = "Versioned owner-neutral FailureObservation and MemoryRevisionEvidence refs consumed by NegativeMemoryExtinctionCandidate, with complete dependency-closure denominator, fence, scope and omission semantics."
 forbidden_workaround = "suppressing negative memory only because it rarely changed an action, rewriting history, or claiming purge-grade safety for a reversible candidate"
-resolution_evidence = ["versioned owner-neutral observation/revision contracts", "producer fixtures", "closure-denominator recheck per cognitive-wave-09 NegativeMemoryExtinctionCandidate denominator_rule", "Governor transition-path Edge proof"]
+resolution_evidence = ["versioned owner-neutral observation/revision contracts", "producer fixtures", "closure-denominator recheck per cognitive-wave-09 NegativeMemoryExtinctionCandidate denominator_rule", "crates/smart/eliot-dreamer-memory-revision/module.toml owner-located NegativeMemoryExtinctionCandidate copy carrying that denominator_rule and the advisory-only/history-preserved invariants", "Governor transition-path Edge proof"]
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
@@ -149,7 +149,7 @@ needed_by = ["eliot-cognitive-quality"]
 depends_on = ["CC-007", "eliot-learning-contracts::UseAttributionCandidate", "eliot-learning-contracts::ImprovementExperimentCandidate"]
 missing_contract = "Versioned owner-neutral Skill execution evidence, tool-definition versions, Durable Job and route-usage/curation/outcome receipts, and SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt projections consumed by CognitiveQualityAssessment, with per-sub-assessment denominators and no aggregate score."
 forbidden_workaround = "installed/delivered/executed/useful conflation, retrieval/repetition/agreement as Skill reinforcement, elegant-but-unused synthesis as utility, active-generation self-modification, self-verification, or model-rated improvement"
-resolution_evidence = ["versioned execution/receipt/projection contracts", "per-attempt HarnessActivationReceipt fixtures", "per-sub-assessment denominator recheck per cognitive-wave-09 CognitiveQualityAssessment denominator_rule", "Governor/Meta ownership acceptance and Edge proof"]
+resolution_evidence = ["versioned execution/receipt/projection contracts", "per-attempt HarnessActivationReceipt fixtures", "per-sub-assessment denominator recheck per cognitive-wave-09 CognitiveQualityAssessment denominator_rule", "crates/smart/eliot-cognitive-quality/module.toml owner-located CognitiveQualityAssessment copy carrying the six sub-assessment field groups, the per-sub-assessment denominator_rule, the no-aggregate-score invariants and the Mechanism Review rule", "Governor/Meta ownership acceptance and Edge proof"]
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
@@ -162,7 +162,7 @@ needed_by = ["eliot-understanding-assessment"]
 depends_on = ["CC-004", "CC-006", "eliot-context-contracts::ActiveUnderstandingView"]
 missing_contract = "Versioned accepted-source projection and already-compiled ActiveUnderstandingView consumed by CommonGroundAssessment and ScopedUnderstandingAssessment, with question/task-family State-Fence denominator, rival/prediction/discriminator/verifier closure, and held-out discipline for product claims."
 forbidden_workaround = "summary similarity or native continuation state as Common Ground, graphs/prose/delivery/agreement as LOCALLY_ADEQUATE, fixed graph/edge/context thresholds as proof, or a second ContextCompiler invocation/admission pass"
-resolution_evidence = ["accepted-source manifest with edition identity", "ActiveUnderstandingView contract fixtures", "denominator recheck per cognitive-wave-09 UnderstandingAssessment denominator_rule", "Governor/context consumer Edge proof"]
+resolution_evidence = ["accepted-source manifest with edition identity", "ActiveUnderstandingView contract fixtures", "denominator recheck per cognitive-wave-09 UnderstandingAssessment denominator_rule", "crates/smart/eliot-understanding-assessment/module.toml owner-located UnderstandingAssessment copy carrying the Common Ground and scoped field groups, the LOCALLY_ADEQUATE evidence minimum and the public-causal-inheritance invariant", "Governor/context consumer Edge proof"]
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
@@ -177,6 +177,27 @@ missing_contract = "Handoff for #223 delivered: crates/smart/cognitive-rev12-con
 forbidden_workaround = "implementing W9 Rust types from prose, inventing upstream denominators, or treating this static freeze as implementation/edge/pulse proof"
 resolution_evidence = ["crates/smart/cognitive-rev12-contract-schema-freeze.toml freeze_id cognitive-rev12-contract-schema-freeze-2026-09-22-r7 published as the r6 superseding candidate via CC-W2-FREEZE-REPIN; r6 delivered earlier via #2403/#2407", "producer fixtures in freeze", "W9 Module Proof per crate stays TEST-PHASE (not claimed)", "real provider-consumer Edge proof per edge stays TEST-PHASE (not claimed)", "named W9 Product Pulse execution stays TEST-PHASE (not claimed)", "readback digest sha256:cab58a4cd3536ee407b1655c07a3a122fe2ae0f45e3ccabf447eb9a606b675c5 over the 61816 exact bytes of that file, recorded here because a self-referential digest cannot live inside the bytes it digests; recomputed by python scripts/read_freeze_digest.py"]
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+# ---------------------------------------------------------------------------
+# Issue #259 rows. W9 meta-quality and understanding field contracts were
+# frozen once in crates/smart/cognitive-wave-09.toml while the four physical
+# crates carried none of those tables. They are now also written into each
+# owning crate's own module.toml. The remaining decision is which single
+# location is authoritative, because the duplication is deliberate and bounded.
+# ---------------------------------------------------------------------------
+
+[[challenge]]
+id = "CC-W9-OWNER-LOCATED-CONTRACT-COPY"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Catalogue owner of crates/smart/cognitive-wave-09.toml (Issue #262 wave-10 lane) together with the four W9 crate owner lanes"
+needed_by = ["eliot-memory-quality", "eliot-dreamer-memory-revision", "eliot-cognitive-quality", "eliot-understanding-assessment"]
+depends_on = ["CC-W9-MEMORY-QUALITY", "CC-W9-MEMORY-REVISION", "CC-W9-COGNITIVE-QUALITY", "CC-W9-UNDERSTANDING", "CC-W2-NORMATIVE-PAIR-KEY"]
+missing_contract = "Issue #259 measured the tree before writing: the four crates/smart/*/module.toml files carried zero [[field_contract]], [[field_contract_index]], [[assignment]], [[agent_brief]], [[ownership]], [[crate_manifest]] and [[validation_gate]] tables, and the whole W9 freeze lived only in crates/smart/cognitive-wave-09.toml, so an implementation agent handed its own crate manifest had no contract in front of it. Each of the four field contracts is now also written into the owning crate's own module.toml, and every [[agent_brief]] names a field_contract_ref pointing at that crate copy. The remaining undecided point is which of the two locations is the single source of truth for the field text, and therefore which one a later edit must touch. This issue does not decide it: it is the integration owner's call, and no W9 field, denominator, dimension, action candidate, proof ceiling or mutation authority depends on the choice. Related but separate: crates/smart/cognitive-wave-09.toml line 6 still carries the superseded pre-sharding pair key and that divergence is registered, not repaired, under CC-W2-NORMATIVE-PAIR-KEY."
+forbidden_workaround = "shipping the four W9 field contracts in the wave catalogue only, or in the crate manifests only, so that the implementation agent and the wave index read different field text; or letting the two copies drift on fields, denominator, denominator_rule, complete_rule, fence, omission_semantics or invariants"
+resolution_evidence = ["measured: the four crates/smart/*/module.toml files carried zero of the seven table types before this change, and crates/smart/cognitive-wave-09.toml carried field_contract=4, field_contract_index=4, assignment=11, agent_brief=11, ownership=9, crate_manifest=4, validation_gate=5", "crates/smart/eliot-memory-quality/module.toml owner-located MemoryEcologyAssessment copy", "crates/smart/eliot-dreamer-memory-revision/module.toml owner-located NegativeMemoryExtinctionCandidate copy", "crates/smart/eliot-cognitive-quality/module.toml owner-located CognitiveQualityAssessment copy", "crates/smart/eliot-understanding-assessment/module.toml owner-located UnderstandingAssessment copy", "an integration-owner ruling naming the single source of truth and the drift-detection gate for the two copies"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
