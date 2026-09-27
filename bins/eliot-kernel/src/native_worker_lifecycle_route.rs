@@ -325,6 +325,22 @@ pub(crate) fn require_nonzero_u64(
     Ok(number)
 }
 
+/// Reads the admitted Module Catalog revision and capability-cell identity.
+fn native_worker_catalog_binding(
+    value: &serde_json::Value,
+) -> Result<(CapabilityCellId, u64), NativeWorkerRouteError> {
+    let module_catalog_revision = require_nonzero_u64(value, "module_catalog_revision")?;
+    let capability_cell = serde_json::from_value(value.get("capability_cell").cloned().ok_or(
+        NativeWorkerRouteError::Shape {
+            field: "capability_cell",
+        },
+    )?)
+    .map_err(|_| NativeWorkerRouteError::Shape {
+        field: "capability_cell",
+    })?;
+    Ok((capability_cell, module_catalog_revision))
+}
+
 /// Reads one lowercase SHA-256 digest field.
 pub(crate) fn require_digest(
     value: &serde_json::Value,
@@ -948,19 +964,7 @@ impl KernelComposition {
         }
         require_op_id(payload, "renewal_id")?;
         let worker_generation = require_nonzero_u64(payload, "worker_generation")?;
-        require_nonzero_u64(payload, "module_catalog_revision")?;
-        let capability_cell_value =
-            payload
-                .get("capability_cell")
-                .cloned()
-                .ok_or(NativeWorkerRouteError::Shape {
-                    field: "capability_cell",
-                })?;
-        serde_json::from_value::<CapabilityCellId>(capability_cell_value).map_err(|_| {
-            NativeWorkerRouteError::Shape {
-                field: "capability_cell",
-            }
-        })?;
+        let _ = native_worker_catalog_binding(payload)?;
         require_nonzero_u64(payload, "process_id")?;
         require_nonzero_u64(payload, "process_start_100ns")?;
         require_nonzero_u64(payload, "lease_expires_at_unix_ms")?;
@@ -1317,16 +1321,8 @@ impl KernelComposition {
         live_epoch: &EpochId,
     ) -> Result<NativeWorkerExecutableExpectation, NativeWorkerRouteError> {
         let config_digest = require_digest(registration, "worker_config_digest")?;
-        let capability_cell: CapabilityCellId =
-            serde_json::from_value(registration.get("capability_cell").cloned().ok_or(
-                NativeWorkerRouteError::Shape {
-                    field: "capability_cell",
-                },
-            )?)
-            .map_err(|_| NativeWorkerRouteError::Shape {
-                field: "capability_cell",
-            })?;
-        let module_catalog_revision = require_nonzero_u64(registration, "module_catalog_revision")?;
+        let (capability_cell, module_catalog_revision) =
+            native_worker_catalog_binding(registration)?;
         let current = match presented {
             Some(join) => {
                 if join.capability_cell != capability_cell

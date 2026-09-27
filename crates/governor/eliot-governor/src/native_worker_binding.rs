@@ -11,7 +11,7 @@
 //! ceilings; credential/resource references without values; replay stream;
 //! nonce relationship; process invocation digest; generation/epoch/fence;
 //! deadlines and current invalidation evidence. The admitted Module Catalog
-//! revision and FunctionalCapabilityCell identity are explicit required
+//! revision and `FunctionalCapabilityCell` identity are explicit required
 //! owner inputs; neither is inferred from grant refs or package names.
 //!
 //! Governor hard boundary (`crates/governor/AGENTS.md`): this module composes a

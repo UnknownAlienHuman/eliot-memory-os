@@ -164,7 +164,7 @@ pub struct NativeWorkerExecutableBinding {
     pub config_digest: String,
     /// Facet manifest reference.
     pub facet_manifest_ref: String,
-    /// Admitted FunctionalCapabilityCell identity from the owner record.
+    /// Admitted `FunctionalCapabilityCell` identity from the owner record.
     pub capability_cell: CapabilityCellId,
     /// Grant-graph revision the binding was compiled against; nonzero.
     pub grant_graph_revision: u64,
