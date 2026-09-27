@@ -3573,6 +3573,37 @@ impl RedbRecoveryStore {
         Ok(records)
     }
 
+    /// Returns one bounded page of store-rebind replay rows in durable key
+    /// order, bounded by [`crate::MAX_RECOVERY_PAGE`].
+    ///
+    /// The second tuple element reports that the family continues past this
+    /// page, so a caller can never mistake a bounded page for a complete
+    /// snapshot: an unbounded full-table read inside an async caller stays
+    /// unavailable, and a caller that needs a complete family must report the
+    /// truncated coverage instead of treating absence as resolution.
+    pub fn load_store_rebind_page(
+        &self,
+        limit: u16,
+    ) -> Result<(Vec<crate::StoreRebindReplayRecord>, bool), OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
+        let page = usize::from(limit);
+        let mut records = Vec::new();
+        // One extra row proves that the family continues past this page.
+        for entry in table.iter().map_err(storage)?.take(page + 1) {
+            let (_, value) = entry.map_err(storage)?;
+            let record: crate::StoreRebindReplayRecord = decode(value.value())?;
+            record.validate()?;
+            records.push(record);
+        }
+        let has_more = records.len() > page;
+        records.truncate(page);
+        Ok((records, has_more))
+    }
+
     /// Retains one closed typed Store failure bound to its exact admitted
     /// operation identity.
     ///

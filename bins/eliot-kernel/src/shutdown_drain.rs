@@ -295,6 +295,167 @@ impl CoordinatorState {
     }
 }
 
+/// Owner family of a drain-gate obligation. One family is read only by its own
+/// owner, so a `StoreRebind` observation can never clear another family's
+/// work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReceiptOwnerFamily {
+    /// ORS store-rebind replay rows, the family the drain gate registers today.
+    StoreRebind,
+}
+
+/// One obligation exactly as its owner recorded it.
+///
+/// The registered drain-gate identity names only the operation, so the request
+/// binding, generation and revision are hydrated from the owner row rather
+/// than invented from the identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptOwnerEvidence {
+    /// The drain-gate identity this evidence is registered under.
+    identity: String,
+    /// The exact request digest the owner stored for the operation.
+    request_digest: String,
+    /// The owner's generation for this operation.
+    generation: u64,
+    /// The owner's monotonic commit-order revision, zero for a row the owner
+    /// retained before the ordering field existed.
+    revision: u64,
+}
+
+impl ReceiptOwnerEvidence {
+    /// Binds one owner row to the drain-gate identity it is registered under.
+    /// The caller supplies the identity in its owner's exact form so a
+    /// projection and its evidence can never disagree.
+    pub(crate) fn new(
+        identity: String,
+        request_digest: String,
+        generation: u64,
+        revision: u64,
+    ) -> Self {
+        Self {
+            identity,
+            request_digest,
+            generation,
+            revision,
+        }
+    }
+
+    /// The drain-gate identity this evidence is registered under, in its
+    /// owner family's exact form.
+    pub(crate) fn identity(&self) -> String {
+        self.identity.clone()
+    }
+}
+
+/// One typed, fallible read of an owner family's durable replay rows.
+///
+/// The observation is the only thing that may subtract an obligation, so it
+/// carries the coverage it actually has: a partial or foreign read, and a read
+/// whose owner revision regressed, hold no removal authority at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptRescanObservation {
+    /// Owner family this read observed.
+    pub(crate) family: ReceiptOwnerFamily,
+    /// The read covered the whole family in one consistent snapshot. A
+    /// partial page is reported as incomplete rather than silently truncated.
+    pub(crate) complete: bool,
+    /// True only when the owner's own contract makes absence proof of
+    /// resolution. The ORS store-rebind family has no such contract: an abort
+    /// removes its row, so absence is a query miss, not success.
+    pub(crate) absence_resolves: bool,
+    /// The highest owner revision this read reported, zero when it reported no
+    /// committed row.
+    pub(crate) revision: u64,
+    /// Obligations the owner still reports pending.
+    pub(crate) pending: Vec<ReceiptOwnerEvidence>,
+    /// Operations the owner proved terminal for the exact binding it read.
+    pub(crate) resolved: Vec<ReceiptOwnerEvidence>,
+}
+
+/// Outcome of the bounded receipt-reconciliation wait. Only `Reconciled`
+/// authorizes the next drain phase; a known-empty registry reached through an
+/// incomplete or unavailable observation is never reconciled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReceiptReconciliation {
+    /// A current, complete observation proved the registry empty.
+    Reconciled,
+    /// Residuals remain, with the reason they were not cleared.
+    Incomplete {
+        pending: Vec<String>,
+        reason: &'static str,
+    },
+    /// A required read or the durable publication failed; nothing was proven.
+    Unavailable { reason: &'static str },
+}
+
+/// What one observation proves about one registered obligation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptVerdict {
+    /// The owner still reports the obligation pending.
+    Pending,
+    /// The owner reported terminal evidence for it and nothing contradicts it.
+    Resolved,
+    /// Pending and terminal evidence, or two different request bindings, for
+    /// the same identity: a conflict, never a resolution.
+    Conflict,
+}
+
+/// Folds one observation into one verdict per registered identity. Pending
+/// evidence always wins over terminal evidence for the same identity, and two
+/// different request bindings for one identity are a conflict rather than
+/// whichever row was processed last.
+fn fold_rescan_observation(
+    observation: &ReceiptRescanObservation,
+) -> BTreeMap<String, ReceiptVerdict> {
+    let mut verdicts: BTreeMap<String, ReceiptVerdict> = BTreeMap::new();
+    let mut bindings: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    for (evidence, observed_pending) in observation
+        .pending
+        .iter()
+        .map(|evidence| (evidence, true))
+        .chain(
+            observation
+                .resolved
+                .iter()
+                .map(|evidence| (evidence, false)),
+        )
+    {
+        let identity = evidence.identity.clone();
+        let binding = (evidence.request_digest.clone(), evidence.generation);
+        let verdict = match (verdicts.get(&identity), bindings.get(&identity)) {
+            (None, _) => {
+                if observed_pending {
+                    ReceiptVerdict::Pending
+                } else {
+                    ReceiptVerdict::Resolved
+                }
+            }
+            (Some(_), Some(existing)) if *existing != binding => ReceiptVerdict::Conflict,
+            (Some(ReceiptVerdict::Pending), _) if !observed_pending => ReceiptVerdict::Conflict,
+            (Some(ReceiptVerdict::Resolved), _) if observed_pending => ReceiptVerdict::Conflict,
+            (Some(verdict), _) => *verdict,
+        };
+        bindings.insert(identity.clone(), binding);
+        verdicts.insert(identity, verdict);
+    }
+    verdicts
+}
+
+/// True when this observation proves the registered identity resolved. Absence
+/// proves resolution only under the owner's explicit complete-snapshot
+/// contract; otherwise a query miss preserves the obligation.
+fn proven_resolved(
+    verdicts: &BTreeMap<String, ReceiptVerdict>,
+    identity: &str,
+    absence_resolves: bool,
+) -> bool {
+    match verdicts.get(identity) {
+        Some(ReceiptVerdict::Resolved) => true,
+        Some(ReceiptVerdict::Pending | ReceiptVerdict::Conflict) => false,
+        None => absence_resolves,
+    }
+}
+
 /// Kernel-owned persisted shutdown/drain coordinator.
 ///
 /// One instance per `work_root`, shared process-wide through
@@ -647,48 +808,165 @@ impl ShutdownDrainCoordinator {
         }
     }
 
-    /// Bounded wait for pending receipts to resolve: merges the coordinator
-    /// registry with the caller's rescan on every tick and returns the
-    /// remainder at deadline. An empty return means reconciled; a non-empty
-    /// return is retained by the caller into the incomplete terminal.
+    /// Bounded wait for pending receipts to resolve, driven by one typed
+    /// owner observation per tick.
+    ///
+    /// The merge is `next = (current_pending UNION newly_observed_pending)
+    /// MINUS exactly_proven_resolved`: the owner read runs without the
+    /// coordinator mutex, removals are limited to the identities the
+    /// observation proves resolved, and the drain generation and registered
+    /// entries are rechecked under the lock before adoption. Only
+    /// [`ReceiptReconciliation::Reconciled`] authorizes the next drain
+    /// phase; a known-empty registry reached through an incomplete or
+    /// unavailable observation is reported as a coverage failure instead.
+    pub(crate) async fn reconcile_pending_observation(
+        &self,
+        deadline: Duration,
+        family: ReceiptOwnerFamily,
+        mut rescan: impl FnMut() -> Result<ReceiptRescanObservation, String>,
+    ) -> ReceiptReconciliation {
+        let start = Instant::now();
+        // Highest owner revision already used to clear an obligation in this
+        // wait. A later observation that reports an older revision must not
+        // clear anything.
+        let mut adopted_revision: Option<u64> = None;
+        loop {
+            // Snapshot the registered obligations and the drain generation
+            // they are registered under. The owner read below runs without
+            // the coordinator mutex, so a concurrent registration can only
+            // land after this snapshot and is never a removal candidate.
+            let (generation, baseline) = {
+                let state = self.lock();
+                (state.generation.clone(), state.pending.clone())
+            };
+            // A failed required read proves nothing in either direction and
+            // can never authorize the next phase through an empty registry.
+            let Ok(observation) = rescan() else {
+                observe_shutdown("kernel.shutdown.receipt_scan_unavailable", "unavailable");
+                return ReceiptReconciliation::Unavailable {
+                    reason: "receipt-owner-observation-unavailable",
+                };
+            };
+            // Removal authority requires one current, complete observation of
+            // the reconciled family. A partial read, a foreign family, or a
+            // regressed owner revision retains every obligation.
+            let covered = observation.family == family
+                && observation.complete
+                && adopted_revision.is_none_or(|seen| observation.revision >= seen);
+            let verdicts = fold_rescan_observation(&observation);
+            let merged = {
+                let mut state = self.lock();
+                if state.committed.is_some() || state.terminal.is_some() {
+                    return ReceiptReconciliation::Unavailable {
+                        reason: "receipt-reconciliation-after-drain-commit",
+                    };
+                }
+                let mut candidate = state.clone();
+                // A new drain generation owns a different obligation set, so
+                // evidence read under the previous one is not adopted.
+                if state.generation == generation {
+                    if covered {
+                        for identity in &baseline {
+                            if proven_resolved(&verdicts, identity, observation.absence_resolves) {
+                                candidate.pending.remove(identity);
+                            }
+                        }
+                    }
+                    for identity in observation
+                        .pending
+                        .iter()
+                        .map(ReceiptOwnerEvidence::identity)
+                    {
+                        candidate.pending.insert(identity);
+                    }
+                }
+                if candidate.pending != state.pending {
+                    // Additions and valid removals reach the durable state
+                    // owner before any progress is reported; a failed
+                    // publication cannot be reported as reconciled-empty.
+                    if self.persist_state(&candidate).is_err() {
+                        observe_shutdown("kernel.shutdown.receipt_publish_failed", "unavailable");
+                        return ReceiptReconciliation::Unavailable {
+                            reason: "receipt-state-publication-failed",
+                        };
+                    }
+                    *state = candidate;
+                }
+                state.pending.clone()
+            };
+            if !covered {
+                // No subtraction is possible, so waiting cannot converge.
+                observe_shutdown("kernel.shutdown.receipt_coverage_incomplete", "incomplete");
+                return ReceiptReconciliation::Incomplete {
+                    pending: merged.into_iter().collect(),
+                    reason: "receipt-observation-incomplete-coverage",
+                };
+            }
+            adopted_revision = Some(observation.revision.max(adopted_revision.unwrap_or(0)));
+            if merged.is_empty() {
+                return ReceiptReconciliation::Reconciled;
+            }
+            if start.elapsed() >= deadline {
+                let reason = if merged
+                    .iter()
+                    .any(|identity| !verdicts.contains_key(identity))
+                {
+                    // A registered identity this owner family never reports
+                    // stays pending: it is foreign or unparseable, and one
+                    // family's scan can never clear another family's work.
+                    "receipt-identity-not-observed-by-owner"
+                } else {
+                    "receipt-deadline-expired"
+                };
+                observe_shutdown("kernel.shutdown.receipt_deadline_expired", "incomplete");
+                return ReceiptReconciliation::Incomplete {
+                    pending: merged.into_iter().collect(),
+                    reason,
+                };
+            }
+            tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Untyped receipt-rescan boundary retained for the existing rescan
+    /// call sites. It is a thin adapter over
+    /// [`Self::reconcile_pending_observation`]: the legacy projection is one
+    /// whole-family snapshot in which the caller asserts that anything it did
+    /// not list is resolved, which the typed owner read never asserts.
+    #[cfg(test)]
     pub(crate) async fn reconcile_pending_to_deadline(
         &self,
         deadline: Duration,
         mut rescan: impl FnMut() -> Result<Vec<String>, String>,
     ) -> Result<Vec<String>, String> {
-        let start = Instant::now();
-        loop {
-            let baseline: BTreeSet<String> = self.pending_receipts().into_iter().collect();
-            let rescanned: BTreeSet<String> = rescan()?
-                .into_iter()
-                .filter(|identity| !identity.trim().is_empty())
-                .collect();
-            let merged = {
-                let mut state = self.lock();
-                if state.committed.is_some() || state.terminal.is_some() {
-                    return Err("receipt reconciliation after drain commit".to_owned());
-                }
-                let mut candidate = state.clone();
-                // Only remove entries present in the snapshot being rescanned;
-                // concurrent registrations remain pending for the next tick.
-                for identity in baseline.difference(&rescanned) {
-                    candidate.pending.remove(identity);
-                }
-                candidate.pending.extend(rescanned.iter().cloned());
-                if candidate.pending != state.pending {
-                    self.persist_state(&candidate)?;
-                    *state = candidate;
-                }
-                state.pending.clone()
-            };
-            if merged.is_empty() {
-                return Ok(Vec::new());
-            }
-            if start.elapsed() >= deadline {
-                observe_shutdown("kernel.shutdown.receipt_deadline_expired", "incomplete");
-                return Ok(merged.into_iter().collect());
-            }
-            tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+        match self
+            .reconcile_pending_observation(deadline, ReceiptOwnerFamily::StoreRebind, || {
+                Ok(ReceiptRescanObservation {
+                    family: ReceiptOwnerFamily::StoreRebind,
+                    complete: true,
+                    absence_resolves: true,
+                    // The untyped projection carries no owner revision and no
+                    // request binding, so it observes revision zero and binds
+                    // nothing beyond the identity it was given.
+                    revision: 0,
+                    pending: rescan()?
+                        .into_iter()
+                        .filter(|identity| !identity.trim().is_empty())
+                        .map(|identity| ReceiptOwnerEvidence {
+                            identity,
+                            request_digest: String::new(),
+                            generation: 0,
+                            revision: 0,
+                        })
+                        .collect(),
+                    resolved: Vec::new(),
+                })
+            })
+            .await
+        {
+            ReceiptReconciliation::Reconciled => Ok(Vec::new()),
+            ReceiptReconciliation::Incomplete { pending, .. } => Ok(pending),
+            ReceiptReconciliation::Unavailable { reason } => Err(reason.to_owned()),
         }
     }
 
