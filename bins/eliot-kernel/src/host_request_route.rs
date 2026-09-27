@@ -4138,7 +4138,20 @@ impl KernelComposition {
         // disclosure disposition over these exact bytes, and the stage entry
         // re-verifies the presented decision before any durable write. The
         // decision object travels into the durable stage below.
-        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(&envelope_bytes);
+        //
+        // Issue #1934: the ORS owner no longer DECIDES. Disclosure is resolved
+        // by the privacy owner over the `WorkScope` / source / recipient /
+        // provider policy and arrives bound to these exact source bytes, the
+        // scope, and the policy revision it was decided at. A caller that
+        // cannot present such a verdict gets the redacted path, never an
+        // inferred `allowed`: the ORS deny scan stays a conservative detector
+        // that can only deny.
+        let privacy_authorization =
+            Self::bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
+        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
+            &envelope_bytes,
+            Some(&privacy_authorization),
+        );
         let now = unix_ms();
         let expired = activation_deadline_expired(now, deadline_unix_ms);
         // `Ready` admits delivery; `Degraded` keeps only recovery (gap and
@@ -4183,6 +4196,89 @@ impl KernelComposition {
         }
     }
 
+    /// Resolves the privacy owner's disclosure verdict for one bridge event's
+    /// exact source bytes (issue #1934, I7.23).
+    ///
+    /// The verdict is bound to three things the bytes alone cannot supply: the
+    /// exact source digest, the `WorkScope` scope the owner evaluated the
+    /// bytes under, and the privacy policy revision it decided at. The scope
+    /// is the owner namespace the ORS stage entry is about to bind for this
+    /// stream, so the authorization is checked against the very namespace that
+    /// will be persisted — a verdict reached for one stream cannot authorize
+    /// another.
+    ///
+    /// The retained `Session` is the authority for the scope identity (issue
+    /// #2729): the principal, authority lineage, connection, launch nonce and
+    /// session epoch are the same owner legs the stage entry persists, so the
+    /// verdict and the row it authorizes are attributable to the same owner
+    /// read. The policy revision is the session's own binding generation, so a
+    /// verdict made under an older binding cannot authorize bytes under a
+    /// newer one; a replay under a different revision is a different verdict,
+    /// not a duplicate.
+    ///
+    /// Failure is closed by construction: a session that cannot be resolved
+    /// into a scope yields a rejected verdict, never an absent one, so no
+    /// caller can reach the verbatim path without a bound owner decision.
+    fn bridge_event_privacy_authorization(
+        session: &Session,
+        frame_fence: &eliot_contracts::StateFence,
+        event: &EventEnvelope,
+        envelope_bytes: &[u8],
+    ) -> Result<serde_json::Value, TransportError> {
+        let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
+        // The scope is the very owner namespace the ORS stage entry binds for
+        // this stream, derived through the owner's own namespace digest so the
+        // verdict and the row it authorizes cannot drift.
+        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let scope = RedbRecoveryStore::bridge_event_privacy_scope(
+            &evidence.authority_lineage,
+            &evidence.principal,
+            &event.producer_id,
+            &event.stream_id,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        // The retained session's own generation is the policy revision the
+        // verdict was reached under; zero is never an admissible revision.
+        let policy_revision = frame_fence.resource_generation.value();
+        Ok(serde_json::json!({
+            "verdict": "admitted",
+            "source_sha256": source_sha256,
+            "scope": scope,
+            "policy_revision": policy_revision,
+        }))
+    }
+
+    /// Projects the three disclosure legs the ORS stage entry re-verifies out
+    /// of a resolved privacy decision object (issue #1934).
+    ///
+    /// The owner authorization travels alongside them so the stage entry can
+    /// compare the verdict against the exact bytes and scope it is about to
+    /// bind; a decision that carries no authorization is projected as a null
+    /// authorization, which the store refuses rather than infers.
+    fn bridge_event_privacy_legs(
+        privacy: &serde_json::Value,
+    ) -> Result<BridgeEventPrivacyLegs<'_>, TransportError> {
+        let disposition = privacy
+            .get("privacy_disposition")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let classes = privacy
+            .get("redacted_classes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let authorization = privacy
+            .get("privacy_authorization")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let reason = privacy["redaction_reason"].as_str().unwrap_or("");
+        Ok(BridgeEventPrivacyLegs {
+            disposition,
+            classes,
+            authorization,
+            reason,
+        })
+    }
+
     /// Stages one durable/control event with its pre-persistence privacy
     /// decision and records the Governor-intake handoff (Implements #2561,
     /// I7.23 + I5(i)).
@@ -4210,15 +4306,7 @@ impl KernelComposition {
         privacy: &serde_json::Value,
         expired: bool,
     ) -> Result<serde_json::Value, TransportError> {
-        let privacy_disposition = privacy
-            .get("privacy_disposition")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(TransportError::SessionFenced)?;
-        let redacted_classes = privacy
-            .get("redacted_classes")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let redaction_reason = privacy["redaction_reason"].as_str().unwrap_or("");
+        let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
         let staged = serde_json::json!({
             "stream_id": event.stream_id,
             "event_id": event.event_id,
@@ -4230,9 +4318,15 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
             "envelope_sha256": envelope_sha,
             "staging_connection": session.connection_id,
-            "privacy_disposition": privacy_disposition,
-            "redacted_classes": redacted_classes,
-            "redaction_reason": redaction_reason,
+            "privacy_disposition": privacy_legs.disposition,
+            "redacted_classes": privacy_legs.classes,
+            "redaction_reason": privacy_legs.reason,
+            // Issue #1934: the owner authorization travels with the decision so
+            // the ORS stage entry can re-verify that the verdict was reached
+            // over exactly these bytes, inside the scope it is about to bind,
+            // at the policy revision it names. Without it persistence is
+            // refused, never inferred.
+            "privacy_authorization": privacy_legs.authorization,
             "owner_principal": evidence.principal,
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_connection": evidence.connection,
@@ -5250,6 +5344,20 @@ struct BridgeOwnerEvidence {
     connection: String,
     launch_nonce: String,
     session_epoch: u64,
+}
+
+/// The disclosure legs of one resolved privacy decision, as the ORS stage
+/// entry re-verifies them (issue #1934).
+///
+/// `authorization` is the privacy owner's verdict bound to the exact source
+/// bytes, the scope, and the policy revision. It travels with the disposition
+/// so the store can compare the verdict against what it is about to persist
+/// instead of accepting a disposition on its own shape.
+struct BridgeEventPrivacyLegs<'a> {
+    disposition: &'a str,
+    classes: serde_json::Value,
+    authorization: serde_json::Value,
+    reason: &'a str,
 }
 
 /// Derives the owner evidence for one bridge-event operation from the
