@@ -10,6 +10,7 @@ use eliot_types::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -176,6 +177,13 @@ impl SkillPackService {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let reference_assets = match declared_reference_assets(&manifest) {
+            Ok(assets) => Some(assets),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        };
         for entry in &entries {
             let manifest_hash = manifest_skills.iter().find_map(|value| {
                 (value.get("name").and_then(Value::as_str) == Some(entry.name.as_str()))
@@ -184,6 +192,23 @@ impl SkillPackService {
             });
             if manifest_hash != Some(entry.canonical_hash.as_str()) {
                 errors.push(format!("{}: skill manifest content hash drift", entry.name));
+            }
+            if let Some(assets) = &reference_assets {
+                match assets.get(&entry.name) {
+                    Some(declared) => {
+                        if let Err(error) = verify_reference_assets(
+                            &canonical_root.join(&entry.name),
+                            &entry.name,
+                            declared,
+                        ) {
+                            errors.push(error);
+                        }
+                    }
+                    None => errors.push(format!(
+                        "{}: skill manifest reference_assets list is missing",
+                        entry.name
+                    )),
+                }
             }
         }
         Ok(SkillPackLintReport {
@@ -238,6 +263,7 @@ pub struct SkillPackSyncReport {
 struct SkillPackManifest<'a> {
     schema_version: &'a str,
     hash_algorithm: &'a str,
+    reference_assets_schema: &'a str,
     pack_hash: &'a str,
     listing_characters: usize,
     skills: &'a [ManifestSkill],
@@ -248,6 +274,13 @@ struct SkillPackManifest<'a> {
 struct ManifestSkill {
     name: &'static str,
     content_blake3: String,
+    reference_assets: Vec<ReferenceAsset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ReferenceAsset {
+    path: String,
+    sha256: String,
 }
 
 impl SkillPackService {
@@ -256,6 +289,10 @@ impl SkillPackService {
     /// the goal is one editable source, not three that a lint compares.
     pub fn sync(self, repo_root: &Path) -> Result<SkillPackSyncReport, EngineError> {
         let canonical_root = repo_root.join("integrations/agent-skills");
+        let manifest_path = canonical_root.join("skill-pack.manifest.json");
+        let previous_manifest: Value = serde_json::from_reader(File::open(&manifest_path)?)?;
+        let declared_assets =
+            declared_reference_assets(&previous_manifest).map_err(skill_manifest_error)?;
         let mut report = SkillPackSyncReport::default();
         let mut pack_material = String::new();
         let mut manifest_skills = Vec::new();
@@ -264,6 +301,13 @@ impl SkillPackService {
         for name in ELIOT_SKILL_NAMES {
             let body = std::fs::read_to_string(canonical_root.join(name).join("SKILL.md"))?;
             let hash = canonical_skill_content_hash(&body);
+            let reference_assets = declared_assets.get(name).cloned().ok_or_else(|| {
+                skill_manifest_error(format!(
+                    "{name}: skill manifest reference_assets list is missing"
+                ))
+            })?;
+            verify_reference_assets(&canonical_root.join(name), name, &reference_assets)
+                .map_err(skill_manifest_error)?;
             if let Some((frontmatter, _)) = split_frontmatter(&body) {
                 listing_characters += frontmatter_value(frontmatter, "description")
                     .unwrap_or_default()
@@ -292,6 +336,7 @@ impl SkillPackService {
             manifest_skills.push(ManifestSkill {
                 name,
                 content_blake3: hash,
+                reference_assets,
             });
         }
 
@@ -307,10 +352,10 @@ impl SkillPackService {
         }
 
         report.pack_hash = blake3::hash(pack_material.as_bytes()).to_hex().to_string();
-        let manifest_path = canonical_root.join("skill-pack.manifest.json");
         let manifest = SkillPackManifest {
             schema_version: "eliot-agent-skill-pack-v1",
             hash_algorithm: "blake3(name:content_blake3 joined with LF in manifest order)",
+            reference_assets_schema: "sha256-path-list-v1",
             pack_hash: &report.pack_hash,
             listing_characters,
             skills: &manifest_skills,
@@ -323,6 +368,180 @@ impl SkillPackService {
         }
         Ok(report)
     }
+}
+
+fn skill_manifest_error(reason: String) -> EngineError {
+    EngineError::ServiceNotReady {
+        service: "skill-pack".to_owned(),
+        reason,
+    }
+}
+
+fn declared_reference_assets(
+    manifest: &Value,
+) -> Result<BTreeMap<String, Vec<ReferenceAsset>>, String> {
+    if manifest
+        .get("reference_assets_schema")
+        .and_then(Value::as_str)
+        != Some("sha256-path-list-v1")
+    {
+        return Err("skill manifest reference_assets_schema is missing or unsupported".to_owned());
+    }
+    let skills = manifest
+        .get("skills")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "skill manifest skills must be an array".to_owned())?;
+    let mut result = BTreeMap::new();
+    for skill in skills {
+        let name = skill
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "skill manifest entry has no string name".to_owned())?;
+        let values = skill
+            .get("reference_assets")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{name}: skill manifest reference_assets must be an array"))?;
+        let mut assets = Vec::with_capacity(values.len());
+        for value in values {
+            let object = value
+                .as_object()
+                .ok_or_else(|| format!("{name}: reference_assets entries must be objects"))?;
+            if object.len() != 2 || !object.contains_key("path") || !object.contains_key("sha256") {
+                return Err(format!(
+                    "{name}: each reference asset must contain only path and sha256"
+                ));
+            }
+            let path = value
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{name}: reference asset path must be a string"))?;
+            let sha256 = value
+                .get("sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{name}: reference asset sha256 must be a string"))?;
+            if !valid_reference_asset_path(path) {
+                return Err(format!("{name}: invalid reference asset path {path:?}"));
+            }
+            if sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(format!(
+                    "{name}: invalid SHA-256 for reference asset {path}"
+                ));
+            }
+            assets.push(ReferenceAsset {
+                path: path.to_owned(),
+                sha256: sha256.to_owned(),
+            });
+        }
+        if assets.windows(2).any(|pair| pair[0].path >= pair[1].path) {
+            return Err(format!(
+                "{name}: reference_assets must be unique and sorted by path"
+            ));
+        }
+        if result.insert(name.to_owned(), assets).is_some() {
+            return Err(format!("skill manifest has duplicate skill {name}"));
+        }
+    }
+    let expected = ELIOT_SKILL_NAMES.into_iter().collect::<BTreeSet<_>>();
+    let observed = result.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if observed != expected {
+        return Err(
+            "skill manifest reference_assets membership does not match the skill set".to_owned(),
+        );
+    }
+    Ok(result)
+}
+
+fn valid_reference_asset_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && path.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.contains(':')
+                && !part.chars().any(char::is_control)
+        })
+        && path != "SKILL.md"
+}
+
+fn verify_reference_assets(
+    skill_root: &Path,
+    skill_name: &str,
+    declared: &[ReferenceAsset],
+) -> Result<(), String> {
+    let mut observed = Vec::new();
+    collect_reference_assets(skill_root, skill_root, &mut observed)
+        .map_err(|error| format!("{skill_name}: cannot enumerate reference assets: {error}"))?;
+    observed.sort_by(|left, right| left.path.cmp(&right.path));
+    let declared_paths = declared
+        .iter()
+        .map(|asset| asset.path.as_str())
+        .collect::<Vec<_>>();
+    let observed_paths = observed
+        .iter()
+        .map(|asset| asset.path.as_str())
+        .collect::<Vec<_>>();
+    if declared_paths != observed_paths {
+        return Err(format!(
+            "{skill_name}: reference_assets membership does not match canonical source files"
+        ));
+    }
+    for (pinned, source) in declared.iter().zip(observed) {
+        if pinned.sha256 != source.sha256 {
+            return Err(format!(
+                "{skill_name}: reference asset SHA-256 drift at {}",
+                pinned.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_reference_assets(
+    root: &Path,
+    directory: &Path,
+    assets: &mut Vec<ReferenceAsset>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "symlinks are not allowed in canonical Skill assets",
+            ));
+        }
+        if file_type.is_dir() {
+            collect_reference_assets(root, &path, assets)?;
+        } else if file_type.is_file() && path != root.join("SKILL.md") {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let relative = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let mut reader = BufReader::new(File::open(&path)?);
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 8 * 1024];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            assets.push(ReferenceAsset {
+                path: relative,
+                sha256: format!("{:x}", hasher.finalize()),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn canonical_skill_content_hash(body: &str) -> String {

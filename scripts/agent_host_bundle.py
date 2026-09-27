@@ -80,6 +80,7 @@ IDENTITY_VERSION = "eliot.agent-host-bundle-identity.v2"
 # verification fails explicitly instead of degrading to shape-only metadata.
 SKILL_PACK_SCHEMA_VERSION = "eliot-agent-skill-pack-v1"
 SKILL_PACK_HASH_ALGORITHM = "blake3(name:content_blake3 joined with LF in manifest order)"
+SKILL_REFERENCE_ASSETS_SCHEMA = "sha256-path-list-v1"
 BLAKE3_EMPTY_INPUT_HEX = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 # Structural cap for manifest parses whose own limits live inside the manifest.
 MANIFEST_PARSE_BYTES_MAX = 1024 * 1024
@@ -88,6 +89,7 @@ MANIFEST_PARSE_BYTES_MAX = 1024 * 1024
 # pin format and fails explicitly.
 PAYLOAD_MODE_FILE = "verbatim_copy"
 PAYLOAD_MODE_TREE = "verbatim_tree_copy"
+TREE_DIGEST_RECIPE = "sha256-canonical-json-tree-members-v1"
 DISPOSITIONS = (
     "live-admitted",
     "unavailable-target",
@@ -417,11 +419,14 @@ def load_skill_pack(root: Path, skill_manifest_relative: str, max_file_bytes: in
         raise BundleError("canonical Skill manifest schema mismatch")
     if document.get("hash_algorithm") != SKILL_PACK_HASH_ALGORITHM:
         raise BundleError("canonical Skill manifest hash algorithm is not the canonical BLAKE3 recipe")
+    if document.get("reference_assets_schema") != SKILL_REFERENCE_ASSETS_SCHEMA:
+        raise BundleError("canonical Skill manifest reference asset schema mismatch")
     skills = document.get("skills")
     if not isinstance(skills, list) or not skills:
         raise BundleError("canonical Skill manifest declares no Skills")
     order: list[str] = []
     pins: dict[str, str] = {}
+    reference_assets: dict[str, dict[str, str]] = {}
     for entry in skills:
         if not isinstance(entry, dict):
             raise BundleError("canonical Skill manifest Skill entry must be an object")
@@ -441,12 +446,34 @@ def load_skill_pack(root: Path, skill_manifest_relative: str, max_file_bytes: in
             f"canonical Skill manifest Skill {name!r}",
             label="content_blake3",
         )
+        assets = entry.get("reference_assets")
+        if not isinstance(assets, list):
+            raise BundleError(f"{name}: reference assets must be a declared list")
+        members: dict[str, str] = {}
+        observed_lower: set[str] = set()
+        for asset in assets:
+            if not isinstance(asset, dict) or set(asset) != {"path", "sha256"}:
+                raise BundleError(f"{name}: invalid reference asset declaration")
+            relative = _safe_relative(asset["path"], f"{name}: reference asset")
+            member_path = relative.as_posix()
+            if member_path != asset["path"] or member_path == "SKILL.md":
+                raise BundleError(f"{name}: invalid reference asset path")
+            if member_path.lower() in observed_lower:
+                raise BundleError(f"{name}: duplicate reference asset path")
+            observed_lower.add(member_path.lower())
+            members[member_path] = _require_hex_digest(
+                asset["sha256"], f"{name}: {member_path}", label="sha256"
+            )
+        if list(members) != sorted(members):
+            raise BundleError(f"{name}: reference assets are not path ordered")
+        reference_assets[name] = members
         order.append(name)
     return {
         "bytes": manifest_bytes,
         "sha256": sha256_bytes(manifest_bytes),
         "order": order,
         "pins": pins,
+        "reference_assets": reference_assets,
     }
 
 
@@ -479,9 +506,8 @@ def _snapshot_skill_pack(
     Selection and order come only from the manifest list: unrelated top-level
     directories are never opened, hashed, or copied. Returns per-Skill snapshots
     mapping paths relative to the Skill directory to validated bytes (including
-    the SKILL.md body and any sibling reference files), plus the verified pack
-    hash. Sibling files are covered by receipt byte accounting, not by the body
-    pin: only SKILL.md carries the body's approval.
+    SKILL.md and only explicitly pinned reference assets), plus the verified
+    pack hash. The body pin never approves an adjacent file.
     """
     canonical_root = skill_root.resolve()
     snapshots: dict[str, dict[str, bytes]] = {}
@@ -502,6 +528,12 @@ def _snapshot_skill_pack(
         body_data = files.get("SKILL.md")
         if body_data is None:
             raise BundleError(f"declared Skill is missing its SKILL.md: {name!r}")
+        declared_assets = skill_pack["reference_assets"][name]
+        if set(files) != {"SKILL.md", *declared_assets}:
+            raise BundleError(f"{name}: Skill file set differs from declared reference assets")
+        for relative, expected_sha256 in declared_assets.items():
+            if sha256_bytes(files[relative]) != expected_sha256:
+                raise BundleError(f"{name}: reference asset bytes differ from declared pin: {relative}")
         try:
             body_text = body_data.decode("utf-8")
         except UnicodeDecodeError as error:
@@ -527,14 +559,7 @@ def _read_snapshot(root: Path, relative: PurePosixPath, limits: dict[str, int]) 
 
 
 def _tree_digest(member_entries: list[dict[str, Any]]) -> str:
-    """Reproduce the manifest producer's tree-digest definition.
-
-    Confirmed against the generation 1217-A.1 pins: SHA-256 over the canonical
-    JSON (no trailing newline) of `{path, sha256, bytes}` entries sorted by
-    relative path, where each member digest covers raw file bytes. The manifest
-    format does not name this recipe, so any different concatenation or order is
-    a schema migration, never an inferred equivalent.
-    """
+    """Versioned tree recipe: SHA-256 over canonical sorted member JSON."""
     ordered = sorted(member_entries, key=lambda entry: entry["path"])
     return sha256_bytes(canonical_json_bytes(ordered))
 
@@ -655,6 +680,8 @@ def _verify_tree_payload(
 ) -> list[tuple[PurePosixPath, bytes]]:
     if mapping.get("mode", PAYLOAD_MODE_TREE) != PAYLOAD_MODE_TREE:
         raise BundleError(f"{host}: unknown tree payload mode {mapping.get('mode')!r}")
+    if mapping.get("tree_digest_recipe") != TREE_DIGEST_RECIPE:
+        raise BundleError(f"{host}: unsupported tree digest recipe")
     source_relative = _safe_relative(str(mapping.get("source", "")), "payload source")
     destination_relative = _safe_relative(str(mapping.get("destination", "")), "payload destination")
     source = root.joinpath(*source_relative.parts)
