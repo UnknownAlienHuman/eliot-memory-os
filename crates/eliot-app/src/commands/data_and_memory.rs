@@ -1264,8 +1264,9 @@ fn run_governed_verify_plan(config_path: &Path, profile: &str) -> Result<()> {
     let config = load_config(config_path)?;
     let root = runtime_root(config_path);
     let blob_store = BlobStore::open(&config.blob_store)?;
+    let request = governed_profile_resolution_request(&root)?;
     let report =
-        GovernedProfileService.describe_execution(profile, Some(&blob_store))?;
+        GovernedProfileService.describe_execution(profile, &request.bindings()?, Some(&blob_store))?;
     write_verification_report(&root, "governed-profile", "Governed Profile Execution", &report)?;
     write_json(&serde_json::json!({
         "component": "governed_verification_plan",
@@ -1279,8 +1280,9 @@ fn run_governed_verify_run(config_path: &Path, profile: &str) -> Result<()> {
     let config = load_config(config_path)?;
     let root = runtime_root(config_path);
     let blob_store = BlobStore::open(&config.blob_store)?;
+    let request = governed_profile_resolution_request(&root)?;
     let report =
-        GovernedProfileService.describe_execution(profile, Some(&blob_store))?;
+        GovernedProfileService.describe_execution(profile, &request.bindings()?, Some(&blob_store))?;
     write_verification_report(&root, "governed-profile", "Governed Profile Execution", &report)?;
     write_json(&serde_json::json!({
         "component": "governed_verification_run",
@@ -1290,6 +1292,82 @@ fn run_governed_verify_run(config_path: &Path, profile: &str) -> Result<()> {
     }))?;
     GovernedProfileService.enforce_success(&report)?;
     Ok(())
+}
+
+/// Runtime-root subtree the instrument lane builds external targets under.
+///
+/// Admitted, not defaulted: the resolver refuses a layout whose roots are not
+/// absolute and pairwise distinct, so this name only has to name one real
+/// subtree of the admitted source root for the stage DAG to resolve.
+const INSTRUMENT_TARGET_ROOT_DIR: &str = "instrument-target";
+/// Runtime-root subtree the instrument lane keeps its cache under.
+const INSTRUMENT_CACHE_ROOT_DIR: &str = "instrument-cache";
+/// Environment class the admitted instrument specs declare for their stages.
+const GOVERNED_PROFILE_ENVIRONMENT_CLASS: &str = eliot_engine::ISOLATED_PROCESS_CLASS;
+
+/// Assembles the admitted resolution inputs for one governed verify run.
+///
+/// Every value is read from the live composition root rather than written
+/// here: the source root is the worktree this invocation verifies, the target
+/// and cache roots are the instrument lane's own subtrees of the runtime root,
+/// the authority lineage is this runtime instance's deterministic published
+/// identity, and the environment class is the one the instrument specs declare
+/// for their stages. Nothing is defaulted: an unusable root or a missing
+/// instance identity fails closed instead of resolving a profile against a
+/// substituted binding.
+fn governed_profile_resolution_request(runtime_root: &Path) -> Result<ProfileResolutionRequest> {
+    let worktree = std::env::current_dir()
+        .context("resolve the verified worktree for a governed profile run")?;
+    let source_root = std::fs::canonicalize(&worktree).with_context(|| {
+        format!(
+            "resolve the verified worktree for a governed profile run: {}",
+            worktree.display()
+        )
+    })?;
+    let root = std::fs::canonicalize(runtime_root).with_context(|| {
+        format!(
+            "resolve the runtime root for a governed profile run: {}",
+            runtime_root.display()
+        )
+    })?;
+    let instance = RuntimeInstance::select(&root.join("config").join("governor.toml"), None)?;
+    let authority_lineage = runtime_instance_lineage_uuid(instance.name())
+        .context("derive the runtime instance authority lineage for a governed profile run")?;
+    let target_root = root.join(INSTRUMENT_TARGET_ROOT_DIR);
+    let cache_root = root.join(INSTRUMENT_CACHE_ROOT_DIR);
+    std::fs::create_dir_all(&target_root)
+        .context("create the admitted instrument target root for a governed profile run")?;
+    std::fs::create_dir_all(&cache_root)
+        .context("create the admitted instrument cache root for a governed profile run")?;
+    Ok(ProfileResolutionRequest::new(
+        source_root.to_string_lossy().into_owned(),
+        target_root.to_string_lossy().into_owned(),
+        cache_root.to_string_lossy().into_owned(),
+        authority_lineage,
+        format!("runtime:{}", instance.publication_root().display()),
+        GOVERNED_PROFILE_ENVIRONMENT_CLASS.to_owned(),
+    ))
+}
+
+/// Reinterprets the runtime instance's deterministic identity as a lineage UUID.
+///
+/// `RuntimeInstance::select` already derives the instance name from a blake3
+/// digest of the publication path, so the same instance always yields the same
+/// lineage: the admitted authority identity is stable across the plan/run pair
+/// instead of being a fresh random value per invocation.
+fn runtime_instance_lineage_uuid(instance_name: &str) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let digest = blake3::hash(instance_name.as_bytes());
+    let bytes = digest.as_bytes();
+    let mut text = String::with_capacity(36);
+    for (index, byte) in bytes.iter().take(16).enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            text.push('-');
+        }
+        let _ = write!(text, "{byte:02x}");
+    }
+    uuid::Uuid::parse_str(&text).ok().map(|lineage| lineage.to_string())
 }
 
 pub fn run_verify_verdict(config_path: &Path, run: &str) -> Result<()> {
