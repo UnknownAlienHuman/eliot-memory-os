@@ -2411,13 +2411,36 @@ impl KernelComposition {
         // submission. The submission leg causally precedes the Kernel
         // binding, so its record is fsync-sealed before the ORS completion
         // below: a crash after completion can never lose it.
-        self.audit_observe(AuditEventDraft::result_daemon_submitted(
+        let submitted_draft = AuditEventDraft::result_daemon_submitted(
             session,
             body,
             &stored,
             queued_envelope.as_ref(),
             lane,
-        ));
+        );
+        // Issue #1837 (I16.11 spool cascade): the binding record below can
+        // only append after the ORS completion it evidences, so a crash or
+        // a failed append in between would leave a completed result without
+        // its binding evidence. Spool both result-leg drafts durably BEFORE
+        // the persist: reconcile replays a surviving entry against the
+        // validated ORS record, and the chain stays complete. The spooled
+        // binding lineage equals the post-persist draft (persist only sets
+        // state/result/commit fields, none of which feed `fill_stored`);
+        // only `durable_state` refreshes from the ORS original at reconcile.
+        self.spool_pending_result_binding(
+            &submitted_draft,
+            &AuditEventDraft::result_kernel_bound(
+                session,
+                body,
+                &stored,
+                queued_envelope.as_ref(),
+                lane,
+            ),
+            &body.operation_id,
+            &body.request_sha256,
+            &body.result_digest,
+        );
+        let submitted_ok = self.audit_observe(submitted_draft).is_some();
         let persisted = self
             .generation_gateway
             .ors
@@ -2436,13 +2459,23 @@ impl KernelComposition {
         // record evidences the persisted completion above, so it must follow
         // it; a failed persist leaves submission evidence without binding,
         // which is the accurate history.
-        self.audit_observe(AuditEventDraft::result_kernel_bound(
-            session,
-            body,
-            &persisted,
-            queued_envelope.as_ref(),
-            lane,
-        ));
+        let bound_ok = self
+            .audit_observe(AuditEventDraft::result_kernel_bound(
+                session,
+                body,
+                &persisted,
+                queued_envelope.as_ref(),
+                lane,
+            ))
+            .is_some();
+        // Both legs sealed in the chain retire the pre-persist spool. Any
+        // missing leg keeps it for reconcile (a later `audit_chain_records`
+        // completes the chain from it); a failed persist likewise leaves the
+        // spool in place so reconcile can still evidence the submission
+        // while the binding stays absent, accurately.
+        if submitted_ok && bound_ok {
+            self.clear_pending_result_binding(&body.operation_id);
+        }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
