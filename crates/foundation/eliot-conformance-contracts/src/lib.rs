@@ -15,8 +15,9 @@ use thiserror::Error;
 
 pub use obligations::{
     ActiveConformanceObligation, ActiveConformanceObligationSet, ActiveObligationHotset,
-    ActiveObligationHotsetEntry, ColdSourceClaim, ColdSourceLineage, OBLIGATION_CONTRACT_VERSION,
-    OBLIGATION_SCHEMA, ObligationError, ObligationStatus, ProductIdentityCapabilitySet,
+    ActiveObligationHotsetEntry, AdoptionGateEvidence, AdoptionStage, ColdSourceClaim,
+    ColdSourceLineage, DonorStopCondition, OBLIGATION_CONTRACT_VERSION, OBLIGATION_SCHEMA,
+    ObligationError, ObligationStatus, ProductIdentityCapabilitySet, TestDisposition,
     compile_active_conformance_obligations, validate_active_conformance_obligation,
     validate_cold_source_claim, validate_obligation_set,
 };
