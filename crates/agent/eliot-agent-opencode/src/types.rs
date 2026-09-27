@@ -561,7 +561,7 @@ impl ModelSelection {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, thiserror::Error)]
 pub enum ModelSelectionError {
     #[error("provider identity is missing")]
     MissingProviderIdentity,
@@ -1296,16 +1296,221 @@ impl OpenCodeWireRouteReceipt {
 /// Conversion failures for [`OpenCodeWireRouteReceipt::to_physical_observation`].
 /// Wire-shape failures stay wire-typed; linkage/shape failures stay
 /// contract-typed; neither is silently upgraded.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, thiserror::Error)]
 pub enum OpenCodeObservationConversionError {
     #[error("opencode wire route is invalid: {0}")]
     Wire(#[from] OpenCodeWireRouteError),
     #[error("physical observation contract rejected: {0}")]
-    Contract(#[from] eliot_agent_api::ContractError),
+    Contract(
+        #[from]
+        #[serde(with = "contract_error_serde")]
+        eliot_agent_api::ContractError,
+    ),
     #[error("observation conversion serialization failed: {0}")]
     Serialization(String),
     #[error("invalid opencode host-event input: {0}")]
-    InvalidInput(&'static str),
+    InvalidInput(String),
+}
+
+/// Serde boundary mirror for [`eliot_agent_api::ContractError`] inside the
+/// sealed route disposition (issue #2902 item 11).
+///
+/// `ContractError` carries `&'static str` fields whose `Deserialize` impl is
+/// bounded to `'static` input, so it cannot cross the disposition's own
+/// generic `Deserialize` derive. This mirror reproduces the exact externally
+/// tagged `SCREAMING_SNAKE_CASE` shape with owned strings, so the typed
+/// contract cause round-trips through the sealed candidate artifact without
+/// changing `ContractError` itself. The mirror must stay field-for-field in
+/// sync with `ContractError`: the forward conversion is total, and the
+/// reverse conversion fails closed on a field that cannot be represented.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ContractErrorWire {
+    EmptyField(String),
+    EmptyIdentity(String),
+    EmptyCollection(String),
+    ZeroLimit {
+        field: String,
+    },
+    ChildBudgetExceeded {
+        field: String,
+    },
+    InvalidAttemptTransition {
+        attempt: String,
+        from: eliot_agent_api::AttemptState,
+        to: eliot_agent_api::AttemptState,
+    },
+    TerminalResultMutation,
+    RouteMismatch,
+    ContinuationRouteMismatch,
+    InsufficientAuthority,
+    UnauthorizedReceipt,
+    InvalidCausalProperty,
+    MissingUnknownReason,
+    NonMonotonicEvent,
+    InvalidStateFence,
+    BindingMismatch,
+    InvalidDigest {
+        field: String,
+    },
+    DigestMismatch,
+    InvalidClock,
+    InvalidRouteDisposition,
+    ConflictingObservation,
+    MissingObservationReason,
+    OversizeField {
+        field: String,
+    },
+    UnknownContractVersion,
+    ForbiddenContent {
+        field: String,
+    },
+}
+
+impl From<eliot_agent_api::ContractError> for ContractErrorWire {
+    fn from(error: eliot_agent_api::ContractError) -> Self {
+        match error {
+            eliot_agent_api::ContractError::EmptyField(field) => Self::EmptyField(field.to_owned()),
+            eliot_agent_api::ContractError::EmptyIdentity(field) => {
+                Self::EmptyIdentity(field.to_owned())
+            }
+            eliot_agent_api::ContractError::EmptyCollection(field) => {
+                Self::EmptyCollection(field.to_owned())
+            }
+            eliot_agent_api::ContractError::ZeroLimit { field } => Self::ZeroLimit {
+                field: field.to_owned(),
+            },
+            eliot_agent_api::ContractError::ChildBudgetExceeded { field } => {
+                Self::ChildBudgetExceeded {
+                    field: field.to_owned(),
+                }
+            }
+            eliot_agent_api::ContractError::InvalidAttemptTransition { attempt, from, to } => {
+                Self::InvalidAttemptTransition { attempt, from, to }
+            }
+            eliot_agent_api::ContractError::TerminalResultMutation => Self::TerminalResultMutation,
+            eliot_agent_api::ContractError::RouteMismatch => Self::RouteMismatch,
+            eliot_agent_api::ContractError::ContinuationRouteMismatch => {
+                Self::ContinuationRouteMismatch
+            }
+            eliot_agent_api::ContractError::InsufficientAuthority => Self::InsufficientAuthority,
+            eliot_agent_api::ContractError::UnauthorizedReceipt => Self::UnauthorizedReceipt,
+            eliot_agent_api::ContractError::InvalidCausalProperty => Self::InvalidCausalProperty,
+            eliot_agent_api::ContractError::MissingUnknownReason => Self::MissingUnknownReason,
+            eliot_agent_api::ContractError::NonMonotonicEvent => Self::NonMonotonicEvent,
+            eliot_agent_api::ContractError::InvalidStateFence => Self::InvalidStateFence,
+            eliot_agent_api::ContractError::BindingMismatch => Self::BindingMismatch,
+            eliot_agent_api::ContractError::InvalidDigest { field } => Self::InvalidDigest {
+                field: field.to_owned(),
+            },
+            eliot_agent_api::ContractError::DigestMismatch => Self::DigestMismatch,
+            eliot_agent_api::ContractError::InvalidClock => Self::InvalidClock,
+            eliot_agent_api::ContractError::InvalidRouteDisposition => {
+                Self::InvalidRouteDisposition
+            }
+            eliot_agent_api::ContractError::ConflictingObservation => Self::ConflictingObservation,
+            eliot_agent_api::ContractError::MissingObservationReason => {
+                Self::MissingObservationReason
+            }
+            eliot_agent_api::ContractError::OversizeField { field } => Self::OversizeField {
+                field: field.to_owned(),
+            },
+            eliot_agent_api::ContractError::UnknownContractVersion => Self::UnknownContractVersion,
+            eliot_agent_api::ContractError::ForbiddenContent { field } => Self::ForbiddenContent {
+                field: field.to_owned(),
+            },
+        }
+    }
+}
+
+impl TryFrom<ContractErrorWire> for eliot_agent_api::ContractError {
+    type Error = ContractErrorWireOverflow;
+
+    fn try_from(error: ContractErrorWire) -> Result<Self, Self::Error> {
+        const MAX_FIELD_CHARS: usize = 128;
+        let bounded = |field: String| -> Result<&'static str, ContractErrorWireOverflow> {
+            if field.chars().count() > MAX_FIELD_CHARS {
+                return Err(ContractErrorWireOverflow);
+            }
+            Ok(Box::leak(field.into_boxed_str()))
+        };
+        match error {
+            ContractErrorWire::EmptyField(field) => Ok(Self::EmptyField(bounded(field)?)),
+            ContractErrorWire::EmptyIdentity(field) => Ok(Self::EmptyIdentity(bounded(field)?)),
+            ContractErrorWire::EmptyCollection(field) => Ok(Self::EmptyCollection(bounded(field)?)),
+            ContractErrorWire::ZeroLimit { field } => Ok(Self::ZeroLimit {
+                field: bounded(field)?,
+            }),
+            ContractErrorWire::ChildBudgetExceeded { field } => Ok(Self::ChildBudgetExceeded {
+                field: bounded(field)?,
+            }),
+            ContractErrorWire::InvalidAttemptTransition { attempt, from, to } => {
+                Ok(Self::InvalidAttemptTransition { attempt, from, to })
+            }
+            ContractErrorWire::TerminalResultMutation => Ok(Self::TerminalResultMutation),
+            ContractErrorWire::RouteMismatch => Ok(Self::RouteMismatch),
+            ContractErrorWire::ContinuationRouteMismatch => Ok(Self::ContinuationRouteMismatch),
+            ContractErrorWire::InsufficientAuthority => Ok(Self::InsufficientAuthority),
+            ContractErrorWire::UnauthorizedReceipt => Ok(Self::UnauthorizedReceipt),
+            ContractErrorWire::InvalidCausalProperty => Ok(Self::InvalidCausalProperty),
+            ContractErrorWire::MissingUnknownReason => Ok(Self::MissingUnknownReason),
+            ContractErrorWire::NonMonotonicEvent => Ok(Self::NonMonotonicEvent),
+            ContractErrorWire::InvalidStateFence => Ok(Self::InvalidStateFence),
+            ContractErrorWire::BindingMismatch => Ok(Self::BindingMismatch),
+            ContractErrorWire::InvalidDigest { field } => Ok(Self::InvalidDigest {
+                field: bounded(field)?,
+            }),
+            ContractErrorWire::DigestMismatch => Ok(Self::DigestMismatch),
+            ContractErrorWire::InvalidClock => Ok(Self::InvalidClock),
+            ContractErrorWire::InvalidRouteDisposition => Ok(Self::InvalidRouteDisposition),
+            ContractErrorWire::ConflictingObservation => Ok(Self::ConflictingObservation),
+            ContractErrorWire::MissingObservationReason => Ok(Self::MissingObservationReason),
+            ContractErrorWire::OversizeField { field } => Ok(Self::OversizeField {
+                field: bounded(field)?,
+            }),
+            ContractErrorWire::UnknownContractVersion => Ok(Self::UnknownContractVersion),
+            ContractErrorWire::ForbiddenContent { field } => Ok(Self::ForbiddenContent {
+                field: bounded(field)?,
+            }),
+        }
+    }
+}
+
+/// Overflow marker for one contract-cause field that cannot be represented as
+/// the `&'static str` shape [`eliot_agent_api::ContractError`] carries: the
+/// bounded leak in [`ContractErrorWire`] reproduces short static labels
+/// exactly, and an over-long field fails the artifact decode instead of
+/// fabricating a sentinel value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("contract error wire field overflow")]
+struct ContractErrorWireOverflow;
+
+/// Serde boundary for [`eliot_agent_api::ContractError`]: serialization goes
+/// through [`ContractErrorWire`], whose externally tagged
+/// `SCREAMING_SNAKE_CASE` shape matches `ContractError`'s own format.
+mod contract_error_serde {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::ContractErrorWire;
+
+    pub fn serialize<S>(
+        error: &eliot_agent_api::ContractError,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ContractErrorWire::from(error.clone()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<eliot_agent_api::ContractError, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ContractErrorWire::deserialize(deserializer)?;
+        eliot_agent_api::ContractError::try_from(wire).map_err(D::Error::custom)
+    }
 }
 
 fn is_blank(value: Option<&str>) -> bool {
@@ -1324,7 +1529,7 @@ fn is_live_wire_locator(value: &str) -> bool {
     parse_versioned_sha256_digest(value).is_ok()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, thiserror::Error)]
 pub enum OpenCodeWireRouteError {
     #[error("requested route model is invalid: {0}")]
     InvalidRequestedModel(ModelSelectionError),
@@ -1627,7 +1832,7 @@ fn bind_opencode_source(
         .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
     if decoded_canonical != supplied_canonical {
         return Err(OpenCodeObservationConversionError::InvalidInput(
-            "raw_source_bytes/event",
+            "raw_source_bytes/event".to_owned(),
         ));
     }
     Ok(BoundOpenCodeSource::Decoded {
@@ -1697,13 +1902,15 @@ fn validate_opencode_input(
     input: &OpenCodeHostEventInput<'_>,
 ) -> Result<(), OpenCodeObservationConversionError> {
     if input.sequence == 0 {
-        return Err(OpenCodeObservationConversionError::InvalidInput("sequence"));
+        return Err(OpenCodeObservationConversionError::InvalidInput(
+            "sequence".to_owned(),
+        ));
     }
     if input.raw_source_bytes.is_empty()
         || input.raw_source_bytes.len() > OPENCODE_MAX_RAW_SOURCE_BYTES
     {
         return Err(OpenCodeObservationConversionError::InvalidInput(
-            "raw_source_bytes",
+            "raw_source_bytes".to_owned(),
         ));
     }
     match &input.lineage {
@@ -1713,14 +1920,14 @@ fn validate_opencode_input(
                 .map_err(OpenCodeObservationConversionError::Contract)?,
             None => {
                 return Err(OpenCodeObservationConversionError::InvalidInput(
-                    "admission/lineage",
+                    "admission/lineage".to_owned(),
                 ));
             }
         },
         ProviderObservationLineage::SessionObservation(_) => {
             if input.admission.is_some() {
                 return Err(OpenCodeObservationConversionError::InvalidInput(
-                    "admission/lineage",
+                    "admission/lineage".to_owned(),
                 ));
             }
         }
@@ -1795,7 +2002,7 @@ fn finish_opencode_envelope(
     for text in payload.public_strings() {
         if contains_restricted_source_token(text) {
             return Err(OpenCodeObservationConversionError::InvalidInput(
-                "payload/restricted-content",
+                "payload/restricted-content".to_owned(),
             ));
         }
     }
@@ -1844,7 +2051,7 @@ fn finish_opencode_envelope(
                 input
                     .admission
                     .ok_or(OpenCodeObservationConversionError::InvalidInput(
-                        "admission/lineage",
+                        "admission/lineage".to_owned(),
                     ))?;
             envelope
                 .validate_for_lineage(binding, admission)
@@ -2554,7 +2761,8 @@ pub const ROUTE_COMPONENT_SOURCE_UNOBSERVED: &str = "unobserved";
 /// canonical authority: the sealed candidate stays
 /// [`AuthorityCeiling::CandidateOnly`] on every variant, and a route conflict
 /// never erases the retained provider output evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SealedRouteDisposition {
     /// Canonical conversion succeeded and the receipt asserts observed
     /// execution (`MATCHED` or `DIVERGED`, both with
@@ -2597,7 +2805,7 @@ pub enum SealedRouteDisposition {
     /// item 11). Explicitly unverified and quarantined: it must never be
     /// read as a current `Unobserved` or `Matched` receipt, and it justifies
     /// no actual route column at durable staging.
-    LegacyUnverified { reason: &'static str },
+    LegacyUnverified { reason: String },
 }
 
 impl SealedRouteDisposition {
@@ -2607,7 +2815,7 @@ impl SealedRouteDisposition {
     /// observed/conflict/unknown variants.
     pub fn legacy_unverified() -> Self {
         Self::LegacyUnverified {
-            reason: LEGACY_UNVERIFIED_ROUTE_REASON,
+            reason: LEGACY_UNVERIFIED_ROUTE_REASON.to_owned(),
         }
     }
 
@@ -2981,6 +3189,16 @@ pub struct AdmittedAttemptCandidate {
     pub result_digest: LowercaseSha256,
     pub authority: AuthorityCeiling,
     pub status: RunStatus,
+    /// The typed seal-time route-observation disposition bound into this
+    /// candidate artifact (issue #2902 items 8 and 11). A candidate sealed
+    /// under typed route-observation truthfulness carries the exact
+    /// disposition here; a legacy candidate predating it carries no field
+    /// at all and decodes as `None`, which
+    /// [`crate::classify_sealed_candidate`] reads as explicitly unverified —
+    /// quarantined route evidence, never a current `Unobserved` or
+    /// `Matched` receipt.
+    #[serde(default)]
+    pub route_disposition: Option<SealedRouteDisposition>,
 }
 
 impl AdmittedAttemptCandidate {
@@ -3039,6 +3257,11 @@ impl AdmittedAttemptCandidate {
             result_digest,
             authority: AuthorityCeiling::CandidateOnly,
             status: RunStatus::Succeeded,
+            // The route disposition is attached by the sealer
+            // (`seal_admitted_outcome`) immediately after sealing: it is
+            // computed from the wire receipt against this run, never from the
+            // candidate fields, so it cannot be derived here.
+            route_disposition: None,
         })
     }
 
@@ -4243,7 +4466,9 @@ mod tests {
                 delivery: HostEventDeliveryDisposition::DurableOrdered,
                 admission: Some(&admission),
             }),
-            Err(OpenCodeObservationConversionError::InvalidInput("sequence"))
+            Err(OpenCodeObservationConversionError::InvalidInput(
+                "sequence".to_owned(),
+            ))
         ));
         // Missing admission for execution-unit lineage fails closed.
         assert!(matches!(

@@ -154,7 +154,8 @@ id_type!(EventCursor);
 
 /// Contract validation failures.  Errors are safe to expose to an external
 /// provider and never contain raw provider error bodies or credentials.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ContractError {
     #[error("{0} must not be empty")]
     EmptyField(&'static str),
