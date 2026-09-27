@@ -31,11 +31,17 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod claim;
+mod resources;
 mod typed_evidence;
 
 pub use claim::{
     ClaimBindingExpectation, ExpiredRunningReconciliation, reconcile_expired_running,
     validate_claim_binding,
+};
+pub use resources::{
+    JobClass, NextestLanePlan, ResourceClaim, ResourceError, ResourceKind, ResourceLease,
+    ResourceLeaseAllocator, ResourceWeight, SchedulingDecision, TestResourceProfile,
+    scheduling_decision,
 };
 pub use typed_evidence::{
     EphemeralSourceBytes, ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackPort,
@@ -516,10 +522,22 @@ pub enum TestdError {
     /// The instrument request and process admission were not bound together.
     #[error("instrument and process admissions are not bound")]
     InvalidBinding,
+    /// A declared exclusive resource or serial group is held by another
+    /// running job, so this claim would overlap. Fail-closed: the job is
+    /// refused, never started concurrently.
+    #[error("declared resource conflict: {0}")]
+    ResourceConflict(String),
 }
 
 fn database<E: std::fmt::Display>(error: E) -> TestdError {
     TestdError::Database(error.to_string())
+}
+
+/// Default job class for a job persisted before job classes were declared.
+/// A verification job is the productive TestD profile, so the default must not
+/// silently demote an older verification job to a background lane.
+fn default_job_class() -> JobClass {
+    JobClass::Verification
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), TestdError> {
@@ -907,6 +925,20 @@ pub struct TestJob {
     pub target_roots: TargetRoots,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
+    /// Declared job class. The class, not the raw `priority` integer, is the
+    /// I2.22 admission order; a background class is never ordered ahead of
+    /// Kernel, Watchdog, Control Reserve, verification, or interactive work.
+    #[serde(default = "default_job_class")]
+    pub job_class: JobClass,
+    /// Declared resource weight, exclusive resources, and serial group. An
+    /// older job without the field keeps the default parallel declaration.
+    #[serde(default)]
+    pub resource_profile: TestResourceProfile,
+    /// Leases allocated to this job while it runs, and the scheduling decision
+    /// that produced them. Retained in the job so the work item execution
+    /// record carries the decision and its leases after the worker returns.
+    #[serde(default)]
+    pub scheduling: Option<SchedulingDecision>,
     /// Durable lifecycle state.
     pub state: JobState,
     /// Number of physical execution attempts.
@@ -1324,6 +1356,11 @@ pub struct TestdVerifierJobSubmission {
     pub invocation: InstrumentInvocation,
     pub target_roots: TargetRoots,
     pub priority: i32,
+    /// Declared class and resource requirements for this verification job.
+    /// A submission that omits it is a verification job with the default
+    /// parallel declaration, never a background lane.
+    #[serde(default)]
+    pub metadata: JobSubmissionMetadata,
 }
 
 /// Authenticated Kernel owner-submit operation for one productive verifier.
@@ -1517,6 +1554,65 @@ impl TestdOwnerSubmitResponse {
     }
 }
 
+/// Declared class and resource requirements carried into one submitted job.
+///
+/// This is the test/job metadata I2.22 asks to extend: the job's resource
+/// weight, its exclusive-resource requirements, and its runtime-lease
+/// requirements. It is bound at submission so the durable job record carries
+/// the declaration the scheduler and the nextest lane plan both read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobSubmissionMetadata {
+    pub job_class: JobClass,
+    pub resource_profile: TestResourceProfile,
+}
+
+impl Default for JobSubmissionMetadata {
+    /// An undeclared job is a verification job: a productive TestD submission
+    /// must never default into a background lane.
+    fn default() -> Self {
+        Self::verification()
+    }
+}
+
+impl JobSubmissionMetadata {
+    /// A verification job with the default parallel declaration.
+    #[must_use]
+    pub const fn verification() -> Self {
+        Self {
+            job_class: JobClass::Verification,
+            resource_profile: TestResourceProfile {
+                weight: ResourceWeight::Light,
+                exclusive_resources: Vec::new(),
+                serial_group: String::new(),
+            },
+        }
+    }
+
+    /// A job of `job_class` with an explicit resource profile.
+    #[must_use]
+    pub const fn declared(job_class: JobClass, resource_profile: TestResourceProfile) -> Self {
+        Self {
+            job_class,
+            resource_profile,
+        }
+    }
+
+    /// The priority the declared class claims with.
+    #[must_use]
+    pub const fn priority(&self) -> i32 {
+        self.job_class.priority()
+    }
+
+    /// Validates the declared profile and refuses a background class that
+    /// claims to outrank a protected foreground class.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        self.resource_profile
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))
+    }
+}
+
 impl TestdVerifierJobSubmission {
     pub fn validate(&self) -> Result<(), TestdError> {
         validate_text(&self.job_id, "job_id")?;
@@ -1533,7 +1629,8 @@ impl TestdVerifierJobSubmission {
                 reason: "productive submission requires the registered TestD profile and no caller arguments",
             });
         }
-        self.target_roots.validate()
+        self.target_roots.validate()?;
+        self.metadata.validate()
     }
 }
 
@@ -3139,6 +3236,12 @@ impl TestdStore {
     }
 
     /// Submits a job exactly once and assigns its project-local sequence.
+    ///
+    /// The job's declared class and resource profile come from
+    /// [`JobSubmissionMetadata`], which binds the I2.22 class, weight,
+    /// exclusive resources, and serial group. This route serves probe jobs;
+    /// the priority integer is retained for wire compatibility but the class
+    /// is what orders the job.
     #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &self,
@@ -3150,6 +3253,31 @@ impl TestdStore {
         priority: i32,
         at_ms: u64,
     ) -> Result<TestJob, TestdError> {
+        self.submit_with_metadata(
+            job_id.into(),
+            project_id.into(),
+            invocation,
+            permit,
+            target_roots,
+            priority,
+            JobSubmissionMetadata::verification(),
+            at_ms,
+        )
+    }
+
+    /// Submits a job carrying its declared class and resource profile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_metadata(
+        &self,
+        job_id: impl Into<String>,
+        project_id: impl Into<String>,
+        invocation: InstrumentInvocation,
+        permit: ProcessAdmissionPermit,
+        target_roots: TargetRoots,
+        priority: i32,
+        metadata: JobSubmissionMetadata,
+        at_ms: u64,
+    ) -> Result<TestJob, TestdError> {
         self.submit_inner(
             job_id.into(),
             project_id.into(),
@@ -3157,6 +3285,7 @@ impl TestdStore {
             permit,
             target_roots,
             priority,
+            metadata,
             at_ms,
             None,
         )
@@ -3174,11 +3303,17 @@ impl TestdStore {
         permit: ProcessAdmissionPermit,
         target_roots: TargetRoots,
         priority: i32,
+        metadata: JobSubmissionMetadata,
         at_ms: u64,
         identity: Option<RequestIdentity>,
     ) -> Result<TestJob, TestdError> {
         validate_text(&job_id, "job_id")?;
         validate_text(&project_id, "project_id")?;
+        metadata.validate()?;
+        let JobSubmissionMetadata {
+            job_class,
+            resource_profile,
+        } = metadata;
         invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
@@ -3249,7 +3384,14 @@ impl TestdStore {
         let mut target_roots = target_roots;
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
-        let digest = payload_digest(&invocation, &process, &target_roots, priority)?;
+        let digest = payload_digest(
+            &invocation,
+            &process,
+            &target_roots,
+            priority,
+            job_class,
+            &resource_profile,
+        )?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
         let existing = {
@@ -3346,6 +3488,9 @@ impl TestdStore {
             process,
             target_roots,
             priority,
+            job_class,
+            resource_profile,
+            scheduling: None,
             state: JobState::Queued,
             attempts: 0,
             not_before_ms: at_ms,
@@ -3420,6 +3565,7 @@ impl TestdStore {
             permit,
             submission.target_roots,
             submission.priority,
+            submission.metadata,
             now,
             Some(identity),
         )
@@ -3445,12 +3591,21 @@ impl TestdStore {
         // their project head forever. A reconciled job never reruns silently;
         // it needs a fresh claim, lease, and permit binding.
         self.reconcile_expired_running_all(now)?;
+        let running_weight = self.running_weight_units()?;
         let candidates = self.ready_heads(now)?;
         let Some(candidate) = candidates
             .into_iter()
             .filter(|candidate| {
                 candidate.invocation.profile != TESTD_PRODUCTIVE_PROFILE
                     || candidate.verifier_dispatch.is_some()
+            })
+            .filter(|candidate| {
+                // A background job may not consume the capacity reserved for
+                // Kernel, Watchdog, Control Reserve, verification, and
+                // interactive product work. Under constrained capacity a
+                // background job waits rather than displacing a protected
+                // class, so a queued verification job still starts first.
+                !candidate.job_class.is_background() || running_weight < RESERVED_FOREGROUND_WEIGHT
             })
             .max_by(compare_ready)
         else {
@@ -3476,6 +3631,20 @@ impl TestdStore {
             return Ok(None);
         }
         let previous = job.state;
+        // Allocate the runtime leases this job declared and record the
+        // scheduling decision, so the work item execution record carries both
+        // the decision and the distinct leases it received. The lease state is
+        // rebuilt from the durable record inside the same write transaction,
+        // so a competing claim committed first still wins and this claim is
+        // refused rather than overlapping.
+        let mut held = held_leases_in(&write, &job.job_id)?;
+        let leases = held
+            .allocate(&job.job_id, &job.resource_profile)
+            .map_err(|error| TestdError::ResourceConflict(error.to_string()))?;
+        job.scheduling = Some(
+            scheduling_decision(job.job_class, &job.resource_profile, leases)
+                .map_err(|error| TestdError::ResourceConflict(error.to_string()))?,
+        );
         job.state = JobState::Running;
         job.attempts = job.attempts.saturating_add(1);
         job.execution = Some(ExecutionStatus::Running);
@@ -3936,8 +4105,80 @@ impl TestdStore {
                 }),
             )
         });
+        // I2.22: "A worktree does not isolate runtime resources." A ready job
+        // whose exclusive resource or serial group is already held by a
+        // running job is not a claim candidate, so two tests that claim the
+        // same exclusive stateful resource never run concurrently. The
+        // decision is re-evaluated against the durable record at claim time.
+        let allocator = running_lease_allocator(&snapshot);
+        candidates.retain(|job| allocator.is_available(&job.resource_profile));
         Ok(candidates)
     }
+
+    /// Sum of the declared resource weight units across durably running jobs.
+    /// This is the capacity a background claim would be measured against.
+    fn running_weight_units(&self) -> Result<u32, TestdError> {
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(JOBS).map_err(database)?;
+        let mut units = 0u32;
+        for item in table.iter().map_err(database)? {
+            let (_, value) = item.map_err(database)?;
+            let job: TestJob = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if job.state == JobState::Running {
+                units = units.saturating_add(job.resource_profile.weight.as_u32());
+            }
+        }
+        drop(table);
+        Ok(units)
+    }
+}
+
+/// Capacity units held back from background claims so a Kernel, Watchdog,
+/// Control Reserve, verification, or interactive job is never displaced by a
+/// background indexing, coverage, mutation, or Dreamer job under constrained
+/// capacity. The reservation is expressed in the same declared weight units as
+/// the job declarations, so it is measured rather than assumed.
+const RESERVED_FOREGROUND_WEIGHT: u32 = 3;
+
+/// Builds the lease state held by every durably running job. Recomputed from
+/// the record rather than cached, so a restart reconstructs the same leases.
+fn running_lease_allocator(jobs: &[TestJob]) -> ResourceLeaseAllocator {
+    let mut allocator = ResourceLeaseAllocator::new();
+    for job in jobs.iter().filter(|job| job.state == JobState::Running) {
+        let leases = job
+            .scheduling
+            .as_ref()
+            .map_or_else(Vec::new, |scheduling| scheduling.leases.clone());
+        allocator.adopt_running(
+            job.job_id.clone(),
+            leases,
+            job.resource_profile.serial_group.clone(),
+        );
+    }
+    allocator
+}
+
+/// Builds the lease state held by the running jobs in an open write
+/// transaction, excluding `job_id` which is the claim being evaluated. This
+/// makes the exclusivity check and the job update one transaction, so a
+/// competing claim that committed first is observed and refused.
+fn held_leases_in(
+    write: &redb::WriteTransaction,
+    job_id: &str,
+) -> Result<ResourceLeaseAllocator, TestdError> {
+    let table = write.open_table(JOBS).map_err(database)?;
+    let mut jobs = Vec::new();
+    for item in table.iter().map_err(database)? {
+        let (_, value) = item.map_err(database)?;
+        let job: TestJob = serde_json::from_slice(value.value())
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        if job.job_id != job_id {
+            jobs.push(job);
+        }
+    }
+    drop(table);
+    Ok(running_lease_allocator(&jobs))
 }
 
 fn project_head_blocked<'a>(
@@ -3958,9 +4199,18 @@ fn payload_digest(
     process: &ProcessRequest,
     target_roots: &TargetRoots,
     priority: i32,
+    job_class: JobClass,
+    resource_profile: &TestResourceProfile,
 ) -> Result<String, TestdError> {
-    let bytes = serde_json::to_vec(&(invocation, process, target_roots, priority))
-        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+    let bytes = serde_json::to_vec(&(
+        invocation,
+        process,
+        target_roots,
+        priority,
+        job_class,
+        resource_profile,
+    ))
+    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -4153,9 +4403,19 @@ fn cancellation_lease_matches(
     }
 }
 
+/// Orders two ready heads for a claim.
+///
+/// I2.22: "Verification has priority over background indexing, coverage,
+/// mutation, and Dreamer jobs" and "A background build cannot displace Kernel,
+/// Watchdog, Control Reserve, or interactive product work." The declared job
+/// class therefore orders the claim first, and the caller-supplied `priority`
+/// integer is only a within-class tie-break, so a background job can never be
+/// promoted above a protected class by choosing a large integer.
 fn compare_ready(left: &TestJob, right: &TestJob) -> Ordering {
-    left.priority
-        .cmp(&right.priority)
+    left.job_class
+        .priority()
+        .cmp(&right.job_class.priority())
+        .then_with(|| left.priority.cmp(&right.priority))
         .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
         .then_with(|| right.project_sequence.cmp(&left.project_sequence))
         .then_with(|| right.job_id.cmp(&left.job_id))
