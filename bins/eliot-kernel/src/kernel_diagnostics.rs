@@ -24,9 +24,13 @@
 //! Event Log port) is still open and unlanded, so this facade must neither
 //! acquire Event Log FFI nor fake delivery through another sink.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
 
+use eliot_observability::field_policy::{
+    self, RedactedHandle, TelemetryFieldFamily, requires_evidence_handle, scrub_labels_for_emit,
+};
 use tracing_subscriber::EnvFilter;
 
 /// Target for every event emitted by this facade.
@@ -36,6 +40,18 @@ pub const KERNEL_DIAGNOSTICS_TARGET: &str = "eliot_kernel::diagnostics";
 pub const MAX_DIAGNOSTIC_FIELD_BYTES: usize = 256;
 /// Bound for free-text detail fields.
 pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 1024;
+
+/// Telemetry family governing every record this facade emits.
+///
+/// Kernel records are operational-log records: they reach span fields and the
+/// rolling-log sink through `tracing`, so the emission boundary is
+/// [`scrub_labels_for_emit`] under this family (issue #1842, I16.3/I16.9).
+const KERNEL_TELEMETRY_FAMILY: TelemetryFieldFamily = TelemetryFieldFamily::OperationalLog;
+
+/// Label key for one bounded detail value on the emission path.
+const DETAIL_LABEL_KEY: &str = "detail";
+/// Label key for one bounded short identity/code value on the emission path.
+const FIELD_LABEL_KEY: &str = "code";
 
 /// Process ownership claim for the facade's one global subscriber install.
 static SUBSCRIBER_INSTALLED: OnceLock<()> = OnceLock::new();
@@ -130,16 +146,21 @@ fn truncate_to(value: &str, max_bytes: usize) -> (String, usize, bool) {
 /// Bounded short field (stage names, terminal codes).
 ///
 /// Pure and total: never panics and never allocates beyond the bound.
-/// Callers must pass only nonsecret material; bounding limits size, not
-/// sensitivity (I15.4).
+/// Bounding limits size, not sensitivity: the value is screened against the
+/// shared telemetry field policy before it can reach a span field or a
+/// rolling-log line, so a recognisable secret leaves the field and becomes an
+/// immutable redacted evidence handle (issue #1842, I16.3/I15.4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundedField {
-    /// Retained prefix: at most [`MAX_DIAGNOSTIC_FIELD_BYTES`] bytes.
+    /// Retained prefix: at most [`MAX_DIAGNOSTIC_FIELD_BYTES`] bytes, unless
+    /// the value was redacted under the field policy.
     text: String,
     /// Byte length of the input before truncation.
     original_bytes: usize,
     /// Whether the retained prefix is shorter than the input.
     truncated: bool,
+    /// Recorded handle when the value was redacted, `None` otherwise.
+    redaction: Option<RedactedHandle>,
 }
 
 impl BoundedField {
@@ -157,34 +178,54 @@ impl BoundedField {
     pub const fn truncated(&self) -> bool {
         self.truncated
     }
-}
 
-/// Bounds one short field to [`MAX_DIAGNOSTIC_FIELD_BYTES`].
-#[must_use]
-pub fn bound_field(value: &str) -> BoundedField {
-    let (text, original_bytes, truncated) = truncate_to(value, MAX_DIAGNOSTIC_FIELD_BYTES);
-    BoundedField {
-        text,
-        original_bytes,
-        truncated,
+    /// Redaction status recorded for this value, or `None` when the value
+    /// passed the policy gate unchanged.
+    ///
+    /// A handle is present exactly when the emitted text is not the input, so
+    /// a reader can tell a redacted field from a genuinely short one.
+    #[must_use]
+    pub fn redaction_status(&self) -> Option<&str> {
+        self.redaction
+            .as_ref()
+            .map(|handle| handle.redaction_status.as_str())
+    }
+
+    /// Immutable evidence handle standing in for the redacted value, or
+    /// `None` when no redaction occurred.
+    #[must_use]
+    pub fn evidence_handle(&self) -> Option<&str> {
+        self.redaction.as_ref().map(|handle| handle.handle.as_str())
     }
 }
 
-/// Bounded free-text detail with truncation honesty.
+/// Bounds one short field to [`MAX_DIAGNOSTIC_FIELD_BYTES`], screening it
+/// through the shared telemetry field policy first.
+#[must_use]
+pub fn bound_field(value: &str) -> BoundedField {
+    bounded_value(value, MAX_DIAGNOSTIC_FIELD_BYTES, FIELD_LABEL_KEY).into()
+}
+
+/// Bounded free-text detail with truncation honesty and policy screening.
 ///
 /// Pure and total: never panics and never allocates beyond the bound plus
-/// the retained prefix. It never inspects content for secrets, so callers
-/// must only pass nonsecret material: no credentials, DB URLs, signed
-/// authority material, raw argv/environment, unrestricted paths, or
-/// frame/request/model/user/evidence bodies (I15.4, I07.20).
+/// the retained prefix. Callers must only pass nonsecret material: no
+/// credentials, DB URLs, signed authority material, raw argv/environment,
+/// unrestricted paths, or frame/request/model/user/evidence bodies
+/// (I15.4, I07.20). A value that nevertheless carries a recognisable secret
+/// never reaches the emitted record: it is replaced by an immutable redacted
+/// evidence handle before bounding (issue #1842, I16.3).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundedDetail {
-    /// Retained prefix: at most [`MAX_DIAGNOSTIC_DETAIL_BYTES`] bytes.
+    /// Retained prefix: at most [`MAX_DIAGNOSTIC_DETAIL_BYTES`] bytes, unless
+    /// the value was redacted under the field policy.
     text: String,
     /// Byte length of the input before truncation.
     original_bytes: usize,
     /// Whether the retained prefix is shorter than the input.
     truncated: bool,
+    /// Recorded handle when the value was redacted, `None` otherwise.
+    redaction: Option<RedactedHandle>,
 }
 
 impl BoundedDetail {
@@ -202,17 +243,117 @@ impl BoundedDetail {
     pub const fn truncated(&self) -> bool {
         self.truncated
     }
+
+    /// Redaction status recorded for this value, or `None` when the value
+    /// passed the policy gate unchanged.
+    #[must_use]
+    pub fn redaction_status(&self) -> Option<&str> {
+        self.redaction
+            .as_ref()
+            .map(|handle| handle.redaction_status.as_str())
+    }
+
+    /// Immutable evidence handle standing in for the redacted value, or
+    /// `None` when no redaction occurred.
+    #[must_use]
+    pub fn evidence_handle(&self) -> Option<&str> {
+        self.redaction.as_ref().map(|handle| handle.handle.as_str())
+    }
 }
 
-/// Bounds one free-text detail to [`MAX_DIAGNOSTIC_DETAIL_BYTES`], recording
-/// the original length and whether truncation occurred.
+/// Bounds one free-text detail to [`MAX_DIAGNOSTIC_DETAIL_BYTES`], screening
+/// it through the shared telemetry field policy first.
 #[must_use]
 pub fn bound_detail(detail: &str) -> BoundedDetail {
-    let (text, original_bytes, truncated) = truncate_to(detail, MAX_DIAGNOSTIC_DETAIL_BYTES);
-    BoundedDetail {
+    bounded_value(detail, MAX_DIAGNOSTIC_DETAIL_BYTES, DETAIL_LABEL_KEY).into()
+}
+
+/// One screened, bounded, already-policy-admitted field value.
+///
+/// Shared by [`bound_field`] and [`bound_detail`]: the two differ only in
+/// their bound, so the emission boundary exists once.
+struct BoundedScreenedValue {
+    text: String,
+    original_bytes: usize,
+    truncated: bool,
+    redaction: Option<RedactedHandle>,
+}
+
+impl From<BoundedScreenedValue> for BoundedField {
+    fn from(value: BoundedScreenedValue) -> Self {
+        Self {
+            text: value.text,
+            original_bytes: value.original_bytes,
+            truncated: value.truncated,
+            redaction: value.redaction,
+        }
+    }
+}
+
+impl From<BoundedScreenedValue> for BoundedDetail {
+    fn from(value: BoundedScreenedValue) -> Self {
+        Self {
+            text: value.text,
+            original_bytes: value.original_bytes,
+            truncated: value.truncated,
+            redaction: value.redaction,
+        }
+    }
+}
+
+/// Screens one value through the field policy and then bounds it.
+///
+/// Screening is first and is fail-closed: a value carrying a recognisable
+/// secret, or one too long to be an opaque identifier, is replaced by the
+/// immutable handle [`scrub_labels_for_emit`] mints, so no part of it reaches
+/// the emitted record. Bounding then applies only to a value that already
+/// passed the gate, which keeps the handle itself exact rather than truncated.
+fn bounded_value(value: &str, max_bytes: usize, label_key: &str) -> BoundedScreenedValue {
+    let original_bytes = value.len();
+    if requires_evidence_handle(value) {
+        let mut candidate = BTreeMap::new();
+        candidate.insert(label_key.to_owned(), value.to_owned());
+        let scrubbed = scrub_labels_for_emit(KERNEL_TELEMETRY_FAMILY, &candidate);
+        // A Forbidden family emits nothing, so a redacted field would have no
+        // emitted value. The Kernel family is Allowed, so the key survives
+        // unless the field policy also renamed it as a forbidden key; either
+        // way there is exactly one emitted value, and it is the handle.
+        let Some(redacted) = scrubbed
+            .labels
+            .get(label_key)
+            .or_else(|| scrubbed.labels.values().next())
+        else {
+            // Unreachable for the Allowed Kernel family; fail closed by
+            // recording the value as denied rather than emitting it.
+            return BoundedScreenedValue {
+                text: field_policy::RedactionReason::Secret.as_str().to_owned(),
+                original_bytes,
+                truncated: false,
+                redaction: None,
+            };
+        };
+        let redaction = scrubbed
+            .handles
+            .iter()
+            .find(|handle| &handle.handle == redacted)
+            .cloned();
+        debug_assert!(
+            redaction.is_some(),
+            "every emitted handle must be recorded on the scrubbed output"
+        );
+        return BoundedScreenedValue {
+            text: redacted.clone(),
+            original_bytes,
+            truncated: false,
+            redaction,
+        };
+    }
+    let (text, original_bytes, truncated) = truncate_to(value, max_bytes);
+    BoundedScreenedValue {
         text,
         original_bytes,
         truncated,
+        redaction: None,
     }
 }
 
@@ -307,10 +448,12 @@ pub fn observe_entrypoint(stage: EntrypointStage) {
 }
 
 /// Records that the entrypoint reached one frozen boundary stage with a
-/// bounded nonsecret detail.
+/// bounded, policy-screened nonsecret detail.
 ///
-/// The detail is truncated before formatting with its honesty record
-/// attached; see [`bound_detail`] for the nonsecret caller contract.
+/// The detail is screened against the shared telemetry field policy and then
+/// truncated before formatting, with its honesty record attached; a
+/// recognisable secret leaves the record as an immutable redacted evidence
+/// handle carrying its redaction status, never as text. See [`bound_detail`].
 pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
     let bounded = bound_detail(detail);
     tracing::info!(
@@ -320,6 +463,8 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
         detail = bounded.text(),
         detail_bytes = bounded.original_bytes(),
         detail_truncated = bounded.truncated(),
+        detail_redaction = bounded.redaction_status().unwrap_or("none"),
+        detail_evidence = bounded.evidence_handle().unwrap_or("none"),
         "kernel entrypoint reached stage"
     );
 }
@@ -329,10 +474,10 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
 ///
 /// One underlying failed operation yields exactly one terminal record here;
 /// lower-phase entrypoint observations correlate by stage order, not by a
-/// dedup cache. The code is bounded defensively; every current call site
-/// passes a `&'static str` typed code owned by its failure path (I07.20).
-/// Terminal receipt framing (`write_error`) is untouched and still owns the
-/// process exit.
+/// dedup cache. The code is screened against the shared telemetry field policy
+/// and bounded defensively; every current call site passes a `&'static str`
+/// typed code owned by its failure path (I07.20). Terminal receipt framing
+/// (`write_error`) is untouched and still owns the process exit.
 pub fn observe_terminal_error(code: &str) {
     let bounded = bound_field(code);
     tracing::error!(
@@ -341,6 +486,8 @@ pub fn observe_terminal_error(code: &str) {
         code = bounded.text(),
         code_bytes = bounded.original_bytes(),
         code_truncated = bounded.truncated(),
+        code_redaction = bounded.redaction_status().unwrap_or("none"),
+        code_evidence = bounded.evidence_handle().unwrap_or("none"),
         "kernel terminal error"
     );
 }
