@@ -570,7 +570,15 @@ pub fn absence_claim_admissible(
     manifest: &ObservationCoverageManifest,
     source_class: &str,
 ) -> bool {
-    manifest.completeness == CoverageCompleteness::Complete
+    complete_source_class_denominator_admissible(manifest, source_class)
+}
+
+fn complete_source_class_denominator_admissible(
+    manifest: &ObservationCoverageManifest,
+    source_class: &str,
+) -> bool {
+    manifest.validate().is_ok()
+        && manifest.completeness == CoverageCompleteness::Complete
         && manifest.declares_source_class(source_class)
         && manifest
             .blind_intervals_and_missing_source_reasons
@@ -579,32 +587,22 @@ pub fn absence_claim_admissible(
         && manifest.sequence_faults.payload_mutations == 0
 }
 
-/// Returns a coverage percentage only against a declared complete
-/// denominator with continuous cursors and a consistent numerator; otherwise
-/// returns `None` so percentages without an explicit gap-free denominator, or
-/// with more covered units than the denominator declares, are rejected rather
-/// than rendered. A numerator above the denominator is inconsistent evidence,
-/// never a valid claim above 100 %.
+/// Returns a coverage percentage only for `source_class` in a valid, declared
+/// complete denominator with continuous cursors and a consistent numerator;
+/// otherwise returns `None`. A numerator above the denominator is
+/// inconsistent evidence, never a valid claim above 100 %.
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn coverage_percentage(
     manifest: &ObservationCoverageManifest,
+    source_class: &str,
     covered: u64,
     total: u64,
 ) -> Option<f64> {
-    if manifest.completeness != CoverageCompleteness::Complete || total == 0 {
+    if !complete_source_class_denominator_admissible(manifest, source_class) || total == 0 {
         return None;
     }
     if covered > total {
-        return None;
-    }
-    if !manifest
-        .blind_intervals_and_missing_source_reasons
-        .is_empty()
-    {
-        return None;
-    }
-    if manifest.sequence_faults.gaps > 0 || manifest.sequence_faults.payload_mutations > 0 {
         return None;
     }
     Some((covered as f64 / total as f64) * 100.0)
@@ -703,7 +701,7 @@ mod coverage_trace_tests_1936 {
             4
         );
         assert!(absence_claim_admissible(&manifest, "host.shell"));
-        assert!(coverage_percentage(&manifest, 4, 4).is_some());
+        assert!(coverage_percentage(&manifest, "host.shell", 4, 4).is_some());
     }
 
     #[test]
@@ -731,7 +729,7 @@ mod coverage_trace_tests_1936 {
                 .any(|blind| blind.first_missing_cursor == 3)
         );
         assert!(!absence_claim_admissible(&manifest, "host.shell"));
-        assert!(coverage_percentage(&manifest, 3, 4).is_none());
+        assert!(coverage_percentage(&manifest, "host.shell", 3, 4).is_none());
     }
 
     #[test]
@@ -781,7 +779,7 @@ mod coverage_trace_tests_1936 {
                 .any(|blind| blind.reason == "payload-mismatch")
         );
         assert!(!absence_claim_admissible(&manifest, "host.shell"));
-        assert!(coverage_percentage(&manifest, 3, 4).is_none());
+        assert!(coverage_percentage(&manifest, "host.shell", 3, 4).is_none());
     }
 
     #[test]
@@ -789,24 +787,27 @@ mod coverage_trace_tests_1936 {
         let mut manifest = complete_manifest();
         manifest.sequence_faults.payload_mutations = 1;
         assert!(!absence_claim_admissible(&manifest, "host.shell"));
-        assert!(coverage_percentage(&manifest, 4, 4).is_none());
+        assert!(coverage_percentage(&manifest, "host.shell", 4, 4).is_none());
     }
 
     #[test]
     fn cursor_gap_without_percentage_denominator_is_rejected() {
         let manifest = complete_manifest();
-        assert!(coverage_percentage(&manifest, 4, 4).is_some());
+        assert!(coverage_percentage(&manifest, "host.shell", 4, 4).is_some());
         let mut gapped = complete_manifest();
         gapped.sequence_faults.gaps = 1;
-        assert!(coverage_percentage(&gapped, 4, 4).is_none());
+        assert!(coverage_percentage(&gapped, "host.shell", 4, 4).is_none());
     }
 
     #[test]
     fn inconsistent_numerator_is_refused_never_over_one_hundred() {
         let manifest = complete_manifest();
-        assert_eq!(coverage_percentage(&manifest, 4, 4), Some(100.0));
-        assert!(coverage_percentage(&manifest, 5, 4).is_none());
-        assert!(coverage_percentage(&manifest, 1, 0).is_none());
+        assert_eq!(
+            coverage_percentage(&manifest, "host.shell", 4, 4),
+            Some(100.0)
+        );
+        assert!(coverage_percentage(&manifest, "host.shell", 5, 4).is_none());
+        assert!(coverage_percentage(&manifest, "host.shell", 1, 0).is_none());
     }
 
     #[test]
@@ -833,7 +834,7 @@ mod coverage_trace_tests_1936 {
             CoverageCompleteness::Partial
         );
         assert!(!absence_claim_admissible(&manifest, "host.shell"));
-        assert!(coverage_percentage(&manifest, 3, 4).is_none());
+        assert!(coverage_percentage(&manifest, "host.shell", 3, 4).is_none());
     }
 
     #[test]
