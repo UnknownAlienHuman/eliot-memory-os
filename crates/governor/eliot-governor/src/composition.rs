@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use self::authority_recovery::map_transition_receipt_error;
 use crate::activation_outcome::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
     GovernorSelectionDirective,
@@ -6126,8 +6127,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Fail-closed behavior:
     /// - Without a retained port, or when the composition is not ready, no
     ///   crossing is presented.
-    /// - A second presentation on an already-recorded active identity fails
-    ///   closed instead of minting a second transition.
+    /// - An exact replay of an active identity is re-presented to the owner;
+    ///   the complete returned receipt must equal the retained validated
+    ///   receipt. The process-local receipt is never returned as a substitute
+    ///   for owner readback.
+    /// - Changed content under the retained transition identity returns
+    ///   `IdentityConflict` before transport.
     /// - An `UnknownOutcome` retains the exact request with its owner snapshot
     ///   until exact reconciliation; the crossing stays unadmitted, never
     ///   active.
@@ -6141,17 +6146,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.require_ready_for_authority()?;
         let port = self.authority_port()?;
         let presented = PresentedAuthorityRequest::RootTransition(Box::new(request.clone()));
-        self.require_admissible_transition(&presented)?;
+        let retained_receipt = self.require_admissible_transition(&presented)?;
         let receipt = match port.activate_root_transition(request) {
             Ok(receipt) => receipt,
             Err(P07PortError::UnknownOutcome { snapshot_id }) => {
-                self.note_unknown_outcome(presented, &snapshot_id)?;
+                // A prior validated receipt remains historical evidence, but
+                // a failed owner readback cannot be replaced by that local
+                // copy. Keep the retained Active state unchanged and report
+                // the owner's unresolved outcome.
+                if retained_receipt.is_none() {
+                    self.note_unknown_outcome(presented, &snapshot_id)?;
+                } else if &snapshot_id != request.snapshot_id() {
+                    return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+                }
                 return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
                     snapshot_id,
                 }));
             }
             Err(error) => return Err(CompositionError::Authority(error)),
         };
+
+        if let Some(retained_receipt) = retained_receipt {
+            receipt.validate(request).map_err(|error| {
+                CompositionError::Authority(map_transition_receipt_error(&error))
+            })?;
+            if receipt != retained_receipt {
+                return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+            }
+            return Ok(receipt);
+        }
+
         let retained = self.retain_presentation(presented)?;
         retained.note_transition_activated(&receipt)?;
         Ok(receipt)
@@ -6435,25 +6459,48 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(())
     }
 
-    /// Resolves the transition identity for an activation presentation: an
-    /// already-recorded active identity fails closed before any transport is
-    /// touched, so a lost acknowledgement can reconcile but never mint a
-    /// second transition.
+    /// Resolves the transition identity for an activation presentation.
+    /// Changed content under a retained identity conflicts before transport.
+    /// An exact active replay returns its retained receipt only as a
+    /// comparison value; the caller must obtain and validate owner readback
+    /// before returning a result.
     fn require_admissible_transition(
         &self,
         presented: &PresentedAuthorityRequest,
-    ) -> Result<(), CompositionError> {
-        let PresentedAuthorityRequest::RootTransition(_) = presented else {
+    ) -> Result<Option<RootTransitionActivationReceipt>, CompositionError> {
+        let PresentedAuthorityRequest::RootTransition(request) = presented else {
             return Err(CompositionError::Authority(P07PortError::InvalidBinding));
         };
+        let incoming = request.record();
+        let conflicting_identity = self.authority_presentations.values().any(|retained| {
+            let PresentedAuthorityRequest::RootTransition(previous) = retained.request() else {
+                return false;
+            };
+            let held = previous.record();
+            (held.transition_id == incoming.transition_id
+                || held.operation_id == incoming.operation_id
+                || held.idempotency_key == incoming.idempotency_key)
+                && previous != request
+        });
+        if conflicting_identity {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
         if let Some(retained) = self
             .authority_presentations
             .get(presented.ledger_key().as_str())
-            && matches!(retained.state(), AuthorityPresentationState::Active { .. })
         {
-            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+            if retained.request() != presented {
+                return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+            }
+            if matches!(retained.state(), AuthorityPresentationState::Active { .. }) {
+                return retained
+                    .transition_receipt()
+                    .cloned()
+                    .map(Some)
+                    .ok_or(CompositionError::Authority(P07PortError::InvalidBinding));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn recovered_grant_status(&self, grant_id: &GrantId) -> Option<GrantStatus> {
