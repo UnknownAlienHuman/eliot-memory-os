@@ -23,6 +23,17 @@
 //! are part of [`OrsBackupSnapshot::snapshot_digest`], and a snapshot that
 //! declares no family denominator can never validate as `Complete`.
 //!
+//! Issue #1971 makes that machinery serve a SECOND family. The versioned-artifact
+//! family is cursor-paged for the same reason
+//! [`RowFamilyKind::uses_family_cursor`] already names it: its rows carry no
+//! operation order. Each paged family keeps its OWN named request cursor, page
+//! continuation and snapshot identity rather than sharing one slot, because each
+//! of those slots refuses a cursor frozen for a different family — sharing one
+//! would let one family's table be paged under another family's denominator. A
+//! `Complete` snapshot therefore requires a frozen identity for every cursor-
+//! paged family, and a page is final only when the operational window AND every
+//! paged family are closed.
+//!
 //! Issue #953 binds the capture to ONE owner-established read consistency
 //! point and rebinds every page digest to its own token. Three contract changes
 //! carry that:
@@ -64,7 +75,25 @@ use crate::OrsError;
 /// rather than being silently reinterpreted. I05-22 keeps migration IDs and
 /// checksums immutable after release, which is why this is a version bump with no
 /// migration rather than an in-place widening of v1.
-pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
+///
+/// Issue #1971 bumps this from `2` to `3` because #1971 registers a SECOND
+/// cursor-paged row family and the v2 wire shape has exactly ONE family slot on
+/// each of its three carriers: [`OrsBackupRequest`] carries one
+/// `process_stream_recovery_cursor`, [`OrsBackupPage`] one
+/// `family_continuation`, and [`OrsBackupSnapshot`] one frozen family identity
+/// plus one outstanding next cursor. A v2 shape cannot state the
+/// versioned-artifact family's frozen identity at all, so a v2 page cannot carry
+/// that family's entries, its continuation or its movement refusal, and a v2
+/// snapshot cannot fold it into [`OrsBackupSnapshot::snapshot_digest`] or require
+/// it for `Complete`. The bump is a WIRE constant again, not durable schema: no
+/// table, column or row changes, nothing is rewritten, and no migration is
+/// introduced. The existing refusal mechanism covers it unchanged —
+/// [`OrsBackupSourceIdentity::new`] already returns [`OrsError::MigrationRequired`]
+/// for any schema other than this constant, so a v1 or v2 request or snapshot is
+/// rejected at construction and at import rather than being silently
+/// reinterpreted. For the same I05-22 reason this is a version bump with no
+/// migration rather than an in-place widening of v2.
+pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 /// Hard ceiling for entries in one backup page (mirrors `MAX_RECOVERY_PAGE`).
 pub const MAX_BACKUP_PAGE_ENTRIES: u16 = 256;
 /// Hard ceiling for pages in one backup snapshot.
@@ -595,6 +624,40 @@ pub struct OrsBackupRequest {
     /// family was fully retained. The operational `after_order` window is never
     /// reused for this family: observation time is not a total order.
     pub process_stream_recovery_cursor: Option<OrsFamilyCursor>,
+    /// Typed continuation for the paged versioned-artifact family (issue
+    /// #1971), or `None` when the caller declared no continuation for it.
+    ///
+    /// A SECOND symmetric slot rather than a widened first one, and the reason is
+    /// that widening would destroy the property the first slot exists for:
+    /// [`Self::with_process_stream_recovery_cursor`] refuses a cursor frozen for
+    /// any other family, precisely so one family's table can never be paged
+    /// under another family's denominator. One named slot per family keeps that
+    /// refusal exact and keeps the digest folds in
+    /// [`OrsBackupPage::expected_page_digest`] and
+    /// [`OrsBackupSnapshot::snapshot_digest`] positionally unambiguous, where a
+    /// map keyed by family would make the fold order a serde detail. A general
+    /// per-family map would additionally need `RowFamilyKind: Ord` plus a string
+    /// map key, which is more new surface than a second field.
+    ///
+    /// The versioned-artifact family's rows carry no operation order at all, so
+    /// the operational `after_order` window is never reused for it either.
+    pub versioned_artifact_cursor: Option<OrsFamilyCursor>,
+}
+impl OrsBackupRequest {
+    /// The exact family continuation this request declares for `family`, or
+    /// `None` when it declares none.
+    ///
+    /// One read point for both slots so the export loop cannot read the wrong
+    /// family's cursor: the discriminator is the caller's `family`, not a guess
+    /// made where the cursor is consumed.
+    #[must_use]
+    pub fn family_cursor(&self, family: RowFamilyKind) -> Option<&OrsFamilyCursor> {
+        match family {
+            RowFamilyKind::ProcessStreamRecovery => self.process_stream_recovery_cursor.as_ref(),
+            RowFamilyKind::VersionedArtifacts => self.versioned_artifact_cursor.as_ref(),
+            _ => None,
+        }
+    }
 }
 impl OrsBackupRequest {
     /// Validate and bind a backup request.
@@ -629,6 +692,7 @@ impl OrsBackupRequest {
             max_bytes,
             max_pages,
             process_stream_recovery_cursor: None,
+            versioned_artifact_cursor: None,
         })
     }
     /// Binds one typed family continuation to this request (issue #2884).
@@ -654,6 +718,36 @@ impl OrsBackupRequest {
             });
         }
         self.process_stream_recovery_cursor = Some(cursor);
+        Ok(self)
+    }
+    /// Binds one typed versioned-artifact family continuation to this request
+    /// (issue #1971).
+    ///
+    /// The exact mirror of [`Self::with_process_stream_recovery_cursor`], and it
+    /// refuses the same way for the same reason: the slot names ONE family, so a
+    /// cursor frozen for any other family is refused here rather than paging one
+    /// family's table under another family's denominator. The cursor still comes
+    /// only from the store's family-snapshot opener
+    /// (`RedbRecoveryStore::open_backup_versioned_artifact_family`), never from
+    /// the caller.
+    ///
+    /// Attaching a cursor for a family whose disposition is
+    /// [`RowDisposition::NonrestorableHistorical`] grants no restore path: it
+    /// puts those rows inside the exported denominator, where quarantine triage
+    /// lands them `Forensic` (I05-27 / ARCH-RES-03). It never reactivates a prior
+    /// installation's generation authority.
+    pub fn with_versioned_artifact_cursor(
+        mut self,
+        cursor: OrsFamilyCursor,
+    ) -> Result<Self, OrsError> {
+        cursor.validate()?;
+        if cursor.identity.family != RowFamilyKind::VersionedArtifacts {
+            return Err(OrsError::InvalidField {
+                field: "backup_versioned_artifact_cursor",
+                reason: "cursor names a different row family",
+            });
+        }
+        self.versioned_artifact_cursor = Some(cursor);
         Ok(self)
     }
     /// Deterministic binding token for source, fence, and page cursor.
@@ -797,15 +891,24 @@ pub struct OrsBackupPage {
     pub page_digest: String,
     /// True only on the final page.
     ///
-    /// Unambiguous by construction (issue #2884): it is the conjunction of the
-    /// operational window being exhausted and the paged family having no
-    /// continuation left. A page that still owes family rows is never `is_last`
-    /// even when its operational segment ended, so page continuity can never
-    /// hide an unemitted family tail behind a final page.
+    /// Unambiguous by construction (issue #2884, extended by #1971): it is the
+    /// conjunction of the operational window being exhausted and EVERY paged
+    /// family having no continuation left. A page that still owes rows to
+    /// either the process-stream recovery family or the versioned-artifact family
+    /// is never `is_last` even when its operational segment ended, so page
+    /// continuity can never hide an unemitted family tail behind a final page.
     pub is_last: bool,
-    /// Family continuation this page was read under, or `None` when the request
-    /// declared no family continuation.
+    /// Process-stream recovery family continuation this page was read under, or
+    /// `None` when the request declared no continuation for that family.
     pub family_continuation: Option<OrsFamilyContinuation>,
+    /// Versioned-artifact family continuation this page was read under, or `None`
+    /// when the request declared no continuation for that family (issue #1971).
+    ///
+    /// Never shares a cursor with [`Self::family_continuation`]: the two families
+    /// have independent durable-key orders and independent frozen identities, so
+    /// one field per family is what keeps a page from carrying a continuation
+    /// under the wrong family's denominator.
+    pub versioned_artifact_continuation: Option<OrsFamilyContinuation>,
 }
 impl OrsBackupPage {
     /// The one digest derivation over a page's own content (issue #953).
@@ -820,8 +923,13 @@ impl OrsBackupPage {
     /// and a shape-checked digest bound nothing at all.
     ///
     /// Binds, in order: the capture token, the page index, finality, the whole
-    /// capture window, the entry count, the family continuation in force and the
-    /// exact next cursor, then one 64-hex digest per entry. Every contribution is
+    /// capture window, the entry count, the process-stream recovery family
+    /// continuation in force and its exact next cursor, then the SAME four family
+    /// facts for the versioned-artifact family (issue #1971), then one 64-hex
+    /// digest per entry. Both family segments are folded in a FIXED order with a
+    /// literal label in front of each, so a page that carried only the
+    /// versioned-artifact family cannot produce the same material as a page that
+    /// carried only the process-stream recovery family. Every contribution is
     /// either a fixed-width digest or a delimiter-separated decimal/bool field, so
     /// the concatenation is length-delimited by construction and an embedded
     /// separator inside a `record_id` cannot make two different pages produce the
@@ -837,17 +945,16 @@ impl OrsBackupPage {
             self.expires_at_ms,
             self.entries.len()
         );
-        match &self.family_continuation {
-            Some(continuation) => {
-                material.push_str(&continuation.cursor.fence_token());
-                material.push(':');
-                match &continuation.next {
-                    Some(next) => material.push_str(&next.fence_token()),
-                    None => material.push_str("no-next"),
-                }
-            }
-            None => material.push_str("no-family"),
-        }
+        push_family_continuation_material(
+            &mut material,
+            "recovery-family",
+            self.family_continuation.as_ref(),
+        );
+        push_family_continuation_material(
+            &mut material,
+            "artifact-family",
+            self.versioned_artifact_continuation.as_ref(),
+        );
         material.push(':');
         for entry in &self.entries {
             // Fixed-width per entry, so a record id containing the delimiter
@@ -899,11 +1006,41 @@ impl OrsBackupPage {
         if let Some(continuation) = &self.family_continuation {
             continuation.validate()?;
         }
+        if let Some(continuation) = &self.versioned_artifact_continuation {
+            continuation.validate()?;
+        }
         if self.expected_page_digest() != self.page_digest {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
         Ok(())
     }
+}
+
+/// Folds one family's in-force and next cursors into a page's digest material.
+///
+/// ONE derivation for both paged families (issue #1971), with `label` naming
+/// which family the following four fields belong to. Sharing it is what makes
+/// "one derivation over a page" stay one derivation after the second family was
+/// added: a producer and a validator cannot disagree about one family's fold
+/// while agreeing about the other's.
+fn push_family_continuation_material(
+    material: &mut String,
+    label: &str,
+    continuation: Option<&OrsFamilyContinuation>,
+) {
+    material.push_str(label);
+    material.push('=');
+    if let Some(continuation) = continuation {
+        material.push_str(&continuation.cursor.fence_token());
+        material.push(':');
+        match &continuation.next {
+            Some(next) => material.push_str(&next.fence_token()),
+            None => material.push_str("no-next"),
+        }
+    } else {
+        material.push_str("no-family");
+    }
+    material.push(':');
 }
 /// Completeness of a backup snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -948,14 +1085,31 @@ pub struct OrsBackupSnapshot {
     /// `max_pages` or byte exhaustion leaves a resumable partial disposition
     /// carrying this cursor, never a permanent all-or-nothing failure.
     pub next_process_stream_recovery_cursor: Option<OrsFamilyCursor>,
+    /// Frozen versioned-artifact family snapshot this snapshot exported, or `None`
+    /// when the request declared no continuation for that family (issue #1971).
+    ///
+    /// A missing family denominator is legacy/partial evidence, never an empty
+    /// complete family, for the same reason the process-stream recovery family's
+    /// is: a snapshot that declares no denominator cannot distinguish "no
+    /// generations were retained" from "this exporter never looked at the
+    /// family", so it may not certify `Complete`.
+    pub versioned_artifact_family: Option<OrsFamilySnapshotIdentity>,
+    /// Exact versioned-artifact continuation that resumes an incomplete family
+    /// export, or `None` when no such continuation is outstanding.
+    pub next_versioned_artifact_cursor: Option<OrsFamilyCursor>,
 }
 impl OrsBackupSnapshot {
     /// Recompute the denominator digest over source, fence, family and page
     /// digests.
     ///
-    /// The frozen family snapshot identity, every page's family cursor and the
-    /// outstanding next cursor are all folded in, so the denominator certifies
-    /// the composite snapshot and not just one table's pages (issue #2884).
+    /// Every frozen family snapshot identity, every page's in-force and next
+    /// family cursors and every outstanding next cursor are all folded in, so the
+    /// denominator certifies the composite snapshot and not just one table's pages
+    /// (issue #2884, extended to the second paged family by #1971). The two
+    /// families are folded in a FIXED order and each under its own label, so a
+    /// snapshot cannot present a versioned-artifact denominator as a
+    /// process-stream recovery one or omit one of them from the digest without
+    /// changing the value.
     ///
     /// Since issue #953 the denominator also transitively binds each page's
     /// capture token and capture window, because it folds `page_digest` and
@@ -988,20 +1142,35 @@ impl OrsBackupSnapshot {
             }
             None => material.push_str("next:none:"),
         }
+        match &self.versioned_artifact_family {
+            Some(identity) => {
+                material.push_str("artifact_family:");
+                material.push_str(&identity.fence_token());
+                material.push(':');
+            }
+            None => material.push_str("artifact_family:none:"),
+        }
+        match &self.next_versioned_artifact_cursor {
+            Some(next) => {
+                material.push_str("artifact_next:");
+                material.push_str(&next.fence_token());
+                material.push(':');
+            }
+            None => material.push_str("artifact_next:none:"),
+        }
         for page in &self.pages {
             material.push_str(&page.page_digest);
             material.push(':');
-            match &page.family_continuation {
-                Some(continuation) => {
-                    material.push_str(&continuation.cursor.fence_token());
-                    if let Some(next) = &continuation.next {
-                        material.push('|');
-                        material.push_str(&next.fence_token());
-                    }
-                    material.push(':');
-                }
-                None => material.push_str("no-family:"),
-            }
+            push_family_continuation_material(
+                &mut material,
+                "recovery-family",
+                page.family_continuation.as_ref(),
+            );
+            push_family_continuation_material(
+                &mut material,
+                "artifact-family",
+                page.versioned_artifact_continuation.as_ref(),
+            );
             for entry in &page.entries {
                 material.push_str(&entry.payload_digest);
                 material.push(':');
@@ -1011,48 +1180,43 @@ impl OrsBackupSnapshot {
     }
     /// Validate digest shapes, page continuity and finality, denominator, and completeness.
     ///
-    /// A `Complete` snapshot must carry a frozen process-stream recovery family
-    /// identity and no outstanding continuation. That is the compatibility rule
-    /// for snapshots produced before the family cursor existed: they declare no
-    /// family denominator, so they stay `Partial` and can never be read as a
-    /// proven complete family.
+    /// A `Complete` snapshot must carry a frozen family identity for BOTH paged
+    /// families and no outstanding continuation for either. That is the
+    /// compatibility rule for snapshots produced before a family cursor existed:
+    /// they declare no family denominator, so they stay `Partial` and can never be
+    /// read as a proven complete family. It is also why #1971, which adds a second
+    /// cursor-paged family, is a wire-shape change: a snapshot that declared only
+    /// the process-stream recovery denominator is no longer able to certify that
+    /// the versioned-artifact family was fully retained, and the requirement stays
+    /// exact rather than being relaxed for the new slot.
     pub fn validate(&self) -> Result<(), OrsError> {
         require_digest(&self.fence.fence_digest, "backup_fence_digest")?;
         require_digest(&self.denominator_digest, "backup_denominator_digest")?;
-        if let Some(identity) = &self.process_stream_recovery_family {
-            if !identity.family.uses_family_cursor() {
-                return Err(OrsError::InvalidField {
-                    field: "backup_process_stream_recovery_family",
-                    reason: "family is not paged through a typed family cursor",
-                });
-            }
-            require_digest(&identity.family_root_digest, "backup_family_root_digest")?;
-        }
-        if let Some(next) = &self.next_process_stream_recovery_cursor {
-            next.validate()?;
-        }
+        let last_page = self.pages.last();
+        let last_recovery = last_page.and_then(|page| page.family_continuation.as_ref());
+        let last_artifact =
+            last_page.and_then(|page| page.versioned_artifact_continuation.as_ref());
         // The declared family state must be the state the last page actually
-        // reported, so a snapshot cannot claim an outstanding continuation the
-        // pages do not carry, nor a finished family whose last page still owes
-        // one.
-        let last_continuation = self
-            .pages
-            .last()
-            .and_then(|page| page.family_continuation.as_ref());
-        if self.process_stream_recovery_family.is_some() && last_continuation.is_none() {
-            return Err(OrsError::InvalidField {
-                field: "backup_process_stream_recovery_family",
-                reason: "a declared family denominator requires a family continuation on the last page",
-            });
-        }
-        if let Some(continuation) = last_continuation
-            && continuation.next != self.next_process_stream_recovery_cursor
-        {
-            return Err(OrsError::InvalidField {
-                field: "backup_next_process_stream_recovery_cursor",
-                reason: "declared family continuation does not match the last page",
-            });
-        }
+        // reported, for EACH family independently, so a snapshot cannot claim an
+        // outstanding continuation the pages do not carry, nor a finished family
+        // whose last page still owes one, nor swap one family's declared state
+        // onto the other family's page.
+        check_declared_family(
+            RowFamilyKind::ProcessStreamRecovery,
+            self.process_stream_recovery_family.as_ref(),
+            self.next_process_stream_recovery_cursor.as_ref(),
+            last_recovery,
+            "backup_process_stream_recovery_family",
+            "backup_next_process_stream_recovery_cursor",
+        )?;
+        check_declared_family(
+            RowFamilyKind::VersionedArtifacts,
+            self.versioned_artifact_family.as_ref(),
+            self.next_versioned_artifact_cursor.as_ref(),
+            last_artifact,
+            "backup_versioned_artifact_family",
+            "backup_next_versioned_artifact_cursor",
+        )?;
         if matches!(self.completeness, BackupCompleteness::Complete) {
             if self.process_stream_recovery_family.is_none() {
                 return Err(OrsError::InvalidField {
@@ -1060,7 +1224,15 @@ impl OrsBackupSnapshot {
                     reason: "a complete snapshot must carry a process-stream recovery family denominator",
                 });
             }
-            if self.next_process_stream_recovery_cursor.is_some() {
+            if self.versioned_artifact_family.is_none() {
+                return Err(OrsError::InvalidField {
+                    field: "backup_completeness",
+                    reason: "a complete snapshot must carry a versioned-artifact family denominator",
+                });
+            }
+            if self.next_process_stream_recovery_cursor.is_some()
+                || self.next_versioned_artifact_cursor.is_some()
+            {
                 return Err(OrsError::InvalidField {
                     field: "backup_completeness",
                     reason: "a complete snapshot must have no outstanding family continuation",
@@ -1101,6 +1273,58 @@ impl OrsBackupSnapshot {
         check_completeness(&self.completeness, counted, &self.pages)
     }
 }
+/// Checks one paged family's declared snapshot state against the last page's
+/// continuation for that SAME family (issue #2884, extended to the second
+/// cursor-paged family by #1971).
+///
+/// The four arguments are the family's own three declared fields and the
+/// continuation the last page reported FOR THAT FAMILY, so a snapshot cannot
+/// present one family's page as the other's denominator. `identity_field` and
+/// `next_field` are the caller's own field names, which keeps the refusal
+/// pointing at the slot that is actually wrong.
+fn check_declared_family(
+    family: RowFamilyKind,
+    identity: Option<&OrsFamilySnapshotIdentity>,
+    declared_next: Option<&OrsFamilyCursor>,
+    last: Option<&OrsFamilyContinuation>,
+    identity_field: &'static str,
+    next_field: &'static str,
+) -> Result<(), OrsError> {
+    if let Some(identity) = identity {
+        if identity.family != family {
+            return Err(OrsError::InvalidField {
+                field: identity_field,
+                reason: "declared family denominator names a different row family",
+            });
+        }
+        if !identity.family.uses_family_cursor() {
+            return Err(OrsError::InvalidField {
+                field: identity_field,
+                reason: "family is not paged through a typed family cursor",
+            });
+        }
+        require_digest(&identity.family_root_digest, "backup_family_root_digest")?;
+    }
+    if let Some(next) = declared_next {
+        next.validate()?;
+    }
+    if identity.is_some() && last.is_none() {
+        return Err(OrsError::InvalidField {
+            field: identity_field,
+            reason: "a declared family denominator requires a family continuation on the last page",
+        });
+    }
+    if let Some(continuation) = last
+        && continuation.next.as_ref() != declared_next
+    {
+        return Err(OrsError::InvalidField {
+            field: next_field,
+            reason: "declared family continuation does not match the last page",
+        });
+    }
+    Ok(())
+}
+
 /// Validate one page's index continuity, finality, self-binding and entry bound.
 ///
 /// The self-binding half is [`OrsBackupPage::validate_binding`] and is NOT
@@ -1131,12 +1355,19 @@ fn check_page_shape(
         });
     }
     page.validate_binding()?;
-    if page.is_last
-        && page
-            .family_continuation
+    // A final page must leave NO paged family open. Both continuations are
+    // checked because `is_last` is the conjunction over both of them, so a
+    // producer that computed finality from only one family would be caught here
+    // (issue #1971).
+    let family_open = page
+        .family_continuation
+        .as_ref()
+        .is_some_and(OrsFamilyContinuation::family_open)
+        || page
+            .versioned_artifact_continuation
             .as_ref()
-            .is_some_and(OrsFamilyContinuation::family_open)
-    {
+            .is_some_and(OrsFamilyContinuation::family_open);
+    if page.is_last && family_open {
         return Err(OrsError::InvalidField {
             field: "backup_page_is_last",
             reason: "a final page must not leave an open family continuation",
