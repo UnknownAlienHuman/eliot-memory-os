@@ -3984,10 +3984,27 @@ pub struct CandidateEvidence {
 /// — and the kind is kept because a candidate handle is caller-shaped, not fixed.
 /// A source identity is judged on the `SourceRecord.handle` the observation
 /// projects into
-/// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`], and a
-/// line range is judged by the manifest's admitted anchor precision in
-/// [`EvidenceSetPrecision::evaluate`]; neither can be a *citation* on this path,
-/// so neither is a candidate diagnostic here.
+/// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`].
+///
+/// # What a line range is, and is not
+///
+/// `LineSpan` names a *reference the run observed*, not an anchor decision. How
+/// coarse an admitted anchor may be is the manifest's `allowed_anchor_precision`
+/// and belongs to [`EvidenceSetPrecision::evaluate`]; that check answers "may a
+/// citation anchor this finely?", while this kind answers "was a line range
+/// minted in prose?". They are separate obligations and neither substitutes for
+/// the other: a line range can be perfectly well formed and still be outside the
+/// manifest's admitted anchor precision, and it is refused here for the list
+/// reason rather than for the precision one.
+///
+/// Which candidates the run actually produces is the composition root's
+/// projection, not this boundary's: `retained_provider_material` in
+/// `bins/eliot-mod-research` mints one `provider-artifact:<sha256>` handle from
+/// the retained stdout digest and never decodes the body, so neither a URL nor a
+/// line range reaches this classification from the current live path. Both arms
+/// are reachable for a candidate whose handle carries that shape, which is what a
+/// caller-influenced handle means; enumerating the references inside provider
+/// output is a separate and still-open step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnadmittedReferenceKind {
     /// An absolute locator URL, named for what the spelling presents itself as.
@@ -4016,6 +4033,21 @@ pub enum UnadmittedReferenceKind {
     /// `ArtifactHandle`, because a namespaced opaque handle is a handle and the
     /// grammar is what keeps it distinct from a URI scheme.
     AmbiguousReference,
+    /// A line anchor or line range: a handle the shared classifier reads as an
+    /// opaque handle, followed by `:<line>` or an inclusive `:<first>-<last>`.
+    ///
+    /// I21.7 lists a line range beside citation, URL, source ID, artifact handle
+    /// and support relation as a reference a model cannot mint through prose, so
+    /// it is a reference identity here and gets its own kind rather than being
+    /// reported as whatever the classifier made of the handle part. It is not an
+    /// *anchor* decision either: how coarse an admitted anchor may be belongs to
+    /// the manifest's admitted anchor precision in
+    /// [`EvidenceSetPrecision::evaluate`], and this kind only says that the
+    /// observed spelling is a line range.
+    ///
+    /// Recognition is fail-closed and refuses every spelling it cannot decide:
+    /// see [`line_span_shape`], which is the single reader of the grammar.
+    LineSpan,
     /// A handle the manifest lists but marks stale or revoked.
     StaleOrRevoked,
 }
@@ -4029,6 +4061,7 @@ impl UnadmittedReferenceKind {
             Self::ArtifactHandle => "ARTIFACT_HANDLE",
             Self::InternalOwnedReference => "INTERNAL_OWNED_REFERENCE",
             Self::AmbiguousReference => "AMBIGUOUS_REFERENCE",
+            Self::LineSpan => "LINE_SPAN",
             Self::StaleOrRevoked => "STALE_OR_REVOKED",
         }
     }
@@ -5089,6 +5122,16 @@ fn assess_sources(
 /// composition root derives it from the retained provider artifact digest, so it
 /// is caller-influenced text and is checked against the manifest like any other.
 ///
+/// The kind is a function of that one reference text, not of the shape the
+/// composition root happens to mint today. A candidate whose handle is a
+/// syntactically valid absolute URL reaches [`UnadmittedReferenceKind::LocatorUrl`]
+/// and one that carries a line anchor or range reaches
+/// [`UnadmittedReferenceKind::LineSpan`], because both are reference identities
+/// I21.7 names and neither is an artifact handle. Which candidates the run
+/// actually produces is the composition root's projection and is not decided
+/// here; what is decided here is that a reference of either shape is refused and
+/// retained rather than typed as a handle.
+///
 /// #2894: the kind is read from the one shared classifier,
 /// [`eliot_research_exchange_api::classify_locator`], which is the same
 /// classification the delivered-bundle firewall applies to
@@ -5110,6 +5153,14 @@ fn assess_sources(
 /// the diagnostic whatever the spelling is. A reason here names a list this
 /// function actually reads, and says plainly when the remaining problem is the
 /// text rather than the list.
+///
+/// The line-range arm runs before the shared locator classification, because a
+/// line range is a position inside a reference rather than a reference identity
+/// of its own kind: `README.md:12-40` classifies as an external URI under
+/// `classify_locator` (the `README.md` prefix is a valid RFC 3986 scheme token),
+/// and reporting that as a URL would name the wrong acquisition path for a
+/// spelling that is a line range. [`line_span_shape`] is the single reader of
+/// that grammar and it declines every spelling it cannot decide.
 fn reference_firewall(
     observation: &InquiryObservation,
 ) -> Result<Vec<UnadmittedReference>, InquiryError> {
@@ -5136,18 +5187,21 @@ fn reference_firewall(
                     .to_owned(),
             )
         } else if !manifest.allows(&candidate.handle) {
-            // Every reason below names the one thing that can change this
-            // verdict, and the arm it names is one this path actually reads.
-            // This path tests `manifest.allows` and nothing else:
-            // `AllowedReferenceManifest::allows` reads `source_handles`,
-            // `evidence_handles` and `artifact_handles`, so the handle allowlist
-            // is the only lever here. `url_handles` belongs to the separate
-            // `admits_url` predicate, which is the delivered-locator path in
-            // `eliot_research_exchange_api` and is never called from this
-            // function — so a reason that told a reader to add the value to
-            // `url_handles` would name a list that cannot admit it and the
-            // diagnostic would recur forever.
-            match classify_locator(&candidate.handle) {
+            if let Some(shape) = line_span_shape(&candidate.handle) {
+                (UnadmittedReferenceKind::LineSpan, line_span_reason(shape))
+            } else {
+                // Every reason below names the one thing that can change this
+                // verdict, and the arm it names is one this path actually reads.
+                // This path tests `manifest.allows` and nothing else:
+                // `AllowedReferenceManifest::allows` reads `source_handles`,
+                // `evidence_handles` and `artifact_handles`, so the handle allowlist
+                // is the only lever here. `url_handles` belongs to the separate
+                // `admits_url` predicate, which is the delivered-locator path in
+                // `eliot_research_exchange_api` and is never called from this
+                // function — so a reason that told a reader to add the value to
+                // `url_handles` would name a list that cannot admit it and the
+                // diagnostic would recur forever.
+                match classify_locator(&candidate.handle) {
                 // The spelling presents as an absolute locator, and the lever is
                 // still the handle allowlist: a candidate handle is a reference
                 // identity, not a `SourceSnapshot::locator`, so it is admitted by
@@ -5195,6 +5249,7 @@ fn reference_firewall(
                     ),
                 ),
             }
+            }
         } else {
             continue;
         };
@@ -5208,6 +5263,90 @@ fn reference_firewall(
         )?);
     }
     Ok(diagnostics)
+}
+
+/// The closed shape of one recognised line-range reference spelling.
+///
+/// The shape is carried rather than the text: this module's residue convention
+/// is to name the observed fact and never echo the supplied reference, and the
+/// two shapes are the only thing a consumer acts on differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineSpanShape {
+    /// `<handle>:<line>` — one line anchor.
+    Single,
+    /// `<handle>:<first>-<last>` — an inclusive line range, `first <= last`.
+    Range,
+}
+
+/// Recognises a line anchor or line range in one observed reference, or declines.
+///
+/// This is the single reader of that grammar, and it declines every spelling it
+/// cannot decide rather than guessing. Three conditions, each stated because
+/// dropping it would re-type something that is not a line range:
+///
+/// 1. The text is `<precedent>:<anchor>` at its **last** colon, and the
+///    precedent is non-empty. The anchor is decimal digits, optionally a
+///    `-`-separated inclusive pair with `first <= last`. A range spelled the
+///    other way round is not a range, and no upper bound is assumed.
+/// 2. The **precedent** classifies as [`LocatorClass::OpaqueHandle`], so a
+///    colon the shared classifier already reads as a scheme separator is never
+///    re-read as a line separator. This is what keeps `https://host:8080` a
+///    URL rather than a line anchor: its precedent is an external URI.
+/// 3. The **whole** text does not classify as [`LocatorClass::InternalUri`], so
+///    a scheme a named owner mints keeps its opaque part. `provider-artifact:12`
+///    is an internally owned handle, not the twelfth line of anything, and this
+///    is the condition that says so.
+///
+/// Condition 2 alone would already re-type `README.md:12-40` away from the
+/// external URI `classify_locator` calls it, which is the point: the prefix
+/// there is a valid RFC 3986 scheme token and nothing more, and a position
+/// inside a reference is a line range rather than a URL. The live
+/// `provider-artifact:<sha256>` candidate is unaffected by all three.
+fn line_span_shape(text: &str) -> Option<LineSpanShape> {
+    let colon = text.rfind(':')?;
+    let (precedent, anchor) = text.split_at(colon);
+    let anchor = anchor.strip_prefix(':')?;
+    if precedent.is_empty() || !matches!(classify_locator(precedent), LocatorClass::OpaqueHandle) {
+        return None;
+    }
+    if matches!(classify_locator(text), LocatorClass::InternalUri { .. }) {
+        return None;
+    }
+    match anchor.split_once('-') {
+        Some((first, last)) => match (first.parse::<u64>(), last.parse::<u64>()) {
+            (Ok(first), Ok(last)) if first <= last => Some(LineSpanShape::Range),
+            _ => None,
+        },
+        None => decimal_exact(anchor).then_some(LineSpanShape::Single),
+    }
+}
+
+/// Whether `value` is one or more ASCII decimal digits and nothing else.
+///
+/// A hand-rolled digit test rather than a numeric parse, because the single-line
+/// shape never needs a value: only the shape is load-bearing, and parsing it
+/// would imply a base and a bound the grammar does not state.
+fn decimal_exact(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The reason a line-range reference is retained unadmitted.
+///
+/// As every reason on this path does, it names the list that can change the
+/// verdict — here the same handle allowlist every other arm names, because
+/// `line_span_shape` chose the *kind* and takes no part in the admission
+/// decision — and it states the second fact a reader needs, that a line range
+/// is not a citable identity on this path at all.
+fn line_span_reason(shape: LineSpanShape) -> String {
+    let observed = match shape {
+        LineSpanShape::Single => "a single line anchor over a handle",
+        LineSpanShape::Range => "an inclusive line range over a handle",
+    };
+    format!(
+        "this reference carries {observed}; a line range is not a citable identity on this path, \
+         and the only lever here is the manifest's source, evidence and artifact handle allowlist, \
+         which admits the exact text as a handle or not at all"
+    )
 }
 
 /// Opens the exact coverage accounting over the admitted reference members.

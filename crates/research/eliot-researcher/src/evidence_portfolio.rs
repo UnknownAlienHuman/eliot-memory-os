@@ -4229,18 +4229,17 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             .supported
             .split('|')
             .any(|mechanism| mechanism.trim() == assertion.asserted.trim()),
-        // The line rung reads the same ladder `Coordinate` reads, through the
-        // same `coordinate_rank` owner, and differs only in the residue it
-        // produces. A second rank table for one rung would be the second,
+        // The line rung and the ladder-wide coordinate form are ONE comparison
+        // on purpose: they differ only in the residue they produce, and a
+        // separate rank table for the single rung would be the second,
         // differently shaped vocabulary the `Coordinate` doc comment exists to
-        // prevent.
-        PrecisionKind::Line => match (
+        // prevent. An unrecognised spelling is never treated as supported for
+        // either: an unknown rank fails closed.
+        PrecisionKind::Line | PrecisionKind::Coordinate => match (
             coordinate_rank(assertion.asserted.trim()),
             coordinate_rank(assertion.supported.trim()),
         ) {
             (Some(asserted_rank), Some(supported_rank)) => asserted_rank <= supported_rank,
-            // An unrecognised spelling is never treated as supported, exactly as
-            // for `Coordinate`: an unknown rank fails closed.
             _ => false,
         },
         // Declared-set membership, on the delimiter `Causal` already reads. The
@@ -4250,15 +4249,6 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             .supported
             .split('|')
             .any(|population| population.trim() == assertion.asserted.trim()),
-        PrecisionKind::Coordinate => match (
-            coordinate_rank(assertion.asserted.trim()),
-            coordinate_rank(assertion.supported.trim()),
-        ) {
-            // An unrecognised coordinate spelling is never treated as supported:
-            // an unknown rank fails closed rather than falling back to equality.
-            (Some(asserted_rank), Some(supported_rank)) => asserted_rank <= supported_rank,
-            _ => false,
-        },
     };
     if supported {
         Ok(())
