@@ -10,27 +10,70 @@
 //! strict draft decode and never reach the service.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_governor::FinishAttemptError;
-use eliot_protocol::FinishResultBody;
+use eliot_governor::{CompositionError, FinishAttemptError};
+use eliot_protocol::{AgentResponseDisposition, FinishResultBody};
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{DaemonComposition, DaemonKernelClient, daemon_kernel_client::FinishClaimedInvocation};
+use crate::{
+    DaemonComposition, DaemonKernelClient,
+    daemon_kernel_client::{
+        FinishClaimedInvocation, LEGACY_FINISH_PROOF_MEMBER, LEGACY_FINISH_PROOF_REJECTION,
+    },
+};
 
 /// Rejection content for one refused finish attempt. Every Governor or
 /// decode failure is projected as a typed rejected response body; a refusal
 /// must never terminate the daemon or escape as an untyped poll error.
+///
+/// `status`/`reason` are the historical bridge-visible fields and are kept
+/// verbatim; `disposition`/`reason_code` add the I7.20 agent-facing control
+/// pair so a refusal never escapes as untyped prose. The response envelope
+/// shape is unchanged.
 #[derive(Debug, Serialize)]
 struct FinishRejection {
     status: String,
     reason: String,
+    disposition: String,
+    reason_code: String,
 }
 
-fn rejection(reason: &str) -> FinishRejection {
+fn rejection(reason: &str, cause: (AgentResponseDisposition, &'static str)) -> FinishRejection {
     FinishRejection {
         status: "rejected".to_owned(),
         reason: reason.to_owned(),
+        disposition: cause.0.as_str().to_owned(),
+        reason_code: cause.1.to_owned(),
+    }
+}
+
+/// Projects one finish failure onto the I7.20 agent-facing control pair.
+///
+/// `reason` keeps the exact owner error verbatim, so unknown or future
+/// failures are preserved rather than silently becoming success; this pair
+/// adds the stable closed disposition plus the exact additive reason code.
+/// Every code used here is a verbatim member of the `AGENT_REASON_CODES`
+/// registry. A refused Finish decision means the decision context could not
+/// be completed; a refused composition stays recovery-typed; a failed Kernel
+/// transition or uncommitted mutation stays runtime-typed.
+fn finish_rejection_cause(error: &FinishAttemptError) -> (AgentResponseDisposition, &'static str) {
+    match error {
+        FinishAttemptError::Composition(CompositionError::NotReady) => (
+            AgentResponseDisposition::UnavailableOrCapacity,
+            "DEFERRED_CAPACITY",
+        ),
+        FinishAttemptError::Composition(_) => (
+            AgentResponseDisposition::RecoveryRequired,
+            "RECOVERY_REQUIRED",
+        ),
+        FinishAttemptError::Kernel(_) | FinishAttemptError::Store(_) => {
+            (AgentResponseDisposition::Failed, "RUNTIME_FAILED")
+        }
+        FinishAttemptError::Finish(_) | FinishAttemptError::Serialization(_) => (
+            AgentResponseDisposition::Failed,
+            "DECISION_CONTEXT_INCOMPLETE",
+        ),
     }
 }
 
@@ -90,14 +133,42 @@ fn finish_result_body(
     Ok(body)
 }
 
+fn rejected_finish_result_with_detail(
+    claimed: &FinishClaimedInvocation,
+    reason: &str,
+    cause: (AgentResponseDisposition, &'static str),
+) -> Result<FinishResultBody, String> {
+    let content = serde_json::to_value(rejection(reason, cause))
+        .map_err(|error| format!("finish rejection projection failed: {error}"))?;
+    let response = finish_response_json(claimed, "PLAN_GAP", &content, ProofCeiling::Observation)?;
+    finish_result_body(claimed, response)
+}
+
 fn rejected_finish_result(
     claimed: &FinishClaimedInvocation,
     error: &FinishAttemptError,
 ) -> Result<FinishResultBody, String> {
-    let content = serde_json::to_value(rejection(&error.to_string()))
-        .map_err(|error| format!("finish rejection projection failed: {error}"))?;
-    let response = finish_response_json(claimed, "PLAN_GAP", &content, ProofCeiling::Observation)?;
-    finish_result_body(claimed, response)
+    rejected_finish_result_with_detail(claimed, &error.to_string(), finish_rejection_cause(error))
+}
+
+/// Rejects one claimed candidate that carries a legacy caller-supplied proof.
+///
+/// I7.9 pins this exact code: the candidate is refused with
+/// `LEGACY_FINISH_INPUT_REJECTED` and never evaluated. The refusal is
+/// submitted as the typed result body for the admitted attempt — the same
+/// submitted-rejection shape the lane already uses — so the poisoned claim is
+/// consumed instead of stalling the queue as a poll error.
+fn rejected_legacy_finish_proof(
+    claimed: &FinishClaimedInvocation,
+) -> Result<FinishResultBody, String> {
+    rejected_finish_result_with_detail(
+        claimed,
+        LEGACY_FINISH_PROOF_REJECTION,
+        (
+            AgentResponseDisposition::InvalidRequest,
+            "LEGACY_FINISH_INPUT_REJECTED",
+        ),
+    )
 }
 
 /// Serves one exact Kernel-claimed `eliot.finish` candidate.
@@ -122,6 +193,13 @@ pub async fn serve_finish_claim(
         .get("arguments")
         .cloned()
         .ok_or_else(|| "claimed finish pair omits the admitted draft".to_owned())?;
+    // The claim parser already rejects the exact legacy proof member with its
+    // pinned code; this re-check keeps the same typed refusal for any direct
+    // caller of the serve path before strict decoding could only report a
+    // generic unknown-field failure.
+    if arguments.get(LEGACY_FINISH_PROOF_MEMBER).is_some() {
+        return rejected_legacy_finish_proof(&claimed);
+    }
     let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
         .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
 

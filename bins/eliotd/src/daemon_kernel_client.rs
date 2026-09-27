@@ -481,6 +481,24 @@ pub fn parse_task_controller_submit_outcome(
     Err("Kernel task_controller_result answer is not accepted, expired, or stale".to_owned())
 }
 
+/// Exact legacy proof member spelling rejected from `eliot.finish` arguments
+/// (issue #1741, I7.9/I7.20).
+///
+/// This mirrors the `completion_proof` spelling pinned by
+/// `eliot_mcp::contract::LEGACY_FINISH_PROOF_MEMBER`: the strict
+/// `FinishAttemptDraft` contract has no such member. Only this exact spelling
+/// is recognized here — no aliases are invented. The spelling is cited, not
+/// imported, because the daemon has no dependency on the MCP surface crate.
+pub(crate) const LEGACY_FINISH_PROOF_MEMBER: &str = "completion_proof";
+
+/// Exact typed diagnostic for a caller-supplied finish proof member.
+///
+/// The text carries the pinned `LEGACY_FINISH_INPUT_REJECTED` reason code
+/// first so the typed reason survives even the string error channel, and it
+/// echoes only the static member spelling — never caller bytes. It mirrors
+/// the ingress message shape so every lane reports one identical rejection.
+pub(crate) const LEGACY_FINISH_PROOF_REJECTION: &str = "LEGACY_FINISH_INPUT_REJECTED: caller-supplied finish proof member `completion_proof` is not accepted; submit only the strict FinishAttemptDraft fields";
+
 /// Typed outcome of one `finish_result` submit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishSubmitOutcome {
@@ -638,6 +656,14 @@ pub fn parse_finish_claimed_pair(
         .get("arguments")
         .cloned()
         .ok_or_else(|| "Kernel finish pair omits the admitted draft".to_owned())?;
+    // A legacy caller-supplied proof is rejected with its pinned reason code
+    // before strict typed decoding, which would otherwise report only a
+    // generic unknown-field failure. This mirrors the protected-ingress order
+    // (`decode_protected_request_bytes`); only the exact legacy spelling is
+    // recognized and no caller bytes are echoed.
+    if arguments.get(LEGACY_FINISH_PROOF_MEMBER).is_some() {
+        return Err(LEGACY_FINISH_PROOF_REJECTION.to_owned());
+    }
     let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
         .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
     draft
