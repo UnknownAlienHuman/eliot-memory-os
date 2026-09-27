@@ -12,6 +12,7 @@ mod dogfood;
 mod front_door_cutover;
 mod host_runtime;
 mod mcp_stdio;
+mod migration_disposition;
 mod named_pipe_ipc;
 mod provider_budget_runtime;
 mod runtime_bootstrap;
@@ -24,6 +25,7 @@ mod windows_service;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use disposition::run_facade_disposition_guards;
+use migration_disposition::migration_ledger_guard;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -2036,6 +2038,8 @@ fn main() -> Result<()> {
             init_tracing();
             run_facade_disposition_guards()
                 .map_err(|reason| anyhow::anyhow!("facade disposition guard failed: {reason}"))?;
+            migration_ledger_guard()
+                .map_err(|reason| anyhow::anyhow!("migration ledger guard failed: {reason}"))?;
             let cli = Cli::parse();
             let (config, implicit_instance) = match cli.config {
                 Some(config) => (config, None),
