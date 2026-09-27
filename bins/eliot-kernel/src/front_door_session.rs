@@ -64,6 +64,21 @@ fn transport_terminal_code(error: &eliot_ipc::TransportError) -> &'static str {
     }
 }
 
+#[derive(Default)]
+pub(super) struct DaemonSessionBindingAuditEvidence {
+    pub(super) refusal_cause: Option<&'static str>,
+    pub(super) owner_launch: Option<EliotdLaunchDescriptor>,
+    pub(super) owner_process_receipt: Option<ProcessStartReceipt>,
+}
+
+impl DaemonSessionBindingAuditEvidence {
+    fn refuse(&mut self, client: &eliot_protocol::ClientHello, cause: &'static str) {
+        if client.module_bridge_identity == ACTIVE_DAEMON_CALLER && self.refusal_cause.is_none() {
+            self.refusal_cause = Some(cause);
+        }
+    }
+}
+
 /// Stable module identity of the one-shot Doctor repair worker (T6-D2 P-07).
 ///
 /// The Doctor never self-asserts authority through this string:
@@ -611,12 +626,14 @@ impl KernelComposition {
         connection_id: impl Into<String>,
         peer: PeerIdentity,
         client: &eliot_protocol::ClientHello,
+        audit_evidence: &mut DaemonSessionBindingAuditEvidence,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
-        let generation_poison = self
-            .generation_poison
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
+        let Ok(generation_poison) = self.generation_poison.lock() else {
+            audit_evidence.refuse(client, "kernel.generation_poison_state_unavailable");
+            return Err(TransportError::SessionFenced);
+        };
         if generation_poison.is_some() {
+            audit_evidence.refuse(client, "kernel.generation_poisoned");
             return Err(TransportError::SessionFenced);
         }
         #[cfg(windows)]
@@ -631,7 +648,7 @@ impl KernelComposition {
         }
         #[cfg(windows)]
         if client.module_bridge_identity == ACTIVE_DAEMON_CALLER {
-            self.validate_eliotd_peer(&peer, client)?;
+            self.validate_eliotd_peer(&peer, client, audit_evidence)?;
         }
         if client.module_bridge_identity == DOCTOR_MODULE_ID {
             // The one-shot Doctor repair worker binds at session scope over
@@ -683,11 +700,15 @@ impl KernelComposition {
             // they establish the evidence needed to publish step 10.
             return Err(TransportError::SessionFenced);
         }
-        let policy = self
-            .front_door_policy
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Session::establish_with_server(connection_id, peer, client, &policy)
+        let Ok(policy) = self.front_door_policy.lock() else {
+            audit_evidence.refuse(client, "kernel.handshake_policy_unavailable");
+            return Err(TransportError::SessionFenced);
+        };
+        let result = Session::establish_with_server(connection_id, peer, client, &policy);
+        if result.is_err() {
+            audit_evidence.refuse(client, "handshake.session_establishment_rejected");
+        }
+        result
     }
 
     /// Binds an authenticated local peer to the selected principal/session.
@@ -703,7 +724,11 @@ impl KernelComposition {
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
         observe_front_door_session("kernel.front_door_handshake_decode", "attempt");
-        let result = self.bind_session_inner(connection_id, peer, client);
+        let connection_id = connection_id.into();
+        let peer_identity_well_formed = peer.validate().is_ok();
+        let mut audit_evidence = DaemonSessionBindingAuditEvidence::default();
+        let result =
+            self.bind_session_inner(connection_id.clone(), peer, client, &mut audit_evidence);
         match &result {
             Ok(handshake) => {
                 observe_front_door_session("kernel.front_door_handshake_accept", "success");
@@ -713,6 +738,16 @@ impl KernelComposition {
             Err(error) => {
                 observe_front_door_session("kernel.front_door_handshake_reject", "fenced");
                 super::kernel_diagnostics::observe_terminal_error(transport_terminal_code(error));
+                if client.module_bridge_identity == ACTIVE_DAEMON_CALLER {
+                    self.audit_observe(AuditEventDraft::session_rejected(
+                        &connection_id,
+                        peer_identity_well_formed,
+                        transport_terminal_code(error),
+                        audit_evidence.refusal_cause,
+                        audit_evidence.owner_launch.as_ref(),
+                        audit_evidence.owner_process_receipt.as_ref(),
+                    ));
+                }
             }
         }
         result
@@ -723,64 +758,169 @@ impl KernelComposition {
         &self,
         peer: &PeerIdentity,
         client: &eliot_protocol::ClientHello,
+        audit_evidence: &mut DaemonSessionBindingAuditEvidence,
     ) -> Result<(), TransportError> {
         observe_front_door_session("kernel.front_door_eliotd_peer_validate", "attempt");
-        let launch = self
-            .active_daemon_launch()
-            .map_err(|_| TransportError::SessionFenced)?
-            .ok_or(TransportError::SessionFenced)?;
-        let policy = self
-            .front_door_policy
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Self::validate_eliotd_client_binding(&launch, &policy, client)?;
-        drop(policy);
-        let peer_binding = peer
-            .process_binding()
-            .ok_or(TransportError::PeerIdentityUnavailable)?;
-        let receipt = {
-            let state = self
-                .daemon_runtime
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            Self::published_daemon_receipt(&state)?
+        let launch = match self.active_daemon_launch() {
+            Ok(Some(launch)) => launch,
+            Ok(None) => {
+                audit_evidence.refuse(client, "daemon.active_launch_missing");
+                return Err(TransportError::SessionFenced);
+            }
+            Err(_) => {
+                audit_evidence.refuse(client, "daemon.active_launch_unavailable");
+                return Err(TransportError::SessionFenced);
+            }
         };
-        receipt
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let physical = receipt.identity().physical();
-        // INTENDED EpochId shape (B→A→C): exact-tuple is_same_authority.
-        if receipt.accepted_generation().get() != launch.generation.value()
-            || !receipt
-                .binding()
-                .state_fence()
-                .authority_epoch()
-                .is_same_authority(&launch.authority_epoch)
-            || receipt.identity().executable_sha256() != launch.executable_sha256
-            || peer_binding.process_id() != physical.process_id()
-            || peer_binding.start_time_100ns() != physical.start_time_100ns()
-            || !peer_binding
-                .image_path()
-                .eq_ignore_ascii_case(physical.image_path())
-        {
+        audit_evidence.owner_launch = Some(launch.clone());
+        self.validate_eliotd_client_claim(&launch, client, audit_evidence)?;
+        let Some(peer_binding) = peer.process_binding() else {
+            audit_evidence.refuse(client, "transport.peer_process_binding_unavailable");
+            return Err(TransportError::PeerIdentityUnavailable);
+        };
+        let receipt = self.current_daemon_process_receipt(client, audit_evidence)?;
+        Self::validate_daemon_receipt_binding(
+            &launch,
+            &receipt,
+            peer_binding,
+            client,
+            audit_evidence,
+        )?;
+        Self::validate_daemon_job_membership(
+            &launch,
+            &receipt,
+            peer_binding,
+            client,
+            audit_evidence,
+        )
+    }
+
+    #[cfg(windows)]
+    fn validate_eliotd_client_claim(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        client: &eliot_protocol::ClientHello,
+        audit_evidence: &mut DaemonSessionBindingAuditEvidence,
+    ) -> Result<(), TransportError> {
+        let policy = self.front_door_policy.lock().map_err(|_| {
+            audit_evidence.refuse(client, "kernel.handshake_policy_unavailable");
+            TransportError::SessionFenced
+        })?;
+        if let Err(error) = Self::validate_eliotd_client_binding(launch, &policy, client) {
+            if let Some(cause) = Self::eliotd_client_binding_refusal_cause(launch, &policy, client)
+            {
+                audit_evidence.refuse(client, cause);
+            }
+            return Err(error);
+        }
+        drop(policy);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn current_daemon_process_receipt(
+        &self,
+        client: &eliot_protocol::ClientHello,
+        audit_evidence: &mut DaemonSessionBindingAuditEvidence,
+    ) -> Result<ProcessStartReceipt, TransportError> {
+        let Ok(state) = self.daemon_runtime.lock() else {
+            audit_evidence.refuse(client, "daemon.runtime_state_unavailable");
+            return Err(TransportError::SessionFenced);
+        };
+        let receipt = match Self::published_daemon_receipt(&state) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                audit_evidence.refuse(
+                    client,
+                    if matches!(&error, TransportError::PlanGap { .. }) {
+                        "daemon.process_start_receipt_pending"
+                    } else {
+                        "daemon.process_start_receipt_missing"
+                    },
+                );
+                return Err(error);
+            }
+        };
+        if receipt.validate().is_err() {
+            audit_evidence.refuse(client, "daemon.process_start_receipt_invalid");
             return Err(TransportError::SessionFenced);
         }
+        audit_evidence.owner_process_receipt = Some(receipt.clone());
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    fn validate_daemon_receipt_binding(
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+        peer_binding: &eliot_ipc::ProcessBinding,
+        client: &eliot_protocol::ClientHello,
+        audit_evidence: &mut DaemonSessionBindingAuditEvidence,
+    ) -> Result<(), TransportError> {
+        let physical = receipt.identity().physical();
+        if receipt.accepted_generation().get() != launch.generation.value() {
+            audit_evidence.refuse(client, "process.receipt_generation_mismatch");
+        } else if !receipt
+            .binding()
+            .state_fence()
+            .authority_epoch()
+            .is_same_authority(&launch.authority_epoch)
+        {
+            audit_evidence.refuse(client, "process.receipt_authority_epoch_mismatch");
+        } else if receipt.identity().executable_sha256() != launch.executable_sha256 {
+            audit_evidence.refuse(client, "process.receipt_executable_digest_mismatch");
+        } else if peer_binding.process_id() != physical.process_id() {
+            audit_evidence.refuse(client, "peer.process_id_mismatch");
+        } else if peer_binding.start_time_100ns() != physical.start_time_100ns() {
+            audit_evidence.refuse(client, "peer.process_start_time_mismatch");
+        } else if !peer_binding
+            .image_path()
+            .eq_ignore_ascii_case(physical.image_path())
+        {
+            audit_evidence.refuse(client, "peer.image_path_mismatch");
+        }
+        if audit_evidence.refusal_cause.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn validate_daemon_job_membership(
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+        peer_binding: &eliot_ipc::ProcessBinding,
+        client: &eliot_protocol::ClientHello,
+        audit_evidence: &mut DaemonSessionBindingAuditEvidence,
+    ) -> Result<(), TransportError> {
+        let physical = receipt.identity().physical();
         let observed = observe_named_pipe_peer_process_in_job(
             physical.executor_job_name(),
             physical.process_id(),
         )
-        .map_err(|_| TransportError::SessionFenced)?;
+        .map_err(|_| {
+            audit_evidence.refuse(client, "peer.job_process_observation_unavailable");
+            TransportError::SessionFenced
+        })?;
         let observed_binding = observed.process_binding();
-        if observed_binding.process_id() != peer_binding.process_id()
-            || observed_binding.start_time_100ns() != peer_binding.start_time_100ns()
-            || observed_binding.start_time_100ns() != physical.start_time_100ns()
-            || !observed_binding
-                .image_path()
-                .eq_ignore_ascii_case(physical.image_path())
-            || !observed_binding
-                .image_path()
-                .eq_ignore_ascii_case(launch.executable.as_str())
+        if observed_binding.process_id() != peer_binding.process_id() {
+            audit_evidence.refuse(client, "job_process.process_id_mismatch");
+        } else if observed_binding.start_time_100ns() != peer_binding.start_time_100ns() {
+            audit_evidence.refuse(client, "job_process.process_start_time_mismatch");
+        } else if observed_binding.start_time_100ns() != physical.start_time_100ns() {
+            audit_evidence.refuse(client, "job_process.receipt_start_time_mismatch");
+        } else if !observed_binding
+            .image_path()
+            .eq_ignore_ascii_case(physical.image_path())
         {
+            audit_evidence.refuse(client, "job_process.receipt_image_path_mismatch");
+        } else if !observed_binding
+            .image_path()
+            .eq_ignore_ascii_case(launch.executable.as_str())
+        {
+            audit_evidence.refuse(client, "job_process.launch_image_path_mismatch");
+        }
+        if audit_evidence.refusal_cause.is_some() {
             return Err(TransportError::SessionFenced);
         }
         Ok(())
@@ -792,15 +932,32 @@ impl KernelComposition {
         policy: &ServerHandshakePolicy,
         client: &eliot_protocol::ClientHello,
     ) -> Result<(), TransportError> {
-        if client.artifact_hash.as_str() != policy.module_generation.artifact_id.as_str()
-            || client.module_generation.artifact_id.as_str() != launch.executable_sha256.as_str()
-            || client.module_generation.generation != launch.generation
-            || client.authority_epoch != launch.authority_epoch
-            || client.launch_nonce.as_str() != launch.launch_nonce.as_str()
-        {
+        if Self::eliotd_client_binding_refusal_cause(launch, policy, client).is_some() {
             return Err(TransportError::SessionFenced);
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn eliotd_client_binding_refusal_cause(
+        launch: &EliotdLaunchDescriptor,
+        policy: &ServerHandshakePolicy,
+        client: &eliot_protocol::ClientHello,
+    ) -> Option<&'static str> {
+        if client.artifact_hash.as_str() != policy.module_generation.artifact_id.as_str() {
+            Some("client.artifact_hash_mismatch")
+        } else if client.module_generation.artifact_id.as_str() != launch.executable_sha256.as_str()
+        {
+            Some("client.module_generation_artifact_id_mismatch")
+        } else if client.module_generation.generation != launch.generation {
+            Some("client.module_generation_generation_mismatch")
+        } else if client.authority_epoch != launch.authority_epoch {
+            Some("client.authority_epoch_mismatch")
+        } else if client.launch_nonce.as_str() != launch.launch_nonce.as_str() {
+            Some("client.launch_nonce_mismatch")
+        } else {
+            None
+        }
     }
 
     #[cfg(windows)]
