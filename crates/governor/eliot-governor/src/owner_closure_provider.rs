@@ -36,8 +36,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId,
-    GrantRecoveryRecord, GrantStatus, QuarantineEvidenceStatus, RevocationClosureState,
-    RevocationClosureVerdict, RevocationHistoryEvidence, VerifiedQuarantineBinding,
+    GrantRecoveryRecord, GrantStatus, QuarantineEnforcementRef, QuarantineEvidenceStatus,
+    RevocationClosureState, RevocationClosureVerdict, RevocationHistoryEvidence,
+    VerifiedQuarantineBinding,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_influence::RevocationBounds;
@@ -85,6 +86,18 @@ pub struct OwnerClosureProvider {
     /// verdict revalidates each record against CURRENT graph, fence, and
     /// receipt state before it may satisfy an omission.
     quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+    /// Typed retained semantic quarantine decisions keyed by semantic
+    /// decision reference, supplied by the durable boundary only.
+    /// Admission proves presented evidence against these owner facts, so
+    /// a substituted reference, policy, or request digest fails even with
+    /// the authentic receipt map. Presented evidence is never retained
+    /// here: retaining a claim would certify it vacuously.
+    retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+    /// Exact retained mechanical enforcement results keyed by durable ORS
+    /// record reference, supplied by the durable boundary only. A claimed
+    /// ORS reference must resolve here before any receipt readback can
+    /// satisfy a fenced disposition.
+    retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
 }
 
 /// Governor-side admitted-hydration registry.
@@ -283,6 +296,9 @@ impl OwnerClosureProvider {
     /// quarantine evidence records read from the durable boundary. Evidence
     /// shape and map identity are proven here; CURRENT qualification
     /// happens per verdict and per explicit admission, never at restore.
+    /// No retained semantic decisions are supplied, so presented evidence
+    /// proves nothing yet: verdicts stay partial and the fencing gate
+    /// refuses until the retained readback facts arrive.
     pub fn restore_with_quarantine_evidence(
         snapshot: AuthorityOwnerSnapshot,
         history: Option<RevocationHistoryEvidence>,
@@ -290,8 +306,36 @@ impl OwnerClosureProvider {
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
         quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
     ) -> Result<Self, CompositionError> {
+        Self::restore_with_retained_quarantine_decisions(
+            snapshot,
+            history,
+            expected_fence,
+            canonical_receipts,
+            quarantine_evidence,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+
+    /// Restores the provider with canonical second-phase links, owner
+    /// quarantine evidence records, and the retained semantic decisions
+    /// plus exact enforcement results read from the durable boundary.
+    /// Evidence shape and map identity are proven here; CURRENT
+    /// qualification happens per verdict and per explicit admission,
+    /// never at restore.
+    pub fn restore_with_retained_quarantine_decisions(
+        snapshot: AuthorityOwnerSnapshot,
+        history: Option<RevocationHistoryEvidence>,
+        expected_fence: &StateFence,
+        canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+        quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+        retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+        retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
+    ) -> Result<Self, CompositionError> {
         validate_canonical_receipt_links(&canonical_receipts)?;
         validate_quarantine_evidence_links(&quarantine_evidence)?;
+        validate_retained_decision_links(&retained_quarantine_decisions)?;
+        validate_retained_enforcement_links(&retained_quarantine_enforcements)?;
         snapshot.validate()?;
         if snapshot.state_fence != *expected_fence {
             return Err(CompositionError::Recovery(
@@ -346,6 +390,8 @@ impl OwnerClosureProvider {
             registry: AdmittedHydrations::default(),
             canonical_receipts,
             quarantine_evidence,
+            retained_quarantine_decisions,
+            retained_quarantine_enforcements,
         };
         if let Some(hydrations) = hydrations.as_ref() {
             let durable_bytes = canonical_json_bytes(hydrations).map_err(recovery)?;
@@ -480,12 +526,14 @@ impl OwnerClosureProvider {
     /// Validates one quarantine evidence record at the semantic owner
     /// boundary and returns its CURRENT verified binding.
     ///
-    /// This proves the exact relation and grant commitments, both roots and
+    /// This proves the presented content against the retained semantic
+    /// decision, the exact relation and grant commitments, both roots and
     /// graph revision, the current fence/epoch/policy relation, the exact
-    /// semantic decision operation and replay identity, the applicable
-    /// mechanical receipt readback, and non-revoked status — all against
-    /// CURRENT provider state. Equality among fields from one supplied
-    /// snapshot is not owner readback.
+    /// semantic decision operation and replay identity, the resolved
+    /// exact enforcement result with its applicable mechanical receipt
+    /// readback, and non-revoked status — all against CURRENT provider
+    /// state. Equality among fields from one supplied snapshot is not
+    /// owner readback.
     ///
     /// # Errors
     ///
@@ -500,6 +548,8 @@ impl OwnerClosureProvider {
             &self.owner.grants,
             &self.state_fence,
             &self.canonical_receipts,
+            &self.retained_quarantine_decisions,
+            &self.retained_quarantine_enforcements,
         )
         .map_err(|error| CompositionError::Owner(error.to_string()))
     }
@@ -896,7 +946,9 @@ impl OwnerClosureProvider {
     /// Serves the complete restore bundle the Kernel-side mirror binds at
     /// the provider revision: durable snapshot, CURRENT history, admitted
     /// members, roots, introductions, preserved survivors, canonical
-    /// receipts, and the typed quarantine evidence map.
+    /// receipts, the typed quarantine evidence map, and the retained
+    /// semantic decisions plus exact enforcement results the mirror
+    /// revalidates against.
     ///
     /// A fully closed graph may legitimately have no current grant hydrations;
     /// its graph roots and durable history still reach the Kernel so revoked
@@ -927,6 +979,8 @@ impl OwnerClosureProvider {
             preserved,
             canonical_receipts: self.canonical_receipts.clone(),
             quarantine_evidence: self.quarantine_evidence.clone(),
+            retained_quarantine_decisions: self.retained_quarantine_decisions.clone(),
+            retained_quarantine_enforcements: self.retained_quarantine_enforcements.clone(),
         })
     }
 
@@ -1678,6 +1732,65 @@ fn validate_quarantine_evidence_links(
         {
             return Err(CompositionError::Recovery(
                 "quarantine evidence operation identity is bound to more than one relation"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates owner-retained semantic quarantine decisions before the
+/// restore becomes a trust anchor: map identity against the decision
+/// reference, closed shape, and operation identity uniqueness. CURRENT
+/// qualification is proven per use, never here.
+fn validate_retained_decision_links(
+    links: &BTreeMap<String, CrossRootQuarantineEvidence>,
+) -> Result<(), CompositionError> {
+    let mut operation_ids = BTreeSet::new();
+    let mut idempotency_keys = BTreeSet::new();
+    for (decision_ref, retained) in links {
+        if decision_ref != &retained.semantic_decision_ref {
+            return Err(CompositionError::Recovery(
+                "retained quarantine decision map key disagrees with the decision reference"
+                    .to_owned(),
+            ));
+        }
+        retained
+            .validate_shape()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if !operation_ids.insert(retained.operation_id.clone())
+            || !idempotency_keys.insert(retained.idempotency_key.clone())
+        {
+            return Err(CompositionError::Recovery(
+                "retained quarantine decision operation identity is bound to more than one decision"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates owner-retained exact enforcement results before the restore
+/// becomes a trust anchor: map identity against the ORS record
+/// reference, closed shape, and enforcement operation uniqueness.
+/// CURRENT qualification is proven per use, never here.
+fn validate_retained_enforcement_links(
+    links: &BTreeMap<String, QuarantineEnforcementRef>,
+) -> Result<(), CompositionError> {
+    let mut operation_ids = BTreeSet::new();
+    for (ors_record_ref, retained) in links {
+        if ors_record_ref != &retained.ors_record_ref {
+            return Err(CompositionError::Recovery(
+                "retained quarantine enforcement map key disagrees with the ORS record reference"
+                    .to_owned(),
+            ));
+        }
+        retained
+            .validate_shape()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if !operation_ids.insert(retained.operation_id.clone()) {
+            return Err(CompositionError::Recovery(
+                "retained quarantine enforcement operation identity is bound to more than one ORS record"
                     .to_owned(),
             ));
         }
