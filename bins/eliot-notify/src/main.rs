@@ -212,7 +212,7 @@ fn main() {
         };
         let response = match NotificationComposition::from_fallback(root) {
             Ok(mut composition) => dispatch_fallback(&mut composition, &envelope, &request),
-            Err(error) => composition_error(error.to_string()),
+            Err(error) => fallback_startup_degraded(error.to_string()),
         };
         let provider_error = is_provider_rejection(&response);
         if !write_response(&response) {
@@ -567,6 +567,26 @@ fn composition_error(detail: String) -> Response {
     Response::Error {
         code: "NOTIFICATION_PROVIDER_REJECTED",
         detail,
+    }
+}
+
+/// Degradation writer for a Watchdog-fallback startup failure.
+///
+/// `from_fallback` can fail before any delivery runs (unreadable installer
+/// material, unloadable ledger, unconstructible adapter). I11.6:9-11 and
+/// I11.6:19 require control-loss evidence to survive adapter loss, so the
+/// failure is persisted to the Event Log / spool contour before answering.
+/// The condition is a fixed code, never caller text, and the wire code and
+/// exit semantics are unchanged: the caller still sees a provider rejection.
+fn fallback_startup_degraded(detail: String) -> Response {
+    let persisted =
+        eliot_notify::no_session_persist::record_no_session("fallback:adapter-unavailable");
+    Response::Error {
+        code: "NOTIFICATION_PROVIDER_REJECTED",
+        detail: format!(
+            "{detail}; degradation persisted event_logged={} spool_persisted={} reason={}",
+            persisted.event_logged, persisted.spool_persisted, persisted.reason_code
+        ),
     }
 }
 
