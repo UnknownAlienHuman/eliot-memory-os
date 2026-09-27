@@ -1728,12 +1728,7 @@ impl GrantGraph {
                 eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
             ));
         }
-        Ok(AdmittedRevocationClosure::admit(
-            closure,
-            origin,
-            denominator,
-            bounds,
-        ))
+        AdmittedRevocationClosure::admit(closure, origin, denominator, bounds)
     }
 
     /// The first denominator member the committed closure leaves

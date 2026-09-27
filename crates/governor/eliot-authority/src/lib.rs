@@ -53,8 +53,8 @@ pub use quarantine_evidence::{
     QuarantineEvidenceStatus, UnresolvedEffectDisposition, VerifiedQuarantineBinding,
 };
 pub use revocation_history::{
-    GrantRestoreOutcome, RevocationHistoryError, RevocationHistoryEvidence, SuppressedGrant,
-    SuppressionCause, ValidatedRevocationClosure,
+    GrantRestoreOutcome, REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationHistoryError,
+    RevocationHistoryEvidence, SuppressedGrant, SuppressionCause, ValidatedRevocationClosure,
 };
 
 use std::{error::Error, fmt};
