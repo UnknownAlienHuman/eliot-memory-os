@@ -20,7 +20,7 @@ use crate::WatchdogAdmissionSource;
 use crate::WatchdogConfig;
 use crate::admission_gap_reason;
 use crate::backup_control::BackupControlRegistration;
-use crate::heartbeat_transport::HeartbeatTransport;
+use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::kernel_gap_reason;
 use crate::report_gap_nonfatal;
 use crate::watchdog_spool::WatchdogSpool;
@@ -466,7 +466,11 @@ async fn emit_admitted_heartbeat_best_effort(
         tracing::debug!(
             event = "watchdog.heartbeat.emit_skipped",
             observation = "attempted",
-            error = error.to_string().as_str(),
+            error_code = match &error {
+                HeartbeatTransportError::Unavailable(_) => "transport_unavailable",
+                HeartbeatTransportError::InvalidDescriptor(_) => "invalid_descriptor",
+                HeartbeatTransportError::Emit(_) => "emission_failed",
+            },
             "heartbeat emission skipped; supervision continues"
         );
     }

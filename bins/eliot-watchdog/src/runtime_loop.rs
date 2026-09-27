@@ -24,11 +24,12 @@ use std::time::Instant;
 use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
 use eliot_platform_windows::WindowsPlatform;
+use eliot_runtime::ShutdownDisposition;
 use eliot_watchdog::{
     FileWatchdogAdmission, GovernorIntentAdmissionSource, HeartbeatTransport,
     INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor, LiveHostObservationSource,
-    SERVICE_NAME, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig, WatchdogReadiness,
-    inspect_approved_host_registration,
+    SERVICE_NAME, SpoolError, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
+    WatchdogReadiness, inspect_approved_host_registration,
 };
 
 #[cfg(windows)]
@@ -102,10 +103,20 @@ pub(super) fn run_watchdog(
             // A real admission-path failure observed before the sensor exists
             // is still evidence: a gap-only sensor opens below and starts
             // counting the deterministic rule on its first supervision tick.
+            let reason = match &error {
+                SpoolError::Io(_) => "spool_io",
+                SpoolError::InvalidProtectedRoot => "invalid_protected_root",
+                SpoolError::Serialization(_) => "serialization",
+                SpoolError::Database(_) => "database",
+                SpoolError::Corrupt(_) => "corrupt",
+                SpoolError::InvalidLease(_) => "unavailable_or_invalid",
+                SpoolError::LeaseStale(_) => "stale",
+                SpoolError::LeaseFenced(_) => "fenced",
+            };
             tracing::info!(
                 event = "watchdog.initial_admission_unavailable",
                 observation = "unavailable",
-                detail = error.to_string().as_str(),
+                reason = reason,
                 "initial durable admission is unavailable; starting a gap-only sensor"
             );
             None
@@ -174,11 +185,23 @@ pub(super) fn run_watchdog(
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    runtime
+    let shutdown = runtime
         .block_on(composition.run_until_shutdown())
         .map_err(|error| format!("{error:?}"))?;
     #[cfg(windows)]
     set_service_status_stopped();
+    let disposition = match shutdown.disposition {
+        ShutdownDisposition::Graceful => "graceful",
+        ShutdownDisposition::Forced => "forced",
+        ShutdownDisposition::Incomplete => "incomplete",
+    };
+    tracing::info!(
+        event = "watchdog.shutdown",
+        disposition = disposition,
+        forced_tasks = shutdown.forced_tasks,
+        no_orphans = shutdown.no_orphans,
+        "watchdog supervision shutdown reported"
+    );
     Ok(())
 }
 

@@ -284,10 +284,16 @@ pub(super) fn publish_service_status(
         checkpoint,
         wait_hint,
     );
-    // The platform wrapper owns the `SetServiceStatus` mechanics; the result
-    // stays ignored exactly as before, keeping status publication best-effort
-    // while SCM status plus stderr remain the primary signals.
-    let _ = report_service_status(handle, &report);
+    // The platform wrapper owns the `SetServiceStatus` mechanics. Publication
+    // remains best-effort, with a failed call recorded once at this boundary.
+    if let Err(error) = report_service_status(handle, &report) {
+        tracing::error!(
+            event = "watchdog.scm_status_publish_failed",
+            state = state,
+            win32_error_code = error.code(),
+            "SCM service status publication failed"
+        );
+    }
 }
 
 /// Builds the bounded secret-free start-failure capsule JSON.
@@ -349,12 +355,19 @@ pub(super) fn persist_start_failure(
         None => (None, None, std::env::temp_dir()),
     };
     let capsule = build_start_failure_capsule(code, detail, installation_id, plan_generation);
-    tracing::debug!(
-        event = "watchdog.start_failure_persisted",
-        failure_class = code.failure_class(),
-        "persisted bounded start-failure capsule receipt"
-    );
-    let _ = std::fs::write(root.join(START_FAILURE_CAPSULE_FILE_NAME), capsule);
+    match std::fs::write(root.join(START_FAILURE_CAPSULE_FILE_NAME), capsule) {
+        Ok(()) => tracing::debug!(
+            event = "watchdog.start_failure_persisted",
+            failure_class = code.failure_class(),
+            "persisted bounded start-failure capsule receipt"
+        ),
+        Err(error) => tracing::error!(
+            event = "watchdog.start_failure_persist_failed",
+            failure_class = code.failure_class(),
+            error_kind = ?error.kind(),
+            "bounded start-failure capsule persistence failed"
+        ),
+    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
