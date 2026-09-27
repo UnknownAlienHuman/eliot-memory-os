@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod initial_snapshot;
 pub mod legacy_capability_import;
 
 use eliot_contracts::{PolicyRevision, StateFence};
@@ -15,6 +16,14 @@ use thiserror::Error;
 
 pub mod first_run;
 pub mod quiet_hours;
+
+pub use initial_snapshot::{
+    Ed25519InitialSnapshotSigner, INITIAL_SNAPSHOT_PUBLIC_KEY_BYTES, INITIAL_SNAPSHOT_SCHEMA,
+    INITIAL_SNAPSHOT_SIGNATURE_ALGORITHM, INITIAL_SNAPSHOT_SIGNATURE_BYTES,
+    INITIAL_SNAPSHOT_WIRE_VERSION, InitialConfigSnapshotTrustAnchor, InitialSnapshotError,
+    InitialSnapshotPayload, InitialSnapshotSigner, InitialSnapshotVerificationContext,
+    PRIVACY_MODE_KEY, PrivacyChoice, SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot,
+};
 
 pub const CONTRACT_NAME: &str = "eliot.governor.config";
 pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =

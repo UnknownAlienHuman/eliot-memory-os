@@ -1088,6 +1088,7 @@ dependencies = [
 name = "eliot-config"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "eliot-contracts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
@@ -2145,6 +2146,7 @@ dependencies = [
 name = "eliot-installation"
 version = "0.1.0"
 dependencies = [
+ "eliot-config",
  "eliot-contracts",
  "eliot-ipc",
  "eliot-platform",

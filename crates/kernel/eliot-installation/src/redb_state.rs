@@ -27,10 +27,11 @@ use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROL
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
     InstallationError, InstallationStage, InstallationStepOutcome, InstallationTransaction,
-    InstallationTransactionStore, InstallerEffectPlan, PackageArtifactDigest,
-    decode_installation_transaction_json_from_store,
+    InstallationTransactionStore, InstallerEffectPlan, PackageArtifactDigest, SetupBinding,
+    SetupMilestone, SetupStatus, decode_installation_transaction_json_from_store,
     transaction_store_private::{self, TransactionVersion},
 };
+use eliot_config::initial_snapshot::SignedInitialConfigSnapshot;
 use eliot_contracts::ContractVersion;
 use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
@@ -47,6 +48,9 @@ const CANARY_REMOVAL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("canary_removal_operations_v1");
 const PUBLICATION_JOURNAL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("source_bundle_publication_journal_v1");
+const SETUP_BINDING_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("setup_bindings_v1");
+const INITIAL_SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("initial_config_snapshots_v1");
 const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
 static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1173,6 +1177,225 @@ impl RedbInstallationTransactionStore {
             .commit()
             .map_err(|error| InstallationError::Platform(error.to_string()))
     }
+
+    /// Persists one freshly created milestone-1 setup binding.
+    ///
+    /// The binding must be constructor-produced fresh state: milestone 1,
+    /// revision 1, and no expected previous binding. A second create for the
+    /// same transaction is refused, so concurrent setup attempts serialize
+    /// against the same installation instead of forking a second trust root.
+    pub fn create_setup_binding(
+        &mut self,
+        binding: &SetupBinding,
+    ) -> Result<(), InstallationError> {
+        binding.validate()?;
+        if binding.state() != SetupMilestone::InstallationIdentityConfirmed
+            || binding.revision() != 1
+            || binding.expected_previous_revision != 0
+        {
+            return Err(InstallationError::InvalidField {
+                field: "setup_binding".to_owned(),
+                reason: "create accepts only a fresh milestone-1 binding".to_owned(),
+            });
+        }
+        let bytes = encode_setup_binding(binding)?;
+        let database = self.open_for_mutation()?;
+        let write = database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SETUP_BINDING_TABLE)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let key = binding.transaction_id.as_str();
+            if table
+                .get(key)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?
+                .is_some()
+            {
+                return Err(InstallationError::CompareAndSaveConflict {
+                    expected: 0,
+                    actual: binding.revision(),
+                });
+            }
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Loads one exact durable setup binding by its transaction identity.
+    pub fn load_setup_binding(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<Option<SetupBinding>, InstallationError> {
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(SETUP_BINDING_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(transaction_id.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let binding = decode_setup_binding(value.value())?;
+        if binding.transaction_id != *transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(Some(binding))
+    }
+
+    /// Revision-checked compare-and-save for one setup binding.
+    ///
+    /// This is the same durable discipline the installation transaction store
+    /// already uses: an expected revision, exactly one revision step per save,
+    /// and a refused identity change of the transaction. Restart resumes the
+    /// same binding and its proven milestones; it never resets a completed
+    /// installation into first-run setup.
+    pub fn compare_and_save_setup_binding(
+        &mut self,
+        expected_revision: u64,
+        binding: &SetupBinding,
+    ) -> Result<(), InstallationError> {
+        binding.validate()?;
+        let bytes = encode_setup_binding(binding)?;
+        let database = self.open_for_mutation()?;
+        let write = database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SETUP_BINDING_TABLE)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let key = binding.transaction_id.as_str();
+            let current_bytes = {
+                let current = table
+                    .get(key)
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?
+                    .ok_or_else(|| InstallationError::TransactionNotFound {
+                        transaction_id: key.to_owned(),
+                    })?;
+                current.value().to_vec()
+            };
+            let current = decode_setup_binding(&current_bytes)?;
+            if current.revision() != expected_revision {
+                return Err(InstallationError::CompareAndSaveConflict {
+                    expected: expected_revision,
+                    actual: current.revision(),
+                });
+            }
+            if binding.revision != expected_revision + 1 {
+                return Err(InstallationError::InvalidField {
+                    field: "setup_binding.revision".to_owned(),
+                    reason: "compare_and_save requires exactly one revision step".to_owned(),
+                });
+            }
+            if current.transaction_id != binding.transaction_id
+                || current.installation_id != binding.installation_id
+                || current.runtime_state_roots_digest != binding.runtime_state_roots_digest
+                || current.confirmed_owner != binding.confirmed_owner
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Returns the read-only setup status for authenticated recovery queries.
+    pub fn setup_status(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<SetupStatus, InstallationError> {
+        match self.load_setup_binding(transaction_id)? {
+            Some(binding) => Ok(binding.status()),
+            None => Ok(SetupStatus::NotStarted),
+        }
+    }
+
+    /// Commits one signed initial configuration snapshot for the exact
+    /// transaction.
+    ///
+    /// The snapshot is committed through the existing protected operational
+    /// journal. A lost response reconciles the original publication: an
+    /// identical existing snapshot is an idempotent success, while a differing
+    /// snapshot under the same transaction is refused rather than issuing
+    /// another initial generation.
+    pub fn create_initial_snapshot(
+        &self,
+        transaction_id: &PlatformHandle,
+        snapshot: &SignedInitialConfigSnapshot,
+    ) -> Result<(), InstallationError> {
+        snapshot
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "signed_initial_snapshot".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let bytes = encode_initial_snapshot(snapshot)?;
+        let database = self.open_for_mutation()?;
+        let write = database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(INITIAL_SNAPSHOT_TABLE)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let key = transaction_id.as_str();
+            if let Some(existing) = table
+                .get(key)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?
+            {
+                let existing = decode_initial_snapshot(existing.value())?;
+                if existing != *snapshot {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                return Ok(());
+            }
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Loads one exact durable signed initial snapshot by transaction identity.
+    pub fn load_initial_snapshot(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<Option<SignedInitialConfigSnapshot>, InstallationError> {
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(INITIAL_SNAPSHOT_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(transaction_id.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(decode_initial_snapshot(value.value())?))
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1226,6 +1449,132 @@ fn decode_canary_removal_operation(
         })?;
     envelope.operation.validate()?;
     Ok(envelope.operation)
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SetupBindingEnvelope {
+    wire_version: ContractVersion,
+    binding: SetupBinding,
+}
+
+fn encode_setup_binding(binding: &SetupBinding) -> Result<Vec<u8>, InstallationError> {
+    serde_json::to_vec(&SetupBindingEnvelope {
+        wire_version: super::SETUP_BINDING_WIRE_VERSION,
+        binding: binding.clone(),
+    })
+    .map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })
+}
+
+fn decode_setup_binding(bytes: &[u8]) -> Result<SetupBinding, InstallationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    let version =
+        value
+            .get("wire_version")
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "setup binding envelope predates the required wire discriminator"
+                    .to_owned(),
+            })?;
+    let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
+        InstallationError::MigrationRequired {
+            reason: "setup binding envelope has an unsupported wire discriminator".to_owned(),
+        }
+    })?;
+    if version != super::SETUP_BINDING_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "setup binding envelope wire {version} requires explicit migration to {}",
+                super::SETUP_BINDING_WIRE_VERSION
+            ),
+        });
+    }
+    let envelope: SetupBindingEnvelope =
+        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
+            reason: format!("setup binding record is not the strict current shape: {error}"),
+        })?;
+    if envelope.wire_version != super::SETUP_BINDING_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "setup binding envelope wire {} requires explicit migration to {}",
+                envelope.wire_version,
+                super::SETUP_BINDING_WIRE_VERSION
+            ),
+        });
+    }
+    envelope.binding.validate()?;
+    Ok(envelope.binding)
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct InitialSnapshotEnvelope {
+    wire_version: ContractVersion,
+    snapshot: SignedInitialConfigSnapshot,
+}
+
+fn encode_initial_snapshot(
+    snapshot: &SignedInitialConfigSnapshot,
+) -> Result<Vec<u8>, InstallationError> {
+    serde_json::to_vec(&InitialSnapshotEnvelope {
+        wire_version: eliot_config::initial_snapshot::INITIAL_SNAPSHOT_WIRE_VERSION,
+        snapshot: snapshot.clone(),
+    })
+    .map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })
+}
+
+fn decode_initial_snapshot(bytes: &[u8]) -> Result<SignedInitialConfigSnapshot, InstallationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    let version =
+        value
+            .get("wire_version")
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "initial snapshot envelope predates the required wire discriminator"
+                    .to_owned(),
+            })?;
+    let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
+        InstallationError::MigrationRequired {
+            reason: "initial snapshot envelope has an unsupported wire discriminator".to_owned(),
+        }
+    })?;
+    if version != eliot_config::initial_snapshot::INITIAL_SNAPSHOT_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "initial snapshot envelope wire {version} requires explicit migration to {}",
+                eliot_config::initial_snapshot::INITIAL_SNAPSHOT_WIRE_VERSION
+            ),
+        });
+    }
+    let envelope: InitialSnapshotEnvelope =
+        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
+            reason: format!("initial snapshot record is not the strict current shape: {error}"),
+        })?;
+    if envelope.wire_version != eliot_config::initial_snapshot::INITIAL_SNAPSHOT_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "initial snapshot envelope wire {} requires explicit migration to {}",
+                envelope.wire_version,
+                eliot_config::initial_snapshot::INITIAL_SNAPSHOT_WIRE_VERSION
+            ),
+        });
+    }
+    envelope
+        .snapshot
+        .validate()
+        .map_err(|error| InstallationError::InvalidField {
+            field: "signed_initial_snapshot".to_owned(),
+            reason: error.to_string(),
+        })?;
+    Ok(envelope.snapshot)
 }
 
 struct PendingTransactionStorePublication {
