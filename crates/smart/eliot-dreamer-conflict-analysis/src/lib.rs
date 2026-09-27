@@ -113,6 +113,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::{
@@ -561,6 +562,409 @@ pub struct SuppliedComparison {
     pub right_source: String,
     /// Exactly one entry per canonical dimension.
     pub dimensions: Vec<DimensionComparison>,
+}
+
+/// Owner-issued commitment binding one source handle to the record it names.
+///
+/// The commitment carries the handle it is issued for, so it cannot be detached
+/// from its source and re-attached to another. Normalizing a comparison pair
+/// moves a source and its commitment as one unit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRecordCommitment {
+    source: String,
+    record_digest: String,
+    profile: String,
+    profile_digest: String,
+}
+
+impl SourceRecordCommitment {
+    /// Declares the owner-issued commitment for one source handle.
+    ///
+    /// `profile` names the owner-issued comparison profile the record was
+    /// admitted under; a commitment without both digests is refused rather
+    /// than admitted as unverified.
+    pub fn new(
+        source: &str,
+        record_digest: &str,
+        profile: &str,
+        profile_digest: &str,
+    ) -> Result<Self, ConflictAnalysisError> {
+        check_handle(source, "commitment.source")?;
+        check_digest(record_digest, "commitment.record_digest")?;
+        check_handle(profile, "commitment.profile")?;
+        check_digest(profile_digest, "commitment.profile_digest")?;
+        Ok(Self {
+            source: source.to_owned(),
+            record_digest: record_digest.to_owned(),
+            profile: profile.to_owned(),
+            profile_digest: profile_digest.to_owned(),
+        })
+    }
+
+    /// Source handle this commitment is issued for.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Digest of the owner-issued source record.
+    #[must_use]
+    pub fn record_digest(&self) -> &str {
+        &self.record_digest
+    }
+
+    /// Owner-issued comparison profile the record was admitted under.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    /// Digest of that comparison profile.
+    #[must_use]
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+}
+
+/// One canonical dimension outcome whose value stays coupled to its source.
+///
+/// `first_value` belongs to [`CanonicalComparisonPair::first_source`] and
+/// `second_value` belongs to [`CanonicalComparisonPair::second_source`]. The two
+/// values are never ordered independently of the sources that supplied them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalDimensionOutcome {
+    /// Both positions declare the same value. The compared source identities
+    /// stay bound by the enclosing pair.
+    Equal {
+        /// The value both positions declare.
+        value: String,
+    },
+    /// The positions declare different values, each coupled to its own source.
+    Differing {
+        /// Value supplied by the pair's first source.
+        first_value: String,
+        /// Value supplied by the pair's second source.
+        second_value: String,
+    },
+    /// The field cannot be normalized. The reason stays bound to this exact
+    /// pair, profile and dimension.
+    Unnormalizable {
+        /// Bounded reason the field cannot be normalized.
+        reason: String,
+    },
+}
+
+/// One canonical dimension of an admitted comparison pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalDimensionEntry {
+    /// Which canonical dimension this entry compares.
+    pub dimension: ComparisonDimension,
+    /// Outcome whose values are coupled to the pair's ordered sources.
+    pub outcome: CanonicalDimensionOutcome,
+}
+
+/// One admitted comparison in its single canonical orientation.
+///
+/// `first_source` is the lexicographically lesser of the two handles, under the
+/// same ordering the unordered pair key applies, so pair identity and canonical
+/// orientation cannot disagree. Orientation is a property of this value and
+/// never of the caller's field order: the mirrored declarations `A/B` carrying
+/// `(a,b)` and `B/A` carrying `(b,a)` both normalize to the same pair, while
+/// swapping the handles without their values does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalComparisonPair {
+    /// Lexicographically lesser source handle of the pair.
+    pub first_source: String,
+    /// Owner-issued commitment for `first_source`; it travels with that source.
+    pub first_source_commitment: SourceRecordCommitment,
+    /// Lexicographically greater source handle of the pair.
+    pub second_source: String,
+    /// Owner-issued commitment for `second_source`; it travels with that source.
+    pub second_source_commitment: SourceRecordCommitment,
+    /// One entry per canonical dimension, in [`COMPARISON_DIMENSIONS`] order.
+    pub dimensions: Vec<CanonicalDimensionEntry>,
+}
+
+/// Confirms one commitment is bound to the position it is supplied for.
+///
+/// A commitment carries the handle it was issued for, so a mismatch means the
+/// evidence names a different position than the one being admitted.
+fn check_commitment_binding(
+    commitment: &SourceRecordCommitment,
+    source: &str,
+    field: &str,
+) -> Result<(), ConflictAnalysisError> {
+    if commitment.source() == source {
+        return Ok(());
+    }
+    Err(ConflictAnalysisError::Binding {
+        field: format!("{field}_commitment"),
+        detail: format!(
+            "commitment names source {} but is bound to comparison position {}",
+            redact(commitment.source()),
+            redact(source)
+        ),
+    })
+}
+
+/// Maps one caller-declared dimension onto the canonical orientation.
+///
+/// `swapped` is the single ordering decision taken by the pair. The values move
+/// with the source that declared them, so a mirrored declaration carrying the
+/// same associations yields the same outcome, and one carrying different
+/// associations does not.
+fn canonical_dimension_outcome(
+    entry: &DimensionComparison,
+    swapped: bool,
+) -> Result<CanonicalDimensionOutcome, ConflictAnalysisError> {
+    match &entry.outcome {
+        DimensionOutcome::Equal { value } => {
+            check_bounded_text(value, "comparison.equal", MAX_TEXT_BYTES)?;
+            Ok(CanonicalDimensionOutcome::Equal {
+                value: value.clone(),
+            })
+        }
+        DimensionOutcome::Differing { left, right } => {
+            check_bounded_text(left, "comparison.left_value", MAX_TEXT_BYTES)?;
+            check_bounded_text(right, "comparison.right_value", MAX_TEXT_BYTES)?;
+            if left == right {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "a differing dimension must state two distinct values, not {} twice",
+                        entry.dimension.as_str()
+                    ),
+                });
+            }
+            let (first_value, second_value) = if swapped {
+                (right.clone(), left.clone())
+            } else {
+                (left.clone(), right.clone())
+            };
+            Ok(CanonicalDimensionOutcome::Differing {
+                first_value,
+                second_value,
+            })
+        }
+        DimensionOutcome::Unnormalizable { reason } => {
+            check_bounded_text(reason, "comparison.unnormalizable", MAX_NOTE_BYTES)?;
+            Ok(CanonicalDimensionOutcome::Unnormalizable {
+                reason: reason.clone(),
+            })
+        }
+    }
+}
+
+impl CanonicalComparisonPair {
+    /// Normalizes one caller declaration into its single canonical orientation.
+    ///
+    /// The commitments are supplied in the caller's own orientation — the first
+    /// is for `supplied.left_source` — and are moved together with the values
+    /// that source declared. Sources and values are therefore never sorted
+    /// independently: swapping the handles without their values produces a
+    /// different pair instead of a second spelling of the first one.
+    ///
+    /// Dimensions are emitted in [`COMPARISON_DIMENSIONS`] order, so an
+    /// irrelevant input dimension order cannot change the pair.
+    pub fn from_supplied(
+        supplied: &SuppliedComparison,
+        left_commitment: &SourceRecordCommitment,
+        right_commitment: &SourceRecordCommitment,
+    ) -> Result<Self, ConflictAnalysisError> {
+        check_handle(&supplied.left_source, "comparison.left")?;
+        check_handle(&supplied.right_source, "comparison.right")?;
+        if supplied.left_source == supplied.right_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "comparison.pair".to_owned(),
+                detail: "a comparison must name two distinct positions".to_owned(),
+            });
+        }
+        check_commitment_binding(left_commitment, &supplied.left_source, "comparison.left")?;
+        check_commitment_binding(right_commitment, &supplied.right_source, "comparison.right")?;
+        if supplied.dimensions.len() != EXPECTED_COMPARISON_DIMENSIONS {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "each comparison must cover exactly {EXPECTED_COMPARISON_DIMENSIONS} canonical dimensions"
+                ),
+            });
+        }
+
+        // One ordering decision, taken once, and every value and commitment
+        // below follows it.
+        let swapped = supplied.left_source > supplied.right_source;
+        let (first_source, first_commitment, second_source, second_commitment) = if swapped {
+            (
+                supplied.right_source.as_str(),
+                right_commitment,
+                supplied.left_source.as_str(),
+                left_commitment,
+            )
+        } else {
+            (
+                supplied.left_source.as_str(),
+                left_commitment,
+                supplied.right_source.as_str(),
+                right_commitment,
+            )
+        };
+
+        let mut dimensions = Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+        for dimension in COMPARISON_DIMENSIONS {
+            let Some(entry) = supplied
+                .dimensions
+                .iter()
+                .find(|entry| entry.dimension == dimension)
+            else {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "comparison does not cover canonical dimension {}",
+                        dimension.as_str()
+                    ),
+                });
+            };
+            let outcome = canonical_dimension_outcome(entry, swapped)?;
+            dimensions.push(CanonicalDimensionEntry { dimension, outcome });
+        }
+
+        let pair = Self {
+            first_source: first_source.to_owned(),
+            first_source_commitment: first_commitment.clone(),
+            second_source: second_source.to_owned(),
+            second_source_commitment: second_commitment.clone(),
+            dimensions,
+        };
+        pair.validate()?;
+        Ok(pair)
+    }
+
+    /// Returns the order-independent identity of this canonical pair.
+    ///
+    /// The spelling commits each source to its own value and commitment, so a
+    /// pair that pairs a source with another source's value cannot produce the
+    /// same key as the pair it claims to be.
+    #[must_use]
+    pub fn canonical_key(&self) -> String {
+        let mut parts = [
+            self.canonical_position_key(0),
+            self.canonical_position_key(1),
+        ];
+        parts.sort_unstable();
+        format!("{}|{}", parts[0], parts[1])
+    }
+
+    /// Returns the value this source contributed for one canonical dimension.
+    ///
+    /// A consumer identifies value ownership from the pair alone, without
+    /// knowing the original caller order.
+    #[must_use]
+    pub fn value_for(&self, source: &str, dimension: ComparisonDimension) -> Option<&str> {
+        let entry = self
+            .dimensions
+            .iter()
+            .find(|entry| entry.dimension == dimension)?;
+        let is_first = source == self.first_source;
+        let is_second = source == self.second_source;
+        if !is_first && !is_second {
+            return None;
+        }
+        match &entry.outcome {
+            CanonicalDimensionOutcome::Equal { value } => Some(value.as_str()),
+            CanonicalDimensionOutcome::Differing {
+                first_value,
+                second_value,
+            } => Some(if is_first {
+                first_value.as_str()
+            } else {
+                second_value.as_str()
+            }),
+            CanonicalDimensionOutcome::Unnormalizable { .. } => None,
+        }
+    }
+
+    /// Confirms the pair carries one canonical orientation and full commitments.
+    fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        if self.first_source >= self.second_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "canonical_pair.order".to_owned(),
+                detail: "canonical pair requires first_source < second_source".to_owned(),
+            });
+        }
+        if self.first_source_commitment.source() != self.first_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "canonical_pair.first_commitment".to_owned(),
+                detail: "first commitment is not bound to first_source".to_owned(),
+            });
+        }
+        if self.second_source_commitment.source() != self.second_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "canonical_pair.second_commitment".to_owned(),
+                detail: "second commitment is not bound to second_source".to_owned(),
+            });
+        }
+        if self.dimensions.len() != EXPECTED_COMPARISON_DIMENSIONS {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "canonical pair must carry exactly {EXPECTED_COMPARISON_DIMENSIONS} dimensions"
+                ),
+            });
+        }
+        for (index, dimension) in COMPARISON_DIMENSIONS.iter().enumerate() {
+            if self.dimensions[index].dimension != *dimension {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "canonical pair dimension {index} is {} rather than {}",
+                        self.dimensions[index].dimension.as_str(),
+                        dimension.as_str()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the length-prefixed spelling of one position's own contribution.
+    fn canonical_position_key(&self, position: usize) -> String {
+        let (source, commitment) = if position == 0 {
+            (&self.first_source, &self.first_source_commitment)
+        } else {
+            (&self.second_source, &self.second_source_commitment)
+        };
+        let mut key = format!(
+            "{}:{}|{}:{}|{}:{}|{}:{}",
+            source.len(),
+            source,
+            commitment.record_digest().len(),
+            commitment.record_digest(),
+            commitment.profile().len(),
+            commitment.profile(),
+            commitment.profile_digest().len(),
+            commitment.profile_digest()
+        );
+        for entry in &self.dimensions {
+            let value = match &entry.outcome {
+                CanonicalDimensionOutcome::Equal { value } => value.clone(),
+                CanonicalDimensionOutcome::Differing {
+                    first_value,
+                    second_value,
+                } => {
+                    if position == 0 {
+                        first_value.clone()
+                    } else {
+                        second_value.clone()
+                    }
+                }
+                CanonicalDimensionOutcome::Unnormalizable { reason } => reason.clone(),
+            };
+            let _ = write!(
+                key,
+                "|{}:{}:{}:{}",
+                entry.dimension.as_str().len(),
+                entry.dimension.as_str(),
+                value.len(),
+                value
+            );
+        }
+        key
+    }
 }
 
 /// Typed relation between two positions over the canonical dimensions.
