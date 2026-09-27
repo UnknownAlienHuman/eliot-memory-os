@@ -60,18 +60,32 @@
 //! typed readiness leg it already runs is unreachable for the same measured
 //! reason (see `task_binding_admission`'s "Measured reachability" section).
 //!
-//! [`reconcile_external_attach`] and [`admit_automatic_agent_launch`] have no
-//! production call site yet. The daemon has no live ingress that reports an
-//! attach of an already-running external agent: the attach transport is
-//! `eliot-agent-bridge-core` (`AttachRequest::external` plus
-//! `AttachView::reconciliation_required`), and this repository's daemon side of
-//! that transport does not yet exist. A startup attach was deliberately not
-//! added to manufacture a caller, and no attach receipt was fabricated from the
-//! daemon's own config/state directories, which are not a user `WorkScope`.
+//! [`reconcile_external_attach`] is called from one in-crate production
+//! ingress: [`serve_bridge_external_attach`], which
+//! `DaemonComposition::serve_bridge_external_attach` drives with the live
+//! Bridge binding plus the live Governor fence and Kernel-issued owner session.
+//! That composition ingress is the daemon side of the
+//! `eliot-agent-bridge-core` external-attach transport
+//! (`AttachRequest::external` plus `AttachView::reconciliation_required`):
+//! it takes the exact [`AttachBinding`](eliot_agent_bridge_core::AttachBinding)
+//! the trusted host activation boundary sealed, checks it against the live
+//! owners, compiles the receipt through this compiler, and retains the
+//! resulting record before reporting any gate-clearing view. Replay and the
+//! Material-continuation recheck read the same retained record back, so a lost
+//! response replays the same disposition and a stale or substituted binding
+//! fails closed. The retained record is composition-held: a durable
+//! ORS/Store row for cross-restart survival lives with the Governor/Kernel
+//! owners outside this crate and is not synthesized here.
+//!
+//! [`admit_automatic_agent_launch`] has no production call site yet: no
+//! `Start work` surface exists in this crate, and no second launcher is added
+//! to manufacture one.
 
 #![forbid(unsafe_code)]
 
-use eliot_agent_bridge_core::BridgeError;
+use eliot_agent_bridge_core::{AttachBinding, AttachKind, AttachRequest, BridgeError};
+use eliot_contracts::StateFence;
+use eliot_process::{FencingToken, Generation};
 use eliot_workscope::{
     CandidateDisposition, OnboardingReadinessReceipt, ReadinessLifecycle, RequestedEffect,
     ScopeBinding, ScopeBindingDisposition, ScopeBindingGuardReceipt, ScopeResolutionState,
@@ -815,6 +829,364 @@ pub fn admit_material_continuation(
         return Ok(());
     }
     Err(Box::new(BridgeError::ExternalAttachReconciliationRequired))
+}
+
+/// The exact Bridge request/session/task/fence binding one external attach
+/// presented (issue #1782 audit repair).
+///
+/// Every field is copied from the [`AttachBinding`](eliot_agent_bridge_core::AttachBinding)
+/// the trusted host activation boundary sealed plus the
+/// [`AttachRequest`](eliot_agent_bridge_core::AttachRequest) that carried it:
+/// nothing is inferred, and no receipt field is mapped onto a binding field
+/// by format. The receipt and this claim are linked by joint retention in
+/// [`ExternalAttachIngressRecord`], never by a fabricated field mapping.
+/// Replay and the Material-continuation recheck compare a presenting claim
+/// against the retained one field for field: a stale or substituted binding
+/// fails closed with [`BridgeError::StaleAuthority`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalAttachBridgeClaim {
+    /// Demand the attach was presented under.
+    pub demand_ref: String,
+    /// Transport connection the attach was presented on.
+    pub connection_ref: String,
+    /// Authenticated principal the host boundary admitted.
+    pub principal_ref: String,
+    /// Authenticated session the host boundary admitted.
+    pub session_ref: String,
+    /// Activation generation the host boundary sealed.
+    pub activation_generation: Generation,
+    /// State fence the host boundary sealed.
+    pub state_fence: FencingToken,
+    /// Admitted task identity.
+    pub task_ref: String,
+    /// Admitted work-unit identity.
+    pub work_unit_ref: String,
+    /// Admitted work-scope identity.
+    pub work_scope_ref: String,
+    /// Admitted task revision.
+    pub task_revision: String,
+    /// Admitted plan identity.
+    pub plan_ref: String,
+    /// Admitted plan revision.
+    pub plan_revision: String,
+}
+
+/// Copies the exact binding content of one Bridge external-attach request.
+///
+/// The request must be an [`AttachKind::External`] attach carrying its blind
+/// interval, and its connection must still be the live binding's connection:
+/// a transport replacement requires a reconnect, exactly as the core refuses
+/// it. Every copied reference is re-validated through the same blank/control
+/// rule the receipt compiler enforces, so a malformed binding fails here with
+/// the same typed refusal instead of travelling into the record.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::InvalidContract`] for a non-external request, a
+/// missing blind interval, or a malformed reference, and
+/// [`BridgeError::InvalidTransition`] when the request connection no longer
+/// matches the live binding.
+pub fn claim_bridge_attach(
+    binding: &AttachBinding,
+    request: &AttachRequest,
+) -> Result<ExternalAttachBridgeClaim, Box<BridgeError>> {
+    if request.attach_kind() != AttachKind::External {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "attach_kind",
+            reason: "only an external attach reconciles through this ingress",
+        }));
+    }
+    if request.pre_attach_blind_interval().is_none() {
+        return Err(Box::new(BridgeError::InvalidContract {
+            field: "pre_attach_blind_interval",
+            reason: "external attach must preserve its blind interval",
+        }));
+    }
+    if request.connection_id().as_str() != binding.connection_id().as_str() {
+        return Err(Box::new(BridgeError::InvalidTransition(
+            "transport replacement requires reconnect",
+        )));
+    }
+    let demand_ref = reference(
+        "external_attach_binding.demand_ref",
+        request.demand_id().as_str(),
+    )?;
+    let connection_ref = reference(
+        "external_attach_binding.connection_ref",
+        request.connection_id().as_str(),
+    )?;
+    let principal_ref = reference(
+        "external_attach_binding.principal_ref",
+        binding.principal_id().as_str(),
+    )?;
+    let session_ref = reference(
+        "external_attach_binding.session_ref",
+        binding.session_id().as_str(),
+    )?;
+    let task = binding.task_binding();
+    let task_ref = reference("external_attach_binding.task_ref", task.task_id().as_str())?;
+    let work_unit_ref = reference(
+        "external_attach_binding.work_unit_ref",
+        task.work_unit_id().as_str(),
+    )?;
+    let work_scope_ref = reference(
+        "external_attach_binding.work_scope_ref",
+        task.work_scope_id(),
+    )?;
+    let task_revision = reference(
+        "external_attach_binding.task_revision",
+        task.task_revision(),
+    )?;
+    let plan_ref = reference("external_attach_binding.plan_ref", task.plan_id())?;
+    let plan_revision = reference(
+        "external_attach_binding.plan_revision",
+        task.plan_revision(),
+    )?;
+    Ok(ExternalAttachBridgeClaim {
+        demand_ref,
+        connection_ref,
+        principal_ref,
+        session_ref,
+        activation_generation: binding.activation_generation(),
+        state_fence: binding.state_fence().clone(),
+        task_ref,
+        work_unit_ref,
+        work_scope_ref,
+        task_revision,
+        plan_ref,
+        plan_revision,
+    })
+}
+
+/// One retained external-attach ingress: the compiled receipt plus the exact
+/// binding it was compiled under and the live owner evidence observed at
+/// ingest (issue #1782 audit repair).
+///
+/// The receipt shape is unchanged: this record only joins it to the Bridge
+/// binding claim, the admitted Governor fence, and the Kernel-issued owner
+/// session binding observed when the receipt was compiled. `claim` is `None`
+/// only for a receipt retained through the receipt-only path, which can never
+/// satisfy a presenting-binding check. The fence and session snapshots are
+/// what the Material-continuation recheck compares the live owners against:
+/// workspace movement, source/task revision drift, logout, or session
+/// replacement invalidates dependent use with
+/// [`BridgeError::StaleAuthority`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalAttachIngressRecord {
+    /// Exact Bridge binding the receipt was compiled under, when the attach
+    /// arrived through the Bridge ingress.
+    pub claim: Option<ExternalAttachBridgeClaim>,
+    /// Compiled reconciliation receipt, validated before retention.
+    pub receipt: ExternalAttachReconciliationReceipt,
+    /// Live Governor fence observed at ingest.
+    pub admitted_fence: StateFence,
+    /// Kernel-issued owner session binding observed at ingest, if one was
+    /// noted.
+    pub owner_session_binding: Option<String>,
+}
+
+/// Compiles and seals one Bridge external attach through the receipt compiler.
+///
+/// The owner-observed [`ExternalAttachObservation`] is fed into
+/// [`reconcile_external_attach`] unchanged: this ingress adds no observation
+/// of its own and resolves nothing. The compiled receipt is validated on the
+/// original before it is sealed into the record, so a malformed compiler
+/// output can never be retained. The caller persists the returned record
+/// before reporting any gate-clearing view to the Bridge: the Bridge flag is
+/// cleared only after this retention, never before.
+///
+/// # Errors
+///
+/// Returns the exact [`BridgeError`] from [`reconcile_external_attach`] or
+/// [`ExternalAttachReconciliationReceipt::validate`] without collapsing it.
+pub fn serve_bridge_external_attach(
+    claim: ExternalAttachBridgeClaim,
+    observation: &ExternalAttachObservation,
+    live_fence: &StateFence,
+    live_owner_session: Option<&str>,
+) -> Result<ExternalAttachIngressRecord, Box<BridgeError>> {
+    let receipt = reconcile_external_attach(observation)?;
+    receipt.validate()?;
+    Ok(ExternalAttachIngressRecord {
+        claim: Some(claim),
+        receipt,
+        admitted_fence: live_fence.clone(),
+        owner_session_binding: live_owner_session.map(str::to_owned),
+    })
+}
+
+/// Reads back the retained disposition for the exact presenting binding.
+///
+/// A lost Bridge response replays through here: an exact content match
+/// returns the same receipt with the same continuation and the same attempt
+/// identity, minting nothing. Any other binding fails closed without touching
+/// the retained record, so a replay can neither duplicate an attempt nor
+/// reset the reconciliation state.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::StaleAuthority`] when no attach is retained or the
+/// presenting binding differs from the retained claim in any field, and
+/// [`BridgeError::InvalidContract`] when the retained receipt itself no
+/// longer validates.
+pub fn replay_bridge_external_attach<'a>(
+    record: Option<&'a ExternalAttachIngressRecord>,
+    presenting: &ExternalAttachBridgeClaim,
+) -> Result<&'a ExternalAttachReconciliationReceipt, Box<BridgeError>> {
+    let Some(record) = record else {
+        return Err(Box::new(BridgeError::NotAttached));
+    };
+    let Some(retained) = record.claim.as_ref() else {
+        return Err(Box::new(BridgeError::StaleAuthority));
+    };
+    if retained != presenting {
+        return Err(Box::new(BridgeError::StaleAuthority));
+    }
+    record.receipt.validate()?;
+    Ok(&record.receipt)
+}
+
+/// The exact retained binding read back for the Bridge to verify (issue #1782
+/// audit repair).
+///
+/// This is a readback, never a mint: every field is cloned from the retained
+/// record. The Bridge verifies the returned request/session/task/fence/attempt
+/// relation against its live attach instead of trusting a nonblank receipt
+/// reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalAttachBindingView {
+    /// Demand the retained attach was presented under.
+    pub demand_ref: String,
+    /// Connection the retained attach was presented on.
+    pub connection_ref: String,
+    /// Authenticated principal of the retained attach.
+    pub principal_ref: String,
+    /// Authenticated session of the retained attach.
+    pub session_ref: String,
+    /// Activation generation of the retained attach.
+    pub activation_generation: u64,
+    /// Fence nonce of the retained attach.
+    pub fence_nonce: String,
+    /// Fence generation of the retained attach.
+    pub fence_generation: u64,
+    /// Admitted task identity of the retained attach.
+    pub task_ref: String,
+    /// Admitted work-unit identity of the retained attach.
+    pub work_unit_ref: String,
+    /// Admitted work-scope identity of the retained attach.
+    pub work_scope_ref: String,
+    /// Admitted task revision of the retained attach.
+    pub task_revision: String,
+    /// Admitted plan identity of the retained attach.
+    pub plan_ref: String,
+    /// Admitted plan revision of the retained attach.
+    pub plan_revision: String,
+    /// How the retained attach continues.
+    pub continuation: ContinuationKind,
+    /// New attempt identity, present exactly for a new bounded attempt.
+    pub new_attempt_ref: Option<String>,
+    /// Explicit pre-attach blind interval, in unix milliseconds.
+    pub blind_interval_ms: u64,
+}
+
+/// Reads back the exact retained binding plus the retained disposition.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::InvalidContract`] when the retained receipt no
+/// longer validates. The view is read from the retained record only after
+/// that check, so a stale receipt can never produce a verifying view.
+pub fn binding_view(
+    record: &ExternalAttachIngressRecord,
+) -> Result<ExternalAttachBindingView, Box<BridgeError>> {
+    let Some(claim) = record.claim.as_ref() else {
+        return Err(Box::new(BridgeError::StaleAuthority));
+    };
+    record.receipt.validate()?;
+    Ok(ExternalAttachBindingView {
+        demand_ref: claim.demand_ref.clone(),
+        connection_ref: claim.connection_ref.clone(),
+        principal_ref: claim.principal_ref.clone(),
+        session_ref: claim.session_ref.clone(),
+        activation_generation: claim.activation_generation.get(),
+        fence_nonce: claim.state_fence.nonce().to_owned(),
+        fence_generation: claim.state_fence.generation().get(),
+        task_ref: claim.task_ref.clone(),
+        work_unit_ref: claim.work_unit_ref.clone(),
+        work_scope_ref: claim.work_scope_ref.clone(),
+        task_revision: claim.task_revision.clone(),
+        plan_ref: claim.plan_ref.clone(),
+        plan_revision: claim.plan_revision.clone(),
+        continuation: record.receipt.continuation_kind(),
+        new_attempt_ref: record
+            .receipt
+            .continuation_kind_and_new_attempt_identity
+            .new_attempt_ref
+            .clone(),
+        blind_interval_ms: record.receipt.pre_attach_blind_interval_ms(),
+    })
+}
+
+/// Admits one requested effect against the retained ingress record, rechecking
+/// applicability before any Material continuation (issue #1782 audit repair).
+///
+/// Beyond the [`admit_material_continuation`] gate this re-derives nothing:
+///
+/// - a presenting Bridge binding must equal the retained claim field for
+///   field, so a stale or substituted request/session/task/fence binding
+///   cannot clear the gate;
+/// - the live Governor fence must still equal the admitted fence, so
+///   workspace movement or source/task revision drift invalidates dependent
+///   use;
+/// - the live owner session binding must still equal the recorded one, so a
+///   logout, replacement, or fresh grant never revives the cached
+///   disposition (I11.8: fresh authentication never revives cached grants).
+///
+/// Authentication staleness stays the stronger refusal: binding, fence, and
+/// session mismatches report [`BridgeError::StaleAuthority`] ahead of the
+/// disposition gate, which still reports
+/// [`BridgeError::ExternalAttachReconciliationRequired`] for an unattributed
+/// continuation.
+///
+/// # Errors
+///
+/// Returns [`BridgeError::InvalidContract`] when the retained receipt does
+/// not validate, [`BridgeError::StaleAuthority`] for a stale or substituted
+/// binding, fence, or session, and
+/// [`BridgeError::ExternalAttachReconciliationRequired`] when a Material
+/// effect is requested before an attributed continuation exists.
+pub fn admit_material_continuation_for_record(
+    effect: RequestedEffect,
+    record: Option<&ExternalAttachIngressRecord>,
+    presenting: Option<&ExternalAttachBridgeClaim>,
+    live_fence: &StateFence,
+    live_owner_session: Option<&str>,
+) -> Result<(), Box<BridgeError>> {
+    if !effect.requires_material_readiness() {
+        return Ok(());
+    }
+    let Some(record) = record else {
+        return Ok(());
+    };
+    record.receipt.validate()?;
+    match (record.claim.as_ref(), presenting) {
+        (Some(retained), Some(presenting)) => {
+            if retained != presenting {
+                return Err(Box::new(BridgeError::StaleAuthority));
+            }
+        }
+        (None, Some(_)) => {
+            return Err(Box::new(BridgeError::StaleAuthority));
+        }
+        (Some(_) | None, None) => {}
+    }
+    if record.admitted_fence != *live_fence {
+        return Err(Box::new(BridgeError::StaleAuthority));
+    }
+    if record.owner_session_binding.as_deref() != live_owner_session {
+        return Err(Box::new(BridgeError::StaleAuthority));
+    }
+    admit_material_continuation(effect, Some(&record.receipt))
 }
 
 /// Why `Start work` may not hide the presented state behind an automatic agent
