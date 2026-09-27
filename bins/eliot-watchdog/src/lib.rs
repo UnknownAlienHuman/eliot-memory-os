@@ -61,6 +61,7 @@ mod backup_control;
 mod diagnostics;
 mod heartbeat_transport;
 mod host_identity_observation;
+mod observation_coverage;
 mod runtime_manifest_selection;
 mod scm_launch;
 mod self_admission;
@@ -1293,11 +1294,19 @@ fn owner_backup_port(
     installation_id: &str,
     watchdog_generation: u64,
 ) -> Result<Arc<WatchdogBackupPort>, SpoolError> {
+    // I8.2 (#1755 W1/W5): the per-interval coverage cell is created once here,
+    // beside the owner-bound port, and shared with the composition that
+    // publishes into it. One cell per owner means a capture and a readiness
+    // projection can never disagree about what this owner observed.
+    let coverage = Arc::new(observation_coverage::IntervalCoverageCell::new(
+        current_unix_ms().unwrap_or(0),
+    ));
     Ok(Arc::new(WatchdogBackupPort::new(
         Arc::clone(spool),
         installation_id.to_owned(),
         watchdog_generation,
         WatchdogSpoolBackupLimits::default(),
+        coverage,
     )?))
 }
 

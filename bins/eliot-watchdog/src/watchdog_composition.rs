@@ -22,8 +22,10 @@ use crate::WatchdogAdmissionSource;
 use crate::WatchdogConfig;
 use crate::admission_gap_reason;
 use crate::backup_control::BackupControlRegistration;
+use crate::current_unix_ms;
 use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::kernel_gap_reason;
+use crate::observation_coverage::{IntervalCoverageCell, ObservationChannel, ObservationClass};
 use crate::report_gap_nonfatal;
 use crate::watchdog_spool::WatchdogSpool;
 use crate::watchdog_spool::backup::{
@@ -35,6 +37,30 @@ mod authority_state;
 
 use authority_state::WatchdogAuthorityStateCell;
 pub use authority_state::{WatchdogAuthorityState, WatchdogReadiness};
+
+/// Closes the open coverage interval and reports its named gaps once.
+///
+/// The per-interval publication itself is consumed by the readiness projection
+/// and by the owner-bound capture path, which read the same cell; this
+/// function only makes the blocking set visible to an operator. The blocking
+/// set is a measured property of the current sensor map, so it is logged when
+/// it changes rather than on every tick, and a poisoned cell publishes nothing
+/// at all — never a claim.
+fn publish_closed_interval_coverage(coverage: &IntervalCoverageCell) {
+    let Some(publication) = coverage.close_interval(current_unix_ms().unwrap_or(0)) else {
+        return;
+    };
+    if publication.blocking_changed() {
+        let report = publication.report();
+        tracing::warn!(
+            event = "watchdog.observation_coverage_gap",
+            observation = "partial",
+            full_coverage = report.full_coverage_claimed(),
+            blocking_channels = ?report.blocking_channels(),
+            "required observation coverage is not full; the listed I8.2 channels are blind or unknown"
+        );
+    }
+}
 
 /// Runtime-owned watchdog composition.
 pub struct WatchdogComposition {
@@ -61,6 +87,12 @@ pub struct WatchdogComposition {
     /// second composition in the same process opens its own table, and
     /// starting supervision never touches either one.
     backup_control_registration: BackupControlRegistration,
+    /// This owner's shared per-interval I8.2 coverage cell.
+    ///
+    /// The very same cell the owner-bound backup port captures against, so the
+    /// coverage a readiness projection claims and the coverage a fence carries
+    /// are one publication, not two.
+    coverage: Arc<IntervalCoverageCell>,
 }
 
 impl WatchdogComposition {
@@ -172,6 +204,15 @@ impl WatchdogComposition {
         let task_authority_state = authority_state.clone();
         let task_heartbeat = heartbeat.clone();
         let task_kernel = Arc::clone(&kernel);
+        // I8.2 (#1755 W1/W5): one coverage cell per composition, shared with
+        // the owner-bound backup port so the readiness claim and any capture
+        // read the same publication. It is opened with the owner clock, and it
+        // holds observations only.
+        let coverage = kernel.spool_backup_port().map_or_else(
+            || Arc::new(IntervalCoverageCell::new(current_unix_ms().unwrap_or(0))),
+            |port| Arc::clone(port.coverage()),
+        );
+        let task_coverage = Arc::clone(&coverage);
         let interval = config.tick_interval;
         let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
             SERVICE_NAME,
@@ -182,6 +223,7 @@ impl WatchdogComposition {
                 let host = task_host.clone();
                 let authority_state = task_authority_state.clone();
                 let heartbeat = task_heartbeat.clone();
+                let coverage = task_coverage.clone();
                 async move {
                     loop {
                         tokio::select! {
@@ -193,6 +235,28 @@ impl WatchdogComposition {
                         // otherwise unavailable during first install/recovery.
                         let host_observation = host.observe();
                         let host_gap = host_observation.gap_reason();
+                        // I8.2 (#1755 W5): this tick's Host read is the live
+                        // sample for the two I8.2 channels it can actually
+                        // reach. Every state other than `Unknown` was produced
+                        // by the SCM registration readback inside `observe`,
+                        // so the SCM channel is covered; `Unknown` may equally
+                        // mean the readback itself failed, so it establishes
+                        // no coverage at all. The health result (absent, PID
+                        // reuse, image substitution) stays in `host_gap` and in
+                        // `HostObservationState`; only the coverage disposition
+                        // is recorded here.
+                        if host_observation.state != HostObservationState::Unknown {
+                            coverage.record(
+                                ObservationChannel::ScmServiceState,
+                                ObservationClass::ServiceState,
+                            );
+                        }
+                        if host_observation.identity.is_some() {
+                            coverage.record(
+                                ObservationChannel::ProcessExitIdentity,
+                                ObservationClass::ProcessIdentity,
+                            );
+                        }
                         let admission = match admission.reload() {
                             Ok(admission) => admission,
                             Err(error) => {
@@ -269,6 +333,16 @@ impl WatchdogComposition {
                                     .await;
                             }
                         }
+                        // I8.2 (#1755 W5): the Kernel fence is read once per
+                        // tick whether or not it answers, so the channel was
+                        // observed live. A refusal is a health result, already
+                        // reported as the gap above, and is deliberately not
+                        // folded into the coverage disposition.
+                        coverage.record(
+                            ObservationChannel::KernelHeartbeat,
+                            ObservationClass::Liveness,
+                        );
+                        publish_closed_interval_coverage(&coverage);
                     }
                 }
             },
@@ -303,6 +377,7 @@ impl WatchdogComposition {
             shutdown_requested,
             heartbeat,
             backup_control_registration: BackupControlRegistration::open(),
+            coverage,
         })
     }
 
@@ -331,7 +406,16 @@ impl WatchdogComposition {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
             authority_state: snapshot.state,
-            coverage_claimed: snapshot.state.coverage_claimed(),
+            // I8.2 (#1755 W5): admitted authority is not coverage. The claim
+            // is the conjunction of admitted authority and a closed interval
+            // whose every I8.2 channel was observed CONTINUOUS, so one good
+            // channel cannot erase another channel's blind interval and an
+            // owner that has not closed an interval yet claims nothing.
+            coverage_claimed: snapshot.state.coverage_claimed()
+                && self
+                    .coverage
+                    .latest()
+                    .is_some_and(|report| report.full_coverage_claimed()),
             kernel_epoch: snapshot.kernel_epoch,
             watchdog_epoch: snapshot.watchdog_epoch,
             tick_interval_ms: self.config.tick_interval.as_millis(),
@@ -555,6 +639,13 @@ pub struct WatchdogBackupPort {
     source_installation: String,
     watchdog_generation: u64,
     limits: WatchdogSpoolBackupLimits,
+    /// This owner's shared per-interval I8.2 coverage cell.
+    ///
+    /// The same cell the bounded supervision tick publishes into, so a capture
+    /// carries the coverage this owner actually observed rather than coverage
+    /// a caller asserted. It holds observations only: no lease, heartbeat,
+    /// supervision, or epoch authority passes through it.
+    coverage: Arc<IntervalCoverageCell>,
 }
 
 impl WatchdogBackupPort {
@@ -578,6 +669,7 @@ impl WatchdogBackupPort {
         source_installation: String,
         watchdog_generation: u64,
         limits: WatchdogSpoolBackupLimits,
+        coverage: Arc<IntervalCoverageCell>,
     ) -> Result<Self, SpoolError> {
         limits.validate()?;
         if source_installation.trim().is_empty()
@@ -597,7 +689,14 @@ impl WatchdogBackupPort {
             source_installation,
             watchdog_generation,
             limits,
+            coverage,
         })
+    }
+
+    /// Returns this owner's shared per-interval coverage cell.
+    #[must_use]
+    pub(crate) fn coverage(&self) -> &Arc<IntervalCoverageCell> {
+        &self.coverage
     }
 
     /// Returns the owner-held installation identity this port is bound to.
@@ -672,7 +771,15 @@ impl WatchdogBackupPort {
         limits: WatchdogSpoolBackupLimits,
     ) -> Result<WatchdogSpoolFence, SpoolError> {
         self.check_owner_bindings(&params)?;
-        let fence = self.spool.snapshot_backup(params, limits)?;
+        // I8.2 (#1755 W5): the capture carries the coverage this owner most
+        // recently published, never caller-supplied coverage. `None` — no
+        // interval closed yet — is retained as unknown coverage, so the fence
+        // cannot report a full-coverage claim before the owner observed
+        // anything.
+        let channel_coverage = self.coverage.latest();
+        let fence = self
+            .spool
+            .snapshot_backup(params, limits, channel_coverage.as_ref())?;
         self.check_capture_age(&fence)?;
         Ok(fence)
     }

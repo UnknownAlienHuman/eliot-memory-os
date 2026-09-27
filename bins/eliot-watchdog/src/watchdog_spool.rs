@@ -321,6 +321,7 @@ impl WatchdogSpool {
         &self,
         params: backup::CaptureFenceParams,
         limits: WatchdogSpoolBackupLimits,
+        channel_coverage: Option<&crate::observation_coverage::IntervalCoverageReport>,
     ) -> Result<WatchdogSpoolFence, SpoolError> {
         limits.validate()?;
         if params.canonical_ref.is_some() || params.ors_ref.is_some() {
@@ -374,7 +375,7 @@ impl WatchdogSpool {
                 "watchdog spool backup capture exceeds the bounded work ceiling".to_owned(),
             ));
         }
-        backup::capture_fence(&header, &entries, high_water, &params)
+        backup::capture_fence(&header, &entries, high_water, &params, channel_coverage)
     }
 
     /// Imports an isolated-restore step chain as quarantined historical evidence.
