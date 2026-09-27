@@ -335,9 +335,13 @@ impl RowFamilyKind {
     /// selecting it by observation time silently drops or duplicates rows
     /// whenever two rows share a millisecond or a row lands between two pages.
     /// Its entry `order` stays a reporting value; selection is always by the
-    /// family's own durable-key order through [`OrsFamilyCursor`].
+    /// family's own durable-key order through [`OrsFamilyCursor`]. The
+    /// versioned-artifact family (issue #1971) qualifies for the same reason:
+    /// its rows carry no operation order at all, so selection is always by the
+    /// family's own durable-key order and the entry `order` reports the
+    /// generation as a reporting value only.
     pub const fn uses_family_cursor(self) -> bool {
-        matches!(self, Self::ProcessStreamRecovery)
+        matches!(self, Self::ProcessStreamRecovery | Self::VersionedArtifacts)
     }
 }
 
@@ -633,12 +637,22 @@ impl OrsBackupRequest {
     /// caller: it names a frozen durable family revision and the durable-key
     /// prefix the owner already emitted. Attaching it here is what makes the
     /// family part of the exported denominator instead of an implicit
-    /// side-effect of the final operational page.
+    /// side-effect of the final operational page. The cursor must name the
+    /// process-stream recovery family (issue #1971 registers a second
+    /// cursor-paged family, so the slot refuses a cursor frozen for any other
+    /// family rather than paging one family's table under another family's
+    /// denominator).
     pub fn with_process_stream_recovery_cursor(
         mut self,
         cursor: OrsFamilyCursor,
     ) -> Result<Self, OrsError> {
         cursor.validate()?;
+        if cursor.identity.family != RowFamilyKind::ProcessStreamRecovery {
+            return Err(OrsError::InvalidField {
+                field: "backup_process_stream_recovery_cursor",
+                reason: "cursor names a different row family",
+            });
+        }
         self.process_stream_recovery_cursor = Some(cursor);
         Ok(self)
     }
