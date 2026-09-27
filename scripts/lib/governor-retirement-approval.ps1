@@ -114,7 +114,10 @@ $script:GovernorRetirementNonAdmissionReasons = @(
 # qualified spellings, and the environment-variable spelling catches launch
 # references such as '{env:ELIOT_GOVERNOR_EXE}'. The bare facade package name
 # catches references through the package ('cargo run -p eliot-app',
-# 'crates/eliot-app/...') without a governor spelling. Detection stays purely
+# 'crates/eliot-app/...') without a governor spelling. The uninstall flag
+# spelling catches references to the retiring 'host uninstall' CLI through a
+# launcher variable such as '$governor' without any governor spelling. Detection
+# stays purely
 # content-based, so candidate shrinkage of CONSUMER_SURFACES can never remove
 # a reference from the denominator.
 $script:GovernorRetirementClosureTokens = @(
@@ -125,6 +128,7 @@ $script:GovernorRetirementClosureTokens = @(
     'eliot-governor'
     'ELIOT_GOVERNOR'
     'eliot-app'
+    'uninstall --host'
 )
 
 
