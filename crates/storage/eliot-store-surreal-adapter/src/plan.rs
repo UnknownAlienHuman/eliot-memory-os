@@ -73,6 +73,124 @@ pub(crate) struct EvidenceRecord {
 /// [`ORDERING_LINK_GENESIS_HASH`] when the scope has no row yet. Issue #1931.
 pub(crate) type OrderingChainTips = BTreeMap<String, String>;
 
+/// One projection kind's publication generation as the store's own retained
+/// `projection_record` rows already hold it (issue #1931, `I5.8`).
+///
+/// A readback, never a constant: `0` is the generation a kind has before its
+/// first publication exists, so the first publication is generation 1 exactly
+/// as before and every later publication advances from the retained value.
+/// `I5.8` requires an *advancing* `projection_kind_and_generation` and
+/// `source_generation_and_cursor`; a hard-coded generation can never fence a
+/// projection against a superseded one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RetainedProjectionGeneration {
+    /// Highest `projection_generation` the store retains for this kind.
+    pub(crate) projection_generation: u64,
+    /// Highest `source_generation` the store retains for this kind.
+    pub(crate) source_generation: u64,
+}
+
+/// Retained publication generations per declared projection kind.
+///
+/// Keyed by the same `projection_kind` string the transition declares, so the
+/// planner never invents a second spelling of the projection's identity. A kind
+/// with no retained publication is absent and reads as the genesis cursor.
+pub(crate) type ProjectionGenerations = BTreeMap<String, RetainedProjectionGeneration>;
+
+/// Every durable value one planning pass reads back before it plans.
+///
+/// The heads, the per-scope chain tips, and the retained publication
+/// generations are all observed state of the SAME store read, and the planner
+/// needs them together: the chain links, the revision deltas, and the
+/// publication generations must all be derived from one consistent observation
+/// rather than from independently supplied fragments (issue #1931).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ObservedStoreState {
+    /// Current `revision_head` rows for the transition's revision keys.
+    pub(crate) revision_heads: Vec<RevisionHead>,
+    /// Current `ordering_head` rows for the transition's Ordering Scopes.
+    pub(crate) ordering_heads: Vec<OrderingHead>,
+    /// Per-scope prior link hashes for the canonical event's chain links.
+    pub(crate) chain_tips: OrderingChainTips,
+    /// Retained publication generations for the declared projection kinds.
+    pub(crate) projection_generations: ProjectionGenerations,
+}
+
+/// Folds one observed retained publication into the per-kind maximum.
+///
+/// Publications for a kind accumulate one row each, so the reader folds the
+/// maximum generation it observed rather than rejecting repeats: only the
+/// highest retained generation is the cursor the next publication advances
+/// from.
+pub(crate) fn retain_projection_generations(
+    generations: &mut ProjectionGenerations,
+    projection_kind: String,
+    observed: RetainedProjectionGeneration,
+) {
+    generations
+        .entry(projection_kind)
+        .and_modify(|retained| {
+            retained.projection_generation = retained
+                .projection_generation
+                .max(observed.projection_generation);
+            retained.source_generation = retained.source_generation.max(observed.source_generation);
+        })
+        .or_insert(observed);
+}
+
+/// The generation pair the next publication of one kind must carry.
+fn next_projection_generations(
+    projection_kind: &str,
+    generations: &ProjectionGenerations,
+) -> Result<RetainedProjectionGeneration, StoreError> {
+    let retained = generations
+        .get(projection_kind)
+        .copied()
+        .unwrap_or_default();
+    Ok(RetainedProjectionGeneration {
+        projection_generation: checked_increment(
+            retained.projection_generation,
+            "projection_generation",
+            "projection generation overflow",
+        )?,
+        source_generation: checked_increment(
+            retained.source_generation,
+            "source_generation",
+            "source generation overflow",
+        )?,
+    })
+}
+
+/// Re-binds every planned publication to the freshly read retained state.
+///
+/// An allocation-contention retry re-enters through
+/// [`recompute_allocation`], which by contract preserves every semantic value
+/// from the established plan — but the projection generation is read from the
+/// store's retained publications, and the partner that won the contended
+/// allocation may have published a newer one. Re-binding here keeps the
+/// publication generation equal to "the retained generation plus one" on the
+/// attempt that actually commits, without re-entering full planning and without
+/// ever deriving a generation from anything but retained durable state.
+///
+/// A plan that declares no projection kind has nothing to re-bind, so this is
+/// the identity for the majority of transitions.
+pub(crate) fn rebind_publication_generations(
+    plan: &mut ApplyPlan,
+    generations: &ProjectionGenerations,
+) -> Result<(), StoreError> {
+    let mut rebound = Vec::with_capacity(plan.projection_records.len());
+    for record in &plan.projection_records {
+        let next = next_projection_generations(&record.projection_kind, generations)?;
+        let mut record = record.clone();
+        record.projection_generation = next.projection_generation;
+        record.source_generation = next.source_generation;
+        record.validate()?;
+        rebound.push(record);
+    }
+    plan.projection_records = rebound;
+    Ok(())
+}
+
 /// Planned durable effects of one committed transition.
 #[derive(Clone, Debug)]
 pub(crate) struct ApplyPlan {
@@ -129,21 +247,20 @@ pub(crate) fn plan_apply(
 ) -> Result<ApplyPlan, StoreError> {
     plan_apply_with_chain_tips(
         transition,
-        current_revision_heads,
-        current_ordering_heads,
-        &OrderingChainTips::new(),
+        &ObservedStoreState {
+            revision_heads: current_revision_heads.to_vec(),
+            ordering_heads: current_ordering_heads.to_vec(),
+            ..ObservedStoreState::default()
+        },
         next_commit_sequence,
         next_outbox_sequence,
     )
 }
 
-/// Legacy no-authority planning against the observed per-scope chain tips
-/// (issue #1931).
+/// Legacy no-authority planning against the observed store state (issue #1931).
 pub(crate) fn plan_apply_with_chain_tips(
     transition: &PreparedTransition,
-    current_revision_heads: &[RevisionHead],
-    current_ordering_heads: &[OrderingHead],
-    current_chain_tips: &OrderingChainTips,
+    observed: &ObservedStoreState,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
@@ -151,9 +268,7 @@ pub(crate) fn plan_apply_with_chain_tips(
     plan_apply_with_payload_authority(
         transition,
         &authorities,
-        current_revision_heads,
-        current_ordering_heads,
-        current_chain_tips,
+        observed,
         next_commit_sequence,
         next_outbox_sequence,
     )
@@ -176,16 +291,19 @@ pub(crate) fn select_apply_plan(
     select_apply_plan_with_chain_tips(
         transition,
         authorities,
-        current_revision_heads,
-        current_ordering_heads,
-        &OrderingChainTips::new(),
+        &ObservedStoreState {
+            revision_heads: current_revision_heads.to_vec(),
+            ordering_heads: current_ordering_heads.to_vec(),
+            ..ObservedStoreState::default()
+        },
         next_commit_sequence,
         next_outbox_sequence,
     )
 }
 
 /// Sole production planner entry: routes the transition and threads the
-/// observed per-scope chain tips into every canonical-event chain link.
+/// observed store state into every canonical-event chain link and projection
+/// publication record.
 ///
 /// Slice C2 (issue #19): when at least one operation claims a payload
 /// authority, the transaction plans through
@@ -198,9 +316,7 @@ pub(crate) fn select_apply_plan(
 pub(crate) fn select_apply_plan_with_chain_tips(
     transition: &PreparedTransition,
     authorities: &[Option<ExactJsonBytes>],
-    current_revision_heads: &[RevisionHead],
-    current_ordering_heads: &[OrderingHead],
-    current_chain_tips: &OrderingChainTips,
+    observed: &ObservedStoreState,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
@@ -214,18 +330,14 @@ pub(crate) fn select_apply_plan_with_chain_tips(
         plan_apply_with_payload_authority(
             transition,
             authorities,
-            current_revision_heads,
-            current_ordering_heads,
-            current_chain_tips,
+            observed,
             next_commit_sequence,
             next_outbox_sequence,
         )
     } else {
         plan_apply_with_chain_tips(
             transition,
-            current_revision_heads,
-            current_ordering_heads,
-            current_chain_tips,
+            observed,
             next_commit_sequence,
             next_outbox_sequence,
         )
@@ -241,12 +353,16 @@ pub(crate) fn select_apply_plan_with_chain_tips(
 /// authority. When at least one authority is present, the outbox payload
 /// digest binds every authority digest on top of the whole-transition
 /// digest; legacy all-`None` plans keep the exact historical digest.
+///
+/// `observed` is the one consistent readback of the store's heads, per-scope
+/// chain tips, and retained projection publication generations; every value
+/// this plan derives comes from it, so a chain link, a revision delta, and a
+/// publication generation can never be planned against different observations
+/// of the same store.
 pub(crate) fn plan_apply_with_payload_authority(
     transition: &PreparedTransition,
     authorities: &[Option<ExactJsonBytes>],
-    current_revision_heads: &[RevisionHead],
-    current_ordering_heads: &[OrderingHead],
-    current_chain_tips: &OrderingChainTips,
+    observed: &ObservedStoreState,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
@@ -261,7 +377,8 @@ pub(crate) fn plan_apply_with_payload_authority(
     let mut revision_before_after = Vec::with_capacity(revision_keys.len());
     let mut next_revision_heads = Vec::with_capacity(revision_keys.len());
     for key in revision_keys {
-        let before = current_revision_heads
+        let before = observed
+            .revision_heads
             .iter()
             .find(|head| head.key == key)
             .map_or(1, |head| head.revision);
@@ -280,7 +397,8 @@ pub(crate) fn plan_apply_with_payload_authority(
 
     let mut next_ordering_heads = Vec::with_capacity(transition.ordering_scopes.len());
     for scope in transition.ordering_scopes.iter().cloned() {
-        let before = current_ordering_heads
+        let before = observed
+            .ordering_heads
             .iter()
             .find(|head| head.scope == scope)
             .map_or(1, |head| head.sequence);
@@ -304,8 +422,13 @@ pub(crate) fn plan_apply_with_payload_authority(
     } else {
         bound_payload_digest(transition, &records)?
     };
-    let projection_records =
-        projection_records(transition, &operation_key, &commit_id, &next_revision_heads)?;
+    let projection_records = projection_records(
+        transition,
+        &operation_key,
+        &commit_id,
+        &next_revision_heads,
+        &observed.projection_generations,
+    )?;
     let (outbox_records, next_outbox_sequence) = outbox_records(
         transition,
         &operation_key,
@@ -318,7 +441,7 @@ pub(crate) fn plan_apply_with_payload_authority(
         transition,
         &event_ids,
         &next_ordering_heads,
-        current_chain_tips,
+        &observed.chain_tips,
         &payload_digest,
         commit_sequence,
     )?;
@@ -942,11 +1065,19 @@ fn command_ids(transition: &PreparedTransition, operation_key: &str) -> Vec<Stri
 /// are the lossless representation and these projections must never be used
 /// to reconstruct payload content. Any authority/projection disagreement is
 /// a typed error at the read boundary, never a silent fallback.
+///
+/// `I5.8` requires an advancing `projection_kind_and_generation` and
+/// `source_generation_and_cursor`, and this record is the only place either
+/// generation is chosen: both are read back from the store's own retained
+/// publications for that kind (issue #1931) and advanced by exactly one, so a
+/// publication can never claim a generation another publication already
+/// holds and a reader can fence a superseded publication out.
 fn projection_records(
     transition: &PreparedTransition,
     operation_key: &str,
     commit_id: &CommitId,
     source_revision_heads: &[RevisionHead],
+    retained_generations: &ProjectionGenerations,
 ) -> Result<Vec<ProjectionPublicationRecord>, StoreError> {
     transition
         .event_projection_relation_intents
@@ -959,13 +1090,14 @@ fn projection_records(
                 .map(|head| head.revision)
                 .max()
                 .unwrap_or(1);
+            let generation = next_projection_generations(kind, retained_generations)?;
             let record = ProjectionPublicationRecord {
                 publication_id: ProjectionPublicationId::new(format!(
                     "projection-{operation_key}-{index}"
                 ))?,
                 projection_kind: kind.clone(),
-                projection_generation: 1,
-                source_generation: 1,
+                projection_generation: generation.projection_generation,
+                source_generation: generation.source_generation,
                 source_cursor,
                 state_fence: transition.state_fence.clone(),
                 mode: ProjectionMode::Delta,

@@ -684,6 +684,17 @@ pub(crate) const READ_ORDERING_HEADS_BY_SCOPES: &str =
 /// chain links, which the caller reads as the genesis prior.
 pub(crate) const READ_ORDERING_CHAIN_TIPS_BY_SCOPES: &str = "SELECT VALUE { ordering_scope: ordering_scope, event_hash: event_hash } FROM ordering_head WHERE ordering_scope IN $scopes;";
 
+/// Reads each declared projection kind's retained publication generations, the
+/// `projection_generation`/`source_generation` the next publication of that
+/// kind must advance from (issue #1931, `I5.8`).
+///
+/// The two generations live inside the record's `body`, so they are projected
+/// out of it explicitly: a schemaless `SELECT *` would return the provider
+/// `id` as well and fail closed deserialization against a real provider (see
+/// [`READ_SCHEMA_META`]). A kind with no retained publication simply returns
+/// no row, which the caller reads as the genesis cursor.
+pub(crate) const READ_PROJECTION_GENERATIONS_BY_KINDS: &str = "SELECT VALUE { projection_kind: body.projection_kind, projection_generation: body.projection_generation, source_generation: body.source_generation } FROM projection_record WHERE body.projection_kind IN $kinds;";
+
 pub(crate) const READ_ALL_REVISION_HEADS: &str = "SELECT VALUE body FROM revision_head;";
 
 pub(crate) const READ_ALL_ORDERING_HEADS: &str = "SELECT VALUE body FROM ordering_head;";
