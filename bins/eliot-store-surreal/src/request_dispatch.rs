@@ -78,13 +78,13 @@ fn internal_defect_fallback(context: &StoreFailureIdentityContext) -> Response {
     // and never re-enters the legacy string error path.
     if let Ok(failure) = StoreFailure::from_store_error(StoreError::InvalidOutbox, context.clone())
     {
-        return Response::Failure { failure };
+        return Response::canonical_failure(failure);
     }
     if let Ok(failure) = StoreFailure::from_store_error(
         StoreError::InvalidOutbox,
         StoreFailureIdentityContext::default(),
     ) {
-        return Response::Failure { failure };
+        return Response::canonical_failure(failure);
     }
     unreachable!(
         "store failure contract rejects the empty internal defect; \
@@ -100,7 +100,7 @@ fn map_store_error(error: StoreError, context: StoreFailureIdentityContext) -> R
     // string error variant.
     let sanitized = sanitized_identity_context(context);
     match StoreFailure::from_store_error(error, sanitized.clone()) {
-        Ok(failure) => Response::Failure { failure },
+        Ok(failure) => Response::canonical_failure(failure),
         Err(_) => internal_defect_fallback(&sanitized),
     }
 }
@@ -119,7 +119,7 @@ pub(crate) fn map_composition_error(
         StoreCompositionError::UnknownOutcome { .. } => {
             let sanitized = sanitized_identity_context(context);
             match StoreFailure::from_provider_unknown_outcome(&sanitized) {
-                Ok(failure) => Response::Failure { failure },
+                Ok(failure) => Response::canonical_failure(failure),
                 Err(_) => internal_defect_fallback(&sanitized),
             }
         }
@@ -228,7 +228,7 @@ fn response_for_transaction_receipt(
     }
     let sanitized = sanitized_identity_context(context);
     match StoreFailure::from_store_error(StoreError::MissingReceiptEnvelope, sanitized.clone()) {
-        Ok(failure) => Response::Failure { failure },
+        Ok(failure) => Response::canonical_failure(failure),
         Err(_) => internal_defect_fallback(&sanitized),
     }
 }
@@ -258,7 +258,7 @@ fn response_for_receipt_lookup(
                 StoreError::MissingReceiptEnvelope,
                 sanitized.clone(),
             ) {
-                Ok(failure) => Response::Failure { failure },
+                Ok(failure) => Response::canonical_failure(failure),
                 Err(_) => internal_defect_fallback(&sanitized),
             }
         }

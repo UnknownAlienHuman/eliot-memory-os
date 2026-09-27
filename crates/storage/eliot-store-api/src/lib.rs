@@ -179,11 +179,16 @@ pub use request_hash::{
 pub use store_failure::{
     ErasureFailureKind, LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN,
     MAX_STORE_FAILURE_EVIDENCE_HANDLES, MAX_STORE_FAILURE_REFERENCE_LEN,
-    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
-    StoreConflictObservation, StoreEvidenceHandles, StoreFailure, StoreFailureContractError,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreFailureRequestContext,
-    StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreRetryDirective,
-    decode_legacy_store_failure_v1, erasure_store_failure,
+    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, MigratedV1Failure,
+    STORE_FAILURE_CONTRACT_REVISION, StoreConflictObservation, StoreEvidenceHandles, StoreFailure,
+    StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
+    StoreFailureRequestContext, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
+    StoreRetryDirective, V1_FAILURE_USE_SITES, V1_UNSCANNED_SURFACES, V1CompatWindow,
+    V1DispositionStatus, V1FailureUseInventory, V1FailureUseSite, V1Interpretation,
+    V1MigrationDisposition, V1RemovalBlocker, V1UnscannedSurface, bridge_v1_within_window,
+    decode_legacy_store_failure_v1, erasure_store_failure, migrate_legacy_store_failure_v1,
+    v1_compat_window, v1_decoder_removal_gate, v1_failure_use_inventory, v1_migration_disposition,
+    v1_use_inventory_digest,
 };
 
 pub use named_mutation_receipt::{

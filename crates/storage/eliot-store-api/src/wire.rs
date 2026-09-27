@@ -1015,6 +1015,15 @@ pub enum StoreResponse {
 }
 
 impl StoreResponse {
+    /// Builds the canonical typed-failure response (issue #1859).
+    ///
+    /// New failures are emitted exclusively in this lossless envelope; the
+    /// legacy `Error`/`Unknown` variants are never constructed for new
+    /// failures. They remain readable only through the bounded v1 window.
+    pub fn canonical_failure(failure: crate::StoreFailure) -> Self {
+        Self::Failure { failure }
+    }
+
     /// Converts a write receipt into a reconciliation-safe response.
     pub fn from_transaction_receipt(receipt: WriteReceipt) -> Self {
         let reason = match receipt.validate() {
