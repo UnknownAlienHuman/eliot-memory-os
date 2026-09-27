@@ -745,7 +745,9 @@ impl fmt::Display for DiagnosticBrief {
             write!(
                 formatter,
                 " blocked_on_owner={} resource={} awaiting_transition={}",
-                wait.blocked_owner, wait.blocked_resource, wait.blocked_transition
+                wait.blocked_owner(),
+                wait.blocked_resource(),
+                wait.blocked_transition()
             )?;
         }
         write!(formatter, " evidence_refs={}", self.raw_evidence_refs)?;
