@@ -726,8 +726,10 @@ pub struct ImprovementMaterialEquality {
 ///
 /// A record, never a verdict. It pairs the retained content commitment with the
 /// discriminator projection and the material-equality key computed from those
-/// same retained bytes and the retained experiment, so a consumer can compare
-/// the current candidate against the retained one without re-committing either.
+/// same retained bytes and the exact retained experiment plan, so a consumer
+/// can compare the current candidate against the retained one without
+/// re-committing either. The full plan is retained separately from the
+/// intentionally narrower cross-operation material-equality key.
 /// The record supplies no judgement: a caller may read it, carry it, or withhold
 /// it, and withholding it establishes nothing.
 ///
@@ -745,13 +747,15 @@ pub struct RetainedImprovementProposal {
     /// Material-equality key of the same retained bytes and retained
     /// experiment.
     pub material_equality: ImprovementMaterialEquality,
+    /// Exact checked experiment plan that accompanied the retained proposal.
+    pub experiment_plan: ExperimentPlan,
 }
 
 /// The current proposal exactly as the pipeline committed it.
 ///
-/// The one commitment this run computed, plus the projection and the
-/// material-equality key of the same normalized bytes and the same joined
-/// experiment plan. The pipeline builds it once and hands the same value to the
+/// The one commitment this run computed, plus the projection, material-equality
+/// key, and exact joined experiment plan that accompany the same normalized
+/// proposal. The pipeline builds it once and hands the same value to the
 /// admission gate and to the canary handoff, so a consumer reads the checked
 /// version instead of computing a second opinion. It carries no decision: the
 /// assessment belongs to [`compare_improvement_commitments`].
@@ -764,6 +768,8 @@ pub struct ImprovementCurrentProposal {
     pub discriminator: ImprovementDiscriminatorProjection,
     /// Material-equality key of the same bytes and the same joined experiment.
     pub material_equality: ImprovementMaterialEquality,
+    /// Exact checked experiment plan joined to the normalized proposal.
+    pub experiment_plan: ExperimentPlan,
 }
 
 /// Inspectable, non-authorizing canary handoff for one joined run.
@@ -1167,12 +1173,13 @@ pub fn proposal_digest(
 /// Builds the one checked current record from already-normalized bytes.
 ///
 /// The single producer of [`ImprovementCurrentProposal`]: the commitment, the
-/// discriminator projection, and the material-equality key are derived here,
-/// together, from the same normalized proposal and the same joined experiment
-/// plan, so no consumer can hold a commitment, a projection, and a key that
-/// describe different content or different experiments. The experiment is a
-/// required argument rather than an optional refinement because a no-progress
-/// decision over the wrong experiment is not a no-progress decision.
+/// discriminator projection, the material-equality key, and exact experiment
+/// plan are derived or copied here, together, from the same normalized
+/// proposal and the same joined experiment plan, so no consumer can hold
+/// identities that describe different content or experiments. The experiment
+/// is a required argument rather than an optional refinement because a
+/// no-progress decision over the wrong experiment is not a no-progress
+/// decision.
 fn current_proposal_of(
     normalized: &ImprovementProposal,
     experiment: &ExperimentPlan,
@@ -1181,6 +1188,7 @@ fn current_proposal_of(
         commitment: commitment_of(normalized)?,
         discriminator: discriminator_of(normalized),
         material_equality: material_equality_of(normalized, experiment),
+        experiment_plan: experiment.clone(),
     })
 }
 
@@ -1227,9 +1235,10 @@ fn material_equality_of(
 /// Exact-repeat and identity-conflict assessment for one uncommitted proposal.
 ///
 /// Integrity and semantic progress stay separate. An exact replay reproduces
-/// the complete current commitment under its original logical operation. The
-/// same operation and idempotency key with different content is an identity
-/// conflict, not the old request and not an automatic retry. A retained record
+/// the complete current proposal commitment and experiment plan under its
+/// original logical operation. The same operation and idempotency key with
+/// different proposal or plan content is an identity conflict, not the old
+/// request and not an automatic retry. A retained record
 /// written under another domain, encoding revision, or algorithm — a legacy
 /// FNV-1a value, for example — stays an unqualified historical observation
 /// until its owner reconciles it. A different logical operation is not progress
@@ -1275,13 +1284,14 @@ pub(crate) fn assess_improvement_progress(
 
 /// Compares a retained prior record with the current checked record.
 ///
-/// The single owner of the integrity decision, over canonical bytes only: no
-/// caller boolean, no legacy value reinterpreted as a current commitment, and
-/// no effect state. Integrity is decided first and stays separate from semantic
-/// progress.
+/// The single owner of the integrity decision, over the current proposal's
+/// canonical bytes and exact checked experiment plan: no caller boolean, no
+/// legacy value reinterpreted as a current commitment, and no effect state.
+/// Integrity is decided first and stays separate from semantic progress.
 ///
-/// Under one logical operation and idempotency key, a byte identical repeat is
-/// `ExactReplay` and changed current-encoding content is `IdentityConflict`; a
+/// Under one logical operation and idempotency key, `ExactReplay` requires both
+/// a byte-identical current-version proposal commitment and an equal complete
+/// experiment plan; changed proposal or plan content is `IdentityConflict`. A
 /// retained value written under another domain, encoding revision, or algorithm
 /// is `UnestablishedPrior` and cannot be matched. Outside that operation, a
 /// repeat of the same bounded experiment — same mechanism, target, budget,
@@ -1334,7 +1344,9 @@ fn same_operation_replay(
             prior,
         ));
     }
-    if prior.digest == current.commitment.digest {
+    if prior.digest == current.commitment.digest
+        && retained.experiment_plan == current.experiment_plan
+    {
         return Some(ImprovementReplayAssessment::ExactReplay {
             commitment: current.commitment.clone(),
         });
