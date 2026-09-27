@@ -137,21 +137,19 @@ impl CodeCortexService {
             ast_grep_health(&repo_root, &mut verifier_evidence)?;
         }
 
-        let diagnostic_evidence = diagnostics(
-            &repo_root,
-            request.include_diagnostics,
-            &mut verifier_evidence,
-        )?;
+        let diagnostic_evidence = Vec::new();
+        verifier_evidence.push(diagnostic_availability(request.include_diagnostics));
 
         unavailable_adapters(&mut verifier_evidence);
         let blast_radius = blast_radius(&file_evidence, &symbol_evidence);
         let invariant_cards = invariant_cards();
         let evidence_sources = evidence_sources(&verifier_evidence);
-        let operation_status = if core_adapters_ready(&verifier_evidence) {
-            OperationStatus::OperationCompleted
-        } else {
-            OperationStatus::Blocked
-        };
+        let operation_status =
+            if core_adapters_ready(&verifier_evidence) && !request.include_diagnostics {
+                OperationStatus::OperationCompleted
+            } else {
+                OperationStatus::Blocked
+            };
 
         Ok(CodeCortexReport {
             project: request.project.clone(),
@@ -181,6 +179,27 @@ impl CodeCortexService {
             memory_receipt: None,
             operation_status,
         })
+    }
+}
+
+fn diagnostic_availability(include_diagnostics: bool) -> VerifierEvidence {
+    let (status, summary) = if include_diagnostics {
+        (
+            "unavailable",
+            "no LspBridge diagnostics observation was supplied; CodeCortex does not execute diagnostics",
+        )
+    } else {
+        (
+            "skipped",
+            "diagnostics were not requested; no diagnostic observation was consumed",
+        )
+    };
+    VerifierEvidence {
+        name: "diagnostics_adapter".to_owned(),
+        command: "LspBridge diagnostics observation".to_owned(),
+        status: status.to_owned(),
+        summary: summary.to_owned(),
+        source: CodeEvidenceSource::Diagnostics,
     }
 }
 
@@ -898,66 +917,6 @@ fn ast_grep_scan(
         }
     }
     Ok(())
-}
-
-fn diagnostics(
-    repo_root: &Path,
-    include_diagnostics: bool,
-    verifier_evidence: &mut Vec<VerifierEvidence>,
-) -> Result<Vec<DiagnosticEvidence>, EngineError> {
-    if !include_diagnostics {
-        verifier_evidence.push(verifier(
-            "diagnostics_adapter",
-            "cargo check --workspace --all-targets --all-features",
-            true,
-            "skipped by request".to_owned(),
-            CodeEvidenceSource::Diagnostics,
-        ));
-        return Ok(vec![DiagnosticEvidence {
-            source: CodeEvidenceSource::Diagnostics,
-            status: "skipped".to_owned(),
-            path: None,
-            line: None,
-            severity: "info".to_owned(),
-            message: "diagnostics skipped by request".to_owned(),
-        }]);
-    }
-
-    let output = run_process(
-        repo_root,
-        "cargo",
-        &["check", "--workspace", "--all-targets", "--all-features"],
-    )?;
-    verifier_evidence.push(verifier(
-        "diagnostics_adapter",
-        "cargo check --workspace --all-targets --all-features",
-        output.status,
-        output.summary(),
-        CodeEvidenceSource::Diagnostics,
-    ));
-    if output.status {
-        return Ok(vec![DiagnosticEvidence {
-            source: CodeEvidenceSource::Diagnostics,
-            status: "clean".to_owned(),
-            path: None,
-            line: None,
-            severity: "info".to_owned(),
-            message: "cargo check passed".to_owned(),
-        }]);
-    }
-    Ok(output
-        .stderr
-        .lines()
-        .take(20)
-        .map(|message| DiagnosticEvidence {
-            source: CodeEvidenceSource::Diagnostics,
-            status: "failed".to_owned(),
-            path: None,
-            line: None,
-            severity: "error".to_owned(),
-            message: message.to_owned(),
-        })
-        .collect())
 }
 
 fn unavailable_adapters(verifier_evidence: &mut Vec<VerifierEvidence>) {
