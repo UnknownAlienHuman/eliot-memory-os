@@ -16,11 +16,11 @@ from agent_host_bundle import (
     IDENTITY_VERSION,
     MANIFEST_PATH,
     TREE_DIGEST_RECIPE,
-    _blake3_hex,
-    _canonical_skill_content_hash,
     _require_hex_digest,
     _safe_relative,
     _tree_digest,
+    _validate_source_file,
+    _verify_skill_pack_snapshot,
     _verify_adapter_contract,
     _verify_file_payload,
     _verify_staged_bytes,
@@ -65,7 +65,7 @@ def _load_expected_inputs(root: Path, host: str) -> dict[str, Any]:
     )
     skill_root_relative = _safe_relative(str(manifest["canonical_skill_root"]), "canonical_skill_root")
     skill_root = root.joinpath(*skill_root_relative.parts)
-    material: list[str] = []
+    bodies: list[tuple[str, bytes]] = []
     skill_file_digests: dict[str, str] = {}
     for name in skill_pack["order"]:
         skill_dir = skill_root / name
@@ -82,18 +82,21 @@ def _load_expected_inputs(root: Path, host: str) -> dict[str, Any]:
         if observed_members != {"SKILL.md", *declared_assets}:
             raise AssertionError(f"{host}: source Skill files differ from declared assets: {name!r}")
         body_bytes = body.read_bytes()
-        body_text = body_bytes.decode("utf-8")
-        observed = _canonical_skill_content_hash(body_text)
-        if observed != skill_pack["pins"][name]:
-            raise AssertionError(f"{host}: expected Skill pin mismatch: {name!r}")
-        material.append(f"{name}:{observed}\n")
+        try:
+            body_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise AssertionError(f"{host}: expected Skill body is not UTF-8: {name!r}") from error
+        bodies.append((name, body_bytes))
         skill_file_digests[f"{name}/SKILL.md"] = sha256_bytes(body_bytes)
         for relative, expected_digest in declared_assets.items():
             source = skill_dir.joinpath(*_safe_relative(relative, "reference asset").parts)
             if sha256_bytes(source.read_bytes()) != expected_digest:
                 raise AssertionError(f"{host}: expected Skill asset pin mismatch: {name}/{relative}")
             skill_file_digests[f"{name}/{relative}"] = expected_digest
-    pack_hash = _blake3_hex("".join(material).encode("utf-8"))
+    owner_result = _verify_skill_pack_snapshot(
+        skill_pack["bytes"], bodies, skill_pack["order"], skill_pack["pins"]
+    )
+    pack_hash = owner_result["pack_hash"]
     if pack_hash != manifest["skill_pack"]["pack_hash"]:
         raise AssertionError(f"{host}: expected Skill pack hash mismatch")
     route_pin = _require_hex_digest(
@@ -377,42 +380,30 @@ def _route_profile(host: str) -> dict[str, Any]:
 def _synthetic_root() -> Path:
     root = Path(tempfile.mkdtemp(prefix="eliot-host-bundle-self-test-"))
     (root / "integrations/agent-runtimes").mkdir(parents=True)
-    (root / "integrations/agent-skills/eliot-work/references").mkdir(parents=True)
-    # Fixed regression body: its BLAKE3 content pin and the pack hash below are
-    # hardcoded so the self-test proves the adapter recipe on every run. Any
-    # byte change here (including line endings) must fail the pack check.
-    (root / "integrations/agent-skills/eliot-work/SKILL.md").write_text(
-        "# Work\n\nUse this procedure for a bounded ELIOT work item.\n",
-        encoding="utf-8",
+    repository_root = Path(__file__).resolve().parents[1]
+    source_root = repository_root / "integrations/agent-skills"
+    skill_pack = load_skill_pack(
+        repository_root,
+        "integrations/agent-skills/skill-pack.manifest.json",
+        1024 * 1024,
     )
-    (root / "integrations/agent-skills/eliot-work/references/contract.md").write_text(
-        "Reference loaded only when requested.\n",
-        encoding="utf-8",
-    )
-    (root / "integrations/agent-skills/skill-pack.manifest.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "eliot-agent-skill-pack-v1",
-                "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
-                "reference_assets_schema": "sha256-path-list-v1",
-                "pack_hash": "085980d3da535214408d09de0fcb1925b8a68c444f9491385cbbcd77fcf41fcc",
-                "skills": [
-                    {
-                        "name": "eliot-work",
-                        "content_blake3": "df19ab6cdfcacc4644905930ad4984271e081c0dfbccced250d91c6d2f82c3c6",
-                        "reference_assets": [{
-                            "path": "references/contract.md",
-                            "sha256": sha256_bytes((root / "integrations/agent-skills/eliot-work/references/contract.md").read_bytes()),
-                        }],
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    skill_manifest_sha = sha256_bytes(
-        (root / "integrations/agent-skills/skill-pack.manifest.json").read_bytes()
-    )
+    skill_manifest_bytes = skill_pack["bytes"]
+    skill_manifest = json.loads(skill_manifest_bytes.decode("utf-8"))
+    skills_root = root / "integrations/agent-skills"
+    copied_skill_files: list[Path] = []
+    for name in skill_pack["order"]:
+        for relative in ["SKILL.md", *skill_pack["reference_assets"][name]]:
+            source = source_root / name / Path(relative)
+            destination = skills_root / name / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            data = _validate_source_file(source, repository_root, 1024 * 1024)
+            destination.write_bytes(data)
+            copied_skill_files.append(destination)
+    (skills_root / "skill-pack.manifest.json").write_bytes(skill_manifest_bytes)
+    skill_manifest_sha = sha256_bytes(skill_manifest_bytes)
+    skill_pack_order = skill_pack["order"]
+    max_skill_file_bytes = max(path.stat().st_size for path in copied_skill_files)
+    skill_pack_bytes = sum(path.stat().st_size for path in copied_skill_files)
     hosts: dict[str, Any] = {}
     for host in HOSTS:
         route = root / f"integrations/{host}/route-profile.json"
@@ -443,14 +434,14 @@ def _synthetic_root() -> Path:
         "skill_pack": {
             "manifest": "integrations/agent-skills/skill-pack.manifest.json",
             "manifest_sha256": skill_manifest_sha,
-            "pack_hash": "085980d3da535214408d09de0fcb1925b8a68c444f9491385cbbcd77fcf41fcc",
-            "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
-            "order": ["eliot-work"],
+            "pack_hash": skill_manifest["pack_hash"],
+            "hash_algorithm": skill_manifest["hash_algorithm"],
+            "order": skill_pack_order,
         },
         "limits": {
-            "max_file_bytes": 65536,
-            "max_bundle_bytes": 1048576,
-            "max_files": 64,
+            "max_file_bytes": max(65536, max_skill_file_bytes),
+            "max_bundle_bytes": max(1048576, skill_pack_bytes * 2),
+            "max_files": max(64, len(copied_skill_files) + 16),
         },
         "hosts": hosts,
     }
@@ -623,6 +614,9 @@ def self_test() -> None:
             skills_root = root / "integrations/agent-skills"
             pack_path = skills_root / "skill-pack.manifest.json"
             original_pack = pack_path.read_bytes()
+            canonical_order = [
+                entry["name"] for entry in json.loads(original_pack.decode("utf-8"))["skills"]
+            ]
             body_path = skills_root / "eliot-work" / "SKILL.md"
             original_body = body_path.read_bytes()
             route_path = root / "integrations/codex/route-profile.json"
@@ -637,7 +631,7 @@ def self_test() -> None:
                 pack_path.write_bytes(original_pack)
                 repack = _read_json(manifest_path)
                 repack["skill_pack"]["manifest_sha256"] = sha256_bytes(original_pack)
-                repack["skill_pack"]["order"] = ["eliot-work"]
+                repack["skill_pack"]["order"] = canonical_order
                 manifest_path.write_text(json.dumps(repack), encoding="utf-8")
 
             # Case 14: unlisted well-formed and empty directories never enter.
@@ -647,7 +641,7 @@ def self_test() -> None:
             (skills_root / "empty-shadow").mkdir()
             shadowed = materialize_host_bundle(root, "codex", scratch / "unlisted-ignored")
             _assert_bundle(scratch / "unlisted-ignored", "codex", shadowed, expect())
-            if shadowed.get("skill_pack_order") != ["eliot-work"]:
+            if shadowed.get("skill_pack_order") != canonical_order:
                 raise AssertionError("unlisted directory entered the Skill index")
             if any("shadow" in item["path"] for item in shadowed["files"]):
                 raise AssertionError("unlisted directory entered the payload")
@@ -694,31 +688,17 @@ def self_test() -> None:
             body_path.write_bytes(original_body)
 
             # Case 19: an altered pack order rejects even when every body pin is right.
-            second_dir = skills_root / "eliot-second"
-            second_dir.mkdir()
-            (second_dir / "SKILL.md").write_text(
-                "# Second\n\nSecond procedure body for ordering checks.\n",
-                encoding="utf-8",
-            )
             two_pack = json.loads(original_pack.decode("utf-8"))
-            two_pack["skills"].append(
-                {
-                    "name": "eliot-second",
-                    "content_blake3": "6e7c00e13f6a3d9f95880317786b5c5a4906bf5c570815226189b16b7e8b8347",
-                    "reference_assets": [],
-                }
-            )
             two_pack["skills"] = list(reversed(two_pack["skills"]))
             rewrite_pack(two_pack)
             both = _read_json(manifest_path)
-            both["skill_pack"]["order"] = ["eliot-second", "eliot-work"]
+            both["skill_pack"]["order"] = list(reversed(canonical_order))
             manifest_path.write_text(json.dumps(both), encoding="utf-8")
             _expect_failure(
                 "altered pack order",
                 lambda: materialize_host_bundle(root, "codex", scratch / "reordered-pack"),
             )
             restore_pack()
-            shutil.rmtree(second_dir, ignore_errors=True)
 
             # Case 20: a route source pin mismatch rejects before validation.
             original_route = route_path.read_bytes()
