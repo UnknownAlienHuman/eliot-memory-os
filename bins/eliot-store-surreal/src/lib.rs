@@ -72,9 +72,10 @@ pub(crate) use launch_config::{validate_digest, validate_launch_text};
 mod compatibility;
 pub use compatibility::{
     ADMITTED_TRANSPORT, COMPATIBILITY_FILE_NAME, CompatibilityFile, CompatibilityVerdict,
-    SurrealCompatibility, compatibility_path_for_config, evaluate_compatibility,
-    load_compatibility_for_config, parse_compatibility_bytes, require_compatibility_for_writer,
-    require_observed_identity_match,
+    EVIDENCE_SNAPSHOT_FILE_NAME, EvidenceSnapshotVerification, SurrealCompatibility,
+    compatibility_path_for_config, evaluate_compatibility, load_compatibility_for_config,
+    load_evidence_snapshot_verification, parse_compatibility_bytes,
+    require_compatibility_for_writer, require_observed_identity_match,
 };
 mod schema_bootstrap_contract;
 use schema_bootstrap_contract::{
