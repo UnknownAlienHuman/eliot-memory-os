@@ -230,6 +230,10 @@ fn map_composition_store_failure(
     .map_or(SkillError::IdentityMismatch, SkillError::Store)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "closed owner-error mapping retains typed refusals"
+)]
 fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityContext) -> SkillError {
     match error {
         CompositionError::Kernel(inner) => map_kernel_error(inner, ctx),
@@ -313,6 +317,19 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
             verdict,
             report,
         })),
+        CompositionError::MaterialReadinessDenied {
+            receipt_ref,
+            effect,
+            directive,
+            missing_inputs,
+        } => SkillError::MaterialReadinessDenied(Box::new(
+            eliot_skill::SkillMaterialReadinessDenial {
+                receipt_ref,
+                effect,
+                directive,
+                missing_inputs,
+            },
+        )),
         CompositionError::ScopeSensitiveGuardInputsMissing {
             trigger,
             missing_observed_binding,

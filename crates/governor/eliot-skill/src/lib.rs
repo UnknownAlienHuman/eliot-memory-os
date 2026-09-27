@@ -113,6 +113,11 @@ pub(crate) fn unique<T: Ord>(
     Ok(())
 }
 
+// StoreFailure remains by value in the public Skill error contract.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "StoreFailure is retained by value in the Skill error contract"
+)]
 #[derive(Debug, Error)]
 pub enum SkillError {
     #[error("invalid Skill lifecycle field {field}: {reason}")]
@@ -132,6 +137,9 @@ pub enum SkillError {
     IdentityMismatch,
     #[error("Skill lifecycle canonical write withheld by WorkScope guard")]
     ScopeGuardWithheld(Box<SkillScopeGuardFailure>),
+    /// Preserves the Governor's exact readiness denial for a canonical write.
+    #[error("Skill lifecycle material readiness denied: {0:?}")]
+    MaterialReadinessDenied(Box<SkillMaterialReadinessDenial>),
     #[error("Skill lifecycle requires independent route evidence")]
     IndependentEvidenceRequired,
     #[error("Skill lifecycle promotion is not reversible")]
@@ -142,6 +150,16 @@ pub enum SkillError {
     Surface(String),
     #[error("Skill lifecycle store failure: {0:?}")]
     Store(eliot_store_api::StoreFailure),
+}
+
+/// Exact material-readiness refusal retained across the Skill result boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillMaterialReadinessDenial {
+    pub receipt_ref: String,
+    pub effect: eliot_workscope::RequestedEffect,
+    pub directive: eliot_workscope::MaterialReadinessDirective,
+    pub missing_inputs: Vec<String>,
 }
 
 /// Typed evidence for a canonical write withheld by the `WorkScope` guard.
@@ -1144,6 +1162,10 @@ impl SkillRegistry {
 }
 
 #[derive(Debug, Error)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the lookup error retains the public SkillError by value"
+)]
 pub enum SkillRegistryLookupError {
     #[error("Skill lifecycle view not found")]
     NotFound,
