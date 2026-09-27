@@ -20,6 +20,7 @@ mod control_reserve;
 mod hot_path;
 mod i14_backpressure;
 mod installation_activation;
+mod restart_policy;
 mod runtime_live;
 mod supervision_authority;
 mod supervision_incarnation;
@@ -58,6 +59,12 @@ pub use installation_activation::{
     InstallationDigestBinding, InstallationScmReadback, InstallationScmRole,
     SignedInstallationActivation, SignedInstallationActivationApproval,
     VerifiedInstallationActivationApproval,
+};
+pub use restart_policy::{
+    AutomaticRestartDecision, RestartClass, RestartDependency, RestartDependencyKind,
+    RestartFailureEvidence, RestartGroupStrategy, RestartIdentityEvidence, RestartIntensityPolicy,
+    RestartInvalidationTrigger, RestartOwnerLifecycle, RestartPolicyAdmissionBinding,
+    RestartPolicyError, RestartPolicyV1, decide_automatic_restart,
 };
 pub use runtime_live::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
