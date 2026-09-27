@@ -119,26 +119,56 @@ def inferred_targets(
         return value
 
     targets: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: dict[tuple[str, str], str] = {}
 
-    def add(kind: str, name: Any, raw_path: Any, required: bool = False) -> None:
+    def add(
+        kind: str,
+        name: Any,
+        raw_path: Any,
+        required: bool = False,
+        required_features: list[str] | None = None,
+    ) -> None:
         relative = _manifest_path(package_root, raw_path, f"Cargo {kind} target path")
         path = package_root / PurePosixPath(relative)
         if not path.is_file():
             if required and strict:
                 raise NavigationError(f"Cargo {kind} target does not exist: {relative}")
             return
+        features = ",".join(required_features or ())
         key = (kind, relative)
         if key in seen:
+            if required_features is not None and seen[key] != features:
+                raise NavigationError(
+                    f"Cargo {kind} target is declared more than once with different "
+                    f"required-features: {relative}"
+                )
             return
-        seen.add(key)
+        seen[key] = features
         targets.append(
             {
                 "kind": kind,
                 "name": str(name).strip() if name is not None else Path(relative).stem,
                 "path": relative,
+                "required_features": features,
             }
         )
+
+    def table_required_features(table: dict[str, Any], kind: str) -> list[str]:
+        raw_features = table.get("required-features")
+        if raw_features is None:
+            return []
+        if not isinstance(raw_features, list) or not all(
+            isinstance(item, str) and item.strip() for item in raw_features
+        ):
+            raise NavigationError(
+                f"Cargo {kind} target required-features must be a list of non-empty strings"
+            )
+        features = [item.strip() for item in raw_features]
+        if len(set(features)) != len(features):
+            raise NavigationError(
+                f"Cargo {kind} target required-features contains a duplicate feature"
+            )
+        return features
 
     raw_lib = payload.get("lib")
     if raw_lib is not None and not isinstance(raw_lib, dict):
@@ -149,6 +179,7 @@ def inferred_targets(
             raw_lib.get("name") or package_name,
             raw_lib["path"] if "path" in raw_lib else "src/lib.rs",
             True,
+            table_required_features(raw_lib, "lib"),
         )
     elif auto_enabled("autolib"):
         add("lib", package_name, "src/lib.rs")
@@ -170,7 +201,7 @@ def inferred_targets(
             raw_path = "src/main.rs" if name == package_name else f"src/bin/{name}.rs"
         else:
             name = declared_name or PurePosixPath(str(raw_path).replace("\\", "/")).stem
-        add("bin", name, raw_path, True)
+        add("bin", name, raw_path, True, table_required_features(raw, "bin"))
 
     if auto_enabled("autobins"):
         add("bin", package_name, "src/main.rs")
@@ -206,7 +237,7 @@ def inferred_targets(
                 if not isinstance(name, str) or not name.strip():
                     raise NavigationError(f"Cargo [[{kind}]] requires a name or path")
                 raw_path = f"{directory}/{name}.rs"
-            add(kind, name, raw_path, True)
+            add(kind, name, raw_path, True, table_required_features(raw, kind))
         if not auto_enabled(auto_key):
             continue
         directory_path = package_root / directory
