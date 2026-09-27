@@ -96,8 +96,8 @@ impl RevocationHistoryEvidence {
     /// This step decodes and shape-checks the history only. It deliberately
     /// does not decide which grants the affected references reach: that is
     /// the origin-bound denominator comparison
-    /// (`GrantGraph::admit_origin_bound_closure`),
-    /// which runs before any suppression is derived.
+    /// `GrantGraph::admit_origin_bound_closure`, which runs before any
+    /// suppression is derived.
     ///
     /// Missing evidence is expressed by passing `None` at the restore
     /// boundary (see [`RevocationHistoryError::MissingHistory`]); this
@@ -130,12 +130,11 @@ impl RevocationHistoryEvidence {
 /// One CURRENT revocation closure with its exact declared reference set.
 ///
 /// The affected set is what the durable record CLAIMS: the origin reference
-/// plus every dependent the record supplied, unfiltered and undeduplicated
-/// against any graph. It is not a validated denominator — set semantics
-/// here only absorb influence cycles and self-edges so decoding terminates —
-/// and no member of it suppresses anything until the graph owner has proven
-/// it reachable from the one declared
-/// [`RevocationOrigin`](RevocationOrigin) (see [`AdmittedRevocationClosure`]).
+/// plus every dependent the record supplied, kept verbatim. It is not a
+/// validated denominator — set semantics here only absorb influence cycles
+/// and self-edges so decoding terminates — and no member of it suppresses
+/// anything until the graph owner has proven it reachable from the one
+/// declared [`RevocationOrigin`] (see [`AdmittedRevocationClosure`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedRevocationClosure {
     /// Stable closure identity carried by the evidence.
@@ -240,8 +239,9 @@ pub enum RevocationOrigin {
     Grant(GrantId),
     /// A revoked authority root. Its denominator is every admitted grant that
     /// root owns, closed under their authorized descendant paths. The root
-    /// marker is retained here, separately from the grant members, so no
-    /// grant member is ever represented by an unnamed second origin.
+    /// marker is retained here, separately from the grant members, so the
+    /// marker itself is never counted as a grant member and a second origin
+    /// can never stand in for a member.
     AuthorityRoot(AuthorityRootRef),
 }
 
@@ -259,9 +259,9 @@ impl RevocationOrigin {
 impl fmt::Display for RevocationOrigin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Grant(_) => formatter.write_str("grant:"),
-            Self::AuthorityRoot(_) => formatter.write_str("authority_root:"),
-        }?;
+            Self::Grant(_) => formatter.write_str("grant origin ")?,
+            Self::AuthorityRoot(_) => formatter.write_str("authority-root origin ")?,
+        }
         formatter.write_str(self.as_str())
     }
 }
