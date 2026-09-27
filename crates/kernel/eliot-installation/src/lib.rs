@@ -211,14 +211,16 @@ use package::{
 };
 #[cfg(test)]
 use package::{package_absent_with_snapshot, package_manifest_matches, package_staging_reference};
-pub use package_planner::{GenerationPackagePlanInput, GenerationPackagePlanner};
+pub use package_planner::{
+    GenerationPackagePlanInput, GenerationPackagePlanner, ProfileRootSelectionInput,
+};
 pub use plan::{
     InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole,
     PackageArtifactDigest, PlannedChange, SupervisionAuthorityProvisionPlan,
 };
 use plan::{validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings};
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
-pub use profile_roots::InstallationRoots;
+pub use profile_roots::{INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots};
 pub use redb_state::{
     RedbInstallationTransactionStore, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,

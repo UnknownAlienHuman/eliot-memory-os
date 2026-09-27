@@ -389,7 +389,7 @@ impl RuntimeStateRoots {
         ]
     }
 
-    fn installer_profile_root(&self) -> Result<PlatformHandle, InstallationError> {
+    pub(super) fn installer_profile_root(&self) -> Result<PlatformHandle, InstallationError> {
         match self.profile {
             InstallationProfile::SystemService | InstallationProfile::UserMode => {
                 PlatformHandle::new(joined_windows_path(
