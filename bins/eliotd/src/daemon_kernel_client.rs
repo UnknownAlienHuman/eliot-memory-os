@@ -502,6 +502,49 @@ fn derive_finish_request_identity(
     Ok(identity)
 }
 
+fn validate_finish_claim_request_identity(
+    envelope: &HostRequestEnvelope,
+    draft: &eliot_governor::FinishAttemptDraft,
+    request_identity: &RequestIdentity,
+    expected_identity: &RequestIdentity,
+) -> Result<(), String> {
+    if !envelope
+        .state_fence
+        .is_compatible_with(&request_identity.request.state_fence)
+        || request_identity.request.state_fence != expected_identity.request.state_fence
+        || request_identity.request.metadata.request_id != envelope.identity.request_id
+        || request_identity.request.metadata.session_id
+            != expected_identity.request.metadata.session_id
+        || request_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .is_none_or(|task| task.as_str() != draft.task_id.as_str())
+        || envelope
+            .identity
+            .task_id
+            .as_deref()
+            .is_some_and(|task| task != draft.task_id)
+        || request_identity.idempotency_key != envelope.identity.idempotency_key
+        || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+        || request_identity.cancellation_id != envelope.identity.cancellation_id
+        || request_identity.request.metadata.product_id
+            != expected_identity.request.metadata.product_id
+        || request_identity.request.metadata.source_id
+            != expected_identity.request.metadata.source_id
+        || request_identity
+            .request
+            .metadata
+            .state_fence
+            .task_revision
+            .is_none_or(|revision| revision.value() != draft.expected_task_revision)
+    {
+        return Err("Kernel finish identity does not bind its admitted envelope".to_owned());
+    }
+    Ok(())
+}
+
 /// Parses one unwrapped finish poll answer into its exact admitted envelope,
 /// tool, Kernel-issued attempt and derived owner request identity.
 pub fn parse_finish_claimed_pair(
@@ -561,42 +604,17 @@ pub fn parse_finish_claimed_pair(
     request_identity
         .validate()
         .map_err(|error| format!("Kernel finish identity is invalid: {error}"))?;
+    validate_finish_claim_request_identity(
+        &envelope,
+        &draft,
+        &request_identity,
+        &expected_identity,
+    )?;
     let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
     if envelope.kind != eliot_protocol::HostRequestKind::Invocation
         || envelope.identity.capability != "eliot.finish"
         || envelope.identity.payload_schema_id != eliot_protocol::FINISH_INVOKE_PAYLOAD_SCHEMA_ID
         || tool_name != Some("eliot.finish")
-        || !envelope
-            .state_fence
-            .is_compatible_with(&request_identity.request.state_fence)
-        || request_identity.request.state_fence != expected_identity.request.state_fence
-        || request_identity.request.metadata.request_id != envelope.identity.request_id
-        || request_identity.request.metadata.session_id
-            != expected_identity.request.metadata.session_id
-        || request_identity
-            .request
-            .metadata
-            .task_id
-            .as_ref()
-            .is_none_or(|task| task.as_str() != draft.task_id.as_str())
-        || envelope
-            .identity
-            .task_id
-            .as_deref()
-            .is_some_and(|task| task != draft.task_id)
-        || request_identity.idempotency_key != envelope.identity.idempotency_key
-        || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
-        || request_identity.cancellation_id != envelope.identity.cancellation_id
-        || request_identity.request.metadata.product_id
-            != expected_identity.request.metadata.product_id
-        || request_identity.request.metadata.source_id
-            != expected_identity.request.metadata.source_id
-        || request_identity
-            .request
-            .metadata
-            .state_fence
-            .task_revision
-            .is_none_or(|revision| revision.value() != draft.expected_task_revision)
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
         || attempt.session_id != envelope.identity.session_id.as_deref().unwrap_or_default()

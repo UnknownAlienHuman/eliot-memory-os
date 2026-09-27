@@ -92,7 +92,7 @@ fn finish_result_body(
 
 fn rejected_finish_result(
     claimed: &FinishClaimedInvocation,
-    error: FinishAttemptError,
+    error: &FinishAttemptError,
 ) -> Result<FinishResultBody, String> {
     let content = serde_json::to_value(rejection(&error.to_string()))
         .map_err(|error| format!("finish rejection projection failed: {error}"))?;
@@ -133,18 +133,18 @@ pub async fn serve_finish_claim(
     };
     let evidence = match evidence {
         Ok(evidence) => evidence,
-        Err(error) => return rejected_finish_result(&claimed, error),
+        Err(error) => return rejected_finish_result(&claimed, &error),
     };
     if let Some(prepared) = evidence.as_ref() {
         if let Err(error) = prepared.exchange(kernel).await {
-            return rejected_finish_result(&claimed, error);
+            return rejected_finish_result(&claimed, &error);
         }
         let accepted = {
             let guard = composition.lock().await;
             guard.accept_prepared_finish_exchange(prepared)
         };
         if let Err(error) = accepted {
-            return rejected_finish_result(&claimed, error);
+            return rejected_finish_result(&claimed, &error);
         }
     }
 
@@ -156,18 +156,18 @@ pub async fn serve_finish_claim(
     };
     let decision = match decision {
         Ok(decision) => decision,
-        Err(error) => return rejected_finish_result(&claimed, error),
+        Err(error) => return rejected_finish_result(&claimed, &error),
     };
     if let Some(prepared) = decision.exchange() {
         if let Err(error) = prepared.exchange(kernel).await {
-            return rejected_finish_result(&claimed, error);
+            return rejected_finish_result(&claimed, &error);
         }
         let accepted = {
             let guard = composition.lock().await;
             guard.accept_prepared_finish_exchange(prepared)
         };
         if let Err(error) = accepted {
-            return rejected_finish_result(&claimed, error);
+            return rejected_finish_result(&claimed, &error);
         }
     }
     let receipt = decision.into_decision();
