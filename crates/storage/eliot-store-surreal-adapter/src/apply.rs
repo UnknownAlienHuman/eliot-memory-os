@@ -46,6 +46,7 @@ mod schema_contract;
 pub(crate) mod surreal_automation;
 pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_experience;
+pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;
@@ -1010,6 +1011,7 @@ struct AttemptLegWrites {
     reactive: surreal_reactive::ReactiveWrites,
     automation: surreal_automation::AutomationWrites,
     experience: surreal_experience::ExperienceWrites,
+    learning: surreal_learning::LearningWrites,
 }
 
 /// Same-operation reuse check for one apply attempt (issue #63).
@@ -1137,11 +1139,14 @@ async fn prepare_attempt_leg_writes(
         surreal_automation::prepare_automation_writes(db, &adapter.config, transition).await?;
     let experience_writes =
         surreal_experience::prepare_experience_writes(db, &adapter.config, transition).await?;
+    let learning_writes =
+        surreal_learning::prepare_learning_writes(db, &adapter.config, transition).await?;
     Ok(AttemptLegWrites {
         notification: notification_writes,
         reactive: reactive_writes,
         automation: automation_writes,
         experience: experience_writes,
+        learning: learning_writes,
     })
 }
 
@@ -1167,7 +1172,8 @@ async fn prepare_attempt_leg_writes(
 /// exact same-operation receipt reconciliation before replay.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the apply attempt carries the exact admitted contract: context, transition, both head sets, authorities, lane"
+    clippy::too_many_lines,
+    reason = "the apply attempt carries the exact admitted contract: context, transition, both head sets, authorities, lane; each admitted leg computes its row writes inline before receipt planning"
 )]
 async fn apply_with_retry(
     adapter: &SurrealStoreAdapter,
@@ -1281,6 +1287,7 @@ async fn apply_with_retry(
             &legs.reactive,
             &legs.automation,
             &legs.experience,
+            &legs.learning,
         )
         .await
         {
@@ -2481,7 +2488,8 @@ mod concurrent_allocation_tests {
 
         use super::super::{
             apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
-            client, read_fence, surreal_automation, surreal_experience, surreal_reactive,
+            client, read_fence, surreal_automation, surreal_experience, surreal_learning,
+            surreal_reactive,
         };
         use crate::client::session_pool::SessionRole;
         use crate::config::{ClientSetLimits, SurrealAdapterConfig};
@@ -2864,6 +2872,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             .expect("first writer commits");
@@ -2887,6 +2896,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             {
@@ -2933,6 +2943,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             .expect("bounded retry commits");

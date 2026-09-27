@@ -62,6 +62,7 @@ mod learning_admission;
 mod learning_closure;
 mod learning_delta_integration;
 mod learning_promotion;
+mod learning_record_commit;
 mod observation_reconciliation;
 mod operator_intent;
 mod operator_reconciliation;
@@ -139,6 +140,10 @@ pub use learning_promotion::{
     LearningPromotionError, LearningPromotionOutcome, PromotionAdmissionReceipt,
     PromotionBoundaryInput, PromotionEvaluationInput, PromotionRefusal, evaluate_promotion,
     rollback_promotion,
+};
+pub use learning_record_commit::{
+    commit_learning_record, learning_effective_under_admission,
+    learning_record_mutation_request_for_delta,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
