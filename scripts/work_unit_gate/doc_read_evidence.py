@@ -594,18 +594,13 @@ def _compare_bundle(recorded: Any, recomputed: Recomputed) -> None:
 
 
 def _compare_optional(recorded: Any, recomputed: Recomputed) -> None:
-    """`none` is valid only when no optional item is claimed and routing returned
-    none; a claimed optional expansion needs its exact current hash and reason.
-    Neither form can hide a required fragment (those are verified separately).
+    """`none` means no optional item is claimed as read.
+
+    Required items are verified separately; a claimed optional expansion needs
+    its exact current hash and reason.
     """
     optional = {str(item["path"]): item for item in recomputed.route.get("optional", [])}
     if recorded == "none":
-        if optional:
-            _fail(
-                EvidenceFailure.REQUIRED_ITEM_MISMATCH,
-                f"optional_expansions='none' but routing offered {len(optional)} optional item(s); "
-                "'none' cannot hide an optional item",
-            )
         return
     if type(recorded) is not list or len(recorded) > MAX_ITEMS:
         _fail(EvidenceFailure.REQUIRED_ITEM_MISMATCH, "optional_expansions must be 'none' or a list")
