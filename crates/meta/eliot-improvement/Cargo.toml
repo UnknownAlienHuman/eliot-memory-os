@@ -11,6 +11,7 @@ eliot-contracts.workspace = true
 eliot-context-contracts = { path = "../../smart/eliot-context-contracts", version = "0.1.0" }
 eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
 eliot-governor.workspace = true
+eliot-learning-contracts.workspace = true
 eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
