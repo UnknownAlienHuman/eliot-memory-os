@@ -44,9 +44,14 @@ use super::skill_acceptance_read::{AcceptanceRecord, AcceptanceResolution, Accep
 /// receiver can tell which owner state the assessment was taken at.
 const SOURCE_SKILL_LIFECYCLE_VIEW: &str = "skill_lifecycle_view";
 /// Closed source label naming the attempt/effect owner whose expected
-/// execution/effect set an assessment would be measured against. No such owner
-/// issues one today, so the assessment reports the set as not established and
-/// names this gap rather than inventing a denominator.
+/// execution/effect set an assessment would be measured against.
+///
+/// THERE IS NO SUCH OWNER IN THE TREE. This label exists so the assessment
+/// names the gap it has instead of leaving it implicit, and so a reader can
+/// tell at a glance that the expected set is missing rather than empty. Do not
+/// go looking for this owner: no activated read, store record or registry in
+/// this workspace issues an expected execution/effect set, which is why every
+/// assessment currently reports `expected`/`missing` as not established.
 const SOURCE_ATTEMPT_EFFECT_OWNER: &str = "attempt_effect_owner";
 
 ///
@@ -746,13 +751,20 @@ fn decode_execution(
     })
 }
 
-/// Projects the owner's retained window into the explicit reconciliation
-/// assessment and its result envelope (issue #2664, I7.25 / I14.21).
+/// Projects the owner's window into the explicit reconciliation assessment and
+/// its result envelope (issue #2664, I7.25 / I14.21).
 ///
 /// `view` is the lifecycle owner's own view AFTER it accepted this page: the
 /// assessment is computed over the evidence the owner holds, never over the
 /// submitted page in isolation, so a genuine B-only page cannot clear an
 /// execution the owner still holds as unresolved (issue #2664 acceptance).
+/// The window's size decides which of the two it is, and the verdict says so:
+/// an owner window holding nothing but this page's records is reported as
+/// [`AssessmentScope::SubmittedPage`](eliot_skill::activation::AssessmentScope::SubmittedPage),
+/// never as an attempt-wide claim. That case is the honest state of the owner
+/// today, because the merged view is not written back into the owner's
+/// registry — see [`DaemonComposition::skill_publish_execution_evidence`]
+/// (`bins/eliotd/src/lib.rs`) for the exact missing seam.
 ///
 /// The expected set is `NotEstablished` and is named as such. No attempt/effect
 /// owner issues one today, and a caller-provided set, a record count, a short
@@ -766,17 +778,35 @@ fn execution_verdict_outcome(
     page_records: u64,
 ) -> SkillResultEnvelope {
     let window = &view.execution_evidence;
+    let window_records = window.len() as u64;
+    let source_revision = eliot_skill::SourceRevision {
+        source: SOURCE_SKILL_LIFECYCLE_VIEW.to_owned(),
+        revision: Some(view.lifecycle_revision),
+    };
+    // The scope discriminator is read off the OWNER'S OWN window: a window
+    // holding records this ingest did not contribute is retained history, and
+    // one holding only what this page contributed is reported as the page it
+    // is. The owner merges a page into the window it already holds and returns
+    // that window, so a B-only page that the owner has nothing behind reports
+    // `SubmittedPage` and cannot be read as an attempt-wide clearance. The
+    // uncertain direction under-claims: retention by exact replay looks
+    // identical to no retention, and is reported as the page.
+    let scope = if window_records > page_records {
+        eliot_skill::activation::AssessmentScope::OwnerRetainedWindow {
+            source_revision,
+            window_records,
+            page_records,
+        }
+    } else {
+        eliot_skill::activation::AssessmentScope::SubmittedPage {
+            source_revision,
+            page_records,
+        }
+    };
     let assessment = eliot_skill::reconcile_unknown_effects(
         eliot_skill::activation::ExecutionAssessmentWindow {
             window,
-            scope: eliot_skill::activation::AssessmentScope::OwnerRetainedWindow {
-                source_revision: eliot_skill::SourceRevision {
-                    source: SOURCE_SKILL_LIFECYCLE_VIEW.to_owned(),
-                    revision: Some(view.lifecycle_revision),
-                },
-                window_records: window.len() as u64,
-                page_records,
-            },
+            scope,
             expected_set: eliot_skill::activation::ExpectedExecutionSet::NotEstablished {
                 owner: SOURCE_ATTEMPT_EFFECT_OWNER.to_owned(),
             },
@@ -785,9 +815,11 @@ fn execution_verdict_outcome(
     );
     match assessment {
         Ok(verdict) => SkillResultEnvelope::evidence(verdict),
-        // Refused would imply nothing was stored, and the owner HAS taken
-        // this page by the time the assessment runs, so the page is reported
-        // as stored alongside the failure to assess it.
+        // `Refused` would read as "nothing was taken", and the owner HAS
+        // accepted this page into the window it computed, so the refusal names
+        // what actually happened: the page was taken, no assessment came out
+        // of it, and the page is NOT durably retained — the owner has no
+        // write-back seam (see `DaemonComposition::skill_publish_execution_evidence`).
         Err(error) => {
             tracing::warn!(
                 target: "eliotd::skill_evidence",
@@ -796,10 +828,10 @@ fn execution_verdict_outcome(
                 window_records = window.len(),
                 page_records,
                 reason = %error,
-                "the Skill lifecycle owner accepted this execution evidence, but no reconciliation assessment could be derived from the retained window; the page stays stored and clears nothing"
+                "the Skill lifecycle owner accepted this execution evidence into the window it computed, but no reconciliation assessment could be derived from it; the page is not durably retained and clears nothing"
             );
             SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
-                "execution evidence was stored by the Skill lifecycle owner, but its reconciliation assessment failed: {error}"
+                "the Skill lifecycle owner accepted this execution evidence, but no reconciliation assessment could be derived from its window; the page is not durably retained and clears nothing: {error}"
             )))
         }
     }

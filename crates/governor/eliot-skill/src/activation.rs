@@ -821,6 +821,13 @@ pub struct LifecycleEvidence<'a> {
 /// than installs, usefulness without verifier-backed execution evidence) are
 /// rejected by the final validation, never adjusted — the runtime accumulates
 /// coherent windows across install revisions.
+///
+/// The execution counters here come from the unique current-state projection,
+/// so an evidence slice carrying one record twice, or two different records
+/// under one identity, derives counters the view's own validation rejects
+/// rather than publishing an inflated or arbitrarily resolved count. See
+/// [`fold_execution_evidence`] for the full statement of which inputs disagree
+/// with that validation and why the projection is the authoritative one.
 pub fn derive_lifecycle_view(
     evidence: LifecycleEvidence<'_>,
 ) -> Result<SkillLifecycleView, SkillError> {
@@ -975,6 +982,19 @@ pub struct ExecutionEvidenceIdentity {
 /// This is the I14.21 partition per operation, never an aggregate: `committed
 /// → reconcile ORS`, `known rollback → retry under the same identity`,
 /// `unknown → pause Ordering Scope, preserve the operation`.
+///
+/// The issue's table separates "exact committed effect/result found" from
+/// "Observed status without complete effect disposition" while the evidence
+/// vocabulary has ONE observed outcome, so the split has to rest on a field
+/// that records whether the effect disposition is actually complete. It rests
+/// on the same signal this crate already uses for the `verified` counter — a
+/// non-empty `verifier_refs` — because that is the only field in
+/// [`SkillExecutionEvidence`] carrying "a verifier observed this effect"
+/// (I7.25: Skill execution is linked to exact steps, artifacts and verifiers
+/// when observable). An observed record with a verifier run is a committed
+/// result to reconcile; an observed record without one has a status only.
+/// A reviewer could reasonably split these two the other way, and the field to
+/// change is `effect_state` alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionEffectState {
@@ -1055,18 +1075,29 @@ pub const MAX_ASSESSMENT_DISPOSITIONS: usize = 256;
 /// expected set and the coverage, and a page-local scope can never be shown to
 /// cover an attempt. Page statistics and attempt-wide statistics are separate
 /// fields and are never conflated.
+///
+/// The discriminator is read off the OWNER'S OWN window, never asserted: a
+/// window that holds records this ingest did not contribute is retained
+/// history, and one that holds only what this page contributed is reported as
+/// the page it is. The uncertain direction is the fail-closed one — an owner
+/// that retains by replay can look identical to one that retains nothing, and
+/// this label then under-claims rather than over-claims.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum AssessmentScope {
-    /// Exactly the submitted ingest page, with no retained window behind it.
-    /// A genuine B-only page is this: it says nothing about an execution
-    /// retained from an earlier page, so it can never clear one.
+    /// Exactly the submitted ingest page: the owner returned nothing beyond
+    /// what this ingest contributed, so no retained history is behind it. A
+    /// genuine B-only page is this — it says nothing about an execution an
+    /// owner would hold from an earlier page, and it can never clear one.
     SubmittedPage {
+        /// Closed source and revision the window was read at.
+        source_revision: SourceRevision,
         /// Records this submitted page carried.
         page_records: u64,
     },
-    /// The window the lifecycle owner returned after accepting this ingest —
-    /// the retained set it merged the page into — read at this owner revision.
+    /// The window the lifecycle owner returned after accepting this ingest, and
+    /// it holds records this ingest did not contribute: the retained set the
+    /// owner merged the page into, read at this owner revision.
     OwnerRetainedWindow {
         /// Closed source and revision the owner returned the window at.
         source_revision: SourceRevision,
@@ -1502,7 +1533,11 @@ fn effect_state(execution: &SkillExecutionEvidence) -> ExecutionEffectState {
 ///
 /// ONE current-state projection is computed first ([`ExecutionProjection`]),
 /// and every count below is read from it, so a duplicate, a superseded record
-/// and a lifecycle counter can no longer disagree. The verdict then states
+/// and a lifecycle counter can no longer disagree. The projection is the
+/// authoritative current state, and the input-ordering question it refuses to
+/// answer is refused here too: a second record under one identity with
+/// different content is a conflict, never a supersession, because nothing in
+/// the evidence a caller presents orders two revisions. The verdict then states
 /// what the evidence establishes and what it does not:
 ///
 /// * a contradictory identity, an uncertain effect, an observed status without
@@ -1520,6 +1555,12 @@ fn effect_state(execution: &SkillExecutionEvidence) -> ExecutionEffectState {
 /// empty pending list, or the caller's word: without an owner-issued expected
 /// set, `expected`/`missing` stay [`AssessmentCount::NotEstablished`] and the
 /// verdict cannot report a complete set.
+///
+/// This is the same projection [`fold_execution_evidence`] counts, and it is
+/// the authoritative one: where a view's own validation disagrees — because it
+/// recomputes its counters from raw records rather than from the projection —
+/// `fold_execution_evidence` documents exactly which inputs disagree and what a
+/// caller now sees.
 pub fn reconcile_unknown_effects(
     assessment: ExecutionAssessmentWindow<'_>,
 ) -> Result<UnknownEffectsVerdict, SkillError> {
@@ -1564,6 +1605,34 @@ pub fn reconcile_unknown_effects(
 /// behind [`derive_lifecycle_view`] and behind
 /// [`reconcile_unknown_effects`], which read the same projection, so an exact
 /// replay cannot inflate one counter and not the other.
+///
+/// ## The projection is authoritative, and where it disagrees with the view
+///
+/// A member here is one exact evidence identity, so a window carrying the same
+/// record twice counts it once, and a window carrying two different records
+/// under one identity counts neither (the identity is
+/// [`ExecutionEffectState::ContradictoryRevisions`], not a guess about which
+/// revision wins). [`SkillLifecycleView::validate`] still recomputes its
+/// execution counters by counting RAW records in the view's own
+/// `execution_evidence` slice. The two therefore disagree for exactly two
+/// inputs, and both are refused rather than published:
+///
+/// * a window with two different records under one identity derives counters
+///   that the view rejects — a contradiction can no longer be published as a
+///   settled count, which is the point;
+/// * a window with the SAME record twice also derives counters the view
+///   rejects, where it previously derived an inflated `executed`. Before this
+///   projection existed, a duplicate inflated a published counter; now the
+///   view refuses the window instead.
+///
+/// Every in-tree caller already deduplicates before folding:
+/// `SkillRegistry::record_execution_evidence` keeps one record per evidence
+/// identity and refuses a changed one as
+/// [`SkillError::RevisionConflict`], which is the only production path into
+/// [`derive_lifecycle_view`]. A caller that hands duplicates to the public
+/// [`derive_lifecycle_view`] / `derive_and_record` entry points now gets an
+/// `Err` instead of inflated counters — the fail-closed direction, and the
+/// only behavioural change this projection makes.
 pub fn fold_execution_evidence(
     executions: &[SkillExecutionEvidence],
 ) -> Result<ExecutionFold, SkillError> {

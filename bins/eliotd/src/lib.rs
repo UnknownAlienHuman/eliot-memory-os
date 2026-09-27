@@ -2099,6 +2099,32 @@ impl DaemonComposition {
     /// superseded Skill: the owner binds it to the stored view's exact
     /// revision and package and refuses a mismatch.
     ///
+    /// ## The merged window is NOT written back: the exact missing seam
+    ///
+    /// `record_execution_evidence` merges this page into the view the owner's
+    /// registry already holds — one record per evidence identity, a changed
+    /// record refused as `RevisionConflict` — and RETURNS that merged view.
+    /// The registry itself is only mutable through
+    /// `SkillRegistry::record_view(&mut self, …)`, and
+    /// `GovernorComposition` exposes its owners only as a shared borrow
+    /// (`pub const fn owners(&self) -> &GovernorOwners<P>`; the `owners` field
+    /// itself is private). There is therefore no `&mut` path from this daemon to
+    /// the Skill owner, and the merged view is dropped here.
+    ///
+    /// The consequence is stated rather than papered over: a page submitted
+    /// after an earlier page is reconciled against the window this call
+    /// computes, which today contains only what the owner's registry already
+    /// held plus this page — nothing is durably retained between ingests, and
+    /// the verdict reports `AssessmentScope::SubmittedPage` whenever that is
+    /// the case. Closing this needs, outside this daemon: a `&mut` accessor for
+    /// the Skill owner on `GovernorComposition`
+    /// (`crates/governor/eliot-governor/src/composition.rs`), plus a canonical
+    /// write that persists a `SkillLifecycleView` including its
+    /// `execution_evidence` so the Kernel-served `RecoveryOwner::Skill`
+    /// snapshot carries it across a restart. The only canonical Skill write
+    /// today is the governed promotion envelope
+    /// (`GovernorSkillLifecycle::promote`), which is not evidence retention.
+    ///
     /// The crate error travels by value here like every neighboring
     /// composition seam feeding the Governor lifecycle API, so the size
     /// lint is allowed for this seam.

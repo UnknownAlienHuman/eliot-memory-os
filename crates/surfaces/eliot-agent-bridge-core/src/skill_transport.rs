@@ -16,10 +16,16 @@
 //! payload byte. A new Tool Definition or payload shape gets a NEW contract
 //! revision — v1 is frozen and rejected; v2 adds the accepted candidate to
 //! the intake payload, while v3 carries typed `WorkScope` guard-withholding
-//! evidence in result outcomes, and v4 carries the owner-qualified
+//! evidence in result outcomes, v4 carries the owner-qualified
 //! [`SkillUsefulness`](eliot_skill::SkillUsefulness) vocabulary plus the
 //! owner-resolved outcome evidence backing a usefulness claim, so `useful` is
-//! no longer a plain boolean that unverified wire strings can set.
+//! no longer a plain boolean that unverified wire strings can set, and v5
+//! replaces the `Evidence` result's three bare counts with the explicit
+//! reconciliation assessment (scope, expected/observed/missing counts,
+//! coverage, per-execution disposition, pending identities and clearance).
+//! The v5 result shape is INCOMPATIBLE with v4's, so the version moves with
+//! it: a v4 decoder rejects a v5 `Evidence` payload as an unknown field
+//! instead of silently reading a count as complete evidence.
 
 #![forbid(unsafe_code)]
 
@@ -32,9 +38,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Versioned Skill transport contract identity.
-pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v4";
+pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v5";
 /// Payload contract revision. Decode rejects any other revision.
-pub const SKILL_TRANSPORT_VERSION: u32 = 4;
+pub const SKILL_TRANSPORT_VERSION: u32 = 5;
 /// Maximum encoded intake bytes (I7.2 default frame max). Larger material
 /// must arrive by Blob or handle reference (future extension), never as
 /// giant inline frames; oversize fails closed here.
