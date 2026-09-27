@@ -110,6 +110,7 @@ class AdmissionDefect(str, enum.Enum):
     """
 
     UNCLASSIFIED = "UNCLASSIFIED"
+    UNRESOLVED_OWNER = "UNRESOLVED_OWNER"
     FACADE_OWNER_MISSING = "FACADE_OWNER_MISSING"
     FACADE_EXPIRY_MISSING = "FACADE_EXPIRY_MISSING"
     FACADE_EXPIRED = "FACADE_EXPIRED"
@@ -242,6 +243,82 @@ TEXT_INDICATORS: Final[tuple[tuple[str, str], ...]] = (
     ("not yet implemented", "NOT_IMPLEMENTED_LANGUAGE"),
 )
 
+# A ``todo!``/``unimplemented!``/placeholder hit is a *finding*, never a verdict. These
+# are the contextual classes the issue requires the row to keep distinguishable so a
+# deliberate test fixture or an unsupported-platform guard is never reported as a
+# missing production implementation (A7). They are derived from exact source context
+# only: the enclosing item's own attribute chain and the comment/literal mask.
+# ``None`` means "no contextual class established" -> stays REVIEW_REQUIRED.
+_TEST_ATTRIBUTE_RE: Final = re.compile(r"#!?\s*\[\s*(?:tokio\s*::\s*)?test(?:\s*\([^]]*\))?\s*\]")
+_PLATFORM_CFG_RE: Final = re.compile(
+    r"#!?\s*\[\s*cfg\s*\([^]]*\b(?:target_os|target_arch|target_env|target_family|target_vendor|windows|unix)\b[^]]*\)\s*\]"
+)
+# One attribute item: `#[cfg(...)]` / `#[test]` / `#[allow(...)]` / `#[tokio::test]`.
+_ATTRIBUTE_ITEM_RE: Final = re.compile(r"#!?\s*\[[^\]\n]*\]")
+
+
+def _in_non_code(masked: str, text: str, index: int, length: int) -> bool:
+    """True when the matched text lies inside a comment or literal body.
+
+    Compares against the comment/string-masked copy of the same file, so a doc
+    comment mentioning "placeholder" is never reported as a code gap.
+    """
+    return masked[index : index + length] != text[index : index + length]
+
+
+def _enclosing_attributes(masked_lines: Sequence[str], line: int) -> tuple[str, ...]:
+    """Attributes governing ``line``: its own plus any immediately above it.
+
+    Only contiguous attribute lines directly above the finding are considered, so
+    the classification is anchored to the actual enclosing item rather than to a
+    fuzzy window that could pick up an unrelated sibling item.
+    """
+    collected: list[str] = []
+    index = line - 1
+    while index >= 0:
+        candidate = masked_lines[index].strip()
+        if not candidate:
+            index -= 1
+            if not collected:
+                continue
+            break
+        if not candidate.startswith("#"):
+            break
+        matches = _ATTRIBUTE_ITEM_RE.findall(candidate)
+        if not matches:
+            break
+        collected = matches + collected
+        index -= 1
+    return tuple(collected)
+
+
+def _contextual_disposition(
+    scope: str,
+    text: str,
+    masked: str,
+    index: int,
+    line: int,
+) -> tuple[str, str | None]:
+    """Classify a gap indicator by its own exact source context.
+
+    Returns ``(disposition, contextual_class)``. This is contextual *evidence* for
+    a reviewer, never a verdict: an unrecognised context stays ``REVIEW_REQUIRED``
+    with a ``None`` class. The classes exist so a deliberate fixture, a deliberate
+    unsupported-platform guard, and a plain documentation mention each stay
+    distinguishable from a missing production implementation (A7).
+    """
+    if scope in {SourceScope.TEST.value, SourceScope.EXAMPLE.value, SourceScope.BENCH.value}:
+        return ("TEST_SCOPE", "TEST_FIXTURE_OR_NON_PRODUCTION_SCOPE")
+    if _in_non_code(masked, text, index, 1):
+        return ("NON_CODE_MENTION", "DOCUMENTATION_OR_LITERAL_MENTION")
+    attributes = _enclosing_attributes(masked.splitlines(), line)
+    if attributes:
+        if any(_TEST_ATTRIBUTE_RE.match(item) for item in attributes):
+            return ("TEST_SCOPE", "TEST_FIXTURE_OR_NON_PRODUCTION_SCOPE")
+        if any(_PLATFORM_CFG_RE.match(item) for item in attributes):
+            return ("DELIBERATE_UNSUPPORTED_PLATFORM_GUARD", "UNSUPPORTED_PLATFORM_GUARD")
+    return ("REVIEW_REQUIRED", None)
+
 CODE_INDICATORS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     (re.compile(r"\btodo\s*!\s*\("), "TODO_MACRO"),
     (re.compile(r"\bunimplemented\s*!\s*\("), "UNIMPLEMENTED_MACRO"),
@@ -292,6 +369,17 @@ def _root(path: Path) -> Path:
     if not (resolved / "Cargo.toml").is_file() or not (resolved / ".git").exists():
         raise InventoryError("NOT_A_REPOSITORY", f"expected Git/Cargo repository root: {resolved}")
     return resolved
+
+
+def _utc_today() -> date:
+    """Today's UTC date.
+
+    The import binds the ``datetime`` class, so the only correct call is
+    ``datetime.now(tz)``. Constructing ``datetime(tz)`` passes a bare ``tzinfo``
+    where the year is expected and raises ``TypeError``; binding the callable
+    through ``datetime_now`` here keeps that single obvious spelling.
+    """
+    return datetime_now.now(timezone.utc).date()
 
 
 def _inside(root: Path, path: Path, *, must_exist: bool = True) -> Path:
@@ -746,6 +834,86 @@ def _line_number(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
+# A ``#[cfg(test)]``-attributed item is compiled only for the crate's own test
+# harness. A constructor or call site inside one can never be a production
+# construction, so it must be masked exactly like a comment. Only the
+# annotation line is consumed; the attributed item keeps its own span.
+_CFG_TEST_ATTRIBUTE_RE: Final = re.compile(r"#!?\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+
+
+def _blank_cf_test_bodies(masked: str) -> str:
+    """Blank every ``#[cfg(test)]``-attributed item body in masked source.
+
+    Operates on comment/string-masked text so braces inside literals cannot
+    confuse the balance. An unbalanced body fails closed: a ``#[cfg(test)]``
+    whose extent cannot be bounded would otherwise leak test-only constructions
+    into production reachability.
+    """
+    chars = list(masked)
+    length = len(chars)
+    cursor = 0
+    while True:
+        match = _CFG_TEST_ATTRIBUTE_RE.search(masked, cursor)
+        if match is None:
+            return "".join(chars)
+        index = match.end()
+        # Skip the attributed item's tail (visibility, generics, `where`, ...) up
+        # to the first `{`. Anything else means a non-brace target such as
+        # `#[cfg(test)] use a::b;`, which has no body to blank.
+        while index < length and chars[index] in " \t\r\n":
+            index += 1
+        if index >= length or chars[index] != "{":
+            cursor = match.end()
+            continue
+        depth = 0
+        probe = index
+        while probe < length:
+            if chars[probe] == "{":
+                depth += 1
+            elif chars[probe] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            probe += 1
+        if probe >= length or depth != 0:
+            raise InventoryError(
+                "MALFORMED_RUST_SOURCE",
+                "unbalanced #[cfg(test)] body: the test-only extent is unbounded",
+            )
+        for pos in range(match.start(), probe + 1):
+            if chars[pos] not in "\r\n":
+                chars[pos] = " "
+        cursor = probe + 1
+
+
+def _contextual_disposition(
+    scope: str,
+    text: str,
+    masked: str,
+    index: int,
+    line: int,
+) -> tuple[str, str | None]:
+    """Classify a gap indicator by its own exact source context.
+
+    Returns ``(disposition, contextual_class)``. This is contextual *evidence* for
+    a reviewer, never a verdict: an unrecognised context stays ``REVIEW_REQUIRED``
+    with a ``None`` class. The classes exist so a deliberate fixture, a deliberate
+    unsupported-platform guard, and a plain documentation mention each stay
+    distinguishable from a missing production implementation (A7).
+    """
+    if scope in {SourceScope.TEST.value, SourceScope.EXAMPLE.value, SourceScope.BENCH.value}:
+        return ("TEST_SCOPE", "TEST_FIXTURE_OR_NON_PRODUCTION_SCOPE")
+    if _in_non_code(masked, text, index, 1):
+        return ("NON_CODE_MENTION", "DOCUMENTATION_OR_LITERAL_MENTION")
+    attributes = _enclosing_attributes(masked.splitlines(), line)
+    if attributes:
+        if any(_TEST_ATTRIBUTE_RE.match(item) for item in attributes):
+            return ("TEST_SCOPE", "TEST_FIXTURE_OR_NON_PRODUCTION_SCOPE")
+        if any(_PLATFORM_CFG_RE.match(item) for item in attributes):
+            return ("DELIBERATE_UNSUPPORTED_PLATFORM_GUARD", "UNSUPPORTED_PLATFORM_GUARD")
+    return ("REVIEW_REQUIRED", None)
+
+
 def _line_excerpt(text: str, line: int) -> str:
     lines = text.splitlines()
     if line < 1 or line > len(lines):
@@ -814,10 +982,14 @@ def _scan_sources(
             raise InventoryError("INVALID_RUST_ENCODING", f"Rust source is not UTF-8: {_relative(root, path)}") from exc
         try:
             masked = _mask_rust(text)
+            # Test-only construction is masked out before any consumer, finding or
+            # public-API decision is taken, so a `#[cfg(test)]` constructor can
+            # never be recorded as a production construction.
+            production_masked = _blank_cf_test_bodies(masked)
         except InventoryError as exc:
             raise InventoryError(exc.code, f"{_relative(root, path)}: {exc.detail}") from exc
         scope = _source_scope(manifest_dir, path)
-        identifiers = tuple(sorted(set(IDENTIFIER_RE.findall(masked))))
+        identifiers = tuple(sorted(set(IDENTIFIER_RE.findall(production_masked))))
         evidence.append(
             SourceFileEvidence(
                 package_key=package_key,
@@ -826,7 +998,7 @@ def _scan_sources(
                 scope=scope.value,
                 sha256=_sha256(raw),
                 nonblank_loc=sum(1 for line in text.splitlines() if line.strip()),
-                public_items=len(PUBLIC_ITEM_RE.findall(masked)),
+                public_items=len(PUBLIC_ITEM_RE.findall(production_masked)),
                 test_attributes=len(TEST_ATTRIBUTE_RE.findall(masked)),
                 identifiers=identifiers,
                 raw_identifiers=tuple(sorted(set(IDENTIFIER_RE.findall(text)))),
@@ -841,34 +1013,48 @@ def _scan_sources(
                 if index < 0:
                     break
                 line = _line_number(text, index)
+                disposition, contextual_class = _contextual_disposition(
+                    scope.value, text, masked, index, line
+                )
                 findings.append(
                     {
                         "package_key": package_key,
                         "path": _relative(root, path),
                         "line": line,
+                        "column": index - (text.rfind("\n", 0, index) + 1) + 1,
+                        "byte_offset": index,
+                        "span": _bounded_text(text[index : index + len(token)], 128),
                         "scope": scope.value,
                         "category": category,
                         "token": token,
                         "excerpt": _line_excerpt(text, line),
                         "source_sha256": _sha256(raw),
-                        "contextual_disposition": "REVIEW_REQUIRED",
+                        "contextual_disposition": disposition,
+                        "contextual_class": contextual_class,
                     }
                 )
                 start = index + len(needle)
         for pattern, category in CODE_INDICATORS:
             for match in pattern.finditer(masked):
                 line = _line_number(masked, match.start())
+                disposition, contextual_class = _contextual_disposition(
+                    scope.value, text, masked, match.start(), line
+                )
                 findings.append(
                     {
                         "package_key": package_key,
                         "path": _relative(root, path),
                         "line": line,
+                        "column": match.start() - (masked.rfind("\n", 0, match.start()) + 1) + 1,
+                        "byte_offset": match.start(),
+                        "span": _bounded_text(match.group(0), 128),
                         "scope": scope.value,
                         "category": category,
                         "token": _bounded_text(match.group(0), 128),
                         "excerpt": _line_excerpt(text, line),
                         "source_sha256": _sha256(raw),
-                        "contextual_disposition": "REVIEW_REQUIRED",
+                        "contextual_disposition": disposition,
+                        "contextual_class": contextual_class,
                     }
                 )
         if len(findings) > BOUNDS.max_findings:
@@ -937,7 +1123,8 @@ def _package_rows(
         reverse_edges[edge["to_package"]].append(edge)
         forward_edges[edge["from_package"]].append(edge)
 
-    token_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    production_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    non_production_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     doc_only_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     source_by_package: dict[str, list[SourceFileEvidence]] = defaultdict(list)
     findings_by_package: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -956,10 +1143,17 @@ def _package_rows(
             # never be promoted to a production construction of the capability.
             for identifier in set(file.raw_identifiers) - code_only:
                 doc_only_consumers[identifier].add((key, file.scope))
-            if file.scope not in {SourceScope.PRODUCTION.value, SourceScope.BUILD.value}:
-                continue
+            # A TEST/EXAMPLE/BENCH construction is a real consumer but never a
+            # production one. It is recorded in its own set so a test-only
+            # constructor cannot impersonate production reachability (A3), while
+            # still remaining explicit instead of disappearing (A3).
+            bucket = (
+                production_consumers
+                if file.scope in {SourceScope.PRODUCTION.value, SourceScope.BUILD.value}
+                else non_production_consumers
+            )
             for identifier in code_only:
-                token_consumers[identifier].add((key, file.scope))
+                bucket[identifier].add((key, file.scope))
 
     for key, package in sorted(package_by_key.items()):
         graph = graph_by_key[key]
@@ -967,8 +1161,9 @@ def _package_rows(
         package_name = str(package.get("name", ""))
         crate_identifier = package_name.replace("-", "_")
         source_consumers: list[dict[str, str]] = []
+        test_only_source_consumers: list[dict[str, str]] = []
         documentation_only_consumers: list[dict[str, str]] = []
-        for consumer_key, scope in sorted(token_consumers.get(crate_identifier, set())):
+        for consumer_key, scope in sorted(production_consumers.get(crate_identifier, set())):
             if consumer_key == key:
                 continue
             source_consumers.append({"package_key": consumer_key, "scope": scope})
@@ -976,6 +1171,16 @@ def _package_rows(
                 raise InventoryError(
                     "SOURCE_CONSUMER_LIMIT",
                     f"source consumer count exceeds {BOUNDS.max_source_consumers_per_package}: {package_name}",
+                )
+        for consumer_key, scope in sorted(non_production_consumers.get(crate_identifier, set())):
+            if consumer_key == key:
+                continue
+            test_only_source_consumers.append({"package_key": consumer_key, "scope": scope})
+            if len(test_only_source_consumers) > BOUNDS.max_source_consumers_per_package:
+                raise InventoryError(
+                    "SOURCE_CONSUMER_LIMIT",
+                    f"non-production source consumer count exceeds "
+                    f"{BOUNDS.max_source_consumers_per_package}: {package_name}",
                 )
         for consumer_key, scope in sorted(doc_only_consumers.get(crate_identifier, set())):
             if consumer_key == key:
@@ -1044,7 +1249,8 @@ def _package_rows(
             reachability = Reachability.PRODUCTION_CONSUMER
         elif build_consumers or source_build_consumers:
             reachability = Reachability.BUILD_ONLY
-        elif dev_consumers:
+        elif dev_consumers or test_only_source_consumers:
+            # A test-only construction is explicit reachability, not absence of one.
             reachability = Reachability.TEST_ONLY
         elif package.get("links") or ((package.get("metadata") or {}).get("eliot") or {}).get("dynamic_registration"):
             reachability = Reachability.UNRESOLVED_DYNAMIC
@@ -1074,11 +1280,36 @@ def _package_rows(
             ),
             "reverse_dependency_edges": rev,
             "source_consumers": source_consumers,
+            "test_only_source_consumers": test_only_source_consumers,
             "documentation_only_consumers": documentation_only_consumers,
+            "consumer_summary": {
+                # The three-way split the issue requires: a package row always
+                # distinguishes production consumers, test-only consumers and
+                # no consumers, and never reports a test-only construction as
+                # production reachability.
+                "production_source_consumers": len(source_prod_consumers),
+                "build_source_consumers": len(source_build_consumers),
+                "test_or_example_source_consumers": len(test_only_source_consumers),
+                "documentation_only_consumers": len(documentation_only_consumers),
+                "normal_dependency_edges": len(normal_consumers),
+                "build_dependency_edges": len(build_consumers),
+                "dev_dependency_edges": len(dev_consumers),
+                "production_consumers": len(source_prod_consumers) + len(normal_consumers),
+                "test_only_consumers": len(test_only_source_consumers) + len(dev_consumers),
+                "no_consumers": int(
+                    not (
+                        source_prod_consumers
+                        or source_build_consumers
+                        or normal_consumers
+                        or build_consumers
+                        or test_only_source_consumers
+                    )
+                ),
+            },
             "capability_construction": (
-                # The crate identifier appearing as a *code* identifier is the only
-                # signal that the public capability is constructed/called. A bare
-                # dependency edge never reaches this state.
+                # The crate identifier appearing as a *code* identifier outside any
+                # `#[cfg(test)]` body is the only signal that the public capability is
+                # constructed/called. A bare dependency edge never reaches this state.
                 "PRODUCTION_CONSTRUCTED"
                 if source_prod_consumers
                 else (
@@ -1086,7 +1317,7 @@ def _package_rows(
                     if source_build_consumers
                     else (
                         "TEST_ONLY"
-                        if any(item["scope"] == SourceScope.TEST.value for item in source_consumers)
+                        if test_only_source_consumers
                         else (
                             "DOCUMENTATION_ONLY"
                             if documentation_only_consumers
@@ -1118,10 +1349,16 @@ def _package_rows(
             ),
             "nearest_instructions": instructions,
             "owner_issue_refs_from_instructions": owner_issues,
+            "capability_binding": _capability_binding(package, owner_issues),
             "support_axes": {
+                # I0.5/I0.13 require these six dimensions to be recorded
+                # independently and never promoted from source statistics. The
+                # declared values are copied verbatim from
+                # `[package.metadata.eliot]`; nothing here is inferred.
                 "contract_maturity": "UNKNOWN_FROM_THIS_INVENTORY",
                 "implementation_support": "SOURCE_SHAPE_OBSERVED_ONLY",
                 "evidence_execution_status": "NOT_EXECUTED_BY_THIS_INVENTORY",
+                "production_reachability": reachability.value,
                 "runtime_support": "UNKNOWN_FROM_THIS_INVENTORY",
                 "product_support": "UNKNOWN_FROM_THIS_INVENTORY",
             },
@@ -1152,6 +1389,87 @@ def _package_rows(
         sorted(source_files, key=lambda item: (item.package_key, item.scope, item.path)),
         sorted(findings, key=lambda item: (item["package_key"], item["path"], item["line"], item["category"])),
     )
+
+
+def _eliot_metadata(package: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata = package.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    eliot = metadata.get("eliot")
+    return eliot if isinstance(eliot, dict) else {}
+
+
+def _declared_str_list(eliot: Mapping[str, Any], field: str) -> tuple[str, ...]:
+    value = eliot.get(field)
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return ()
+    return tuple(sorted({item for item in value if isinstance(item, str) and item}))
+
+
+_DECLARED_ISSUE_REF_RE: Final = re.compile(r"^issue:(\d{1,7})$")
+
+
+def _capability_binding(
+    package: Mapping[str, Any],
+    owner_issues: Sequence[int],
+) -> dict[str, Any]:
+    """Bind a row to its declared owner/cell/contract/proof (I2.8, I2.20, I2.23).
+
+    Every field is copied from the package's own declared
+    ``[package.metadata.eliot]`` table. Nothing here is inferred from package
+    name, layer guesswork or source statistics, so a missing table yields an
+    explicit ``UNRESOLVED_OWNER`` rather than an invented owner.
+    """
+    eliot = _eliot_metadata(package)
+    declared_issues = {
+        int(match.group(1))
+        for value in _declared_str_list(eliot, "issue_refs")
+        + _declared_str_list(eliot, "owning_issue")
+        if (match := _DECLARED_ISSUE_REF_RE.match(value))
+    }
+    all_issues = sorted(set(owner_issues) | declared_issues)
+    functional_cell_refs = _declared_str_list(eliot, "functional_cell_refs")
+    if not functional_cell_refs:
+        functional_cell = eliot.get("functional_cell")
+        if isinstance(functional_cell, str) and functional_cell:
+            functional_cell_refs = (functional_cell,)
+    proof_entrypoint = eliot.get("proof_entrypoint")
+    if not isinstance(proof_entrypoint, str) or not proof_entrypoint:
+        proof_entrypoint = None
+    layer = eliot.get("layer") or eliot.get("source_layer")
+    layer = layer if isinstance(layer, str) and layer else None
+    owner = eliot.get("source_maintenance_owner")
+    owner = owner if isinstance(owner, str) and owner else None
+    owner_status = (
+        "DECLARED_OWNER"
+        if owner is not None
+        else ("UNRESOLVED_OWNER" if all_issues else "UNRESOLVED_OWNER_NO_ISSUE")
+    )
+    return {
+        "owning_issue_refs": all_issues,
+        "owning_issue_source": (
+            "DECLARED_METADATA"
+            if declared_issues
+            else ("NEAREST_AGENTS_MD" if owner_issues else "NONE")
+        ),
+        "owner_status": owner_status,
+        "source_maintenance_owner": owner,
+        "functional_cell_refs": list(functional_cell_refs),
+        "contract_refs": list(_declared_str_list(eliot, "contract_refs")),
+        "source_layer": layer,
+        "independent_proof_profile": eliot.get("independent_proof_profile")
+        if isinstance(eliot.get("independent_proof_profile"), str)
+        else None,
+        "proof_entrypoint": proof_entrypoint,
+        "declared_implementation_support": eliot.get("implementation_support")
+        if isinstance(eliot.get("implementation_support"), str)
+        else None,
+        "declared_evidence_execution_status": eliot.get("evidence_execution_status")
+        if isinstance(eliot.get("evidence_execution_status"), str)
+        else None,
+    }
 
 
 def _package_names_by_key(packages: Sequence[Mapping[str, Any]]) -> dict[str, str]:
@@ -1328,6 +1646,20 @@ def classify_unreachable_packages(
                 "defects": sorted(set(defects)),
                 "record": None,
             }
+        # A8: a package with no production consumer must stay explicit about who
+        # owns the gap. No disposition record and no declared owner/Issue means
+        # the owner is genuinely unresolved, and that is reported, not invented.
+        binding = row.get("capability_binding") or {}
+        owning_issues = binding.get("owning_issue_refs") or []
+        classification["owning_issue_refs"] = list(owning_issues)
+        classification["owner_status"] = str(
+            binding.get("owner_status") or AdmissionDefect.UNRESOLVED_OWNER.value
+        )
+        if record is None and not owning_issues and not binding.get("source_maintenance_owner"):
+            classification["defects"] = sorted(
+                set(classification["defects"]) | {AdmissionDefect.UNRESOLVED_OWNER.value}
+            )
+            classification["admitted"] = False
         classifications.append(classification)
         if classification["defects"]:
             admission_defects.append(
@@ -1337,6 +1669,8 @@ def classify_unreachable_packages(
                     "reachability": classification["reachability"],
                     "capability_construction": classification["capability_construction"],
                     "classification": classification["classification"],
+                    "owning_issue_refs": classification["owning_issue_refs"],
+                    "owner_status": classification["owner_status"],
                     "defects": classification["defects"],
                 }
             )
@@ -1374,7 +1708,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
     decision_path = _inside(root, root / DECISION_DATA_RELPATH)
     decision_sha = _sha256(_read_bytes(root, decision_path, max_bytes=BOUNDS.max_source_file_bytes))
     _, decision_revision, records = load_decision_records(root)
-    as_of = as_of or datetime_now.now(timezone.utc).date()
+    as_of = as_of or _utc_today()
     classifications, admission_defects, orphan_decisions = classify_unreachable_packages(
         packages,
         records,
@@ -1428,11 +1762,30 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
             "packages_without_consumer": sum(item["reachability"] == Reachability.NO_CONSUMER.value for item in packages),
             "packages_with_binary_entrypoint": sum(item["reachability"] == Reachability.BINARY_ENTRYPOINT.value for item in packages),
             "packages_requiring_review": sum(item["review_state"] == "REVIEW_REQUIRED" for item in packages),
+            "packages_test_only_consumers": sum(
+                item["consumer_summary"]["test_only_consumers"] > 0
+                and item["consumer_summary"]["production_consumers"] == 0
+                for item in packages
+            ),
+            "packages_with_no_consumer_at_all": sum(
+                item["consumer_summary"]["no_consumers"] for item in packages
+            ),
+            "packages_with_unresolved_owner": sum(
+                item["capability_binding"]["owner_status"].startswith("UNRESOLVED_OWNER")
+                for item in packages
+            ),
+            "findings_by_contextual_disposition": {
+                disposition: sum(item["contextual_disposition"] == disposition for item in findings)
+                for disposition in sorted({item["contextual_disposition"] for item in findings})
+            },
             "complete_denominator": True,
             "unreachable_classified": sum(item["admitted"] for item in classifications),
             "admission_defects": len(admission_defects),
             "unclassified_unreachable": sum(
                 AdmissionDefect.UNCLASSIFIED.value in item["defects"] for item in classifications
+            ),
+            "unresolved_owner_unreachable": sum(
+                AdmissionDefect.UNRESOLVED_OWNER.value in item["defects"] for item in classifications
             ),
             "proof_ceiling": "CRATE_REACHABILITY_CLASSIFICATION_AND_SOURCE_SHAPE_EVIDENCE_ONLY",
         },
