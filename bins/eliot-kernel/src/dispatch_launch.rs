@@ -119,11 +119,11 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    JobState as TestdJobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy, TESTD_OWNER_SUBMIT_OPERATION,
-    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetRoots,
-    TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
-    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
+    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
+    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy,
+    TESTD_OWNER_SUBMIT_OPERATION, TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE,
+    TargetRoots, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse,
+    TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
     testd_profile_binding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
@@ -1446,6 +1446,10 @@ pub(crate) async fn submit_testd_owner_job(
         invocation: request.submission.invocation.clone(),
         target_roots,
         priority: 0,
+        // This is the Kernel's productive verifier launch: the job class is
+        // verification, so it is ordered ahead of every background lane and
+        // reserves capacity against them (I2.22).
+        metadata: JobSubmissionMetadata::verification(),
     };
     submission
         .validate()
