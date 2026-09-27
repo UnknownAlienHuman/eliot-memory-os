@@ -45,6 +45,7 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 mod derived_cache;
 mod finish_disposition;
+mod plan_consumer;
 
 pub use derived_cache::{
     ADMITTED_SCHEMA_REVISIONS, ArtifactLineage, CacheCounters, CacheLimits, CacheLookup,
@@ -58,6 +59,7 @@ pub use finish_disposition::{
     FinishBoundaryResponse, FinishDisposition, OracleObservation, OracleOrigin,
     ProvenRequiredProof, RequiredProofCompletion, TaskOutcome, apply_finish_boundary,
 };
+pub use plan_consumer::{ApplicableInputs, ResolverPlanConsumer};
 
 pub(crate) fn validate_text_shape(value: &str, field: &'static str) -> Result<(), GraphError> {
     text(value, field)
@@ -1060,6 +1062,22 @@ pub enum PlanError {
     /// A narrowing was attempted without an eligible selected check.
     #[error("deviation for {check} rejected: only a selected check may narrow with evidence")]
     DeviationRejected { check: String },
+    /// A consumer refused a plan whose completeness is incomplete; the named
+    /// regions are the plan's own gaps.
+    #[error("plan is incomplete in {} named region(s): build a complete or explicitly permitted revision", regions.len())]
+    IncompletePlan { regions: Vec<String> },
+    /// A consumer is not admitted for the broader tier the plan permits.
+    #[error("resolver is not admitted for the broader tier {tier}")]
+    UnpermittedTier { tier: String },
+    /// Required checks stay mandatory-but-deferred and were not dropped.
+    #[error("plan retains mandatory-but-deferred required check(s): {}", checks.join(", "))]
+    DeferredRequiredCheck { checks: Vec<String> },
+    /// A considered check has no settled disposition.
+    #[error("plan retains a pending check with no settled disposition")]
+    PendingCheck,
+    /// An affected node's coverage is not established or explicitly waived.
+    #[error("unknown verifier coverage for affected node {node:?}")]
+    UnknownCoverage { node: Option<String> },
     /// The plan could not be canonicalized for its digest.
     #[error("plan canonicalization failed")]
     Canonicalization,
