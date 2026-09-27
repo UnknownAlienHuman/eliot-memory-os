@@ -9,10 +9,10 @@
 use std::io::{self, Read, Write};
 
 use eliot_native_worker_core::{
-    ActionEnvelopeCarrier, CapabilityAdmissionPort, ClaimAdmissionRequest, DurableCheckpointPort,
-    DurableReplayPort, NativeWorkerClaim, NativeWorkerRegistration, ReadinessSubmission,
-    WorkerCore, WorkerError, WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle,
-    WorkerReady,
+    ActionEnvelopeCarrier, CapabilityAdmissionFacts, CapabilityAdmissionPort,
+    ClaimAdmissionRequest, DurableCheckpointPort, DurableReplayPort, NativeWorkerClaim,
+    NativeWorkerRegistration, ReadinessSubmission, WorkerCore, WorkerError, WorkerEventEnvelope,
+    WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use serde::{Deserialize, Serialize};
@@ -1065,10 +1065,20 @@ pub fn derive_admitted_intent(
 /// The port retains its admission observation window and echoes it back on
 /// revalidation, so liveness answers the exact sealed grant instead of a
 /// fresh clock reading that could never match it.
+///
+/// Issue #1912: the port also retains the exact
+/// [`CapabilityAdmissionFacts`] it returned, and shares them with the
+/// composition root through a cloneable handle. Those facts are the ones the
+/// core sealed the live `CapabilityGrant` from, so they are the only in-hand
+/// record of the granted epoch/fence/lease/revision/generation the terminal
+/// coverage-gap checkpoint frame must bind. Retaining what this port already
+/// emitted mints nothing: no second admission, no new owner type, and no
+/// re-derivation that could drift from the sealed grant.
+#[derive(Clone)]
 pub struct PresentationEchoAdmission {
-    /// Admission observation window installed by `admit`, echoed by
-    /// `revalidate`.
-    observed: std::sync::Mutex<Option<(u64, u64)>>,
+    /// Exact admission facts returned by `admit`, carrying the observation
+    /// window `revalidate` echoes back.
+    sealed: std::sync::Arc<std::sync::Mutex<Option<CapabilityAdmissionFacts>>>,
 }
 
 impl PresentationEchoAdmission {
@@ -1076,8 +1086,18 @@ impl PresentationEchoAdmission {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            observed: std::sync::Mutex::new(None),
+            sealed: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Returns the exact admission facts this port returned, if it admitted.
+    ///
+    /// `None` before a successful `admit`. The composition root reads this
+    /// through the same instance it injected, so the granted binding it
+    /// observes is the binding the core sealed the live grant from.
+    #[must_use]
+    pub fn sealed_admission(&self) -> Option<CapabilityAdmissionFacts> {
+        self.sealed.lock().ok().and_then(|guard| guard.clone())
     }
 }
 
@@ -1096,8 +1116,8 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
         eliot_native_worker_core::ProviderFailure,
     > {
         use eliot_native_worker_core::{
-            AuthorityEnvelope, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
-            NativeWorkerExecutableExpectation, ProviderFailure,
+            AuthorityEnvelope, CapabilityAdmissionOutcome, NativeWorkerExecutableExpectation,
+            ProviderFailure,
         };
         let presented = request.claim().ok_or_else(|| {
             ProviderFailure::new(
@@ -1173,12 +1193,12 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
             current: join.clone(),
             revoked: false,
         });
-        *self.observed.lock().map_err(|_| {
+        *self.sealed.lock().map_err(|_| {
             ProviderFailure::new(
                 "presentation-echo-admission",
                 "admission observation lock poisoned",
             )
-        })? = Some((now, now.saturating_add(60_000)));
+        })? = Some(facts.clone());
         Ok(CapabilityAdmissionOutcome::Admitted(Box::new(facts)))
     }
 
@@ -1192,18 +1212,19 @@ impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmis
         use eliot_native_worker_core::{
             AdmissionLivenessFacts, AdmissionLivenessOutcome, ProviderFailure,
         };
-        let guard = self.observed.lock().map_err(|_| {
+        let guard = self.sealed.lock().map_err(|_| {
             ProviderFailure::new(
                 "presentation-echo-admission",
                 "admission observation lock poisoned",
             )
         })?;
-        let Some((observed_at, expires_at)) = *guard else {
+        let Some(sealed) = guard.as_ref() else {
             return Err(ProviderFailure::new(
                 "presentation-echo-admission",
                 "no retained admission to revalidate",
             ));
         };
+        let (observed_at, expires_at) = (sealed.observed_at_unix_ms(), sealed.expires_at_unix_ms());
         drop(guard);
         Ok(AdmissionLivenessOutcome::Live(AdmissionLivenessFacts::new(
             request.admission_id(),

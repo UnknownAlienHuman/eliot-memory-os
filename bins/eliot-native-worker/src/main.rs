@@ -11,7 +11,8 @@ use eliot_native_worker::{
     derive_admitted_intent, dispatch_now_unix_ms, select_factory_for_admitted,
 };
 use eliot_native_worker_core::{
-    CapabilityAdmissionPort, DurableCheckpointPort, DurableReplayPort, WorkerCore, WorkerError,
+    CapabilityAdmissionPort, CheckpointRequest, DurableCheckpointPort, DurableReplayPort,
+    JSON_ENCODING_PROFILE, PROTOCOL_VERSION, WorkerCore, WorkerError, WorkerFrame, WorkerFrameBody,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use eliot_process_executor::WindowsProcessExecutor;
@@ -184,14 +185,19 @@ fn run() -> i32 {
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
     let executor = WindowsProcessExecutor::new(authority);
+    // Issue #1912: the composition root keeps a handle to the exact admission
+    // port it injects, so the terminal coverage-gap checkpoint frame binds the
+    // granted epoch/fence/lease/revision the core sealed its live grant from
+    // instead of a re-derived guess.
+    let admission = PresentationEchoAdmission::new();
     let mut worker = NativeWorker::new(WorkerCore::new(
         Some(executor),
-        Some(PresentationEchoAdmission::new()),
+        Some(admission.clone()),
         Some(replay),
         Some(checkpoint),
         Some(Arc::new(BoundedEvidenceSink::new())),
     ));
-    drive_admitted_material(&mut lifecycle, &mut worker, &material, process)
+    drive_admitted_material(&mut lifecycle, &mut worker, &material, process, &admission)
 }
 
 /// Drives one validated admitted presentation to `Ready` and serves.
@@ -205,11 +211,16 @@ fn run() -> i32 {
 /// intent rule on every admitted invocation. Issue #1912 re-proves the
 /// explicit job envelope at the serve boundary and leaves a visible
 /// coverage-gap record when the serve ends cancelled or unknown.
+///
+/// `admission` is a handle to the exact admission port injected into
+/// `worker` above; the terminal coverage-gap checkpoint binds the granted
+/// lease/epoch/fence/revision that port admitted and the core sealed.
 fn drive_admitted_material<E, A, R, C, L>(
     lifecycle: &mut L,
     worker: &mut NativeWorker<E, A, R, C>,
     material: &ValidatedAdmittedMaterial,
     process: ProcessRequest,
+    admission: &PresentationEchoAdmission,
 ) -> i32
 where
     E: ProcessExecutor,
@@ -263,7 +274,14 @@ where
             if let Some(gap) =
                 eliot_native_worker::CoverageGap::for_job_envelope(&envelope, worker.lifecycle())
             {
-                emit_coverage_gap(&gap);
+                // Durable before reported: the verified partial output is
+                // first persisted as a claim-bound checkpoint through the
+                // already-injected `DurableCheckpointPort`, and only then is
+                // the gap emitted — so the disposition can never claim
+                // durability the persist did not return.
+                let (durable, detail) =
+                    persist_coverage_gap_checkpoint(worker, material, admission, &gap);
+                emit_coverage_gap(&gap, durable, &detail);
             }
             0
         }
@@ -300,13 +318,92 @@ fn emit_governed_provenance(actions: &[eliot_native_worker::governed_action::Val
     );
 }
 
+/// Persists the verified partial output behind a coverage gap, durably.
+///
+/// The gap's own `retention_ref` is used verbatim as the checkpoint
+/// reference, so the durable record lands under the same locator the gap
+/// names. The frame rides the worker's existing `Checkpoint` body through the
+/// already-injected `DurableCheckpointPort`; no second persistence mechanism
+/// and no new request type is involved. `WorkerCore::checkpoint` returns
+/// `Ok` only after the port returned `Stored` and the worker re-validated the
+/// request-bound receipt facts, so the boolean below is exactly "the port
+/// persisted this checkpoint" and nothing stronger.
+///
+/// Every binding field comes from data in hand: the live connection, trace
+/// context, and EBP request correlation identity from the admitted hello, the
+/// owner-issued claim deadline, and the granted epoch/fence/lease/revision/
+/// generation from the exact admission facts the core sealed its live grant
+/// from. A missing sealed admission, or any refusal, is reported as a
+/// non-durable disposition rather than swallowed.
+fn persist_coverage_gap_checkpoint<E, A, R, C>(
+    worker: &mut NativeWorker<E, A, R, C>,
+    material: &ValidatedAdmittedMaterial,
+    admission: &PresentationEchoAdmission,
+    gap: &eliot_native_worker::CoverageGap,
+) -> (bool, String)
+where
+    E: ProcessExecutor,
+    A: CapabilityAdmissionPort,
+    R: DurableReplayPort,
+    C: DurableCheckpointPort,
+{
+    let Some(sealed) = admission.sealed_admission() else {
+        return (
+            false,
+            "no sealed admission binds the checkpoint frame; verified partial output is NOT durable"
+                .to_owned(),
+        );
+    };
+    let frame = WorkerFrame {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
+        connection_id: material.hello.connection_id.clone(),
+        request_id: material.hello.request_id.clone(),
+        trace_context: material.hello.trace_context.clone(),
+        deadline_unix_ms: material.admission.claim().deadline_unix_ms,
+        authority_epoch: sealed.authority().epoch.clone(),
+        state_fence: sealed.authority().state_fence.clone(),
+        lease_id: sealed.authority().lease.clone(),
+        admission_revision: sealed.admission_revision().to_owned(),
+        producer_generation: sealed.worker_generation(),
+        body: WorkerFrameBody::Checkpoint(CheckpointRequest {
+            checkpoint_ref: gap.retention_ref.clone(),
+        }),
+    };
+    match block_on(worker.handle(frame)) {
+        Ok(events) => (
+            true,
+            format!(
+                "durable checkpoint stored under '{}' as worker event {}",
+                gap.retention_ref,
+                events
+                    .first()
+                    .map_or_else(|| "<none>".to_owned(), |event| event.event_id.clone())
+            ),
+        ),
+        Err(error) => (
+            false,
+            format!(
+                "durable checkpoint under '{}' was NOT stored: {error}",
+                gap.retention_ref
+            ),
+        ),
+    }
+}
+
 /// Emits one visible coverage-gap record for a terminally incomplete serve.
 ///
 /// Compact stderr receipt line (never a stdout frame) naming the retained
 /// claim/task/job/attempt/operation, the honest finish word, the durable
 /// retention locator holding verified partial output, and the reason the
 /// gap stays open — so supervision observes the gap instead of losing it.
-fn emit_coverage_gap(gap: &eliot_native_worker::CoverageGap) {
+///
+/// `durable` is the persist verdict, never an assumption: it is `true` only
+/// when the injected checkpoint port returned a stored receipt, and `detail`
+/// then names that record. When the persist failed, `durable` is `false` and
+/// `detail` carries the refusal, so the record reads as an open gap with
+/// non-durable partial output instead of a successful disposition.
+fn emit_coverage_gap(gap: &eliot_native_worker::CoverageGap, durable: bool, detail: &str) {
     let record = serde_json::json!({
         "receipt": "COVERAGE_GAP",
         "claim_id": gap.claim_id,
@@ -317,6 +414,8 @@ fn emit_coverage_gap(gap: &eliot_native_worker::CoverageGap) {
         "finish": gap.finish.as_str(),
         "retention_ref": gap.retention_ref,
         "reason": gap.reason,
+        "checkpoint_durable": durable,
+        "checkpoint_detail": detail,
     });
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "{record}");
