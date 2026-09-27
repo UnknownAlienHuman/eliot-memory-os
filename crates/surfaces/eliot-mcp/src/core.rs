@@ -2273,7 +2273,7 @@ pub fn build_host_invocation(
 /// The handle must be the exact Kernel-issued handle retained for the
 /// cancelled correlation; the gateway echoes it back so a redirected result
 /// is detected instead of trusted. The cancellation carries a separate
-/// explicit domain marker and original JSON-RPC type, so it cannot alias an
+/// explicit domain marker and original JSON-RPC type, so it cannot collide with an
 /// invocation key or a client string resembling an internal tag.
 pub fn build_host_cancellation(
     version: NegotiatedWireVersion,
