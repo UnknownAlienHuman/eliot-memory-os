@@ -158,8 +158,8 @@ def audit(
 ) -> tuple[list[Finding], dict[str, int]]:  # noqa: F405
     findings, metrics = _base_audit(root, cfg)
     pipeline_findings, pipeline_metrics = documentation_pipeline_findings(root, cfg)
-    traceability_findings, traceability_metrics = traceability_retirement.findings(root)
-    normative_findings, normative_metrics = normative_references.reference_findings(root)
+    traceability_findings, traceability_metrics = traceability_retirement.audit(root)
+    normative_findings, normative_metrics = normative_references.audit(root)
     findings.extend(pipeline_findings)
     findings.extend(traceability_findings)
     findings.extend(normative_findings)
