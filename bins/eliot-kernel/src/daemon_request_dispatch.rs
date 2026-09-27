@@ -20,7 +20,7 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
-    AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError,
+    AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     UserAutomationDueWakeRejection, UserAutomationDueWakeResolution, UserAutomationDurableJobPort,
     UserAutomationHorizonOutcome, UserAutomationHorizonPhase, UserAutomationHorizonTrigger,
     UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
@@ -6300,79 +6300,31 @@ impl KernelComposition {
         if operation.context.request_id != request_id {
             return Err(TransportError::SessionFenced);
         }
-        operation
-            .context
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        if let Err(error) = operation.transition.validate() {
-            return Ok(Self::store_error_response_text(
-                "write_receipt",
-                &error.to_string(),
-            ));
-        }
         validate_store_session_fence(session, &operation.context.state_fence)?;
-        if operation.transition.state_fence != operation.context.state_fence {
-            return Err(TransportError::SessionFenced);
-        }
-        super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
-        for head in &operation.expected_revision_heads {
-            if let Err(error) = head.validate() {
-                return Ok(Self::store_error_response_text(
-                    "write_receipt",
-                    &error.to_string(),
-                ));
-            }
-            if head.state_fence != operation.context.state_fence {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        for head in &operation.expected_ordering_heads {
-            if let Err(error) = head.validate() {
-                return Ok(Self::store_error_response_text(
-                    "write_receipt",
-                    &error.to_string(),
-                ));
-            }
-            if head.state_fence != operation.context.state_fence {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        // RECHECK-63 slice B: recompute the canonical request hash from the
-        // exact values about to be executed (context + transition + expected
-        // heads) and reject divergence before the gateway call. The view is
-        // built from these references — not re-forwarded copies — so a
-        // mutation after admission fails here with the typed mismatch,
-        // rendered through the existing store-error response shape. The
-        // carried ordering scopes must also still equal the hashed expected
-        // ordering heads: a post-admission scope edit leaves the shared
-        // digest unchanged but changes head advancement, so it fails here
-        // with the same typed mismatch.
+        // Issue #1796 (I6.8): the pre-stage admission boundary emits one typed
+        // rejection carrying every detected defect with `stage_state: none`,
+        // `ordering_sequence_assigned: false`, `write_mutation_status:
+        // NOT_ATTEMPTED`, and no `write_intent_id`. Exact same-hash retry
+        // replays the same rejection identity; changed canonical bytes under
+        // one idempotency key yield `IDENTITY_CONFLICT`. The gate allocates no
+        // ordering sequence, mints no `write_intent_id`, and records no
+        // effect, so a refusal never reaches the Store backend below.
         {
-            if let Err(error) = verify_ordering_scope_binding(
-                &operation.transition,
-                &operation.expected_ordering_heads,
-            ) {
-                return Ok(Self::store_error_response_text(
-                    "write_receipt",
-                    &error.to_string(),
-                ));
-            }
-            let view = CanonicalRequestView::from_apply(
+            let mut cache = self
+                .pre_stage_identity_cache
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if let Err(rejection) = eliot_kernel_service::pre_stage_check(
+                &mut cache,
                 &operation.context,
                 &operation.transition,
                 &operation.expected_revision_heads,
                 &operation.expected_ordering_heads,
-            );
-            if let Err(error) = verify_canonical_request_hash(
-                &view,
-                &operation.transition.identity.canonical_request_hash,
             ) {
-                return Ok(Self::store_error_response_text(
-                    "write_receipt",
-                    &error.to_string(),
-                ));
+                return Ok(Self::pre_stage_rejection_response(&rejection));
             }
         }
+        super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
             .replay_committed_apply_receipt(&gateway, &operation)
@@ -7894,6 +7846,22 @@ impl KernelComposition {
             "status": status,
             "value": { "kind": kind, "value": null },
             "recovery": null,
+        })
+    }
+
+    /// Renders one typed I6.8 pre-stage rejection (issue #1796) as the
+    /// `write_receipt` error response. The full typed record — stage state,
+    /// ordering flag, decision, defect codes, mutation status, and retry rule
+    /// — travels in `recovery` so the client can distinguish schema-invalid,
+    /// identity-conflict, and staged outcomes without parsing prose.
+    #[cfg(windows)]
+    fn pre_stage_rejection_response(rejection: &PreStageRejection) -> serde_json::Value {
+        serde_json::json!({
+            "status": "error",
+            "value": { "kind": "write_receipt", "value": null },
+            "recovery": {
+                "pre_stage_rejection": rejection,
+            },
         })
     }
 

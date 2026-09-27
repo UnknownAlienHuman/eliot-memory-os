@@ -550,6 +550,12 @@ pub struct KernelComposition {
     /// of re-arming a fresh join. Pruned by grant expiry on every use;
     /// process-local only, never a restart/durable record.
     wasm_join_table: Mutex<eliot_kernel_service::WasmJoinTable>,
+    /// Pre-stage contract-rejection identity cache (issue #1796, I6.8). Holds
+    /// the exact canonical-hash → rejection mapping so an exact same-hash
+    /// retry replays the same rejection and changed bytes under one idempotency
+    /// key yield `IDENTITY_CONFLICT` — all before any ORS/store mutation,
+    /// ordering-sequence allocation, or `write_intent_id` mint.
+    pre_stage_identity_cache: Mutex<eliot_kernel_service::PreStageIdentityCache>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
     #[cfg(windows)]
