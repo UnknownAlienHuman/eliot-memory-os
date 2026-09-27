@@ -14,10 +14,22 @@
 //! Planning is strictly read-only. `plan_canary_removal` resolves the target
 //! from the accepted installation registry and the original transaction's own
 //! effect receipts and creates no file, secret, service, reservation or
-//! transaction row. Admission records one durable removal operation, and
-//! execution revalidates the retained resource identity immediately before each
-//! mutation, persists the exact intent before the call and the observed result
-//! before advancing.
+//! transaction row. Admission records one durable removal operation together
+//! with the one absolute deadline of its bounded reconcile wait, and execution
+//! revalidates the retained resource identity immediately before each mutation,
+//! persists the exact intent before the call and the observed result before
+//! advancing.
+//!
+//! The reconcile wait is bounded by that single recorded deadline rather than by
+//! a caller-chosen or per-attempt budget. A resumed or retried reconcile reads
+//! the same recorded deadline back, so a restart cannot hand the same removal a
+//! second unbounded wait. Once the deadline is reached, both entry points refuse
+//! to drive any further effect and return the untouched durable projection: the
+//! non-terminal stage, the blocking effect and the unresolved
+//! `CanaryRemovalEffectState::Unknown { pending_ref }` row all stay exactly as
+//! observed. Expiry therefore produces visible incomplete recovery state and
+//! can never author a green `Completed`; only a per-row authoritative readback
+//! can.
 
 use std::collections::BTreeSet;
 
@@ -31,6 +43,7 @@ use super::{
     ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PlatformHandle, PortOutcome,
     RedbInstallationRegistry, RedbInstallationTransactionStore, candidate_manifest_digest,
     effect_request, handle, handles, platform_error, port_pending, sha256_handle, sha256_hex,
+    wall_clock_millis,
 };
 
 /// Wire discriminator for the canary-removal plan, its frozen effect graph and
@@ -39,7 +52,12 @@ use super::{
 /// This revision is independent from the installation-transaction wire version,
 /// so an existing installation transaction keeps its exact identity: a removal
 /// is a separate durable record, not a rewritten install.
-pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+///
+/// Version 2 makes the absolute reconcile deadline of the bounded reconcile
+/// wait a mandatory durable member. A version 1 record cannot supply it and
+/// requires explicit migration; a deadline is never synthesized as a default,
+/// because a defaulted budget would silently grant an unbounded second wait.
+pub const CANARY_REMOVAL_WIRE_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
 
 /// Canonical prefix of every derived canary-removal operation identity.
 const CANARY_REMOVAL_OPERATION_PREFIX: &str = "canary-removal/v1:";
@@ -51,6 +69,19 @@ const CANARY_REMOVAL_OPERATION_PREFIX: &str = "canary-removal/v1:";
 /// attempt under the same identity, and any further attempt requires a new,
 /// separately admitted removal operation rather than a silent extra mutation.
 const CANARY_REMOVAL_ROW_MAX_ATTEMPTS: u32 = 2;
+
+/// Bounded wall-clock window in which one admitted canary-removal operation may
+/// keep driving and reconciling its own removal rows.
+///
+/// This is the same absolute injected-clock shape the crate already uses for
+/// one bounded SCM start convergence window. The deadline is computed once from
+/// the observed clock when the operation is admitted, persisted with the
+/// operation and never recomputed, so a resumed reconcile re-derives its
+/// remaining window from that recorded deadline instead of restarting the
+/// budget. Expiry is not a resolution: it only refuses to drive further, which
+/// preserves the durable incomplete recovery and its blocking effect exactly as
+/// observed.
+const CANARY_REMOVAL_RECONCILE_TIMEOUT_MS: u64 = 30_000;
 
 /// Closed set of resource categories one governed canary removal must account
 /// for.
@@ -669,6 +700,15 @@ pub struct CanaryRemovalOperation {
     pub effect_progress: Vec<CanaryRemovalEffectProgress>,
     /// Exact removal effect that currently blocks the terminal disposition.
     pub blocking_effect_id: Option<PlatformHandle>,
+    /// Absolute injected-clock deadline of this operation's bounded reconcile
+    /// wait.
+    ///
+    /// It is computed once at admission and never recomputed, so a resumed
+    /// reconcile re-derives its remaining window from this recorded value
+    /// instead of restarting the budget. It is a bound on driving, not a
+    /// resolution: reaching it leaves every unresolved row, the blocking
+    /// effect and the non-terminal stage exactly as observed.
+    pub reconcile_deadline_ms: u64,
     /// Monotonic state revision used by the durable compare-and-save path.
     pub revision: u64,
 }
@@ -698,6 +738,11 @@ impl CanaryRemovalOperation {
             stage: CanaryRemovalStage::Admitted,
             effect_progress,
             blocking_effect_id: None,
+            // The one deadline of the whole reconcile wait, taken once from the
+            // observed clock at admission. It is never recomputed afterwards,
+            // so neither a retry nor a resumed reconcile can restart it.
+            reconcile_deadline_ms: wall_clock_millis()
+                .saturating_add(CANARY_REMOVAL_RECONCILE_TIMEOUT_MS),
             revision: 1,
         };
         operation.validate()?;
@@ -717,6 +762,12 @@ impl CanaryRemovalOperation {
         if self.revision == 0 {
             return Err(InstallationError::InvalidField {
                 field: "canary_removal.revision".to_owned(),
+                reason: "must be non-zero".to_owned(),
+            });
+        }
+        if self.reconcile_deadline_ms == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "canary_removal.reconcile_deadline_ms".to_owned(),
                 reason: "must be non-zero".to_owned(),
             });
         }
@@ -1115,6 +1166,10 @@ where
 /// revision, records the removal intent durably and only then issues a
 /// destructive call. A reused removal identity with changed inputs is an
 /// identity conflict; an identical replay resumes the same operation.
+///
+/// The drive is additionally bounded by the operation's one recorded reconcile
+/// deadline, so a replay of an already admitted plan can never buy a fresh
+/// unbounded wait.
 pub(crate) fn apply_canary_removal<P>(
     coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
     registry: &RedbInstallationRegistry,
@@ -1124,6 +1179,9 @@ where
     P: InstallationEffectPort,
 {
     let mut operation = admit_or_resume(coordinator, plan)?;
+    if reconcile_budget_exhausted(&operation) {
+        return Ok(operation.project());
+    }
     let install = revalidate_fence(coordinator, registry, &operation)?;
     advance(coordinator, registry, &mut operation, &install)?;
     operation.validate()?;
@@ -1147,10 +1205,24 @@ where
     if operation.stage == CanaryRemovalStage::Completed {
         return Ok(operation.project());
     }
+    if reconcile_budget_exhausted(&operation) {
+        return Ok(operation.project());
+    }
     let install = revalidate_fence(coordinator, registry, &operation)?;
     advance(coordinator, registry, &mut operation, &install)?;
     operation.validate()?;
     Ok(operation.project())
+}
+
+/// Reports whether this operation's one recorded reconcile deadline has passed.
+///
+/// The window is re-derived from the durable operation state, never from a
+/// fresh per-call budget, so a resumed or retried reconcile can neither restart
+/// nor extend it. Every path that could issue a destructive call consults this
+/// first: at expiry the drive is refused and the durable incomplete recovery is
+/// preserved unchanged.
+fn reconcile_budget_exhausted(operation: &CanaryRemovalOperation) -> bool {
+    wall_clock_millis() >= operation.reconcile_deadline_ms
 }
 
 /// Returns the stable read-only disposition of one removal operation.
@@ -1573,7 +1645,8 @@ where
 /// installed transaction and its completed stage, the re-observed drain
 /// evidence (applied effects, no pending external change, no held activation
 /// intent), the current registry revision, the target's still-retired
-/// position, any pending activation and the observed activation-owner handoff.
+/// position, any pending activation, and the required re-observed
+/// activation-owner retirement handoff a dependent stop/delete has to follow.
 #[allow(
     clippy::too_many_lines,
     reason = "the pre-destructive fence keeps every drift check in one auditable boundary"
@@ -1680,12 +1753,25 @@ where
             "the removal target is staged in a pending activation".to_owned(),
         ));
     }
-    if !already_retired
-        && plan.quiesce.retirement_barrier.is_some()
-        && observed_retirement_barrier(&projection, &plan.generation)
-            != plan.quiesce.retirement_barrier
-    {
-        return Err(InstallationError::IdentityConflict);
+    // The retirement barrier is the drain evidence a dependent stop/delete has
+    // to follow: the activation owner's own committed cutover receipt naming
+    // the target as the predecessor it consumed. It must be present in the
+    // frozen plan and re-observed in this same attempt, so no dependent
+    // stop/delete is ever issued for a target whose retirement was never
+    // observed. A target whose terminal registry record is already absent is
+    // exempt: that record only commits after every pre-registry row resolved,
+    // so no dependent stop/delete is left to order and only the terminal save
+    // remains.
+    if !already_retired {
+        let Some(recorded) = &plan.quiesce.retirement_barrier else {
+            return Err(InstallationError::IncompleteObservation(
+                "a dependent canary stop/delete requires the observed activation-owner retirement barrier"
+                    .to_owned(),
+            ));
+        };
+        if observed_retirement_barrier(&projection, &plan.generation).as_ref() != Some(recorded) {
+            return Err(InstallationError::IdentityConflict);
+        }
     }
     Ok(install)
 }
