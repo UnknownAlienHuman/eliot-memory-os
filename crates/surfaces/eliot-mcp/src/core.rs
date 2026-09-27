@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
+use eliot_protocol::{AgentHostRequestFailure, HARD_STRUCTURED_RESPONSE_BYTES};
 use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding};
 use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
@@ -644,6 +644,12 @@ pub enum PortFailure {
     /// Owner rejected a stale or mismatched state fence.
     #[error("FENCE_MISMATCH")]
     FenceMismatch,
+    /// Kernel returned its typed non-success host-request envelope.
+    #[error("AGENT_RESPONSE")]
+    AgentResponse {
+        /// Exact Kernel-authored failure contract, including open reason code.
+        failure: Box<AgentHostRequestFailure>,
+    },
     /// Scoped credential or operational transport binding was rejected.
     #[error("TRANSPORT_BINDING_REJECTED: {reason}")]
     TransportBindingRejected {

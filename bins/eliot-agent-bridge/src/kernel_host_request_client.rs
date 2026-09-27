@@ -35,7 +35,7 @@ use eliot_mcp::{
     ToolRequest,
 };
 use eliot_protocol::{
-    EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
+    AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
     HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
     HostRequestResultBody, MessageType, ProtocolPayload, ProtocolVersion,
@@ -454,6 +454,13 @@ fn request_failure() -> PortFailure {
     }
 }
 
+fn retain_agent_response(error: PortFailure, fallback: PortFailure) -> PortFailure {
+    match error {
+        response @ PortFailure::AgentResponse { .. } => response,
+        _ => fallback,
+    }
+}
+
 fn resource_source_refused() -> PortFailure {
     PortFailure::TransportBindingRejected {
         reason: "resource source is not authorized by the current Kernel attach".to_owned(),
@@ -580,14 +587,64 @@ impl KernelTransportOwner {
         if !matches!(delivery, eliot_ipc::DeliveryOutcome::Delivered) {
             return Err(request_failure());
         }
-        self.runtime.block_on(async {
+        let reply = self.runtime.block_on(async {
             self.admitted
                 .transport
                 .receive_frame(self.limits)
                 .await
                 .map_err(|_| request_failure())
-        })
+        })?;
+        if let Some(failure) = decode_host_request_failure(&reply, frame) {
+            return Err(PortFailure::AgentResponse {
+                failure: Box::new(failure),
+            });
+        }
+        Ok(reply)
     }
+}
+
+/// Decodes a canonical Kernel failure only after joining the reply to the
+/// exact request envelope, request ID, and live connection. Unknown future
+/// reason strings remain untouched in the typed envelope.
+fn decode_host_request_failure(reply: &Frame, request: &Frame) -> Option<AgentHostRequestFailure> {
+    reply.validate().ok()?;
+    request.validate().ok()?;
+    if reply.kind != FrameKind::Response
+        || reply.message_type != MessageType::Result
+        || reply.protocol_version != request.protocol_version
+        || reply.connection_id != request.connection_id
+        || reply.request_id != request.request_id
+        || reply.request_identity.is_some()
+    {
+        return None;
+    }
+    let ProtocolPayload::Json(request_payload) = &request.payload else {
+        return None;
+    };
+    let envelope: HostRequestEnvelope =
+        serde_json::from_value(request_payload.get("envelope")?.clone()).ok()?;
+    envelope.validate().ok()?;
+    if envelope.connection_id != request.connection_id
+        || request.request_id.as_ref() != Some(&envelope.identity.request_id)
+    {
+        return None;
+    }
+    let ProtocolPayload::Json(reply_payload) = &reply.payload else {
+        return None;
+    };
+    if canonical_json_bytes(reply_payload).ok()?.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+        return None;
+    }
+    if reply_payload.get("status")?.as_str()? != "failure" {
+        return None;
+    }
+    let failure: AgentHostRequestFailure =
+        serde_json::from_value(reply_payload.get("failure")?.clone()).ok()?;
+    failure.validate().ok()?;
+    (failure.request_identity == envelope.identity
+        && failure.envelope_sha256 == envelope.envelope_sha256
+        && failure.protocol_version == request.protocol_version)
+        .then_some(failure)
 }
 
 /// What one invocation preparation decided (issue #2571).
@@ -674,7 +731,7 @@ impl KernelHostRequestClient {
         let frame = host_request_resolve_frame(&query, &resolve_envelope, &facts)?;
         let reply = self
             .exchange(&frame)
-            .map_err(|_| resource_source_refused())?;
+            .map_err(|error| retain_agent_response(error, resource_source_refused()))?;
         let record = match decode_resolve_reply(
             &reply,
             &resolve_envelope,
@@ -768,6 +825,7 @@ impl KernelHostRequestClient {
                     key: logical_key.clone(),
                 },
             ),
+            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
             Err(_) => LogicalOwnerOutcome::Unavailable,
         };
         match outcome {
@@ -852,6 +910,7 @@ impl KernelHostRequestClient {
                     handle: handle.clone(),
                 },
             ),
+            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
             Err(_) => LogicalOwnerOutcome::Unavailable,
         };
         match outcome {
@@ -930,6 +989,7 @@ impl KernelHostRequestClient {
                     handle: parent.handle.clone(),
                 },
             ),
+            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
             Err(_) => LogicalOwnerOutcome::Unavailable,
         };
         let LogicalOwnerOutcome::Resolved(record) = outcome else {
@@ -1001,6 +1061,7 @@ impl KernelHostRequestClient {
                     key: logical_key.clone(),
                 },
             ),
+            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
             Err(_) => LogicalOwnerOutcome::Unavailable,
         };
         match outcome {
@@ -2408,8 +2469,10 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                 host_request_observe_submit_frame(request, &envelope, &facts)?
             }
         };
-        let Ok(reply) = self.exchange(&frame) else {
-            return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+        let reply = match self.exchange(&frame) {
+            Ok(reply) => reply,
+            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
+            Err(_) => return self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
         };
         match decode_admitted_reply(&reply, &envelope) {
             Some((receipt, record)) => {
@@ -2424,6 +2487,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     | HostRequestRecordState::Reconciling => {
                         match self.rehydrate_operation(&envelope, &receipt) {
                             Ok(refreshed) => refreshed,
+                            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
                             Err(_) => record,
                         }
                     }
@@ -2467,19 +2531,21 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             &facts,
         )?;
         let cancel_correlation = request.correlation_id.as_str().to_owned();
-        let Ok(reply) = self.exchange(&frame) else {
-            // Unknown delivery: the retained cancellation intent is
-            // resolved by its own stable identity before any probe, so a
-            // lost acknowledgement recovers the staged intent instead of
-            // generating another effectful cancellation.
-            return self.resolve_retained_cancellation(
-                &parent,
-                cancel_correlation.as_str(),
-                &envelope,
-                &facts,
-                &session,
-                now_ms,
-            );
+        let reply = match self.exchange(&frame) {
+            Ok(reply) => reply,
+            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
+            // Unknown delivery: resolve the retained cancellation identity
+            // before any probe, without generating another cancellation.
+            Err(_) => {
+                return self.resolve_retained_cancellation(
+                    &parent,
+                    cancel_correlation.as_str(),
+                    &envelope,
+                    &facts,
+                    &session,
+                    now_ms,
+                );
+            }
         };
         match decode_admitted_reply(&reply, &envelope) {
             Some((_, _intent_record)) => {
@@ -2538,7 +2604,9 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         };
         payload["restore"] = query_value;
         frame.validate().map_err(|_| request_failure())?;
-        let reply = self.exchange(&frame).map_err(|_| request_failure())?;
+        let reply = self
+            .exchange(&frame)
+            .map_err(|error| retain_agent_response(error, request_failure()))?;
         let (_, record) = decode_admitted_reply(&reply, &envelope).ok_or_else(|| {
             PortFailure::TransportBindingRejected {
                 reason: "restore reply is not the admitted answer".to_owned(),
@@ -2613,7 +2681,7 @@ impl KernelHostRequestClient {
         let frame = host_request_rehydrate_frame(envelope, receipt, &facts)?;
         let reply = self
             .exchange(&frame)
-            .map_err(|_| unknown_outcome(&digest))?;
+            .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
         decode_rehydrated_reply(&reply, envelope).ok_or_else(|| unknown_outcome(&digest))
     }
 
@@ -2673,7 +2741,7 @@ impl KernelHostRequestClient {
             host_request_frame_for_envelope(AGENT_HOST_REQUEST_RECONCILE_OPERATION, &probe, facts)?;
         let reply = self
             .exchange(&frame)
-            .map_err(|_| unknown_outcome(&digest))?;
+            .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
         match decode_admitted_reply(&reply, &probe) {
             Some(_) => {
                 let handle = HostOperationHandle::new(host_request_operation_id(envelope))
@@ -2711,7 +2779,7 @@ impl KernelHostRequestClient {
         let digest = envelope.envelope_sha256.clone();
         let reply = self
             .exchange(&frame)
-            .map_err(|_| unknown_outcome(&digest))?;
+            .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
         match decode_admitted_reply(&reply, &probe) {
             Some(_) => Err(unknown_cancel_outcome(&parent.handle)),
             None => Err(unknown_outcome(&digest)),
