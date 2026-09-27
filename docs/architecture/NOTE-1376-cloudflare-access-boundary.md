@@ -127,3 +127,16 @@ endpoint and owner selected at setup.
   <https://help.openai.com/en/articles/10929079-google-drive-app-and-setup-in-chatgpt> —
   Drive connects to ChatGPT under its own permissions; not a bridge into
   ELIOT.
+
+## 7. Deferred implementation items
+
+The runtime implementation items created from this note are the T14 ordered
+slices T14-S1..S5 (`T14.md`, §5 "Ordered slices"). S1–S5 execute after the
+installation phase, and the controller creates child issues only after
+accepting that proposal.
+
+- T14-S1 — Complete the existing bounded local read/result path.
+- T14-S2 — Add the generated remote MCP read profile.
+- T14-S3 — Wire the separate local gateway process.
+- T14-S4 — Configure owner Tunnel/Access and prove public OAuth.
+- T14-S5 — Prove ChatGPT question → ELIOT evidence → cited answer.
