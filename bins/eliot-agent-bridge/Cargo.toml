@@ -27,6 +27,7 @@ eliot-integration-coverage.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-mcp.workspace = true
+eliot-observability-runtime.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true

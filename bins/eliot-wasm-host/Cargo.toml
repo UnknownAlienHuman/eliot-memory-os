@@ -20,6 +20,7 @@ eliot-profile-full-composition = []
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-observability-runtime.workspace = true
 eliot-platform.workspace = true
 eliot-process-executor.workspace = true
 eliot-process.workspace = true

@@ -32,6 +32,7 @@ eliot-ipc.workspace = true
 # bins/eliotd declares it. No version upgrade: versions match the member
 # manifest.
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
+eliot-observability-runtime.workspace = true
 eliot-ors.workspace = true
 eliot-process-executor.workspace = true
 eliot-protocol.workspace = true

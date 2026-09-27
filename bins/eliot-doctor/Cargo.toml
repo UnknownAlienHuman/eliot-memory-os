@@ -18,6 +18,7 @@ eliot-cli.workspace = true
 eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
 eliot-kernel-service.workspace = true
+eliot-observability-runtime.workspace = true
 eliot-platform.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true

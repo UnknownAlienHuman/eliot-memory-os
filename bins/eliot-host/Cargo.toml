@@ -23,6 +23,7 @@ eliot-installation.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-service.workspace = true
 eliot-host-state.workspace = true
+eliot-observability-runtime.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-ors.workspace = true
 eliot-platform.workspace = true
