@@ -18,10 +18,20 @@ branch-handoff documents to duplicate issue/PR state.
 
 ## Workflows
 
-All repository-owned workflows use **`workflow_dispatch` only**. They do not run
-on pushes, pull requests, schedules, merges, releases, or any other automatic
-event. A person starts a workflow explicitly from the Actions UI or an
-equivalent authenticated manual dispatch. Ordinary verification is run locally.
+Every repository-owned workflow except `ci.yml` uses `workflow_dispatch` only.
+Those workflows do not run on pushes, pull requests, schedules,
+merges, releases, or any other automatic event. A person starts one explicitly
+from the Actions UI or an equivalent authenticated manual dispatch. Ordinary
+verification is run locally.
+
+`ci.yml` is the **sole automatic workflow** (accepted issue #3004): one
+automatic, required, Windows compile-only merge check. It runs for every
+opened, updated, reopened, or ready pull request targeting `main`, keeps a
+manual rerun, and runs diagnostically for every pushed `main` commit. No other
+workflow may gain an automatic trigger without its own accepted issue and a
+full migration of this policy surface (`AGENTS.md`, `WORKFLOW.md`, the
+`ci.yml` exception record, `scripts/verify-github-workflows.py`,
+`config/doc-code-conformance.toml`, and the #1225 allocation).
 
 ### `repository-policy.yml`
 
@@ -39,23 +49,39 @@ Proof ceiling: repository routing and authority-surface integrity only.
 
 ### `ci.yml`
 
-Manual bounded integration-source check.
+Automatic compile-only merge check (the sole automatic workflow).
 
-Checks the selected checked-out source revision through:
+Checks the exact integration candidate — the checked-out synthetic merge for
+pull requests (base SHA, head SHA, merge SHA/tree recorded; branch-head-only
+checkout fails), the exact pushed commit for `main` pushes, the selected
+ref/SHA for manual reruns — through:
 
-- the closed Review profile owned by `scripts/verify.ps1`, invoked exactly
-  once (normative identity, Cargo metadata, formatting, workspace all-target
-  check, Clippy, nonzero workspace tests, dependency-policy offline gate);
+- the closed MergeCompile profile owned by `scripts/verify.ps1`, invoked
+  exactly once: the shared source/policy oracle gates, locked Cargo metadata,
+  formatting check, workspace all-target check, `cargo test --no-run`
+  compilation of every workspace test target with zero execution, bounded
+  Clippy over directly changed packages with normal warning semantics,
+  compile-only standalone/excluded-package coverage, and locked restore plus
+  Release build of both `Eliot.Operator` and `Eliot.Operator.Tests` with zero
+  harness execution;
 - hash-locked Python verification dependencies
-  (`scripts/requirements-verification.txt` with `--require-hashes`);
-- locked-mode NuGet restore of `Eliot.Operator` and `Eliot.Operator.Tests`
-  against their checked-in `packages.lock.json` files, then the
-  Eliot.Operator Release build and the explicit `Eliot.Operator.Tests`
-  harness execution.
+  (`scripts/requirements-verification.txt` with `--require-hashes`).
 
-Proof ceiling: source-only review candidate (`REVIEW_SOURCE_ONLY`). It does not
-prove release packaging, an installed Windows service tree, store recovery, or
-a Product Pulse.
+Least privilege: GitHub-hosted Windows runners, `contents: read`, no
+repository/environment secrets, `persist-credentials: false`, no
+`pull_request_target`, no writes to issues, PRs, releases, repository contents,
+or branch refs. Cache holds only rebuildable Cargo registry/git inputs bound
+to OS, toolchain, lock/config identity, profile, and event class; fork pull
+requests restore without saving into the trusted `main` namespace; every cache
+hit still runs every mandatory gate. Cancellation is event-specific: a PR
+update cancels only that PR's obsolete run; each pushed `main` SHA keeps a
+terminal diagnostic result.
+
+Proof ceiling: compile-only merge candidate (`MERGE_COMPILE_SOURCE_ONLY`). It
+does not execute or prove broad unit behavior, lint cleanliness, release
+packaging, an installed Windows service tree, store recovery, external
+providers, or a Product Pulse. Manual `Review` and source-candidate workflows
+retain their stronger executed-test semantics.
 
 ### `source-candidate.yml`
 
@@ -107,7 +133,10 @@ A change requires an owning issue and must state:
 - cancellation/concurrency behavior;
 - replacement/removal path.
 
-The trigger remains `workflow_dispatch` only. Workflow names such as `release`,
-`certified`, `production`, or `live` are used only when the workflow owns that
-exact decision and executes the required proof. A source check may not be renamed
-into a release or Product-Pulse gate.
+The default trigger remains `workflow_dispatch` only; `pull_request_target`,
+schedules, releases, broad branch pushes, and arbitrary dispatch inputs stay
+rejected on every workflow. Any further automatic trigger needs its own
+accepted owning issue plus a full migration of this policy surface. Workflow
+names such as `release`, `certified`, `production`, or `live` are used only
+when the workflow owns that exact decision and executes the required proof. A
+source check may not be renamed into a release or Product-Pulse gate.

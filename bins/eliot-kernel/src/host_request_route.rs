@@ -85,6 +85,15 @@ use self::daemon_claim_queue::{campaign_packet_admission, check_task_controller_
 /// unknown operation rather than a fence failure.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
 
+/// Durable identity dimensions staged with the admitted operation in one ORS
+/// transaction. The idempotency namespace matches the earlier Kernel binder;
+/// request and cancellation identities are independent collision keys.
+const HOST_REQUEST_IDEMPOTENCY_BINDING_PREFIX: &str = "hostreq-identity:";
+const HOST_REQUEST_REQUEST_BINDING_PREFIX: &str = "hostreq-request-id:";
+const HOST_REQUEST_CANCELLATION_BINDING_PREFIX: &str = "hostreq-cancellation-id:";
+const HOST_REQUEST_IDENTITY_BINDING_LABEL: &str =
+    "eliot.kernel.host-request.operation-identity-binding.v1";
+
 /// Typed frame operations carrying one [`HostRequestEnvelope`] through the
 /// closed frame gateway.
 ///
@@ -437,8 +446,11 @@ impl KernelComposition {
                 .admit_host_request(envelope, &descriptor, &binding, resolution.as_ref())
                 .map_err(|_| TransportError::SessionFenced)?
         };
+        let identity_bindings = host_request_identity_binding_records(&requested)?;
         let stored = self
-            .stage_host_request_with_logical_claim(&requested)
+            .generation_gateway
+            .ors
+            .resolve_or_stage_host_request_with_identity_bindings(&requested, &identity_bindings)
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
                 _ => TransportError::SessionFenced,
@@ -498,33 +510,6 @@ impl KernelComposition {
 
         self.note_host_request_operation_under_transition(envelope)?;
         Ok((admission_receipt, admitted))
-    }
-
-    /// Stages one `Requested` host-request row, claiming its logical key when
-    /// it carries one (issue #2571: the production logical-key writer).
-    ///
-    /// Records with a canonical logical key (session-bound `Invocation` or
-    /// `Cancellation`) go through the owner's atomic resolve-or-stage entry,
-    /// so the key claim and the operation row commit in one write
-    /// transaction: the first stage wins, an exact replay returns the winner
-    /// unchanged, and a changed commitment under a known key fails as an
-    /// identity conflict. Records without a key (every other kind, or a
-    /// missing session) keep the legacy stage path unchanged. A winner
-    /// reached under a different operation identity fails closed through the
-    /// advance join in the admit path, which only ever advances the
-    /// presented identity.
-    fn stage_host_request_with_logical_claim(
-        &self,
-        requested: &HostRequestRecord,
-    ) -> Result<HostRequestRecord, OrsError> {
-        let keyed = RedbRecoveryStore::host_request_logical_key_for_record(requested)?.is_some();
-        if keyed {
-            self.generation_gateway
-                .ors
-                .resolve_or_stage_host_request(requested)
-        } else {
-            self.generation_gateway.ors.stage_host_request(requested)
-        }
     }
 
     /// Admits one Watchdog spool intent batch through the fenced named Kernel
@@ -3085,6 +3070,43 @@ fn bridge_process_binding(
     }
     .with_computed_digest()
     .map_err(|_| TransportError::SessionFenced)
+}
+
+/// Derives three immutable ORS collision rows from the exact admitted request.
+///
+/// Each namespace is keyed by one identity value. ORS compares the stable
+/// operation commitment for session-bound logical replays, whose transport
+/// binding may change after reconnect, and the full binding otherwise. It
+/// stages these rows with the operation and its logical claim atomically.
+fn host_request_identity_binding_records(
+    requested: &HostRequestRecord,
+) -> Result<[HostRequestRecord; 3], TransportError> {
+    let binding_digest = sha256_json(&HOST_REQUEST_IDENTITY_BINDING_LABEL)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let make = |prefix: &str, value: &str| -> Result<HostRequestRecord, TransportError> {
+        let mut binding = requested.clone();
+        binding.operation_id = OperationIdentity::new(format!("{prefix}{value}"))
+            .map_err(|_| TransportError::SessionFenced)?;
+        binding.request_digest.clone_from(&binding_digest);
+        binding
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(binding)
+    };
+    Ok([
+        make(
+            HOST_REQUEST_IDEMPOTENCY_BINDING_PREFIX,
+            requested.idempotency_key.as_str(),
+        )?,
+        make(
+            HOST_REQUEST_REQUEST_BINDING_PREFIX,
+            requested.request_id.as_str(),
+        )?,
+        make(
+            HOST_REQUEST_CANCELLATION_BINDING_PREFIX,
+            requested.cancellation_id.as_str(),
+        )?,
+    ])
 }
 
 /// Builds the `Requested` ORS record for one validated envelope.

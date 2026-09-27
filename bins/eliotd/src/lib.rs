@@ -47,7 +47,6 @@ pub mod campaign_task_controller;
 pub use campaign_context_owner::build_context_owner_publications;
 pub use campaign_evaluation_owner::build_product_evaluation_publications;
 pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publications;
-pub use campaign_task_controller::serve_task_controller_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
@@ -866,6 +865,11 @@ impl DaemonComposition {
         identity: &eliot_protocol::RequestIdentity,
         envelope: eliot_governor::CanonicalWriteEnvelope,
         readiness: &eliot_workscope::MaterialReadinessInputs<'_>,
+        observed_work_scope: &eliot_governor::ScopeBinding,
+        source_closure: Option<(
+            &eliot_governor::GoverningSourceSet,
+            &eliot_governor::PrivacyProfile,
+        )>,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
         // #740: request/result span over the neutral handoff boundary. The
         // handoff (prepared envelope submitted) and the commitment (validated
@@ -923,16 +927,32 @@ impl DaemonComposition {
             );
         }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
-        // any commit. When a WorkScope binding is retained, a write addressing
-        // another scope quarantines here instead of committing against the
-        // wrong workspace; with no retained binding there is nothing to
-        // revalidate and the write proceeds unchanged.
+        // any commit. The caller must supply the actual observed `WorkScope` and
+        // source closure; the Governor never reconstructs identity from the
+        // retained binding or the write's claimed scope label. A missing
+        // binding or MATCHED receipt withholds the write.
         self.governor
-            .check_canonical_write_work_scope(envelope.scope_id.as_str())
+            .check_canonical_write_work_scope(
+                envelope.scope_id.as_str(),
+                observed_work_scope,
+                source_closure,
+            )
             .map_err(DaemonError::Composition)?;
+        let (sources, privacy) = source_closure.ok_or_else(|| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "canonical write has no governing-source closure".to_owned(),
+            ))
+        })?;
         let receipt = self
             .governor
-            .commit_canonical_with_readiness(identity, envelope, readiness)
+            .commit_canonical_with_readiness(
+                identity,
+                envelope,
+                readiness,
+                observed_work_scope,
+                sources,
+                privacy,
+            )
             .await
             .map_err(DaemonError::Composition)?;
         if self.governor.refresh_from_kernel().is_err() {
@@ -1166,6 +1186,13 @@ impl DaemonComposition {
     /// unadmitted proposed behavioral change is not delivered to the subsequent
     /// attempt.
     ///
+    /// `promotion` is the owner-published candidate-only promotion boundary for
+    /// this attempt together with the attribution and experiment lineage whose
+    /// digests it consumed. The promotion verdict is produced on every committed
+    /// record here. A caller that holds no boundary presents
+    /// [`eliot_governor::PromotionBoundaryInput::absent`], and the committed
+    /// receipt records the withheld verdict with its exact reason.
+    ///
     /// The edge is non-blocking by construction: it reads retained owner
     /// images, performs no transport, and its result is returned to the caller
     /// instead of being propagated into the finish decision (I12.24 line 293).
@@ -1175,6 +1202,7 @@ impl DaemonComposition {
         decision: &eliot_governor::FinishDecisionReceipt,
         activity_name: &str,
         receipt: Option<&eliot_governor::AdmissionReceipt>,
+        promotion: eliot_governor::PromotionBoundaryInput<'_>,
     ) -> Result<eliot_governor::LearningClosureOutcome, eliot_governor::LearningClosureError> {
         self.governor.close_attempt_learning(
             &self.learning_closure,
@@ -1183,6 +1211,7 @@ impl DaemonComposition {
             activity_name,
             None,
             receipt,
+            promotion,
         )
     }
 

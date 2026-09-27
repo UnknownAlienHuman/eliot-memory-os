@@ -37,7 +37,11 @@
 //! terminal-completion call by construction; the only cryptography is the
 //! canonical digest below, and the only fallible work is pure bounded
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
-//! every branch binds an explicit input field.
+//! every branch binds an explicit input field. The retained comparison and
+//! causal supplement shapes are legacy version 1 declarations: their values
+//! are preserved and digested, but never treated as owner evidence. They do
+//! not qualify equality, difference, prediction support, intervention, or
+//! causal attribution. No legacy bytes are deserialized into a stronger shape.
 //!
 //! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
@@ -109,6 +113,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::{
@@ -158,7 +163,7 @@ pub const MAX_CAUSAL_CLAIMS: usize = 64;
 pub const EXPECTED_COMPARISON_DIMENSIONS: usize = 8;
 
 /// Routing-only proof ceiling carried by every emitted candidate.
-pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved without Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
+pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved; legacy v1 comparison and causal declarations remain unverified and cannot qualify equality, difference, prediction, intervention, or causality; no Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
 
 // ---------------------------------------------------------------------------
 // Small pure helpers (no ambient clock, no allocation of authority).
@@ -510,30 +515,32 @@ pub const COMPARISON_DIMENSIONS: [ComparisonDimension; EXPECTED_COMPARISON_DIMEN
     ComparisonDimension::FactualPredictiveCausal,
 ];
 
-/// Typed outcome of comparing one canonical dimension across two positions.
+/// Legacy caller-declared outcome for one canonical comparison dimension.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DimensionOutcome {
-    /// Both positions state the same canonical value.
+    /// The legacy caller declares the same value for both positions. This is
+    /// not an owner-bound observation and cannot establish equality.
     Equal {
-        /// The shared canonical value, preserved verbatim.
+        /// The caller-declared value, preserved verbatim and unverified.
         value: String,
     },
-    /// The positions state different canonical values.
+    /// The legacy caller declares different values for the positions. This is
+    /// not an owner-bound observation and cannot establish a difference.
     Differing {
-        /// Canonical value stated by the left position.
+        /// Caller-declared value for the left position, preserved verbatim.
         left: String,
-        /// Canonical value stated by the right position.
+        /// Caller-declared value for the right position, preserved verbatim.
         right: String,
     },
-    /// The field cannot be normalized. It stays ambiguous and is never
-    /// smoothed into agreement or difference.
+    /// The caller declares the field unnormalizable. It stays unverified and
+    /// cannot be promoted to an evidence-backed relation.
     Unnormalizable {
         /// Bounded reason the field cannot be normalized.
         reason: String,
     },
 }
 
-/// One canonical dimension compared across two positions.
+/// One legacy caller-declared outcome for a canonical comparison dimension.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DimensionComparison {
     /// Which canonical dimension this entry compares.
@@ -542,9 +549,11 @@ pub struct DimensionComparison {
     pub outcome: DimensionOutcome,
 }
 
-/// One caller-supplied typed comparison of two positions over every canonical
-/// dimension. Prose is never parsed into dimensions: the caller states the
-/// canonical values, and an unnormalizable field is stated as such.
+/// Legacy version 1 caller declaration for two positions over the canonical
+/// dimensions. No source bytes, revisions, owner-issued profile, or admitted
+/// dimension records accompany this shape, so declarations are never
+/// qualified as equality or difference. Rust callers may continue constructing
+/// it for compatibility; this crate does not deserialize legacy bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppliedComparison {
     /// Source handle of the left position.
@@ -555,14 +564,417 @@ pub struct SuppliedComparison {
     pub dimensions: Vec<DimensionComparison>,
 }
 
+/// Owner-issued commitment binding one source handle to the record it names.
+///
+/// The commitment carries the handle it is issued for, so it cannot be detached
+/// from its source and re-attached to another. Normalizing a comparison pair
+/// moves a source and its commitment as one unit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRecordCommitment {
+    source: String,
+    record_digest: String,
+    profile: String,
+    profile_digest: String,
+}
+
+impl SourceRecordCommitment {
+    /// Declares the owner-issued commitment for one source handle.
+    ///
+    /// `profile` names the owner-issued comparison profile the record was
+    /// admitted under; a commitment without both digests is refused rather
+    /// than admitted as unverified.
+    pub fn new(
+        source: &str,
+        record_digest: &str,
+        profile: &str,
+        profile_digest: &str,
+    ) -> Result<Self, ConflictAnalysisError> {
+        check_handle(source, "commitment.source")?;
+        check_digest(record_digest, "commitment.record_digest")?;
+        check_handle(profile, "commitment.profile")?;
+        check_digest(profile_digest, "commitment.profile_digest")?;
+        Ok(Self {
+            source: source.to_owned(),
+            record_digest: record_digest.to_owned(),
+            profile: profile.to_owned(),
+            profile_digest: profile_digest.to_owned(),
+        })
+    }
+
+    /// Source handle this commitment is issued for.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Digest of the owner-issued source record.
+    #[must_use]
+    pub fn record_digest(&self) -> &str {
+        &self.record_digest
+    }
+
+    /// Owner-issued comparison profile the record was admitted under.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    /// Digest of that comparison profile.
+    #[must_use]
+    pub fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+}
+
+/// One canonical dimension outcome whose value stays coupled to its source.
+///
+/// `first_value` belongs to [`CanonicalComparisonPair::first_source`] and
+/// `second_value` belongs to [`CanonicalComparisonPair::second_source`]. The two
+/// values are never ordered independently of the sources that supplied them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalDimensionOutcome {
+    /// Both positions declare the same value. The compared source identities
+    /// stay bound by the enclosing pair.
+    Equal {
+        /// The value both positions declare.
+        value: String,
+    },
+    /// The positions declare different values, each coupled to its own source.
+    Differing {
+        /// Value supplied by the pair's first source.
+        first_value: String,
+        /// Value supplied by the pair's second source.
+        second_value: String,
+    },
+    /// The field cannot be normalized. The reason stays bound to this exact
+    /// pair, profile and dimension.
+    Unnormalizable {
+        /// Bounded reason the field cannot be normalized.
+        reason: String,
+    },
+}
+
+/// One canonical dimension of an admitted comparison pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalDimensionEntry {
+    /// Which canonical dimension this entry compares.
+    pub dimension: ComparisonDimension,
+    /// Outcome whose values are coupled to the pair's ordered sources.
+    pub outcome: CanonicalDimensionOutcome,
+}
+
+/// One admitted comparison in its single canonical orientation.
+///
+/// `first_source` is the lexicographically lesser of the two handles, under the
+/// same ordering the unordered pair key applies, so pair identity and canonical
+/// orientation cannot disagree. Orientation is a property of this value and
+/// never of the caller's field order: the mirrored declarations `A/B` carrying
+/// `(a,b)` and `B/A` carrying `(b,a)` both normalize to the same pair, while
+/// swapping the handles without their values does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalComparisonPair {
+    /// Lexicographically lesser source handle of the pair.
+    pub first_source: String,
+    /// Owner-issued commitment for `first_source`; it travels with that source.
+    pub first_source_commitment: SourceRecordCommitment,
+    /// Lexicographically greater source handle of the pair.
+    pub second_source: String,
+    /// Owner-issued commitment for `second_source`; it travels with that source.
+    pub second_source_commitment: SourceRecordCommitment,
+    /// One entry per canonical dimension, in [`COMPARISON_DIMENSIONS`] order.
+    pub dimensions: Vec<CanonicalDimensionEntry>,
+}
+
+/// Confirms one commitment is bound to the position it is supplied for.
+///
+/// A commitment carries the handle it was issued for, so a mismatch means the
+/// evidence names a different position than the one being admitted.
+fn check_commitment_binding(
+    commitment: &SourceRecordCommitment,
+    source: &str,
+    field: &str,
+) -> Result<(), ConflictAnalysisError> {
+    if commitment.source() == source {
+        return Ok(());
+    }
+    Err(ConflictAnalysisError::Binding {
+        field: format!("{field}_commitment"),
+        detail: format!(
+            "commitment names source {} but is bound to comparison position {}",
+            redact(commitment.source()),
+            redact(source)
+        ),
+    })
+}
+
+/// Maps one caller-declared dimension onto the canonical orientation.
+///
+/// `swapped` is the single ordering decision taken by the pair. The values move
+/// with the source that declared them, so a mirrored declaration carrying the
+/// same associations yields the same outcome, and one carrying different
+/// associations does not.
+fn canonical_dimension_outcome(
+    entry: &DimensionComparison,
+    swapped: bool,
+) -> Result<CanonicalDimensionOutcome, ConflictAnalysisError> {
+    match &entry.outcome {
+        DimensionOutcome::Equal { value } => {
+            check_bounded_text(value, "comparison.equal", MAX_TEXT_BYTES)?;
+            Ok(CanonicalDimensionOutcome::Equal {
+                value: value.clone(),
+            })
+        }
+        DimensionOutcome::Differing { left, right } => {
+            check_bounded_text(left, "comparison.left_value", MAX_TEXT_BYTES)?;
+            check_bounded_text(right, "comparison.right_value", MAX_TEXT_BYTES)?;
+            if left == right {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "a differing dimension must state two distinct values, not {} twice",
+                        entry.dimension.as_str()
+                    ),
+                });
+            }
+            let (first_value, second_value) = if swapped {
+                (right.clone(), left.clone())
+            } else {
+                (left.clone(), right.clone())
+            };
+            Ok(CanonicalDimensionOutcome::Differing {
+                first_value,
+                second_value,
+            })
+        }
+        DimensionOutcome::Unnormalizable { reason } => {
+            check_bounded_text(reason, "comparison.unnormalizable", MAX_NOTE_BYTES)?;
+            Ok(CanonicalDimensionOutcome::Unnormalizable {
+                reason: reason.clone(),
+            })
+        }
+    }
+}
+
+impl CanonicalComparisonPair {
+    /// Normalizes one caller declaration into its single canonical orientation.
+    ///
+    /// The commitments are supplied in the caller's own orientation — the first
+    /// is for `supplied.left_source` — and are moved together with the values
+    /// that source declared. Sources and values are therefore never sorted
+    /// independently: swapping the handles without their values produces a
+    /// different pair instead of a second spelling of the first one.
+    ///
+    /// Dimensions are emitted in [`COMPARISON_DIMENSIONS`] order, so an
+    /// irrelevant input dimension order cannot change the pair.
+    pub fn from_supplied(
+        supplied: &SuppliedComparison,
+        left_commitment: &SourceRecordCommitment,
+        right_commitment: &SourceRecordCommitment,
+    ) -> Result<Self, ConflictAnalysisError> {
+        check_handle(&supplied.left_source, "comparison.left")?;
+        check_handle(&supplied.right_source, "comparison.right")?;
+        if supplied.left_source == supplied.right_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "comparison.pair".to_owned(),
+                detail: "a comparison must name two distinct positions".to_owned(),
+            });
+        }
+        check_commitment_binding(left_commitment, &supplied.left_source, "comparison.left")?;
+        check_commitment_binding(right_commitment, &supplied.right_source, "comparison.right")?;
+        if supplied.dimensions.len() != EXPECTED_COMPARISON_DIMENSIONS {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "each comparison must cover exactly {EXPECTED_COMPARISON_DIMENSIONS} canonical dimensions"
+                ),
+            });
+        }
+
+        // One ordering decision, taken once, and every value and commitment
+        // below follows it.
+        let swapped = supplied.left_source > supplied.right_source;
+        let (first_source, first_commitment, second_source, second_commitment) = if swapped {
+            (
+                supplied.right_source.as_str(),
+                right_commitment,
+                supplied.left_source.as_str(),
+                left_commitment,
+            )
+        } else {
+            (
+                supplied.left_source.as_str(),
+                left_commitment,
+                supplied.right_source.as_str(),
+                right_commitment,
+            )
+        };
+
+        let mut dimensions = Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+        for dimension in COMPARISON_DIMENSIONS {
+            let Some(entry) = supplied
+                .dimensions
+                .iter()
+                .find(|entry| entry.dimension == dimension)
+            else {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "comparison does not cover canonical dimension {}",
+                        dimension.as_str()
+                    ),
+                });
+            };
+            let outcome = canonical_dimension_outcome(entry, swapped)?;
+            dimensions.push(CanonicalDimensionEntry { dimension, outcome });
+        }
+
+        let pair = Self {
+            first_source: first_source.to_owned(),
+            first_source_commitment: first_commitment.clone(),
+            second_source: second_source.to_owned(),
+            second_source_commitment: second_commitment.clone(),
+            dimensions,
+        };
+        pair.validate()?;
+        Ok(pair)
+    }
+
+    /// Returns the order-independent identity of this canonical pair.
+    ///
+    /// The spelling commits each source to its own value and commitment, so a
+    /// pair that pairs a source with another source's value cannot produce the
+    /// same key as the pair it claims to be.
+    #[must_use]
+    pub fn canonical_key(&self) -> String {
+        let mut parts = [
+            self.canonical_position_key(0),
+            self.canonical_position_key(1),
+        ];
+        parts.sort_unstable();
+        format!("{}|{}", parts[0], parts[1])
+    }
+
+    /// Returns the value this source contributed for one canonical dimension.
+    ///
+    /// A consumer identifies value ownership from the pair alone, without
+    /// knowing the original caller order.
+    #[must_use]
+    pub fn value_for(&self, source: &str, dimension: ComparisonDimension) -> Option<&str> {
+        let entry = self
+            .dimensions
+            .iter()
+            .find(|entry| entry.dimension == dimension)?;
+        let is_first = source == self.first_source;
+        let is_second = source == self.second_source;
+        if !is_first && !is_second {
+            return None;
+        }
+        match &entry.outcome {
+            CanonicalDimensionOutcome::Equal { value } => Some(value.as_str()),
+            CanonicalDimensionOutcome::Differing {
+                first_value,
+                second_value,
+            } => Some(if is_first {
+                first_value.as_str()
+            } else {
+                second_value.as_str()
+            }),
+            CanonicalDimensionOutcome::Unnormalizable { .. } => None,
+        }
+    }
+
+    /// Confirms the pair carries one canonical orientation and full commitments.
+    fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        if self.first_source >= self.second_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "canonical_pair.order".to_owned(),
+                detail: "canonical pair requires first_source < second_source".to_owned(),
+            });
+        }
+        if self.first_source_commitment.source() != self.first_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "canonical_pair.first_commitment".to_owned(),
+                detail: "first commitment is not bound to first_source".to_owned(),
+            });
+        }
+        if self.second_source_commitment.source() != self.second_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "canonical_pair.second_commitment".to_owned(),
+                detail: "second commitment is not bound to second_source".to_owned(),
+            });
+        }
+        if self.dimensions.len() != EXPECTED_COMPARISON_DIMENSIONS {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "canonical pair must carry exactly {EXPECTED_COMPARISON_DIMENSIONS} dimensions"
+                ),
+            });
+        }
+        for (index, dimension) in COMPARISON_DIMENSIONS.iter().enumerate() {
+            if self.dimensions[index].dimension != *dimension {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "canonical pair dimension {index} is {} rather than {}",
+                        self.dimensions[index].dimension.as_str(),
+                        dimension.as_str()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the length-prefixed spelling of one position's own contribution.
+    fn canonical_position_key(&self, position: usize) -> String {
+        let (source, commitment) = if position == 0 {
+            (&self.first_source, &self.first_source_commitment)
+        } else {
+            (&self.second_source, &self.second_source_commitment)
+        };
+        let mut key = format!(
+            "{}:{}|{}:{}|{}:{}|{}:{}",
+            source.len(),
+            source,
+            commitment.record_digest().len(),
+            commitment.record_digest(),
+            commitment.profile().len(),
+            commitment.profile(),
+            commitment.profile_digest().len(),
+            commitment.profile_digest()
+        );
+        for entry in &self.dimensions {
+            let value = match &entry.outcome {
+                CanonicalDimensionOutcome::Equal { value } => value.clone(),
+                CanonicalDimensionOutcome::Differing {
+                    first_value,
+                    second_value,
+                } => {
+                    if position == 0 {
+                        first_value.clone()
+                    } else {
+                        second_value.clone()
+                    }
+                }
+                CanonicalDimensionOutcome::Unnormalizable { reason } => reason.clone(),
+            };
+            let _ = write!(
+                key,
+                "|{}:{}:{}:{}",
+                entry.dimension.as_str().len(),
+                entry.dimension.as_str(),
+                value.len(),
+                value
+            );
+        }
+        key
+    }
+}
+
 /// Typed relation between two positions over the canonical dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CompatibilityRelation {
-    /// Every supplied dimension is equal: the claims stand or fall together.
+    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
     EqualConditions,
-    /// At least one dimension differs and none is ambiguous.
+    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
     TypedDifference,
-    /// At least one dimension is unnormalizable; the relation stays ambiguous.
+    /// Legacy declarations lack owner-bound evidence; relation is unknown.
     Ambiguous,
 }
 
@@ -578,24 +990,43 @@ impl CompatibilityRelation {
     }
 }
 
-/// One position's exact compatibility mapping against another position.
+/// One position's preserved legacy declaration mapping against another.
 ///
-/// [`Self::outcomes`] carries the caller's canonical values for every dimension
-/// in [`COMPARISON_DIMENSIONS`] order, so the mapping is exact rather than a bare
-/// verdict: a reader can see which value each position asserted and why a field
-/// was unnormalizable.
+/// [`Self::outcomes`] carries the caller's declarations in
+/// [`COMPARISON_DIMENSIONS`] order. `relation` stays ambiguous because no
+/// owner-bound source/profile/value records exist in legacy v1. The declared
+/// differing and unnormalizable dimensions are retained for review, not proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionCompatibility {
     /// Source handle of the other position.
     pub other_source: String,
-    /// Typed relation derived from the canonical dimensions.
+    /// Legacy proof ceiling; always ambiguous until owner records exist.
     pub relation: CompatibilityRelation,
+    /// Proof ceiling for these retained declarations.
+    pub supplement_version: SupplementVersion,
     /// Every dimension outcome in canonical order, values preserved.
     pub outcomes: Vec<DimensionComparison>,
-    /// Dimensions that differ, in canonical order.
+    /// Dimensions the legacy caller declares to differ, in canonical order.
     pub differing_dimensions: Vec<ComparisonDimension>,
-    /// Dimensions that remain ambiguous, in canonical order.
+    /// Dimensions the legacy caller declares unnormalizable, in canonical order.
     pub unnormalizable_dimensions: Vec<ComparisonDimension>,
+}
+
+/// Version and proof ceiling of a retained caller-supplied supplement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SupplementVersion {
+    /// Legacy caller declarations with no owner-bound records; never verified.
+    LegacyV1Unverified,
+}
+
+impl SupplementVersion {
+    /// Canonical spelling of the supplement version and proof ceiling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyV1Unverified => "legacy_v1_unverified",
+        }
+    }
 }
 
 /// Distinct states a causal or predictive claim may hold (algorithm step 7).
@@ -634,33 +1065,30 @@ impl CausalClaimState {
     }
 }
 
-/// One caller-supplied causal or predictive claim.
+/// One legacy version 1 caller declaration of a causal or predictive claim.
 ///
-/// Algorithm step 7 requires exact mechanism, falsifier, matched control or
-/// evaluator evidence, and rival or confounder status for a **causal** claim.
-/// A claim declaring [`CausalClaimState::CausalHypothesis`] or
-/// [`CausalClaimState::Intervention`] is reduced to [`CausalClaimState::Unknown`]
-/// unless all four are supplied. The four evidence fields may be left empty —
-/// that absence is what makes the reduction fire, so it is admitted here and
-/// bounded rather than rejected as a malformed shape. A `Prediction` is not a
-/// causal claim and is carried at its declared state.
+/// The prose fields are declarations, not evidence records. Nonblank mechanism,
+/// falsifier, control/evaluator, and rival/confounder text cannot qualify a
+/// causal or intervention state. This compatibility shape has no owner-issued
+/// observation, verification receipt, or coverage denominator and is never
+/// deserialized from old bytes into a stronger contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppliedCausalClaim {
     /// Source handle holding the claim.
     pub source_handle: String,
     /// State the caller declares for this claim.
     pub declared_state: CausalClaimState,
-    /// Exact mechanism behind the claim.
+    /// Caller-declared mechanism prose, not owner evidence.
     pub mechanism: String,
-    /// Exact falsifier for the claim.
+    /// Caller-declared falsifier prose, not an observed falsifier result.
     pub falsifier: String,
-    /// Matched control and evaluator evidence for the claim.
+    /// Caller-declared control/evaluator prose, not a matched owner record.
     pub control_evaluator: String,
-    /// Rival or confounder status for the claim.
+    /// Caller-declared rival/confounder prose, not a covered denominator.
     pub rivals_or_confounders: String,
 }
 
-/// One preserved causal claim with its declared and effective state.
+/// One preserved causal declaration and its lower-ceiling legacy assessment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CausalClaimRecord {
     /// Source handle holding the claim.
@@ -669,11 +1097,17 @@ pub struct CausalClaimRecord {
     pub declared_state: CausalClaimState,
     /// State after the algorithm step 7 evidence rule is applied.
     pub effective_state: CausalClaimState,
-    /// Bounded reason the effective state was reduced; empty when unchanged.
+    /// Proof ceiling for the caller-declared supplement.
+    pub supplement_version: SupplementVersion,
+    /// Bounded reason for reduction or unverified preservation.
     pub reduction_reason: String,
 }
 
 /// Caller-supplied supplements bound to one `ConflictSet` analysis.
+///
+/// `comparisons` and `causal_claims` retain legacy v1 declaration shapes and
+/// are digested as such. This type has no byte deserializer that could silently
+/// fill defaults while upgrading old serialized values into a stronger schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictSupplements {
     /// Expected A-05 receipt the item and draft receipts bind against.
@@ -694,9 +1128,9 @@ pub struct ConflictSupplements {
     pub unknowns: Vec<String>,
     /// Supplied structured probe candidates in any order.
     pub supplied_probes: Vec<SuppliedProbe>,
-    /// Caller-supplied typed comparisons over the canonical dimensions.
+    /// Legacy v1 caller declarations over canonical dimensions; never qualified.
     pub comparisons: Vec<SuppliedComparison>,
-    /// Caller-supplied causal or predictive claims with their evidence.
+    /// Legacy v1 causal/predictive declarations; prose is not evidence.
     pub causal_claims: Vec<SuppliedCausalClaim>,
     /// Externally supplied resolution status, when one exists.
     pub external_resolution: Option<ExternalResolution>,
@@ -1033,11 +1467,10 @@ fn check_bounded_text(value: &str, field: &str, max: usize) -> Result<(), Confli
 /// Checks one optional evidence field for control characters and byte ceiling,
 /// permitting an empty value.
 ///
-/// An absent piece of evidence is a legitimate thing for a caller to declare:
-/// it is exactly what makes a causal claim unsupported, and the algorithm step 7
-/// reduction turns it into an inert `Unknown` state. Rejecting it as a malformed
-/// shape here would make that reduction unreachable and turn a semantic shortfall
-/// into a request error, which is the opposite of this cell's design.
+/// An absent piece of declaration text is a legitimate input. Whether it is
+/// blank or nonblank, legacy prose is not owner evidence and cannot raise a
+/// causal proof ceiling. Rejecting blank text as malformed would hide the same
+/// semantic unknown behind a request error.
 fn check_optional_text(value: &str, field: &str, max: usize) -> Result<(), ConflictAnalysisError> {
     if has_control(value) {
         return Err(ConflictAnalysisError::Shape {
@@ -1393,7 +1826,7 @@ fn comparison_pair_key(left: &str, right: &str) -> String {
     )
 }
 
-/// Validates supplied canonical comparisons before any interpretation.
+/// Validates legacy declarations before they are preserved in the candidate.
 ///
 /// Every comparison must name two distinct positions that exist in the set and
 /// must cover each canonical dimension exactly once. A mirrored duplicate pair
@@ -1948,12 +2381,13 @@ fn dimension_outcome_spelling(outcome: &DimensionOutcome) -> String {
     }
 }
 
-/// Builds the typed compatibility mapping for one position.
+/// Preserves the legacy compatibility declarations for one position.
 ///
 /// Every supplied comparison naming this position contributes one entry, from
-/// either side, so the mapping is symmetric. An unnormalizable dimension makes
-/// the whole relation [`CompatibilityRelation::Ambiguous`]: ambiguity is the
-/// honest state and is never resolved into agreement or difference here.
+/// either side, so the mapping is symmetric. Because version 1 has no
+/// owner-bound source/profile/value records, every relation remains
+/// [`CompatibilityRelation::Ambiguous`] even when the caller declares eight
+/// equal or differing dimensions. Outcomes are preserved only as declarations.
 fn build_compatibility(
     source_handle: &str,
     comparisons: &[SuppliedComparison],
@@ -1997,18 +2431,11 @@ fn build_compatibility(
                 outcome: entry.outcome.clone(),
             });
         }
-        let relation = if unnormalizable.is_empty() {
-            if differing.is_empty() {
-                CompatibilityRelation::EqualConditions
-            } else {
-                CompatibilityRelation::TypedDifference
-            }
-        } else {
-            CompatibilityRelation::Ambiguous
-        };
+        let relation = CompatibilityRelation::Ambiguous;
         out.push(PositionCompatibility {
             other_source: other.to_owned(),
             relation,
+            supplement_version: SupplementVersion::LegacyV1Unverified,
             outcomes,
             differing_dimensions: differing,
             unnormalizable_dimensions: unnormalizable,
@@ -2044,9 +2471,10 @@ fn compatibility_clause(mapping: &[PositionCompatibility]) -> String {
             )
         };
         clauses.push(format!(
-            "against {}: {}{}{}",
+            "against {}: {} {}{}{}",
             entry.other_source,
             entry.relation.as_str(),
+            entry.supplement_version.as_str(),
             differing,
             unnormalizable
         ));
@@ -2066,13 +2494,13 @@ fn compatibility_note_with_mapping(base: &str, mapping: &[PositionCompatibility]
     format!("{base}; {}", compatibility_clause(mapping))
 }
 
-/// Applies the algorithm step 7 evidence rule to one supplied claim.
+/// Applies the legacy v1 proof ceiling to one supplied declaration.
 ///
-/// A claim declaring a causal-hypothesis or intervention state without an exact
-/// mechanism, an exact falsifier, matched control or evaluator evidence, and
-/// rival or confounder status stays [`CausalClaimState::Unknown`]. Topology,
-/// chronology, correlation, and count never raise a state, so the reduction is
-/// the only direction this cell moves a declared state.
+/// Caller prose is not owner-issued evidence. Causal and intervention claims
+/// therefore stay [`CausalClaimState::Unknown`] regardless of whether all four
+/// prose fields are nonblank. Lower-level structural, correlational, and
+/// prediction declarations are preserved as declarations and explicitly
+/// marked unverified; none is evidence-qualified by this projection.
 fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
     let mut effective = claim.declared_state;
     let mut reduction_reason = String::new();
@@ -2080,32 +2508,34 @@ fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
         claim.declared_state,
         CausalClaimState::CausalHypothesis | CausalClaimState::Intervention
     ) {
-        let mut missing: Vec<&str> = Vec::new();
-        if claim.mechanism.trim().is_empty() {
-            missing.push("mechanism");
-        }
-        if claim.falsifier.trim().is_empty() {
-            missing.push("falsifier");
-        }
-        if claim.control_evaluator.trim().is_empty() {
-            missing.push("control_evaluator");
-        }
-        if claim.rivals_or_confounders.trim().is_empty() {
-            missing.push("rivals_or_confounders");
-        }
-        if !missing.is_empty() {
-            effective = CausalClaimState::Unknown;
-            reduction_reason = format!(
-                "declared {} reduced to unknown: missing {}",
-                claim.declared_state.as_str(),
-                missing.join("+")
-            );
-        }
+        effective = CausalClaimState::Unknown;
+        reduction_reason = format!(
+            "declared {} retained as legacy v1 unverified: owner-bound evidence and coverage are absent",
+            claim.declared_state.as_str()
+        );
+    } else if matches!(
+        claim.declared_state,
+        CausalClaimState::Structural | CausalClaimState::Correlational
+    ) {
+        reduction_reason = format!(
+            "declared {} retained as legacy v1 unverified; declaration is not support evidence",
+            claim.declared_state.as_str()
+        );
+    } else if matches!(
+        claim.declared_state,
+        CausalClaimState::Prediction | CausalClaimState::Refuted
+    ) {
+        effective = CausalClaimState::Unknown;
+        reduction_reason = format!(
+            "declared {} retained as legacy v1 unverified: outcome and verifier records are absent",
+            claim.declared_state.as_str()
+        );
     }
     CausalClaimRecord {
         source_handle: claim.source_handle.clone(),
         declared_state: claim.declared_state,
         effective_state: effective,
+        supplement_version: SupplementVersion::LegacyV1Unverified,
         reduction_reason,
     }
 }
@@ -2579,13 +3009,14 @@ fn check_preservation(
 // Digest and emission.
 // ---------------------------------------------------------------------------
 
-/// Builds the sorted digest parts binding the typed comparison and causal
-/// claim inputs.
+/// Builds the sorted digest parts binding the legacy v1 comparison and causal
+/// declaration inputs.
 ///
-/// Both lists are bound whole: a caller that changes a canonical value, a
-/// dimension outcome, or any causal evidence field moves the candidate digest.
-/// The comparison pair key is order-independent, so supplying the same pair
-/// from either side yields the same digest.
+/// Both lists are bound whole: a caller that changes a declared value, outcome,
+/// or causal prose moves the candidate digest. This digest binds declarations,
+/// not their truth or owner qualification. The comparison pair key is
+/// order-independent, so supplying the same pair from either side yields the
+/// same digest.
 fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for comparison in &supplements.comparisons {

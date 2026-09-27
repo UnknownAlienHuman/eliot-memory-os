@@ -399,6 +399,241 @@ impl ToolExposureReceipt {
     }
 }
 
+/// Explicitly versioned exposure receipt that separates an executed result
+/// from the representation delivered to a consumer.
+///
+/// `ToolExposureReceipt` remains the legacy V1 wire contract. V2 does not
+/// reinterpret its `result_digest` or `exact_token_cost` fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExposureReceiptV2 {
+    /// Wire contract revision. Must equal [`TOOL_EXPOSURE_RECEIPT_V2_VERSION`].
+    pub schema_version: u16,
+    /// Stable identity of this immutable exposure receipt.
+    pub receipt_id: String,
+    /// Versioned tool definition identity.
+    pub tool_definition: String,
+    /// Route fingerprint the tool was evaluated on.
+    pub route_fingerprint: String,
+    /// The tool version is registered; `None` means unobserved.
+    pub registered: Option<bool>,
+    /// The tool was advertised to the route; `None` means unobserved.
+    pub advertised_to_route: Option<bool>,
+    /// The tool was eligible under scope, policy, and grant; `None` means unobserved.
+    pub eligible_under_scope_policy_and_grant: Option<bool>,
+    /// The planner or model selected the tool; `None` means unobserved.
+    pub selected_by_planner_or_model: Option<bool>,
+    /// The tool was called; `None` means unobserved.
+    pub called: Option<bool>,
+    /// Transport for the call completed; `None` means unobserved.
+    pub transport_completed: Option<bool>,
+    /// Delivery completeness, independent of execution and transport completion.
+    pub result_delivery: ResultDelivery,
+    /// Identity and digest of the produced execution result, if one was retained.
+    pub produced_result: Option<ProducedToolResultIdentity>,
+    /// Exact rendered representation evidence; absent only when delivery is missing.
+    pub delivered_representation: Option<DeliveredToolRepresentation>,
+    /// The call was expanded or retried; `None` means unobserved.
+    pub expanded_or_retried: Option<bool>,
+    /// The result was observably used in a decision, action, or verifier; `None` means unobserved.
+    pub observably_used_in_decision_action_or_verifier: Option<bool>,
+    /// Terminal task or product outcome reference, when known.
+    pub terminal_task_or_product_outcome_ref: Option<String>,
+}
+
+/// Wire version for [`ToolExposureReceiptV2`].
+pub const TOOL_EXPOSURE_RECEIPT_V2_VERSION: u16 = 2;
+
+/// Retained identity of a result produced by execution, independently of delivery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProducedToolResultIdentity {
+    /// Exact artifact digest for the produced result.
+    pub result_digest: String,
+    /// Stable artifact identity, when the result has one.
+    pub artifact_ref: Option<String>,
+    /// Admissible source handle for retrieving the produced result, when available.
+    pub source_handle: Option<String>,
+}
+
+/// Exact representation delivered to the consumer boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveredToolRepresentation {
+    /// Digest of the exact rendered/delivered representation bytes.
+    pub representation_digest: String,
+    /// Admissible handle for the delivered representation.
+    pub source_handle: String,
+    /// Exact number of delivered representation bytes.
+    pub byte_count: u64,
+    /// Token observation bound to the delivered representation.
+    pub token_observation: TokenCountObservation,
+    /// Prior receipt identity when this is a later authorized expansion delivery.
+    pub prior_delivery_receipt_id: Option<String>,
+}
+
+/// Token measurement for exact delivered bytes, or explicit measurement uncertainty.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "state",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum TokenCountObservation {
+    /// Exact owner-reported token count bound to the representation digest.
+    Observed {
+        /// Exact token count reported by the actual route tokenizer.
+        exact_token_cost: u64,
+        /// Digest of the exact representation counted by the tokenizer.
+        representation_digest: String,
+        /// Reference to the owner attestation for this digest and count.
+        tokenizer_evidence_ref: String,
+    },
+    /// Token count was not observed; this is not a zero-token measurement.
+    Unavailable {
+        /// Why the exact token count is unavailable.
+        reason: TokenCountUnavailableReason,
+    },
+}
+
+/// Bounded reasons an exact token observation may be unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TokenCountUnavailableReason {
+    /// The actual route tokenizer was unavailable.
+    TokenizerUnavailable,
+    /// The count was not supplied by its observation owner.
+    MeasurementUnavailable,
+}
+
+impl ToolExposureReceiptV2 {
+    /// Validates V2 identities and delivery evidence without inferring unknown stages.
+    ///
+    /// A missing delivery may retain a produced result. Non-missing deliveries
+    /// require an exact representation digest, source handle, and byte count;
+    /// token measurement may remain explicitly unavailable. This local shape
+    /// validator does not verify external artifact or prior-receipt references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported schema version, malformed digest,
+    /// blank identity/reference, or inconsistent delivery evidence.
+    pub fn validate(&self) -> Result<(), ToolExposureError> {
+        if self.schema_version != TOOL_EXPOSURE_RECEIPT_V2_VERSION {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.schema_version",
+                reason: "unsupported tool exposure schema version",
+            });
+        }
+        text(&self.receipt_id, "receipt.receipt_id")?;
+        text(&self.tool_definition, "receipt.tool_definition")?;
+        text(&self.route_fingerprint, "receipt.route_fingerprint")?;
+        if let Some(result) = &self.produced_result {
+            digest(
+                &result.result_digest,
+                "receipt.produced_result.result_digest",
+            )?;
+            if let Some(reference) = &result.artifact_ref {
+                text(reference, "receipt.produced_result.artifact_ref")?;
+            }
+            if let Some(handle) = &result.source_handle {
+                text(handle, "receipt.produced_result.source_handle")?;
+            }
+        }
+        match (&self.result_delivery, &self.delivered_representation) {
+            (ResultDelivery::Missing, None) => {}
+            (ResultDelivery::Missing, Some(_)) => {
+                return Err(ToolExposureError::InvalidField {
+                    field: "receipt.delivered_representation",
+                    reason: "missing delivery cannot carry rendered representation evidence",
+                });
+            }
+            (ResultDelivery::Full | ResultDelivery::Partial | ResultDelivery::Truncated, None) => {
+                return Err(ToolExposureError::InvalidField {
+                    field: "receipt.delivered_representation",
+                    reason: "non-missing delivery requires rendered representation evidence",
+                });
+            }
+            (
+                ResultDelivery::Full | ResultDelivery::Partial | ResultDelivery::Truncated,
+                Some(representation),
+            ) => {
+                digest(
+                    &representation.representation_digest,
+                    "receipt.delivered_representation.representation_digest",
+                )?;
+                text(
+                    &representation.source_handle,
+                    "receipt.delivered_representation.source_handle",
+                )?;
+                match &representation.token_observation {
+                    TokenCountObservation::Observed {
+                        representation_digest,
+                        tokenizer_evidence_ref,
+                        ..
+                    } => {
+                        digest(
+                            representation_digest,
+                            "receipt.delivered_representation.tokenizer_representation_digest",
+                        )?;
+                        if representation_digest != &representation.representation_digest {
+                            return Err(ToolExposureError::InvalidField {
+                                field: "receipt.delivered_representation.tokenizer_representation_digest",
+                                reason: "token observation must bind the delivered representation digest",
+                            });
+                        }
+                        text(
+                            tokenizer_evidence_ref,
+                            "receipt.delivered_representation.tokenizer_evidence_ref",
+                        )?;
+                    }
+                    TokenCountObservation::Unavailable { .. } => {}
+                }
+                if let Some(prior_id) = &representation.prior_delivery_receipt_id {
+                    text(
+                        prior_id,
+                        "receipt.delivered_representation.prior_delivery_receipt_id",
+                    )?;
+                    if prior_id == &self.receipt_id {
+                        return Err(ToolExposureError::InvalidField {
+                            field: "receipt.delivered_representation.prior_delivery_receipt_id",
+                            reason: "delivery receipt cannot link to itself",
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(reference) = &self.terminal_task_or_product_outcome_ref {
+            text(reference, "receipt.terminal_task_or_product_outcome_ref")?;
+        }
+        Ok(())
+    }
+
+    /// Whether a valid complete result delivery and transport completion were observed.
+    ///
+    /// Unknown observations do not qualify. A `TRUNCATED`, `PARTIAL`, or
+    /// `MISSING` delivery cannot satisfy complete-evidence requirements. Local
+    /// receipt validation does not establish external reference authority.
+    #[must_use]
+    pub fn is_delivered_full(&self) -> bool {
+        self.validate().is_ok()
+            && matches!(self.called, Some(true))
+            && matches!(self.transport_completed, Some(true))
+            && matches!(self.result_delivery, ResultDelivery::Full)
+            && self.delivered_representation.is_some()
+    }
+
+    /// Whether a complete delivery was observably used in a public decision, action, or verifier.
+    #[must_use]
+    pub fn is_evidence_used(&self) -> bool {
+        self.is_delivered_full()
+            && matches!(
+                self.observably_used_in_decision_action_or_verifier,
+                Some(true)
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

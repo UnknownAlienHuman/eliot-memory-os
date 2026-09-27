@@ -118,20 +118,25 @@ impl KernelComposition {
             observe_health("kernel.health.snapshot_omitted", "fenced");
             return Err(TransportError::SessionFenced);
         };
-        let Some(kernel_artifact_digest) = policy
+        let kernel_artifact_digest = policy
             .config_snapshot
             .get("artifact_digest")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())
-        else {
-            observe_health("kernel.health.snapshot_omitted", "missing_artifact");
-            return Err(TransportError::SessionFenced);
-        };
+            .map(str::to_owned);
         let protected_snapshot_digest = policy
             .config_snapshot
             .get("protected_snapshot_digest")
-            .and_then(serde_json::Value::as_str);
-        if let Some(value) = protected_snapshot_digest {
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let generation = policy.module_generation.generation.value();
+        let authority_epoch = policy.module_generation.state_fence.authority_epoch.clone();
+        drop(policy);
+        let Some(kernel_artifact_digest) = kernel_artifact_digest else {
+            observe_health("kernel.health.snapshot_omitted", "missing_artifact");
+            return Err(TransportError::SessionFenced);
+        };
+        if let Some(value) = protected_snapshot_digest.as_deref() {
             if !is_lower_sha256(value) {
                 observe_health("kernel.health.snapshot_omitted", "invalid_protected");
                 return Err(TransportError::SessionFenced);
@@ -143,15 +148,15 @@ impl KernelComposition {
         let mut snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
-            "generation": policy.module_generation.generation.value(),
-            "authority_epoch": policy.module_generation.state_fence.authority_epoch.clone(),
+            "generation": generation,
+            "authority_epoch": authority_epoch,
             // This is the Kernel peer artifact domain. The daemon child
             // artifact remains in module_generation.artifact_id and ClientHello.
             "artifact_digest": kernel_artifact_digest,
         });
         if let Some(protected_snapshot_digest) = protected_snapshot_digest {
             snapshot["protected_snapshot_digest"] =
-                serde_json::Value::String(protected_snapshot_digest.to_owned());
+                serde_json::Value::String(protected_snapshot_digest);
         }
         observe_health("kernel.health.snapshot_projected", "success");
         Ok(snapshot)
@@ -202,6 +207,7 @@ impl KernelComposition {
             ));
         };
         let state = service.state();
+        drop(service);
         observe_health("kernel.health.service_state_observed", "success");
         Ok(state)
     }

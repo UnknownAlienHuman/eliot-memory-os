@@ -1,6 +1,8 @@
 name: Fixture forbidden triggers (must be rejected)
 # WORK_UNIT_CASE: 750/3 negative fixture. Automatic triggers are forbidden
-# by repository policy; only workflow_dispatch is allowed.
+# by repository policy on every non-exception workflow; only
+# workflow_dispatch is allowed there (the ci.yml exception is declared
+# per-file by accepted issue #3004, never by this fixture).
 on:
   push:
   pull_request:

@@ -26,7 +26,10 @@ from pathlib import Path
 from typing import Any, Final
 
 SCHEMA: Final = "eliot.integration.ignored-test-inventory.v1"
-TOOL_VERSION: Final = "0.2.0"
+# TOOL_VERSION binds the emitted artifact identity: any change to the header,
+# row schema, requirement classes, or classification rules bumps it, so two
+# different tool states never certify indistinguishable artifacts (issue #905 W3).
+TOOL_VERSION: Final = "0.4.0"
 OUTPUT_ROOT: Final = ".eliot"
 
 
@@ -69,6 +72,7 @@ class Requirement(str, enum.Enum):
     STORE = "STORE"
     RUNTIME = "RUNTIME"
     GIT = "GIT"
+    NETWORK = "NETWORK"
     EXTERNAL_CREDENTIALED_MANUAL_ONLY = "EXTERNAL_CREDENTIALED_MANUAL_ONLY"
     UNKNOWN = "UNKNOWN"
 
@@ -107,6 +111,9 @@ class SourceTest:
     cfg_evidence: tuple[str, ...]
     requirements: tuple[str, ...]
     source_digest: str
+    # Declared isolation/serialization/reset/timeout tokens (issue #905 row
+    # contract). Last with a default so existing constructions stay valid.
+    isolation: tuple[str, ...] = ()
 
     def identity(self) -> tuple[str, str, str, str]:
         return (self.package_id, self.target_kind, self.target_name, self.test_name)
@@ -146,6 +153,9 @@ class InventoryRow:
     executable_digest: str | None
     remediation_owner: str
     row_digest: str
+    # Declared isolation/serialization/reset/timeout tokens, digest-covered via
+    # the _row payload (issue #905 row contract). Default keeps the field additive.
+    isolation: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -676,7 +686,15 @@ def _scan_file(root: Path, target: PackageTarget, path: Path) -> list[SourceTest
                 reason = next((item[3] for item in flags if item[1] and item[3]), None)
                 cfg = tuple(item[4] for item in flags if item[4])
                 attributes = "\n".join(pending_attributes)
-                requirements = _requirements(attributes + "\n" + (reason or ""))
+                # W24: environment tokens derive ONLY from the bound ignore
+                # reason. Sibling attribute text (#[doc] prose, cfg/feature
+                # strings, flavor literals) must never manufacture a provider
+                # class: cfg_evidence is preserved verbatim above as the
+                # target/OS/cfg discriminator and never contributes
+                # environment tokens, so unknown vocabulary stays UNCLASSIFIED.
+                requirements = _requirements(reason or "")
+                attribute_code = "\n".join(_STRING_SPAN.sub('""', raw) for raw in pending_attributes)
+                isolation = _isolation(attribute_code, reason)
                 relative = _relative(root, path)
                 source_identity = {
                     "path": relative,
@@ -699,6 +717,7 @@ def _scan_file(root: Path, target: PackageTarget, path: Path) -> list[SourceTest
                         cfg_evidence=cfg,
                         requirements=requirements,
                         source_digest=_sha256(_canonical_bytes(source_identity)),
+                        isolation=isolation,
                     )
                 )
             pending_attributes.clear()
@@ -759,17 +778,52 @@ _EXTERNAL_PATTERNS: Final = (
     r"\bmanual-only\b",
     _phrase_pattern("manual only"),
 )
+# Network class vocabulary (issue #905 row contract "credential/network
+# class"). Word-boundary discipline throughout: bare "connection" is
+# deliberately absent because declared Runtime phrases ("Host daemon
+# connection", "named pipe connection") must not compose a network class.
+_NETWORK_PATTERNS: Final = tuple(
+    _phrase_pattern(item) for item in ("network", "egress", "ingress", "internet", "outbound")
+)
 _STORE_MATCHER: Final = re.compile("|".join(_STORE_PATTERNS))
 _RUNTIME_MATCHER: Final = re.compile("|".join(_RUNTIME_PATTERNS))
 _GIT_MATCHER: Final = re.compile("|".join(_GIT_PATTERNS))
 _EXTERNAL_MATCHER: Final = re.compile("|".join(_EXTERNAL_PATTERNS))
+_NETWORK_MATCHER: Final = re.compile("|".join(_NETWORK_PATTERNS))
+_REQUIREMENT_MATCHERS: Final = (
+    _STORE_MATCHER,
+    _RUNTIME_MATCHER,
+    _GIT_MATCHER,
+    _EXTERNAL_MATCHER,
+    _NETWORK_MATCHER,
+)
+
+# Negation remains local to the clause containing a recognized requirement
+# token. The bounded prefix/suffix windows catch explicit forms such as "no
+# network", "without local SurrealDB", and "network access not required";
+# an unrelated earlier "no" cannot negate a later clause.
+_NEGATION_CLAUSES: Final = re.compile(
+    r"[;.!?\r\n]+|\b(?:but|however|although|whereas|while)\b"
+)
+_NEGATION_PREFIX: Final = re.compile(
+    r"(?:^|\b)(?:no|without|never|not(?!\s+only)|"
+    r"(?:is|are|was|were|do|does|did|has|have|had|can|could|will|would|must|should|need|needs|require|requires)\s+not)"
+    r"(?:\s+\w+){0,3}\s*$"
+)
+_NEGATION_SUFFIX: Final = re.compile(
+    r"^(?:\W+\w+){0,3}\W+(?:"
+    r"not\s+(?:required|needed|necessary|used|available|requested|applicable|present|supported|provided|allowed|permitted)\b|"
+    r"(?:is|are|was|were|do|does|did|has|have|had|can|could|will|would|must|should|need|needs|require|requires)\s+not\b|"
+    r"(?:isn't|aren't|wasn't|weren't|don't|doesn't|didn't|haven't|hasn't|can't|cannot)\b|"
+    r"unneeded\b|unnecessary\b)"
+)
 
 
 # Versioned finite rule-table identity (issue #905: "versioned finite rule
 # table"). RULE_TABLE_VERSION is the human identity; RULE_TABLE_SHA256 binds the
 # exact pattern literals, so any rule edit changes the emitted header and
 # aggregate digest even when no row's composed requirement set changes.
-RULE_TABLE_VERSION: Final = "1.0.0"
+RULE_TABLE_VERSION: Final = "1.2.0"
 RULE_TABLE_SHA256: Final = _sha256(
     _canonical_bytes(
         {
@@ -777,13 +831,32 @@ RULE_TABLE_SHA256: Final = _sha256(
             "runtime": _RUNTIME_PATTERNS,
             "git": _GIT_PATTERNS,
             "external": _EXTERNAL_PATTERNS,
+            "network": _NETWORK_PATTERNS,
+            "negation": {
+                "clauses": _NEGATION_CLAUSES.pattern,
+                "prefix": _NEGATION_PREFIX.pattern,
+                "suffix": _NEGATION_SUFFIX.pattern,
+            },
         }
     )
 )
 
 
+def _has_negated_requirement(text: str) -> bool:
+    for clause in _NEGATION_CLAUSES.split(text.casefold()):
+        for matcher in _REQUIREMENT_MATCHERS:
+            for match in matcher.finditer(clause):
+                prefix = clause[max(0, match.start() - 96) : match.start()].rsplit(",", 1)[-1]
+                suffix = clause[match.end() : match.end() + 96]
+                if _NEGATION_PREFIX.search(prefix) or _NEGATION_SUFFIX.match(suffix):
+                    return True
+    return False
+
+
 def _requirements(text: str) -> tuple[str, ...]:
     value = text.casefold()
+    if _has_negated_requirement(value):
+        return (Requirement.UNKNOWN.value,)
     result: set[Requirement] = set()
     if _STORE_MATCHER.search(value):
         result.add(Requirement.STORE)
@@ -791,11 +864,47 @@ def _requirements(text: str) -> tuple[str, ...]:
         result.add(Requirement.RUNTIME)
     if _GIT_MATCHER.search(value):
         result.add(Requirement.GIT)
+    if _NETWORK_MATCHER.search(value):
+        result.add(Requirement.NETWORK)
     if _EXTERNAL_MATCHER.search(value):
         result.add(Requirement.EXTERNAL_CREDENTIALED_MANUAL_ONLY)
     if not result:
         result.add(Requirement.UNKNOWN)
     return tuple(sorted(item.value for item in result))
+
+
+# Finite isolation/serialization/reset/timeout declaration table (issue #905
+# row contract). Attribute markers bind from string-stripped attribute code so
+# a marker such as #[serial] binds without its strings being read as
+# vocabulary; reason phrases bind from the bound ignore reason only, never
+# from sibling attribute strings (W24). Anything undeclared binds nothing.
+_ISOLATION_MARKERS: Final = ("parallel", "serial")
+_ISOLATION_REASON_PATTERNS: Final = (
+    ("isolated", (_phrase_pattern("isolated"), _phrase_pattern("isolation"))),
+    ("serial", (_phrase_pattern("serial"), _phrase_pattern("serialization"))),
+    ("timeout", (_phrase_pattern("timeout"),)),
+    ("reset", (_phrase_pattern("reset"),)),
+)
+_ISOLATION_MARKER_MATCHERS: Final = tuple(
+    (marker, re.compile(r"(?:^|[:\[,])" + re.escape(marker) + r"(?:$|[\],(])")) for marker in _ISOLATION_MARKERS
+)
+_ISOLATION_REASON_MATCHERS: Final = tuple(
+    (token, re.compile("|".join(patterns))) for token, patterns in _ISOLATION_REASON_PATTERNS
+)
+
+
+def _isolation(attribute_code: str, reason: str | None) -> tuple[str, ...]:
+    """Bind declared isolation/serialization/reset/timeout tokens."""
+    found: set[str] = set()
+    for marker, matcher in _ISOLATION_MARKER_MATCHERS:
+        if matcher.search(attribute_code):
+            found.add(marker)
+    if reason:
+        value = reason.casefold()
+        for token, matcher in _ISOLATION_REASON_MATCHERS:
+            if matcher.search(value):
+                found.add(token)
+    return tuple(sorted(found))
 
 
 def discover_source(root: Path, targets: Sequence[PackageTarget]) -> list[SourceTest]:
@@ -951,6 +1060,7 @@ def _row(source: SourceTest | None, compiled: CompiledTest | None, state: RowSta
         "ignore_reason": source.reason if source else None,
         "cfg_evidence": source.cfg_evidence if source else (),
         "requirements": source.requirements if source else (Requirement.UNKNOWN.value,),
+        "isolation": source.isolation if source else (),
         "executable": compiled.executable if compiled else None,
         "executable_digest": compiled.executable_digest if compiled else None,
         "remediation_owner": owner,

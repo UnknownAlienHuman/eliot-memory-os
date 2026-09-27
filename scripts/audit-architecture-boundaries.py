@@ -81,15 +81,24 @@ CFG_TEST_PATTERN = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 # discarding the rest of the file), and (2) raw Win32 launch APIs, which are
 # extern free-function calls the pinned lint demonstrably misses.
 #
-# SEAM: root clippy.toml does not exist yet (out of lane for this change) and
-# is never required here. Exception records below carry exact item/cfg/
-# operation/class fields so the future clippy.toml per-item expectations can
-# mirror them 1:1. When that file exists, _audit_process_lint_config
-# cross-checks its `disallowed-methods` set against PROCESS_LINT_METHODS
-# (method paths only -- raw extern APIs stay oracle-owned per the probe);
-# while absent, an explicit AUDIT_SIGNAL is emitted instead of claiming lint
-# coverage. Unknown parse/attribution state fails explicitly via
-# `process_attribution_unknown`, never empty-success.
+# SEAM: root clippy.toml lands with this change (#748 worker scope) and is
+# cross-checked both directions by _audit_process_lint_config: every
+# PROCESS_LINT_METHODS path must be configured and no unsupported path may
+# be listed (method paths only -- raw extern APIs stay oracle-owned per the
+# probe). Exception records below carry exact item/cfg/operation/class
+# fields so the clippy.toml per-item expectations mirror them 1:1. While
+# the file is absent, an explicit AUDIT_SIGNAL is emitted instead of
+# claiming lint coverage. Unknown parse/attribution state fails explicitly
+# via `process_attribution_unknown`, never empty-success.
+#
+# Second pinned-toolchain probe (clippy 0.1.97, default lint levels, no
+# [lints] overrides, scratch workspace outside the repo): all eight
+# std/tokio new/spawn/output/status paths fire, including through `as`
+# aliases; a nested member two levels below clippy.toml fires (upward
+# discovery); tokio entries are inert -- not errors -- in crates without a
+# tokio dependency; item-level #[allow(clippy::disallowed_methods)]
+# suppresses. The lint therefore activates on landing at default levels;
+# full `-D warnings` clearance awaits the controller-owned item annotations.
 PROCESS_LINT_METHODS = (
     "std::process::Command::new",
     "std::process::Command::spawn",
@@ -192,14 +201,17 @@ def _strip_rust_noise(content: str) -> tuple[str, bool]:
         elif content[i] == '"':
             j = i + 1
             closed = False
+            # Plain strings may span physical lines (rustc accepts raw
+            # newlines inside "...", and backslash+newline is a continuation
+            # escape); only EOF without a closing quote is unterminated.
+            # Treating a raw newline as failure wiped the rest of
+            # crates/eliot-engine/src/host.rs and hid its real launch.
             while j < n:
                 if content[j] == "\\":
                     j += 2
                 elif content[j] == '"':
                     closed = True
                     j += 1
-                    break
-                elif content[j] == "\n":
                     break
                 else:
                     j += 1
@@ -1914,12 +1926,14 @@ def _audit_process_launch_gaps(
     if _matches_owner(relative, policy):
         return
     sites, attribution_ok = _discover_process_launch_sites(content)
-    if not sites:
-        return
-    key = ("direct_process_launch", relative)
-    record = debt.get(key)
     if not attribution_ok:
+        # Unknown parse state blocks clearance even when no site could be
+        # attributed: an unparseable file must fail explicitly rather than
+        # report empty success as a cleared process boundary.
         first = ", ".join(f"line {site.line} ({site.kind})" for site in sites[:5])
+        scope_note = (
+            f"sites at {first}. " if first else "no site could be attributed. "
+        )
         findings.append(
             Finding(
                 "HARD_VIOLATION",
@@ -1927,11 +1941,15 @@ def _audit_process_launch_gaps(
                 relative,
                 package,
                 "Process-launch evidence cannot be attributed to an item/cfg "
-                f"scope (unbalanced or unparseable source); sites at {first}. "
+                f"scope (unbalanced or unparseable source); {scope_note}"
                 "Unknown parse state blocks clearance instead of passing empty.",
             )
         )
         return
+    if not sites:
+        return
+    key = ("direct_process_launch", relative)
+    record = debt.get(key)
     legacy_hit = _contains_direct_process_launch(production)
     if legacy_hit and record is None:
         # File is already hard-blocked by the legacy gate; raw sites in the
@@ -2040,6 +2058,20 @@ def _audit_process_lint_config(root: Path) -> list[Finding]:
                 None,
                 "Root clippy.toml omits canonical process-lint methods "
                 f"declared by the boundary oracle: {missing}.",
+            )
+        ]
+    canonical = set(PROCESS_LINT_METHODS)
+    unsupported = sorted(path for path in configured if path not in canonical)
+    if unsupported:
+        return [
+            Finding(
+                "HARD_VIOLATION",
+                "process_lint_policy_drift",
+                "clippy.toml",
+                None,
+                "Root clippy.toml lists disallowed-methods outside the "
+                "canonical oracle set (raw extern APIs stay oracle-owned): "
+                f"{unsupported}.",
             )
         ]
     return []

@@ -64,8 +64,9 @@ mod testd_terminal_completion_route;
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
 pub use backup_capture::{
-    ArchivedFenceRelation, CaptureEvidenceLevel, CaptureReport, CaptureRequest, CaptureState,
-    KernelBackupCapture, request_from_ports,
+    ARCHIVE_FENCE_RELATION_CONTRACT_VERSION, ArchiveFenceProof, ArchiveFenceRelation,
+    CaptureEvidenceLevel, CaptureReport, CaptureRequest, CaptureState, KernelBackupCapture,
+    archive_fence_restrictions, archived_state_fence_digest, request_from_ports,
 };
 pub use backup_capture_ports::{
     CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
@@ -521,6 +522,14 @@ pub struct KernelComposition {
     wasm_host_executable_path: Option<PathBuf>,
     /// Digest bound to `wasm_host_executable_path`, validated at assembly.
     wasm_host_artifact_sha256: Option<String>,
+    /// Retained owner-side WASM join table (#2786 step 3): the single
+    /// cross-call registry of published delivery-bound joins. The
+    /// dispatch operation merges each published bundle here and admits
+    /// under one short lock (no file I/O, never held across await), so
+    /// an exact same-delivery replay observes the spent record instead
+    /// of re-arming a fresh join. Pruned by grant expiry on every use;
+    /// process-local only, never a restart/durable record.
+    wasm_join_table: Mutex<eliot_kernel_service::WasmJoinTable>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
     #[cfg(windows)]

@@ -2873,6 +2873,22 @@ fn render_mcp_invocation(
         } => {
             state.retain_handle(correlation, operation_handle.clone());
             let evidence = record_mcp_delivery(port, runner, state, result.outcome());
+            if evidence.is_none()
+                && matches!(
+                    response.kind,
+                    eliot_mcp::ResponseKind::Candidate | eliot_mcp::ResponseKind::Projection
+                )
+                && serde_json::to_vec(&response.content).map_or(true, |content| {
+                    content.len() > eliot_agent_bridge::MAX_PREVIEW_BYTES
+                })
+            {
+                return render_error(
+                    Some(id),
+                    WIRE_INTERNAL_ERROR,
+                    "large tool result could not be retained for resource expansion",
+                    Value::Null,
+                );
+            }
             match render_responded_result(operation_handle, response, evidence.as_ref()) {
                 Ok(result) => render_result(id, result),
                 Err(rejection) => render_rejection(Some(id), &rejection),

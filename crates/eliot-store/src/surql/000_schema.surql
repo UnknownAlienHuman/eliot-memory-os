@@ -49,21 +49,29 @@ DEFINE INDEX OVERWRITE idx_canonical_write ON TABLE canonical_record FIELDS writ
 -- Pre-exact-lookup releases persisted the canonical body and byte-exact JSON,
 -- but did not materialize these indexed identity fields. Repair those rows on
 -- every idempotent schema migration so an upgrade cannot hide prior authority.
+--
+-- The repair guard is the same explicit missing-field predicate the read
+-- fallbacks use (`type::is_none(x)`, equivalently `x IS NONE` on the pinned
+-- SurrealDB 3.1.4 route). Verified on that provider: `type::is_none(x)` is
+-- true only for an absent/UNSET field and false for '', NULL, and any present
+-- value, so the guard can only select a genuinely unmaterialized identity.
+-- The former `(x ?? '') = ''` guard also matched an explicitly stored empty
+-- string and NULL, which let the repair overwrite a materialized identity.
+-- Each UPDATE sets only fields its own guard proves are missing, so running
+-- this migration twice changes nothing the second time.
 UPDATE canonical_record SET trace_ref = <string> receipt_body.trace_ref
 WHERE receipt_kind = 'trace_completeness_contract'
-  AND (trace_ref ?? '') = ''
+  AND type::is_none(trace_ref)
   AND receipt_body.trace_ref != NONE
   AND receipt_body.trace_ref != NULL;
-UPDATE canonical_record SET
-  candidate_id = <string> receipt_body.candidate_id,
-  canonical_action = <string> receipt_body.action
+UPDATE canonical_record SET candidate_id = <string> receipt_body.candidate_id
 WHERE receipt_kind IN ['meta_policy_promotion', 'meta_policy_rollback']
-  AND (
-    (candidate_id ?? '') = ''
-    OR (canonical_action ?? '') = ''
-  )
+  AND type::is_none(candidate_id)
   AND receipt_body.candidate_id != NONE
-  AND receipt_body.candidate_id != NULL
+  AND receipt_body.candidate_id != NULL;
+UPDATE canonical_record SET canonical_action = <string> receipt_body.action
+WHERE receipt_kind IN ['meta_policy_promotion', 'meta_policy_rollback']
+  AND type::is_none(canonical_action)
   AND receipt_body.action != NONE
   AND receipt_body.action != NULL;
 

@@ -51,7 +51,9 @@ use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
     ActivationRecoverySnapshot, ActivationResultRetentionPhase, ActivationResultRetentionRecord,
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
-    AdmissionReservationReceipt, AdmissionReservationRelease, AuthorityActivationReceipt,
+    AdmissionReservationDisposition, AdmissionReservationReceipt, AdmissionReservationRecord,
+    AdmissionReservationRelease, AdmissionReservationSnapshot, AdmissionReservationStage,
+    AdmissionReservationState, AdmissionReservationTransitionRequest, AuthorityActivationReceipt,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
     AuthorityRevocationReceipt, AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
     BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
@@ -63,18 +65,19 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission,
-    NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel,
-    OperationIdentity, OperationalMutationReceipt, OperationalPhase, OperationalRecordContext,
-    OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
-    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
-    ProcessStartReplayState, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
-    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRevalidation,
-    ProcessStreamRecoveryStatusProjection, ProcessStreamRecoveryWriteOutcome,
-    ProcessStreamRetirementProof, ProcessStreamSourceResolver, RecoveredAuthoritySnapshot,
-    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
-    RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, ReservationRecord,
-    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
+    KernelAuthoritySnapshot, LegacyTwoValueRelationBackupVerificationClass,
+    LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
+    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
+    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
+    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
+    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
+    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
+    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
+    RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
+    RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
     ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
     StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
@@ -1944,6 +1947,32 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         release: AdmissionReservationRelease,
     ) -> Result<AdmissionReservationReceipt, OrsError>;
+    /// Persists one typed `STAGED_INACTIVE` reservation with its complete
+    /// immutable claims. Exact replay returns the current same-identity receipt.
+    fn stage_kernel_admission_reservation(
+        &self,
+        stage: AdmissionReservationStage,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
+    /// Loads one typed reservation by its stable identity.
+    fn load_kernel_admission_reservation(
+        &self,
+        reservation_id: &OperationIdentity,
+    ) -> Result<Option<AdmissionReservationSnapshot>, OrsError>;
+    /// Marks an inactive reservation as reconciling with exact evidence.
+    fn reconcile_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
+    /// Releases an inactive reservation with receipt-backed evidence.
+    fn release_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
+    /// Expires an inactive reservation only after its declared expiry time.
+    fn expire_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
     fn apply_generation_transition(
         &self,
         transition: GenerationTransition,
@@ -2023,6 +2052,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         subject_id: &crate::OperationIdentity,
     ) -> Result<Option<CapabilityGrantProjection>, OrsError>;
+    /// Commits one immutable root-transition request under its operation
+    /// identity, then returns a fresh owner readback of the retained bytes.
+    /// Exact replay returns the same projection; changed content under the
+    /// same identity fails with [`OrsError::DuplicateConflict`]. ORS receipt
+    /// evidence does not grant transition authority.
+    fn commit_root_transition(
+        &self,
+        commit: RootTransitionCommit,
+    ) -> Result<RootTransitionCommitProjection, OrsError>;
+    /// Reads one retained root-transition commit by stable operation identity
+    /// from a fresh ORS read transaction. The projection is non-semantic.
+    fn load_root_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<RootTransitionCommitProjection>, OrsError>;
     /// Commits one grant-closure row binding a closure operation identity to
     /// its target, lineage root, exact graph revision, canonical digest,
     /// complete affected set, and survivor set (issue #2100).
@@ -4189,6 +4233,50 @@ impl RedbRecoveryStore {
             idempotency_key,
         ))
     }
+    /// Classifies the PRE-#2863 `v1` durable key for this operation
+    /// (issue #2863).
+    ///
+    /// #2863 bumped the verify profile to `v2`, which is a new
+    /// `idempotency_namespace` and therefore a different key. That alone is not
+    /// enough: a `v1` row simply becomes unreachable, and the caller would read
+    /// that as `Absent` and stage a SECOND row for an operation that already has
+    /// a stored answer — the fail-open outcome. So the route addresses the `v1`
+    /// key explicitly, through
+    /// [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`], and
+    /// asks this question about it.
+    ///
+    /// The three classes must be honoured differently, which is what makes the
+    /// probe fail CLOSED: `Absent` means the `v1` key is free and nothing is
+    /// quarantined; `LegacyUnqualified` means intact pre-#2863 evidence whose
+    /// archived-fence answer is `current-session` or `historical-authority`, which
+    /// is replayable as LEGACY evidence and must never be upgraded, re-keyed,
+    /// backfilled or projected as a current-profile answer; and `Unreadable`
+    /// means bytes that are neither shape, for which NO verification result may be
+    /// answered at all.
+    ///
+    /// Nothing is migrated, re-keyed, backfilled or returned. The `v1` row keeps
+    /// its own key and its own bytes, and a new verification operation is what
+    /// produces a row under the current profile — which is the alternative the
+    /// issue explicitly permits, chosen here because it is the only one that needs
+    /// no invented authority over old evidence.
+    pub fn legacy_two_value_backup_verification_class(
+        &self,
+        legacy_record_key: &str,
+    ) -> Result<LegacyTwoValueRelationBackupVerificationClass, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BACKUP_VERIFICATION_RESULTS)
+            .map_err(storage)?;
+        let Some(bytes) = table
+            .get(legacy_record_key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(LegacyTwoValueRelationBackupVerificationClass::Absent);
+        };
+        Ok(crate::classify_backup_verification_two_value_key(&bytes))
+    }
+
     /// Stages one durable `backup.verify` result under its scoped namespace key.
     ///
     /// Persist-before-answer: the row is committed before the route answers, so a
@@ -4498,6 +4586,233 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(outcome)
+    }
+
+    /// Atomically binds immutable request identities with one host-request
+    /// operation and its logical-key claim (issue #74 W7).
+    ///
+    /// A valid logical replay is resolved first so its semantic identity can
+    /// survive transport changes. Existing identity rows are then checked:
+    /// keyed operations compare semantic commitment, while unkeyed operations
+    /// require an exact binding. A replay returns its durable winner and does
+    /// not stage missing identity rows. For a fresh operation, all identity
+    /// rows, the operation row, and any logical link commit in one transaction;
+    /// any conflict aborts the entire write.
+    pub fn resolve_or_stage_host_request_with_identity_bindings(
+        &self,
+        record: &crate::HostRequestRecord,
+        identity_bindings: &[crate::HostRequestRecord],
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        Self::validate_host_request_identity_bindings(record, identity_bindings)?;
+        let logical_key = Self::host_request_logical_key_for_record(record)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let logical_winner =
+            Self::host_request_logical_winner_in(&write, logical_key.as_deref(), record)?;
+        let missing_bindings = Self::check_host_request_identity_bindings_in(
+            &write,
+            identity_bindings,
+            logical_key.is_some(),
+        )?;
+        let outcome = match logical_winner {
+            Some(winner) => winner,
+            None => Self::stage_host_request_with_bindings_in(
+                &write,
+                record,
+                logical_key.as_deref(),
+                &missing_bindings,
+            )?,
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    fn validate_requested_host_request(
+        record: &crate::HostRequestRecord,
+        action: &'static str,
+    ) -> Result<(), OrsError> {
+        record.validate()?;
+        if record.state != crate::HostRequestState::Requested {
+            return Err(OrsError::InvalidField {
+                field: "host_request_state",
+                reason: action,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_host_request_identity_bindings(
+        record: &crate::HostRequestRecord,
+        identity_bindings: &[crate::HostRequestRecord],
+    ) -> Result<(), OrsError> {
+        Self::validate_requested_host_request(record, "logical resolution stages requested state")?;
+        if identity_bindings.len() != 3 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_identity_bindings",
+                reason: "exactly three identity binding rows are required",
+            });
+        }
+        let required_namespaces = [
+            format!("hostreq-identity:{}", record.idempotency_key.as_str()),
+            format!("hostreq-request-id:{}", record.request_id.as_str()),
+            format!(
+                "hostreq-cancellation-id:{}",
+                record.cancellation_id.as_str()
+            ),
+        ];
+        let binding_digest = "4c34aefb3b4c7f374a9e216800835ff70f67e3f1f44672d3d6297da86aaf7c79";
+        let mut identity_keys = BTreeSet::new();
+        let mut observed_namespaces = BTreeSet::new();
+        for binding in identity_bindings {
+            binding.validate()?;
+            let binding_key = binding.record_key();
+            if binding.state != crate::HostRequestState::Requested
+                || binding.result_digest.is_some()
+                || binding.result_response.is_some()
+                || binding.commit_order != 0
+                || binding.operation_id == record.operation_id
+                || binding_key == record.record_key()
+                || binding.request_digest != binding_digest
+                || binding.payload_digest != record.payload_digest
+                || !identity_keys.insert(binding_key)
+                || !required_namespaces
+                    .iter()
+                    .any(|namespace| namespace == binding.operation_id.as_str())
+                || !observed_namespaces.insert(binding.operation_id.as_str())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_identity_binding",
+                    reason: "identity bindings must be the three distinct immutable namespace rows",
+                });
+            }
+            let mut expected = record.clone();
+            expected.operation_id.clone_from(&binding.operation_id);
+            expected.request_digest.clone_from(&binding.request_digest);
+            if !expected.same_binding(binding) {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_identity_binding",
+                    reason: "identity binding row must preserve the requested operation fields",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn host_request_logical_winner_in(
+        write: &redb::WriteTransaction,
+        logical_key: Option<&str>,
+        record: &crate::HostRequestRecord,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let Some(logical_key) = logical_key else {
+            return Ok(None);
+        };
+        let link = {
+            let links = write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            links
+                .get(logical_key)
+                .map_err(storage)?
+                .map(|value| decode::<HostRequestLogicalLink>(value.value()))
+                .transpose()?
+        };
+        let Some(link) = link else {
+            return Ok(None);
+        };
+        let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+        let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+        let winner: crate::HostRequestRecord = operations
+            .get(row_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "host_request_logical_link",
+                reason: "logical link points at a missing host-request row".to_owned(),
+            })?;
+        winner.validate()?;
+        let winner_key = Self::host_request_logical_key_for_record(&winner)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "host_request_logical_link",
+                reason: "linked host-request row carries no logical key".to_owned(),
+            }
+        })?;
+        if winner_key != logical_key
+            || !Self::host_requests_share_logical_commitment(&winner, record)
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: winner.operation_id.as_str().to_owned(),
+                request_digest: winner.request_digest.clone(),
+            });
+        }
+        Ok(Some(winner))
+    }
+
+    fn check_host_request_identity_bindings_in<'a>(
+        write: &redb::WriteTransaction,
+        identity_bindings: &'a [crate::HostRequestRecord],
+        compare_semantic_commitment: bool,
+    ) -> Result<Vec<&'a crate::HostRequestRecord>, OrsError> {
+        let mut missing = Vec::new();
+        for binding in identity_bindings {
+            let existing = {
+                let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                operations
+                    .get(binding.record_key().as_str())
+                    .map_err(storage)?
+                    .map(|value| {
+                        let existing: crate::HostRequestRecord = decode(value.value())?;
+                        existing.validate()?;
+                        Ok::<_, OrsError>(existing)
+                    })
+                    .transpose()?
+            };
+            if let Some(existing) = existing {
+                let immutable = existing.state == crate::HostRequestState::Requested
+                    && existing.result_digest.is_none()
+                    && existing.result_response.is_none()
+                    && existing.commit_order == 0;
+                let same_binding = if compare_semantic_commitment {
+                    Self::host_requests_share_logical_commitment(&existing, binding)
+                } else {
+                    existing.same_binding(binding)
+                };
+                if !immutable || !same_binding {
+                    return Err(OrsError::HostRequestIdentityConflict {
+                        operation_id: binding.operation_id.as_str().to_owned(),
+                        request_digest: binding.request_digest.clone(),
+                    });
+                }
+            } else {
+                missing.push(binding);
+            }
+        }
+        Ok(missing)
+    }
+
+    fn stage_host_request_with_bindings_in(
+        write: &redb::WriteTransaction,
+        record: &crate::HostRequestRecord,
+        logical_key: Option<&str>,
+        missing_bindings: &[&crate::HostRequestRecord],
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        for binding in missing_bindings {
+            Self::stage_host_request_in(write, binding)?;
+        }
+        let staged = Self::stage_host_request_in(write, record)?;
+        if let Some(logical_key) = logical_key {
+            let link = HostRequestLogicalLink {
+                operation_id: staged.operation_id.clone(),
+                request_digest: staged.request_digest.clone(),
+            };
+            let payload = encode(&link)?;
+            let mut links = write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            links
+                .insert(logical_key, payload.as_str())
+                .map_err(storage)?;
+        }
+        Ok(staged)
     }
 
     /// Loads one host-request operation by logical key (issue #2571).
@@ -17745,6 +18060,17 @@ impl RedbRecoveryStore {
         next_phase: OperationalPhase,
     ) -> Result<OperationalMutationReceipt, OrsError> {
         input.validate()?;
+        if kind == OperationalKind::RootTransition
+            || matches!(
+                &input.payload,
+                crate::RecoveryPayload::CanonicalRequest { .. }
+            )
+        {
+            return Err(OrsError::InvalidField {
+                field: "operational_payload",
+                reason: "root transitions require the immutable commit operation",
+            });
+        }
         let key = Self::operational_key(kind, &input.subject_id);
         let write = self.database.begin_write().map_err(storage)?;
         let existing = {
@@ -17757,6 +18083,13 @@ impl RedbRecoveryStore {
                 })
                 .transpose()?
         };
+        if kind == OperationalKind::AdmissionReservation
+            && existing
+                .as_ref()
+                .is_some_and(|record| record.admission_reservation.is_some())
+        {
+            return Err(OrsError::InvalidTransition);
+        }
         if let Some(existing) = existing {
             if existing.input.subject_id == input.subject_id
                 && existing.input.record_id == input.record_id
@@ -17793,6 +18126,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: None,
         };
         Self::persist_operational_record(&write, &key, &record)?;
@@ -18074,6 +18408,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: Some(record),
         };
         Self::persist_operational_record(&write, &key, &durable)?;
@@ -18204,6 +18539,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: Some(committed),
         };
         Self::persist_operational_record(&write, &route_key, &durable)?;
@@ -18629,6 +18965,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: None,
         };
         Self::persist_operational_record(&write, &key, &durable)?;
@@ -18955,6 +19292,220 @@ impl RedbRecoveryStore {
     }
 }
 
+impl RedbRecoveryStore {
+    pub(super) fn admission_reservation_input(
+        record: &AdmissionReservationRecord,
+    ) -> Result<OperationalRecordInput, OrsError> {
+        let payload =
+            serde_json::to_vec(record).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let payload_length = u64::try_from(payload.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        let locator = PlatformHandle::new(format!(
+            "ors:admission-reservation:{}",
+            record.reservation_id.as_str()
+        ))
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        OperationalRecordInput::immutable_locator(
+            OperationalRecordContext {
+                record_id: record.operation_id.clone(),
+                subject_id: record.reservation_id.clone(),
+                authority_epoch: record.authority_epoch.clone(),
+                state_fence: record.state_fence.clone(),
+                created_at_ms: record.created_at_ms,
+                cleanup_after_ms: None,
+            },
+            locator,
+            crate::model::sha256_hex(&payload),
+            payload_length,
+        )
+    }
+
+    fn admission_reservation_snapshot(
+        durable: &DurableOperationalRecord,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        if durable.kind != OperationalKind::AdmissionReservation {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "operational row has the wrong kind".to_owned(),
+            });
+        }
+        let record =
+            durable
+                .admission_reservation
+                .clone()
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "admission_reservation",
+                    reason: "operational row has no typed reservation".to_owned(),
+                })?;
+        record.validate()?;
+        if record.reservation_id != durable.input.subject_id
+            || record.operation_id != durable.input.record_id
+            || record.authority_epoch != durable.input.authority_epoch
+            || record.state_fence != durable.input.state_fence
+            || Self::admission_reservation_input(&record)? != durable.input
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "typed reservation does not match its operational binding".to_owned(),
+            });
+        }
+        let expected_phase = match record.state {
+            AdmissionReservationState::StagedInactive => OperationalPhase::Staged,
+            AdmissionReservationState::Reconciling => OperationalPhase::Reconciling,
+            AdmissionReservationState::Released | AdmissionReservationState::Expired => {
+                OperationalPhase::Released
+            }
+            AdmissionReservationState::Active => OperationalPhase::Active,
+        };
+        if durable.phase != expected_phase {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "typed lifecycle and operational phase disagree".to_owned(),
+            });
+        }
+        Ok(AdmissionReservationSnapshot::from_store(
+            record,
+            Self::receipt_for(durable)?,
+        ))
+    }
+
+    fn prepare_admission_reservation_transition(
+        record: &mut AdmissionReservationRecord,
+        disposition: &AdmissionReservationDisposition,
+        target: AdmissionReservationState,
+        current_snapshot: &AdmissionReservationSnapshot,
+    ) -> Result<bool, OrsError> {
+        disposition.evidence.validate()?;
+        if disposition.now_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "admission_reservation_disposition.now_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        if record.reservation_id != disposition.reservation_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "reservation identity does not match its operational key".to_owned(),
+            });
+        }
+        if disposition.operation_id == record.stage_operation_id {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let request = AdmissionReservationTransitionRequest {
+            operation_id: disposition.operation_id.clone(),
+            target_state: target,
+            reason: disposition.reason.clone(),
+            evidence: disposition.evidence.clone(),
+            expected_current_receipt: disposition.expected_current_receipt.clone(),
+            authority_epoch: disposition.authority_epoch.clone(),
+            state_fence: disposition.state_fence.clone(),
+            now_ms: disposition.now_ms,
+        };
+        if record.operation_id == disposition.operation_id {
+            if record.last_transition.as_ref() == Some(&request) && record.state == target {
+                return Ok(false);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        if current_snapshot.receipt() != &disposition.expected_current_receipt {
+            return Err(OrsError::DuplicateConflict);
+        }
+        if record.authority_epoch != disposition.authority_epoch
+            || record.state_fence != disposition.state_fence
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if record.state == target
+            || !matches!(
+                record.state,
+                AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling
+            )
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        if disposition.now_ms < record.updated_at_ms {
+            return Err(OrsError::InvalidField {
+                field: "admission_reservation_disposition.now_ms",
+                reason: "transition time cannot move backwards",
+            });
+        }
+        if target == AdmissionReservationState::Expired && disposition.now_ms < record.expires_at_ms
+        {
+            return Err(OrsError::InvalidExpiry);
+        }
+        if !matches!(
+            target,
+            AdmissionReservationState::Reconciling
+                | AdmissionReservationState::Released
+                | AdmissionReservationState::Expired
+        ) {
+            return Err(OrsError::InvalidTransition);
+        }
+        record.operation_id = disposition.operation_id.clone();
+        record.updated_at_ms = disposition.now_ms;
+        record.state = target;
+        record.disposition_reason = Some(disposition.reason.clone());
+        record.disposition_evidence = Some(disposition.evidence.clone());
+        record.last_transition = Some(request);
+        record.validate()?;
+        Ok(true)
+    }
+
+    fn transition_kernel_admission_reservation(
+        &self,
+        disposition: &AdmissionReservationDisposition,
+        target: AdmissionReservationState,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        let key = Self::operational_key(
+            OperationalKind::AdmissionReservation,
+            &disposition.reservation_id,
+        );
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut durable =
+            Self::decode_operational_current(&write, &key)?.ok_or(OrsError::ReservationNotFound)?;
+        let current_snapshot = Self::admission_reservation_snapshot(&durable)?;
+        let mut record =
+            durable
+                .admission_reservation
+                .clone()
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "admission_reservation",
+                    reason: "operational row has no typed reservation".to_owned(),
+                })?;
+        record.validate()?;
+        if record.operation_id != durable.input.record_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "reservation identity does not match its operational key".to_owned(),
+            });
+        }
+        let should_commit = Self::prepare_admission_reservation_transition(
+            &mut record,
+            disposition,
+            target,
+            &current_snapshot,
+        )?;
+        if !should_commit {
+            return Ok(current_snapshot);
+        }
+
+        durable.input = Self::admission_reservation_input(&record)?;
+        durable.phase = match target {
+            AdmissionReservationState::StagedInactive => OperationalPhase::Staged,
+            AdmissionReservationState::Reconciling => OperationalPhase::Reconciling,
+            AdmissionReservationState::Released | AdmissionReservationState::Expired => {
+                OperationalPhase::Released
+            }
+            AdmissionReservationState::Active => return Err(OrsError::InvalidTransition),
+        };
+        durable.admission_reservation = Some(record);
+        durable.operation_order = Self::next_operational_order(&write)?;
+        Self::admission_reservation_snapshot(&durable)?;
+        Self::persist_operational_record(&write, &key, &durable)?;
+        write.commit().map_err(storage)?;
+        Self::admission_reservation_snapshot(&durable)
+    }
+}
+
 impl OperationalRecoveryStore for RedbRecoveryStore {
     fn stage_generation_cutover(
         &self,
@@ -19175,6 +19726,115 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             OperationalPhase::Released,
         )
         .map(AdmissionReservationReceipt::from_receipt)
+    }
+
+    fn stage_kernel_admission_reservation(
+        &self,
+        stage: AdmissionReservationStage,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        let stage_operation_id = stage.operation_id.clone();
+        let record = AdmissionReservationRecord {
+            reservation_id: stage.reservation_id,
+            work_item_id: stage.work_item_id,
+            proposed_attempt_id: stage.proposed_attempt_id,
+            stage_operation_id,
+            operation_id: stage.operation_id,
+            claims: stage.claims,
+            authority_epoch: stage.authority_epoch,
+            state_fence: stage.state_fence,
+            canonical_admission_receipt: None,
+            activation_receipt: None,
+            expires_at_ms: stage.expires_at_ms,
+            state: AdmissionReservationState::StagedInactive,
+            disposition_reason: None,
+            disposition_evidence: None,
+            last_transition: None,
+            created_at_ms: stage.now_ms,
+            updated_at_ms: stage.now_ms,
+        };
+        record.validate()?;
+        let input = Self::admission_reservation_input(&record)?;
+        let key = Self::operational_key(
+            OperationalKind::AdmissionReservation,
+            &record.reservation_id,
+        );
+        let write = self.database.begin_write().map_err(storage)?;
+        if let Some(existing) = Self::decode_operational_current(&write, &key)? {
+            let Some(existing_record) = existing.admission_reservation.as_ref() else {
+                return Err(OrsError::DuplicateConflict);
+            };
+            existing_record.validate()?;
+            if existing_record != &record {
+                return Err(OrsError::DuplicateConflict);
+            }
+            let snapshot = Self::admission_reservation_snapshot(&existing)?;
+            drop(write);
+            return Ok(snapshot);
+        }
+        let durable = DurableOperationalRecord {
+            kind: OperationalKind::AdmissionReservation,
+            input,
+            phase: OperationalPhase::Staged,
+            operation_order: Self::next_operational_order(&write)?,
+            terminal_receipt_id: None,
+            terminal_receipt_sha256: None,
+            admission_reservation: Some(record),
+            generation_cutover: None,
+        };
+        Self::admission_reservation_snapshot(&durable)?;
+        Self::persist_operational_record(&write, &key, &durable)?;
+        write.commit().map_err(storage)?;
+        Self::admission_reservation_snapshot(&durable)
+    }
+
+    fn load_kernel_admission_reservation(
+        &self,
+        reservation_id: &OperationIdentity,
+    ) -> Result<Option<AdmissionReservationSnapshot>, OrsError> {
+        let key = Self::operational_key(OperationalKind::AdmissionReservation, reservation_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let durable: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if durable.input.subject_id != *reservation_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "reservation key does not match its subject".to_owned(),
+            });
+        }
+        Self::admission_reservation_snapshot(&durable).map(Some)
+    }
+
+    fn reconcile_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        self.transition_kernel_admission_reservation(
+            &disposition,
+            AdmissionReservationState::Reconciling,
+        )
+    }
+
+    fn release_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        self.transition_kernel_admission_reservation(
+            &disposition,
+            AdmissionReservationState::Released,
+        )
+    }
+
+    fn expire_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        self.transition_kernel_admission_reservation(
+            &disposition,
+            AdmissionReservationState::Expired,
+        )
     }
 
     fn apply_generation_transition(
@@ -19415,6 +20075,131 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             record.input,
             record.phase,
             record.operation_order,
+            receipt,
+        )))
+    }
+
+    fn commit_root_transition(
+        &self,
+        commit: RootTransitionCommit,
+    ) -> Result<RootTransitionCommitProjection, OrsError> {
+        commit.validate()?;
+        let operation_id = commit.operation_id().clone();
+        let key = Self::operational_key(OperationalKind::RootTransition, &operation_id);
+        let input = commit.record().clone();
+        {
+            let write = self.database.begin_write().map_err(storage)?;
+            let existing = {
+                let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+                current
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| {
+                        decode_named::<DurableOperationalRecord>(
+                            value.value(),
+                            "operational_current",
+                        )
+                    })
+                    .transpose()?
+            };
+            if let Some(existing) = existing {
+                if existing.kind != OperationalKind::RootTransition
+                    || existing.input.record_id != operation_id
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "root_transition",
+                        reason: "current root-transition key, kind, or operation identity mismatch"
+                            .to_owned(),
+                    });
+                }
+                let retained =
+                    RootTransitionCommit::from_record(existing.input.clone()).map_err(|error| {
+                        OrsError::IntegrityProblem {
+                            record_type: "root_transition",
+                            reason: format!("retained root-transition record is invalid: {error}"),
+                        }
+                    })?;
+                if retained != commit {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                if existing.phase != OperationalPhase::Active {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "root_transition",
+                        reason: "immutable root-transition commit has a non-active phase"
+                            .to_owned(),
+                    });
+                }
+                drop(write);
+            } else {
+                let record = DurableOperationalRecord {
+                    kind: OperationalKind::RootTransition,
+                    input,
+                    phase: OperationalPhase::Active,
+                    operation_order: Self::next_operational_order(&write)?,
+                    terminal_receipt_id: None,
+                    terminal_receipt_sha256: None,
+                    admission_reservation: None,
+                    generation_cutover: None,
+                };
+                Self::persist_operational_record(&write, &key, &record)?;
+                write.commit().map_err(storage)?;
+            }
+        }
+
+        let readback = self.load_root_transition(&operation_id)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: "committed root-transition row is absent from owner readback".to_owned(),
+            }
+        })?;
+        if readback.commit() != &commit {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: "owner readback differs from the committed request".to_owned(),
+            });
+        }
+        Ok(readback)
+    }
+
+    fn load_root_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<RootTransitionCommitProjection>, OrsError> {
+        let key = Self::operational_key(OperationalKind::RootTransition, operation_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if record.kind != OperationalKind::RootTransition
+            || record.input.record_id != *operation_id
+            || record.phase != OperationalPhase::Active
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: "current root-transition key, kind, operation identity, or phase mismatch"
+                    .to_owned(),
+            });
+        }
+        record
+            .input
+            .validate()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: format!("retained root-transition input is invalid: {error}"),
+            })?;
+        let receipt = Self::receipt_for(&record)?;
+        let operation_order = record.operation_order;
+        let commit = RootTransitionCommit::from_record(record.input).map_err(|error| {
+            OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: format!("retained root-transition request is invalid: {error}"),
+            }
+        })?;
+        Ok(Some(RootTransitionCommitProjection::from_store(
+            commit,
+            operation_order,
             receipt,
         )))
     }

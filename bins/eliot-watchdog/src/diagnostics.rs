@@ -125,10 +125,6 @@ pub(crate) const fn host_observation_diagnostic(state: HostObservationState) -> 
 /// data); only the variant class is returned. `InvalidLease` (unavailable or
 /// invalid) stays distinct from `LeaseStale` (stale) and `LeaseFenced`.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "port of #738 observation helper; wiring blocked on root-lock preparation"
-)]
 pub(crate) const fn spool_error_observation(error: &SpoolError) -> &'static str {
     match error {
         SpoolError::Io(_) => "spool_io",

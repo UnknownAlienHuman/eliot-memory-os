@@ -26,13 +26,16 @@ use eliot_agent_bridge_core::ProviderFailure;
 use eliot_agent_bridge_core::SessionId;
 use eliot_agent_bridge_core::TaskId;
 use eliot_agent_bridge_core::WorkUnitId;
+use eliot_protocol::AgentActivationDirectiveKind;
 use eliot_protocol::AgentBridgeActivationDenialCode;
 use eliot_protocol::AgentBridgeActivationRequest;
-use eliot_protocol::AgentBridgeActivationResponse;
 use eliot_protocol::AgentBridgePeerAdmissionReceipt;
+use eliot_protocol::AgentResponseDisposition;
 use eliot_protocol::Frame;
 use eliot_protocol::FrameKind;
 use eliot_protocol::MessageType;
+use eliot_protocol::OpenAgentBridgeActivationDisposition;
+use eliot_protocol::OpenAgentBridgeActivationResponse;
 use eliot_protocol::ProtocolPayload;
 
 use crate::KernelTransportOwner;
@@ -78,17 +81,11 @@ pub(super) fn agent_disposition_for_denial(code: AgentBridgeActivationDenialCode
 /// `AMBIGUOUS_RESULT` (state/conflict), `DEFERRED_CAPACITY`
 /// (capacity/availability), `STALE_STATE_FENCE` (state/conflict),
 /// `RUNTIME_FAILED` (route/integration), `UNKNOWN_OUTCOME`
-/// (security/recovery). Exhaustive with no wildcard arm.
-pub(super) fn agent_reason_for_denial(code: AgentBridgeActivationDenialCode) -> &'static str {
-    match code {
-        AgentBridgeActivationDenialCode::TaskSelectionRequired => "TASK_SELECTION_REQUIRED",
-        AgentBridgeActivationDenialCode::ScopeSelectionRequired => "TASK_SCOPE_INCOMPATIBLE",
-        AgentBridgeActivationDenialCode::ScopeAmbiguous => "AMBIGUOUS_RESULT",
-        AgentBridgeActivationDenialCode::NotReady => "DEFERRED_CAPACITY",
-        AgentBridgeActivationDenialCode::StaleFence => "STALE_STATE_FENCE",
-        AgentBridgeActivationDenialCode::FailedInternal => "RUNTIME_FAILED",
-        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => "UNKNOWN_OUTCOME",
-    }
+/// (security/recovery). A missing alias fails closed at the caller.
+pub(super) fn agent_reason_for_denial(
+    code: AgentBridgeActivationDenialCode,
+) -> Option<&'static str> {
+    eliot_protocol::bridge_reason_code_alias(code.as_str())
 }
 
 /// I7.20 Recovery / Conflict Directive kind for a typed activation denial.
@@ -145,11 +142,29 @@ pub(super) fn denial_report_for(
         return Err(provider_failure());
     }
     eliot_agent_bridge_core::ActivationDenialReport::new(
-        agent_reason_for_denial(code),
-        agent_disposition_for_denial(code),
-        denial_directive_kind(code),
+        agent_reason_for_denial(code)
+            .ok_or_else(provider_failure)?
+            .to_owned(),
+        agent_disposition_for_denial(code).to_owned(),
+        denial_directive_kind(code).to_owned(),
         operation.to_owned(),
         detail,
+    )
+}
+
+fn canonical_denial_report_for(
+    reason_code: String,
+    disposition: AgentResponseDisposition,
+    directive_kind: AgentActivationDirectiveKind,
+    detail: eliot_protocol::AgentActivationResolutionDisposition,
+    operation: &str,
+) -> Result<eliot_agent_bridge_core::ActivationDenialReport, ProviderFailure> {
+    eliot_agent_bridge_core::ActivationDenialReport::new(
+        reason_code,
+        disposition.as_str().to_owned(),
+        directive_kind.as_str().to_owned(),
+        operation.to_owned(),
+        Some(detail),
     )
 }
 
@@ -341,7 +356,7 @@ pub(super) fn decode_activation_response(
     frame: &Frame,
     expected_request: &AgentBridgeActivationRequest,
     admission: &AgentBridgePeerAdmissionReceipt,
-) -> Result<AgentBridgeActivationResponse, ProviderFailure> {
+) -> Result<OpenAgentBridgeActivationResponse, ProviderFailure> {
     frame.validate().map_err(|_| provider_failure())?;
     if frame.kind != FrameKind::Response || frame.message_type != MessageType::Result {
         return Err(provider_failure());
@@ -372,14 +387,13 @@ pub(super) fn decode_activation_response(
         ProtocolPayload::Json(v) => v.clone(),
         _ => return Err(provider_failure()),
     };
-    let response: AgentBridgeActivationResponse =
+    let response: OpenAgentBridgeActivationResponse =
         serde_json::from_value(payload).map_err(|_| provider_failure())?;
     response.validate().map_err(|_| provider_failure())?;
     response
         .validate_request(expected_request)
         .map_err(|_| provider_failure())?;
-    if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
-        &response.disposition
+    if let OpenAgentBridgeActivationDisposition::Authenticated { binding } = &response.disposition
         && (binding.activation_generation != admission.state_fence.resource_generation
             || !binding
                 .state_fence
@@ -460,7 +474,7 @@ impl KernelTransportOwner {
         // observed) leaves the one-shot open for one exact retry.
         self.activation_used = true;
         match response.disposition {
-            eliot_protocol::AgentBridgeActivationDisposition::Denied {
+            OpenAgentBridgeActivationDisposition::Denied {
                 reason_code,
                 detail,
             } => {
@@ -477,7 +491,22 @@ impl KernelTransportOwner {
                 let report = denial_report_for(reason_code, detail, &demand)?;
                 Ok(ActivationPortOutcome::Denied(report))
             }
-            eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {
+            OpenAgentBridgeActivationDisposition::CanonicalDenied {
+                reason_code,
+                disposition,
+                directive_kind,
+                detail,
+            } => {
+                let report = canonical_denial_report_for(
+                    reason_code,
+                    disposition,
+                    directive_kind,
+                    detail,
+                    &demand,
+                )?;
+                Ok(ActivationPortOutcome::Denied(report))
+            }
+            OpenAgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;
                 self.activated_session = Some(b.session_id.clone());
                 let principal_id =

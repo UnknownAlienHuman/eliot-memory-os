@@ -131,6 +131,47 @@ pub fn install_host_diagnostics() -> Result<(), HostDiagnosticsError> {
     Ok(())
 }
 
+/// Starts the single bounded Event Log worker before the first Host request
+/// projection. Failure is diagnostic only; no Host operation waits for an OS
+/// report or gains an alternate delivery path.
+pub fn start_event_log_reporting() {
+    let status = crate::windows_event_log::start_event_log_producer();
+    let queued = status.queued().known();
+    let in_flight = status.in_flight().known();
+    tracing::info!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.event_log_producer_start",
+        worker_started = status.worker_started(),
+        shutdown = status.is_shutdown(),
+        queued = queued.unwrap_or(0),
+        queued_unknown = queued.is_none(),
+        in_flight = in_flight.unwrap_or(0),
+        in_flight_unknown = in_flight.is_none(),
+        dropped_total = status.dropped_total(),
+        "host event log producer start disposition"
+    );
+}
+
+/// Closes Event Log admission without waiting for the OS worker. Queued or
+/// in-flight work has unknown delivery at this snapshot; no timeout, dropped
+/// worker handle, or process exit is reported as a completed drain or abort.
+pub fn shutdown_event_log_reporting() {
+    let status = crate::windows_event_log::shutdown_event_log_producer();
+    let queued = status.queued().known();
+    let in_flight = status.in_flight().known();
+    tracing::info!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.event_log_producer_shutdown",
+        queued = queued.unwrap_or(0),
+        queued_unknown = queued.is_none(),
+        in_flight = in_flight.unwrap_or(0),
+        in_flight_unknown = in_flight.is_none(),
+        outstanding_delivery = status.delivery_disposition().as_str(),
+        dropped_total = status.dropped_total(),
+        "host event log producer shutdown disposition"
+    );
+}
+
 /// One truncated string plus its truncation honesty record.
 fn truncate_to(value: &str, max_bytes: usize) -> (String, usize, bool) {
     let original_bytes = value.len();
@@ -677,19 +718,18 @@ pub fn observe_host_request(projection: &HostRequestProjection) {
 /// never asked to record an outcome the owner did not produce (I14.20: the
 /// diagnostic projects owner state, it never asserts one).
 ///
-/// The submission is the same synchronous OS port
-/// [`crate::windows_event_log::report_event`] uses, reached through
-/// [`crate::windows_event_log::report_admitted_event`]. The insertion string
-/// is built here from the projection's own frozen vocabulary (service, phase,
-/// evidence, operation, and the bounded terminal exit when the record
-/// carries one) and is then bounded by the wrapper, so no secret, payload,
-/// free-text, or unredacted error text can cross into the Event Log
-/// (I15.4, I07.20).
+/// Admission uses the bounded nonblocking producer in
+/// [`crate::windows_event_log::try_admit_admitted_event`]. Its sole worker
+/// calls the synchronous OS port after Host control has continued. The
+/// insertion string is built here from the projection's own frozen
+/// vocabulary (service, phase, evidence, operation, and the bounded terminal
+/// exit when the record carries one) and is then bounded by the wrapper, so
+/// no secret, payload, free-text, or unredacted error text can cross into the
+/// Event Log (I15.4, I07.20).
 ///
-/// Delivery is attempted before the `tracing` record so a blocking or refused
-/// port cannot reorder the two sinks. The outcome is diagnostics only: it
-/// never changes the Host operation, result, order, retry, state, or receipt,
-/// and the typed disposition is recorded on the same stderr sink.
+/// The tracing record describes admission or a counted drop, never OS
+/// acceptance or downstream delivery. The outcome is diagnostics only: it
+/// never changes the Host operation, result, order, retry, state, or receipt.
 fn publish_projected_event_log_record(projection: &HostRequestProjection) {
     let Some(operation) = projection.operation else {
         return;
@@ -707,20 +747,16 @@ fn publish_projected_event_log_record(projection: &HostRequestProjection) {
         projection.evidence.as_str(),
         operation.as_str(),
     );
-    let outcome = match crate::windows_event_log::report_admitted_event(operation, &correlation) {
-        // OS acceptance only: not a registered source, not installed message
-        // resources, not downstream delivery, and not a Host result.
-        Ok(delivery) => delivery.as_str(),
-        Err(error) => error.as_str(),
-    };
+    let admission = crate::windows_event_log::try_admit_admitted_event(operation, &correlation);
     tracing::info!(
         target: HOST_DIAGNOSTICS_TARGET,
-        event = "host.event_log_delivery",
+        event = "host.event_log_admission",
         service = crate::SERVICE_NAME,
         phase = projection.phase.as_str(),
         evidence = projection.evidence.as_str(),
         operation = operation.as_str(),
-        outcome = outcome,
-        "host event log delivery outcome"
+        outcome = admission.as_str(),
+        dropped_total = admission.dropped_total(),
+        "host event log admission outcome"
     );
 }

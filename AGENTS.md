@@ -38,5 +38,5 @@ permission. See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READ
 
 - Run the smallest check that covers the change: `just quick` for documentation/configuration, or the relevant package/edge proof for Rust. Repeat checks only after relevant changes or failures.
 - Report what changed, which checks ran, and any failures, skipped checks, or remaining uncertainty. Match completion claims to observed evidence.
-- GitHub Actions use `workflow_dispatch` only. Change workflows only when requested; run ordinary checks locally.
+- GitHub Actions use `workflow_dispatch` only, except `.github/workflows/ci.yml`, the sole automatic compile-only merge check (accepted issue #3004; triggers `pull_request` to `main`, `push` to `main`, manual rerun). Change workflows only when requested; run ordinary checks locally.
 - Commit only task files. Keep credentials, local state, build output, `.eliot/`, `.codebase-memory/`, generated reports, and downloaded research out of Git.

@@ -3,18 +3,23 @@
 Read this file first. It is the shortest route from a cold start to a merged change.
 It does not replace `AGENTS.md`, `WORKFLOW.md`, or the normative pair; it points to the authority you need.
 
-## 1. Priority — code first
+## 1. Priority — land the code and its proof
 
-The product is a draft: write the missing code and land it on `main`. Do not build
-ceremony, exhaustive negative matrices, or projections before the capability exists.
+The product is a draft: write the missing code and land it on `main`. Ship the
+capability together with the proof its owning issue requires; security, negative,
+and edge proof is required from the first change and is never deferred to a later
+phase. Cut ceremony, projections, and optional hardening down to what acceptance
+asks for, not to how far along the product feels. Section 5 governs the proof.
 
 ## 2. Roles are distinct
 
 - **Controller (root-owned sync only):** performs the coordinated upstream fetch and
   publishes the authority receipt (remote URL, tracked ref, commit SHA, sync result, UTC timestamp).
-- **Manager:** works in its own worktree, never runs fetch or pull, and merges its own
-  verified PR only after the standing gate passes.
+- **Manager:** works in its own worktree, never runs fetch or pull, and reviews the
+  verified PR against the owning issue. It never merges that PR.
 - **Writer:** implements one owning issue inside the claimed scope only, and never merges its own work.
+- **Integration owner (root/reviewer/controller):** owns integration. A different
+  principal than the writer reviews, merges, and retires; no lane merges its own result.
 - **Independent verifier:** reviews the diff against the owning issue; never the writer.
 
 ## 3. Start from the published authority
@@ -65,7 +70,7 @@ not automatically mergeable; a false claim never merges. See `WORKFLOW.md` and `
 ## 6. Finish
 
 Open a PR to `main` with the authority receipt, read receipt, base and candidate revisions, scope, proof,
-and residuals. The writer never merges; the manager merges its verified PR after the gate, then retires
-the branch and removes the worktree. See `workstreams/ACTIVE.toml` for programme state.
+and residuals. No writer or manager merges its own work; the integration owner reviews, merges after the
+gate, then retires the branch and removes the worktree. See `workstreams/ACTIVE.toml` for programme state.
 
 Map: Architecture `docs/ARCHITECTURE_CONTRACT.md` · source `docs/PROJECT_MAP.md` · scripts `scripts/README.md`.

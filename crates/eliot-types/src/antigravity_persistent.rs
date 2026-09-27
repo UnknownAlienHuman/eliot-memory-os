@@ -62,6 +62,23 @@ pub struct AntigravityExecutableFingerprint {
     pub fingerprinted_at: OffsetDateTime,
 }
 
+impl AntigravityExecutableFingerprint {
+    /// Decode one canonical fingerprint JSON document (#934 W2).
+    ///
+    /// Wire text -> `serde_json::from_str` into the denied `Self` (unknown
+    /// fields and duplicate keys rejected by the derive before any map
+    /// insertion). No policy validator exists for this type and none is
+    /// invented here. Diagnostics name the error class without echoing input.
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        serde_json::from_str(raw).map_err(|_| "malformed executable fingerprint".to_owned())
+    }
+
+    /// Byte-oriented form of [`Self::from_json_str`].
+    pub fn from_json_slice(raw: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(raw).map_err(|_| "malformed executable fingerprint".to_owned())
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -240,6 +257,27 @@ impl AntigravityPersistentLaunchContract {
         }
         Ok(())
     }
+
+    /// Decode one canonical launch-contract JSON document (#934 W2).
+    ///
+    /// Wire text -> `serde_json::from_str` into the denied `Self` (unknown
+    /// fields and duplicate keys rejected by the derive before any map
+    /// insertion) -> `validate` (existing launch policy, reused unchanged).
+    /// Diagnostics name the error class without echoing input.
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        let contract: Self =
+            serde_json::from_str(raw).map_err(|_| "malformed launch contract".to_owned())?;
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    /// Byte-oriented form of [`Self::from_json_str`].
+    pub fn from_json_slice(raw: &[u8]) -> Result<Self, String> {
+        let contract: Self =
+            serde_json::from_slice(raw).map_err(|_| "malformed launch contract".to_owned())?;
+        contract.validate()?;
+        Ok(contract)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -274,30 +312,18 @@ impl AntigravityPersistentFrame {
                 max_frame_bytes
             ));
         }
-        // Explicit per-kind payload disposition (#934): no owner-defined Eliot
-        // payload schema exists for any frame kind — the only producer is the
-        // fake runtime, which emits ad-hoc objects — so every kind retains its
-        // payload as inert bounded vendor data. The payload must be a JSON
-        // object (the documented wire shape); the payload is never interpreted
-        // as session/permission/terminal authority. The pre-existing drift-key
-        // rejection below is preserved byte-for-byte: existing behavior (pinned
-        // by the engine's schema_drift_fails_closed test) must not be weakened
-        // by this decoder-closure slice; redesigning that policy is out of scope.
-        match self.kind {
-            AntigravityFrameKind::Request
-            | AntigravityFrameKind::Response
-            | AntigravityFrameKind::Event
-            | AntigravityFrameKind::Error => {
-                if !self.payload.is_object() {
-                    return Err("frame payload must be a JSON object".to_owned());
-                }
-            }
-        }
-        if let Some(obj) = self.payload.as_object()
-            && (obj.contains_key("schema_drift") || obj.contains_key("unknown_field_that_drifts"))
-        {
-            return Err("schema drift marker rejected".to_owned());
-        }
+        // Explicit per-kind payload disposition (#934): Eliot currently owns
+        // no payload schema for any frame kind, so each retains its payload as
+        // opaque, bounded vendor JSON:
+        // - Request: retain as inert data.
+        // - Response: retain as inert data.
+        // - Event: retain as inert data; this does not certify a normalized event.
+        // - Error: retain as inert data.
+        // No payload key or value grants session, permission, or terminal
+        // authority. The serialized-frame bound above limits the retained
+        // content; from_ndjson_line separately bounds raw-line bytes before
+        // parsing. Cumulative stream bounds and acquisition deadlines belong
+        // to their upstream owners.
         Ok(())
     }
 
@@ -339,6 +365,23 @@ pub struct AntigravityPersistentLaunchReceipt {
     pub env_allowlisted: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+impl AntigravityPersistentLaunchReceipt {
+    /// Decode one canonical launch-receipt JSON document (#934 W2).
+    ///
+    /// Wire text -> `serde_json::from_str` into the denied `Self` (unknown
+    /// fields and duplicate keys rejected by the derive before any map
+    /// insertion). No policy validator exists for this type and none is
+    /// invented here. Diagnostics name the error class without echoing input.
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        serde_json::from_str(raw).map_err(|_| "malformed launch receipt".to_owned())
+    }
+
+    /// Byte-oriented form of [`Self::from_json_str`].
+    pub fn from_json_slice(raw: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(raw).map_err(|_| "malformed launch receipt".to_owned())
+    }
 }
 
 pub fn is_allowed_env_name(name: &str) -> bool {

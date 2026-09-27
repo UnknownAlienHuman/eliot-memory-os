@@ -269,15 +269,33 @@ const BACKUP_CLASS_CEILINGS: [&str; 5] = [
     "cutover",
 ];
 
-/// Closed archived-fence relation vocabulary this surface accepts.
+/// Closed STRUCTURAL archived-fence relation vocabulary this surface accepts
+/// from a verify reply, mirroring the owner's `ArchiveFenceRelation`
+/// kebab-case spelling.
 ///
 /// A13.7 requires an archive's fence to be validated against the authority
 /// history rather than demanded to equal the live fence, so the owner states
-/// the relation between the archived fence and this target: an archive from
-/// an earlier generation stays `historical-authority` instead of being
-/// reported as structurally corrupt, and current-target compatibility is
-/// never assumed here.
-const BACKUP_TARGET_COMPATIBILITY: [&str; 2] = ["current-session", "historical-authority"];
+/// the exact relation between the archived fence VALUE and this target. A
+/// relation outside this array is a typed result mismatch rather than a
+/// silent pass, and an unknown future value is never coerced to "current" or
+/// "invalid".
+const BACKUP_ARCHIVE_FENCE_RELATIONS: [&str; 6] = [
+    "exact-fence-value",
+    "same-authority-older",
+    "same-authority-newer",
+    "same-authority-divergent",
+    "unrelated-lineage",
+    "incomparable-or-unknown",
+];
+
+/// Closed archived-fence PROOF vocabulary this surface accepts, mirroring the
+/// owner's `ArchiveFenceProof` kebab-case spelling.
+///
+/// This is a separate axis from the relation and is what stops a structurally
+/// exact or same-lineage value from being printed as proven installation
+/// history: without a capture-owner receipt the only honest qualifier is
+/// `structural-only`.
+const BACKUP_ARCHIVE_FENCE_PROOFS: [&str; 2] = ["structural-only", "capture-owner-proven"];
 
 /// The capture owner a create refusal names while admitted capture is missing.
 ///
@@ -629,11 +647,26 @@ pub struct BackupOperationOutcome {
     /// inferred from the archive and never defaulted, so an unproven
     /// capture cannot look like a proven one.
     pub capture_receipt: Option<String>,
-    /// Archived-fence relation the owner proved for this target, or `null`
-    /// when the routed command proves none. The owner's own answer, echoed
-    /// under a closed vocabulary check: a historical archive stays
-    /// historical instead of being reported as corrupt for an older
-    /// generation, and nothing here is inferred or defaulted.
+    /// STRUCTURAL archived-fence relation the owner reported for this target,
+    /// or `null` when the routed command proves none. The owner's own answer,
+    /// echoed under the closed [`BACKUP_ARCHIVE_FENCE_RELATIONS`] check: a
+    /// historical archive stays historical instead of being reported as corrupt
+    /// for an older generation, and nothing here is inferred or defaulted. It
+    /// is NOT target compatibility — see [`Self::target_compatibility`].
+    pub archive_fence_relation: Option<String>,
+    /// PROVENANCE qualifier for [`Self::archive_fence_relation`], echoed under
+    /// the closed [`BACKUP_ARCHIVE_FENCE_PROOFS`] check. A structural relation
+    /// is never printed as proven installation history without it.
+    pub archive_fence_proof: Option<String>,
+    /// TARGET COMPATIBILITY as the RESTORE owner stated it, or `null` when no
+    /// restore owner supplied one.
+    ///
+    /// The verify owner never fills this in: A13.7 keeps schema/build/key/
+    /// purge/import/epoch compatibility, Authority Epoch monotonicity and
+    /// cutover with the isolated restore owner. It is retained as an explicit
+    /// optional field so this surface can print a real compatibility verdict
+    /// when one exists, instead of rendering the structural relation under a
+    /// compatibility label.
     pub target_compatibility: Option<String>,
     /// Exact reason code a cancelled owner answered with, or `null` when this
     /// outcome is not [`BACKUP_STATE_CANCELLED`].
@@ -791,6 +824,16 @@ pub fn render_backup_outcome_human(outcome: &BackupOperationOutcome) -> String {
     }
     if let Some(receipt) = &outcome.capture_receipt {
         let _ = writeln!(lines, "capture_receipt: {receipt}");
+    }
+    // The archived fence's relation and its proof qualifier print as what they
+    // are: a relation over fence VALUES plus where those values came from. A
+    // target-compatibility verdict is a restore owner's answer and is printed
+    // only when that owner actually supplied one.
+    if let Some(relation) = &outcome.archive_fence_relation {
+        let _ = writeln!(lines, "archive_fence_relation: {relation}");
+    }
+    if let Some(proof) = &outcome.archive_fence_proof {
+        let _ = writeln!(lines, "archive_fence_proof: {proof}");
     }
     if let Some(compatibility) = &outcome.target_compatibility {
         let _ = writeln!(lines, "target_compatibility: {compatibility}");
@@ -1199,6 +1242,8 @@ pub fn backup_create(
         verification_level: None,
         class_ceiling: None,
         capture_receipt: None,
+        archive_fence_relation: None,
+        archive_fence_proof: None,
         target_compatibility: None,
         // A `plan_gap` refusal is not a cancellation: the create reply carries
         // no cancellation reason code and no owner cleanup state, so both stay
@@ -1292,6 +1337,8 @@ pub fn backup_verify(
         verification_level: None,
         class_ceiling: None,
         capture_receipt: None,
+        archive_fence_relation: None,
+        archive_fence_proof: None,
         target_compatibility: None,
         // Undecided until a `cancelled` reply carries the owner's own two
         // answers. Every other status reports both as explicitly absent, so a
@@ -1313,7 +1360,11 @@ pub fn backup_verify(
             outcome.requested_class = Some(evidence.class.to_owned());
             outcome.verification_level = Some(evidence.level.to_owned());
             outcome.class_ceiling = Some(evidence.class_ceiling.to_owned());
-            outcome.target_compatibility = Some(evidence.target_compatibility.to_owned());
+            outcome.archive_fence_relation = Some(evidence.archive_fence_relation.to_owned());
+            outcome.archive_fence_proof = Some(evidence.archive_fence_proof.to_owned());
+            // A verify reply never states target compatibility, so the field
+            // stays explicitly absent instead of borrowing the relation.
+            outcome.target_compatibility = None;
             outcome.capture_receipt = evidence.capture_receipt.map(str::to_owned);
             outcome.gates_passed = evidence.member_counts;
             // The owner did prove this archive's identity and class at every
@@ -1388,8 +1439,12 @@ struct VerifyEvidence<'a> {
     level: &'a str,
     /// Exact class ceiling, from the owner's own ceiling spelling.
     class_ceiling: &'a str,
-    /// Archived-fence relation to this target, from the closed pair.
-    target_compatibility: &'a str,
+    /// STRUCTURAL archived-fence relation to this target, from
+    /// [`BACKUP_ARCHIVE_FENCE_RELATIONS`].
+    archive_fence_relation: &'a str,
+    /// PROVENANCE qualifier for the relation, from
+    /// [`BACKUP_ARCHIVE_FENCE_PROOFS`].
+    archive_fence_proof: &'a str,
     /// Owner-issued publication receipt, or `None` when the owner issued none.
     capture_receipt: Option<&'a str>,
     /// Per-domain member counts, in the owner's own pass order.
@@ -1431,10 +1486,17 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
     if !BACKUP_CLASS_CEILINGS.contains(&class_ceiling) {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
-    // The archived fence's relation to this target, so a historical archive
-    // stays historical instead of being refused for an older generation.
-    let target_compatibility = envelope_text(response, "target_compatibility")?;
-    if !BACKUP_TARGET_COMPATIBILITY.contains(&target_compatibility) {
+    // The archived fence's relation to this target and its proof qualifier, so a
+    // historical archive stays historical instead of being refused for an older
+    // generation, and an exact structural value is never printed as proven
+    // installation history. Both are closed-checked: a value this surface cannot
+    // name is a typed result mismatch, never a coerced "current".
+    let archive_fence_relation = envelope_text(response, "archive_fence_relation")?;
+    if !BACKUP_ARCHIVE_FENCE_RELATIONS.contains(&archive_fence_relation) {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
+    let archive_fence_proof = envelope_text(response, "archive_fence_proof")?;
+    if !BACKUP_ARCHIVE_FENCE_PROOFS.contains(&archive_fence_proof) {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
     let capture_receipt = envelope_optional_text(response, "capture_receipt")?;
@@ -1446,7 +1508,8 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
         class,
         level,
         class_ceiling,
-        target_compatibility,
+        archive_fence_relation,
+        archive_fence_proof,
         capture_receipt,
         member_counts,
     })
@@ -1616,6 +1679,8 @@ pub fn backup_restore_test(
         verification_level: None,
         class_ceiling: None,
         capture_receipt: None,
+        archive_fence_relation: None,
+        archive_fence_proof: None,
         target_compatibility: None,
         // A rehearsal is not a capture and is never answered with a
         // cancellation, so it carries no cancellation reason code and no owner

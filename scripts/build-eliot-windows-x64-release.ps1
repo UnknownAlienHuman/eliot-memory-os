@@ -294,7 +294,9 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # trust policy; none of them is read out of the candidate tree. The neutral
 # contract constants and the independent closure verifier live in
 # scripts/lib/governor-retirement-approval.ps1, which is dot-sourced above.
-$script:GovernorRetainedDisposition = 'retained-legacy-entrypoint (step 1-prime: Codex/OpenCode/Desktop plus the flag-absent Claude default still execute this entry; full retire/re-home BLOCKED-BY #18; no owner-issued detached retirement approval R(C) was supplied for this candidate)'
+# Byte-identical retained slice: this string is exactly the pre-#2968 retained
+# disposition. Approval absence is reported in the plan, never in staged bytes.
+$script:GovernorRetainedDisposition = 'retained-legacy-entrypoint (step 1-prime: Codex/OpenCode/Desktop plus the flag-absent Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
 function Read-ObjectProperty([object]$Object, [string]$Name) {
     # Strict-safe property read for external objects (cargo metadata,
     # receipts, manifests): a missing property is $null data, never a
@@ -447,8 +449,9 @@ function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$
         # the legacy source is already absent, source absence with no detached
         # approval is broken/blocked, not retired.
         if ([string]$cargo.status -ceq 'present') {
+            # No nested approval block: retained evidence stages byte-identically
+            # to the pre-#2968 form, and absence is reported in the plan.
             $retainedEvidence = New-RetainedGovernorEvidence $SourceCommit $pinned $cargo
-            $retainedEvidence.retirement_approval = New-GovernorRetirementAbsentApprovalEvidence $SourceCommit $pinned
             return [pscustomobject]@{ Kind = 'Retained'; Reason = $null; Identity = $cargo; Evidence = $retainedEvidence; Disposition = $script:GovernorRetainedDisposition; ApprovalReference = $null }
         }
         return [pscustomobject]@{ Kind = 'MalformedOrAmbiguous'; Reason = 'package eliot-app is absent from cargo metadata and no detached owner retirement approval was supplied for this candidate (source absence is not authority to retire)'; Identity = $null; Evidence = $null; Disposition = $null; ApprovalReference = $null }
@@ -579,8 +582,9 @@ function Resolve-PinnedGovernorEvidence([string]$Repo, [string]$SourceCommit, [o
     $pinned = Get-GovernorRetirementPinnedLegacyIdentity $Repo $SourceCommit
     if (-not [bool]$ApprovalInput.supplied) {
         if ([string]$pinned.status -ceq 'present') {
+            # No nested approval block: recomputed retained evidence matches the
+            # staged pre-#2968 form byte for byte.
             $retainedEvidence = New-RetainedGovernorEvidence $SourceCommit $pinned $null
-            $retainedEvidence.retirement_approval = New-GovernorRetirementAbsentApprovalEvidence $SourceCommit $pinned
             return [pscustomobject]@{ kind = 'retained'; evidence = $retainedEvidence; live_references = @() }
         }
         throw 'governor retirement evidence is unverifiable: the legacy identity is absent from the pinned commit and no detached owner approval was supplied'
@@ -1924,7 +1928,288 @@ function Get-VerifiedOperatorBuildReceipt([string]$Repo, [string]$SourceCommit, 
     }
 }
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval) {
+function Get-SigningInventoryExtensionPolicy {
+    $peExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in @('.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node', '.com')) {
+        [void]$peExtensions.Add($extension)
+    }
+    $codeBearingExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in @(
+            '.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node', '.com',
+            '.ps1', '.psm1', '.psd1', '.cmd', '.bat', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh', '.hta',
+            '.html', '.htm', '.svg', '.mjs', '.cjs', '.ts', '.tsx', '.py', '.pyw', '.sh', '.bash', '.zsh',
+            '.lua', '.pl', '.rb', '.wasm', '.jar', '.class', '.msi', '.msix', '.appx'
+        )) {
+        [void]$codeBearingExtensions.Add($extension)
+    }
+    $dataExtensions = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in @(
+            '.json', '.txt', '.md', '.toml', '.yaml', '.yml', '.xml', '.config', '.lock', '.png', '.jpg', '.jpeg',
+            '.ico', '.css', '.woff', '.woff2', '.ttf', '.otf', '.pdb', '.mui', '.pri', '.xbf'
+        )) {
+        [void]$dataExtensions.Add($extension)
+    }
+    [pscustomobject]@{ pe = $peExtensions; code = $codeBearingExtensions; data = $dataExtensions }
+}
+
+function Test-PortableExecutableHeader([string]$Path) {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 64) { return $false }
+        $dos = [byte[]]::new(64)
+        if ($stream.Read($dos, 0, $dos.Length) -ne $dos.Length -or $dos[0] -ne 0x4d -or $dos[1] -ne 0x5a) {
+            return $false
+        }
+        $peOffset = [System.BitConverter]::ToInt32($dos, 0x3c)
+        if ($peOffset -lt 64 -or $peOffset -gt 16MB -or $peOffset -gt ($stream.Length - 4) -or
+            $stream.Seek($peOffset, [System.IO.SeekOrigin]::Begin) -ne $peOffset) {
+            return $false
+        }
+        $signature = [byte[]]::new(4)
+        return ($stream.Read($signature, 0, $signature.Length) -eq $signature.Length -and
+            $signature[0] -eq 0x50 -and $signature[1] -eq 0x45 -and $signature[2] -eq 0 -and $signature[3] -eq 0)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function New-SigningInventoryEntry([string]$Path, [string]$Role, [string]$Owner, [string]$SourceReceipt, [string]$SourceReceiptSha256, [string]$UnsignedSha256, [int64]$UnsignedBytes) {
+    [ordered]@{
+        path = $Path
+        role = $Role
+        owner = $Owner
+        source_receipt = $SourceReceipt
+        source_receipt_sha256 = $SourceReceiptSha256
+        unsigned_sha256 = $UnsignedSha256
+        unsigned_bytes = $UnsignedBytes
+    }
+}
+
+function Get-ExpectedSigningInventory(
+    [string]$BundlePath,
+    [object]$RuntimeManifest,
+    [string]$RuntimeReceiptSha256,
+    [object]$OperatorReceipt,
+    [string]$OperatorReceiptSha256,
+    [bool]$IncludeGovernor,
+    [bool]$IncludeAgentBridge,
+    [string]$AgentBridgeSha256,
+    [int64]$AgentBridgeBytes
+) {
+    $extensions = Get-SigningInventoryExtensionPolicy
+    foreach ($digest in @($RuntimeReceiptSha256, $OperatorReceiptSha256)) {
+        if ($digest -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'signing inventory source receipt digest is malformed'
+        }
+    }
+    $entries = @()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($record in @($RuntimeManifest.artifacts)) {
+        $path = Assert-SafeRelativePath ([string]$record.path) 'runtime signing source record'
+        if ($path -cne [string]$record.path) {
+            throw "runtime signing source record path is not canonical: $path"
+        }
+        $extension = [System.IO.Path]::GetExtension($path)
+        if ($extensions.code.Contains($extension) -and -not $extensions.pe.Contains($extension)) {
+            throw "runtime receipt contains unsupported non-PE code-bearing content: $path"
+        }
+        if (-not $extensions.pe.Contains($extension)) {
+            throw "runtime artifact receipt contains an unsupported code-bearing path: $path"
+        }
+        if ([string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$record.bytes -le 0 -or
+            [string]::IsNullOrWhiteSpace([string]$record.role) -or -not $seen.Add($path)) {
+            throw "runtime signing source record is malformed or duplicated: $path"
+        }
+        $stagedPath = Join-Path $BundlePath $path.Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $stagedPath -PathType Leaf) -or -not (Test-PortableExecutableHeader $stagedPath)) {
+            throw "runtime signing source record does not identify a staged PE: $path"
+        }
+        $stagedFile = Get-Item -LiteralPath $stagedPath
+        $stagedHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stagedHash -cne [string]$record.sha256 -or $stagedFile.Length -ne [int64]$record.bytes) {
+            throw "runtime signing source record differs from staged bytes: $path"
+        }
+        $owner = if ([string]$record.package -ceq 'surrealdb') {
+            'external-lock:docs/release/SURREALDB_WINDOWS_X64.lock.json'
+        }
+        else {
+            "cargo-package:$([string]$record.package)"
+        }
+        $entries += New-SigningInventoryEntry $path ([string]$record.role) $owner 'runtime/RUNTIME_ARTIFACTS.json' $RuntimeReceiptSha256 ([string]$record.sha256) ([int64]$record.bytes)
+    }
+
+    $expectedBundleRoles = @()
+    if ($IncludeGovernor) {
+        $expectedBundleRoles += [pscustomobject]@{ package = 'eliot-app'; binary = 'eliot-governor'; role = 'governor'; path = 'eliot-governor.exe'; owner = 'cargo-package:eliot-app' }
+    }
+    if ($IncludeAgentBridge) {
+        $expectedBundleRoles += [pscustomobject]@{ package = 'eliot-agent-bridge'; binary = 'eliot-agent-bridge'; role = 'agent-bridge'; path = 'eliot-agent-bridge.exe'; owner = 'cargo-package:eliot-agent-bridge' }
+    }
+    $bundleRecords = @($RuntimeManifest.bundle_signing_artifacts)
+    if ($bundleRecords.Count -ne $expectedBundleRoles.Count) {
+        throw "runtime receipt bundle signing record count mismatch: declared=$($bundleRecords.Count) expected=$($expectedBundleRoles.Count)"
+    }
+    foreach ($expectedRecord in $expectedBundleRoles) {
+        $matching = @($bundleRecords | Where-Object { [string]$_.role -ceq [string]$expectedRecord.role })
+        if ($matching.Count -ne 1) {
+            throw "runtime receipt is missing or duplicates bundle signing role $($expectedRecord.role)"
+        }
+        $record = $matching[0]
+        $path = Assert-SafeRelativePath ([string]$record.path) 'bundle signing source record'
+        if ($path -cne [string]$expectedRecord.path -or
+            [string]$record.package -cne [string]$expectedRecord.package -or
+            [string]$record.binary -cne [string]$expectedRecord.binary -or
+            [string]$record.source -cne 'cargo' -or
+            [string]$record.version -cne [string]$RuntimeManifest.version -or
+            [string]$record.architecture -cne 'windows-x64' -or
+            [string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$record.bytes -le 0 -or
+            -not $seen.Add($path)) {
+            throw "runtime receipt bundle signing record is invalid: $($expectedRecord.role)"
+        }
+        if ($expectedRecord.role -ceq 'agent-bridge' -and
+            ([string]$record.sha256 -cne $AgentBridgeSha256 -or [int64]$record.bytes -ne $AgentBridgeBytes)) {
+            throw 'runtime receipt agent-bridge record differs from RELEASE.json front-door bytes'
+        }
+        $stagedPath = Join-Path $BundlePath $path.Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $stagedPath -PathType Leaf) -or -not (Test-PortableExecutableHeader $stagedPath)) {
+            throw "bundle signing source record does not identify a staged PE: $path"
+        }
+        $stagedFile = Get-Item -LiteralPath $stagedPath
+        $stagedHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stagedHash -cne [string]$record.sha256 -or $stagedFile.Length -ne [int64]$record.bytes) {
+            throw "bundle signing source record differs from staged bytes: $path"
+        }
+        $entries += New-SigningInventoryEntry $path ([string]$record.role) ([string]$expectedRecord.owner) 'runtime/RUNTIME_ARTIFACTS.json' $RuntimeReceiptSha256 ([string]$record.sha256) ([int64]$record.bytes)
+        if ($expectedRecord.role -ceq 'governor') {
+            $pluginPath = 'integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe'
+            $pluginFullPath = Join-Path $BundlePath $pluginPath.Replace('/', '\')
+            $pluginFile = Get-Item -LiteralPath $pluginFullPath -ErrorAction Stop
+            $pluginHash = (Get-FileHash -LiteralPath $pluginFullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if (-not (Test-PortableExecutableHeader $pluginFullPath) -or
+                $pluginHash -cne [string]$record.sha256 -or [int64]$pluginFile.Length -ne [int64]$record.bytes -or
+                -not $seen.Add($pluginPath)) {
+                throw 'Codex plugin Governor copy differs from the verified Governor source record'
+            }
+            $entries += New-SigningInventoryEntry $pluginPath 'codex-plugin-governor' 'plugin/eliot-governor' 'runtime/RUNTIME_ARTIFACTS.json' $RuntimeReceiptSha256 ([string]$record.sha256) ([int64]$record.bytes)
+        }
+    }
+
+    $operatorSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($record in @($OperatorReceipt.artifacts.files)) {
+        $relative = Assert-SafeRelativePath ([string]$record.path) 'Operator signing source record'
+        if ($relative -cne [string]$record.path -or -not $operatorSeen.Add($relative)) {
+            throw "Operator signing source path is non-canonical or duplicated: $relative"
+        }
+        $path = "operator/$relative"
+        $extension = [System.IO.Path]::GetExtension($relative)
+        if ($extensions.code.Contains($extension) -and -not $extensions.pe.Contains($extension)) {
+            throw "Operator receipt contains unsupported non-PE code-bearing content: $path"
+        }
+        if (-not $extensions.pe.Contains($extension)) { continue }
+        if ([string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$record.bytes -le 0 -or -not $seen.Add($path)) {
+            throw "Operator signing source record is malformed or duplicated: $path"
+        }
+        $stagedPath = Join-Path $BundlePath $path.Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $stagedPath -PathType Leaf) -or -not (Test-PortableExecutableHeader $stagedPath)) {
+            throw "Operator signing source record does not identify a staged PE: $path"
+        }
+        $stagedFile = Get-Item -LiteralPath $stagedPath
+        $stagedHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stagedHash -cne [string]$record.sha256 -or $stagedFile.Length -ne [int64]$record.bytes) {
+            throw "Operator signing source record differs from staged bytes: $path"
+        }
+        $entries += New-SigningInventoryEntry $path 'operator' 'apps/Eliot.Operator' 'operator/OPERATOR_BUILD_RECEIPT.json' $OperatorReceiptSha256 ([string]$record.sha256) ([int64]$record.bytes)
+    }
+    return @($entries | Sort-Object -Property path -CaseSensitive)
+}
+
+function Assert-SigningInventory([object]$Declared, [object[]]$Expected) {
+    $inventoryProperties = @($Declared.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+    if ([string]$Declared.schema -cne 'eliot-signing-role-inventory-v1' -or
+        [string]$Declared.policy -cne 'closed-source-bound-per-file-v1' -or
+        ($inventoryProperties -join ',') -cne 'entries,policy,schema') {
+        throw 'staged signing inventory schema or closed policy is missing or non-canonical'
+    }
+    $declaredEntries = @($Declared.entries)
+    if ($declaredEntries.Count -ne $Expected.Count) {
+        throw "staged signing inventory count differs from validated source receipts: declared=$($declaredEntries.Count) expected=$($Expected.Count)"
+    }
+    $entryFields = 'owner,path,role,source_receipt,source_receipt_sha256,unsigned_bytes,unsigned_sha256'
+    $paths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    for ($index = 0; $index -lt $Expected.Count; $index++) {
+        $actual = $declaredEntries[$index]
+        $fields = @($actual.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        $path = Assert-SafeRelativePath ([string]$actual.path) 'staged signing inventory entry'
+        if (($fields -join ',') -cne $entryFields -or $path -cne [string]$actual.path -or -not $paths.Add($path)) {
+            throw "staged signing inventory entry is non-canonical or duplicated: $path"
+        }
+        $expected = $Expected[$index]
+        if ($path -cne [string]$expected.path -or
+            [string]$actual.role -cne [string]$expected.role -or
+            [string]$actual.owner -cne [string]$expected.owner -or
+            [string]$actual.source_receipt -cne [string]$expected.source_receipt -or
+            [string]$actual.source_receipt_sha256 -cne [string]$expected.source_receipt_sha256 -or
+            [string]$actual.unsigned_sha256 -cne [string]$expected.unsigned_sha256 -or
+            [int64]$actual.unsigned_bytes -ne [int64]$expected.unsigned_bytes) {
+            throw "staged signing inventory entry differs from its validated receipt source: $path"
+        }
+    }
+}
+
+function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$SigningInventory) {
+    $extensions = Get-SigningInventoryExtensionPolicy
+    $expected = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $SigningInventory) {
+        $path = Assert-SafeRelativePath ([string]$entry.path) 'signing inventory path'
+        if ($path -cne [string]$entry.path -or $expected.ContainsKey($path)) {
+            throw "signing inventory contains a non-canonical or duplicate path: $path"
+        }
+        $expected.Add($path, $entry)
+    }
+    $observed = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in Get-ChildItem -LiteralPath $BundlePath -Force -Recurse) {
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "release bundle contains a reparse point: $($item.FullName)"
+        }
+        if (-not ($item -is [System.IO.FileInfo])) { continue }
+        $path = $item.FullName.Substring($BundlePath.Length).TrimStart([char[]]@('\', '/')).Replace('\', '/')
+        $path = Assert-SafeRelativePath $path 'release bundle payload'
+        $extension = $item.Extension
+        if ($extensions.code.Contains($extension) -and -not $extensions.pe.Contains($extension)) {
+            throw "release bundle contains unsupported non-PE code-bearing content: $path"
+        }
+        $hasPeHeader = Test-PortableExecutableHeader $item.FullName
+        if ($extensions.pe.Contains($extension) -and -not $hasPeHeader) {
+            throw "release bundle code-bearing extension is not a PE image: $path"
+        }
+        if ($hasPeHeader) {
+            if (-not $extensions.pe.Contains($extension)) {
+                throw "release bundle contains an unmanifested PE image with a non-code extension: $path"
+            }
+            $expectedEntry = $null
+            if (-not $expected.TryGetValue($path, [ref]$expectedEntry)) {
+                throw "release bundle contains executable code absent from the source-bound signing inventory: $path"
+            }
+            $actualHash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -cne [string]$expectedEntry.unsigned_sha256 -or
+                [int64]$item.Length -ne [int64]$expectedEntry.unsigned_bytes -or -not $observed.Add($path)) {
+                throw "release bundle PE bytes differ from or duplicate the source-bound signing inventory: $path"
+            }
+            continue
+        }
+        if (-not $extensions.data.Contains($extension)) {
+            throw "release bundle contains an unapproved non-executable file extension: $path"
+        }
+    }
+    if ($observed.Count -ne $expected.Count) {
+        $missing = @($expected.Keys | Where-Object { -not $observed.Contains($_) })
+        throw "source-bound signing inventory contains missing staged executable code: $($missing -join ', ')"
+    }
+}
+
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -2156,7 +2441,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
     else {
         'integrations/** except antigravity/official-plugin/ (the Codex plugin leaves the release with the retired governor binary)'
     }
-    [ordered]@{
+    $stagedManifest = [ordered]@{
         schema = 'eliot-staged-payload-manifest-v1'
         component = 'eliot_windows_x64_staged_payload_manifest'
         version = $Version
@@ -2167,6 +2452,11 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         governor_disposition = $GovernorDisposition
         governor_evidence = $GovernorEvidence
         governor_approval = $GovernorApproval
+        signing_inventory = [ordered]@{
+            schema = 'eliot-signing-role-inventory-v1'
+            policy = 'closed-source-bound-per-file-v1'
+            entries = @($SigningInventory)
+        }
         entries = @($entries)
         exclusions = @(
             [ordered]@{
@@ -2186,6 +2476,13 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             }
         )
     }
+    if (-not $GovernorApproval) {
+        # Retained slice stages byte-identically: no approval identity is
+        # carried unless a detached approval was admitted (removal preserves
+        # the exact pre-#2968 field order).
+        [void]$stagedManifest.Remove('governor_approval')
+    }
+    return $stagedManifest
 }
 
 function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) {
@@ -2808,6 +3105,23 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         throw 'runtime directory contains an unmanifested executable'
     }
 
+    $runtimeReceiptSha256 = (Get-FileHash -LiteralPath $runtimeManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $operatorReceiptPath = Join-Path $resolved 'operator/OPERATOR_BUILD_RECEIPT.json'
+    $operatorReceiptSha256 = (Get-FileHash -LiteralPath $operatorReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($operatorReceiptSha256 -cne [string]$verifiedBundleOperator.receipt_sha256 -or
+        $operatorReceiptSha256 -cne [string]$releaseOperator.receipt_sha256) {
+        throw 'Operator signing source receipt digest differs from the independently verified RELEASE.json binding'
+    }
+    $operatorReceipt = Get-Content -LiteralPath $operatorReceiptPath -Raw | ConvertFrom-Json
+    $agentBridgeSelected = $frontDoor -and [string]$frontDoor.selection -ceq 'agent-bridge'
+    $expectedBridgeSha256 = if ($agentBridgeSelected) { [string]$frontDoor.bridge_sha256 } else { '' }
+    $expectedBridgeBytes = if ($agentBridgeSelected) { [int64]$frontDoor.bridge_bytes } else { [int64]0 }
+    $expectedSigningInventory = @(Get-ExpectedSigningInventory `
+            $resolved $runtimeManifest $runtimeReceiptSha256 $operatorReceipt $operatorReceiptSha256 `
+            (-not $governorRetired) $agentBridgeSelected $expectedBridgeSha256 $expectedBridgeBytes)
+    Assert-SigningInventory $payloadManifest.signing_inventory $expectedSigningInventory
+    Assert-ClosedCodeBearingPayload $resolved $expectedSigningInventory
+
     $manifest = Get-Content -LiteralPath (Join-Path $resolved 'SHA256SUMS.json') -Raw | ConvertFrom-Json
     if ([string]$release.source_commit -notmatch '^[0-9a-f]{40}$' -or $release.source_commit -ne $manifest.source_commit) {
         throw 'release source commit is missing, malformed, or differs from the checksum manifest'
@@ -3071,6 +3385,12 @@ $plan = [ordered]@{
     )
     signing_required_before_public_distribution = $true
 }
+if (-not $governorApprovalReference) {
+    # The plan carries the approval identity if, and only if, a detached
+    # approval was admitted; absence is reported by the dedicated
+    # governor_retirement_approval_input block, not by a null field.
+    [void]$plan.Remove('governor_approval')
+}
 
 if ($PlanRetiredGovernor) {
     # Issue #2892/#2968 simulation sketch: -PlanOnly is already enforced at the
@@ -3082,7 +3402,9 @@ if ($PlanRetiredGovernor) {
     $plan.governor = $null
     $plan.governor_disposition = 'SIMULATED_NOT_ADMITTED (issue #2892/#2968 proof sketch: -PlanRetiredGovernor renders the retired layout for inspection only; it is not an accepted retirement, it carries no detached owner approval identity, it writes no bundle, and it cannot stage, verify, sign, or publish)'
     $plan.governor_evidence = $null
-    $plan.governor_approval = $null
+    if ($plan.Contains('governor_approval')) {
+        [void]$plan.Remove('governor_approval')
+    }
     $plan.simulation = 'SIMULATED_NOT_ADMITTED'
     $plan.claude_code_front_door.legacy_available = $false
     $plan.claude_code_front_door.legacy_command = $null
@@ -3237,8 +3559,29 @@ try {
     }
     $verifiedRuntimeArtifacts = @(Get-VerifiedRuntimeArtifacts $runtimeArtifactPlan $Version)
     $peLinkerVersions = @(@($verifiedRuntimeArtifacts | ForEach-Object { [string]$_.linker_version }) | Sort-Object -Unique)
+    $verifiedGovernorArtifact = $null
     if ($legacyGovernorPresent) {
+        $governorFile = Get-Item -LiteralPath $governor -ErrorAction Stop
+        Assert-NoSecretFile $governorFile 'eliot-governor.exe'
+        Assert-WindowsX64Pe $governorFile.FullName 'eliot-governor.exe'
+        $governorHash = (Get-FileHash -LiteralPath $governorFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $governorBytes = [int64]$governorFile.Length
         $governorLinkerVersion = Get-WindowsPeLinkerVersion $governor 'eliot-governor.exe'
+        $governorAfterLinkerHash = (Get-FileHash -LiteralPath $governor -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($governorAfterLinkerHash -cne $governorHash -or [int64](Get-Item -LiteralPath $governor).Length -ne $governorBytes) {
+            throw 'Governor artifact changed while its verified release identity was being collected'
+        }
+        $verifiedGovernorArtifact = [ordered]@{
+            package = 'eliot-app'
+            binary = 'eliot-governor'
+            role = 'governor'
+            path = 'eliot-governor.exe'
+            source = 'cargo'
+            version = $Version
+            architecture = 'windows-x64'
+            sha256 = $governorHash
+            bytes = $governorBytes
+        }
         $peLinkerVersions = @(@($peLinkerVersions) + @($governorLinkerVersion) | Sort-Object -Unique)
     }
     if ($frontDoorBridgeStaged) {
@@ -3317,6 +3660,41 @@ try {
             Assert-NoSecretFile (Get-Item -LiteralPath $destination) "runtime/$($advisoryFile.name)"
         }
     }
+    $bundleSigningArtifacts = @()
+    if ($legacyGovernorPresent) {
+        $governorFile = Get-Item -LiteralPath $governor -ErrorAction Stop
+        $governorHash = (Get-FileHash -LiteralPath $governorFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $governorBundlePath = Join-Path $bundle 'eliot-governor.exe'
+        $governorBundleFile = Get-Item -LiteralPath $governorBundlePath -ErrorAction Stop
+        if (-not $verifiedGovernorArtifact -or
+            $governorHash -cne [string]$verifiedGovernorArtifact.sha256 -or
+            [int64]$governorFile.Length -ne [int64]$verifiedGovernorArtifact.bytes -or
+            (Get-FileHash -LiteralPath $governorBundlePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$verifiedGovernorArtifact.sha256 -or
+            [int64]$governorBundleFile.Length -ne [int64]$verifiedGovernorArtifact.bytes) {
+            throw 'staged Governor differs from the Cargo release artifact used for the runtime receipt'
+        }
+        $bundleSigningArtifacts += $verifiedGovernorArtifact
+    }
+    if ($frontDoorBridgeStaged) {
+        $bridgeBundlePath = Join-Path $bundle ([string]$frontDoorBridgeStaged.path)
+        $bridgeBundleFile = Get-Item -LiteralPath $bridgeBundlePath -ErrorAction Stop
+        $bridgeBundleHash = (Get-FileHash -LiteralPath $bridgeBundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($bridgeBundleHash -cne [string]$frontDoorBridgeStaged.sha256 -or
+            [int64]$bridgeBundleFile.Length -ne [int64]$frontDoorBridgeStaged.bytes) {
+            throw 'staged agent bridge differs from its verified Cargo artifact record'
+        }
+        $bundleSigningArtifacts += [ordered]@{
+            package = 'eliot-agent-bridge'
+            binary = 'eliot-agent-bridge'
+            role = 'agent-bridge'
+            path = 'eliot-agent-bridge.exe'
+            source = 'cargo'
+            version = $Version
+            architecture = 'windows-x64'
+            sha256 = [string]$frontDoorBridgeStaged.sha256
+            bytes = [int64]$frontDoorBridgeStaged.bytes
+        }
+    }
     [ordered]@{
         schema = 'eliot-runtime-artifact-set-v1'
         component = 'eliot_runtime_verified_build_artifacts'
@@ -3343,6 +3721,7 @@ try {
         }
         surreal_version = $verifiedPinnedSurreal.version
         artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal)
+        bundle_signing_artifacts = @($bundleSigningArtifacts)
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'RUNTIME_ARTIFACTS.json') -Encoding utf8
     if ($legacyGovernorPresent) {
         Copy-PinnedSourceFile $repo $sourceCommit 'integrations/codex/marketplace.json' (Join-Path $bundle 'integrations/codex/marketplace.json')
@@ -3399,10 +3778,25 @@ try {
     }
     Copy-OperatorPayload $verifiedOperator.source (Join-Path $bundle 'operator')
     Copy-Item -LiteralPath $verifiedOperator.receipt_path -Destination (Join-Path $bundle 'operator/OPERATOR_BUILD_RECEIPT.json')
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference
+    $runtimeReceiptPath = Join-Path $bundle 'runtime/RUNTIME_ARTIFACTS.json'
+    $operatorReceiptPath = Join-Path $bundle 'operator/OPERATOR_BUILD_RECEIPT.json'
+    $runtimeReceiptSha256 = (Get-FileHash -LiteralPath $runtimeReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $operatorReceiptSha256 = (Get-FileHash -LiteralPath $operatorReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($operatorReceiptSha256 -cne [string]$verifiedOperator.receipt_sha256) {
+        throw 'staged Operator receipt differs from the independently verified publish receipt'
+    }
+    $runtimeManifest = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    $operatorReceipt = Get-Content -LiteralPath $operatorReceiptPath -Raw | ConvertFrom-Json
+    $expectedBridgeSha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { '' }
+    $expectedBridgeBytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { [int64]0 }
+    $signingInventory = @(Get-ExpectedSigningInventory `
+            $bundle $runtimeManifest $runtimeReceiptSha256 $operatorReceipt $operatorReceiptSha256 `
+            $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes)
+    Assert-ClosedCodeBearingPayload $bundle $signingInventory
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory
     $stagedPayloadManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
-    [ordered]@{
+    $release = [ordered]@{
         component = 'eliot_windows_x64_release'
         version = $Version
         source_commit = $sourceCommit
@@ -3559,7 +3953,17 @@ try {
             dotnet_sha256 = $verifiedOperator.dotnet_sha256
             msbuild_version = $verifiedOperator.msbuild_version
         }
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Encoding utf8
+    }
+    if (-not $governorApprovalReference) {
+        # Retained slice stages byte-identically: the approval identity and
+        # the retirement-approval report blocks are carried if, and only if, a
+        # detached approval was admitted (removal preserves the exact
+        # pre-#2968 field order).
+        [void]$release.Remove('governor_approval')
+        [void]$release.Remove('governor_retirement_approval')
+        [void]$release.Remove('governor_retirement_approval_trust')
+    }
+    $release | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Encoding utf8
 
     @'
 This bundle is intentionally unsigned. Before public distribution:
@@ -3580,7 +3984,7 @@ This bundle is intentionally unsigned. Before public distribution:
                 bytes = $_.Length
             }
         }
-    [ordered]@{
+    $checksums = [ordered]@{
         component = 'eliot_windows_x64_release_manifest'
         version = $Version
         source_commit = $sourceCommit
@@ -3589,7 +3993,14 @@ This bundle is intentionally unsigned. Before public distribution:
         governor_evidence = $plan.governor_evidence
         governor_approval = $governorApprovalReference
         files = @($hashes)
-    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS.json') -Encoding utf8
+    }
+    if (-not $governorApprovalReference) {
+        # Retained slice stages byte-identically: no approval identity is
+        # carried unless a detached approval was admitted (removal preserves
+        # the exact pre-#2968 field order).
+        [void]$checksums.Remove('governor_approval')
+    }
+    $checksums | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS.json') -Encoding utf8
     $verification = Test-ReleaseBundle $bundle $GovernorRetirementApproval
     $plan.status = 'STAGED_UNSIGNED'
     $plan.verification = $verification

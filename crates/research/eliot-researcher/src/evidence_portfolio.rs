@@ -2040,72 +2040,72 @@ struct NoMatchEvaluationDigestInput<'a> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NoMatchEvaluation {
     /// Declared wire schema of this evidence shape.
-    pub schema_version: String,
+    schema_version: String,
     /// Exact identity of the predicate that was evaluated.
-    pub predicate_id: String,
+    predicate_id: String,
     /// Exact revision of that predicate.
-    pub predicate_revision: String,
+    predicate_revision: String,
     /// Exact canonical predicate/query bytes the evaluator executed.
     ///
     /// The predicate commitment [`Self::predicate_digest`] is recomputed from
     /// this text and the two identity fields, so the commitment cannot be a
     /// repeated string describing bytes nobody holds.
-    pub predicate_form: String,
+    predicate_form: String,
     /// Owner that issued this record.
-    pub issuer_id: String,
+    issuer_id: String,
     /// Exact identity of the evaluator that executed the predicate.
-    pub evaluator_id: String,
+    evaluator_id: String,
     /// Exact evaluator revision the run was produced under.
-    pub evaluator_revision: String,
+    evaluator_revision: String,
     /// Admitted receipt identity for this evaluation.
-    pub admission_receipt_id: String,
+    admission_receipt_id: String,
     /// State fence the evaluation was admitted under.
-    pub fence: StateFence,
+    fence: StateFence,
     /// Exact work scope the evaluation was bounded to.
-    pub work_scope: String,
+    work_scope: String,
     /// Digest of the frozen scope/denominator snapshot.
-    pub scope_digest: String,
+    scope_digest: String,
     /// Revision of that scope snapshot.
-    pub scope_revision: String,
+    scope_revision: String,
     /// Canonical denominator digest the member set was frozen from.
-    pub denominator_digest: String,
+    denominator_digest: String,
     /// Digest of the authorized manifest covering the frozen members.
-    pub manifest_digest: String,
+    manifest_digest: String,
     /// Revision of that authorized manifest.
-    pub manifest_revision: u64,
+    manifest_revision: u64,
     /// Revision of the source/index the predicate ran against.
-    pub index_revision: String,
+    index_revision: String,
     /// Revision of the source corpus the predicate ran against.
-    pub source_revision: String,
+    source_revision: String,
     /// Owner-recorded observation time in Unix milliseconds.
     ///
     /// This is the owner clock, not a caller-supplied `now_ms`.
     /// [`AbsencePreconditions::derive`] requires it to be at or after every
     /// joined record's retrieval time, to be at or before the caller's assessment
     /// time, and to sit inside the declared currentness window.
-    pub observed_at_ms: i64,
+    observed_at_ms: i64,
     /// Owner-declared last instant, in Unix milliseconds, at which this
     /// evaluation was still current.
-    pub current_until_ms: i64,
+    current_until_ms: i64,
     /// Whether this evaluation grounds a current claim or only a historical one.
-    pub applicability: NoMatchApplicability,
+    applicability: NoMatchApplicability,
     /// Per-member owner-issued no-match results, in canonical member order.
     ///
     /// The coverage this record claims *is* this set: it must equal the set of
     /// members the accounting closed that resolve to a compatible vetted record,
     /// exactly. There is no separate count that could disagree with it.
-    pub results: Vec<MemberNoMatchResult>,
+    results: Vec<MemberNoMatchResult>,
     /// The five separately-established facts, none substituting for another.
-    pub established: BTreeSet<NoMatchDimension>,
+    established: BTreeSet<NoMatchDimension>,
     /// Proof ceiling the negative may not exceed; `None` is unknown coverage,
     /// never unrestricted.
-    pub proof_ceiling_grade: Option<u8>,
+    proof_ceiling_grade: Option<u8>,
     /// Frozen digest over the whole record shape.
     ///
     /// Excluded from its own preimage by `#[serde(skip)]`, so the digest is the
     /// only field on this struct that is not part of the identity it certifies.
     #[serde(skip)]
-    pub digest: String,
+    digest: String,
 }
 
 /// Named constructor arguments for [`NoMatchEvaluation::issue`]. Named fields
@@ -2168,6 +2168,17 @@ impl NoMatchEvaluation {
     /// another predicate, index revision or source revision. To produce the values
     /// this constructor checks, call [`Self::predicate_digest_of`] and then
     /// [`Self::result_identity`] for every member.
+    ///
+    /// The owner-side entry point is [`NoMatchEvaluationIssuer::issue_for`],
+    /// which holds the predicate, snapshot, evaluator, scope, clock and ceiling
+    /// commitments and joins them against the presented accounting, vetted
+    /// records and authorized manifest before calling this constructor. Calling
+    /// this constructor directly checks self-consistency only — the recomputed
+    /// identities catch a result carried across a predicate, revision or record
+    /// boundary, but not a result minted without the predicate ever running — so
+    /// a directly constructed record still has to survive the join
+    /// [`AbsencePreconditions::derive`] performs before [`assess_absence`] can
+    /// read it.
     ///
     /// # Errors
     ///
@@ -2304,15 +2315,15 @@ impl NoMatchEvaluation {
     /// Validates the record's shape, independently of its frozen digest.
     ///
     /// This is the only place the canonical result order is enforced, and it is
-    /// enforced here rather than only in [`Self::issue`] because every field on
-    /// this struct is public: a struct literal bypasses the constructor, and
-    /// [`AbsencePreconditions::derive`] accepts any value of this type. Since the
-    /// canonical encoder sorts object keys but preserves array order
-    /// (`eliot-contracts::canonical_json_bytes`), two otherwise identical
+    /// enforced here rather than only in the constructors because the canonical
+    /// encoder sorts object keys but preserves array order
+    /// (`eliot-contracts::canonical_json_bytes`): two otherwise identical
     /// evaluations whose `results` arrive in different orders would hash
-    /// differently, so exact replay would not be byte-stable. Refusing the
-    /// unordered shape here is what earns that property rather than inheriting it
-    /// from the constructor.
+    /// differently, so exact replay would not be byte-stable. Every field on
+    /// this struct is private, so [`Self::issue`] and [`NoMatchEvaluationIssuer`]
+    /// are the only constructors and both route through this check; refusing the
+    /// unordered shape here is what earns byte-stability rather than inheriting
+    /// it from any one constructor's sort.
     ///
     /// # Errors
     ///
@@ -2376,9 +2387,8 @@ impl NoMatchEvaluation {
             });
         }
         let predicate_digest = self.predicate_digest();
-        // Canonical order is a shape requirement, not a convenience of the
-        // constructor: `results` is public, `derive` accepts any value of this
-        // type, and the canonical encoder keeps array order, so an unordered
+        // Canonical order is a shape requirement, not a convenience of one
+        // constructor: the canonical encoder keeps array order, so an unordered
         // sequence is refused here rather than hashed into a second identity for
         // the same evaluation. A strictly *decreasing* pair is the shape check; an
         // adjacent equal pair is not, so a repeated member still falls through to
@@ -2474,6 +2484,500 @@ impl NoMatchEvaluation {
             });
         }
         Ok(())
+    }
+}
+
+/// Named constructor arguments for [`NoMatchEvaluationIssuer::new`]. Named
+/// fields block transposition across the twenty held commitments; text uses
+/// concrete `String`, the fence uses [`StateFence`], the ceiling stays
+/// `Option<u8>` so the refusal of an absent ceiling is explicit at the call
+/// site rather than a default.
+#[derive(Clone, Debug)]
+pub struct NoMatchEvaluationIssuerParams {
+    /// Exact identity of the predicate the issuer's evaluations answer.
+    pub predicate_id: String,
+    /// Exact predicate revision the issuer's evaluations run under.
+    pub predicate_revision: String,
+    /// Exact canonical predicate bytes the evaluator executes.
+    pub predicate_form: String,
+    /// Owner issuing the evaluations.
+    pub issuer_id: String,
+    /// Evaluator identity executing the predicate.
+    pub evaluator_id: String,
+    /// Evaluator revision the runs are produced under.
+    pub evaluator_revision: String,
+    /// Admitted receipt identity for the evaluations.
+    pub admission_receipt_id: String,
+    /// Admission State Fence the evaluations are admitted under.
+    pub fence: StateFence,
+    /// Exact work scope the evaluations are bounded to.
+    pub work_scope: String,
+    /// Digest of the frozen scope/denominator snapshot.
+    pub scope_digest: String,
+    /// Revision of that scope snapshot.
+    pub scope_revision: String,
+    /// Canonical denominator digest the member set is frozen from.
+    pub denominator_digest: String,
+    /// Digest of the authorized manifest covering the frozen members.
+    pub manifest_digest: String,
+    /// Revision of that authorized manifest.
+    pub manifest_revision: u64,
+    /// Revision of the source/index the predicate runs against.
+    pub index_revision: String,
+    /// Revision of the source corpus the predicate runs against.
+    pub source_revision: String,
+    /// Owner-recorded observation time in Unix milliseconds.
+    pub observed_at_ms: i64,
+    /// Owner-declared last instant, in Unix milliseconds, at which an issued
+    /// evaluation is still current.
+    pub current_until_ms: i64,
+    /// Whether issued evaluations ground a current claim or a historical one.
+    pub applicability: NoMatchApplicability,
+    /// Proof ceiling issued evaluations may not exceed. `None` is refused: an
+    /// absent ceiling is unknown rather than unrestricted, so a record carrying
+    /// none could never survive [`assess_absence`], and the issuer does not mint
+    /// records that prove nothing.
+    pub proof_ceiling_grade: Option<u8>,
+}
+
+/// The query/evaluator-side owner that issues bounded no-match evaluations.
+///
+/// This is the issuer the frozen owner map of I21.6 names and that #2893
+/// acceptance items W1/A4 require: one typed value holds the predicate
+/// identity and bytes, the scope/denominator/manifest snapshot commitment, the
+/// index and source revisions, the issuer/evaluator/receipt identities, the
+/// State Fence and work scope, the owner observation window and applicability,
+/// and the proof ceiling — and [`Self::issue_for`] joins every one of them
+/// against the presented coverage accounting, vetted records and authorized
+/// manifest before a [`NoMatchEvaluation`] exists, refusing with a typed
+/// [`PortfolioError`] when anything does not join. A member list copied out of
+/// the accounting cannot pass through here: each issued result names the
+/// recomputed commitment of the exact vetted record behind its member, the
+/// exact content bytes, and a result identity recomputed under the held
+/// predicate and revisions.
+///
+/// An issued record always carries all five [`NoMatchDimension`]s. Four of them
+/// are re-derived at issuance: complete accounting with no open member, no
+/// exclusion and no stopped frontier establishes enumeration; every outcome
+/// closing with a complete ordered join establishes acquisition; per-record
+/// staleness plus the owner observation window establishes currentness. The
+/// fifth fact — that the named predicate actually executed and returned no
+/// match for each member — is the evaluator owner's irreducible execution
+/// attestation and is asserted as such; no in-crate check can re-derive it, and
+/// this type does not pretend to. See the limitation note on
+/// [`NoMatchEvaluation`].
+///
+/// The issuer performs no I/O, calls no provider and no index: it reads only
+/// the accounting, records, manifest, scope digest and clock instant its caller
+/// presents, exactly as [`assess_absence`] reads only the preconditions it is
+/// handed. What it does not establish is provenance: the held commitments are
+/// still supplied by whoever constructs the issuer, and this repository holds
+/// no issuer registry, admission ledger or signature to check them against, so
+/// a caller that controls the records, the manifest and the clock can still
+/// mint a self-consistent issuer. The construction is narrowed — private record
+/// fields, one validated holder, join before existence — but the residual trust
+/// boundary is the same records, manifest and clock, stated rather than
+/// closed.
+///
+/// No production route holds this issuer yet: the research plane records
+/// per-source acquisition dispositions, not per-member predicate results, so
+/// [`CoverageReceipt::compute`](crate::inquiry_governance::CoverageReceipt::compute)
+/// keeps binding no evaluation and stays fail-closed, and the live evaluator
+/// composition that must hold the issuer belongs to #1762/#1767. Until that
+/// route exists the issuer is complete public API awaiting its holder, and the
+/// evaluation-gated arms of [`assess_absence`] stay unreachable in production.
+#[derive(Clone, Debug)]
+pub struct NoMatchEvaluationIssuer {
+    /// Exact identity of the predicate issued evaluations answer.
+    predicate_id: String,
+    /// Exact predicate revision issued evaluations run under.
+    predicate_revision: String,
+    /// Exact canonical predicate bytes the evaluator executes.
+    predicate_form: String,
+    /// Owner issuing the evaluations.
+    issuer_id: String,
+    /// Evaluator identity executing the predicate.
+    evaluator_id: String,
+    /// Evaluator revision the runs are produced under.
+    evaluator_revision: String,
+    /// Admitted receipt identity for the evaluations.
+    admission_receipt_id: String,
+    /// Admission State Fence the evaluations are admitted under.
+    fence: StateFence,
+    /// Exact work scope the evaluations are bounded to.
+    work_scope: String,
+    /// Digest of the frozen scope/denominator snapshot.
+    scope_digest: String,
+    /// Revision of that scope snapshot.
+    scope_revision: String,
+    /// Canonical denominator digest the member set is frozen from.
+    denominator_digest: String,
+    /// Digest of the authorized manifest covering the frozen members.
+    manifest_digest: String,
+    /// Revision of that authorized manifest.
+    manifest_revision: u64,
+    /// Revision of the source/index the predicate runs against.
+    index_revision: String,
+    /// Revision of the source corpus the predicate runs against.
+    source_revision: String,
+    /// Owner-recorded observation time in Unix milliseconds.
+    observed_at_ms: i64,
+    /// Owner-declared last instant, in Unix milliseconds, at which an issued
+    /// evaluation is still current.
+    current_until_ms: i64,
+    /// Whether issued evaluations ground a current claim or a historical one.
+    applicability: NoMatchApplicability,
+    /// Proof ceiling issued evaluations carry; always present, always on the
+    /// canonical ladder.
+    proof_ceiling_grade: u8,
+}
+
+impl NoMatchEvaluationIssuer {
+    /// Holds one owner commitment set after validating every field it carries.
+    ///
+    /// Validation is the same shape validation [`NoMatchEvaluation::issue`]
+    /// applies to a record, applied once to the holder instead of once per
+    /// record: blank identities, an unvalidated fence, a vague work scope, a
+    /// malformed digest, a non-positive observation time, an inverted
+    /// currentness window, an absent ceiling or a ceiling off the canonical
+    /// ladder are all refused here, so no issuer exists that cannot attest the
+    /// commitments it holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank or malformed held commitment,
+    /// [`PortfolioError::Conflict`] for an inverted currentness window, and
+    /// [`PortfolioError::UnknownGrade`] for a ceiling outside the canonical
+    /// ladder.
+    pub fn new(params: NoMatchEvaluationIssuerParams) -> Result<Self, PortfolioError> {
+        text(&params.predicate_id, "no_match_issuer.predicate_id")?;
+        text(
+            &params.predicate_revision,
+            "no_match_issuer.predicate_revision",
+        )?;
+        text(&params.predicate_form, "no_match_issuer.predicate_form")?;
+        text(&params.issuer_id, "no_match_issuer.issuer_id")?;
+        text(&params.evaluator_id, "no_match_issuer.evaluator_id")?;
+        text(
+            &params.evaluator_revision,
+            "no_match_issuer.evaluator_revision",
+        )?;
+        text(
+            &params.admission_receipt_id,
+            "no_match_issuer.admission_receipt_id",
+        )?;
+        params.fence.validate().map_err(|_| PortfolioError::Blank {
+            field: "no_match_issuer.fence",
+        })?;
+        text(&params.work_scope, "no_match_issuer.work_scope")?;
+        reject_vague(&params.work_scope, "no_match_issuer.work_scope")?;
+        digest(&params.scope_digest, "no_match_issuer.scope_digest")?;
+        text(&params.scope_revision, "no_match_issuer.scope_revision")?;
+        digest(
+            &params.denominator_digest,
+            "no_match_issuer.denominator_digest",
+        )?;
+        digest(&params.manifest_digest, "no_match_issuer.manifest_digest")?;
+        text(&params.index_revision, "no_match_issuer.index_revision")?;
+        text(&params.source_revision, "no_match_issuer.source_revision")?;
+        if params.observed_at_ms <= 0 {
+            return Err(PortfolioError::Blank {
+                field: "no_match_issuer.observed_at_ms",
+            });
+        }
+        if params.current_until_ms < params.observed_at_ms {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.current_until_ms",
+            });
+        }
+        let proof_ceiling_grade = params.proof_ceiling_grade.ok_or(PortfolioError::Blank {
+            field: "no_match_issuer.proof_ceiling_grade",
+        })?;
+        grade_name(proof_ceiling_grade)?;
+        Ok(Self {
+            predicate_id: params.predicate_id,
+            predicate_revision: params.predicate_revision,
+            predicate_form: params.predicate_form,
+            issuer_id: params.issuer_id,
+            evaluator_id: params.evaluator_id,
+            evaluator_revision: params.evaluator_revision,
+            admission_receipt_id: params.admission_receipt_id,
+            fence: params.fence,
+            work_scope: params.work_scope,
+            scope_digest: params.scope_digest,
+            scope_revision: params.scope_revision,
+            denominator_digest: params.denominator_digest,
+            manifest_digest: params.manifest_digest,
+            manifest_revision: params.manifest_revision,
+            index_revision: params.index_revision,
+            source_revision: params.source_revision,
+            observed_at_ms: params.observed_at_ms,
+            current_until_ms: params.current_until_ms,
+            applicability: params.applicability,
+            proof_ceiling_grade,
+        })
+    }
+
+    /// Issues the bounded evaluation for exactly the closed members of `account`.
+    ///
+    /// Every held commitment is joined before the record exists, in this order:
+    /// the presented scope digest is the held one; the presented manifest
+    /// re-proves its own identity and is the held digest, revision and
+    /// denominator; the accounting is completely enumerated with no open
+    /// member, no exclusion and no stopped frontier; the owner observation
+    /// window covers `now_ms`; every closed member resolves through the same
+    /// ordered join [`AbsencePreconditions::derive`] applies — handle present,
+    /// vetted record present, handle bound, record current, manifest
+    /// allowlisted and record-bound, evaluation observed no earlier than the
+    /// record was retrieved — with a per-member result identity recomputed
+    /// under the held predicate and revisions; and the held ceiling is checked
+    /// against the weakest grade behind the joined records. The first unmet
+    /// join refuses issuance outright, so no record exists that the issuer
+    /// could not attest.
+    ///
+    /// No member is ever inserted: results are built only from members a
+    /// closing disposition closed, and an account with no closed member is
+    /// refused rather than completed with a fictitious one. An empty
+    /// authoritative scope cannot reach here either, because
+    /// [`CoverageAccount::open`] refuses an empty denominator before accounting
+    /// starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::IncompleteDenominator`] for a scope the
+    /// accounting did not completely enumerate or close, or for an account with
+    /// no closed member; [`PortfolioError::Conflict`] for a scope, manifest,
+    /// revision, denominator, frontier, clock or per-member join the issuer
+    /// cannot attest; [`PortfolioError::InvalidDigest`] when the presented
+    /// manifest no longer re-proves its own identity; the joined record's own
+    /// digest error when its canonical commitment cannot be recomputed; and
+    /// [`PortfolioError::CeilingViolation`] when the held ceiling exceeds the
+    /// weakest grade behind the joined records.
+    pub fn issue_for(
+        &self,
+        account: &CoverageAccount,
+        records: &BTreeMap<String, SourceRecord>,
+        manifest: &AuthorizedManifest,
+        frozen_scope_digest: &str,
+        now_ms: i64,
+    ) -> Result<NoMatchEvaluation, PortfolioError> {
+        self.check_scope_binding(frozen_scope_digest)?;
+        self.check_manifest_binding(manifest)?;
+        Self::check_enumeration(account)?;
+        self.check_observation_window(now_ms)?;
+        let predicate_digest = NoMatchEvaluation::predicate_digest_of(
+            &self.predicate_id,
+            &self.predicate_revision,
+            &self.predicate_form,
+        );
+        let mut results = Vec::with_capacity(account.outcomes.len());
+        let mut grades = Vec::with_capacity(account.outcomes.len());
+        for (member, (disposition, handle)) in &account.outcomes {
+            if !disposition.closes_member() {
+                return Err(PortfolioError::IncompleteDenominator {
+                    field: "no_match_issuer.disposition",
+                });
+            }
+            let record = handle
+                .as_ref()
+                .and_then(|handle| records.get(handle.as_str()));
+            let (result, grade) = self.result_for(
+                member,
+                handle.as_ref(),
+                record,
+                manifest,
+                &predicate_digest,
+                now_ms,
+            )?;
+            results.push(result);
+            grades.push(grade);
+        }
+        if results.is_empty() {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "no_match_issuer.results",
+            });
+        }
+        match weakest_ceiling(&grades)? {
+            Some(ceiling) => check_ceiling(self.proof_ceiling_grade, ceiling)?,
+            None => {
+                return Err(PortfolioError::Conflict {
+                    field: "no_match_issuer.proof_ceiling_grade",
+                });
+            }
+        }
+        NoMatchEvaluation::issue(NoMatchEvaluationParams {
+            predicate_id: self.predicate_id.clone(),
+            predicate_revision: self.predicate_revision.clone(),
+            predicate_form: self.predicate_form.clone(),
+            issuer_id: self.issuer_id.clone(),
+            evaluator_id: self.evaluator_id.clone(),
+            evaluator_revision: self.evaluator_revision.clone(),
+            admission_receipt_id: self.admission_receipt_id.clone(),
+            fence: self.fence.clone(),
+            work_scope: self.work_scope.clone(),
+            scope_digest: self.scope_digest.clone(),
+            scope_revision: self.scope_revision.clone(),
+            denominator_digest: self.denominator_digest.clone(),
+            manifest_digest: self.manifest_digest.clone(),
+            manifest_revision: self.manifest_revision,
+            index_revision: self.index_revision.clone(),
+            source_revision: self.source_revision.clone(),
+            observed_at_ms: self.observed_at_ms,
+            current_until_ms: self.current_until_ms,
+            applicability: self.applicability,
+            results,
+            established: NoMatchDimension::ALL
+                .into_iter()
+                .collect::<BTreeSet<NoMatchDimension>>(),
+            proof_ceiling_grade: Some(self.proof_ceiling_grade),
+        })
+    }
+
+    /// Refuses a scope the issuer does not hold.
+    fn check_scope_binding(&self, frozen_scope_digest: &str) -> Result<(), PortfolioError> {
+        digest(frozen_scope_digest, "no_match_issuer.frozen_scope_digest")?;
+        if frozen_scope_digest != self.scope_digest {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.scope_digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads the presented manifest back and refuses one that is not the held
+    /// snapshot commitment.
+    fn check_manifest_binding(&self, manifest: &AuthorizedManifest) -> Result<(), PortfolioError> {
+        manifest.verify_integrity()?;
+        if manifest.digest != self.manifest_digest {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.manifest_digest",
+            });
+        }
+        if manifest.revision != self.manifest_revision {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.manifest_revision",
+            });
+        }
+        if manifest.denominator_digest != self.denominator_digest {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.manifest_denominator",
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses an accounting that did not completely enumerate its denominator.
+    ///
+    /// The issuer attests complete scopes only: an open member, an explicit
+    /// exclusion or a stopped frontier each means the enumeration this record
+    /// would claim never completed, so issuance stops before any per-member
+    /// join runs.
+    fn check_enumeration(account: &CoverageAccount) -> Result<(), PortfolioError> {
+        if !account.open_members().is_empty() {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "no_match_issuer.open_members",
+            });
+        }
+        if !account.exclusions.is_empty() {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "no_match_issuer.exclusions",
+            });
+        }
+        if account.frontier.is_some() {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.frontier",
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses an assessment instant the owner window does not cover.
+    fn check_observation_window(&self, now_ms: i64) -> Result<(), PortfolioError> {
+        if self.observed_at_ms > now_ms {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.observed_at_ms",
+            });
+        }
+        if now_ms > self.current_until_ms {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.current_until_ms",
+            });
+        }
+        Ok(())
+    }
+
+    /// Builds the one owner-issued per-member result, or refuses the member.
+    ///
+    /// The join order mirrors [`member_join_reason`]'s evaluation-bound path —
+    /// handle, record, handle binding, currentness, manifest allowlist,
+    /// manifest record binding, observation order — minus the result-presence
+    /// checks, which do not apply where the result is being built rather than
+    /// read back. A member failing any of them refuses issuance outright: the
+    /// refusal is an issuance error, not a retained reason, because no record
+    /// exists to retain one on. The member-specific reason a blocked negative
+    /// must retain is still [`AbsencePreconditions::derive`]'s work, which runs
+    /// when the issued record is bound and assessed.
+    fn result_for(
+        &self,
+        member: &str,
+        handle: Option<&String>,
+        record: Option<&SourceRecord>,
+        manifest: &AuthorizedManifest,
+        predicate_digest: &str,
+        now_ms: i64,
+    ) -> Result<(MemberNoMatchResult, Option<u8>), PortfolioError> {
+        let handle = handle.ok_or(PortfolioError::Conflict {
+            field: "no_match_issuer.handle",
+        })?;
+        let record = record.ok_or(PortfolioError::Conflict {
+            field: "no_match_issuer.record",
+        })?;
+        if record.handle != *handle {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.record_handle",
+            });
+        }
+        if record.is_stale_at(now_ms) {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.record_currentness",
+            });
+        }
+        if !manifest.allows(handle) {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.manifest_allowlist",
+            });
+        }
+        if !manifest.binds_source_record(record) {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.manifest_binding",
+            });
+        }
+        if record
+            .retrieved_ms
+            .is_some_and(|retrieved| retrieved > self.observed_at_ms)
+        {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_issuer.observation_order",
+            });
+        }
+        let record_digest = record.digest()?;
+        let result_identity = NoMatchEvaluation::result_identity(
+            predicate_digest,
+            member,
+            &record_digest,
+            &record.content_digest,
+            &self.index_revision,
+            &self.source_revision,
+        );
+        Ok((
+            MemberNoMatchResult {
+                member: member.to_owned(),
+                record_digest,
+                content_digest: record.content_digest.clone(),
+                result_identity,
+            },
+            record.grade,
+        ))
     }
 }
 
@@ -4959,41 +5463,49 @@ pub struct ManifestSource {
 /// set in meaning and is frozen sorted by [`Self::freeze`], so the manifest bytes
 /// are stable under arrival order while meaningful sequence stays
 /// identity-visible.
+///
+/// Every field is private, so the only way to obtain a value outside this
+/// module is [`Self::freeze`]: a past constructor call is not provenance, and
+/// neither is a struct literal. A literal could name an allowlist the freeze
+/// would refuse, and writable fields would let a caller mutate a frozen value
+/// and re-stamp its digest with [`Self::canonical_digest`]; neither is
+/// expressible from outside this module. Readback still re-proves the value
+/// through [`Self::verify_integrity`] at every consume site.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AuthorizedManifest {
     /// Digest of the frozen inquiry.
-    pub inquiry_digest: String,
+    inquiry_digest: String,
     /// Digest of the exact denominator.
-    pub denominator_digest: String,
+    denominator_digest: String,
     /// Exact source identity commitments by canonical handle.
-    pub sources: BTreeMap<String, ManifestSource>,
+    sources: BTreeMap<String, ManifestSource>,
     /// Dependence edges `(from, to)` in frozen order.
-    pub dependence_edges: BTreeSet<(String, String)>,
+    dependence_edges: BTreeSet<(String, String)>,
     /// Digest of the frozen coverage accounting.
-    pub coverage_digest: String,
+    coverage_digest: String,
     /// Grade limit explanations in frozen order.
-    pub grade_limits: Vec<String>,
+    grade_limits: Vec<String>,
     /// Preserved counterevidence identities in frozen order.
-    pub counterevidence: Vec<String>,
+    counterevidence: Vec<String>,
     /// Preserved conflict notes in frozen order.
-    pub conflicts: Vec<String>,
+    conflicts: Vec<String>,
     /// Preserved unknown references in frozen order.
-    pub unknowns: Vec<String>,
+    unknowns: Vec<String>,
     /// Reference allowlist in frozen order.
-    pub allowlist: Vec<String>,
+    allowlist: Vec<String>,
     /// Revoked or stale handles excluded from the allowlist.
-    pub revoked: Vec<String>,
+    revoked: Vec<String>,
     /// Privacy class carried into any handoff.
-    pub disclosure: DisclosureClass,
+    disclosure: DisclosureClass,
     /// Expiry in Unix milliseconds; audits past it fail closed.
-    pub expires_ms: i64,
+    expires_ms: i64,
     /// Manifest revision; a revision invalidates older audits.
-    pub revision: u64,
+    revision: u64,
     /// Frozen digest over the whole manifest shape.
     ///
     /// Excluded from its own preimage by `#[serde(skip)]`.
     #[serde(skip)]
-    pub digest: String,
+    digest: String,
 }
 
 /// Declared identity domain of [`AuthorizedManifest`].

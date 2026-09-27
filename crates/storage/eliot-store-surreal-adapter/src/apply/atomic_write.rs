@@ -35,10 +35,12 @@ IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_
 // 688-B erasure intent-before-dispatch statements. These closed templates live
 // in this apply-owned writer (a sibling of `schema`, inside the admitted
 // apply/schema SurrealQL contour): the intent upsert opens the same atomic
-// transaction as the destructive statements; one `DELETE` per store-owned
-// surface removes only the selected subject's capture rows admitted under the
-// exact recorded scope; the outcome seal persists the exact per-surface
-// outcomes for idempotent same-operation replay.
+// transaction as the destructive statements; one scrub `UPDATE` pair per
+// store-owned surface removes only the selected subject's erasable entries
+// admitted under the exact recorded scope while the receipt row itself —
+// operation/idempotency identity, immutable `body`, sibling captures —
+// survives for exact replay and resolution; the outcome seal persists the
+// exact per-surface outcomes for idempotent same-operation replay.
 
 // Issue #1712 admits the named erasure dispatch: `apply.rs` routes an
 // admitted `ApplyErasure` transition through `record_surreal_erasure_intent`
@@ -51,10 +53,30 @@ IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_
 /// transaction — before any destructive statement.
 const TX_ERASURE_INTENT: &str = "LET $erasure_existing = (SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id, surfaces: surfaces, state_fence: state_fence, operation_count: operation_count } FROM ONLY type::record($erasure_table, $erasure_operation_id)); IF type::is_object($erasure_existing) { IF $erasure_existing != $erasure_intent_expected { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_table, $erasure_operation_id) CONTENT $erasure_intent_record; };";
 
-/// Deletes exactly the selected subject's capture rows admitted under the
-/// exact recorded scope. `{i}` selects the binding index. Exact subject/scope
-/// match only — never substring, never a default scope.
-const TX_ERASURE_DELETE_EVIDENCE: &str = "DELETE write_receipt WHERE $erasure_subject{i} IN evidence_records.subject AND $erasure_scope{i} = $erasure_scope_expected{i};";
+/// Scrubs exactly the selected subject's payload-authority entries admitted
+/// under the exact recorded scope. `{i}` selects the binding index. The row
+/// survives: only authority entries whose `operation_index` belongs to the
+/// target's own evidence entries are removed (one named operation carries at
+/// most one capture subject, so sibling entries never share the index).
+/// Runs before [`TX_ERASURE_SCRUB_EVIDENCE`] in the same transaction so this
+/// filter still observes the complete evidence array. The scope predicate
+/// compares the single request parameter against the durable row's stored
+/// admitted scope (`body.envelope.core.work_scope.scope_id`, rendered verbatim
+/// from the admitted transition's `ScopeId` at issuance) — row-versus-request,
+/// never parameter-versus-identical-parameter. Exact subject match only —
+/// never substring, never a default scope. Rows without a stored envelope
+/// scope never match (fail closed).
+const TX_ERASURE_SCRUB_AUTHORITY: &str = "UPDATE write_receipt SET payload_authority = payload_authority.filter(|$erasure_authority{i}| array::len(evidence_records.filter(|$erasure_evidence{i}| $erasure_evidence{i}.subject = $erasure_subject{i} AND $erasure_evidence{i}.operation_index = $erasure_authority{i}.operation_index)) = 0) WHERE $erasure_subject{i} IN evidence_records.subject AND $erasure_scope_expected{i} = body.envelope.core.work_scope.scope_id;";
+
+/// Scrubs exactly the selected subject's capture-evidence entries admitted
+/// under the exact recorded scope. `{i}` selects the binding index. Runs after
+/// [`TX_ERASURE_SCRUB_AUTHORITY`], which has already removed the target's
+/// payload-authority entries, so the subject predicate still matches the row
+/// here. The row itself — operation/idempotency identity, immutable `body`,
+/// sibling captures, unrelated authority entries — is preserved for exact
+/// replay and resolution; only the target's erasable entries leave the row.
+/// Same stored-scope predicate as [`TX_ERASURE_SCRUB_AUTHORITY`].
+const TX_ERASURE_SCRUB_EVIDENCE: &str = "UPDATE write_receipt SET evidence_records = evidence_records.filter(|$erasure_entry{i}| $erasure_entry{i}.subject != $erasure_subject{i}) WHERE $erasure_subject{i} IN evidence_records.subject AND $erasure_scope_expected{i} = body.envelope.core.work_scope.scope_id;";
 
 /// Seals one completed operation with its exact per-surface outcomes. Last
 /// statement before commit; same-operation replay reads this row and returns
@@ -104,6 +126,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "finish_owner_create_conflict",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
+    "swarm_owner_revision_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -505,6 +528,7 @@ fn build_apply_statements(
     // #223 experience writes and #325 finish owner snapshots commit atomically
     // with the canonical receipt.
     append_experience_statements(&mut sql, &mut bindings, experience)?;
+    append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
@@ -816,6 +840,30 @@ fn append_experience_statements(
     }
     Ok(())
 }
+
+/// Appends owner-separated swarm records and revision heads when the named
+/// operation is activated after its semantic-owner gate is available (#1702).
+///
+/// Immutable record bytes, owner-head CAS and the canonical receipt commit in
+/// this one transaction. The operation remains unactivated by the catalogue,
+/// so normal transition validation rejects it before this writer is reached.
+fn append_swarm_owner_revision_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_swarm::swarm_owner_revision_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "swarm binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
 /// Appends canonical reactive row writes (issue #1941 C4).
 ///
 /// Same atomicity contract as the notification fragment above: session
@@ -1083,16 +1131,18 @@ pub(crate) fn erasure_outcome_record_id(operation_id: &str) -> String {
 ///
 /// Statement order inside one `BEGIN`/`COMMIT` pair: (1) the intent upsert
 /// that creates the durable intent row when absent and refuses when the same
-/// id already names different bytes; (2) one destructive `DELETE` per
-/// store-owned surface, each deleting only the selected subject's capture
-/// rows admitted under the exact recorded scope; (3) the outcome seal that
+/// id already names different bytes; (2) one scrub `UPDATE` pair per
+/// store-owned surface (authority entries first, then evidence entries), each
+/// pair removing only the selected subject's erasable entries admitted under
+/// the exact recorded scope while the receipt row itself survives for exact
+/// replay and resolution; (3) the outcome seal that
 /// persists the exact per-surface outcomes for idempotent replay.
 ///
 /// All `SurrealQL` stays inside the local `TX_ERASURE_*` templates above:
 /// this builder composes closed statement constants owned by this apply
 /// writer (inside the admitted apply/schema contour), never caller-supplied
 /// query text. `Unknown`-outcome surfaces are preserved for
-/// reconciliation: they appear in the sealed outcomes but emit no destructive
+/// reconciliation: they appear in the sealed outcomes but emit no scrub
 /// statement. Fail-closed: with no recorded intent this template is never
 /// built (the caller refuses with `ReceiptNotFound` before any provider I/O);
 /// a lost commit response is `UnknownOutcome` for same-operation
@@ -1102,7 +1152,8 @@ pub(crate) fn erasure_transaction_template(store_owned_surface_count: usize) -> 
     let mut sql = String::from(schema::TX_BEGIN);
     sql.push_str(TX_ERASURE_INTENT);
     for index in 0..store_owned_surface_count {
-        sql.push_str(&schema::indexed(TX_ERASURE_DELETE_EVIDENCE, index));
+        sql.push_str(&schema::indexed(TX_ERASURE_SCRUB_AUTHORITY, index));
+        sql.push_str(&schema::indexed(TX_ERASURE_SCRUB_EVIDENCE, index));
     }
     sql.push_str(TX_ERASURE_OUTCOME);
     sql.push_str(schema::TX_COMMIT);
@@ -1116,10 +1167,10 @@ pub(crate) fn erasure_transaction_template(store_owned_surface_count: usize) -> 
 /// `Incomplete` (foreign removal is never claimed). A surface that already
 /// carries a terminal non-`NotAttempted` outcome keeps it verbatim
 /// (partial-resume identity; `Unknown` is preserved, never cleared).
-/// A preserved terminal outcome replays verbatim AND emits no destructive
+/// A preserved terminal outcome replays verbatim AND emits no scrub
 /// statement for that surface: the transaction template is rendered from the
 /// count of `erasure_subject{i}` bindings below, so a replayed-`Unknown`
-/// (or any replayed terminal) surface contributes zero `DELETE`s.
+/// (or any replayed terminal) surface contributes zero scrub `UPDATE`s.
 pub(crate) fn erasure_transaction_bindings(
     intent: &SurrealErasureIntent,
     prior_outcomes: &[SurrealSurfaceOutcome],
@@ -1158,8 +1209,9 @@ pub(crate) fn erasure_transaction_bindings(
         });
         if let Some(outcome) = preserved {
             // Terminal replay: keep the stored outcome verbatim and emit no
-            // destructive statement for this surface (no `erasure_subject{i}`
-            // bindings, so the rendered template carries no `DELETE` for it).
+            // scrub statement for this surface (no `erasure_subject{i}`
+            // bindings, so the rendered template carries no scrub `UPDATE`
+            // for it).
             outcomes.push(*outcome);
             continue;
         }
@@ -1206,6 +1258,11 @@ pub(crate) fn erasure_transaction_bindings(
     Ok((bindings, outcomes))
 }
 
+/// Binds one scrub index: the exact admitted subject plus the single admitted
+/// scope. The scope travels in exactly one binding
+/// (`erasure_scope_expected{suffix}`); the scrub statements compare it against
+/// the durable row's stored admitted scope, never against a second copy of
+/// itself.
 fn erasure_delete_bindings(
     bindings: &mut Map<String, Value>,
     index: usize,
@@ -1214,10 +1271,6 @@ fn erasure_delete_bindings(
 ) {
     let suffix = index.to_string();
     bindings.insert(format!("erasure_subject{suffix}"), json!(subject));
-    bindings.insert(
-        format!("erasure_scope{suffix}"),
-        json!(scope_id.to_string()),
-    );
     bindings.insert(
         format!("erasure_scope_expected{suffix}"),
         json!(scope_id.to_string()),
@@ -1228,7 +1281,8 @@ fn erasure_delete_bindings(
 ///
 /// Order: replay check (sealed outcome rows replay verbatim, no duplicate
 /// destructive work) → intent-before-dispatch transaction (intent row first,
-/// then exact-scope/scope deletes, then outcome seal) → sealed outcomes. A
+/// then exact subject/scope scrub `UPDATE`s, then outcome seal) → sealed
+/// outcomes. A
 /// lost commit response surfaces as
 /// [`AdapterError::UnknownOutcome`] for same-operation reconciliation (no
 /// blind retry); a guard conflict surfaces as `IdentityConflict`.
@@ -1244,20 +1298,20 @@ pub(super) async fn write_erasure_transaction(
     intent.validate().map_err(AdapterError::Store)?;
     // Single sealed-outcome read: a sealed row replays verbatim with no
     // duplicate destructive work; the unsealed case (`None`) binds against an
-    // empty prior so the transaction emits the full store-owned `DELETE` set.
+    // empty prior so the transaction emits the full store-owned scrub set.
     let sealed = read_erasure_outcome(db, config, &intent.operation_id).await?;
     if let Some(sealed) = sealed {
         return Ok(sealed);
     }
     let prior: Vec<SurrealSurfaceOutcome> = Vec::new();
     let (bindings, outcomes) = erasure_transaction_bindings(intent, &prior)?;
-    // 688-FIX derives the DELETE count from emitted bindings. This keeps the
-    // transaction empty of destructive statements when a terminal surface is
+    // 688-FIX derives the scrub-pair count from emitted bindings. This keeps the
+    // transaction empty of scrub statements when a terminal surface is
     // preserved during same-operation replay.
     // 688-FIX: render the template from the emitted `erasure_subject{i}`
     // bindings (not from the intent denominator), so a replayed terminal
     // outcome — preserved verbatim above with no bindings — contributes zero
-    // `DELETE`s. On the fresh path every store-owned surface emits bindings,
+    // scrub `UPDATE`s. On the fresh path every store-owned surface emits bindings,
     // so this equals the intent's store-owned count.
     let store_owned = bindings
         .keys()

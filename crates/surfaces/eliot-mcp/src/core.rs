@@ -19,7 +19,7 @@ use crate::{
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
     McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection, canonical_tool_schemas,
-    decode_protected_request_bytes, validate_proof_ceiling,
+    decode_protected_request_bytes, reject_duplicate_keys, validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -2018,6 +2018,7 @@ impl WireRejection {
 /// exactly one frame per line, and a batch has no single correlation to
 /// preserve.
 pub fn decode_wire_request(text: &str) -> Result<WireRequest, WireEnvelopeError> {
+    reject_duplicate_keys(text.as_bytes()).map_err(|_| WireEnvelopeError::parse())?;
     let value: Value = serde_json::from_str(text).map_err(|_| WireEnvelopeError::parse())?;
     if value.is_array() {
         return Err(WireEnvelopeError::invalid_request(
@@ -2418,21 +2419,88 @@ pub fn reject_list_cursor(params: &Value, method: &'static str) -> Result<(), Wi
     Ok(())
 }
 
-/// Renders one admitted inline tool result.
+/// Bounded evidence fields recorded with an admitted MCP result.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HotEvidenceEnvelope {
+    uri: String,
+    digest: String,
+    preview: String,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+/// Validates the bridge's bounded evidence envelope and returns its wire views.
+fn evidence_wire_projection(evidence: &Value) -> Result<(Value, Value), WireRejection> {
+    let envelope: HotEvidenceEnvelope = serde_json::from_value(evidence.clone()).map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "admitted evidence envelope could not be rendered on the wire",
+        )
+    })?;
+    let Some(resource_id) = envelope.uri.strip_prefix("eliot://evidence/") else {
+        return Err(WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "admitted evidence envelope could not be rendered on the wire",
+        ));
+    };
+    let Ok(preview_bytes) = u64::try_from(envelope.preview.len()) else {
+        return Err(WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "admitted evidence envelope could not be rendered on the wire",
+        ));
+    };
+    if !envelope.truncated
+        || !is_sha256(&envelope.digest)
+        || resource_id != envelope.digest
+        || envelope.preview.len() > 1024
+        || envelope.total_bytes <= preview_bytes
+    {
+        return Err(WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "admitted evidence envelope could not be rendered on the wire",
+        ));
+    }
+
+    let response_content = json!({
+        "resource_uri": envelope.uri,
+        "sha256": envelope.digest,
+        "size_bytes": envelope.total_bytes,
+        "preview": envelope.preview,
+        "truncated": envelope.truncated,
+    });
+    let evidence = json!({
+        "uri": envelope.uri,
+        "digest": envelope.digest,
+        "preview": envelope.preview,
+        "total_bytes": envelope.total_bytes,
+        "truncated": envelope.truncated,
+    });
+    Ok((response_content, evidence))
+}
+
+/// Renders one admitted tool result with handle-first evidence when retained.
 ///
-/// `structuredContent` carries the exact owner response plus the exact
-/// admitted operation handle; gap kinds render `isError` with their typed
-/// failure instead of an empty success. `evidence` carries the optional
-/// hot-resource projection recorded for this delivery (handle URI plus
-/// digest naming the immutable bytes); full bytes expand through
-/// `resources/read`, never inline.
+/// `structuredContent` carries the owner response metadata and exact admitted
+/// operation handle. Large content is replaced by a bounded preview and handle
+/// in both wire fields; full bytes expand through `resources/read`.
 pub fn render_responded_result(
     operation_handle: &HostOperationHandle,
     response: &McpResponse,
     evidence: Option<&Value>,
 ) -> Result<Value, WireRejection> {
+    let mut wire_response = response.clone();
+    let evidence = if let Some(evidence) = evidence {
+        // The owner response remains intact. Only its wire projection replaces
+        // the full content with the exact bounded preview and immutable handle.
+        let (content, evidence) = evidence_wire_projection(evidence)?;
+        wire_response.content = content;
+        Some(evidence)
+    } else {
+        None
+    };
     let mut structured = json!({
-        "response": response,
+        "response": wire_response,
         "operation_handle": operation_handle.as_str(),
     });
     if let Some(evidence) = evidence

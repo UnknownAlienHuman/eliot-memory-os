@@ -49,6 +49,7 @@ mod payload_authority;
 mod reactive_state;
 mod request_hash;
 mod store_failure;
+mod swarm_owner_revisions;
 mod user_automation_state;
 mod wire;
 pub mod write_admission;
@@ -169,6 +170,12 @@ pub use store_failure::{
     decode_legacy_store_failure_v1, erasure_store_failure,
 };
 
+pub use swarm_owner_revisions::{
+    SwarmOwnerRevision, SwarmOwnerRevisionBatch, SwarmSemanticOwnerKind,
+    decode_swarm_owner_revisions, swarm_owner_revisions_request,
+    validate_swarm_owner_revision_transition,
+};
+
 pub use wire::{
     CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
     CAPABILITY_DREAMER_JOB_CHECKPOINT, CAPABILITY_DREAMER_JOB_LEASE_EXACT,
@@ -250,6 +257,22 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 pub const RECOVERY_PACKET_SCHEMA: &str = "eliot.storage.recovery.v1";
 /// Versioned schema for opaque Governor owner snapshots.
 pub const OWNER_SNAPSHOT_SCHEMA: &str = "eliot.governor.owner.snapshot.v1";
+/// Namespace for immutable TaskController-owned swarm definition revisions.
+pub const SWARM_DEFINITION_OWNER_NAMESPACE: &str = "swarm-definition-v1";
+/// Namespace for immutable Governor-owned swarm admission revisions.
+pub const SWARM_ADMISSION_OWNER_NAMESPACE: &str = "swarm-admission-v1";
+/// Namespace for immutable AgentCoordinator-owned execution revisions.
+pub const SWARM_EXECUTION_OWNER_NAMESPACE: &str = "swarm-execution-v1";
+/// Namespace for the current revision head of each semantic owner stream.
+pub const SWARM_OWNER_HEAD_NAMESPACE: &str = "swarm-owner-head-v1";
+/// Schema tag for TaskController-owned definition records.
+pub const SWARM_DEFINITION_OWNER_SCHEMA: &str = "eliot.swarm.definition-owner.v1";
+/// Schema tag for Governor-owned admission records.
+pub const SWARM_ADMISSION_OWNER_SCHEMA: &str = "eliot.swarm.admission-owner.v1";
+/// Schema tag for AgentCoordinator-owned execution records.
+pub const SWARM_EXECUTION_OWNER_SCHEMA: &str = "eliot.swarm.execution-owner.v1";
+/// Schema tag for semantic owner revision heads.
+pub const SWARM_OWNER_HEAD_SCHEMA: &str = "eliot.swarm.owner-head.v1";
 /// Maximum number of owner records in one recovery/genesis operation.
 pub const MAX_RECOVERY_OWNER_RECORDS: usize = 16;
 /// Maximum exact payload size of one recovered record.
@@ -515,6 +538,19 @@ impl StoreGenesisRequest {
         let mut record_keys = BTreeSet::new();
         for record in &self.owner_records {
             record.validate_for_fence(&self.state_fence)?;
+            if [
+                SWARM_DEFINITION_OWNER_NAMESPACE,
+                SWARM_ADMISSION_OWNER_NAMESPACE,
+                SWARM_EXECUTION_OWNER_NAMESPACE,
+                SWARM_OWNER_HEAD_NAMESPACE,
+            ]
+            .contains(&record.namespace.as_str())
+            {
+                return Err(StoreError::InvalidField {
+                    field: "genesis.owner_records.namespace",
+                    reason: "is reserved for the named swarm owner transition",
+                });
+            }
             if !record_keys.insert(record.record_key()) {
                 return Err(StoreError::Duplicate {
                     field: "genesis.owner_records",
@@ -3624,6 +3660,9 @@ pub enum NamedMutationOperation {
     CaptureObservation,
     ApplyEpistemicRevision,
     UpdateTaskState,
+    /// Unactivated contract for immutable swarm owner revisions; requires a
+    /// verified semantic-owner authorization gate before catalogue admission.
+    ApplySwarmOwnerRevisions,
     ApplyLifecyclePolicy,
     ReconcileRecovery,
     /// Persists the Governor-owned canonical finish receipt through the
@@ -3707,7 +3746,7 @@ impl NamedMutationOperation {
         match self {
             Self::CaptureObservation | Self::AppendAuditEvent => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
-            Self::UpdateTaskState => TransitionClass::TaskControl,
+            Self::UpdateTaskState | Self::ApplySwarmOwnerRevisions => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
@@ -4417,6 +4456,11 @@ impl PreparedTransition {
             if operation.operation.transition_class() != self.transition_class {
                 return Err(StoreError::TransitionClassExceeded);
             }
+        }
+        if self.named_operations.iter().any(|operation| {
+            operation.operation == NamedMutationOperation::ApplySwarmOwnerRevisions
+        }) {
+            validate_swarm_owner_revision_transition(self)?;
         }
         // Issue #18: the bound decision/plan digests are recomputed from the
         // carried content and compared; any divergence (including a

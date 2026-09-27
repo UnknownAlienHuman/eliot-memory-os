@@ -48,11 +48,12 @@
 //!   proof", so a degraded class reports its own lower ceiling instead of
 //!   being promoted to recovery or collapsed into corruption.
 //! - The archived fence is validated internally and related to the live session
-//!   fence as current or historical ([`ArchivedFenceRelation`]): a restart,
-//!   generation change, or epoch rotation must not make a genuine earlier
-//!   archive unverifiable, and current-target compatibility plus epoch
-//!   monotonicity stay with the isolated restore/cutover owners (A13.7
-//!   "Cutover requires separate authority").
+//!   fence as one closed STRUCTURAL relation over the COMPLETE fence value
+//!   ([`ArchiveFenceRelation`]), while PROVENANCE stays a separate axis
+//!   ([`ArchiveFenceProof`]): a restart, generation change, or epoch rotation
+//!   must not make a genuine earlier archive unverifiable, and
+//!   current-target compatibility plus epoch monotonicity stay with the isolated
+//!   restore/cutover owners (A13.7 "Cutover requires separate authority").
 //! - The reported operation identity is only ever the identity the admitted
 //!   caller bound: I5.27 defines idempotency over canonical bytes, "not over
 //!   caller spelling or an unversioned hash", so this owner never mints one.
@@ -69,7 +70,7 @@ use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupInput, CanonicalRecord,
     ExportFence, HostStateAuditFence, OrsSnapshotFence, RestoreEvidenceLevel, WatchdogSpoolFence,
 };
-use eliot_contracts::{EpochRelation, StateFence};
+use eliot_contracts::{EpochRelation, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
@@ -211,46 +212,215 @@ impl CaptureEvidenceLevel {
     }
 }
 
-/// The closed relation between an archive's own fence and the live session
-/// fence (issue #2802 instruction 4).
+/// Contract version of the closed archived-fence relation vocabulary and of the
+/// classifier that produces it (issue #2863).
 ///
-/// The archived fence is validated internally — `BackupBundle::validate`
-/// already calls `ExportFence::validate` (which validates
-/// `state_fence.validate()` and `consistent`) and already binds the fence to
-/// the archive's own manifest through `export_fence_sha256` — and this relation
-/// adds no weakening of either check. It records only whether the archive is
-/// the current fence or this installation's own earlier authority.
+/// It is bound into every verification answer, in the durable result row and in
+/// the wire body, and it is the ONE place a change to that vocabulary has to be
+/// made. I5.27 requires a versioned canonical encoding, so a vocabulary whose
+/// meaning changed cannot be read back under the new meaning: a consumer that
+/// sees a version it does not know fails closed rather than coercing an
+/// unrecognized value into "current" or "invalid".
+pub const ARCHIVE_FENCE_RELATION_CONTRACT_VERSION: u16 = 1;
+
+/// The closed STRUCTURAL relation between the archive's own COMPLETE
+/// `StateFence` and the live session fence (issue #2863, superseding #2802
+/// instruction 4).
 ///
-/// Current-target compatibility and epoch monotonicity are separate decisions
-/// owned by the isolated restore/cutover owners, because A13.7 states "Cutover
-/// requires separate authority" and old sessions, leases, approvals, and epochs
-/// do not revive. A stale or foreign archive may therefore be incompatible for
-/// this target without being structurally corrupt, and this command reports
-/// that honestly instead of refusing the archive or promoting it to recovery.
+/// This is ONE axis and it answers ONE question: how the archived fence VALUE
+/// stands to the current fence value. It is not archive validity — that is
+/// [`CaptureState`] plus the owner's own `ArchiveInvalid` refusals, and a
+/// malformed archive or fence is a separate result, never one of these variants.
+/// It is not provenance — that is [`ArchiveFenceProof`]. It is not target
+/// compatibility, which is absent from this owner entirely because A13.7 keeps
+/// schema/build/key/purge/import/epoch compatibility and cutover with the
+/// isolated restore owner.
+///
+/// # WHY THE PREVIOUS TWO-VALUE CLASSIFIER WAS REPLACED
+///
+/// The former `ArchivedFenceRelation::{CurrentSession, HistoricalAuthority}`
+/// classifier consulted only `EpochId::relation_to` on the authority epoch, so
+/// `EpochRelation::Same` became `current-session` even when the resource
+/// generation or the optional task/policy/integration revisions disagreed, and
+/// an older epoch became `historical-authority` without proving that any other
+/// comparable field was coherent. An old epoch with a numerically HIGHER
+/// generation was reported as this installation's own accepted history. Those
+/// are three different facts, and none of them is "this installation's history".
+///
+/// # WHAT IS AND IS NOT ORDERED HERE
+///
+/// Only [`EpochRelation`] orders anything, and only the authority epoch's
+/// `(lineage_id, sequence)` tuple. `ResourceGeneration` and the three optional
+/// revision counters are separate contracts with no cross-counter order, so
+/// this owner NEVER compares them to each other or to the epoch sequence, and
+/// never combines them into a total history order. That is why a differing
+/// generation is [`Self::SameAuthorityDivergent`] rather than
+/// [`Self::SameAuthorityOlder`]: the contracts do not say which is later, so this
+/// owner says "these two values contradict or cannot be reconciled", and the
+/// isolated restore owner — which holds the transition evidence — decides
+/// whether a legal transition exists. Inventing an order here would be a
+/// fabricated authority claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ArchivedFenceRelation {
-    /// The archived fence is the live fence of the operation: either it equals
-    /// the session fence the route supplied, or this owner is the producer and
-    /// published it from its own frozen export fence in the same operation.
-    CurrentSession,
-    /// The archived fence is an older epoch on this installation's own
-    /// authority lineage: this installation's history, accepted rather than
-    /// refused.
-    HistoricalAuthority,
+pub enum ArchiveFenceRelation {
+    /// EVERY `StateFence` field is equal: authority epoch, resource generation,
+    /// and all three optional revisions. This is the ONLY value that may be
+    /// described as the current fence value, and reaching it requires complete
+    /// equality — `EpochRelation::Same` on its own is never sufficient.
+    ExactFenceValue,
+    /// The archived authority epoch is older on this installation's own lineage
+    /// (`EpochRelation::DirectParent` / `SameLineageOlder`) AND every other
+    /// comparable field is coherent: the resource generation is equal and each
+    /// optional revision either matches or is absent on both sides. The archived
+    /// value therefore differs from the current one in the authority epoch and
+    /// in nothing else, which is the one "earlier, same shape" statement the
+    /// contracts actually support.
+    SameAuthorityOlder,
+    /// The archived authority epoch is AHEAD of the live session epoch
+    /// (`EpochRelation::DirectChild` / `SameLineageNewer`). An ahead archive is
+    /// not this installation's history and this command does not judge its
+    /// monotonicity, so it is reported as its own relation rather than refused.
+    /// The remaining fields are deliberately NOT consulted for this variant: the
+    /// authority relation alone already establishes that the archive is not
+    /// behind the current authority, and no other field can make it so.
+    SameAuthorityNewer,
+    /// The authority epochs are the same or on one lineage, but the remaining
+    /// fields do not reconcile: the resource generation differs, or a
+    /// task/policy/integration revision is present on BOTH sides with DIFFERENT
+    /// values. That is a contradiction, or at minimum an ordering the owning
+    /// contracts do not define. It is neither historical success and not archive
+    /// corruption, and it is never reported as the current value.
+    SameAuthorityDivergent,
+    /// The authority lineages differ (`EpochRelation::UnrelatedLineage`). The
+    /// archive is a structurally valid candidate from a different authority
+    /// lineage — not corrupt, and not refused as though it were malformed.
+    UnrelatedLineage,
+    /// The complete fence values cannot be compared at all: at least one
+    /// optional revision is present on exactly ONE side, so neither value claims
+    /// the revision and there is nothing to compare. This is deliberately NOT
+    /// merged into [`Self::SameAuthorityDivergent`], because a one-sided revision
+    /// is an absence of comparable evidence and not a contradiction; reporting it
+    /// as divergent would over-claim a conflict that was never observed.
+    IncomparableOrUnknown,
 }
 
-impl ArchivedFenceRelation {
+impl ArchiveFenceRelation {
     /// Stable operator/wire spelling of the archived-fence relation.
     ///
-    /// Bound in one place beside the classification so the front door never
-    /// restates the relation as its own literal.
+    /// Bound in one place beside the classification so the front door and the
+    /// operator surface never restate the relation as its own literal. These
+    /// are the exact tokens the durable result row stores and the CLI decodes.
     #[must_use]
     pub const fn as_wire_name(self) -> &'static str {
         match self {
-            Self::CurrentSession => "current-session",
-            Self::HistoricalAuthority => "historical-authority",
+            Self::ExactFenceValue => "exact-fence-value",
+            Self::SameAuthorityOlder => "same-authority-older",
+            Self::SameAuthorityNewer => "same-authority-newer",
+            Self::SameAuthorityDivergent => "same-authority-divergent",
+            Self::UnrelatedLineage => "unrelated-lineage",
+            Self::IncomparableOrUnknown => "incomparable-or-unknown",
         }
     }
+}
+
+/// The closed PROOF qualifier for one archived-fence relation (issue #2863).
+///
+/// This is the second axis and it is deliberately independent of
+/// [`ArchiveFenceRelation`]. A relation is a statement about VALUES; a proof
+/// qualifier is a statement about where those values came from. An
+/// [`Self::StructuralOnly`] relation may be exact, older, ahead, divergent,
+/// foreign or incomparable and is still only untrusted caller-presented
+/// evidence, because nothing on this path authenticates the archive as produced
+/// by THIS installation.
+///
+/// Only [`Self::CaptureOwnerProven`] may be described to an operator as this
+/// installation's own capture, and it REQUIRES the owner-issued receipt
+/// reference: the variant carries the field, so it cannot be constructed without
+/// naming what proved it. That is the whole mechanism, and it is why the
+/// qualifier is an enum rather than a flag.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArchiveFenceProof {
+    /// The relation was computed from archive bytes this owner decoded and
+    /// validated, with no retained-capture provenance behind it. Structural
+    /// validity plus a relation is still an untrusted candidate (I5.13: "Backup
+    /// existence is not recovery proof"), and this variant is the ONLY value a
+    /// `verify_only` answer can carry today, because no production
+    /// `impl PublicationPort` issues a capture receipt on that path.
+    StructuralOnly,
+    /// Bound to the owner-issued publication receipt identity that proves this
+    /// installation produced the archive. Only this variant licenses the words
+    /// "this installation's capture"; [`Self::StructuralOnly`] never does.
+    CaptureOwnerProven { capture_receipt: String },
+}
+
+impl ArchiveFenceProof {
+    /// Stable operator/wire spelling of the proof qualifier.
+    ///
+    /// The receipt reference itself is NOT part of this token: it travels in its
+    /// own field so a qualifier can be closed-checked without parsing a receipt
+    /// identity out of a composite string.
+    #[must_use]
+    pub const fn as_wire_name(&self) -> &'static str {
+        match self {
+            Self::StructuralOnly => "structural-only",
+            Self::CaptureOwnerProven { .. } => "capture-owner-proven",
+        }
+    }
+
+    /// The owner-issued receipt reference backing this qualifier, if any.
+    ///
+    /// `None` is the owner's own answer on a path where no retained-artifact
+    /// owner issues a receipt; it is never replaced by a placeholder identity.
+    #[must_use]
+    pub fn capture_receipt(&self) -> Option<&str> {
+        match self {
+            Self::StructuralOnly => None,
+            Self::CaptureOwnerProven { capture_receipt } => Some(capture_receipt.as_str()),
+        }
+    }
+}
+
+/// Bounded restriction tokens that travel beside every archived-fence relation
+/// and proof qualifier (issue #2863).
+///
+/// These are the claims the result explicitly does NOT make, as closed tokens
+/// rather than prose, so the Kernel projection and the operator surface report
+/// the same ceiling from the same owner instead of each restating it. Every
+/// token is a refusal of a specific over-claim, and none of them is a repair
+/// instruction or a compatibility verdict.
+pub fn archive_fence_restrictions(
+    relation: ArchiveFenceRelation,
+    proof: &ArchiveFenceProof,
+) -> Vec<&'static str> {
+    let mut restrictions = Vec::new();
+    // No schema/build/key/purge/import/epoch compatibility check ran on this
+    // path, so the absence is stated on EVERY result rather than only on the
+    // ones where a reader might assume it.
+    restrictions.push("target-compatibility-not-evaluated");
+    // Structural relation is never restore readiness, for any variant.
+    restrictions.push("not-restore-readiness");
+    if !matches!(relation, ArchiveFenceRelation::ExactFenceValue) {
+        restrictions.push("not-current-fence-value");
+    }
+    if matches!(proof, ArchiveFenceProof::StructuralOnly) {
+        restrictions.push("origin-unproven");
+    }
+    restrictions
+}
+
+/// Digest binding the COMPLETE archived `StateFence` value (issue #2863).
+///
+/// This is a dedicated digest over the canonical encoding of the fence value
+/// itself. It is deliberately NOT the manifest's `export_fence_sha256`, which the
+/// archive format computes over the whole export fence and re-binds on every
+/// decode, and it is NOT a manifest, plan or approval digest: reusing one of
+/// those as a fence identity would make an unrelated contract's change move this
+/// identity. It exists because the relation is now a statement about a complete
+/// fence value, so a complete fence value has to be commitable on its own terms.
+pub fn archived_state_fence_digest(fence: &StateFence) -> Result<String, KernelCaptureError> {
+    let bytes = canonical_json_bytes(fence).map_err(|_| {
+        KernelCaptureError::OwnerEvidenceInvalid("state fence is not serializable".to_owned())
+    })?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Outcome of one capture or verification: the requested class, exact
@@ -322,9 +492,29 @@ pub struct CaptureReport {
     /// from ever being advertised as operational recovery, so the ceiling is
     /// reported beside the state rather than encoded into it.
     pub class_ceiling: RestoreEvidenceLevel,
-    /// Whether the archive's fence is the current session fence or this
-    /// installation's own earlier authority; see [`ArchivedFenceRelation`].
-    pub archived_fence_relation: ArchivedFenceRelation,
+    /// STRUCTURAL relation of the archive's COMPLETE fence to the live session
+    /// fence; see [`ArchiveFenceRelation`]. This is not validity, not provenance
+    /// and not target compatibility, and it is deliberately reported for a
+    /// foreign, ahead or divergent archive instead of refusing one.
+    pub archived_fence_relation: ArchiveFenceRelation,
+    /// PROVENANCE qualifier for [`Self::archived_fence_relation`]; see
+    /// [`ArchiveFenceProof`]. Independent of the relation: a structurally exact
+    /// or same-lineage value is still unproven origin without an owner receipt.
+    pub archived_fence_proof: ArchiveFenceProof,
+    /// Bounded tokens naming the claims this result does not make, from
+    /// [`archive_fence_restrictions`]. Reported beside the relation so a reader
+    /// cannot take a relation as compatibility, currentness or readiness.
+    pub archived_fence_restrictions: Vec<&'static str>,
+    /// Contract version of the relation vocabulary and classifier that produced
+    /// [`Self::archived_fence_relation`]; see
+    /// [`ARCHIVE_FENCE_RELATION_CONTRACT_VERSION`].
+    pub archived_fence_relation_contract_version: u16,
+    /// Digest of the COMPLETE archived `StateFence` value this report related,
+    /// from [`archived_state_fence_digest`]. Commits the exact value the
+    /// relation was computed from, and is distinct from
+    /// [`Self::export_fence_digest`], which is the archive format's own
+    /// manifest-bound digest over the whole export fence.
+    pub archived_state_fence_digest: String,
     /// Exactly one disposition per expected source member.
     pub member_dispositions: Vec<(String, String)>,
     /// Publication receipt identity, or the suspended-operations marker. It is
@@ -416,12 +606,13 @@ impl KernelBackupCapture {
         // caller granted, and dropping the bytes would hide that a validated
         // archive exists.
         if duration.is_spent() {
-            return Ok(cancelled_report(
+            return cancelled_report(
                 &identities,
                 request.plan.class,
                 operation_id,
                 member_dispositions,
-            ));
+                &bundle.export_fence.state_fence,
+            );
         }
         let receipt = match publisher.publish_once(&operation_id, &idempotency_key, &bytes) {
             Ok(receipt) => receipt,
@@ -454,6 +645,24 @@ impl KernelBackupCapture {
         } else {
             Some(operation_id.clone())
         };
+        // The publication receipt is the owner-issued proof that this operation
+        // durably published THESE bytes, and it was already proved to match the
+        // operation identity and archive digest above. It is therefore the exact
+        // reference that qualifies the relation as this installation's own
+        // capture, and it is the same value the report carries as its receipt
+        // identity so the qualifier and the receipt field cannot drift apart.
+        // It is bound once here rather than cloned per field so the proof value
+        // used for the relation, for the restrictions and for the field itself is
+        // a single construction.
+        let capture_receipt =
+            receipt_identity
+                .clone()
+                .ok_or(KernelCaptureError::OwnerEvidenceInvalid(
+                    "capture published without an owner-issued publication receipt".to_owned(),
+                ))?;
+        let archived_fence_proof = ArchiveFenceProof::CaptureOwnerProven {
+            capture_receipt: capture_receipt.clone(),
+        };
         Ok(CaptureReport {
             backup_id: identities.backup_id,
             class: request.plan.class,
@@ -472,21 +681,46 @@ impl KernelBackupCapture {
             // level; the class ceiling still bounds what the archive may claim.
             evidence_level: CaptureEvidenceLevel::ClassQualified,
             class_ceiling: identities.class_ceiling,
-            // The producing operation is this owner: the published fence is the
-            // frozen export fence of the operation in flight, so no historical
-            // relation applies. The verify path is where a carried archive
-            // carries an earlier generation's fence.
-            archived_fence_relation: ArchivedFenceRelation::CurrentSession,
+            // The producing operation is this owner, so the published fence IS
+            // the frozen export fence of the operation in flight: the relation is
+            // exact over the complete value, and provenance is owner-proven
+            // because this operation is the one that durably published those
+            // bytes. The verify path is where a carried archive carries an
+            // earlier value's fence and no provenance.
+            archived_fence_relation: ArchiveFenceRelation::ExactFenceValue,
+            archived_fence_restrictions: archive_fence_restrictions(
+                ArchiveFenceRelation::ExactFenceValue,
+                &archived_fence_proof,
+            ),
+            archived_fence_relation_contract_version: ARCHIVE_FENCE_RELATION_CONTRACT_VERSION,
+            archived_state_fence_digest: archived_state_fence_digest(
+                &bundle.export_fence.state_fence,
+            )?,
             member_dispositions,
-            receipt_identity,
+            receipt_identity: Some(capture_receipt),
+            archived_fence_proof,
         })
     }
 
     /// Verifies one archive without restoration effects or installation
     /// mutation: admitted gate, `BackupBundle::decode` plus repeated
-    /// validation, and a historical relation between the archived fence and the
-    /// live session fence. No publication happens here and nothing is mutated
-    /// (`&self` only); the report state follows class completeness.
+    /// validation, and the structural relation between the archive's COMPLETE
+    /// fence and the live session fence. No publication happens here and nothing
+    /// is mutated (`&self` only); the report state follows class completeness.
+    ///
+    /// A structurally valid FOREIGN, AHEAD or DIVERGENT archive is answered here,
+    /// as a candidate carrying its exact [`ArchiveFenceRelation`] and its
+    /// [`archive_fence_restrictions`] tokens. It is not refused and not reported
+    /// as `invalid`, because nothing about it fails the archive/fence contract;
+    /// the relation is what tells the restore owner it is not this installation's
+    /// current history. This is the #2863 change from the previous authority-epoch
+    /// -only classifier, which refused those archives.
+    ///
+    /// The proof qualifier is [`ArchiveFenceProof::StructuralOnly`] on every
+    /// answer this path can produce today. Equal fence values, an exact match, or
+    /// a same-lineage older value are NOT evidence that this installation produced
+    /// the bytes: nothing on this path authenticates origin, so the relation is
+    /// structural caller-supplied evidence until #2862 supplies owner provenance.
     ///
     /// `operation_id` is the identity the admitted caller already bound. This
     /// owner reports it back and never mints one: I5.27 defines idempotency
@@ -531,10 +765,25 @@ impl KernelBackupCapture {
         bundle
             .validate()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
+        // The cross-owner snapshot relation is built and validated first, exactly
+        // as on the capture contour: a structurally decodable archive whose
+        // carried owner evidence does not form a coherent relation is not a
+        // verifiable capture.
         let relation = snapshot_relation(&SnapshotEvidence::from_bundle(&bundle));
         Self::validate_snapshot_relation(&relation)?;
+        // The relation is TOTAL over the archived complete fence value: a
+        // foreign, ahead or divergent archive is a structural candidate carrying
+        // its exact relation, not a refusal. `invalid` is reserved for a failure
+        // of the archive/fence contract itself, which `decode`/`validate` above
+        // already decided.
         let archived_fence_relation =
-            classify_archived_fence(&bundle.export_fence.state_fence, kernel_fence)?;
+            classify_archived_fence(&bundle.export_fence.state_fence, kernel_fence);
+        // Nothing on this path authenticates the archive as produced by THIS
+        // installation: no retained-artifact owner issues a capture receipt here
+        // (there is no production `impl PublicationPort`), so a relation computed
+        // from caller-presented bytes is unproven structural evidence whatever
+        // the relation is. #2862 owns the producer that will change this.
+        let archived_fence_proof = ArchiveFenceProof::StructuralOnly;
         let archive_sha256 = bundle
             .bundle_sha256()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
@@ -587,8 +836,21 @@ impl KernelBackupCapture {
             // answer.
             class_ceiling: class.evidence_level(),
             archived_fence_relation,
+            archived_fence_restrictions: archive_fence_restrictions(
+                archived_fence_relation,
+                &archived_fence_proof,
+            ),
+            archived_fence_relation_contract_version: ARCHIVE_FENCE_RELATION_CONTRACT_VERSION,
+            // Commits the exact COMPLETE fence value the relation above was
+            // computed from. It is a dedicated digest over that value's canonical
+            // encoding, not the manifest's `export_fence_sha256` and not any plan
+            // or approval digest.
+            archived_state_fence_digest: archived_state_fence_digest(
+                &bundle.export_fence.state_fence,
+            )?,
             member_dispositions,
             receipt_identity: None,
+            archived_fence_proof,
         })
     }
 
@@ -604,44 +866,114 @@ impl KernelBackupCapture {
 
 /// Classifies one archived `StateFence` against the live session fence.
 ///
-/// The archived fence is already validated internally by the bundle; this
-/// decides only the relation, and it replaces the exact-equality gate that made
-/// a genuine earlier-generation archive unverifiable after a restart, a
-/// generation change, or an epoch rotation.
+/// The archived fence is already validated internally by the bundle, so this
+/// function decides ONLY the structural relation and is TOTAL: every pair of
+/// well-formed fences maps to exactly one [`ArchiveFenceRelation`], and no
+/// relation value is ever a refusal. That is the point of #2863. The previous
+/// classifier returned `Err(RelationIncoherent)` for a foreign lineage or an
+/// ahead epoch, which the front door then rendered as `invalid` — collapsing
+/// "structurally valid archive whose fence is not ours" into "this archive is
+/// malformed". A valid foreign, ahead or divergent archive is a structural
+/// CANDIDATE carrying its exact relation and its restrictions; only a failure of
+/// the archive/fence contract itself is `invalid`, and that is decided before
+/// this function is reached.
 ///
-/// The decision uses `EpochId::relation_to` on the authority epoch only.
-/// `StateFence::is_compatible_with` is deliberately not the gate: it also
-/// requires `resource_generation` equality, so it refuses every archive after
-/// any generation change — the defect this replaces — and A13.7's
-/// schema/format compatibility and Authority Epoch monotonicity checks belong
-/// to the isolated restore, not to a read-only verify.
+/// Complete equality is checked FIRST and over EVERY field, so
+/// [`ArchiveFenceRelation::ExactFenceValue`] requires full `StateFence`
+/// equality. `EpochRelation::Same` alone is never sufficient, and differing
+/// optional revisions can never produce an exact-current statement.
 ///
-/// An older epoch on the same lineage is this installation's own history and is
-/// accepted as [`ArchivedFenceRelation::HistoricalAuthority`]. A foreign
-/// lineage is not this installation's history and refuses; so does an epoch
-/// ahead of the live session, which is not a historical archive and whose
-/// monotonicity this command does not judge.
-fn classify_archived_fence(
-    archived: &StateFence,
-    current: &StateFence,
-) -> Result<ArchivedFenceRelation, KernelCaptureError> {
+/// No ordering is invented. Only [`EpochRelation`] orders, and only the
+/// authority epoch's `(lineage_id, sequence)` tuple. Resource generations and
+/// the optional revision counters are separate owner contracts with no
+/// cross-counter order, so an older epoch with a numerically higher generation
+/// is [`ArchiveFenceRelation::SameAuthorityDivergent`] — neither this
+/// installation's history and not archive corruption — and a one-sided optional
+/// revision, which cannot be compared at all, is
+/// [`ArchiveFenceRelation::IncomparableOrUnknown`] rather than an invented
+/// contradiction. `StateFence::is_compatible_with` is deliberately not consulted
+/// for the same reason as before: its one-directional `None` wildcards would
+/// turn an absent revision into a match.
+fn classify_archived_fence(archived: &StateFence, current: &StateFence) -> ArchiveFenceRelation {
+    // Complete equality over every field, checked before anything else so no
+    // partial match can ever be reported as the current fence value.
+    if archived == current {
+        return ArchiveFenceRelation::ExactFenceValue;
+    }
     match archived
         .authority_epoch
         .relation_to(&current.authority_epoch)
     {
-        EpochRelation::Same => Ok(ArchivedFenceRelation::CurrentSession),
-        EpochRelation::DirectParent | EpochRelation::SameLineageOlder => {
-            Ok(ArchivedFenceRelation::HistoricalAuthority)
-        }
+        EpochRelation::UnrelatedLineage => ArchiveFenceRelation::UnrelatedLineage,
+        // Same authority epoch but different values: the generation or a
+        // revision disagrees, so the two fences contradict and neither is the
+        // other. Never the current value.
+        EpochRelation::Same => ArchiveFenceRelation::SameAuthorityDivergent,
+        // Ahead of the live authority. Established by the epoch relation alone;
+        // no other field can make an ahead archive current or historical.
         EpochRelation::DirectChild | EpochRelation::SameLineageNewer => {
-            Err(KernelCaptureError::RelationIncoherent(
-                "archive authority epoch is ahead of the current session epoch".to_owned(),
-            ))
+            ArchiveFenceRelation::SameAuthorityNewer
         }
-        EpochRelation::UnrelatedLineage => Err(KernelCaptureError::RelationIncoherent(
-            "archive authority lineage is not this installation's lineage".to_owned(),
-        )),
+        EpochRelation::DirectParent | EpochRelation::SameLineageOlder => {
+            if fence_body_coherent(archived, current) {
+                ArchiveFenceRelation::SameAuthorityOlder
+            } else if optional_revision_one_sided(archived, current) {
+                ArchiveFenceRelation::IncomparableOrUnknown
+            } else {
+                ArchiveFenceRelation::SameAuthorityDivergent
+            }
+        }
     }
+}
+
+/// Returns whether everything outside the authority epoch reconciles between an
+/// older archived fence and the current one.
+///
+/// "Reconciles" is deliberately weak and contract-respecting: equal resource
+/// generation, and every optional revision either equal on both sides or absent
+/// on both sides. It does NOT order the generation or the revisions, so a
+/// differing generation is incoherent rather than newer or older.
+fn fence_body_coherent(archived: &StateFence, current: &StateFence) -> bool {
+    archived.resource_generation == current.resource_generation
+        && optional_revision_agrees(
+            archived.task_revision.as_ref(),
+            current.task_revision.as_ref(),
+        )
+        && optional_revision_agrees(
+            archived.policy_revision.as_ref(),
+            current.policy_revision.as_ref(),
+        )
+        && optional_revision_agrees(
+            archived.integration_revision.as_ref(),
+            current.integration_revision.as_ref(),
+        )
+}
+
+/// Returns whether two optional revisions are comparable, and equal when they
+/// are. `None` on both sides is agreement — neither fence claims a revision.
+/// Anything else unequal, including one side claiming a revision the other does
+/// not, is NOT agreement.
+fn optional_revision_agrees<T: PartialEq>(archived: Option<&T>, current: Option<&T>) -> bool {
+    archived == current
+}
+
+/// Returns whether any of the three optional revisions is claimed by exactly one
+/// of the two fences, which is what makes a fence pair incomparable rather than
+/// contradictory.
+fn optional_revision_one_sided(archived: &StateFence, current: &StateFence) -> bool {
+    fn one_sided<T: PartialEq>(left: Option<&T>, right: Option<&T>) -> bool {
+        left.is_some() != right.is_some()
+    }
+    one_sided(
+        archived.task_revision.as_ref(),
+        current.task_revision.as_ref(),
+    ) || one_sided(
+        archived.policy_revision.as_ref(),
+        current.policy_revision.as_ref(),
+    ) || one_sided(
+        archived.integration_revision.as_ref(),
+        current.integration_revision.as_ref(),
+    )
 }
 
 /// Stable class name for capability refusals and the front-door projection.
@@ -824,13 +1156,23 @@ impl ArchiveIdentities {
 /// obtained; discarding the bytes silently would hide that a validated archive
 /// exists at all. I5.13 keeps backup existence from being recovery proof, which
 /// is exactly why a cancelled capture is not a completed one.
+///
+/// The archived fence VALUE is real — it is the frozen export fence of the
+/// operation in flight — so the structural relation is exact over the complete
+/// value. Its proof stays [`ArchiveFenceProof::StructuralOnly`]: publication
+/// never happened, so no owner issued a receipt for those bytes and this owner
+/// cannot claim more than structural evidence.
 fn cancelled_report(
     identities: &ArchiveIdentities,
     class: BackupClass,
     operation_id: String,
     member_dispositions: Vec<(String, String)>,
-) -> CaptureReport {
-    CaptureReport {
+    archived_fence: &StateFence,
+) -> Result<CaptureReport, KernelCaptureError> {
+    let archived_fence_proof = ArchiveFenceProof::StructuralOnly;
+    let archived_fence_restrictions =
+        archive_fence_restrictions(ArchiveFenceRelation::ExactFenceValue, &archived_fence_proof);
+    Ok(CaptureReport {
         backup_id: identities.backup_id.clone(),
         class,
         archive_sha256: identities.archive_sha256.clone(),
@@ -841,10 +1183,14 @@ fn cancelled_report(
         state: CaptureState::Cancelled,
         evidence_level: CaptureEvidenceLevel::StructurallyValidCandidate,
         class_ceiling: identities.class_ceiling,
-        archived_fence_relation: ArchivedFenceRelation::CurrentSession,
+        archived_fence_relation: ArchiveFenceRelation::ExactFenceValue,
+        archived_fence_proof,
+        archived_fence_restrictions,
+        archived_fence_relation_contract_version: ARCHIVE_FENCE_RELATION_CONTRACT_VERSION,
+        archived_state_fence_digest: archived_state_fence_digest(archived_fence)?,
         member_dispositions,
         receipt_identity: None,
-    }
+    })
 }
 
 /// One admitted capture operation's monotonic duration budget.

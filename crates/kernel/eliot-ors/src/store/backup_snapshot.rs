@@ -699,13 +699,15 @@ fn stream_recovery_family_page(
 
 /// Exports one coherent backup page under a single read transaction.
 ///
-/// `page_index` binds `after_order + page_entries * page_index`: the window
-/// start moves by exactly one page stride per index, so pages exported from
-/// independent calls with different fence tokens are NOT one snapshot.
-/// Callers building a snapshot must reuse the same request (same fence
-/// token) across pages, advancing only the typed family cursor;
-/// [`export_snapshot`] enforces this by issuing every page itself. Any row
-/// decode failure returns [`OrsError::IntegrityProblem`]; a page is never
+/// `page_index` selects a legacy count-stride window beginning at
+/// `after_order + page_entries * page_index`. Operation orders may be sparse,
+/// so this is not an exact continuation and does not prove complete coverage.
+/// Callers building a snapshot must reuse the same request (same fence token)
+/// across pages; [`export_snapshot`] applies a bounded refusal when its page
+/// budget ends on a non-final page without an exact family continuation. This
+/// does not make multi-page operational coverage exact. Pages exported from
+/// independent calls with different fence tokens are not one snapshot. Any
+/// row decode failure returns [`OrsError::IntegrityProblem`]; a page is never
 /// fabricated from reference counts alone. Accumulated entry bytes are bounded
 /// by `request.max_bytes` (already `1..=MAX_BACKUP_BYTES` by the request
 /// constructor).
@@ -826,29 +828,30 @@ pub(super) fn export_page(
     })
 }
 
-/// Exports a full snapshot by paging with one request until `is_last`.
+/// Exports a snapshot by paging with one request until a page is final or the
+/// page budget is exhausted.
 ///
-/// The operational request (fence token, `after_order`, page size) is reused for
-/// every page, so `page_index * page_entries` continuity holds by construction;
-/// only the typed family cursor advances, by exactly the owner-issued cursor the
-/// previous page ended with. A pre/post [`composite_state_digest`] freeze check
-/// rejects any canonical advance *or* any process-stream recovery family
-/// movement that lands mid-export with [`OrsError::OrderingHeadMismatch`]
-/// instead of tearing the snapshot.
+/// The operational request (fence token, `after_order`, page size) is reused
+/// for every page, but its count-stride windows are not an exact continuation
+/// in the sparse operation-order domain. Only the typed family cursor advances,
+/// by exactly the owner-issued cursor the previous page ended with. A
+/// pre/post [`composite_state_digest`] freeze check rejects any canonical
+/// advance or process-stream recovery family movement during export with
+/// [`OrsError::OrderingHeadMismatch`].
 ///
-/// Exhausting `request.max_pages` is a resumable `Partial` disposition carrying
-/// the exact next family cursor, not a permanent refusal: a family larger than
-/// the page budget exports by continuing, so retaining more legitimate recovery
-/// evidence no longer makes the backup permanently unavailable. Completeness is
-/// `Complete` only when every page decoded cleanly, the operational window and
-/// the family were both exhausted, and at least one entry landed. A request that
-/// declared no family cursor yields `Partial` with the legacy reason, because a
-/// snapshot with no family denominator is partial evidence and not an empty
-/// complete family. A decode failure reports [`OrsError::IntegrityProblem`],
-/// never a fabricated `Complete`. The denominator digest is the snapshot's own
-/// `snapshot_digest()` binding, which chains every exported entry's payload
-/// digest together with the frozen family snapshot identity, so the process
-/// stream recovery family is inside the denominator on every page it appears.
+/// When the page budget ends on a non-final page, the exact family cursor is
+/// retained as a `Partial` disposition when one exists. If no family cursor
+/// remains, export returns [`OrsError::ProjectionLimitExceeded`] rather than
+/// letting budget exhaustion fall through to `Complete` or an unresumable
+/// partial snapshot. This bounded refusal does not make the legacy operational
+/// count-stride windows an exact multi-page continuation; sparse-order coverage
+/// still requires an operational cursor. A request that declared no family
+/// cursor yields `Partial` with the legacy reason when its final page is
+/// otherwise exhausted, because a snapshot with no family denominator is
+/// partial evidence and not an empty complete family. A decode failure reports
+/// [`OrsError::IntegrityProblem`], never fabricated completeness. The
+/// denominator digest binds every exported entry's payload digest together
+/// with the frozen family snapshot identity.
 pub(super) fn export_snapshot(
     database: &Database,
     request: &OrsBackupRequest,
@@ -897,6 +900,12 @@ pub(super) fn export_snapshot(
         .and_then(|continuation| continuation.next.clone());
     let frozen_post = composite_state_digest(database)?;
     check_canonical_frozen(&frozen_pre, &frozen_post)?;
+    if !last_page_was_final && outstanding_family.is_none() {
+        // Operational pagination has no exact continuation yet. Refuse this
+        // bounded export instead of allowing page-budget exhaustion to be
+        // mistaken for an exhausted operational denominator.
+        return Err(OrsError::ProjectionLimitExceeded);
+    }
     // Byte budget is re-summed from the pages so the snapshot total is a
     // function of observed rows, never of a declared count alone. Entries
     // carry digests only (no raw bytes cross the boundary), so the total

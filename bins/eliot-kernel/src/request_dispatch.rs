@@ -138,8 +138,8 @@ use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde_json::{Map, Value};
 
 use super::backup_capture::{
-    MEMBER_DOMAIN_BLOB, MEMBER_DOMAIN_CANONICAL, MEMBER_DOMAIN_RECEIPT, class_name,
-    member_domain_count,
+    MEMBER_DOMAIN_BLOB, MEMBER_DOMAIN_CANONICAL, MEMBER_DOMAIN_RECEIPT,
+    archived_state_fence_digest, class_name, member_domain_count,
 };
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
 use super::{
@@ -781,8 +781,29 @@ struct VerifiedProjection {
     class_ceiling: String,
     /// The evidence level the owner proved.
     verification_level: String,
-    /// The archived fence's current/historical relation to this target.
-    target_compatibility: String,
+    /// The archive's COMPLETE fence value's structural relation to this target,
+    /// in the owner's own spelling. This is a relation over fence VALUES and is
+    /// NOT target compatibility; see the type doc.
+    archive_fence_relation: String,
+    /// The owner's provenance qualifier for that relation, in its own spelling.
+    /// `structural-only` is the only value a verify answer can carry today.
+    archive_fence_proof: String,
+    /// Bounded tokens naming the claims this answer does not make, in the owner's
+    /// own spelling. Never empty in practice: the target-compatibility absence is
+    /// stated on every result.
+    archive_fence_restrictions: Vec<String>,
+    /// The relation vocabulary/contract version the owner's answer was produced
+    /// under, so a consumer can refuse a vocabulary it does not know instead of
+    /// coercing an unrecognized value.
+    archive_fence_relation_contract_version: u16,
+    /// The archive's complete fence VALUE identity, in the owner's own digest.
+    /// Commits the exact value the relation was computed from; distinct from the
+    /// archive format's own manifest-bound export-fence digest.
+    archived_state_fence_digest: String,
+    /// TARGET COMPATIBILITY IS ABSENT. No schema/build/key/purge/import/epoch
+    /// compatibility check ran on this path and none is projected; this field is
+    /// `None` on every answer and is never filled from the structural relation.
+    target_compatibility: Option<String>,
     /// Canonical-member denominator in the owner's own dispositions.
     event_count: u64,
     /// Receipt-obligation member denominator in the owner's own dispositions.
@@ -903,8 +924,44 @@ fn verified_reply(
                 Value::String(projection.class_ceiling.clone()),
             ),
             (
+                "archive_fence_relation",
+                Value::String(projection.archive_fence_relation.clone()),
+            ),
+            (
+                "archive_fence_proof",
+                Value::String(projection.archive_fence_proof.clone()),
+            ),
+            (
+                "archive_fence_restrictions",
+                Value::Array(
+                    projection
+                        .archive_fence_restrictions
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            ),
+            (
+                "archive_fence_relation_contract_version",
+                Value::from(projection.archive_fence_relation_contract_version),
+            ),
+            (
+                "archived_state_fence_digest",
+                Value::String(projection.archived_state_fence_digest.clone()),
+            ),
+            // Explicitly null, never omitted and never borrowed from the
+            // structural relation: no restore owner evaluates target
+            // schema/build/key/purge/import/epoch compatibility on this path
+            // (A13.7), so this route has no compatibility verdict to project.
+            // The key is retained so the absence is a stated fact rather than a
+            // field a consumer could fill in by inference.
+            (
                 "target_compatibility",
-                Value::String(projection.target_compatibility.clone()),
+                projection
+                    .target_compatibility
+                    .clone()
+                    .map_or(Value::Null, Value::String),
             ),
             ("capture_receipt", capture_receipt),
             ("event_count", Value::from(projection.event_count)),
@@ -949,7 +1006,18 @@ fn projection_from_report(
         archive_sha256: report.archive_sha256.clone(),
         class_ceiling,
         verification_level: report.evidence_level.as_wire_name().to_owned(),
-        target_compatibility: report.archived_fence_relation.as_wire_name().to_owned(),
+        archive_fence_relation: report.archived_fence_relation.as_wire_name().to_owned(),
+        archive_fence_proof: report.archived_fence_proof.as_wire_name().to_owned(),
+        archive_fence_restrictions: report
+            .archived_fence_restrictions
+            .iter()
+            .map(|restriction| (*restriction).to_owned())
+            .collect(),
+        archive_fence_relation_contract_version: report.archived_fence_relation_contract_version,
+        archived_state_fence_digest: report.archived_state_fence_digest.clone(),
+        // No restore owner supplies one, so this route never has a compatibility
+        // verdict to project.
+        target_compatibility: None,
         event_count: member_domain_count(report, MEMBER_DOMAIN_CANONICAL),
         receipt_count: member_domain_count(report, MEMBER_DOMAIN_RECEIPT),
         blob_count: member_domain_count(report, MEMBER_DOMAIN_BLOB),
@@ -981,6 +1049,15 @@ fn projection_from_record(
         archive_sha256: record.archive_sha256.clone(),
         class_ceiling: record.class_ceiling.clone(),
         verification_level: record.verification_level.clone(),
+        archive_fence_relation: record.archive_fence_relation.clone(),
+        archive_fence_proof: record.archive_fence_proof.clone(),
+        archive_fence_restrictions: record.archive_fence_restrictions.clone(),
+        archive_fence_relation_contract_version: record.archive_fence_relation_contract_version,
+        archived_state_fence_digest: record.identity.archived_fence_digest.clone(),
+        // Read from the stored row rather than recomputed, so a replay reports the
+        // compatibility state the row recorded. It is `None` on every row this
+        // owner writes, and a row that carried one would be reporting a restore
+        // owner's answer that this owner has no authority to produce.
         target_compatibility: record.target_compatibility.clone(),
         event_count: record.event_count,
         receipt_count: record.receipt_count,
@@ -1017,6 +1094,10 @@ fn record_from_projection(
         class: projection.class.clone(),
         class_ceiling: projection.class_ceiling.clone(),
         verification_level: projection.verification_level.clone(),
+        archive_fence_relation: projection.archive_fence_relation.clone(),
+        archive_fence_proof: projection.archive_fence_proof.clone(),
+        archive_fence_restrictions: projection.archive_fence_restrictions.clone(),
+        archive_fence_relation_contract_version: projection.archive_fence_relation_contract_version,
         target_compatibility: projection.target_compatibility.clone(),
         event_count: projection.event_count,
         receipt_count: projection.receipt_count,
@@ -1129,6 +1210,16 @@ fn backup_verify_identity(
         archive_owner_contract: report.owner_contract.clone(),
         archive_source_installation: report.source_installation.clone(),
         archive_export_fence_digest: report.export_fence_digest.clone(),
+        // #2863: the archived complete fence is half of what the relation is a
+        // relation BETWEEN, so it is bound into the operation identity and a
+        // different fence value under one identity is an I5.27 conflict. The
+        // observed (current) fence is deliberately AMBIENT and is recorded
+        // beside it, never hashed into the key: a retry after a lost response, a
+        // module re-registration or an Authority Epoch rotation all change the
+        // live fence while remaining the same operation.
+        archived_fence_digest: report.archived_state_fence_digest.clone(),
+        observed_fence_digest: archived_state_fence_digest(&session.module_generation.state_fence)
+            .map_err(|error| error.to_string())?,
         evidenced_class: class_name(report.class).to_owned(),
         capture_receipt: report.receipt_identity.clone(),
         retention_and_collision_window: BACKUP_VERIFY_RETENTION_WINDOW.to_owned(),

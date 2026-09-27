@@ -16,7 +16,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{SchemaError, ToolRequest, ToolSchema, canonical_tool_schemas};
+use crate::{
+    CoordinateInput, ObserveInput, QueryMode, SchemaError, ToolRequest, ToolSchema, VerifyIntent,
+    canonical_tool_schemas,
+};
 
 /// Failure to register, resolve, or validate a semantic profile.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -547,6 +550,222 @@ pub fn known_tool_profile(
 /// order; consumers look up by name and must not rely on positions.
 pub fn canonical_known_tools() -> Result<Vec<ToolSemanticProfile>, SemanticProfileError> {
     Ok(canonical_shared()?.profiles().cloned().collect())
+}
+
+/// One of the eight canonical hot MCP operations, with its closed typed
+/// suboperation where the contract defines one.
+///
+/// This is derived from the request enum, never from caller-supplied method
+/// text, descriptions, or payload strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalOperation {
+    /// Current state and task-selection projection.
+    State,
+    /// Active Understanding View compilation or refresh.
+    Packet,
+    /// Typed observation capture.
+    Observe(ObserveSuboperation),
+    /// Intent-bearing owner-filtered query.
+    Query(QueryMode),
+    /// Action-frame request.
+    Act,
+    /// Typed verifier operation.
+    Verify(VerifyIntent),
+    /// Execution-fabric operation.
+    Coordinate(CoordinateSuboperation),
+    /// Typed finish candidate.
+    Finish,
+}
+
+/// Closed observation suboperations from the canonical Observe contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserveSuboperation {
+    /// Cold raw observation candidate.
+    Observation,
+    /// Cold decision candidate.
+    Decision,
+    /// Cold failure candidate.
+    Failure,
+    /// Cold outcome candidate.
+    Outcome,
+    /// Task-relative memory influence acknowledgement.
+    InfluenceAck,
+}
+
+/// Closed execution-fabric suboperations from the canonical Coordinate
+/// contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinateSuboperation {
+    /// Create a bounded work item or attempt.
+    Delegate,
+    /// Request an independent audit.
+    Audit,
+    /// Compare isolated candidates.
+    Compare,
+    /// Await an authorized job's status.
+    Wait,
+    /// Inspect an authorized job's status and lineage.
+    Inspect,
+    /// Cancel or reconcile a run or subtree.
+    Cancel,
+    /// Send durable mailbox or attention content.
+    Send,
+}
+
+/// Contract classification of an operation's task and effect boundary.
+///
+/// Every variant still requires an authenticated application session. This
+/// classification describes the owner's requirements; it neither
+/// authenticates nor admits a request and never grants effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationAccessClass {
+    /// Authenticated discovery/read-only work available before task selection.
+    AuthenticatedDiscoveryReadOnly,
+    /// Authenticated, policy-bounded cold capture with no task effect.
+    SafeRawCapture,
+    /// Work that is task-relative or effectful and needs exact task evidence.
+    TaskRelativeEffectful,
+}
+
+/// Existing owner evidence the dispatch path must require for a classified
+/// request. Every variant includes an authenticated application session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredBindingEvidence {
+    /// Exact authenticated session and its owner-filtered read scope.
+    AuthenticatedSession,
+    /// Authenticated identity plus valid privacy and cold-staging policy.
+    CaptureIdentityPrivacyAndStaging,
+    /// Exact applicable task selection/binding evidence.
+    ExactApplicableTask,
+    /// Exact authorized job binding; a job handle alone is not authority.
+    ExactAuthorizedJob,
+}
+
+/// Typed, declarative operation requirement consumed by dispatch.
+///
+/// `access_class` is not a grant or admission decision. In particular,
+/// `SafeRawCapture` cannot promote, bind, or otherwise affect a task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationRequirement {
+    /// Canonical operation and typed suboperation.
+    pub operation: CanonicalOperation,
+    /// Access/effect class fixed by the accepted operation contract.
+    pub access_class: OperationAccessClass,
+    /// Exact authenticated scope evidence required from existing owners.
+    pub binding_evidence: RequiredBindingEvidence,
+}
+
+impl CanonicalOperation {
+    /// Returns the contract-owned access class and binding evidence.
+    #[must_use]
+    pub const fn requirement(self) -> OperationRequirement {
+        let (access_class, binding_evidence) = match self {
+            Self::State | Self::Query(_) => (
+                OperationAccessClass::AuthenticatedDiscoveryReadOnly,
+                RequiredBindingEvidence::AuthenticatedSession,
+            ),
+            Self::Observe(
+                ObserveSuboperation::Observation
+                | ObserveSuboperation::Decision
+                | ObserveSuboperation::Failure
+                | ObserveSuboperation::Outcome,
+            ) => (
+                OperationAccessClass::SafeRawCapture,
+                RequiredBindingEvidence::CaptureIdentityPrivacyAndStaging,
+            ),
+            Self::Coordinate(CoordinateSuboperation::Wait | CoordinateSuboperation::Inspect) => (
+                OperationAccessClass::AuthenticatedDiscoveryReadOnly,
+                RequiredBindingEvidence::ExactAuthorizedJob,
+            ),
+            Self::Packet
+            | Self::Act
+            | Self::Verify(_)
+            | Self::Finish
+            | Self::Observe(ObserveSuboperation::InfluenceAck)
+            | Self::Coordinate(
+                CoordinateSuboperation::Delegate
+                | CoordinateSuboperation::Audit
+                | CoordinateSuboperation::Compare
+                | CoordinateSuboperation::Cancel
+                | CoordinateSuboperation::Send,
+            ) => (
+                OperationAccessClass::TaskRelativeEffectful,
+                RequiredBindingEvidence::ExactApplicableTask,
+            ),
+        };
+        OperationRequirement {
+            operation: self,
+            access_class,
+            binding_evidence,
+        }
+    }
+}
+
+/// A request outside the eight canonical hot MCP operations.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("request is not a canonical hot MCP operation")]
+pub struct NonCanonicalHotRequest;
+
+/// Classifies a typed request without granting authority or interpreting
+/// caller-provided text.
+///
+/// State/task-selection and bootstrap discovery can therefore be routed
+/// before task selection; cold Observe capture can be retained only after its
+/// authenticated identity, privacy, and staging owners admit it. Packet is
+/// always task-relative: no-task bootstrap is a separate route, and
+/// `PacketInput` does not contain a bootstrap discriminator. Non-hot carriers
+/// fail closed.
+pub fn classify_tool_request(
+    request: &ToolRequest,
+) -> Result<OperationRequirement, NonCanonicalHotRequest> {
+    let operation = match request {
+        ToolRequest::State(_) => CanonicalOperation::State,
+        ToolRequest::Packet(_) => CanonicalOperation::Packet,
+        ToolRequest::Observe(ObserveInput::Observation(_)) => {
+            CanonicalOperation::Observe(ObserveSuboperation::Observation)
+        }
+        ToolRequest::Observe(ObserveInput::Decision(_)) => {
+            CanonicalOperation::Observe(ObserveSuboperation::Decision)
+        }
+        ToolRequest::Observe(ObserveInput::Failure(_)) => {
+            CanonicalOperation::Observe(ObserveSuboperation::Failure)
+        }
+        ToolRequest::Observe(ObserveInput::Outcome(_)) => {
+            CanonicalOperation::Observe(ObserveSuboperation::Outcome)
+        }
+        ToolRequest::Observe(ObserveInput::InfluenceAck(_)) => {
+            CanonicalOperation::Observe(ObserveSuboperation::InfluenceAck)
+        }
+        ToolRequest::Query(input) => CanonicalOperation::Query(input.intent.mode),
+        ToolRequest::Act(_) => CanonicalOperation::Act,
+        ToolRequest::Verify(input) => CanonicalOperation::Verify(input.intent),
+        ToolRequest::Coordinate(CoordinateInput::Delegate(_)) => {
+            CanonicalOperation::Coordinate(CoordinateSuboperation::Delegate)
+        }
+        ToolRequest::Coordinate(CoordinateInput::Audit(_)) => {
+            CanonicalOperation::Coordinate(CoordinateSuboperation::Audit)
+        }
+        ToolRequest::Coordinate(CoordinateInput::Compare(_)) => {
+            CanonicalOperation::Coordinate(CoordinateSuboperation::Compare)
+        }
+        ToolRequest::Coordinate(CoordinateInput::Wait(_)) => {
+            CanonicalOperation::Coordinate(CoordinateSuboperation::Wait)
+        }
+        ToolRequest::Coordinate(CoordinateInput::Inspect(_)) => {
+            CanonicalOperation::Coordinate(CoordinateSuboperation::Inspect)
+        }
+        ToolRequest::Coordinate(CoordinateInput::Cancel(_)) => {
+            CanonicalOperation::Coordinate(CoordinateSuboperation::Cancel)
+        }
+        ToolRequest::Coordinate(CoordinateInput::Send(_)) => {
+            CanonicalOperation::Coordinate(CoordinateSuboperation::Send)
+        }
+        ToolRequest::Finish(_) => CanonicalOperation::Finish,
+        ToolRequest::UserAutomation(_)
+        | ToolRequest::SkillInject(_)
+        | ToolRequest::SkillDisplay(_) => return Err(NonCanonicalHotRequest),
+    };
+    Ok(operation.requirement())
 }
 
 /// Resolves the single semantic owner for one real contract tool request.

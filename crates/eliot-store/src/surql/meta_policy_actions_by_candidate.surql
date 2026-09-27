@@ -25,14 +25,19 @@ WHERE project_id = $project_id
   AND (
     candidate_id = <string> $candidate_id
     OR (
-      (candidate_id ?? '') = ''
+      -- Same explicit missing-field predicate as canonical_trace_by_trace_ref
+      -- and the 000_schema.surql repair, so candidate/action lookup and trace
+      -- lookup share one confirmed semantic. See that file for the pinned
+      -- SurrealDB 3.1.4 evidence: `type::is_none(x)` is true only for an
+      -- absent/UNSET field and false for '', NULL, and any present value.
+      type::is_none(candidate_id)
       AND <string> receipt_body.candidate_id = <string> $candidate_id
     )
   )
   AND (
     canonical_action = <string> $action
     OR (
-      (canonical_action ?? '') = ''
+      type::is_none(canonical_action)
       AND <string> receipt_body.action = <string> $action
     )
   )

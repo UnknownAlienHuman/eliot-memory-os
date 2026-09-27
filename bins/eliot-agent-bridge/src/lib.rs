@@ -3716,7 +3716,7 @@ mod tests {
             };
             let decoded = decode_activation_response(&frame, &req, &receipt).expect("decode");
             match decoded.disposition {
-                eliot_protocol::AgentBridgeActivationDisposition::Denied {
+                eliot_protocol::OpenAgentBridgeActivationDisposition::Denied {
                     reason_code,
                     detail,
                 } => {
@@ -3728,7 +3728,10 @@ mod tests {
                         "typed denials keep their detail; the no-result denial keeps none"
                     );
                 }
-                eliot_protocol::AgentBridgeActivationDisposition::Authenticated { .. } => {
+                eliot_protocol::OpenAgentBridgeActivationDisposition::Authenticated { .. }
+                | eliot_protocol::OpenAgentBridgeActivationDisposition::CanonicalDenied {
+                    ..
+                } => {
                     panic!("denial response must not decode as authenticated");
                 }
             }

@@ -596,7 +596,7 @@ impl RedbInstallationRegistry {
             self.mutate_atomic(intent.expected_registry_revision, |registry| {
                 registry.stage_pending_activation_from_transaction_with_pre_activation_approval(
                     transaction,
-                    approval.clone(),
+                    approval,
                 )
             })
         } else {

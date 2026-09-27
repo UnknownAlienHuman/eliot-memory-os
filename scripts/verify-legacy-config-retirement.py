@@ -2,8 +2,8 @@
 """Fail on legacy config reintroduction in current release/install/default paths (issue #1219).
 
 Part B guard for item 1220 (legacy config retirement). Static source/packaging
-evidence only: it proves the five deleted legacy files stay deleted, that the
-single pending-retention file stays marker-gated and unextended, and that no
+evidence only: it proves the six deleted legacy files stay deleted, that the
+formerly-pending-retention file is now itself DELETE disposition, and that no
 current launch, install, release, or default path re-selects their filenames,
 modes, roots, password-file fields, legacy Store source paths, or module
 manifests. It is never runtime or Product Proof.
@@ -16,17 +16,17 @@ Deleted legacy family (Part A disposition = DELETE, no retained fixture):
   (pre-split in-process builtin manifests; current Module/Capability registry
   owns registration, never file presence)
 
-Pending-retention fixture (Part A disposition = RETIREMENT-PENDING, NOT deleted):
-- config/eliot-governor.toml is RETAINED with a RETIREMENT-PENDING comment
-  header because crates/eliot-engine/src/safety.rs:1905-1909 probes this exact
-  file for schema_version = "1" as a blocking schema_contract check, and
-  crates/eliot-engine/tests/safety_and_backup.rs:509 expects degraded (not
-  blocked) when surreal resolves. Deletion is blocked on foreign-lane H2
-  engine-probe retirement. The file is non-production, must not be extended
-  with new live keys, and is removed with H2. Verifier rule: absent = retired
-  (pass); present WITH the pending-marker header and unextended = pass-with-
-  pending (distinct text, exit 0); present WITHOUT the marker, missing the
-  schema_version line, or extended with new live keys = finding (exit 1).
+Legacy config retirement (Part A disposition = DELETE; config/eliot-governor.toml
+now also deleted, issue #1219): config/eliot-governor.toml was RETAINED with a
+RETIREMENT-PENDING comment header while crates/eliot-engine/src/safety.rs probed
+it for schema_version = "1" as a blocking schema_contract check (the H2
+engine-probe). That self-referential probe has been retired: the file is DELETED
+and the operations-doctor check removed. This verifier's RETIREMENT_PENDING gate
+therefore now resolves to the absent (fully retired) branch: the file is deleted,
+its disposition is DELETE, and reintroduction by any current path is a finding.
+The gate function is retained so that reintroducing the file WITH the old pending
+marker still fails (absent = retired = pass; present = finding). Absence is the
+only passing state; there is no live pending fixture.
 
 Foreign decoder/fallback retirement (crates/eliot-app, crates/eliot-engine,
 crates/eliot-types, crates/eliot-store, crates/governor, bins/eliot
@@ -82,17 +82,20 @@ PROOF_CEILING = "STATIC_SOURCE_PACKAGING_EVIDENCE_ONLY"
 
 LEGACY_FILES = (
     "config/eliot.local.toml",
+    "config/eliot-governor.toml",
     "config/modules/builtin.memory.toml",
     "config/modules/builtin.mailbox.toml",
     "config/modules/builtin.codecortex.toml",
     "config/modules/builtin.verifier.toml",
 )
 
-# Pending-retention fixture: deletion blocked on foreign-lane H2 engine-probe
-# retirement. Absent = fully retired (pass). Present with the pending-marker
-# header and without new live keys = pass-with-pending (distinct text, exit 0).
-# Present without the marker, missing the schema_version probe line, or
-# extended with new live keys = finding (exit 1).
+# Retired pending fixture (issue #1219). config/eliot-governor.toml is now a
+# DELETE-disposition member of LEGACY_FILES above, so ANY presence raises
+# LCR-001. The PENDING_* gate below is retained only as a reintroduction
+# backstop for the exact RETIREMENT-PENDING shape the H2 probe required:
+# absent = fully retired (pass); present = finding (exit 1) via LCR-001 and,
+# if it somehow evades that, the LCR-003 rules below. There is no longer a
+# pass-with-pending state, because there is no live pending fixture.
 PENDING_FILE = "config/eliot-governor.toml"
 PENDING_MARKER = "RETIREMENT-PENDING"
 PENDING_PROBE_REF = "safety.rs:1905-1909"
@@ -100,7 +103,7 @@ PENDING_SCHEMA_LINE = 'schema_version = "1"'
 
 # Live keys/sections pinned at the item-1220 retention snapshot (base
 # 4706f67 plus comment-only RETIREMENT-PENDING header). Any new live key or
-# section is an extension of a non-production pending fixture and fails.
+# section is an extension of a retired non-production fixture and fails.
 PENDING_ALLOWED_KEYS = frozenset({
     "schema_version",
     "service_name",
@@ -281,11 +284,13 @@ def check_legacy_files_absent(root: Path) -> list[Finding]:
 
 
 def check_pending_retirement(root: Path) -> tuple[list[Finding], bool]:
-    """Gate the RETIREMENT-PENDING fixture (config/eliot-governor.toml).
+    """Gate the RETIRED pending fixture (config/eliot-governor.toml, #1219).
 
-    Returns (findings, is_pending_active). Absent = retired (no findings, not
-    pending). Present with marker + probe line + no new live keys = valid
-    pending (no findings, pending True). Present without marker, missing the
+    The file is now DELETE-disposition and is expected to be absent. Returns
+    (findings, is_pending_active). Absent = fully retired (no findings, not
+    pending) — the only passing state. Present = reintroduction: it raises
+    LCR-001 via check_legacy_files_absent, and independently this function
+    reports the stale-fixture detail: present without marker, missing the
     schema line, unreadable, or extended = findings (exit 1).
     """
     path = root / PENDING_FILE
@@ -399,7 +404,23 @@ def check_pending_retirement(root: Path) -> tuple[list[Finding], bool]:
             ],
             False,
         )
-    return ([], True)
+    # Marker, probe line and pinned keys are all intact, but the file exists at
+    # all: it is DELETE disposition now (issue #1219), so this is a
+    # reintroduction of the retired fixture, not a live pending retention.
+    return (
+        [
+            Finding(
+                "LCR-003",
+                PENDING_FILE,
+                0,
+                "retired legacy config file is present; config/eliot-governor.toml is "
+                "DELETE disposition since issue #1219 and its blocking engine probe "
+                f"({PENDING_PROBE_REF}) is retired — the RETIREMENT-PENDING fixture "
+                "must be deleted, not reinstated",
+            )
+        ],
+        False,
+    )
 
 
 def is_pending_retention_active(root: Path) -> bool:
@@ -634,28 +655,39 @@ def run_self_tests() -> int:
         (docs / "guide.md").write_text("see https://eliot.local/x\n", encoding="utf-8")
         check("foreign lookalikes must pass", verify(root) == [])
 
-    # Case 8: RETIREMENT-PENDING gate — positive (marked, unextended) passes
-    # with pending active; negative (unmarked) and extension fail LCR-003.
+    # Case 8: retired-fixture gate — config/eliot-governor.toml is DELETE
+    # disposition (issue #1219). Absent passes and is not pending; ANY presence
+    # is a reintroduction finding. The exact former RETIREMENT-PENDING shape
+    # (marked, unextended) must now raise LCR-001 rather than pass, because the
+    # H2 engine-probe that justified retention is retired.
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "config").mkdir(parents=True)
         pending = root / PENDING_FILE
-        # Positive: marker header + probe line + only pinned keys.
+        # Positive: absent is the only passing state.
+        check("absent retired file must pass", verify(root) == [])
+        check(
+            "absent retired file must not be pending-active",
+            not is_pending_retention_active(root),
+        )
+        # Reintroduction: even the exact former marked, unextended
+        # RETIREMENT-PENDING shape must now raise LCR-001 and not pass.
         pending.write_text(
-            "# RETIREMENT-PENDING \u2014 deletion blocked on H2 engine-probe retirement "
+            "# RETIREMENT-PENDING — deletion blocked on H2 engine-probe retirement "
             "(safety.rs:1905-1909); non-production; do-not-extend; remove with H2.\n"
             "# Retained only for the engine probe.\n"
             f"{PENDING_SCHEMA_LINE}\n"
             "\n[service]\nservice_name = \"EliotGovernor\"\n",
             encoding="utf-8",
         )
-        check("pending marked file must pass", verify(root) == [])
         check(
-            "pending marked file must be pending-active",
-            is_pending_retention_active(root),
+            "reintroduced marked retired file must raise LCR-001",
+            any(f.code == "LCR-001" and f.path == PENDING_FILE for f in verify(root)),
         )
-        pending_findings, active = check_pending_retirement(root)
-        check("pending positive must report active", active and pending_findings == [])
+        check(
+            "reintroduced marked retired file must not be pending-active",
+            not is_pending_retention_active(root),
+        )
         # Negative: present WITHOUT the marker must fail.
         pending.write_text(
             f"{PENDING_SCHEMA_LINE}\n\n[service]\nservice_name = \"EliotGovernor\"\n",

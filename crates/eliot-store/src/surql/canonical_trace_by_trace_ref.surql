@@ -21,7 +21,15 @@ WHERE project_id = $project_id
   AND (
     trace_ref = <string> $trace_ref
     OR (
-      (trace_ref ?? '') = ''
+      -- Explicit missing-field predicate. On the pinned SurrealDB 3.1.4 route
+      -- `type::is_none(x)` is true only for an absent/UNSET field (and an
+      -- explicitly stored NONE, which the provider itself removes on write),
+      -- and false for '', NULL, and any present value. `x IS NONE` is the
+      -- equivalent grammar form and behaves identically here. Unlike
+      -- `(x ?? '') = ''`, this keeps an explicit empty string, NULL, and a
+      -- non-empty value distinct from an unmaterialized identity, so the
+      -- receipt-body fallback below applies only to a genuinely missing field.
+      type::is_none(trace_ref)
       AND <string> receipt_body.trace_ref = <string> $trace_ref
     )
   )

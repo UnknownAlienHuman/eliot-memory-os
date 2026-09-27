@@ -99,7 +99,14 @@ pub enum TestdPortError {
 ///
 /// Only [`InstrumentKind::Test`] returns true. Every other class resolves
 /// through the registry and is then reported via
-/// [`TestdPortError::UnsupportedByTestd`].
+/// [`TestdPortError::UnsupportedByTestd`]. This is the closed *Testd*
+/// capability surface only; per-provider host readiness is a separate axis
+/// decided by
+/// [`ProviderRegistry::availability`](crate::ProviderRegistry::availability)
+/// and reported as a typed
+/// [`ProviderDisposition`](crate::ProviderDisposition), so a provider that
+/// Testd could dispatch but this host cannot run stays inside the declared
+/// denominator instead of disappearing.
 pub fn testd_dispatchable(kind: InstrumentKind) -> bool {
     matches!(kind, InstrumentKind::Test)
 }

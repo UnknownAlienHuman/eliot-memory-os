@@ -45,6 +45,7 @@ pub(super) enum OperationalKind {
     AuthorityRevocation,
     CapabilityGrant,
     CapabilityIntroduction,
+    RootTransition,
 }
 
 impl OperationalKind {
@@ -63,6 +64,7 @@ impl OperationalKind {
             Self::AuthorityRevocation => "authority_revocation",
             Self::CapabilityGrant => "capability_grant",
             Self::CapabilityIntroduction => "capability_introduction",
+            Self::RootTransition => "root_transition",
         }
     }
 }
@@ -76,6 +78,10 @@ pub(super) struct DurableOperationalRecord {
     pub(super) operation_order: u64,
     pub(super) terminal_receipt_id: Option<OpaqueLabel>,
     pub(super) terminal_receipt_sha256: Option<String>,
+    /// Typed admission-reservation state shares the canonical operational
+    /// current/history transaction and is absent for every other subject.
+    #[serde(default)]
+    pub(super) admission_reservation: Option<crate::AdmissionReservationRecord>,
     /// Typed generation evidence is carried by the same canonical
     /// operational current/history records as every other ORS subject.
     /// `default` keeps older canonical records readable without granting the

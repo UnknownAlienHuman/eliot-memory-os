@@ -45,17 +45,18 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRef, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OrderingHeadExpectation, PreparedTransition,
-    ReadConsistency, RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation,
-    StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
+    CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
+    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
+    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::{Deserialize, Serialize};
 
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
-    ActiveGenerationRegistryQuery,
+    ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
 };
 
 /// Governor's existing authenticated publish operation. The semantic
@@ -98,6 +99,23 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
 
+/// Response `kind` of the ORS process-stream recovery view (issue #269, I14.26).
+///
+/// Availability and the exact gap set, and nothing else: no stream bytes and no
+/// parser, evaluator, task or finish claim. It rides the same-fence
+/// `store_recovery` answer because that is the recovery readback the retained
+/// daemon client already performs, so the ORS half reaches its reader without a
+/// second recovery operation or a second dispatch vocabulary.
+#[cfg(windows)]
+const PROCESS_STREAM_RECOVERY_STATUS_KIND: &str = "process_stream_recovery_status";
+/// Per-operation status when ORS retained a readable recovery row.
+#[cfg(windows)]
+const PROCESS_STREAM_RECOVERY_RETAINED_KIND: &str = "retained";
+/// Per-operation status when ORS could not produce the row at all. The typed
+/// disposition beside it names which of the two failure classes it was.
+#[cfg(windows)]
+const PROCESS_STREAM_RECOVERY_UNREADABLE_KIND: &str = "unreadable";
+
 /// Authenticated P-07 root-transition activation route (`#2962`).
 ///
 /// A DISTINCT Kernel-owned front-door operation: the presented payload is the
@@ -128,6 +146,13 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+/// Typed refusal kind answered by the four P-07 authority arms (`#1110`).
+/// Refusals are completed application answers, never missing frames or receipts.
+const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
+/// I7.20 dispositions emitted only where the P-07 variant establishes a
+/// precise agent-facing classification.
+const P07_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
+const P07_DISPOSITION_RECOVERY_REQUIRED: &str = "RECOVERY_REQUIRED";
 /// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
 ///
 /// This is the exact string published as `USER_AUTOMATION_ROUTE` in
@@ -436,6 +461,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "origin_challenge_issue" => "origin_challenge_issue",
         "origin_control_decide" => "origin_control_decide",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
+        GENERATION_CUTOVER_OPERATION => GENERATION_CUTOVER_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -537,6 +563,25 @@ struct LocalReadOperation {
 #[serde(deny_unknown_fields)]
 struct StoreRecoveryOperation {
     request: StoreRecoveryRequest,
+    /// Issue #269 / I14.26: exact process-operation identities whose retained
+    /// ORS stream-recovery state the Kernel additionally serves on this
+    /// same-fence recovery read.
+    ///
+    /// The selector is a Kernel-owned field on the Kernel-owned carrier, not a
+    /// Store field, and it names a DIFFERENT identity space than
+    /// `request.records`: those are `(namespace, key)` Store recovery records,
+    /// while these are process-operation identities whose durable ORS key is
+    /// `(operation_id, stream)`. Reading one through the other would be a
+    /// category error, so the two never share a selector.
+    ///
+    /// `None` — the shape every existing caller sends — answers explicit `null`
+    /// and reads no ORS row, so this addition changes no existing answer and
+    /// costs the retained daemon no extra read. The selector is bounded by the
+    /// Store's own recovery-record denominator so the extra view can never grow
+    /// wider than the recovery packet it rides on, and every entry is proved as
+    /// a real ORS operation identity before the durable read.
+    #[serde(default)]
+    process_stream_recovery_operations: Option<Vec<String>>,
 }
 
 /// Closed Governor owner-bundle publish operation (`#2100`).
@@ -796,23 +841,111 @@ fn p07_binding_agrees_with_session(
     Ok(())
 }
 
-/// Maps one retained-port refusal to the typed dispatch failure. Admission
-/// refusals and an unready production route fail closed as fenced without
-/// minting authority; a binding that disagrees with retained owner state under
-/// a known identity (changed payload, stale revision, disagreeing material)
-/// conflicts so the caller re-serves fresh state instead of retrying blindly —
-/// the same contract as the owner-bundle publish arm. Only a possible commit
-/// with a lost acknowledgement surfaces as an unknown outcome for exact
-/// reconciliation.
-fn map_p07_port_error(error: &eliot_authority::P07PortError) -> TransportError {
+/// One P-07 refusal projected to the Kernel observation and a wire payload
+/// that preserves the exact P-07 variant. I7.20 fields are present only where
+/// the variant establishes a precise disposition and reason.
+struct P07PortRefusal {
+    transport: TransportError,
+    p07_error: &'static str,
+    snapshot_id: Option<String>,
+    disposition: Option<&'static str>,
+    reason_code: Option<&'static str>,
+}
+
+/// Maps one retained-port refusal to the existing typed dispatch failure and
+/// P-07 wire variant. Only identity conflict and unknown outcome establish an
+/// exact I7.20 classification here; only unknown outcome may report a possible
+/// commit, and it retains its original snapshot identity.
+fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
     match error {
-        eliot_authority::P07PortError::UnknownOutcome { .. } => TransportError::UnknownOutcome,
-        eliot_authority::P07PortError::InvalidBinding
-        | eliot_authority::P07PortError::IdentityConflict => TransportError::IdentityConflict,
-        eliot_authority::P07PortError::NotAdmitted | eliot_authority::P07PortError::Unavailable => {
-            TransportError::SessionFenced
-        }
+        eliot_authority::P07PortError::UnknownOutcome { snapshot_id } => P07PortRefusal {
+            transport: TransportError::UnknownOutcome,
+            p07_error: "UnknownOutcome",
+            snapshot_id: Some(snapshot_id.as_str().to_owned()),
+            disposition: Some(P07_DISPOSITION_RECOVERY_REQUIRED),
+            reason_code: Some(eliot_kernel_service::REASON_UNKNOWN_OUTCOME),
+        },
+        eliot_authority::P07PortError::IdentityConflict => P07PortRefusal {
+            transport: TransportError::IdentityConflict,
+            p07_error: "IdentityConflict",
+            snapshot_id: None,
+            disposition: Some(P07_DISPOSITION_STALE_OR_CONFLICT),
+            reason_code: Some(eliot_kernel_service::REASON_IDENTITY_CONFLICT),
+        },
+        eliot_authority::P07PortError::InvalidBinding => P07PortRefusal {
+            transport: TransportError::IdentityConflict,
+            p07_error: "InvalidBinding",
+            snapshot_id: None,
+            disposition: None,
+            reason_code: None,
+        },
+        eliot_authority::P07PortError::NotAdmitted => P07PortRefusal {
+            transport: TransportError::SessionFenced,
+            p07_error: "NotAdmitted",
+            snapshot_id: None,
+            disposition: None,
+            reason_code: None,
+        },
+        eliot_authority::P07PortError::Unavailable => P07PortRefusal {
+            transport: TransportError::SessionFenced,
+            p07_error: "Unavailable",
+            snapshot_id: None,
+            disposition: None,
+            reason_code: None,
+        },
     }
+}
+
+/// Completes a decided P-07 refusal as a normal, closed `WireOutcome` answer.
+/// A missing frame is indistinguishable from a lost acknowledgement and makes
+/// a refusal that certainly did not commit look like an unknown commit.
+fn p07_refusal_response(
+    operation: &'static str,
+    error: &eliot_authority::P07PortError,
+) -> serde_json::Value {
+    let refusal = map_p07_port_error(error);
+    super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(&refusal.transport));
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "kind": P07_AUTHORITY_REFUSAL_KIND,
+            "value": {
+                "disposition": refusal.disposition,
+                "reason_code": refusal.reason_code,
+                "p07_error": refusal.p07_error,
+                "snapshot_id": refusal.snapshot_id,
+                "operation": operation,
+            },
+        },
+        "recovery": null,
+    })
+}
+
+/// Builds the ordinary correlated response frame for a front-door P-07
+/// preflight refusal discovered before the owner port is called.
+fn p07_refusal_frame(
+    session: &Session,
+    request_id: RequestId,
+    operation: &'static str,
+    error: &eliot_authority::P07PortError,
+) -> Result<Frame, TransportError> {
+    let mut frame = status_frame(
+        session,
+        FrameKind::Response,
+        MessageType::Result,
+        p07_refusal_response(operation, error),
+    )?;
+    frame.request_id = Some(request_id);
+    frame.validate()?;
+    Ok(frame)
+}
+
+/// P-07 lifecycle targets are resolved against the owner-projected classes in
+/// the current `GrantGraph` snapshot; no second membership rule is introduced.
+#[derive(Clone, Copy, Debug)]
+enum P07LifecycleTarget<'a> {
+    Grant(&'a str),
+    Introduction(&'a str),
 }
 
 impl KernelComposition {
@@ -831,6 +964,61 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(guard)
+    }
+
+    /// Confirms that the exact grant or introduction and snapshot are present
+    /// in the current, internally consistent owner revision before mutation.
+    fn admit_p07_target_against_current_grant_graph(
+        &self,
+        target: P07LifecycleTarget<'_>,
+        snapshot_id: &str,
+    ) -> Result<(), eliot_authority::P07PortError> {
+        use eliot_kernel_core::RootGrantHydrationSource as _;
+
+        let guard = self
+            .p07_owner
+            .lock()
+            .map_err(|_| eliot_authority::P07PortError::Unavailable)?;
+        let Some(bound) = guard.as_ref() else {
+            return Err(eliot_authority::P07PortError::Unavailable);
+        };
+        let current_revision = bound.bound_revision();
+        if current_revision == 0 || bound.source().revision() != current_revision {
+            return Err(eliot_authority::P07PortError::Unavailable);
+        }
+        let admitted = match target {
+            P07LifecycleTarget::Grant(grant_id) => bound
+                .source()
+                .admitted_grant_hydrations()
+                .map_err(|_| eliot_authority::P07PortError::Unavailable)?
+                .into_iter()
+                .find(|hydration| hydration.intent.grant_id == grant_id)
+                .map(|hydration| {
+                    (
+                        hydration.intent.snapshot_id,
+                        hydration.intent.grant_graph_revision,
+                    )
+                }),
+            P07LifecycleTarget::Introduction(introduction_id) => bound
+                .source()
+                .admitted_introductions()
+                .map_err(|_| eliot_authority::P07PortError::Unavailable)?
+                .into_iter()
+                .find(|hydration| hydration.intent.introduction_id == introduction_id)
+                .map(|hydration| {
+                    (
+                        hydration.intent.snapshot_id,
+                        hydration.intent.grant_graph_revision,
+                    )
+                }),
+        };
+        let Some((admitted_snapshot_id, admitted_revision)) = admitted else {
+            return Err(eliot_authority::P07PortError::NotAdmitted);
+        };
+        if admitted_snapshot_id != snapshot_id || admitted_revision != current_revision {
+            return Err(eliot_authority::P07PortError::IdentityConflict);
+        }
+        Ok(())
     }
 }
 #[derive(Deserialize)]
@@ -1685,6 +1873,9 @@ impl KernelComposition {
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => {
                 self.generation_registry_active_query_operation(session, payload.clone())
             }
+            GENERATION_CUTOVER_OPERATION => {
+                self.generation_cutover_operation(session, payload.clone())
+            }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
             }
@@ -2461,6 +2652,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Grant(&operation.grant_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "activate_grant",
+                        &refusal,
+                    );
+                }
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -2475,15 +2677,21 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::activate_grant(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_activation_receipt",
-                    "value": value,
-                }))
+                match eliot_authority::P07AuthorityPort::activate_grant(bound.port(), &request) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_activation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("activate_grant", &refusal)),
+                }
             }
             "revoke_grant" => {
                 let operation: GrantRevocationOperation =
@@ -2493,6 +2701,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Grant(&operation.grant_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "revoke_grant",
+                        &refusal,
+                    );
+                }
                 let request = eliot_authority::GrantRevocationRequest {
                     grant_id: eliot_authority::GrantId::new(operation.grant_id)
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -2502,15 +2721,21 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::revoke_grant(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_revocation_receipt",
-                    "value": value,
-                }))
+                match eliot_authority::P07AuthorityPort::revoke_grant(bound.port(), &request) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_revocation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("revoke_grant", &refusal)),
+                }
             }
             "activate_introduction" => {
                 let operation: IntroductionActivationOperation =
@@ -2522,6 +2747,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Introduction(&operation.introduction_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "activate_introduction",
+                        &refusal,
+                    );
+                }
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -2538,17 +2774,24 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt = eliot_authority::P07AuthorityPort::activate_introduction(
+                match eliot_authority::P07AuthorityPort::activate_introduction(
                     bound.port(),
                     &request,
-                )
-                .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_activation_receipt",
-                    "value": value,
-                }))
+                ) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_activation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("activate_introduction", &refusal)),
+                }
             }
             "revoke_introduction" => {
                 let operation: IntroductionRevocationOperation =
@@ -2560,6 +2803,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Introduction(&operation.introduction_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "revoke_introduction",
+                        &refusal,
+                    );
+                }
                 let request = eliot_authority::IntroductionRevocationRequest {
                     introduction_id: eliot_authority::IntroductionId::new(
                         operation.introduction_id,
@@ -2571,15 +2825,22 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::revoke_introduction(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_revocation_receipt",
-                    "value": value,
-                }))
+                match eliot_authority::P07AuthorityPort::revoke_introduction(bound.port(), &request)
+                {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_revocation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("revoke_introduction", &refusal)),
+                }
             }
             ACTIVATE_ROOT_TRANSITION_OPERATION => {
                 let operation: RootTransitionActivationOperation =
@@ -2632,7 +2893,7 @@ impl KernelComposition {
                     bound.port(),
                     &request,
                 )
-                .map_err(|error| map_p07_port_error(&error))?;
+                .map_err(|error| map_p07_port_error(&error).transport)?;
                 receipt
                     .validate(&request)
                     .map_err(|_| TransportError::SessionFenced)?;
@@ -5082,6 +5343,40 @@ impl KernelComposition {
         })
     }
 
+    /// Drives one authenticated generation cutover through the Kernel's sole
+    /// semantic gateway and projects the gateway's own terminal code back on
+    /// the authenticated reply.
+    ///
+    /// The operation selector only picks this entry. The closed request carries
+    /// a cutover identity and the admitted session State Fence and nothing
+    /// else, so the generation, epoch, route scope, and cutover state all come
+    /// from the owner's committed ORS cutover-ownership record inside
+    /// [`super::generation_control::KernelComposition::apply_authenticated_generation_cutover`].
+    /// A malformed request, a fence that is not the exact admitted session
+    /// fence, an absent record, a non-committed record, or a stale/foreign epoch
+    /// fences the session with the exact typed transport error; none of them
+    /// fabricates a cutover or a success answer.
+    fn generation_cutover_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: GenerationCutoverRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let outcome = self
+            .apply_authenticated_generation_cutover(
+                &request,
+                &session.module_generation.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": outcome,
+            "recovery": null,
+        }))
+    }
+
     /// Consumes the authenticated Governor startup receipt without importing
     /// the bin-owned `CapabilityOutcome`. The carrier is only a mechanical
     /// evidence boundary: missing canonical Policy/R2 semantic owner reads
@@ -5365,6 +5660,18 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
+        // Rejection before reading, exactly as the sibling routes do it: the
+        // process-stream selector is proved here, while it is still pure, so a
+        // blank, unusable or over-bound entry never reaches the gateway or the
+        // retained ORS.
+        let stream_identities = match Self::admit_process_stream_recovery_operations(
+            operation.process_stream_recovery_operations.as_deref(),
+        ) {
+            Ok(identities) => identities,
+            Err(reason) => {
+                return Ok(Self::store_error_response_text("store_recovery", &reason));
+            }
+        };
         let gateway = self.retained_store_gateway()?;
         match gateway.recovery(operation.request).await {
             Ok(snapshot) => {
@@ -5375,10 +5682,111 @@ impl KernelComposition {
                 // reconciled before normal writes are enabled.
                 self.record_startup_evidence(6)
                     .map_err(|_| TransportError::SessionFenced)?;
-                Ok(store_recovery_response(&snapshot))
+                Ok(store_recovery_response(
+                    &snapshot,
+                    &self.process_stream_recovery_status_view(&stream_identities),
+                ))
             }
             Err(error) => Ok(Self::store_error_response_text("store_recovery", &error)),
         }
+    }
+
+    /// Proves the process-stream recovery selector before any durable read.
+    ///
+    /// Pure, so an empty, over-bound or unusable selector is refused here rather
+    /// than after the Store recovery has already answered. An absent selector is
+    /// the existing caller's shape and yields an empty view, which the response
+    /// projects as explicit `null` rather than as an empty family.
+    #[cfg(windows)]
+    fn admit_process_stream_recovery_operations(
+        requested: Option<&[String]>,
+    ) -> Result<Vec<eliot_ors::OperationIdentity>, String> {
+        let Some(requested) = requested else {
+            return Ok(Vec::new());
+        };
+        if requested.is_empty() {
+            return Err(
+                "process_stream_recovery_operations must name at least one operation".to_owned(),
+            );
+        }
+        if requested.len() > MAX_RECOVERY_OWNER_RECORDS {
+            return Err(format!(
+                "process_stream_recovery_operations exceeds the bounded recovery denominator of {MAX_RECOVERY_OWNER_RECORDS}"
+            ));
+        }
+        requested
+            .iter()
+            .map(|value| {
+                eliot_ors::OperationIdentity::new(value.clone())
+                    .map_err(|error| format!("process_stream_recovery_operations: {error}"))
+            })
+            .collect()
+    }
+
+    /// Serves the ORS process-stream recovery status for the selected
+    /// operations (issue #269 W6, I14.26).
+    ///
+    /// I14.26 states that the Kernel assembles the recovery view from ORS, and
+    /// the retained daemon client already reads recovery status on this exact
+    /// operation, so the ORS half is served beside the Store snapshot rather
+    /// than through a second recovery vocabulary.
+    ///
+    /// Three properties are load-bearing and none of them is a claim about
+    /// stream content:
+    ///
+    /// - The durable read is
+    ///   [`RedbRecoveryStore::process_stream_recovery_status`] and the projection
+    ///   is the ORS-owned [`eliot_ors::ProcessStreamRecoveryStatusProjection`].
+    ///   Nothing is recomputed here: availability, the exact gap set, the
+    ///   immutable locator handle, the ready-receipt handle, the exact durable
+    ///   coverage and both typed state axes are copied field for field.
+    /// - No raw bytes cross. The ORS view has no byte-bearing field at all, so
+    ///   stdout/stderr payload is structurally absent from the answer rather
+    ///   than redacted from it.
+    /// - No semantic proof is asserted. There is no parser, evaluator, task or
+    ///   finish field to project, `evidence_scope` is a single-variant value
+    ///   that names exactly bytes-and-coverage, and `reports_complete_evidence`
+    ///   is ORS's own conjunction over the copied typed axes.
+    ///
+    /// An unreadable row is answered as ORS's own typed disposition
+    /// (codec-version mismatch versus interrupted read) instead of being
+    /// flattened into a transport error, so a caller can tell a stale codec from
+    /// an interrupted read, and an empty stream list means ORS retains no row
+    /// for that operation — never that the operation had no streams.
+    #[cfg(windows)]
+    fn process_stream_recovery_status_view(
+        &self,
+        identities: &[eliot_ors::OperationIdentity],
+    ) -> serde_json::Value {
+        if identities.is_empty() {
+            return serde_json::Value::Null;
+        }
+        let operations = identities
+            .iter()
+            .map(|identity| {
+                let status = match self.p07_ors.process_stream_recovery_status(identity) {
+                    Ok(views) => serde_json::json!({
+                        "kind": PROCESS_STREAM_RECOVERY_RETAINED_KIND,
+                        "streams": views
+                            .iter()
+                            .map(process_stream_recovery_stream_view)
+                            .collect::<Vec<_>>(),
+                    }),
+                    Err(error) => serde_json::json!({
+                        "kind": PROCESS_STREAM_RECOVERY_UNREADABLE_KIND,
+                        "disposition": process_stream_recovery_load_disposition(&error),
+                    }),
+                };
+                serde_json::json!({
+                    "operation_id": identity.as_str(),
+                    "status": status,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "kind": PROCESS_STREAM_RECOVERY_STATUS_KIND,
+            "operations": operations,
+        })
     }
 
     #[cfg(not(windows))]
@@ -6288,9 +6696,10 @@ impl KernelComposition {
     /// real ordinary request reaches the host request loop; a refused start
     /// fails the operation closed (the staged set stays for the delivery
     /// owner — cleanup is `#2786` territory, never an invented delete
-    /// here). The computed one-shot join gate is projected into the receipt
-    /// so the live join table can close over it; no second registry is
-    /// retained here.
+    /// here). The computed one-shot join gate is projected into the receipt,
+    /// and the composition-retained join table holds the one-shot
+    /// consumption across calls, so an exact same-delivery replay answers
+    /// spent state instead of relaunching the guest.
     #[allow(
         clippy::too_many_lines,
         reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, demand-start, and receipt projection in one audited order"
@@ -6425,27 +6834,55 @@ impl KernelComposition {
             }
             Err(_) => return Err(TransportError::SessionFenced),
         };
-        // Launch-gate admission (#2786 step 8): the staged bundle executes
-        // only against its matching owner join/grant. Expiry is re-verified
-        // at launch instant (closing the validation-to-start window), so
-        // this is a real expiry gate (`Stale` can fire here); anything else
-        // fails closed before the child starts. The join table above is
-        // function-local and dropped after this op, so the one-shot
-        // consumption by this admission is per-op only and buys zero
-        // cross-call replay protection: a repeated call with the same
-        // delivery re-arms the join through the same-delivery replay path
-        // and relaunches the guest (a second guest effect). Cross-call
-        // duplicate suppression depends on the host-half claim dedup, not
-        // on this table.
-        joins
-            .admit_claim(
+        // Launch-gate admission (#2786 steps 3 and 8): the staged bundle
+        // executes only against its matching owner join/grant. The local
+        // table above stays publish scratch (file staging never runs under
+        // the retained lock); the published bundle merges into the
+        // composition-retained join table and admits under one short lock
+        // holding no file I/O and never crossing an await, so concurrent
+        // same-delivery calls linearize here: the first consumes the
+        // one-shot admission and any exact replay observes the spent
+        // record. Expiry is re-verified at launch instant (closing the
+        // validation-to-start window), so this is a real expiry gate
+        // (`Stale` can fire here). A failed launch stays consumed — an
+        // unknown outcome reconciles, it is never blindly retried under
+        // the same delivery — and recovery resubmits under fresh claim
+        // authority (#2786 A7). Anything else fails closed before the
+        // child starts.
+        let admission = {
+            let mut retained = self
+                .wasm_join_table
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let now_ms = unix_ms();
+            retained.prune(now_ms);
+            retained.register_delivery(&bundle.join, &bundle.delivery);
+            retained.admit_claim(
                 bundle.material.claim_id.as_str(),
                 bundle.material.operation_id.as_str(),
                 bundle.join.invocation_digest.as_str(),
                 bundle.delivery.envelope_digest.as_str(),
-                unix_ms(),
+                now_ms,
             )
-            .map_err(|_| TransportError::SessionFenced)?;
+        };
+        match admission {
+            Ok(()) => {}
+            // Same-delivery replay (#2786 step 3): the retained spent
+            // record stands and no second guest effect starts. The caller
+            // receives the exact spent identity, never a fresh launch.
+            Err(eliot_kernel_service::JoinDeny::Replayed) => {
+                return Ok(serde_json::json!({
+                    "kind": "wasm_dispatch_replay",
+                    "value": {
+                        "claim_id": bundle.material.claim_id,
+                        "operation_id": bundle.material.operation_id,
+                        "expires_at": bundle.join.expires_at,
+                        "retry_condition": "resubmit under fresh claim authority",
+                    },
+                }));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        }
         let material_digest = sha256_hex(
             &eliot_kernel_service::material_bytes(&bundle.material)
                 .map_err(|_| TransportError::SessionFenced)?,
@@ -7443,10 +7880,81 @@ fn validate_store_session_fence(
     Ok(())
 }
 
-fn store_recovery_response(snapshot: &StoreRecoverySnapshot) -> serde_json::Value {
+/// Projects one ORS process-stream recovery view onto the wire (issue #269).
+///
+/// Every value is the ORS view's own field, serialized by ORS's own
+/// `Serialize` impls, so the Kernel neither re-derives nor reshapes it. `None`
+/// stays an explicit `null` rather than an omitted key (I5.16), and the
+/// `reports_complete_evidence` flag is ORS's own conjunction over the typed axes
+/// that are projected beside it — it is a mechanical restatement, never an
+/// independent judgement about the stream.
+#[cfg(windows)]
+fn process_stream_recovery_stream_view(
+    view: &eliot_ors::ProcessStreamRecoveryStatusProjection,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": view.operation_id,
+        "stream": view.stream,
+        "transport": view.transport,
+        "persistence": view.persistence,
+        "availability": view.availability,
+        "durable_locator": view.durable_locator,
+        "ready_receipt_ref": view.ready_receipt_ref,
+        "durable_coverage": view.durable_coverage,
+        "gaps": view.gaps,
+        "reconciliation": view.reconciliation,
+        "activation": view.activation,
+        "evidence_scope": view.evidence_scope,
+        "reports_complete_evidence": view.reports_complete_evidence(),
+    })
+}
+
+/// Projects ORS's typed recovery-load disposition without collapsing it.
+///
+/// The two variants stay distinguishable on the wire, because they call for
+/// different actions: a codec-version mismatch means this ORS build must not
+/// read the row at all, while an interrupted read means the row itself is not
+/// currently readable. Neither becomes a generic code or a bare string.
+#[cfg(windows)]
+fn process_stream_recovery_load_disposition(
+    error: &eliot_ors::ProcessStreamRecoveryLoadError,
+) -> serde_json::Value {
+    match error {
+        eliot_ors::ProcessStreamRecoveryLoadError::CodecVersionMismatch { found, current } => {
+            serde_json::json!({
+                "kind": "codec_version_mismatch",
+                "found_contract_version": found,
+                "current_contract_version": current,
+            })
+        }
+        eliot_ors::ProcessStreamRecoveryLoadError::InterruptedRead { reason } => {
+            serde_json::json!({
+                "kind": "interrupted_read",
+                "reason": reason,
+            })
+        }
+    }
+}
+
+/// Same-fence Store recovery answer, plus the ORS process-stream recovery view.
+///
+/// The extra `process_stream_recovery` member is a SIBLING of `kind`/`value`
+/// inside the typed application object, so the retained daemon client's
+/// `kind_value` reader — which resolves `kind` then `value` by name — keeps
+/// decoding the identical `StoreRecoverySnapshot` it always did. It is explicit
+/// `null` when the request selected no operation (I5.16: a field that does not
+/// apply stays explicit `None`), never omitted, so the answer shape is stable.
+fn store_recovery_response(
+    snapshot: &StoreRecoverySnapshot,
+    process_stream_recovery: &serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
-        "value": { "kind": "store_recovery", "value": snapshot },
+        "value": {
+            "kind": "store_recovery",
+            "value": snapshot,
+            "process_stream_recovery": process_stream_recovery,
+        },
         "recovery": null,
     })
 }

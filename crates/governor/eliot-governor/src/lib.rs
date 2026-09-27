@@ -61,6 +61,7 @@ mod controlboard_projection;
 mod learning_admission;
 mod learning_closure;
 mod learning_delta_integration;
+mod learning_promotion;
 mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_closure_feed;
@@ -133,6 +134,11 @@ pub use learning_delta_integration::{
     retry_canonical_evidence_for_delta, retry_lineage_for_delta, store_attempt_close,
     store_derived_delta, verify_delta_delivery,
 };
+pub use learning_promotion::{
+    LearningPromotionError, LearningPromotionOutcome, PromotionAdmissionReceipt,
+    PromotionBoundaryInput, PromotionEvaluationInput, PromotionRefusal, evaluate_promotion,
+    rollback_promotion,
+};
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
@@ -173,7 +179,9 @@ pub use swarm_plan_attachment_service::{
     ATTACHMENT_ORDERING_SCOPE, ATTACHMENT_REVISION_KEY, CanonicalAttachmentStoreError,
     CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
 };
-pub use task_lifecycle::{GovernorTaskLifecycle, GuardedTaskCommand, TaskLifecycleError};
+pub use task_lifecycle::{
+    GovernorTaskLifecycle, GuardedTaskCommand, PreparedTaskTransition, TaskLifecycleError,
+};
 pub use wasm_resolution::{
     CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
     GovernorWasmAdmission, PromotionExpectations,

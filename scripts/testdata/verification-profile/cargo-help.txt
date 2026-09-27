@@ -61,6 +61,12 @@
 #       --workspace         Test all packages in the workspace
 #       --exclude <SPEC>    Exclude packages from the test
 #
+# --- cargo test --help (Target Selection / Execution excerpts, issue #3004) ---
+# Captured with: cargo test --help (same pinned cargo 1.97.1). Proves the
+# compile-only MergeCompile gate flags.
+#       --all-targets       Test all targets (does not include doctests)
+#       --no-run                   Compile, but don't run tests
+#
 # NOTE: both `cargo metadata --locked --format-version 1` (issue text) and
 # `cargo metadata --locked --no-deps --format-version 1` (base) use only flags
 # proven above. The --no-deps choice is WRITER-A's per #815; it is not decided

@@ -11,6 +11,7 @@ eliot-contracts.workspace = true
 eliot-protocol.workspace = true
 eliot-skills.workspace = true
 eliot-store-api.workspace = true
+eliot-workscope.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

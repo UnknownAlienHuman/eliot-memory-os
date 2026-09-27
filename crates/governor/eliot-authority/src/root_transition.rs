@@ -47,7 +47,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::grants::{CapabilityGrant, effect_rank};
-use crate::{AuthorityError, validate_digest, validate_text};
+use crate::{AuthorityError, SnapshotId, validate_digest, validate_text};
 
 /// Closed operation kind of every authenticated root transition, part of the
 /// canonical request preimage so this operation can never collide with another
@@ -204,6 +204,7 @@ pub struct RootTransitionActivationRequest {
     record: RootTransitionRecord,
     subject: AuthorityRequestSubject,
     canonical_request_digest: String,
+    snapshot_id: SnapshotId,
 }
 
 /// Canonical preimage of one root-transition request. Private on purpose: it
@@ -232,10 +233,12 @@ impl RootTransitionActivationRequest {
             .validate()
             .map_err(|_| AuthorityError::InvalidField("root_transition.subject"))?;
         let canonical_request_digest = canonical_request_digest(&record, &subject)?;
+        let snapshot_id = SnapshotId::new(record.graph_snapshot_id.clone())?;
         Ok(Self {
             record,
             subject,
             canonical_request_digest,
+            snapshot_id,
         })
     }
 
@@ -262,6 +265,20 @@ impl RootTransitionActivationRequest {
     #[must_use]
     pub fn graph_snapshot_id(&self) -> &str {
         self.record.graph_snapshot_id.as_str()
+    }
+
+    /// Typed retention-ledger snapshot identity of this presentation. It is
+    /// parsed from the validated `graph_snapshot_id`, so the Governor retains
+    /// and reconciles the exact presented operation under one identity.
+    #[must_use]
+    pub const fn snapshot_id(&self) -> &SnapshotId {
+        &self.snapshot_id
+    }
+
+    /// Authority binding carried by this presentation.
+    #[must_use]
+    pub const fn binding(&self) -> &AuthorityBinding {
+        &self.record.binding
     }
 
     /// Retention-ledger key of this presentation. Namespacing transitions from

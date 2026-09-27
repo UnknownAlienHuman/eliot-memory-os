@@ -223,7 +223,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify manual-only policy, profile wiring, least privilege, cache safety, source-candidate identity
+      - name: Verify workflow trigger policy, profile wiring, least privilege, cache safety, source-candidate identity
         shell: bash
         run: |
           set -euo pipefail
@@ -261,12 +261,18 @@ jobs:
           if not workflows:
               fail('TRIGGER', 'no workflow files found')
 
-          # Manual-only policy: every repository workflow dispatches by hand.
+          # Closed per-workflow trigger policy (accepted issue #3004):
+          # workflow_dispatch-only default; ci.yml is the sole automatic
+          # exception with main-scoped pull_request/push.
+          trigger_policy = {
+              'ci.yml': ['workflow_dispatch', 'pull_request', 'push'],
+          }
           for path in workflows:
               text = path.read_text(encoding='utf-8')
               children = on_children(text)
-              if children != ['workflow_dispatch']:
-                  fail('TRIGGER', f'{path.as_posix()} on-children={children}')
+              expected = trigger_policy.get(path.name, ['workflow_dispatch'])
+              if children != expected:
+                  fail('TRIGGER', f'{path.as_posix()} on-children={children} expected={expected}')
 
           ci = pathlib.Path('.github/workflows/ci.yml').read_text(encoding='utf-8')
           policy_text = pathlib.Path('.github/workflows/repository-policy.yml').read_text(encoding='utf-8')
@@ -274,14 +280,41 @@ jobs:
           just = pathlib.Path('Justfile').read_text(encoding='utf-8')
           verify = pathlib.Path('scripts/verify.ps1').read_text(encoding='utf-8')
 
-          # Exact wiring: one identical Review invocation, closed profiles only.
-          review_invocation = 'pwsh -NoProfile -File scripts/verify.ps1 -Profile Review'
-          if ci.count(review_invocation) != 1:
-              fail('WIRING', 'ci.yml must invoke the Review profile exactly once')
-          for occurrence in re.finditer(r'scripts/verify\.ps1[^\n]*', ci):
-              if '-Profile Review' not in occurrence.group(0):
-                  fail('WIRING', 'ci.yml has a verify.ps1 reference outside -Profile Review')
-          for recipe, marker in (('verify', '-Profile Review'), ('verify-review', '-Profile Review'), ('verify-list', '-List')):
+          # ci.yml exception scope: main-only automatic events, required PR
+          # activity coverage, no wider trigger classes, no dispatch inputs.
+          if ci.count('branches: [main]') != 2:
+              fail('TRIGGER', 'ci.yml pull_request/push must each target branches [main]')
+          for banned_trigger in ('pull_request_target', 'schedule:', 'release:', 'merge_group', 'workflow' + '_call', 'repository_dispatch'):
+              if banned_trigger in ci:
+                  fail('TRIGGER', f'ci.yml carries forbidden trigger {banned_trigger}')
+          for required_type in ('opened', 'synchronize', 'reopened', 'ready_for_review'):
+              if required_type not in ci:
+                  fail('TRIGGER', f'ci.yml pull_request misses required type {required_type}')
+
+          # Exact wiring: one MergeCompile invocation in ci.yml, closed
+          # profiles only; Justfile keeps its Review aliases plus the
+          # merge-compile alias.
+          mergecompile_invocation = 'pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile'
+          if ci.count(mergecompile_invocation) != 1:
+              fail('WIRING', 'ci.yml must invoke the MergeCompile profile exactly once')
+          verify_refs = [ln for ln in ci.splitlines() if 'verify.ps1' in ln]
+          if len(verify_refs) != 5:
+              fail('WIRING', 'ci.yml must reference verify.ps1 on exactly 5 lines (invocation, cache binding, receipt digest, owner mention, inputs digest)')
+          for line in verify_refs:
+              if 'run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile' in line:
+                  continue
+              if 'hashFiles' in line and 'scripts/verify.ps1' in line:
+                  continue
+              if 'Get-FileHash scripts/verify.ps1' in line:
+                  continue
+              if 'gate-definition owner scripts/verify.ps1' in line:
+                  continue
+              if 'verify.ps1=$profileHash' in line:
+                  continue
+              fail('WIRING', 'ci.yml has a verify.ps1 reference outside the closed roles')
+          if '-Profile Review' in ci or '-Profile Quick' in ci:
+              fail('WIRING', 'ci.yml must not select the Review/Quick profiles')
+          for recipe, marker in (('verify', '-Profile Review'), ('verify-review', '-Profile Review'), ('verify-list', '-List'), ('merge-compile', '-Profile MergeCompile')):
               block = re.search(rf'(?m)^{recipe}:\s*\n((?:[ \t]+[^\n]*\n?)+)', just)
               if not block or marker not in block.group(1):
                   fail('WIRING', f'Justfile {recipe} must select {marker}')
@@ -305,8 +338,8 @@ jobs:
                       fail('WIRING', f'just quick must not carry Review-only marker {banned}')
 
           # verify.ps1 owns the closed profiles; retired skips stay rejected.
-          if "[ValidateSet('Quick', 'Review')]" not in verify:
-              fail('WIRING', 'verify.ps1 must own the closed Quick/Review profiles')
+          if "[ValidateSet('Quick', 'Review', 'MergeCompile')]" not in verify:
+              fail('WIRING', 'verify.ps1 must own the closed Quick/Review/MergeCompile profiles')
           if 'SkipCargoCheck' not in verify or 'VERIFY_REJECTED' not in verify:
               fail('WIRING', 'verify.ps1 must explicitly reject the retired skip switch')
           if 'SkipCargoCheck' in just or 'SkipCargoCheck' in ci:
@@ -327,6 +360,29 @@ jobs:
           elif any(later <= earlier for earlier, later in zip(positions, positions[1:])):
               fail('WIRING', 'Review cargo tail is out of order')
 
+          # MergeCompile tail order inside the single gate-definition owner:
+          # denominator, no-run test compile, bounded changed-package clippy,
+          # standalone compile, locked Operator restore/build. Zero execution
+          # and no lint oracle anywhere in the compile-only class.
+          merge_tail = [
+              "Name = 'cargo-denominator'",
+              'cargo test --locked --workspace --all-targets --no-run',
+              "Name = 'cargo-clippy-changed'",
+              '--mode compile',
+              'dotnet restore',
+              'dotnet build',
+          ]
+          merge_positions = [verify.find(anchor) for anchor in merge_tail]
+          if any(pos < 0 for pos in merge_positions):
+              fail('WIRING', 'MergeCompile tail has a missing gate definition')
+          elif any(later <= earlier for earlier, later in zip(merge_positions, merge_positions[1:])):
+              fail('WIRING', 'MergeCompile tail is out of order')
+          for execution_marker in ('dotnet run', 'dotnet test'):
+              if execution_marker in verify or execution_marker in ci:
+                  fail('WIRING', f'compile-only class must not execute tests ({execution_marker})')
+          if 'MERGE_COMPILE_SOURCE_ONLY' not in verify or 'MERGE_COMPILE_SOURCE_ONLY' not in ci:
+              fail('WIRING', 'MergeCompile proof ceiling marker is missing')
+
           # Least privilege on owned workflows (checks run against file
           # content, so this step's own source must also stay clean).
           for name, text in (('ci.yml', ci), ('repository-policy.yml', policy_text), ('source-candidate.yml', sc_text)):
@@ -341,10 +397,28 @@ jobs:
               if 'continue-' + 'on-error' in text:
                   fail('WIRING', f'{name} must not soften gate failure')
 
-          # Cache safety: key binds OS, lockfile, and profile; one ungated run.
+          # Cache safety: key binds OS, toolchain, lockfile, profile, and
+          # event class; fork PRs restore without saving; one ungated run.
           key_lines = [line for line in ci.splitlines() if 'hashFiles' in line and 'Cargo.lock' in line]
-          if len(key_lines) != 1 or 'runner.os' not in key_lines[0] or 'review' not in key_lines[0].lower():
+          if len(key_lines) != 1 or 'runner.os' not in key_lines[0] or 'mergecompile' not in key_lines[0].lower():
               fail('CACHE', 'ci cache key must bind OS, lockfile, and profile')
+          if len(key_lines) == 1 and 'rust-toolchain.toml' not in key_lines[0]:
+              fail('CACHE', 'ci cache key must bind the toolchain identity')
+          if 'lookup-only' not in ci or 'fork' not in ci:
+              fail('CACHE', 'ci must restore caches without saving for fork pull requests')
+
+          # Event-specific cancellation and candidate binding: PR updates
+          # cancel only their own PR line; main pushes and manual runs keep
+          # terminal results; the exact candidate identity is recorded.
+          cancel_match = re.search(r'(?m)^\s*cancel-in-progress:\s*(.+)$', ci)
+          if not cancel_match or 'github.event_name' not in cancel_match.group(1):
+              fail('CANCELLATION', 'ci cancel-in-progress must be event-specific (PR-only)')
+          if 'github.event.pull_request.number' not in ci:
+              fail('CANCELLATION', 'ci concurrency group must separate PR lines by number')
+          if 'MERGE_COMPILE_BASE_SHA' not in ci or 'pull_request.base.sha' not in ci:
+              fail('CANDIDATE', 'ci must bind the exact integration candidate identity')
+          if 'HEAD^{tree}' not in ci:
+              fail('CANDIDATE', 'ci must record the checked-out candidate tree')
 
           # Source-candidate identity by structure, not by frozen hash: the
           # candidate gate keeps its manual trigger, pinned actions, minimal

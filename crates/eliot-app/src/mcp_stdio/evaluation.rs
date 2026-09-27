@@ -137,6 +137,22 @@ pub(super) fn dispatch_eval_baseline_list(state: &McpState, arguments: Value) ->
     let input: EvalSuiteToolInput = serde_json::from_value(arguments)?;
     let artifacts =
         mcp_eval_artifacts(state, input.suite.as_deref().unwrap_or("core-smoke"), None)?;
+    // Surface the retained registry when one exists so list and compare
+    // agree (issue #1922 reachability). A retained registry is read-only
+    // here and never rewritten: MCP has no baseline-approval authority.
+    // Without one, report the same-run diagnostic explicitly as such.
+    if let Some(retained) = mcp_retained_baselines_report(state) {
+        let report = json!({
+            "component": "eval_baselines",
+            "bounded": true,
+            "no_mutation_authority": true,
+            "baseline_create_exposed": false,
+            "baselines": retained.get("baselines").cloned().unwrap_or(Value::Null),
+            "active": retained.get("active").cloned().unwrap_or(Value::Null),
+            "report_ref": state.root.join("reports").join("eval-baselines").join("latest.json")
+        });
+        return Ok(report);
+    }
     let baseline = mcp_diagnostic_baseline(&artifacts);
     let report = json!({
         "component": "eval_baselines",
@@ -162,11 +178,18 @@ pub(super) fn dispatch_eval_compare(state: &McpState, arguments: Value) -> Resul
     {
         anyhow::bail!("only latest eval run or its id is available through MCP");
     }
-    let baseline = mcp_diagnostic_baseline(&artifacts);
+    // Compare against the retained registry baseline, never a diagnostic
+    // of this same run: a same-run baseline shares the candidate's
+    // identity by construction, so drift could never be detected (issue
+    // #1922 reachability). MCP stays read-only: without a retained
+    // baseline this honestly refuses instead of self-comparing.
+    let baseline = mcp_retained_baseline(state)?;
     if input.baseline.as_deref().is_some_and(|baseline_ref| {
         baseline_ref != "latest" && baseline_ref != baseline.baseline_id.as_str()
     }) {
-        anyhow::bail!("only latest diagnostic baseline or its id is available through MCP");
+        anyhow::bail!(
+            "only the retained active baseline (latest) or its id is available through MCP"
+        );
     }
     let comparison = EvalComparisonService::compare(
         &artifacts.suite,
@@ -198,7 +221,10 @@ pub(super) fn dispatch_eval_gate(state: &McpState, arguments: Value) -> Result<V
     let profile_id = input.profile.as_deref().unwrap_or("fast-deterministic");
     let profile = EvalGateProfileService::find(profile_id)
         .with_context(|| format!("unknown eval gate profile: {profile_id}"))?;
-    let baseline = mcp_diagnostic_baseline(&artifacts);
+    // Gate against the retained registry baseline for the same reason
+    // as compare above: a same-run diagnostic baseline could never be
+    // stale (issue #1922 reachability).
+    let baseline = mcp_retained_baseline(state)?;
     let comparison = EvalComparisonService::compare(
         &artifacts.suite,
         &baseline,
@@ -554,6 +580,37 @@ fn mcp_diagnostic_baseline(artifacts: &McpEvalArtifacts) -> EvalBaseline {
         &artifacts.verdict,
         "mcp-read-only",
     )
+}
+
+/// Read the retained eval-baselines registry when the CLI (or another
+/// authorized writer) left one with a non-null `active` baseline. Returns
+/// `None` when no such registry exists, including when the file holds only
+/// this module's own same-run diagnostic (`active: null`), which must
+/// never feed a drift-detecting comparison.
+fn mcp_retained_baselines_report(state: &McpState) -> Option<Value> {
+    let path = state
+        .root
+        .join("reports")
+        .join("eval-baselines")
+        .join("latest.json");
+    let bytes = std::fs::read(path).ok()?;
+    let report: Value = serde_json::from_slice(&bytes).ok()?;
+    match report.get("active") {
+        Some(active) if !active.is_null() => Some(report),
+        _ => None,
+    }
+}
+
+/// Resolve the retained active baseline for drift-detecting compare/gate
+/// paths. Fails closed (never a same-run diagnostic) when no retained
+/// baseline exists or the retained entry does not parse.
+fn mcp_retained_baseline(state: &McpState) -> Result<EvalBaseline> {
+    let report = mcp_retained_baselines_report(state).with_context(|| {
+        "no retained eval baseline: create one via CLI `eval baseline create`, then retry; MCP cannot approve baselines"
+            .to_owned()
+    })?;
+    let active = report.get("active").cloned().unwrap_or(Value::Null);
+    serde_json::from_value(active).context("retained eval baseline entry does not parse")
 }
 
 fn mcp_eval_artifacts(

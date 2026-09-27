@@ -29,6 +29,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+use eliot_agent_coordinator::ProviderAccountCommand;
 use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelCatalogueSnapshot, ModelRole};
 use eliot_contracts::{OperationId, RequestMetadata, SessionId};
 use eliot_evaluation_contracts::ObjectiveStatus;
@@ -137,6 +138,7 @@ pub enum ActionCapability {
     ReplaceSwarmPolicy,
     RequestSwarmLaunch,
     CancelSwarmAttempt,
+    BoundedMonitorSwarm,
 }
 
 /// Visibility selector attached by the canonical owner.
@@ -796,6 +798,12 @@ pub enum OperatorAction {
         attempt_id: String,
         reason: String,
     },
+    BoundedMonitorSwarm {
+        watch_id: String,
+        account_scope: String,
+        bound_unix_ms: u64,
+        reason: String,
+    },
 }
 
 impl OperatorAction {
@@ -834,6 +842,7 @@ impl OperatorAction {
             Self::ReplaceSwarmPolicy { policy, .. } => &policy.policy_id,
             Self::RequestSwarmLaunch { task_id, .. } => task_id,
             Self::CancelSwarmAttempt { attempt_id, .. } => attempt_id,
+            Self::BoundedMonitorSwarm { watch_id, .. } => watch_id,
             Self::StartQuery { query_kind } => query_kind,
         }
     }
@@ -874,6 +883,21 @@ impl OperatorAction {
             Self::CancelSwarmAttempt { attempt_id, .. } => {
                 text(attempt_id, "action.attempt_id")?;
             }
+            Self::BoundedMonitorSwarm {
+                watch_id,
+                account_scope,
+                bound_unix_ms,
+                reason,
+            } => {
+                ProviderAccountCommand::BoundedMonitor {
+                    watch_id: watch_id.clone(),
+                    account_scope: account_scope.clone(),
+                    bound_unix_ms: *bound_unix_ms,
+                    reason: reason.clone(),
+                }
+                .validate()
+                .map_err(|_| ControlBoardError::InvalidField("action.bounded_monitor"))?;
+            }
         }
         for value in self.textual_reasons() {
             text(value, "action.reason")?;
@@ -888,7 +912,8 @@ impl OperatorAction {
             | Self::ResolveReview { reason, .. }
             | Self::RejectReview { reason, .. }
             | Self::RefreshSwarmCatalogue { reason, .. }
-            | Self::CancelSwarmAttempt { reason, .. } => vec![reason],
+            | Self::CancelSwarmAttempt { reason, .. }
+            | Self::BoundedMonitorSwarm { reason, .. } => vec![reason],
             Self::ReplanTask { rationale, .. } | Self::ChallengeRule { rationale, .. } => {
                 vec![rationale]
             }
@@ -1126,6 +1151,7 @@ impl OperatorAction {
             Self::ReplaceSwarmPolicy { .. } => ActionCapability::ReplaceSwarmPolicy,
             Self::RequestSwarmLaunch { .. } => ActionCapability::RequestSwarmLaunch,
             Self::CancelSwarmAttempt { .. } => ActionCapability::CancelSwarmAttempt,
+            Self::BoundedMonitorSwarm { .. } => ActionCapability::BoundedMonitorSwarm,
         }
     }
 }
@@ -1631,6 +1657,9 @@ fn validate_action_target(
     view: &ControlBoardView,
     action: &OperatorAction,
 ) -> Result<(), ControlBoardError> {
+    if matches!(action, OperatorAction::BoundedMonitorSwarm { .. }) {
+        return Err(ControlBoardError::InvalidField("action.kind"));
+    }
     if matches!(action, OperatorAction::StartQuery { .. }) {
         return Ok(());
     }
