@@ -5158,7 +5158,7 @@ impl KernelComposition {
                 resolution,
                 &publication,
                 &requested_occurrence_ids,
-                acknowledgement,
+                &acknowledgement,
             ),
             Err(error) => {
                 let reason = error.to_string();
@@ -5238,7 +5238,7 @@ impl KernelComposition {
         resolution: &UserAutomationDueWakeResolution,
         publication: &UserAutomationWakeHorizonPublication,
         requested_occurrence_ids: &[String],
-        acknowledgement: UserAutomationWakePublication,
+        acknowledgement: &UserAutomationWakePublication,
     ) -> UserAutomationHorizonPhase {
         if let Err(error) = acknowledgement.validate_for(publication) {
             return Self::user_automation_unacknowledged_horizon(
@@ -5251,31 +5251,79 @@ impl KernelComposition {
                 true,
             );
         }
+        // One flight is bounded (issue #2806 item 10): the owner acknowledged
+        // only the requested prefix, so the denominator tail past this flight
+        // is still owed. It joins the owner's own remaining set, and a
+        // non-empty combined remainder forces `Partial` with a handle over the
+        // exact combined set — never a `Published` horizon for occurrences that
+        // were never sent.
+        let tail = match publication.uncapped_tail_ids() {
+            Ok(tail) => tail,
+            Err(error) => {
+                return Self::user_automation_unacknowledged_horizon(
+                    resolution,
+                    requested_occurrence_ids,
+                    &publication.identity,
+                    &format!(
+                        "the bounded horizon slice after the admitted occurrence does not account \
+                         for its own denominator tail: {error}"
+                    ),
+                    true,
+                );
+            }
+        };
+        let mut remaining_occurrence_ids = acknowledgement.remaining_occurrence_ids.clone();
+        remaining_occurrence_ids.extend(tail.iter().cloned());
         let publication_operation_id = Box::new(acknowledgement.publication_operation_id.clone());
-        let outcome = if acknowledgement.acknowledged_all() {
-            UserAutomationHorizonOutcome::Published {
-                publication_operation_id,
-            }
+        let (outcome, retry_handle) = if remaining_occurrence_ids.is_empty()
+            && acknowledgement.acknowledged_all()
+        {
+            (
+                UserAutomationHorizonOutcome::Published {
+                    publication_operation_id,
+                },
+                acknowledgement.retry_handle.clone(),
+            )
         } else {
-            UserAutomationHorizonOutcome::Partial {
-                publication_operation_id,
-                reason: format!(
-                    "the schedule owner acknowledged {} of the {} occurrences that follow the \
-                     admitted one; the exact remaining set is retained and must be replayed under \
-                     its handle",
-                    acknowledgement.acknowledged_occurrence_ids.len(),
-                    requested_occurrence_ids.len()
-                ),
-            }
+            let retry_handle = match publication.retry_handle(&remaining_occurrence_ids) {
+                Ok(retry_handle) => retry_handle,
+                Err(error) => {
+                    return Self::user_automation_unacknowledged_horizon(
+                        resolution,
+                        requested_occurrence_ids,
+                        &publication.identity,
+                        &format!(
+                            "the combined horizon remainder after the admitted occurrence cannot \
+                             be named for replay: {error}"
+                        ),
+                        true,
+                    );
+                }
+            };
+            (
+                UserAutomationHorizonOutcome::Partial {
+                    publication_operation_id,
+                    reason: format!(
+                        "the schedule owner acknowledged {} of the {} requested occurrences that \
+                         follow the admitted one; {} further occurrence(s) past the single-flight \
+                         bound were never sent; the exact remaining set is retained and must be \
+                         replayed under its handle",
+                        acknowledgement.acknowledged_occurrence_ids.len(),
+                        requested_occurrence_ids.len(),
+                        tail.len()
+                    ),
+                },
+                retry_handle,
+            )
         };
         UserAutomationHorizonPhase {
             trigger: publication.trigger,
             automation_id: publication.automation_id.clone(),
             automation_revision: publication.automation_revision.clone(),
             revision_digest: publication.revision_digest.clone(),
-            remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids,
+            remaining_occurrence_ids,
             requested_occurrence_ids: requested_occurrence_ids.to_vec(),
-            retry_handle: acknowledgement.retry_handle,
+            retry_handle,
             outcome,
         }
     }

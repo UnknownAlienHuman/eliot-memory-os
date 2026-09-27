@@ -1798,6 +1798,16 @@ impl KernelStoreGateway {
     /// Every leg that may issue an owner effect retains its obligation in the
     /// composition-bound durable outbox first and appends it to `obligations`,
     /// so the parent transition reports exactly the obligations it retained.
+    ///
+    /// Classification and revalidation (issue #2806 item 2): read-only answers
+    /// own no handoff; a changed or rejected configuration never reaches this
+    /// router because the Store dispatch returned no committed outcome. Before
+    /// each owner call the leg re-proves principal, revision, State Fence, and
+    /// owner denominator against the live owner: `RunNow` reads back the exact
+    /// committed invocation and the current owner revision, `Remove`/`Pause`/
+    /// superseding-`Edit` enumerate and cancel through the complete fail-closed
+    /// owner execution view, and the horizon publication revalidates the
+    /// compiled slice against the live owner before it is issued.
     async fn user_automation_runtime_handoff<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -1830,21 +1840,14 @@ impl KernelStoreGateway {
                 self.remove_handoff(sealed, configuration, runtime, obligations)
                     .await
             }
-            UserAutomationOperation::Pause {
-                automation_id,
-                automation_revision,
-            } => retirement_handoff(
-                configuration,
-                Some(automation_id),
-                automation_revision,
-                UserAutomationConfigurationState::Paused,
-            ),
-            UserAutomationOperation::Edit {
-                previous_revision, ..
-            } => Ok((
-                superseded_wake_phase(&previous_revision.revision)?,
-                not_applicable_execution(),
-            )),
+            UserAutomationOperation::Pause { .. } => {
+                self.pause_handoff(sealed, configuration, runtime, obligations)
+                    .await
+            }
+            UserAutomationOperation::Edit { .. } => {
+                self.superseding_edit_handoff(sealed, configuration, runtime, obligations)
+                    .await
+            }
             _ => Ok((not_applicable_wake(), not_applicable_execution())),
         }
     }
@@ -1936,6 +1939,7 @@ impl KernelStoreGateway {
             ));
         };
         self.continue_retirement_wake_handoff(
+            OwnerWakeHandoffKind::Remove,
             sealed,
             &revision,
             &committed_occurrence_ids,
@@ -1945,8 +1949,167 @@ impl KernelStoreGateway {
         .await
     }
 
+    /// Completes the wake handoff of a committed `Pause` against the wake owner.
+    ///
+    /// This is the same affected-revision contour as [`Self::remove_handoff`]:
+    /// the pause is already committed when this leg runs, so it never refuses
+    /// the pause itself. It enumerates the exact owner-issued pending wake
+    /// targets of the committed paused revision from the wake owner itself and
+    /// cancels exactly those targets through
+    /// [`UserAutomationService::pause_and_cancel_with_targets`], which replays
+    /// the pause under the same admitted identity and shares the complete,
+    /// fail-closed owner execution view. An unproven target list, or a
+    /// cancellation whose answer is absent, empty, or unknown for a non-empty
+    /// proven target set, stays an unresolved wake phase with a recovery
+    /// directive instead of a known success.
+    async fn pause_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let UserAutomationOperation::Pause {
+            automation_id,
+            automation_revision,
+        } = &sealed.intent.operation
+        else {
+            return Err("the pause handoff requires pause".to_owned());
+        };
+        let revision = committed_retirement_revision(
+            configuration,
+            Some(automation_id),
+            automation_revision,
+            UserAutomationConfigurationState::Paused,
+        )?;
+        // The revision is immutable, so this deterministic recompile of its own
+        // normalized denominator is the exact set the wake walk below asks about,
+        // and it is also the exact immutable subject set the durable cancellation
+        // obligation is bound to.
+        let committed_occurrence_ids = revision
+            .compile_occurrence_identities()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        let execution = not_applicable_execution();
+        let Some(runtime) = runtime else {
+            return Ok((
+                UserAutomationWakePhase::Unavailable {
+                    reason: unproven_wake_channel_reason(),
+                },
+                execution,
+            ));
+        };
+        self.continue_retirement_wake_handoff(
+            OwnerWakeHandoffKind::Pause,
+            sealed,
+            &revision,
+            &committed_occurrence_ids,
+            runtime,
+            obligations,
+        )
+        .await
+    }
+
+    /// Completes the wake handoff of a committed superseding `Edit` against the
+    /// wake owner (issue #2806 item 6).
+    ///
+    /// The affected revision is the immutable predecessor, not the committed
+    /// document: the new revision keeps its own horizon (published by
+    /// [`Self::publish_schedule_horizon`]), while the predecessor's
+    /// not-yet-admitted wakes are invalidated. The predecessor denominator is
+    /// the edit intent's own previous revision, re-checked here against the
+    /// committed new revision through the same supersession validation the
+    /// Store admission ran, and bound to the live owner read proving the new
+    /// revision is still current under this principal and fence. Enumeration
+    /// and cancellation then follow the same affected-revision contour as
+    /// remove and pause, cancelling only owner-issued targets through
+    /// [`UserAutomationService::edit_and_cancel_with_targets`].
+    async fn superseding_edit_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let UserAutomationOperation::Edit {
+            previous_revision,
+            revision,
+        } = &sealed.intent.operation
+        else {
+            return Err("the superseding-edit handoff requires edit".to_owned());
+        };
+        let Some(UserAutomationMutationResult::Revision {
+            revision: committed,
+            ..
+        }) = configuration.mutation_result()
+        else {
+            return Err("superseding edit did not return a canonical revision".to_owned());
+        };
+        if committed != revision {
+            return Err(
+                "committed UserAutomation revision does not match the superseding edit request"
+                    .to_owned(),
+            );
+        }
+        committed
+            .validate_supersedes(previous_revision)
+            .map_err(|error| error.to_string())?;
+        // The predecessor document is immutable, but the link to it is only as
+        // current as this owner read: it proves the committed new revision is
+        // still the current one under this principal and fence, so this leg
+        // never cancels predecessor wakes for an edit that a newer transition
+        // already superseded again.
+        let owner = self
+            .read_user_automation_owner(&UserAutomationOwnerLookup {
+                automation_id: revision.automation_id.clone(),
+                requested_revision: revision.revision.clone(),
+                authenticated_principal: sealed.authenticated_principal.clone(),
+                state_fence: sealed.context.state_fence.clone(),
+            })
+            .await?;
+        if owner.revision != *revision {
+            return Err(
+                "committed UserAutomation revision does not match the current owner revision"
+                    .to_owned(),
+            );
+        }
+        let predecessor_occurrence_ids = previous_revision
+            .compile_occurrence_identities()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        let execution = not_applicable_execution();
+        let Some(runtime) = runtime else {
+            return Ok((
+                UserAutomationWakePhase::Unavailable {
+                    reason: unproven_wake_channel_reason(),
+                },
+                execution,
+            ));
+        };
+        self.continue_retirement_wake_handoff(
+            OwnerWakeHandoffKind::SupersedingEdit,
+            sealed,
+            previous_revision,
+            &predecessor_occurrence_ids,
+            runtime,
+            obligations,
+        )
+        .await
+    }
+
     async fn continue_retirement_wake_handoff<R>(
         &self,
+        handoff: OwnerWakeHandoffKind,
         sealed: &UserAutomationServiceRequest,
         revision: &UserAutomationRevision,
         committed_occurrence_ids: &[String],
@@ -1958,12 +2121,18 @@ impl KernelStoreGateway {
     {
         let execution = not_applicable_execution();
         let committed_occurrences = committed_occurrence_ids.len();
-        if let Err(reason) = self.ensure_legacy_cancellation_unqualified(
-            sealed,
-            revision,
-            committed_occurrence_ids,
-            obligations,
-        ) {
+        // Legacy unqualified cancellation records predate the enumeration
+        // receipt binding and belong to the remove contour only: pause and
+        // superseding-edit obligations always carry their receipt, so there is
+        // no legacy record to guard for them.
+        if handoff == OwnerWakeHandoffKind::Remove
+            && let Err(reason) = self.ensure_legacy_cancellation_unqualified(
+                sealed,
+                revision,
+                committed_occurrence_ids,
+                obligations,
+            )
+        {
             return Ok(unresolved_retirement_phases(reason, execution));
         }
         let enumeration_request = match retirement_wake_enumeration_request(
@@ -2009,11 +2178,13 @@ impl KernelStoreGateway {
         };
         if targets.is_empty() {
             obligations.push(receipt_obligation);
+            let noun = handoff.noun();
             return Ok((
                 UserAutomationWakePhase::NotApplicable {
                     reason: format!(
-                        "the Host owner receipt accounts for all {committed_occurrences} committed occurrences of retired revision {} and proves there is no pending target to cancel",
-                        revision.revision
+                        "the Host owner receipt accounts for all {} committed occurrences of {} \
+                         revision {} and proves there is no pending target to cancel",
+                        committed_occurrences, noun, revision.revision
                     ),
                 },
                 execution,
@@ -2034,6 +2205,7 @@ impl KernelStoreGateway {
         };
         obligations.push(receipt_obligation);
         self.issue_retirement_cancellation(
+            handoff,
             sealed,
             &mut obligation,
             (revision.clone(), targets, receipt),
@@ -2346,6 +2518,7 @@ impl KernelStoreGateway {
     /// issued.
     async fn issue_retirement_cancellation<R>(
         &self,
+        handoff: OwnerWakeHandoffKind,
         sealed: &UserAutomationServiceRequest,
         obligation: &mut UserAutomationRuntimeObligation,
         retirement: (
@@ -2361,6 +2534,7 @@ impl KernelStoreGateway {
     {
         let (revision, targets, enumeration_receipt) = retirement;
         let execution = not_applicable_execution();
+        let noun = handoff.noun();
         let mut settled = obligation.clone();
         let retained = classify_retained_cancellation(
             &settled,
@@ -2383,7 +2557,14 @@ impl KernelStoreGateway {
             return Ok(unresolved_retirement_phases(reason, execution));
         }
         let removal = match self
-            .cancel_retirement_wakes(sealed, targets, enumeration_receipt.clone(), runtime)
+            .cancel_retirement_wakes(
+                handoff,
+                sealed,
+                revision.clone(),
+                targets,
+                enumeration_receipt.clone(),
+                runtime,
+            )
             .await
         {
             Ok(removal) => removal,
@@ -2418,11 +2599,11 @@ impl KernelStoreGateway {
                 obligations.push(settled);
                 return Ok(unresolved_retirement_phases(
                     format!(
-                        "revision {} of {} is retired, but its unadmitted wakes were not cancelled \
-                         from the complete owner view: {error}; the not-yet-admitted wakes and the \
-                         exact unresolved reconciliation references of this revision are preserved \
-                         and stay open",
-                        revision.revision, revision.automation_id
+                        "revision {} of {} is {}, but its unadmitted wakes were not cancelled from \
+                         the complete owner view: {}; the not-yet-admitted wakes and the exact \
+                         unresolved reconciliation references of this revision are preserved and \
+                         stay open",
+                        revision.revision, revision.automation_id, noun, error
                     ),
                     execution,
                 ));
@@ -2433,10 +2614,10 @@ impl KernelStoreGateway {
         // that is an unresolved handoff rather than a proven absence.
         if removal.cancelled_wake_ids.is_empty() {
             let reason = format!(
-                "the wake owner returned no cancelled identity for the owner-issued targets of \
-                 retired revision {} of {}; an empty answer is not proof that no unadmitted wake \
-                 existed, so the wake handoff stays unknown",
-                revision.revision, revision.automation_id
+                "the wake owner returned no cancelled identity for the owner-issued targets of {} \
+                 revision {} of {}; an empty answer is not proof that no unadmitted wake existed, \
+                 so the wake handoff stays unknown",
+                noun, revision.revision, revision.automation_id
             );
             settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
                 reason: reason.clone(),
@@ -2474,19 +2655,21 @@ impl KernelStoreGateway {
         ))
     }
 
-    /// Issues the wake cancellation of one committed retirement through the
-    /// existing execution join, and reports whether the refusal left a possibly
-    /// issued owner effect.
+    /// Issues the wake cancellation of one committed retirement-like transition
+    /// through the existing execution join, and reports whether the refusal
+    /// left a possibly issued owner effect.
     ///
-    /// The retirement transition is replayed under the same admitted identity
-    /// this route already committed, so the owner view, the retirement and the
+    /// The committed transition is replayed under the same admitted identity
+    /// this route already committed, so the owner view, the transition and the
     /// cancellation observe one canonical operation rather than two. The boolean
     /// is the only classification the caller needs: a lost owner answer means the
     /// effect may already be applied, while every other refusal happened before
     /// the cancellation left this boundary.
     async fn cancel_retirement_wakes<R>(
         &self,
+        handoff: OwnerWakeHandoffKind,
         sealed: &UserAutomationServiceRequest,
+        affected: UserAutomationRevision,
         targets: Vec<UserAutomationWakeCancellationTarget>,
         enumeration_receipt: UserAutomationWakeEnumerationReceipt,
         runtime: &R,
@@ -2494,19 +2677,43 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
-        Box::pin(
-            UserAutomationService::new(&CanonicalUserAutomationStore::new(
-                BorrowedCanonicalStoreClient::new(self.store.as_ref()),
-            ))
-            .remove_and_cancel_with_targets(
-                sealed.clone(),
-                targets,
-                enumeration_receipt,
-                runtime,
-            ),
-        )
-        .await
-        .map_err(|error| {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        let service = UserAutomationService::new(&store);
+        // Each join is awaited in its own arm: the three joins are different
+        // future types, so they cannot share one match value.
+        let result = match handoff {
+            OwnerWakeHandoffKind::Remove => {
+                Box::pin(service.remove_and_cancel_with_targets(
+                    sealed.clone(),
+                    targets,
+                    enumeration_receipt,
+                    runtime,
+                ))
+                .await
+            }
+            OwnerWakeHandoffKind::Pause => {
+                Box::pin(service.pause_and_cancel_with_targets(
+                    sealed.clone(),
+                    targets,
+                    enumeration_receipt,
+                    runtime,
+                ))
+                .await
+            }
+            OwnerWakeHandoffKind::SupersedingEdit => {
+                Box::pin(service.edit_and_cancel_with_targets(
+                    sealed.clone(),
+                    affected,
+                    targets,
+                    enumeration_receipt,
+                    runtime,
+                ))
+                .await
+            }
+        };
+        result.map_err(|error| {
             let owner_answered_unknown = matches!(
                 &error,
                 UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::UnknownOutcome(
@@ -2515,6 +2722,89 @@ impl KernelStoreGateway {
             );
             (error, owner_answered_unknown)
         })
+    }
+
+    /// Revalidates principal, revision, State Fence, and owner denominator of a
+    /// compiled horizon publication against the live canonical owner before
+    /// the slice is handed to the schedule owner (issue #2806 item 2).
+    ///
+    /// The committed revision proves what this identity committed; only the
+    /// live owner proves that revision is still the current accepted one under
+    /// this principal and fence, with the same normalized denominator this
+    /// publication compiled. An unreadable owner means nothing was proven and
+    /// nothing is sent (`Unavailable`); a moved owner — another current
+    /// revision, a different principal binding, a fence drift, a changed
+    /// denominator, or a no-longer-active admission state — means the wake
+    /// disposition now belongs to that newer transition and must be reconciled
+    /// (`UnknownOutcome`). Neither case publishes from a stale commit.
+    async fn revalidate_horizon_owner(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        publication: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), (UnreachedHorizonKind, String)> {
+        let unavailable = |detail: String| {
+            (
+                UnreachedHorizonKind::Unavailable,
+                format!(
+                    "the live UserAutomation owner could not prove revision {} current for horizon \
+                     publication: {}; nothing was sent and every requested occurrence stays owed",
+                    revision.revision, detail
+                ),
+            )
+        };
+        let moved = |detail: String| {
+            (
+                UnreachedHorizonKind::UnknownOutcome,
+                format!(
+                    "the live UserAutomation owner no longer shows revision {} as the current \
+                     accepted revision for horizon publication: {}; the wake disposition belongs to \
+                     that newer transition and must be reconciled under its identity",
+                    revision.revision, detail
+                ),
+            )
+        };
+        let owner = self
+            .read_user_automation_owner(&UserAutomationOwnerLookup {
+                automation_id: revision.automation_id.clone(),
+                requested_revision: revision.revision.clone(),
+                authenticated_principal: sealed.authenticated_principal.clone(),
+                state_fence: sealed.context.state_fence.clone(),
+            })
+            .await
+            .map_err(unavailable)?;
+        if owner.automation_id != revision.automation_id
+            || owner.authenticated_principal != sealed.authenticated_principal
+            || owner.state_fence != sealed.context.state_fence
+        {
+            return Err(moved(
+                "automation, principal, or State Fence binding drifted".to_owned(),
+            ));
+        }
+        if owner.revision != *revision {
+            return Err(moved(
+                "the current owner revision document is not the committed one".to_owned(),
+            ));
+        }
+        let owner_denominator = owner
+            .revision
+            .compile_occurrence_identities()
+            .map_err(|error| unavailable(error.to_string()))?
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        if owner_denominator != publication.denominator_occurrence_ids {
+            return Err(moved(
+                "the owner denominator is not the denominator this publication compiled".to_owned(),
+            ));
+        }
+        if owner.current_configuration_state != UserAutomationConfigurationState::Active {
+            return Err(moved(format!(
+                "the current admission state is {:?}, which admits no wake",
+                owner.current_configuration_state
+            )));
+        }
+        Ok(())
     }
 
     /// Compiles and publishes the bounded recurring wake horizon this committed
@@ -2587,6 +2877,26 @@ impl KernelStoreGateway {
         let retry_handle = publication
             .retry_handle(&requested_occurrence_ids)
             .map_err(|error| error.to_string())?;
+        // Revalidate principal, revision, State Fence, and owner denominator
+        // against the live owner before any owner call (issue #2806 item 2).
+        // The committed document proves what this identity committed; only the
+        // live owner proves it is still the current accepted revision under
+        // this principal and fence. A revision that a concurrent pause,
+        // remove, or superseding edit already moved is not published from a
+        // stale commit: that leg owns the wake disposition instead.
+        if let Err(reason) = self
+            .revalidate_horizon_owner(sealed, revision, &publication)
+            .await
+        {
+            let (kind, reason) = reason;
+            return Ok(Some(unreached_horizon_phase(
+                &publication,
+                &requested_occurrence_ids,
+                retry_handle,
+                kind,
+                &reason,
+            )));
+        }
         // The publication is an owner effect, so its intent is retained before
         // anything is handed to the schedule owner. A record that could not be
         // retained is a named unavailability: nothing is issued, and the horizon
@@ -2732,7 +3042,7 @@ impl KernelStoreGateway {
                         publication,
                         requested_occurrence_ids,
                         &acknowledgement,
-                    ),
+                    )?,
                 ))
             }
             // No schedule owner was reachable, so nothing was published. The
@@ -3737,6 +4047,37 @@ impl KernelStoreGateway {
     }
 }
 
+/// Which retirement-like transition owns an affected-revision wake
+/// cancellation (issue #2806 item 6).
+///
+/// `Remove` retires the committed document, `Pause` pauses it, and a
+/// superseding `Edit` invalidates the not-yet-admitted wakes of its immutable
+/// predecessor while the new revision keeps its own horizon. All three
+/// enumerate the affected revision's owner `Pending` targets from the wake
+/// owner itself and cancel exactly those targets; already admitted jobs,
+/// completed occurrences, and unknown effects are never rewritten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerWakeHandoffKind {
+    /// Committed `Remove` of the affected revision.
+    Remove,
+    /// Committed `Pause` of the affected revision.
+    Pause,
+    /// Committed superseding `Edit`; the affected revision is its immutable
+    /// predecessor.
+    SupersedingEdit,
+}
+
+impl OwnerWakeHandoffKind {
+    /// Plain noun naming the affected revision state in reasons.
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Remove => "retired",
+            Self::Pause => "paused",
+            Self::SupersedingEdit => "superseded",
+        }
+    }
+}
+
 /// Composes the phase pair of a committed retirement whose wake handoff could
 /// not be proven.
 ///
@@ -4029,11 +4370,26 @@ fn retained_horizon_phase(
                     },
                 ),
             };
-            Some(acknowledged_horizon_phase(
+            match acknowledged_horizon_phase(
                 publication,
                 requested_occurrence_ids,
                 acknowledgement.as_ref(),
-            ))
+            ) {
+                Ok(phase) => Some(phase),
+                Err(reason) => {
+                    obligation.disposition =
+                        UserAutomationRuntimeObligationDisposition::Reconciling {
+                            reason: reason.clone(),
+                        };
+                    Some(unreached_horizon_phase(
+                        publication,
+                        requested_occurrence_ids,
+                        retry_handle.to_owned(),
+                        UnreachedHorizonKind::UnknownOutcome,
+                        &reason,
+                    ))
+                }
+            }
         }
         RetainedHorizonPublication::Unresolved { reason } => {
             obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
@@ -4205,35 +4561,60 @@ fn acknowledged_horizon_phase(
     publication: &UserAutomationWakeHorizonPublication,
     requested_occurrence_ids: &[String],
     acknowledgement: &UserAutomationWakePublication,
-) -> UserAutomationHorizonPhase {
+) -> Result<UserAutomationHorizonPhase, String> {
+    // One flight is bounded (issue #2806 item 10): the owner acknowledged only
+    // the requested prefix, so the denominator tail past this flight is still
+    // owed. It joins the owner's own remaining set, and a non-empty combined
+    // remainder forces `Partial` with a handle over the exact combined set —
+    // never a `Published` horizon for occurrences that were never sent.
+    let tail = publication
+        .uncapped_tail_ids()
+        .map_err(|error| error.to_string())?;
+    let mut remaining_occurrence_ids = acknowledgement.remaining_occurrence_ids.clone();
+    remaining_occurrence_ids.extend(tail.iter().cloned());
     let publication_operation_id = Box::new(acknowledgement.publication_operation_id.clone());
-    let outcome = if acknowledgement.acknowledged_all() {
-        UserAutomationHorizonOutcome::Published {
-            publication_operation_id,
-        }
+    let (outcome, retry_handle) = if remaining_occurrence_ids.is_empty()
+        && acknowledgement.acknowledged_all()
+    {
+        (
+            UserAutomationHorizonOutcome::Published {
+                publication_operation_id,
+            },
+            acknowledgement.retry_handle.clone(),
+        )
     } else {
-        UserAutomationHorizonOutcome::Partial {
-            publication_operation_id,
-            reason: format!(
-                "the schedule owner acknowledged {} of the {} requested occurrences of revision \
-                 {}; the exact remaining set is retained and must be replayed under its handle \
-                 before the horizon counts as published",
-                acknowledgement.acknowledged_occurrence_ids.len(),
-                requested_occurrence_ids.len(),
-                publication.automation_revision
-            ),
-        }
+        let retry_handle = publication
+            .retry_handle(&remaining_occurrence_ids)
+            .map_err(|error| error.to_string())?;
+        let reason = format!(
+            "the schedule owner acknowledged {} of the {} requested occurrences of revision {}; \
+             {} further occurrence(s) past the single-flight bound of {} were never sent; the \
+             exact remaining set is retained and must be replayed under its handle before the \
+             horizon counts as published",
+            acknowledgement.acknowledged_occurrence_ids.len(),
+            requested_occurrence_ids.len(),
+            publication.automation_revision,
+            tail.len(),
+            crate::user_automation_execution::USER_AUTOMATION_HORIZON_ENTRY_BOUND
+        );
+        (
+            UserAutomationHorizonOutcome::Partial {
+                publication_operation_id,
+                reason,
+            },
+            retry_handle,
+        )
     };
-    UserAutomationHorizonPhase {
+    Ok(UserAutomationHorizonPhase {
         trigger: publication.trigger,
         automation_id: publication.automation_id.clone(),
         automation_revision: publication.automation_revision.clone(),
         revision_digest: publication.revision_digest.clone(),
         requested_occurrence_ids: requested_occurrence_ids.to_vec(),
-        remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids.clone(),
-        retry_handle: acknowledgement.retry_handle.clone(),
+        remaining_occurrence_ids,
+        retry_handle,
         outcome,
-    }
+    })
 }
 
 /// Returns the exact digest of the canonical receipt a committed or replayed
@@ -4333,32 +4714,6 @@ fn unreached_horizon_phase(
 /// no proof of which already published wakes its owner still retains, so the
 /// phase stays unresolved rather than asserting a cancellation it cannot
 /// enumerate.
-fn retirement_handoff(
-    configuration: &UserAutomationConfigurationPhase,
-    automation_id: Option<&str>,
-    automation_revision: &str,
-    expected_state: UserAutomationConfigurationState,
-) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String> {
-    let revision = committed_retirement_revision(
-        configuration,
-        automation_id,
-        automation_revision,
-        expected_state,
-    )?;
-    let committed_occurrences = revision
-        .compile_occurrence_identities()
-        .map_err(|error| error.to_string())?
-        .len();
-    Ok((
-        unproven_wake_target_phase(
-            &revision.automation_id,
-            &revision.revision,
-            committed_occurrences,
-        ),
-        not_applicable_execution(),
-    ))
-}
-
 /// Returns the committed revision a retirement committed, after checking it
 /// against the exact request this identity asked for.
 ///
@@ -4399,49 +4754,6 @@ fn not_applicable_execution() -> UserAutomationExecutionPhase {
         reason:
             "this operator operation commits configuration only and owns no occurrence to execute"
                 .to_owned(),
-    }
-}
-
-/// Wake phase for a superseding `Edit`, whose affected revision is the retired
-/// predecessor rather than the committed document.
-///
-/// The superseded document is not the answer of this identity, so its committed
-/// occurrence denominator cannot be counted here. The phase is therefore
-/// unresolved by construction instead of asserting that no wake exists.
-fn superseded_wake_phase(previous_revision: &str) -> Result<UserAutomationWakePhase, String> {
-    if previous_revision.trim().is_empty() {
-        return Err("superseding edit did not name the affected revision".to_owned());
-    }
-    Ok(UserAutomationWakePhase::UnknownOutcome {
-        reason: format!(
-            "superseded revision {previous_revision} is not the committed document of this identity, \
-             so its committed occurrence denominator is unknown; its not-yet-admitted wakes cannot \
-             be cancelled from a bounded subset and stay unknown until the owner enumerates them"
-        ),
-    })
-}
-
-/// Wake phase for a retirement whose exact owner-issued target list could not be
-/// proven complete.
-///
-/// The canonical revision exposes its committed calendar occurrence identities,
-/// but the authenticated wake owner publishes an exact per-occurrence readback
-/// only for a Human `RunNow` occurrence. A retirement therefore cannot present
-/// a non-empty, complete, exact cancellation target list here, and an empty list
-/// is not proof that no unadmitted wake exists: the phase stays unknown.
-fn unproven_wake_target_phase(
-    automation_id: &str,
-    automation_revision: &str,
-    committed_occurrences: usize,
-) -> UserAutomationWakePhase {
-    UserAutomationWakePhase::UnknownOutcome {
-        reason: format!(
-            "retired revision {automation_revision} of {automation_id} exposes {committed_occurrences} \
-             committed calendar occurrence identities, but the authenticated wake owner publishes an \
-             exact per-occurrence target only for a Human run-now occurrence, so no complete exact \
-             unadmitted target list is owner-proven; no cancellation is issued and the already \
-             admitted jobs, immutable history and unresolved obligations are preserved"
-        ),
     }
 }
 

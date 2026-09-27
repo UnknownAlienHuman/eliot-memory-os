@@ -1481,6 +1481,29 @@ impl UserAutomationWakeHorizonPublication {
             .collect()
     }
 
+    /// Returns the denominator members past the slice cursor that this bounded
+    /// flight did not carry (issue #2806 item 10).
+    ///
+    /// The request always carries the complete denominator beside its bounded
+    /// entries, so a caller whose owner acknowledged only the entries can still
+    /// name exactly what remains: the owner's own remaining set plus this tail.
+    /// An empty tail means this flight carried the whole slice from the cursor.
+    pub fn uncapped_tail_ids(&self) -> Result<Vec<String>, UserAutomationExecutionError> {
+        self.validate()?;
+        let start = horizon_slice_start(
+            &self.denominator_occurrence_ids,
+            self.trigger,
+            self.consumed_occurrence_id.as_deref(),
+        )?;
+        let end = start.saturating_add(self.entries.len());
+        if end > self.denominator_occurrence_ids.len() {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "horizon slice runs past the revision denominator",
+            ));
+        }
+        Ok(self.denominator_occurrence_ids[end..].to_vec())
+    }
+
     /// Returns the stable replay handle a caller re-presents to finish an
     /// unacknowledged remainder.
     ///
@@ -1496,6 +1519,19 @@ impl UserAutomationWakeHorizonPublication {
         )
     }
 }
+
+/// Maximum occurrences carried in one bounded horizon publication request.
+///
+/// One publication is one owner round-trip over the bounded Kernel-to-Host
+/// transport: the request carries a full compiled [`WakeIntent`] per entry, so
+/// an unbounded normalized denominator would turn one publication into an
+/// unbounded frame. The slice published now is capped here; the remainder is
+/// never dropped silently. A first publication that exceeds the bound is
+/// reported `Partial` with the exact remaining set and retry handle once the
+/// owner acknowledges the prefix, and the disposition advance continues the
+/// cursor — so the bound limits one flight, never the horizon. (Issue #2806
+/// item 10.)
+pub const USER_AUTOMATION_HORIZON_ENTRY_BOUND: usize = 256;
 
 /// Domain separator for the deterministic horizon retry handle.
 const HORIZON_RETRY_HANDLE_DOMAIN: &str = "eliot.user_automation.horizon-retry.v1";
@@ -1714,8 +1750,17 @@ pub fn compile_wake_horizon(
             UserAutomationError::Invalid("horizon.entries"),
         ));
     }
-    let mut entries = Vec::with_capacity(identities.len() - start);
-    for identity in &identities[start..] {
+    let end = start
+        .saturating_add(USER_AUTOMATION_HORIZON_ENTRY_BOUND)
+        .min(identities.len());
+    // One flight is bounded (issue #2806 item 10): the published slice is a
+    // prefix of at most `USER_AUTOMATION_HORIZON_ENTRY_BOUND` occurrences from
+    // the cursor. The capped tail is not dropped — the publication still
+    // carries the complete denominator, the owner acknowledgement accounts for
+    // the requested prefix, and the exact remainder keeps its retry handle, so
+    // the disposition advance continues the same cursor.
+    let mut entries = Vec::with_capacity(end - start);
+    for identity in &identities[start..end] {
         let UserAutomationTrigger::Scheduled { occurrence_key } = &identity.trigger else {
             return Err(UserAutomationExecutionError::Contract(
                 UserAutomationError::Invalid("horizon.entry.occurrence_key"),
@@ -2374,6 +2419,13 @@ pub enum UserAutomationExecutionOutcome {
 }
 
 /// Result of retiring one automation revision and cancelling future wakes.
+///
+/// The same shape serves the remove, pause, and superseding-edit cancellation
+/// joins (issue #2806 item 6): `revision` is always the affected immutable
+/// revision whose unadmitted wakes were cancelled — the committed document for
+/// remove and pause, the immutable predecessor for a superseding edit — and
+/// `receipt` is the canonical Store receipt of the transition that owns the
+/// cancellation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserAutomationRemovalResult {
@@ -2385,6 +2437,118 @@ pub struct UserAutomationRemovalResult {
     pub cancelled_wake_ids: Vec<String>,
     /// Whether the Store response was an exact replay.
     pub replayed: bool,
+}
+
+/// Which committed transition a wake cancellation replays and which revision
+/// it cancels (issue #2806 item 6).
+///
+/// A remove or pause cancels the committed document itself, which must show
+/// the expected terminal state. A superseding edit cancels the immutable
+/// predecessor named by the edit intent: the replayed commit must be the new
+/// revision linked from that predecessor, and the predecessor must equal the
+/// intent's own previous revision, so no caller can substitute an unrelated
+/// denominator.
+#[derive(Clone, Debug)]
+enum CancellingCommit {
+    /// The affected revision is the committed document in this exact state.
+    CommittedRevision {
+        /// Stable automation identity named by the operator intent.
+        automation_id: String,
+        /// Immutable revision named by the operator intent.
+        automation_revision: String,
+        /// Configuration state the committed document must show.
+        expected_state: UserAutomationConfigurationState,
+    },
+    /// The affected revision is the superseded predecessor of a committed edit.
+    SupersededPredecessor {
+        /// Immutable predecessor whose unadmitted wakes are invalidated, boxed
+        /// because the revision dwarfs the committed-identity variant.
+        superseded: Box<UserAutomationRevision>,
+    },
+}
+
+impl CancellingCommit {
+    /// Returns the automation identity whose complete owner view gates the
+    /// cancellation.
+    fn automation_id(
+        &self,
+        request: &UserAutomationServiceRequest,
+    ) -> Result<String, UserAutomationExecutionError> {
+        match self {
+            Self::CommittedRevision { automation_id, .. } => Ok(automation_id.clone()),
+            Self::SupersededPredecessor { superseded } => {
+                let automation_id = match &request.intent.operation {
+                    eliot_kernel_core::UserAutomationOperation::Edit { revision, .. } => {
+                        revision.automation_id.clone()
+                    }
+                    _ => {
+                        return Err(UserAutomationExecutionError::OperationMismatch(
+                            "edit-and-cancel requires edit",
+                        ));
+                    }
+                };
+                if superseded.automation_id != automation_id {
+                    return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                        "superseded predecessor automation",
+                    ));
+                }
+                Ok(automation_id)
+            }
+        }
+    }
+
+    /// Checks the replayed commit against the operator intent and returns the
+    /// affected immutable revision whose unadmitted wakes are cancelled.
+    fn check_committed(
+        &self,
+        request: &UserAutomationServiceRequest,
+        committed: &UserAutomationRevision,
+    ) -> Result<UserAutomationRevision, UserAutomationExecutionError> {
+        match self {
+            Self::CommittedRevision {
+                automation_id,
+                automation_revision,
+                expected_state,
+            } => {
+                if committed.automation_id != *automation_id
+                    || committed.revision != *automation_revision
+                    || committed.configuration_state != *expected_state
+                {
+                    return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                        "cancel-with-targets revision",
+                    ));
+                }
+                Ok(committed.clone())
+            }
+            Self::SupersededPredecessor { superseded } => {
+                let eliot_kernel_core::UserAutomationOperation::Edit {
+                    previous_revision,
+                    revision,
+                } = &request.intent.operation
+                else {
+                    return Err(UserAutomationExecutionError::OperationMismatch(
+                        "edit-and-cancel requires edit",
+                    ));
+                };
+                if superseded.as_ref() != previous_revision {
+                    return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                        "superseded predecessor is not the edit intent previous revision",
+                    ));
+                }
+                if committed.automation_id != revision.automation_id
+                    || committed.revision != revision.revision
+                {
+                    return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                        "cancel-with-targets revision",
+                    ));
+                }
+                committed
+                    .validate_supersedes(superseded.as_ref())
+                    .map_err(UserAutomationExecutionError::Contract)?;
+                Ok(superseded.as_ref().clone())
+            }
+        }
+    }
 }
 
 /// Existing runtime composition owner for UserAutomation execution joins.
@@ -3004,18 +3168,132 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 ));
             }
         };
+        self.cancel_affected_wakes_with_targets(
+            request,
+            CancellingCommit::CommittedRevision {
+                automation_id,
+                automation_revision,
+                expected_state: UserAutomationConfigurationState::Retired,
+            },
+            targets,
+            enumeration_receipt,
+            runtime,
+        )
+        .await
+    }
+
+    /// Pauses one revision and cancels the exact owner-issued pending wake
+    /// targets observed for that revision (issue #2806 item 6).
+    ///
+    /// This is the production pause contour of the authenticated `Pause`
+    /// operator route: the gateway commits the pause, enumerates the affected
+    /// revision's owner `Pending` targets from the wake owner itself, and then
+    /// calls this method so the cancellation and the pause share one owner
+    /// view, one admitted identity, and one runtime port. Already admitted
+    /// jobs, completed occurrences, and unknown effects are never rewritten:
+    /// the cancellation is unadmitted-only and the committed paused revision is
+    /// preserved verbatim.
+    pub async fn pause_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
+        runtime: &R,
+    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
+        let (automation_id, automation_revision) = match &request.intent.operation {
+            eliot_kernel_core::UserAutomationOperation::Pause {
+                automation_id,
+                automation_revision,
+            } => (automation_id.clone(), automation_revision.clone()),
+            _ => {
+                return Err(UserAutomationExecutionError::OperationMismatch(
+                    "pause-and-cancel requires pause",
+                ));
+            }
+        };
+        self.cancel_affected_wakes_with_targets(
+            request,
+            CancellingCommit::CommittedRevision {
+                automation_id,
+                automation_revision,
+                expected_state: UserAutomationConfigurationState::Paused,
+            },
+            targets,
+            enumeration_receipt,
+            runtime,
+        )
+        .await
+    }
+
+    /// Cancels the exact owner-issued pending wake targets of the revision a
+    /// superseding `Edit` replaced (issue #2806 item 6).
+    ///
+    /// The affected revision is the immutable predecessor, not the committed
+    /// document: the commit this method replays must be the new revision linked
+    /// from that predecessor, and the cancellation carries the predecessor's
+    /// own occurrence denominator. Per I11.12 a superseding edit invalidates
+    /// the not-yet-admitted wake intents of the superseded revision while the
+    /// new revision keeps its own horizon; admitted jobs and immutable history
+    /// are preserved either way.
+    pub async fn edit_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        superseded: UserAutomationRevision,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
+        runtime: &R,
+    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
+        match &request.intent.operation {
+            eliot_kernel_core::UserAutomationOperation::Edit { .. } => {}
+            _ => {
+                return Err(UserAutomationExecutionError::OperationMismatch(
+                    "edit-and-cancel requires edit",
+                ));
+            }
+        }
+        self.cancel_affected_wakes_with_targets(
+            request,
+            CancellingCommit::SupersededPredecessor {
+                superseded: Box::new(superseded),
+            },
+            targets,
+            enumeration_receipt,
+            runtime,
+        )
+        .await
+    }
+
+    /// Cancels the exact owner-issued pending wake targets of one affected
+    /// revision after replaying the committed transition that owns them.
+    ///
+    /// This is the one mechanism behind the remove, pause, and superseding-edit
+    /// cancellation joins: the same complete, fail-closed owner view gate, the
+    /// same replay-under-the-admitted-identity discipline, and the same exact
+    /// ordered cancellation accounting. Only the committed-transition check
+    /// differs, because a remove/pause cancels the committed document while a
+    /// superseding edit cancels its immutable predecessor.
+    async fn cancel_affected_wakes_with_targets<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        commit: CancellingCommit,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
+        runtime: &R,
+    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
         // Wake cancellation acts on the same complete, fail-closed owner view as
-        // execution admission (issue #2808). `remove_and_cancel_with_targets`
-        // is one of the four consumer legs of the single `execution_projection`
-        // constructor, and the Store's retirement gate refuses to commit the
-        // transition unless the declared occurrence denominator is owner-proven
-        // complete at one read revision. Asserting the same gate on the
-        // cancellation that follows the commit means the scheduler owner is
-        // never asked to cancel from a bounded subset, and a Store adapter that
-        // did not gate the retirement is caught here rather than silently
-        // proceeding. Retirement itself is never refused because an effect is
+        // execution admission (issue #2808). Every cancellation join is a
+        // consumer leg of the single `execution_projection` constructor, and the
+        // Store's retirement gate refuses to commit the transition unless the
+        // declared occurrence denominator is owner-proven complete at one read
+        // revision. Asserting the same gate on the cancellation that follows the
+        // commit means the scheduler owner is never asked to cancel from a
+        // bounded subset, and a Store adapter that did not gate the transition
+        // is caught here rather than silently proceeding. The committed
+        // configuration itself is never refused because an effect is
         // unresolved: those obligations are preserved verbatim.
-        let owner_view = self.owner_execution_view(&request, &automation_id).await?;
+        let owner_view = self
+            .owner_execution_view(&request, &commit.automation_id(&request)?)
+            .await?;
         require_complete_occurrence_view(&owner_view)?;
         let response = self.dispatch(request.clone()).await?;
         let (receipt, result, replayed) = match response.outcome {
@@ -3023,30 +3301,23 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             UserAutomationStoreOutcome::Replayed { receipt, result } => (receipt, result, true),
             UserAutomationStoreOutcome::Read { .. } => {
                 return Err(UserAutomationExecutionError::OperationMismatch(
-                    "remove returned a read response",
+                    "cancel-with-targets returned a read response",
                 ));
             }
         };
         let UserAutomationMutationResult::Revision { revision, .. } = result else {
             return Err(UserAutomationExecutionError::OperationMismatch(
-                "remove returned a non-revision result",
+                "cancel-with-targets returned a non-revision result",
             ));
         };
-        if revision.automation_id != automation_id
-            || revision.revision != automation_revision
-            || revision.configuration_state != UserAutomationConfigurationState::Retired
-        {
-            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
-                "remove revision",
-            ));
-        }
+        let affected = commit.check_committed(&request, &revision)?;
         enumeration_receipt.validate_integrity()?;
         let cancellation = UserAutomationWakeCancellation {
             context: request.context.clone(),
             authenticated_principal: request.authenticated_principal,
             identity: request.identity,
-            automation_id,
-            automation_revision,
+            automation_id: affected.automation_id.clone(),
+            automation_revision: affected.revision.clone(),
             state_fence: request.context.state_fence.clone(),
             only_unadmitted: true,
             targets,
@@ -3073,7 +3344,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 ))
             })?;
         Ok(UserAutomationRemovalResult {
-            revision,
+            revision: affected,
             receipt,
             cancelled_wake_ids,
             replayed,
