@@ -3967,9 +3967,11 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // the marker names is terminal-unacknowledged (a crash between
         // publish and reclaim), so it replays below instead of
         // re-executing.
-        let served_marker = crate::dispatch_material::admitted_material_path()
+        let directory = crate::dispatch_material::admitted_material_path()
             .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-            .and_then(|directory| crate::dispatch_material::read_served_marker(&directory));
+            .ok_or(OrdinaryDriveError::Drive(DriveError::NoMaterial))?;
+        let served_marker = crate::dispatch_material::read_served_marker(&directory)
+            .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
         match crate::dispatch_material::classify_staged_delivery(
             &material,
             served.as_slice(),
@@ -4023,19 +4025,21 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 // attested as settled, so reclaiming here never races an
                 // unresolved guest child.
                 //
-                // Durable served marker (#2786 step 7): after the terminal
-                // outcome published, before reclaim. A crash between the two
-                // leaves staged bytes plus this marker, so restart replays
-                // instead of re-executing. Best-effort: the serve already
-                // happened exactly once.
-                if let Some(directory) = crate::dispatch_material::admitted_material_path()
-                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                // A failed marker write leaves no cross-process replay
+                // guard. Preserve the claimed set and report its original
+                // identity as unresolved instead of claiming success.
+                if crate::dispatch_material::write_served_marker(
+                    &directory,
+                    claim.identity(),
+                    edge_now_ms(),
+                )
+                .is_err()
                 {
-                    let _ = crate::dispatch_material::write_served_marker(
-                        &directory,
-                        claim.identity(),
-                        edge_now_ms(),
-                    );
+                    return Err(OrdinaryDriveError::DeliveryInProgress {
+                        operation_id: claim.identity().operation_id.clone(),
+                        generation: claim.identity().generation,
+                        claim_id: claim.identity().claim_id.clone(),
+                    });
                 }
                 let reclamation = consume_delivery_set(&claim);
                 // Bounded residual only: a partial reclamation never
