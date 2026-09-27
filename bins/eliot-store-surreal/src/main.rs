@@ -8,9 +8,9 @@ use eliot_ipc::TransportLimits;
 use eliot_protocol::MessageType;
 use eliot_store_surreal::{
     SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch,
-    load_compatibility_for_config, load_config, require_compatibility_for_writer,
-    require_observed_identity_match, require_semantic_ready_for_pipe, store_bootstrap_descriptor,
-    validate_request_frame,
+    load_compatibility_for_config, load_config, load_evidence_snapshot_verification,
+    require_compatibility_for_writer, require_observed_identity_match,
+    require_semantic_ready_for_pipe, store_bootstrap_descriptor, validate_request_frame,
 };
 
 mod launch_mode;
@@ -107,6 +107,10 @@ fn enforce_store_compatibility(
 ) -> Result<(), String> {
     let config_path = std::path::Path::new(config.runtime_launch.store_config_path.as_str());
     let file = load_compatibility_for_config(config_path)?;
+    // The I0.5 evidence qualification is an observed property of the
+    // installed snapshot document, never state of the record: resolve it
+    // here and pass it explicitly to the admission gate.
+    let evidence_verification = load_evidence_snapshot_verification(config_path, &file.surrealdb);
     let report = require_compatibility_for_writer(
         &file.surrealdb,
         config
@@ -114,6 +118,7 @@ fn enforce_store_compatibility(
             .canonical_store_artifact_digest
             .as_str(),
         &config.schema_generation,
+        &evidence_verification,
     )?;
     eprintln!("{SERVICE_NAME}: {report}");
     Ok(())
