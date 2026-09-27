@@ -14,13 +14,17 @@ use std::sync::Arc;
 
 use eliot_contracts::{AuthorityEpoch, StateFence};
 use eliot_ipc::ServerHandshakePolicy;
-use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
+use eliot_kernel_core::{
+    AcceptedCompatibilityEvidence, CutoverDecision, GenerationRoute, GenerationRouter, RouteScope,
+    admit_rollback,
+};
 use eliot_kernel_service::KernelService;
 use eliot_ors::{CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
 };
 
+use crate::composition_bootstrap::durable_compatibility_state;
 use crate::{PROTOCOL_VERSION, SERVICE_NAME};
 
 fn is_lower_sha256(value: &str) -> bool {
@@ -203,14 +207,25 @@ impl OrsGenerationCoordinator {
         outcome
     }
 
+    /// Restores the committed route and re-admits the previously launched
+    /// `eliotd` artifact behind the I1.12 rollback boundary.
+    ///
+    /// `recorded_evidence` is the compatibility evidence accepted for the
+    /// launch being re-admitted. Restarting an artifact is a rollback request,
+    /// so I1.12 requires that evidence to still match the current durable
+    /// formats and epoch lineage — "last known good" means verified compatible
+    /// with current state, not merely previously launched. `None` is the
+    /// explicitly standalone composition, which has no candidate `eliotd`
+    /// artifact to re-admit.
     pub(crate) fn recover(
         &self,
         generations: &mut GenerationRouter,
         service: &mut KernelService,
         policy: &mut ServerHandshakePolicy,
+        recorded_evidence: Option<&AcceptedCompatibilityEvidence>,
     ) -> Result<(), String> {
         observe_recovery("kernel.recovery.recover_requested", "attempt");
-        let outcome = self.recover_inner(generations, service, policy);
+        let outcome = self.recover_inner(generations, service, policy, recorded_evidence);
         if outcome.is_ok() {
             observe_recovery("kernel.recovery.recover_completed", "success");
         } else {
@@ -224,6 +239,7 @@ impl OrsGenerationCoordinator {
         generations: &mut GenerationRouter,
         service: &mut KernelService,
         policy: &mut ServerHandshakePolicy,
+        recorded_evidence: Option<&AcceptedCompatibilityEvidence>,
     ) -> Result<(), String> {
         let _ = self
             .ors
@@ -235,6 +251,24 @@ impl OrsGenerationCoordinator {
             .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
             .map_err(|error| error.to_string())?;
         observe_recovery("kernel.recovery.cutovers_loaded", "success");
+        // I1.12 rollback boundary (Implements #1968): re-admitting a
+        // previously launched artifact is a rollback request. Its recorded
+        // compatibility evidence must still match the durable formats and the
+        // epoch lineage the Kernel currently holds, or the artifact is not
+        // "last known good" and the restart is refused before any route is
+        // re-projected onto the handshake policy. The refusal names the exact
+        // mismatching field; the fixed observation carries only that boundary.
+        if let Some(evidence) = recorded_evidence {
+            let durable = durable_compatibility_state(&service.authority_epoch())
+                .map_err(|error| error.to_string())?;
+            if let Err(mismatch) = admit_rollback(evidence, &durable) {
+                observe_recovery("kernel.recovery.rollback_refused", "rejected");
+                return Err(format!(
+                    "previously launched artifact is not compatible with current durable state: {mismatch}"
+                ));
+            }
+            observe_recovery("kernel.recovery.rollback_admitted", "success");
+        }
         if snapshots.is_empty() {
             observe_recovery("kernel.recovery.load_empty", "empty");
             return Ok(());

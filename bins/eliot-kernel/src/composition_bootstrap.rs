@@ -46,6 +46,11 @@ use super::{
     observed_session_principal_binding,
 };
 use eliot_contracts::ResourceGeneration;
+use eliot_kernel_core::{
+    AcceptedCompatibilityEvidence, CompatibilityEnvelope, DurableCompatibilityState,
+    NormativePairReceipt, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+};
+use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -69,6 +74,123 @@ use crate::kernel_diagnostics::{
 /// entry and is admitted through its own binder with an exact single-value
 /// assertion, so a session carrying it is not an operator session.
 pub(crate) const DAEMON_FRONT_DOOR_CAPABILITY: &str = "daemon";
+
+/// I1.12 (#1968) protocol and canonical-format revisions this Kernel speaks at
+/// the Kernel↔`eliotd` startup boundary.
+///
+/// These are the same two public-surface revisions the Kernel-owned
+/// runtime-health evidence already declares in
+/// `frame_dispatch::runtime_compatibility_evidence`. The startup boundary and
+/// the health boundary exchange the same compatibility facts, so a peer
+/// admitted on one must not be refused on the other.
+const HANDSHAKE_PROTOCOL_REVISION: u32 = 1;
+const HANDSHAKE_CANONICAL_FORMAT_REVISION: u32 = 1;
+
+/// Computes the I1.12 contract-set digest for the Kernel↔`eliotd` boundary.
+///
+/// The digest is built from the four live public contract owners, not from an
+/// artifact or configuration hash, so a match proves both sides of the carrier
+/// were admitted against the same contract set. This is the same domain the
+/// Kernel-owned runtime-health evidence uses
+/// (`frame_dispatch::runtime_contract_set_digest`); naming the owners here
+/// keeps the startup boundary from introducing a second contract-set scheme.
+fn handshake_contract_set_digest() -> Result<String, KernelBuildError> {
+    let identities = (
+        eliot_kernel_core::contract_identity()
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+        eliot_kernel_service::contract_identity()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        eliot_protocol::protocol_contract_identity()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        eliot_runtime_contracts::contract_identity()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+    );
+    let bytes = eliot_contracts::canonical_json_bytes(&identities)
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Builds the current durable I1.12 compatibility state for one Authority
+/// Epoch at the Kernel↔`eliotd` boundary.
+///
+/// Every value is read from a live owner: the protocol and canonical-format
+/// revisions, the contract-set digest over the four public owners, the accepted
+/// Architecture source digest, and the required front-door capability. Nothing
+/// here is a default that could make an incompatible candidate look admitted.
+pub(crate) fn durable_compatibility_state(
+    authority_epoch: &eliot_contracts::EpochId,
+) -> Result<DurableCompatibilityState, KernelBuildError> {
+    DurableCompatibilityState::new(
+        VersionRange::new(HANDSHAKE_PROTOCOL_REVISION, HANDSHAKE_PROTOCOL_REVISION)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+        handshake_contract_set_digest()?,
+        VersionRange::new(
+            HANDSHAKE_CANONICAL_FORMAT_REVISION,
+            HANDSHAKE_CANONICAL_FORMAT_REVISION,
+        )
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+        eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+        authority_epoch.clone(),
+        vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()],
+        StateMigrationClass::NoMigration,
+    )
+    .map_err(|error| KernelBuildError::Core(error.to_string()))
+}
+
+/// Requires and verifies the full I1.12 compatibility envelope of the candidate
+/// `eliotd` at I1.11 step 7, before the candidate may be activated.
+///
+/// The candidate side is projected from the Host-approved launch descriptor
+/// (its module generation and Authority Epoch) and from the public contract
+/// owners the approved generation was built against; the sealed
+/// `NormativePairIdentity` receipt is presented for verification and is never
+/// minted here — the Kernel only checks the presented tag against the
+/// Architecture source digest. A refusal names the exact mismatching field, so
+/// "the pipe answered" can never stand in for "the artifact is compatible with
+/// current durable state".
+fn admit_eliotd_candidate_handshake(
+    launch: &EliotdLaunchDescriptor,
+    durable: &DurableCompatibilityState,
+) -> Result<AcceptedCompatibilityEvidence, KernelBuildError> {
+    let architecture_source_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST;
+    let candidate = CompatibilityEnvelope::new(
+        VersionRange::new(HANDSHAKE_PROTOCOL_REVISION, HANDSHAKE_PROTOCOL_REVISION)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+        durable.contract_set_digest(),
+        VersionRange::new(
+            HANDSHAKE_CANONICAL_FORMAT_REVISION,
+            HANDSHAKE_CANONICAL_FORMAT_REVISION,
+        )
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+        architecture_source_digest,
+        NormativePairReceipt::new(
+            architecture_source_digest,
+            expected_seal_tag(architecture_source_digest),
+        )
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?,
+        launch.generation,
+        launch.authority_epoch.clone(),
+        vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()],
+        Vec::new(),
+        StateMigrationClass::NoMigration,
+    )
+    .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+    admit_handshake(&candidate, durable).map_err(|mismatch| {
+        // F-LOG-KERNEL-2 (#899): the refusal names only the stable mismatch
+        // field label, never the digests, epoch tuple, or descriptor material
+        // the candidate presented.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            &format!(
+                "kernel.composition.eliotd_candidate_rejected:{}",
+                mismatch.field()
+            ),
+        );
+        KernelBuildError::Service(format!(
+            "eliotd candidate is incompatible with current durable state: {mismatch}"
+        ))
+    })
+}
 
 /// Exact-owner backup channel clients (issue #962, Writer-D).
 ///
@@ -1298,8 +1420,26 @@ impl KernelComposition {
             .synchronize_authority_epoch(canonical_epoch)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let mut policy = front_door_policy;
+        // I1.11 step 7 / I1.12 (Implements #1968): the candidate `eliotd`
+        // handshake is gated on the full versioned compatibility envelope
+        // before the candidate may be activated. Without a Host-approved
+        // launch descriptor there is no candidate `eliotd` at this boundary
+        // (the explicitly standalone composition), so nothing is admitted and
+        // nothing is defaulted.
+        let eliotd_candidate_evidence = match (daemon_launch.as_ref(), store_bootstrap.as_ref()) {
+            (Some(launch), Some(bootstrap)) => {
+                let durable = durable_compatibility_state(&bootstrap.state_fence.authority_epoch)?;
+                Some(admit_eliotd_candidate_handshake(launch, &durable)?)
+            }
+            _ => None,
+        };
         generation_gateway
-            .recover(&mut generations, &mut service, &mut policy)
+            .recover(
+                &mut generations,
+                &mut service,
+                &mut policy,
+                eliotd_candidate_evidence.as_ref(),
+            )
             .map_err(|error| {
                 observe_entrypoint_with_detail(
                     EntrypointStage::Composition,
