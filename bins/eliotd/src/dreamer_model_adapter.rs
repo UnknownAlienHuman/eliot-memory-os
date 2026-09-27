@@ -1901,11 +1901,16 @@ mod tests {
     /// route here).
     fn test_evidence_scope() -> RouteScopeFingerprint {
         RouteScopeFingerprint {
+            host_family: Some("t12-07-host-1".to_owned()),
+            adapter_id: Some("t12-07-adapter-id-1".to_owned()),
+            protocol_transport: Some("app-server|stdio".to_owned()),
             runtime_hash: Some("t12-07-runtime-1".to_owned()),
             adapter_hash: Some("t12-07-adapter-1".to_owned()),
             os_architecture: Some("x86_64-windows".to_owned()),
             auth_profile_class: Some("user-broker".to_owned()),
             provider_model_route: Some("provider-model-a/model-a/fixture-account".to_owned()),
+            tool_call_id_and_role_ordering: Some("t12-07-tool-ordering-1".to_owned()),
+            reasoning_continuation_and_compaction: Some("t12-07-reasoning-compaction-1".to_owned()),
             feature_flags_and_serializer: Some("t12-07-serializer-1".to_owned()),
         }
     }

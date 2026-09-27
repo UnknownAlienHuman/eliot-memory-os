@@ -25,6 +25,18 @@
 //! flows into every admission decision through the explicit `now` parameter,
 //! so positive evidence can go stale in a running daemon.
 //!
+//! Scope keying (issue #1958): [`RouteScopeFingerprint`] is the *complete
+//! effective* route identity, not a provider/model label. It carries every
+//! behaviour-changing group of the I3.4 `RouteFingerprint` - host family,
+//! adapter identity, protocol/transport, runtime and adapter hashes, OS
+//! architecture, auth profile, provider/model route, tool-call ID and role
+//! ordering, reasoning continuation/compaction, and the serializer plus
+//! behaviour-affecting feature-flag and tool/context profile hashes - so two
+//! attempts differing only by serializer or by tool-call/role ordering resolve
+//! to different keys and cannot reuse each other's capability evidence. A
+//! dimension the source does not expose stays `None` (unknown) and matches
+//! only `None`; it is never back-filled from the requested route.
+//!
 //! Supersession is decided by the evidence retained for a key, not by arrival
 //! order: the registry holds one record per `(skill_id, scope_fingerprint)`,
 //! and an insertion replaces it only when its own `observed_at` is strictly
@@ -97,16 +109,38 @@ impl CapabilitySource {
 
 /// Complete route-scope fingerprint for one capability claim.
 ///
-/// Fields the source cannot provide stay `None` (unknown, never inferred).
-/// `None` matches only `None` during exact-fingerprint comparison.
+/// This is the *complete effective* route identity issue #1958 requires, not a
+/// provider/model label: every behaviour-changing group I3.4 lists in
+/// `RouteFingerprint` is present, so a route that differs only in host family,
+/// adapter identity, protocol/transport, tool-call ID and role ordering, or
+/// reasoning continuation/compaction moves the key and its dependent evidence
+/// stops matching instead of being reused. It is the same value the
+/// [`RouteBehaviorFingerprint`](crate::RouteBehaviorFingerprint) owner
+/// projects, so capability lookup cannot drift from route identity.
+///
+/// Fields the source cannot provide stay `None` (unknown, never inferred from
+/// the requested route, a UI selection, or prompt text). `None` matches only
+/// `None` during exact-fingerprint comparison.
 #[derive(Clone, Debug, Default, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteScopeFingerprint {
+    pub host_family: Option<String>,
+    pub adapter_id: Option<String>,
+    /// Protocol kind and transport kind of the runtime connection.
+    pub protocol_transport: Option<String>,
     pub runtime_hash: Option<String>,
     pub adapter_hash: Option<String>,
     pub os_architecture: Option<String>,
     pub auth_profile_class: Option<String>,
+    /// Requested provider and model route label, exposed by the runtime.
     pub provider_model_route: Option<String>,
+    /// Tool-call ID and role ordering semantics of the adapter.
+    pub tool_call_id_and_role_ordering: Option<String>,
+    /// Reasoning continuation and compaction behavior of the runtime.
+    pub reasoning_continuation_and_compaction: Option<String>,
+    /// Composite of the runtime-exposed message serializer/chat-template
+    /// fingerprint and the behaviour-affecting feature-flag and tool/context
+    /// profile hashes of the installation.
     pub feature_flags_and_serializer: Option<String>,
 }
 
@@ -125,20 +159,25 @@ impl RouteScopeFingerprint {
 /// and accounts whose selected fields still match the current fingerprint
 /// stay admitted. [`ScopeDependencySelector::all`] reproduces the coarse
 /// whole-fingerprint invalidation for callers that cannot attribute the
-/// change more narrowly. Six independent dependency dimensions stay six
+/// change more narrowly. Eleven independent dependency dimensions stay eleven
 /// explicit flags (not a bitmask) so each contract dimension reads by name.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "six named I03-04 dependency dimensions"
+    reason = "eleven named I03-04 dependency dimensions"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeDependencySelector {
+    pub host_family: bool,
+    pub adapter_id: bool,
+    pub protocol_transport: bool,
     pub runtime_hash: bool,
     pub adapter_hash: bool,
     pub os_architecture: bool,
     pub auth_profile_class: bool,
     pub provider_model_route: bool,
+    pub tool_call_id_and_role_ordering: bool,
+    pub reasoning_continuation_and_compaction: bool,
     pub feature_flags_and_serializer: bool,
 }
 
@@ -147,11 +186,16 @@ impl ScopeDependencySelector {
     #[must_use]
     pub const fn all() -> Self {
         Self {
+            host_family: true,
+            adapter_id: true,
+            protocol_transport: true,
             runtime_hash: true,
             adapter_hash: true,
             os_architecture: true,
             auth_profile_class: true,
             provider_model_route: true,
+            tool_call_id_and_role_ordering: true,
+            reasoning_continuation_and_compaction: true,
             feature_flags_and_serializer: true,
         }
     }
@@ -160,11 +204,16 @@ impl ScopeDependencySelector {
     #[must_use]
     pub const fn none() -> Self {
         Self {
+            host_family: false,
+            adapter_id: false,
+            protocol_transport: false,
             runtime_hash: false,
             adapter_hash: false,
             os_architecture: false,
             auth_profile_class: false,
             provider_model_route: false,
+            tool_call_id_and_role_ordering: false,
+            reasoning_continuation_and_compaction: false,
             feature_flags_and_serializer: false,
         }
     }
@@ -177,12 +226,20 @@ impl ScopeDependencySelector {
         record: &RouteScopeFingerprint,
         current: &RouteScopeFingerprint,
     ) -> bool {
-        (self.runtime_hash && record.runtime_hash != current.runtime_hash)
+        (self.host_family && record.host_family != current.host_family)
+            || (self.adapter_id && record.adapter_id != current.adapter_id)
+            || (self.protocol_transport && record.protocol_transport != current.protocol_transport)
+            || (self.runtime_hash && record.runtime_hash != current.runtime_hash)
             || (self.adapter_hash && record.adapter_hash != current.adapter_hash)
             || (self.os_architecture && record.os_architecture != current.os_architecture)
             || (self.auth_profile_class && record.auth_profile_class != current.auth_profile_class)
             || (self.provider_model_route
                 && record.provider_model_route != current.provider_model_route)
+            || (self.tool_call_id_and_role_ordering
+                && record.tool_call_id_and_role_ordering != current.tool_call_id_and_role_ordering)
+            || (self.reasoning_continuation_and_compaction
+                && record.reasoning_continuation_and_compaction
+                    != current.reasoning_continuation_and_compaction)
             || (self.feature_flags_and_serializer
                 && record.feature_flags_and_serializer != current.feature_flags_and_serializer)
     }
@@ -390,11 +447,21 @@ impl From<&ImportedLegacyEvidence> for CapabilityEvidenceRecord {
             status: CapabilityStatus::Declared,
             source: CapabilitySource::ImportedLegacyDeclaration,
             scope_fingerprint: RouteScopeFingerprint {
+                // A legacy declaration carries none of the complete effective
+                // route identity beyond the six dimensions the import shape
+                // declares; every further behaviour-changing group stays
+                // `None` (unknown), never back-filled from the route the
+                // declaration names.
+                host_family: None,
+                adapter_id: None,
+                protocol_transport: None,
                 runtime_hash: imported.scope.runtime_hash.clone(),
                 adapter_hash: imported.scope.adapter_hash.clone(),
                 os_architecture: imported.scope.os_architecture.clone(),
                 auth_profile_class: imported.scope.auth_profile_class.clone(),
                 provider_model_route: imported.scope.provider_model_route.clone(),
+                tool_call_id_and_role_ordering: None,
+                reasoning_continuation_and_compaction: None,
                 feature_flags_and_serializer: imported.scope.feature_flags_and_serializer.clone(),
             },
             limitations_and_negative_evidence: Vec::new(),
@@ -632,11 +699,16 @@ mod tests {
 
     fn scope() -> RouteScopeFingerprint {
         RouteScopeFingerprint {
+            host_family: Some("host-family-1".into()),
+            adapter_id: Some("adapter-id-1".into()),
+            protocol_transport: Some("app-server|stdio".into()),
             runtime_hash: Some("runtime-hash-1".into()),
             adapter_hash: Some("adapter-hash-1".into()),
             os_architecture: Some("x86_64-windows".into()),
             auth_profile_class: Some("user-broker".into()),
             provider_model_route: Some("provider/model/auth".into()),
+            tool_call_id_and_role_ordering: Some("tool-call-id-1".into()),
+            reasoning_continuation_and_compaction: Some("reasoning-compaction-1".into()),
             feature_flags_and_serializer: Some("serializer-v1".into()),
         }
     }
