@@ -58,5 +58,29 @@
       }
     }
   ],
+  "members": [
+    {
+      "member_id": "member-975-r1",
+      "member_type": "RECORD",
+      "content_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "residency": {
+        "domain": "INLINE_CANONICAL",
+        "residency_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "byte_count": 1024
+      },
+      "reference_digest": null
+    },
+    {
+      "member_id": "member-975-r2",
+      "member_type": "REFERENCE",
+      "content_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "residency": {
+        "domain": "EXTERNAL_REFERENCE",
+        "residency_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "byte_count": 64
+      },
+      "reference_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
   "member_count": 2
 }
