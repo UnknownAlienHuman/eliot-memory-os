@@ -7132,15 +7132,21 @@ impl HostComposition {
         // One terminal per Unknown outcome; inner `execute` shares correlation
         // and never emits its own terminal.
         host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_REQUESTED);
-        // F-LOG-HOST-1 case 15: the restart sighting carries the admitted
-        // installation/generation so SCM restart records correlate; the
-        // operation/process slots stay missing (no fitting taxonomy value
-        // on this path, never a guessed one).
+        // F-LOG-HOST-1 case 15: the restart sighting correlates on the
+        // installation and generation already held in `launch_options`, plus
+        // this process's own id from `std::process::id()` - the same
+        // `HostProcessBinding` identity the owner already records elsewhere,
+        // read here as a pure value (no probe, no handle, no lock). The
+        // `operation` slot stays explicitly missing: this dispatch is a
+        // runtime-control (SCM) action, and `AdmittedEvent` admits service
+        // start/stop/failure only, so no fitting taxonomy value exists here
+        // and none is guessed.
         host_lifecycle_observe_identity(
             &host_diagnostics::HostRequestProjection::observed(
                 host_diagnostics::EntrypointStage::ScmDispatch,
             )
-            .with_launch_options(&self.launch_options),
+            .with_launch_options(&self.launch_options)
+            .with_process(std::process::id()),
         );
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
             // Reconcile is query-only replay, not another restart commit.
