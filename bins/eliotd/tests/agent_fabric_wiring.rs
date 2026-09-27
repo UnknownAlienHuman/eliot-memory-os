@@ -195,11 +195,16 @@ const EVIDENCE_NOW: u64 = 10;
 
 fn test_evidence_scope() -> RouteScopeFingerprint {
     RouteScopeFingerprint {
+        host_family: Some("fabric-host-1".to_owned()),
+        adapter_id: Some("fabric-adapter-id-1".to_owned()),
+        protocol_transport: Some("app-server|stdio".to_owned()),
         runtime_hash: Some("fabric-runtime-1".to_owned()),
         adapter_hash: Some("fabric-adapter-1".to_owned()),
         os_architecture: Some("x86_64-windows".to_owned()),
         auth_profile_class: Some("user-broker".to_owned()),
         provider_model_route: Some("provider-fabric-a/model-fabric-a/fixture-account".to_owned()),
+        tool_call_id_and_role_ordering: Some("fabric-tool-ordering-1".to_owned()),
+        reasoning_continuation_and_compaction: Some("fabric-reasoning-compaction-1".to_owned()),
         feature_flags_and_serializer: Some("fabric-serializer-1".to_owned()),
     }
 }

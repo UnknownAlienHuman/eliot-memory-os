@@ -1102,11 +1102,18 @@ mod tests {
 
     fn summary_scope() -> eliot_governor::RouteScopeFingerprint {
         eliot_governor::RouteScopeFingerprint {
+            host_family: Some("startup-host-1".to_owned()),
+            adapter_id: Some("startup-adapter-id-1".to_owned()),
+            protocol_transport: Some("app-server|stdio".to_owned()),
             runtime_hash: Some("startup-runtime-1".to_owned()),
             adapter_hash: Some("startup-adapter-1".to_owned()),
             os_architecture: Some("x86_64-windows".to_owned()),
             auth_profile_class: Some("user-broker".to_owned()),
             provider_model_route: Some("provider/model/auth".to_owned()),
+            tool_call_id_and_role_ordering: Some("startup-tool-ordering-1".to_owned()),
+            reasoning_continuation_and_compaction: Some(
+                "startup-reasoning-compaction-1".to_owned(),
+            ),
             feature_flags_and_serializer: Some("serializer-1".to_owned()),
         }
     }

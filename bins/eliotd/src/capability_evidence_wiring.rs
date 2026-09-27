@@ -459,11 +459,16 @@ mod tests {
 
     fn scope() -> RouteScopeFingerprint {
         RouteScopeFingerprint {
+            host_family: Some("host-family-1".into()),
+            adapter_id: Some("adapter-id-1".into()),
+            protocol_transport: Some("app-server|stdio".into()),
             runtime_hash: Some("runtime-hash-1".into()),
             adapter_hash: Some("adapter-hash-1".into()),
             os_architecture: Some("x86_64-windows".into()),
             auth_profile_class: Some("user-broker".into()),
             provider_model_route: Some("provider/model/auth".into()),
+            tool_call_id_and_role_ordering: Some("tool-call-id-1".into()),
+            reasoning_continuation_and_compaction: Some("reasoning-compaction-1".into()),
             feature_flags_and_serializer: Some("serializer-v1".into()),
         }
     }
