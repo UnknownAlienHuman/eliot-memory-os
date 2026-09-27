@@ -3106,8 +3106,10 @@ async fn experience_feedback_range_payload(
 /// `scope_id` request field; an over-bound page request fails closed
 /// through the typed decoder before any row is read. Rows project
 /// verbatim record documents plus presented digests in key order with an
-/// explicit truncation marker. The optional closed kind filter narrows
-/// to one record kind; rows outside the filter never leave the store.
+/// explicit truncation marker. The eligible set is the complete
+/// scope / kind / fence predicate, applied in the query before the page
+/// bound; the optional closed kind filter narrows to one record kind, and
+/// rows outside scope, kind, or the requested fence never enter the page.
 async fn learning_record_range_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -3145,48 +3147,37 @@ async fn learning_record_range_payload(
                 .map_err(AdapterError::Store)?,
         ),
     };
-    // Fetch covers the skip window plus one probe row: the row scan is
-    // O(table) like every other range read on this contour, and the
-    // probe decides truncation without a second query.
-    let fetch = start
-        .unwrap_or(0)
-        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
-        .saturating_add(1);
-    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
-    let rows = super::surreal_learning::read_learning_for_read(
+    // The eligible set is the complete scope/kind/fence predicate: it is
+    // applied in the query before page slicing, and the skip window is
+    // served by bounded keyset continuation from the last returned
+    // eligible row. Same ordering as the memory adapter's
+    // `learning_range_payload`, so both providers agree on a mixed-fence
+    // prefix. `truncated` is true only when a further eligible row was
+    // actually observed, and the page is empty only when the eligible set
+    // was traversed to its end.
+    let page = super::surreal_learning::read_learning_for_read(
         db,
         config,
         scope_id.as_str(),
         kind_filter.as_deref(),
-        fetch,
+        state_fence,
+        start.unwrap_or(0),
+        limit,
     )
     .await?;
-    let mut records = Vec::new();
-    let mut truncated = false;
-    let mut ordinal: u64 = 0;
-    for row in rows {
-        if row.state_fence != *state_fence {
-            continue;
-        }
-        ordinal = ordinal.saturating_add(1);
-        if start.is_some_and(|start| ordinal <= start) {
-            continue;
-        }
-        if records.len() > limit {
-            truncated = true;
-            break;
-        }
-        records.push(json!({
-            "record_kind": row.record_kind,
-            "handle": row.handle,
-            "record_json": row.record_json,
-            "record_digest": row.record_digest,
-        }));
-    }
-    if records.len() > limit {
-        records.pop();
-        truncated = true;
-    }
+    let records: Vec<Value> = page
+        .records
+        .into_iter()
+        .map(|row| {
+            json!({
+                "record_kind": row.record_kind,
+                "handle": row.handle,
+                "record_json": row.record_json,
+                "record_digest": row.record_digest,
+            })
+        })
+        .collect();
+    let truncated = page.more;
     let matched_total = projection_len(records.len())?;
     let next_cursor = if truncated {
         Some(
