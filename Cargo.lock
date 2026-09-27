@@ -2218,6 +2218,7 @@ dependencies = [
  "eliot-instrument-scip",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-receipts",
  "eliot-verifier",
  "serde",
  "serde_json",
