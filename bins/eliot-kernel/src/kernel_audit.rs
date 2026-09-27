@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes};
 use eliot_ipc::Session;
 use eliot_kernel_core::CutoverDecision;
+use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_ors::{HostRequestRecord, SupervisionLeaseSnapshot};
 use eliot_process::ProcessStartReceipt;
 use eliot_protocol::{
@@ -309,6 +310,8 @@ impl AuditEventKind {
     pub const EPOCH_CUTOVER_APPLIED: &'static str = "epoch.cutover_applied";
     /// An authenticated local peer bound a session.
     pub const SESSION_BOUND: &'static str = "session.bound";
+    /// A daemon handshake was refused before session binding.
+    pub const SESSION_REJECTED: &'static str = "session.rejected";
     /// A bridge connection and its session were revoked.
     pub const SESSION_REVOKED: &'static str = "session.revoked";
     /// One queued pair was dispatched to the daemon claimer.
@@ -363,6 +366,7 @@ impl AuditEventKind {
         Self::LEASE_SUPERVISION_EXPIRED,
         Self::EPOCH_CUTOVER_APPLIED,
         Self::SESSION_BOUND,
+        Self::SESSION_REJECTED,
         Self::SESSION_REVOKED,
         Self::DISPATCH_DAEMON_CLAIM,
         Self::RESULT_DAEMON_SUBMITTED,
@@ -400,6 +404,7 @@ impl AuditEventKind {
             | Self::LEASE_SUPERVISION_EXPIRED
             | Self::EPOCH_CUTOVER_APPLIED
             | Self::SESSION_BOUND
+            | Self::SESSION_REJECTED
             | Self::SESSION_REVOKED
             | Self::RESULT_KERNEL_BOUND
             | Self::RECEIPT_LIVE_PUBLISHED
@@ -1123,6 +1128,74 @@ impl AuditEventDraft {
             body: serde_json::json!({
                 "connection_id": session.connection_id,
                 "session_epoch": session.session_epoch,
+            }),
+        }
+    }
+
+    /// Returns a daemon-handshake refusal draft for the durable audit chain
+    /// without promoting peer-supplied identity to authenticated process lineage.
+    #[must_use]
+    pub fn session_rejected(
+        connection_id: &str,
+        peer_identity_well_formed: bool,
+        public_transport_error: &'static str,
+        refusal_cause: Option<&'static str>,
+        owner_launch: Option<&EliotdLaunchDescriptor>,
+        owner_process_receipt: Option<&ProcessStartReceipt>,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.adapter_instance = Some(connection_id.to_owned());
+        lineage.controller = Some("kernel".to_owned());
+        let owner_launch = owner_launch.map(|launch| {
+            AuditLineage::fill(
+                &mut lineage.module_generation,
+                &launch.generation.value().to_string(),
+            );
+            AuditLineage::fill(
+                &mut lineage.authority_epoch,
+                &authority_epoch_text(&launch.authority_epoch),
+            );
+            serde_json::json!({
+                "descriptor_sha256": launch.descriptor_sha256,
+                "generation": launch.generation.value(),
+                "authority_epoch": authority_epoch_text(&launch.authority_epoch),
+            })
+        });
+        let owner_process_receipt = owner_process_receipt.map(|receipt| {
+            let physical = receipt.identity().physical();
+            let process_binding_ref = process_binding_reference(
+                physical.process_id(),
+                physical.start_time_100ns(),
+                physical.image_path(),
+            );
+            serde_json::json!({
+                "expected_process_binding_ref": process_binding_ref,
+                "operation_id": receipt.operation_id().as_str(),
+                "generation": receipt.accepted_generation().get(),
+                "authority_epoch": authority_epoch_text(
+                    receipt.binding().state_fence().authority_epoch()
+                ),
+                "validation_revision": receipt.binding().validation_revision(),
+            })
+        });
+        Self {
+            kind: AuditEventKind::SESSION_REJECTED,
+            lineage,
+            body: serde_json::json!({
+                "connection_id": connection_id,
+                "peer_identity_well_formed": peer_identity_well_formed,
+                "transport_authentication": "not_observed_at_binding_boundary",
+                "operation_authorization": "not_assessed",
+                "semantic_result_acceptance": "not_reached",
+                "public_transport_error": public_transport_error,
+                "refusal_detail_status": if refusal_cause.is_none() {
+                    "unclassified"
+                } else {
+                    "classified"
+                },
+                "refusal_cause": refusal_cause,
+                "owner_launch": owner_launch,
+                "owner_process_receipt": owner_process_receipt,
             }),
         }
     }
