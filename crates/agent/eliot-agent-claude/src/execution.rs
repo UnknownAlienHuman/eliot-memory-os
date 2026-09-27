@@ -683,6 +683,10 @@ pub struct ClaudeResultInput {
 /// `UNKNOWN_OUTCOME` with a recovery handle. The result is validated against
 /// the live binding, admission, and effect ceiling before return, and can
 /// never express task finish.
+/// STITCH (#370 A27): the future live caller passes the real terminal
+/// candidate of an executed attempt with its binding/admission/ceiling;
+/// BLOCKED-BY the adapter driver (test-only callers). Forbidden: a
+/// fabricated terminal candidate to manufacture a caller.
 pub fn translate_candidate_result(
     input: ClaudeResultInput,
     binding: &ProviderExecutionBinding,
