@@ -57,7 +57,7 @@ use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
-use eliot_contracts::RequestId;
+use eliot_contracts::{BridgeRecoverySelector, RequestId};
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
@@ -4746,9 +4746,14 @@ impl KernelComposition {
         reconciliation["connection_id"] = serde_json::Value::String(session.connection_id.clone());
         reconciliation["live_generation"] = serde_json::Value::from(live_generation);
         reconciliation["reconcile_key_version"] = serde_json::Value::from(1_u64);
+        // The selector echoes back as the ONE shared contract type's own
+        // serialization, not as the caller's raw bytes: the preimage binds
+        // what ORS actually selected, so a caller that spelled a legacy or
+        // partial shape cannot hash its way into a matching key.
         reconciliation["requested_recovery_scope"] = scope
             .recovery_scope
-            .clone()
+            .as_ref()
+            .and_then(|selector| serde_json::to_value(selector).ok())
             .unwrap_or(serde_json::Value::Null);
         let key_bytes = eliot_contracts::canonical_json_bytes(&reconciliation)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -5565,156 +5570,21 @@ pub(crate) fn bridge_gap_from_payload(
 /// recovery selector asks for one bounded continuation page and is read-only.
 pub(crate) struct BridgeReconcileScope {
     pub(crate) consumed: Vec<(String, u64)>,
-    pub(crate) recovery_scope: Option<serde_json::Value>,
+    pub(crate) recovery_scope: Option<BridgeRecoverySelector>,
 }
 
-const MAX_BRIDGE_RECOVERY_STREAMS: u64 = 4;
-const MAX_BRIDGE_RECOVERY_EVENTS: u64 = 128;
-const MAX_BRIDGE_RECOVERY_GAPS: u64 = 256;
+// The recovery selector's stream/event/gap page bounds now live on the one
+// shared contract type (`eliot_contracts::BridgeRecoverySelector`), so this
+// route no longer carries a second copy that could drift from it.
 const MAX_BRIDGE_RECONCILE_TEXT_BYTES: usize = 1024;
 
-/// Requires a closed field set for one versioned recovery selector. In
-/// particular, a future field cannot silently weaken this route's bounds.
-fn bridge_recovery_scope_fields(
-    object: &serde_json::Map<String, serde_json::Value>,
-    expected: &[&str],
-) -> Result<(), TransportError> {
-    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
-        return Err(TransportError::SessionFenced);
-    }
-    Ok(())
-}
-
-fn bridge_recovery_scope_text<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<&'a str, TransportError> {
-    object
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .filter(|text| {
-            !text.trim().is_empty()
-                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
-                && !text.chars().any(char::is_control)
-        })
-        .ok_or(TransportError::SessionFenced)
-}
-
-fn bridge_recovery_scope_u64(
-    object: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<u64, TransportError> {
-    object
-        .get(field)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(TransportError::SessionFenced)
-}
-
-/// Validates one bounded, versioned owner continuation selector. The raw
-/// object is forwarded unchanged to ORS only after this closed typed parse.
-fn validate_bridge_recovery_scope(value: &serde_json::Value) -> Result<(), TransportError> {
-    let object = value.as_object().ok_or(TransportError::SessionFenced)?;
-    if bridge_recovery_scope_u64(object, "version")? != 1 {
-        return Err(TransportError::SessionFenced);
-    }
-    let kind = bridge_recovery_scope_text(object, "kind")?;
-    let window_key = bridge_recovery_scope_text(object, "window_key")?;
-    if window_key.len() != 64
-        || !window_key
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(TransportError::SessionFenced);
-    }
-
-    match kind {
-        "streams" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_stream",
-                    "stream_limit",
-                ],
-            )?;
-            bridge_recovery_scope_text(object, "after_stream")?;
-            let limit = bridge_recovery_scope_u64(object, "stream_limit")?;
-            if limit == 0 || limit > MAX_BRIDGE_RECOVERY_STREAMS {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        "stream" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "stream_id",
-                    "after_sequence",
-                    "upper_sequence",
-                    "expected_revision",
-                    "retention_floor",
-                    "event_limit",
-                    "gap_offset",
-                    "gap_limit",
-                ],
-            )?;
-            let stream_id = bridge_recovery_scope_text(object, "stream_id")?;
-            if stream_id.contains("::") {
-                return Err(TransportError::SessionFenced);
-            }
-            let after_sequence = bridge_recovery_scope_u64(object, "after_sequence")?;
-            let upper_sequence = bridge_recovery_scope_u64(object, "upper_sequence")?;
-            let expected_revision = bridge_recovery_scope_u64(object, "expected_revision")?;
-            let retention_floor = bridge_recovery_scope_u64(object, "retention_floor")?;
-            let event_limit = bridge_recovery_scope_u64(object, "event_limit")?;
-            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
-            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
-            if expected_revision == 0
-                || after_sequence > upper_sequence
-                || retention_floor > upper_sequence
-                || event_limit == 0
-                || event_limit > MAX_BRIDGE_RECOVERY_EVENTS
-                || gap_limit == 0
-                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
-                || gap_offset.checked_add(gap_limit).is_none()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        "unscoped_gaps" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_gap_scope",
-                    "gap_offset",
-                    "gap_limit",
-                ],
-            )?;
-            bridge_recovery_scope_text(object, "after_gap_scope")?;
-            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
-            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
-            if gap_limit == 0
-                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
-                || gap_offset.checked_add(gap_limit).is_none()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        _ => return Err(TransportError::SessionFenced),
-    }
-    Ok(())
-}
-
 /// Decodes the bounded consumed-frontier list and optional exact recovery
-/// selector. Initial/open reads omit the selector. Continuation selectors
-/// are closed version-1 objects and cannot be combined with acknowledgements.
+/// selector. Initial/open reads omit the selector. The selector is the one
+/// shared cross-owner contract type: it is decoded and fully validated here
+/// mechanically, then the SAME decoded value travels into ORS, so no second
+/// parser can disagree with this one about what a continuation means.
+/// Continuation selectors are read-only and cannot be combined with
+/// acknowledgements.
 pub(crate) fn bridge_reconcile_scope_from_payload(
     payload: &serde_json::Value,
 ) -> Result<BridgeReconcileScope, TransportError> {
@@ -5748,8 +5618,7 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
     }
     let recovery_scope = match payload.get("recovery_scope") {
         Some(value) => {
-            validate_bridge_recovery_scope(value)?;
-            Some(value.clone())
+            Some(BridgeRecoverySelector::decode(value).map_err(|_| TransportError::SessionFenced)?)
         }
         None => None,
     };

@@ -40,9 +40,11 @@ pub use eliot_agent_bridge_core::{
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
 use eliot_contracts::{
+    BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
     BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
-    BridgeTransportBackpressure, ClockReading, ProductId, RequestId, RequestMetadata, SourceId,
-    StateFence, canonical_json_bytes, sha256_hex,
+    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
+    BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
+    RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -894,13 +896,15 @@ fn decode_recovery_stream(
         decode_stream_snapshot(stream, live_generation)?;
     let producer_id = recovery_text(stream, "producer_id")?;
     let owner_incarnation = recovery_sequence(stream, "owner_incarnation")?;
-    recovery_sequence(stream, "owner_revision")?;
+    let owner_revision = recovery_sequence(stream, "owner_revision")?;
     let events = decode_page_events(&stream_id, &producer_id, page, live_generation, budget)?;
     let gaps = decode_stream_gaps(stream, &stream_id, budget)?;
     let cut = RecoveryStreamCut::checked(
         recovery_cursor(stream, "upper_sequence")?,
         recovery_sequence(stream, "expected_revision")?,
         recovery_cursor(stream, "retention_floor")?,
+        owner_incarnation,
+        owner_revision,
     )
     .map_err(|_| event_shape_failure("reconciliation refused: invalid owner recovery cut"))?;
     let gap_continuation = match stream.get("gap_continuation") {
@@ -1146,6 +1150,43 @@ fn decode_page_continuation(
 /// required stream scope must still be present and its continuation must
 /// still advance past the requested predecessor; otherwise the page is a
 /// foreign or stale continuation and refuses.
+/// Checks that an answer belongs to the presenting attach: the owner must report
+/// the live generation this attach was activated at and — when a continuation
+/// was requested — keep the SAME window identity. A changed window key means the
+/// owner redefined the walk, which is refused rather than adopted.
+fn check_reconciliation_identity(
+    binding: &AttachBinding,
+    reconciliation: &serde_json::Value,
+    expected: Option<&RecoveryReadRequest>,
+) -> Result<u64, ProviderFailure> {
+    let live_generation = recovery_cursor(reconciliation, "live_generation")?;
+    if live_generation == 0 {
+        return Err(event_shape_failure(
+            "reconciliation refused: live generation must be nonzero",
+        ));
+    }
+    if live_generation != binding.activation_generation().get() {
+        return Err(event_shape_failure(
+            "reconciliation refused: live generation does not match the presenting attach",
+        ));
+    }
+    if let Some(request) = expected {
+        let window_key = recovery_digest(reconciliation, "window_key")?;
+        if request.window_key() != window_key.as_str() {
+            return Err(event_shape_failure(
+                "recovery continuation refused: owner window identity changed",
+            ));
+        }
+    }
+    Ok(live_generation)
+}
+
+/// Decodes the owner's reconciliation answer into a port outcome, refusing any
+/// answer that does not belong to the presenting attach. The continuation
+/// checks live in [`check_expected_continuation`]: a required stream scope must
+/// still be present and its continuation must still advance past the requested
+/// predecessor; otherwise the page is a foreign or stale continuation and
+/// refuses.
 fn decode_reconciliation_outcome(
     binding: &AttachBinding,
     facts: &BridgeEventTransportFacts,
@@ -1170,23 +1211,8 @@ fn decode_reconciliation_outcome(
             "reconciliation refused: owner answer does not echo the presenting connection",
         ));
     }
-    let live_generation = recovery_cursor(reconciliation, "live_generation")?;
-    if live_generation == 0 {
-        return Err(event_shape_failure(
-            "reconciliation refused: live generation must be nonzero",
-        ));
-    }
-    if live_generation != binding.activation_generation().get() {
-        return Err(event_shape_failure(
-            "reconciliation refused: live generation does not match the presenting attach",
-        ));
-    }
+    let live_generation = check_reconciliation_identity(binding, reconciliation, expected)?;
     let window_key = recovery_digest(reconciliation, "window_key")?;
-    if expected.is_some_and(|request| request.window_key() != window_key.as_str()) {
-        return Err(event_shape_failure(
-            "recovery continuation refused: owner window identity changed",
-        ));
-    }
     let window_status = match reconciliation
         .get("window_status")
         .and_then(serde_json::Value::as_str)
@@ -1201,6 +1227,31 @@ fn decode_reconciliation_outcome(
         }
     };
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
+    // The typed disposition, the explicit unresolved frontier, and the page
+    // commitment are all resolved BEFORE any fact below is decoded, let alone
+    // applied: a page whose commitment cannot be recomputed from the answer's
+    // own legs is refused whole, so no known fact and no unresolved frontier
+    // is ever applied half-verified.
+    let disposition = decode_recovery_window_disposition(reconciliation)?;
+    // The typed disposition and the legacy status leg must agree, so an
+    // answer cannot present a refresh-required walk as an active one (or the
+    // reverse) and be read through whichever leg the consumer happens to use.
+    let expected_status = match disposition {
+        BridgeRecoveryWindowDisposition::Active => "active",
+        BridgeRecoveryWindowDisposition::Moved => "moved",
+        BridgeRecoveryWindowDisposition::Expired => "expired",
+    };
+    if reconciliation
+        .get("window_status")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_status)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: window status disagrees with its typed disposition",
+        ));
+    }
+    let unresolved = decode_recovery_unresolved_frontier(reconciliation)?;
+    verify_recovery_page_commitment(reconciliation, &window_key, disposition, &unresolved)?;
     let stream_facts = decode_reconciliation_streams(reconciliation, live_generation, &mut budget)?;
     let unscoped_gaps = decode_unscoped_gaps(reconciliation, &mut budget)?;
     let coverage = decode_recovery_reply_coverage(reconciliation)?;
@@ -1351,37 +1402,154 @@ fn decode_unscoped_gaps(
     Ok(unscoped_gaps)
 }
 
-/// Requires the requested continuation scope to still be present in the
-/// answer with a continuation that still advances past the requested
-/// predecessor; otherwise the page is foreign or stale and refuses.
+/// The exact selector this request is, expressed as the ONE shared
+/// cross-owner contract type (issue #2798).
+///
+/// There is no bridge-local shape for this any more: the same type the Kernel
+/// validated and ORS resolved produces these bytes, so a mismatch anywhere
+/// downstream is a real disagreement rather than two parsers spelling the
+/// same request differently.
 fn recovery_scope_value(
     request: &RecoveryReadRequest,
-) -> Result<serde_json::Value, ProviderFailure> {
+) -> Result<BridgeRecoverySelector, ProviderFailure> {
     if let Some((stream_id, after_sequence, cut, event_limit, gap_offset, gap_limit)) =
         request.stream_scope()
     {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "stream", "window_key": request.window_key(),
-            "stream_id": stream_id, "after_sequence": after_sequence,
-            "upper_sequence": cut.upper_sequence(), "expected_revision": cut.expected_revision(),
-            "retention_floor": cut.retention_floor(), "event_limit": event_limit,
-            "gap_offset": gap_offset, "gap_limit": gap_limit,
-        }))
+        Ok(BridgeRecoverySelector::Stream {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: request.window_key().to_owned(),
+            stream_id: stream_id.to_owned(),
+            owner_incarnation: cut.owner_incarnation(),
+            owner_revision: cut.owner_revision(),
+            expected_revision: cut.expected_revision(),
+            after_sequence,
+            upper_sequence: cut.upper_sequence(),
+            retention_floor: cut.retention_floor(),
+            event_limit,
+            gap_offset,
+            gap_limit,
+        })
     } else if let Some((after_stream, stream_limit)) = request.stream_list_scope() {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "streams", "window_key": request.window_key(),
-            "after_stream": after_stream, "stream_limit": stream_limit,
-        }))
+        Ok(BridgeRecoverySelector::Streams {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: request.window_key().to_owned(),
+            after_stream: after_stream.to_owned(),
+            stream_limit,
+        })
     } else if let Some((after_gap_scope, gap_offset, gap_limit)) = request.unscoped_gap_scope() {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "unscoped_gaps", "window_key": request.window_key(),
-            "after_gap_scope": after_gap_scope, "gap_offset": gap_offset, "gap_limit": gap_limit,
-        }))
+        Ok(BridgeRecoverySelector::UnscopedGaps {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: request.window_key().to_owned(),
+            after_gap_scope: after_gap_scope.to_owned(),
+            gap_offset,
+            gap_limit,
+        })
     } else {
         Err(event_shape_failure(
             "recovery continuation has no bounded selector",
         ))
     }
+}
+
+/// Verifies the owner's canonical page commitment BEFORE any live-state swap.
+///
+/// The commitment is recomputed from the answer's own legs with the same
+/// shared contract type the owner used, so this is a genuine content
+/// comparison against the recorded value — not an existence or shape check.
+/// A page that cannot be recomputed exactly is refused whole: no known fact is
+/// applied, and the explicit unresolved frontier that travelled with the
+/// commitment names what the owner could not resolve.
+fn verify_recovery_page_commitment(
+    reconciliation: &serde_json::Value,
+    window_key: &str,
+    disposition: BridgeRecoveryWindowDisposition,
+    unresolved: &BridgeRecoveryUnresolvedFrontier,
+) -> Result<String, ProviderFailure> {
+    if reconciliation
+        .get("page_commitment_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION)
+    {
+        return Err(event_shape_failure(
+            "recovery page refused: unsupported commitment version",
+        ));
+    }
+    let recorded = recovery_digest(reconciliation, "page_commitment")?;
+    // The owner hashes the page body BEFORE attaching the commitment legs, so
+    // they are stripped here and nothing else.
+    let mut preimage = reconciliation.clone();
+    let object = preimage.as_object_mut().ok_or_else(|| {
+        event_shape_failure("recovery page refused: owner answer is not an object")
+    })?;
+    object.remove("page_commitment");
+    object.remove("page_commitment_version");
+    let selector = match object.get("selected_scope") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => Some(BridgeRecoverySelector::decode(value).map_err(|_| {
+            event_shape_failure(
+                "recovery page refused: selected scope is not the shared selector type",
+            )
+        })?),
+    };
+    let computed = BridgeRecoveryPageCommitment::compute(
+        selector.as_ref(),
+        window_key,
+        disposition,
+        unresolved,
+        &preimage,
+    )
+    .map_err(|_| event_shape_failure("recovery page refused: commitment is not computable"))?;
+    if computed.digest() != recorded {
+        return Err(event_shape_failure(
+            "recovery page refused: commitment does not bind these facts; \
+             nothing applied, safe to retry",
+        ));
+    }
+    Ok(recorded)
+}
+
+/// Decodes the explicit unresolved frontier the owner recorded beside its
+/// disposition, and refuses an answer that omits it.
+///
+/// A walk that cannot be completed must stay visibly incomplete: without this
+/// leg a short page could be read as a whole one.
+fn decode_recovery_unresolved_frontier(
+    reconciliation: &serde_json::Value,
+) -> Result<BridgeRecoveryUnresolvedFrontier, ProviderFailure> {
+    let value = reconciliation
+        .get("unresolved_frontier")
+        .ok_or_else(|| event_shape_failure("recovery page refused: unresolved frontier absent"))?;
+    serde_json::from_value(value.clone()).map_err(|_| {
+        event_shape_failure("recovery page refused: unresolved frontier is not the typed frontier")
+    })
+}
+
+/// Decodes the owner's typed disposition, rejecting a bare status string the
+/// contract does not define.
+fn decode_recovery_window_disposition(
+    reconciliation: &serde_json::Value,
+) -> Result<BridgeRecoveryWindowDisposition, ProviderFailure> {
+    let disposition: BridgeRecoveryWindowDisposition = reconciliation
+        .get("window_disposition")
+        .cloned()
+        .ok_or_else(|| event_shape_failure("recovery page refused: typed disposition absent"))
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|_| {
+                event_shape_failure("recovery page refused: disposition is not a known variant")
+            })
+        })?;
+    // The reason leg must be the reason vocabulary member for that variant,
+    // so a moved window can never be relabelled as a plain truncation.
+    if reconciliation
+        .get("window_disposition_reason")
+        .and_then(serde_json::Value::as_str)
+        != Some(disposition.reason())
+    {
+        return Err(event_shape_failure(
+            "recovery page refused: disposition reason does not match its variant",
+        ));
+    }
+    Ok(disposition)
 }
 
 /// A complete finite event page must account for its declared upper bound.
@@ -1493,6 +1661,30 @@ fn check_recovery_page_ordinals(
     Ok(())
 }
 
+/// Checks an answer that carried NO continuation request: any selector in the
+/// answer is unsolicited and refused, and every returned page is instead
+/// checked against the current acknowledged cursor.
+fn check_unsolicited_continuation(
+    reconciliation: &serde_json::Value,
+    stream_facts: &[RecoveredStreamFacts],
+) -> Result<(), ProviderFailure> {
+    if !reconciliation
+        .get("requested_recovery_scope")
+        .is_some_and(serde_json::Value::is_null)
+        || !reconciliation
+            .get("selected_scope")
+            .is_some_and(serde_json::Value::is_null)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: unsolicited continuation selector",
+        ));
+    }
+    for page in stream_facts {
+        check_finite_page_end(page, page.acked_cursor())?;
+    }
+    Ok(())
+}
+
 fn check_expected_continuation(
     reconciliation: &serde_json::Value,
     stream_facts: &[RecoveredStreamFacts],
@@ -1502,22 +1694,13 @@ fn check_expected_continuation(
         .get("requested_recovery_scope")
         .ok_or_else(|| event_shape_failure("reconciliation refused: requested selector absent"))?;
     let Some(request) = expected else {
-        if !requested.is_null()
-            || !reconciliation
-                .get("selected_scope")
-                .is_some_and(serde_json::Value::is_null)
-        {
-            return Err(event_shape_failure(
-                "reconciliation refused: unsolicited continuation selector",
-            ));
-        }
-        for page in stream_facts {
-            check_finite_page_end(page, page.acked_cursor())?;
-        }
-        return Ok(());
+        return check_unsolicited_continuation(reconciliation, stream_facts);
     };
     let exact = recovery_scope_value(request)?;
-    if requested != &exact || reconciliation.get("selected_scope") != Some(&exact) {
+    let exact_value = serde_json::to_value(&exact).map_err(|_| {
+        event_shape_failure("reconciliation refused: requested selector is not encodable")
+    })?;
+    if requested != &exact_value || reconciliation.get("selected_scope") != Some(&exact_value) {
         return Err(event_shape_failure(
             "recovery continuation refused: owner selected a foreign scope",
         ));

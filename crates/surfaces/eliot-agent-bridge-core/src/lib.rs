@@ -2167,25 +2167,40 @@ pub struct RecoveryStreamCut {
     upper_sequence: u64,
     expected_revision: u64,
     retention_floor: u64,
+    owner_incarnation: u64,
+    owner_revision: u64,
 }
 
 impl RecoveryStreamCut {
+    /// Checks one owner-issued finite cut. The stream incarnation and owner
+    /// binding revision are part of the cut (issue #2798): a continuation has
+    /// to name the exact incarnation and revision it belongs to, so a
+    /// successor stream published under the same name inside the same window
+    /// cannot be mistaken for the walk already in progress.
     #[allow(clippy::result_large_err)]
     pub fn checked(
         upper_sequence: u64,
         expected_revision: u64,
         retention_floor: u64,
+        owner_incarnation: u64,
+        owner_revision: u64,
     ) -> Result<Self, BridgeError> {
-        if expected_revision == 0 || retention_floor > upper_sequence {
+        if expected_revision == 0
+            || retention_floor > upper_sequence
+            || owner_incarnation == 0
+            || owner_revision == 0
+        {
             return Err(BridgeError::InvalidContract {
                 field: "recovery_stream.cut",
-                reason: "owner revision must be nonzero and retention floor within the finite bound",
+                reason: "owner revision, incarnation and retention floor must be nonzero and the floor within the finite bound",
             });
         }
         Ok(Self {
             upper_sequence,
             expected_revision,
             retention_floor,
+            owner_incarnation,
+            owner_revision,
         })
     }
 
@@ -2199,6 +2214,16 @@ impl RecoveryStreamCut {
 
     pub const fn retention_floor(self) -> u64 {
         self.retention_floor
+    }
+
+    /// The stream incarnation this cut was taken at.
+    pub const fn owner_incarnation(self) -> u64 {
+        self.owner_incarnation
+    }
+
+    /// The owner binding revision this cut was taken at.
+    pub const fn owner_revision(self) -> u64 {
+        self.owner_revision
     }
 }
 
