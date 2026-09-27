@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use eliot_protocol::{HandoffCausalLink, ProtocolError, RehydrationBundle};
 use thiserror::Error;
 
 /// Fail-closed validation failures for fingerprint conformance.
@@ -48,6 +49,18 @@ pub enum ConformanceError {
     /// tool use, or external effect without a causally linked new attempt.
     #[error("silent mid-attempt failover is denied after meaningful effect")]
     SilentFailoverDenied,
+    /// The handoff link names a different source attempt.
+    #[error("handoff source attempt does not match the current attempt")]
+    HandoffSourceMismatch,
+    /// The handoff link names a different target attempt.
+    #[error("handoff target attempt does not match the new attempt")]
+    HandoffTargetMismatch,
+    /// The sealed rehydration bundle digest does not match the handoff link.
+    #[error("sealed rehydration bundle digest does not match the handoff link")]
+    HandoffBundleDigestMismatch,
+    /// A protocol handoff or sealed bundle failed its typed validation.
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
 }
 
 /// Canonical host/adapter identity from installation discovery.
@@ -135,7 +148,8 @@ pub enum EvidenceTier {
     ProductionObservation,
 }
 
-/// Expiry-scoped capability evidence bound to one exact fingerprint.
+/// Expiry-scoped capability evidence bound to one exact fingerprint and its
+/// explicit fingerprint invalidation dependencies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityEvidence {
     fingerprint: String,
@@ -144,6 +158,7 @@ pub struct CapabilityEvidence {
     proof_ceiling: String,
     expires_unix_ms: u64,
     evidence_links: Vec<String>,
+    invalidation_dependencies: Vec<HostFingerprint>,
     invalidated: bool,
 }
 
@@ -156,6 +171,7 @@ impl CapabilityEvidence {
         proof_ceiling: impl Into<String>,
         expires_unix_ms: u64,
         evidence_links: Vec<String>,
+        invalidation_dependencies: Vec<HostFingerprint>,
     ) -> Result<Self, ConformanceError> {
         let evidence = Self {
             fingerprint: fingerprint.canonical(),
@@ -164,6 +180,7 @@ impl CapabilityEvidence {
             proof_ceiling: proof_ceiling.into(),
             expires_unix_ms,
             evidence_links,
+            invalidation_dependencies,
             invalidated: false,
         };
         evidence.validate()?;
@@ -186,6 +203,15 @@ impl CapabilityEvidence {
                 return Err(ConformanceError::InvalidInput);
             }
             seen.push(link.as_str());
+        }
+        let mut seen_dependencies = Vec::with_capacity(self.invalidation_dependencies.len());
+        for dependency in &self.invalidation_dependencies {
+            dependency.validate()?;
+            let canonical = dependency.canonical();
+            if canonical == self.fingerprint || seen_dependencies.contains(&canonical) {
+                return Err(ConformanceError::InvalidInput);
+            }
+            seen_dependencies.push(canonical);
         }
         Ok(())
     }
@@ -218,6 +244,13 @@ impl CapabilityEvidence {
     #[must_use]
     pub fn evidence_links(&self) -> &[String] {
         &self.evidence_links
+    }
+
+    /// Returns exact host fingerprints whose invalidation also invalidates
+    /// this evidence. Its own fingerprint is an implicit dependency.
+    #[must_use]
+    pub fn invalidation_dependencies(&self) -> &[HostFingerprint] {
+        &self.invalidation_dependencies
     }
 
     /// Returns true once this evidence has been invalidated.
@@ -381,9 +414,9 @@ pub struct AttemptRouteOutcome {
 /// Reconciles one completed attempt's observed route against its requested
 /// route.
 ///
-/// A mismatch marks the result candidate-only, invalidates every dependent
-/// capability evidence entry bound to the mismatched fingerprint (evidence
-/// for unrelated fingerprints is left live), and quarantines the mismatched
+/// A mismatch marks the result candidate-only, invalidates every capability
+/// evidence entry bound to or explicitly dependent on the mismatched
+/// fingerprint (unrelated evidence stays live), and quarantines the mismatched
 /// fingerprint pending reconciliation (unless `disposition` specifies
 /// `RejectUse`). An unknown observed route (`None`) fails closed as a
 /// mismatch. A match changes nothing.
@@ -413,7 +446,12 @@ pub fn reconcile_attempt_route(
     let mismatched_canonical = mismatched_fingerprint.canonical();
     let mut invalidated_count = 0;
     for item in dependent_evidence.iter_mut() {
-        if item.fingerprint() == mismatched_canonical && !item.is_invalidated() {
+        let depends_on_mismatch = item.fingerprint() == mismatched_canonical
+            || item
+                .invalidation_dependencies()
+                .iter()
+                .any(|dependency| dependency.canonical() == mismatched_canonical);
+        if depends_on_mismatch && !item.is_invalidated() {
             item.invalidate();
             invalidated_count += 1;
         }
@@ -506,12 +544,17 @@ pub enum AttemptPhase {
     AfterMeaningfulEffect,
 }
 
-/// Gate enforcing no silent mid-attempt failover.
+/// Shape-only gate enforcing no silent mid-attempt failover.
+///
+/// Handoff values carried here are not persisted and grant no admission
+/// authority; their owning production boundary remains responsible for both.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptGate {
     attempt_id: String,
     causal_parent: Option<String>,
     phase: AttemptPhase,
+    handoff: Option<HandoffCausalLink>,
+    rehydration_bundle: Option<RehydrationBundle>,
 }
 
 impl AttemptGate {
@@ -521,6 +564,8 @@ impl AttemptGate {
             attempt_id: attempt_id.into(),
             causal_parent: None,
             phase: AttemptPhase::BeforeMeaningfulWork,
+            handoff: None,
+            rehydration_bundle: None,
         };
         if !is_token(&gate.attempt_id) {
             return Err(ConformanceError::InvalidInput);
@@ -544,6 +589,20 @@ impl AttemptGate {
     #[must_use]
     pub const fn phase(&self) -> AttemptPhase {
         self.phase
+    }
+
+    /// Returns the shape-validated causal handoff carried by this attempt.
+    /// This value does not prove persistence or grant admission authority.
+    #[must_use]
+    pub const fn handoff(&self) -> Option<&HandoffCausalLink> {
+        self.handoff.as_ref()
+    }
+
+    /// Returns the sealed rehydration bundle carried by this attempt.
+    /// This value does not prove persistence or grant admission authority.
+    #[must_use]
+    pub const fn rehydration_bundle(&self) -> Option<&RehydrationBundle> {
+        self.rehydration_bundle.as_ref()
     }
 
     /// Records meaningful provider output, crossing the failover boundary.
@@ -582,15 +641,34 @@ impl AttemptGate {
     pub fn next_attempt_after_effect(
         &self,
         new_attempt_id: impl Into<String>,
+        handoff: HandoffCausalLink,
+        rehydration_bundle: RehydrationBundle,
     ) -> Result<Self, ConformanceError> {
         let id = new_attempt_id.into();
         if !is_token(&id) || id == self.attempt_id {
             return Err(ConformanceError::InvalidInput);
         }
+        handoff.validate()?;
+        rehydration_bundle.validate()?;
+        if handoff.source_attempt_id != self.attempt_id {
+            return Err(ConformanceError::HandoffSourceMismatch);
+        }
+        if handoff.target_attempt_id != id {
+            return Err(ConformanceError::HandoffTargetMismatch);
+        }
+        let bundle_digest = rehydration_bundle.canonical_digest()?;
+        let Some(link_digest) = handoff.rehydration_bundle_digest.as_ref() else {
+            return Err(ConformanceError::HandoffBundleDigestMismatch);
+        };
+        if link_digest.as_str() != bundle_digest {
+            return Err(ConformanceError::HandoffBundleDigestMismatch);
+        }
         Ok(Self {
             attempt_id: id,
             causal_parent: Some(self.attempt_id.clone()),
             phase: AttemptPhase::BeforeMeaningfulWork,
+            handoff: Some(handoff),
+            rehydration_bundle: Some(rehydration_bundle),
         })
     }
 }
