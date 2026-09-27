@@ -68,6 +68,19 @@
 //! synthesize while the record is still staged. The coordinator grants no
 //! authority of its own and interprets no store payload.
 //!
+//! ## Typed ORS refusals
+//!
+//! [`GenerationCutoverOwnershipReceipt::from_committed`] and
+//! [`CapabilityRouteScope::validate`] fail with a typed [`OrsError`], and this
+//! module classifies every class of it onto the existing [`KernelServiceError`]
+//! Every class of it is classified onto the existing [`KernelServiceError`]
+//! variants by class. A fence mismatch, an epoch-lineage break, a stale writer
+//! epoch, a duplicate conflict, an invalid transition, a field rejection and an
+//! unavailability therefore stay distinguishable at the Kernel service
+//! boundary; only the classes that are text in the source type reach
+//! [`KernelServiceError::Platform`]. No ORS class is collapsed into a string or
+//! a generic code between the layers.
+//!
 //! ## Rollback
 //!
 //! [`StorageReplacement::rollback_disposition`] is a pure classifier over the
@@ -576,7 +589,135 @@ impl StorageReplacement {
     }
 }
 
-/// Projects one ORS refusal onto the Kernel service error surface.
+/// Projects one ORS refusal onto the existing [`KernelServiceError`] variants
+/// without collapsing its class into a string.
+///
+/// Every current [`OrsError`] class is classified. A class that asserts the
+/// presented ORS state does not match the required authority, fence, epoch,
+/// owner or durable head becomes [`KernelServiceError::HandshakeMismatch`] with
+/// a `field` naming that exact class, so it stays distinguishable from a field
+/// rejection, a transition refusal and an unavailability. The remaining
+/// bounded-field, bound, conflict and lifecycle classes become
+/// [`KernelServiceError::InvalidField`] with a `field` naming that exact class;
+/// [`OrsError::InvalidField`], which already carries both values, maps across
+/// with both `&'static str` values verbatim. Only the classes that are strings
+/// in the source type — a foundation contract text, a
+/// storage/encoding/staging text, canonical-evidence text, a migration reason
+/// and an integrity reason — reach [`KernelServiceError::Platform`], because
+/// there is nothing typed left to preserve in them.
+///
+/// The match is exhaustive by construction: a new ORS class is a compile error
+/// here rather than a silently stringified refusal.
 fn ors_refusal(error: &OrsError) -> KernelServiceError {
-    KernelServiceError::Platform(error.to_string())
+    match error {
+        // The presented ORS state does not match the required authority,
+        // fence, owner or durable head.
+        OrsError::FenceMismatch => mismatch("authority_epoch_fence"),
+        OrsError::EpochMismatch => mismatch("authority_epoch"),
+        OrsError::InvalidEpochLineage => mismatch("epoch_lineage"),
+        OrsError::StaleWriterEpoch => mismatch("writer_epoch"),
+        OrsError::AuthorityHandoffNotFresh => mismatch("authority_handoff"),
+        OrsError::RecoveryOwnerMismatch => mismatch("recovery_owner"),
+        OrsError::OrderingHeadMismatch => mismatch("ordering_head"),
+        OrsError::ReconciliationMismatch => mismatch("canonical_reconciliation"),
+        OrsError::IncompatibleArtifact => mismatch("candidate_artifact"),
+        OrsError::ProcessStreamRecoveryFamilyCursorMismatch { .. } => {
+            mismatch("process_stream_recovery_cursor")
+        }
+        OrsError::WorkerReplayStaleStream { .. } => mismatch("worker_replay_stream"),
+        OrsError::WorkerReplayAckMismatch { .. } => mismatch("worker_replay_ack"),
+        // An ORS field rejection already has this crate's exact refusal shape.
+        OrsError::InvalidField { field, reason } => {
+            KernelServiceError::InvalidField { field, reason }
+        }
+        // The free-form classes: their payload is text in the source type, so
+        // this is the only place a string is honest.
+        OrsError::Contract(_)
+        | OrsError::CanonicalEvidence(_)
+        | OrsError::MigrationRequired { .. }
+        | OrsError::IntegrityProblem { .. }
+        | OrsError::Storage(_)
+        | OrsError::Encoding(_)
+        | OrsError::StagingNotDurable(_) => KernelServiceError::Platform(error.to_string()),
+        // Stale or unbound lease lineage is a presented-record mismatch.
+        OrsError::SupervisionLeaseStaleRevision => mismatch("lease_revision_stale"),
+        OrsError::SupervisionLeaseBindingMismatch => mismatch("lease_binding"),
+        // Every remaining class is a bounded-field, bound, conflict or
+        // lifecycle refusal with no authority claim to mismatch against.
+        OrsError::BridgeEventCapacityExceeded(_) => invalid_field("bridge_event_capacity"),
+        OrsError::UnsupportedContractVersion(_) => invalid_field("envelope_contract_version"),
+        OrsError::PayloadTooLarge => invalid_field("payload_length"),
+        OrsError::PayloadIntegrityMismatch => invalid_field("payload_integrity"),
+        OrsError::InvalidExpiry => invalid_field("expiry_ordering"),
+        OrsError::UnsafeExpiry => invalid_field("expiry_reconciliation"),
+        OrsError::EmptyScopeSet => invalid_field("ordering_scopes_empty"),
+        OrsError::DuplicateScope => invalid_field("ordering_scopes_duplicate"),
+        OrsError::InvalidCursorLimit => invalid_field("recovery_cursor_limit"),
+        OrsError::DuplicateConflict => invalid_field("durable_state_duplicate"),
+        OrsError::ReservationNotFound => invalid_field("reservation_missing"),
+        OrsError::InvalidTransition => invalid_field("reservation_lifecycle"),
+        OrsError::PredecessorPending => invalid_field("ordering_scope_predecessor"),
+        OrsError::ScopeRecoveryRequired => invalid_field("ordering_scope_reconciliation"),
+        OrsError::UnknownReceiptCannotResolve => invalid_field("unknown_receipt_resolution"),
+        OrsError::InboxIntegrityMismatch => invalid_field("recovery_inbox_integrity"),
+        OrsError::AuthoritySnapshotUnavailable => invalid_field("authority_snapshot"),
+        OrsError::ProjectionLimitExceeded => invalid_field("operational_projection_bound"),
+        OrsError::ProcessStreamRecoveryFamilyMoved { .. } => {
+            invalid_field("process_stream_family_moved")
+        }
+        OrsError::SupervisionLeaseTicketConflict => invalid_field("lease_ticket_conflict"),
+        OrsError::SupervisionLeaseTicketNotStaged => invalid_field("lease_ticket_not_staged"),
+        OrsError::SupervisionLeaseTicketResolved => invalid_field("lease_ticket_resolved"),
+        OrsError::SupervisionLeaseTicketNotExpired => invalid_field("lease_ticket_not_expired"),
+        OrsError::SupervisionLeaseTicketExpired => invalid_field("lease_ticket_expired"),
+        OrsError::SupervisionLeaseTicketAlreadyCommitted => invalid_field("lease_ticket_committed"),
+        OrsError::InvalidSupervisionLeaseHistoryLimit => invalid_field("lease_history_limit"),
+        OrsError::HostRequestIdentityConflict { .. } => invalid_field("host_request_identity"),
+        OrsError::CampaignLearningStateViewConflict { .. } => {
+            invalid_field("campaign_learning_state_view")
+        }
+        OrsError::CampaignSourcePublicationConflict { .. } => {
+            invalid_field("campaign_source_publication")
+        }
+        OrsError::ActivationResultRetentionIdentityConflict { .. } => {
+            invalid_field("activation_result_ticket")
+        }
+        OrsError::ActivationLifecycleIdentityConflict { .. } => {
+            invalid_field("activation_lifecycle_ticket")
+        }
+        OrsError::ActivationLifecycleExpired { .. } => {
+            invalid_field("activation_lifecycle_ticket_expired")
+        }
+        OrsError::ActivationLifecycleStateConflict { .. } => {
+            invalid_field("activation_lifecycle_ticket_state")
+        }
+        OrsError::NativeWorkerClaimIdentityConflict { .. } => {
+            invalid_field("native_worker_claim_identity")
+        }
+        OrsError::WorkerReplayIdentityConflict { .. } => invalid_field("worker_replay_identity"),
+        OrsError::WorkerReplayIncomplete { .. } => invalid_field("worker_replay_suffix"),
+        OrsError::VersionedArtifactConflict => invalid_field("versioned_artifact_conflict"),
+        OrsError::ActiveExecutableReplacement => invalid_field("active_executable"),
+        OrsError::VersionedArtifactNotFound => invalid_field("versioned_artifact_missing"),
+        OrsError::VersionedArtifactNotDrained => invalid_field("versioned_artifact_draining"),
+        OrsError::RecoveryProblemRetained { .. } => invalid_field("staged_payload_recovery"),
+    }
+}
+
+/// Names one ORS mismatch class on the crate's typed mismatch refusal.
+fn mismatch(field: &'static str) -> KernelServiceError {
+    KernelServiceError::HandshakeMismatch { field }
+}
+
+/// Names one ORS field or bound refusal on the crate's typed field refusal.
+///
+/// The `field` is the ORS class name, so no two ORS refusals of this family read
+/// alike. The shared reason states who refused: the durable ORS owner. A class
+/// that carries its own reason — [`OrsError::InvalidField`] — keeps it verbatim
+/// instead.
+fn invalid_field(field: &'static str) -> KernelServiceError {
+    KernelServiceError::InvalidField {
+        field,
+        reason: "rejected by the durable ORS owner",
+    }
 }
