@@ -403,11 +403,18 @@ pub enum PromotionInputError {
     PromotionReceiptRequired { detail: String },
 }
 
+/// Canonical disposition name that records a performed scoped promotion
+/// (I12.24:283-284, `CampaignLearningClosure.disposition`).
+pub const SCOPED_UPDATE_PROMOTED: &str = "SCOPED_UPDATE_PROMOTED";
+
 /// Separately authorized owner receipt for a performed scoped promotion.
 ///
 /// Records-only cell never issues this; the external owner does. A
 /// `SCOPED_UPDATE_PROMOTED` disposition is valid only with `Some` receipt
-/// whose [`ScopedPromotionReceipt::validate`] passes.
+/// whose [`ScopedPromotionReceipt::validate`] passes AND whose content is
+/// compared against the operation it authorizes — see
+/// [`require_promotion_receipt`]. I12.24:289: "`SCOPED_UPDATE_PROMOTED` is
+/// valid only with the separate authorized owner receipt it references."
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopedPromotionReceipt {
     pub closure_id: String,
@@ -439,35 +446,100 @@ impl ScopedPromotionReceipt {
 
 /// Gate for dispositions that claim a performed promotion.
 ///
-/// Returns `Ok(())` for any `disposition != "SCOPED_UPDATE_PROMOTED"`.
-/// For `"SCOPED_UPDATE_PROMOTED"` requires `Some(receipt)` with passing
-/// [`ScopedPromotionReceipt::validate`], else `Err` with
-/// [`PromotionInputError::PromotionReceiptRequired`].
+/// Returns `Ok(())` for any `disposition != SCOPED_UPDATE_PROMOTED`: those
+/// record no promotion and need no receipt. For `SCOPED_UPDATE_PROMOTED` the
+/// separately authorized owner receipt must be PRESENT **and must match this
+/// operation as content**, not merely be present:
 ///
-/// Intended call site (no-signature-change wiring note): call at the top of
-/// `check_closure_gate` / `prepare_promotion_input` once those functions gain
-/// an `Option<&ScopedPromotionReceipt>` parameter carrying the separate
-/// authorized owner receipt referenced by the disposition. The `disposition`
-/// argument maps to [`PromotionDisposition::disposition`]; the `receipt`
-/// argument maps to the external owner receipt (not
-/// [`PromotionInputPolicy::claimed_promotion_receipt`], which remains rejected
-/// by `validate_policy`, and not [`PromotionHandoff::promotion_receipt`],
-/// which this cell always leaves as `None`). Signatures were left unchanged
-/// here so existing behavior is preserved until that parameter is added.
+/// 1. [`ScopedPromotionReceipt::validate`] — no receipt field is blank;
+/// 2. `receipt.closure_id` must equal `closure_id`, the id of the very closure
+///    being recorded, so a receipt minted for another episode cannot be
+///    replayed here;
+/// 3. `receipt.authorizing_owner` must equal `authorized_owner`, the owner the
+///    closure policy names as the external decision owner, so a receipt signed
+///    by any other party authorizes nothing;
+/// 4. `referenced_receipt_refs` — the closure's own stored
+///    `owner_receipts_and_expiry` group (I12.24:286) — must contain
+///    `receipt.owner_signature_ref`, because I12.24:289 makes the disposition
+///    valid only with the separate authorized owner receipt **it references**.
+///
+/// A missing, blank or unreferenced receipt is refused with
+/// [`PromotionInputError::PromotionReceiptRequired`]; a receipt naming a
+/// different closure or a different authorizing owner is refused with
+/// [`PromotionInputError::IdentityMismatch`]. The two are distinct typed
+/// failures: neither is collapsed into a generic code or a bare string.
+///
+/// # Reachability, measured
+///
+/// This guard has no production caller today, and that is a measured fact
+/// rather than an oversight of this cell. The two cells that own the
+/// improvement pipeline are declared non-overlapping: the closure cell owns
+/// `CampaignLearningClosure` and this cell owns the advisory promotion input,
+/// each declared with "no shared write surface" against the other, and each
+/// package test asserts the other module's name is absent from its own source.
+/// Neither direction is available: this cell cannot reach the one function
+/// that records a `SCOPED_UPDATE_PROMOTED` closure disposition, and the
+/// closure cell cannot call this guard.
+///
+/// Two consequences, stated rather than papered over:
+///
+/// - [`prepare_promotion_input`] is deliberately NOT wired to this guard. It
+///   is advisory-only and can only emit `incomplete` / `rejected` / `blocked` /
+///   `narrowed-for-review`, never a promotion, so a guard there could never
+///   refuse anything. Wiring it would be a call that cannot bite.
+/// - The earlier no-signature-change note pointed at `check_closure_gate` and
+///   `prepare_promotion_input`. That is measurably the wrong seam and is
+///   replaced by the argument binding above, which is what makes the receipt
+///   content comparable to the operation it authorizes.
 pub fn require_promotion_receipt(
     disposition: &str,
     receipt: Option<&ScopedPromotionReceipt>,
+    closure_id: &str,
+    authorized_owner: &str,
+    referenced_receipt_refs: &[String],
 ) -> Result<(), PromotionInputError> {
-    if disposition != "SCOPED_UPDATE_PROMOTED" {
+    if disposition != SCOPED_UPDATE_PROMOTED {
         return Ok(());
     }
-    match receipt {
-        Some(r) => r.validate(),
-        None => Err(PromotionInputError::PromotionReceiptRequired {
-            detail: "SCOPED_UPDATE_PROMOTED requires a separate authorized owner receipt"
-                .to_string(),
-        }),
+    // The operation this receipt is judged against must itself be nameable; a
+    // blank binding is not a weaker check, it is a refusal.
+    non_empty(closure_id, "closure_id")?;
+    non_empty(authorized_owner, "authorized_owner")?;
+    let Some(receipt) = receipt else {
+        return Err(PromotionInputError::PromotionReceiptRequired {
+            detail: format!(
+                "{SCOPED_UPDATE_PROMOTED} requires a separate authorized owner receipt"
+            ),
+        });
+    };
+    receipt.validate()?;
+    if receipt.closure_id.trim() != closure_id.trim() {
+        return Err(PromotionInputError::IdentityMismatch {
+            detail: format!(
+                "receipt closure {:?} is not this closure {:?}: receipt-closure-mismatch",
+                redact(&receipt.closure_id),
+                redact(closure_id)
+            ),
+        });
     }
+    if receipt.authorizing_owner.trim() != authorized_owner.trim() {
+        return Err(PromotionInputError::IdentityMismatch {
+            detail: format!(
+                "receipt owner {:?} is not the authorized owner {:?}: receipt-owner-mismatch",
+                redact(&receipt.authorizing_owner),
+                redact(authorized_owner)
+            ),
+        });
+    }
+    if !referenced_receipt_refs
+        .iter()
+        .any(|reference| reference.trim() == receipt.owner_signature_ref.trim())
+    {
+        return Err(PromotionInputError::PromotionReceiptRequired {
+            detail: "closure evidence does not reference the presented owner receipt".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Prepare one advisory promotion input from exact evidence.
