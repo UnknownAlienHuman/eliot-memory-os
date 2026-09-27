@@ -3508,8 +3508,21 @@ pub enum CompositionReadiness {
     Stopped,
 }
 
+/// Bound on the in-process scope-quarantine projection retained by
+/// [`GovernorComposition`] (issue #1787, W6). A later mismatch must not
+/// silently discard an earlier unresolved conflict, so mismatches accumulate
+/// up to this bound instead of overwriting one slot; the bound itself keeps
+/// the projection from growing without owner storage. Durable quarantine with
+/// restart recovery still belongs to the `WorkScope` owner path.
+const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
+
 /// One daemon-owned Governor composition. There is no second provider or
 /// process executor hidden behind this value.
+///
+/// The in-process scope-quarantine projection below keeps at most
+/// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`] records (one per mandatory
+/// trigger plus margin); older records evict first. It is a diagnostic
+/// projection only, never durable owner state.
 pub struct GovernorComposition<P: ?Sized> {
     kernel: Arc<P>,
     /// Retained P-07 authority port. `None` means diagnosed degradation
@@ -3533,11 +3546,16 @@ pub struct GovernorComposition<P: ?Sized> {
     /// cold-start legs below coalesces on exact workspace identity, privacy
     /// boundary and governing-source generation.
     cold_start: OnboardingSingleFlight,
-    /// Latest in-process diagnostic projection of a scope-identity mismatch
-    /// (issue #1787). It is overwritten by a later mismatch and is not durable,
-    /// rehydrated, or an authority for rebind. Read with
+    /// Bounded in-process diagnostic projection of scope-identity mismatches
+    /// (issue #1787, W6 partial projection). Newest record is last; a later
+    /// mismatch appends instead of overwriting, up to
+    /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`] records, so one unresolved
+    /// conflict cannot silently discard another. This is not durable,
+    /// rehydrated, or an authority for rebind: durable quarantine with an
+    /// owner-issued write/readback receipt and restart recovery belongs to
+    /// the `WorkScope` owner path. Read the latest with
     /// [`Self::last_scope_quarantine`].
-    scope_quarantine: Option<QuarantinedScopeRecord>,
+    scope_quarantine: Vec<QuarantinedScopeRecord>,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -4163,7 +4181,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
             cold_start: OnboardingSingleFlight::new(),
-            scope_quarantine: None,
+            scope_quarantine: Vec::new(),
         })
     }
 
@@ -4180,8 +4198,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `None` means no mismatch has been observed since construction. The
     /// retained binding is never replaced by this record.
     #[must_use]
-    pub const fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
-        self.scope_quarantine.as_ref()
+    pub fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
+        self.scope_quarantine.last()
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -5005,8 +5023,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the guard returns `Allow` with a fresh `MATCHED` source-closure receipt.
     /// The observed binding is never derived from the retained binding or the
     /// write claim. Missing binding or source closure fails closed. Identity
-    /// mismatches are retained only as a process-local diagnostic projection;
-    /// durable quarantine and restart recovery remain partial (W6).
+    /// mismatches append to the bounded process-local diagnostic projection
+    /// (no silent overwrite, no state or memory transfer); durable quarantine
+    /// and restart recovery remain partial (W6).
     pub fn check_canonical_write_work_scope(
         &mut self,
         scope_id: &str,
@@ -5046,7 +5065,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                         "canonical write withheld after scope mismatch, but its process-local diagnostic could not be retained: {error}"
                     ))
                 })?;
-                self.scope_quarantine = Some(record);
+                // Preserve every unresolved conflict instead of overwriting one
+                // slot: an exact repeat of the latest record adds no new
+                // evidence, anything else appends with oldest-first eviction at
+                // the bound. The retained binding, task state, and project
+                // memory stay untouched; durable quarantine still belongs to
+                // the WorkScope owner path.
+                if self.scope_quarantine.last() != Some(&record) {
+                    if self.scope_quarantine.len() >= MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
+                        self.scope_quarantine.remove(0);
+                    }
+                    self.scope_quarantine.push(record);
+                }
             }
             return Err(CompositionError::ScopeGuardWithheld {
                 claimed_scope: scope_id.to_owned(),
