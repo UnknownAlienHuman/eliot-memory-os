@@ -1,5 +1,6 @@
 //! Structural failures used while forming a validated Dreamer handoff.
 
+use eliot_evidence::EvidenceError;
 use thiserror::Error;
 
 /// Typed failures before a candidate can be safely retained.
@@ -31,6 +32,14 @@ pub enum DreamDraftValidationError {
         /// Stable field or dimension identifier.
         field: &'static str,
     },
+    /// A shared evidentiary contract failed with its typed source detail.
+    #[error("{phase} evidentiary contract failure: {source}")]
+    Evidence {
+        /// Validation phase.
+        phase: &'static str,
+        /// Original typed evidence-contract failure.
+        source: EvidenceError,
+    },
 }
 
 /// Reduces a closed contract failure to the stable historical A05 error API.
@@ -40,6 +49,12 @@ pub fn summarize_contract(
 ) -> DreamDraftValidationError {
     use crate::ContractViolation;
     let field = match error {
+        ContractViolation::Evidence(source) => {
+            return DreamDraftValidationError::Evidence {
+                phase,
+                source: source.clone(),
+            };
+        }
         ContractViolation::UnknownVariant { field, .. }
         | ContractViolation::MissingField(field)
         | ContractViolation::ImplicitDefault(field)
