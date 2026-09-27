@@ -47,7 +47,7 @@ use super::{
 use eliot_protocol::{Frame, FrameKind, JsonCodec, ProtocolError};
 
 /// Wire prefix length: four-byte little-endian body length (Implementation `I7.2`).
-const FRAME_PREFIX_LEN: usize = 4;
+pub(super) const FRAME_PREFIX_LEN: usize = 4;
 
 fn oversize_unrepresentable(maximum: usize) -> TransportError {
     // Coupled unsafe use: `usize` cannot represent this `u32` on this target,
