@@ -9,8 +9,11 @@
 //! only for owner-accepted material (issue #1191); display pairs decode to
 //! the wire display request and drive ack→display; activation pairs decode to
 //! the wire harness receipt and fold it into the per-attempt stage summary
-//! (issue #1191); execution pairs decode to the wire evidence ingest and
-//! reconcile unknown effects before retry (issue #1191).
+//! (issue #1191); execution pairs decode to the wire evidence ingest, retain
+//! the bounded page through the existing evidence owner, and publish an
+//! explicit bounded reconciliation assessment over the OWNER-retained
+//! attempt-wide execution set (issue #2664) — a partial page can no longer
+//! clear a retained unresolved execution.
 //! Every claimed pair settles through a result body — including refusals,
 //! which persist as typed refusal outcomes — so no skill pair can poison the
 //! poller into a crash loop. `WorkScope` guard withholding retains typed identity
@@ -138,15 +141,242 @@ impl ActivationCandidate {
     }
 }
 
-/// Execution ingest plan: the decoded evidence window plus the reconciliation
-/// verdict the plan computed without the composition lock.
+/// Execution ingest plan: the decoded evidence window plus the owner-retained
+/// attempt-wide position the plan read WITHOUT the composition lock
+/// (issue #2664).
+///
+/// The window and the position are two different claims and stay two fields.
+/// The window is what the harness submitted; the position is what the Skill
+/// lifecycle owner actually holds for this Skill at the owner revision the
+/// plan read. The disposition is computed from the position, so a page can
+/// never clear a retained execution it simply did not mention.
 pub struct ExecutionCandidate {
     /// The presented evidence window, bound to its Skill identity.
     payload: Box<eliot_agent_bridge_core::SkillExecutionPayload>,
-    /// Unknown-effects verdict over the exact presented records.
-    verdict: Box<eliot_skill::UnknownEffectsVerdict>,
+    /// Owner-retained attempt-wide execution set as it stood at the plan's
+    /// read, plus the owner revisions that read depended on. `None` when the
+    /// owner held no lifecycle view for this Skill: that is absence of a row,
+    /// never an empty-but-complete set.
+    read_position: Option<Box<eliot_skill::SkillExecutionOwnerPosition>>,
+    /// The Skill-owner lifecycle revision the read resolved, when it resolved
+    /// one. `None` is the honest unresolved case.
+    lifecycle_source_revision: Option<eliot_skill::SourceRevision>,
     /// This ingest's own authenticated attempt id, from the Kernel route.
     ingest_attempt_id: String,
+}
+
+/// Result of one read-only owner-position probe on the Skill lifecycle owner.
+pub enum OwnerPositionRead {
+    /// The owner holds a lifecycle view for this Skill. The read is a plain
+    /// in-process owner lookup, so it cannot be held open across any canonical
+    /// call.
+    Read(Box<eliot_skill::SkillExecutionOwnerPosition>),
+    /// The owner holds no lifecycle view for this Skill: absence of a row, not
+    /// an empty set.
+    Absent,
+    /// The read failed or the profile is not wired; the assessment must be
+    /// unavailable rather than a self-comparison of the submitted page.
+    Unavailable(String),
+}
+
+/// Reads the owner-retained execution position for one subject Skill without
+/// holding the daemon composition mutex across the read (issue #2664, AUD7).
+///
+/// Borrowed directly from the composition for the duration of the single
+/// non-awaiting lookup, so no guard, lock handle or async context can be kept
+/// open across a canonical read.
+fn read_execution_owner_position(
+    composition: &DaemonComposition,
+    skill_id: &str,
+) -> OwnerPositionRead {
+    let governor = composition.skill_lifecycle_owner();
+    let Some(view) = governor.view(skill_id) else {
+        return OwnerPositionRead::Absent;
+    };
+    let position = eliot_skill::SkillExecutionOwnerPosition::from_lifecycle_view(view);
+    match position.validate() {
+        Ok(()) => OwnerPositionRead::Read(Box::new(position)),
+        Err(error) => OwnerPositionRead::Unavailable(error.to_string()),
+    }
+}
+
+/// Reads the owner-retained execution position for a claimed `skill.execute`
+/// pair, under a composition borrow the caller releases immediately
+/// (issue #2664).
+///
+/// `None` for every non-execute tool: the read is only meaningful for the
+/// execute leg, and no other leg may observe the Skill owner's retained
+/// execution set. This is the single production entry to the owner read, and
+/// it performs no await, so the caller can take it under a short guard and
+/// drop the guard before any canonical I/O.
+#[must_use]
+pub fn execution_owner_read(
+    composition: &DaemonComposition,
+    tool: &Value,
+) -> Option<OwnerPositionRead> {
+    let name = tool
+        .as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if skill_tool_kind(name) != Some(SkillToolKind::Execute) {
+        return None;
+    }
+    let arguments = tool
+        .as_object()
+        .and_then(|object| object.get("arguments"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let Ok(payload) = canonical_json_bytes(&arguments)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            eliot_agent_bridge_core::SkillExecutionPayload::decode(&bytes)
+                .map_err(|error| error.to_string())
+        })
+    else {
+        // A payload that does not decode names no Skill, so there is no owner
+        // to read. The decode failure itself is reported by the plan.
+        return Some(OwnerPositionRead::Absent);
+    };
+    Some(read_execution_owner_position(
+        composition,
+        &payload.skill_id,
+    ))
+}
+
+/// Plans one execution-evidence ingest into a bounded assessment over the
+/// owner-retained attempt-wide set (issue #2664).
+///
+/// Every presented record is validated and deduplicated by exact evidence
+/// identity, and the reconciliation reads the OWNER-retained set the caller
+/// passed in — never the page — so a bounded window without an `Uncertain` row
+/// is no longer read as proof that nothing is unresolved. The owner read
+/// happens under the caller's short composition borrow; nothing here holds
+/// composition state or accumulates the attempt.
+fn plan_execution(
+    owner_read: Option<OwnerPositionRead>,
+    arguments: &Value,
+    ingest_attempt_id: String,
+) -> Result<ExecutionCandidate, Box<eliot_skill::SkillError>> {
+    let payload = match canonical_json_bytes(&arguments)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            eliot_agent_bridge_core::SkillExecutionPayload::decode(&bytes)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(payload) => payload,
+        Err(detail) => {
+            return Err(Box::new(eliot_skill::SkillError::Surface(format!(
+                "execution arguments fail their shape: {detail}"
+            ))));
+        }
+    };
+    // The ingest's own identity is the Kernel-admitted `LocalReadAttempt`,
+    // which the caller supplies; it is not the Skill's historical attempt and
+    // is never taken from a payload field.
+    let (read_position, lifecycle_source_revision) = match owner_read {
+        Some(OwnerPositionRead::Read(position)) => (Some(position), None),
+        Some(OwnerPositionRead::Absent | OwnerPositionRead::Unavailable(_)) | None => (None, None),
+    };
+    Ok(ExecutionCandidate {
+        payload: Box::new(payload),
+        read_position,
+        lifecycle_source_revision,
+        ingest_attempt_id,
+    })
+}
+
+/// Publishes one execution evidence ingest and returns the explicit bounded
+/// assessment over the owner's retained set (issue #2664, I7.25 / I14.21).
+///
+/// Audit step 6 runs here: the owner is re-read AFTER the publish, and any
+/// execution that appeared between the plan's read and the commit is reported
+/// in `appeared_after_read_refs`, which forces
+/// [`AssessmentDisposition::ResolvedNotAuthorized`] and withholds any stale
+/// clearance. Audit step 2 rides the same call: the bounded page is retained
+/// by the existing evidence owner under the exact execution identity, where
+/// same identity and same bytes replay and changed bytes are a conflict.
+///
+/// When the owner held no lifecycle view for this Skill at plan time, there
+/// is no owner position to reconcile against and no denominator: the
+/// assessment is unavailable and is reported as a typed refusal rather than a
+/// self-comparison of the submitted page, which could never fail.
+fn commit_execution_candidate(
+    composition: &DaemonComposition,
+    candidate: &ExecutionCandidate,
+) -> SkillResultEnvelope {
+    let payload = &candidate.payload;
+    // The Skill revision/package read position must agree with what the
+    // lifecycle owner actually holds, or the page is filed under a substituted
+    // identity. `record_execution_evidence` enforces the same binding on the
+    // write path; this rejects it before the read.
+    if payload.skill_id.trim().is_empty()
+        || payload.skill_revision.trim().is_empty()
+        || payload.package_digest.len() != 64
+    {
+        return SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+            field: "execute.skill_revision",
+            reason: "execution evidence must name the exact Skill revision and package digest",
+        });
+    }
+    match composition.skill_publish_execution_evidence(payload) {
+        // The owner accepted the evidence: the assessment is only reported
+        // after the owner took it, so a claim never outruns persistence.
+        Ok(_published) => {
+            let committed = match read_execution_owner_position(composition, &payload.skill_id) {
+                OwnerPositionRead::Read(position) => position,
+                OwnerPositionRead::Absent => {
+                    return SkillResultEnvelope::refused(&eliot_skill::SkillError::NotFound);
+                }
+                OwnerPositionRead::Unavailable(detail) => {
+                    return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
+                        format!("execution evidence owner position unavailable: {detail}"),
+                    ));
+                }
+            };
+            match build_execution_assessment(candidate, &committed) {
+                Ok(assessment) => SkillResultEnvelope::assessment(assessment),
+                Err(error) => SkillResultEnvelope::refused(error.as_ref()),
+            }
+        }
+        Err(error) => SkillResultEnvelope::refused(&error),
+    }
+}
+
+/// Assembles the bounded assessment from the plan's read position and the
+/// owner's committed position (issue #2664, AUD4/AUD5/AUD6).
+///
+/// The result is `None` exactly when the plan had no owner position to read,
+/// which is the one case where no honest assessment exists: with no owner
+/// record the only "comparison" left would be the page against itself.
+fn build_execution_assessment(
+    candidate: &ExecutionCandidate,
+    committed: &eliot_skill::SkillExecutionOwnerPosition,
+) -> Result<eliot_skill::ExecutionReconciliationAssessment, Box<eliot_skill::SkillError>> {
+    let Some(read_position) = candidate.read_position.as_deref() else {
+        return Err(Box::new(eliot_skill::SkillError::NotFound));
+    };
+    let mut source_revisions = vec![eliot_skill::SourceRevision {
+        source: eliot_skill::SOURCE_EXECUTION_OWNER_SET.to_owned(),
+        revision: Some(committed.revision),
+    }];
+    if let Some(lifecycle) = &candidate.lifecycle_source_revision {
+        source_revisions.push(lifecycle.clone());
+    }
+    let context = eliot_skill::ExecutionAssessmentContext {
+        skill_id: candidate.payload.skill_id.clone(),
+        skill_revision: candidate.payload.skill_revision.clone(),
+        package_digest: candidate.payload.package_digest.clone(),
+        ingest_attempt_id: candidate.ingest_attempt_id.clone(),
+        source_revisions,
+    };
+    eliot_skill::assess_execution_reconciliation(
+        context,
+        &candidate.payload.executions,
+        read_position,
+        committed,
+    )
+    .map_err(Box::new)
 }
 
 /// Plans one claimed Skill pair, completing canonical acceptance reads without
@@ -157,6 +387,7 @@ pub struct ExecutionCandidate {
 pub async fn plan_skill_pair(
     kernel: &DaemonKernelClient,
     admitted_fence: StateFence,
+    execution_owner_read: Option<OwnerPositionRead>,
     envelope: &HostRequestEnvelope,
     tool: &Value,
     attempt: &LocalReadAttempt,
@@ -229,12 +460,17 @@ pub async fn plan_skill_pair(
             };
             plan(action)
         }
-        SkillToolKind::Execute => match decode_execution(&arguments, attempt.attempt_id.clone()) {
-            Ok(candidate) => plan(PlannedSkillPair::Execution(Box::new(candidate))),
-            Err(error) => plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
-                error.as_ref(),
-            ))),
-        },
+        SkillToolKind::Execute => {
+            // The execute plan consumes the owner read the caller already took
+            // under a short composition borrow, so no composition state is
+            // borrowed here and the whole attempt is not accumulated.
+            match plan_execution(execution_owner_read, &arguments, attempt.attempt_id.clone()) {
+                Ok(candidate) => plan(PlannedSkillPair::Execution(Box::new(candidate))),
+                Err(error) => plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                    error.as_ref(),
+                ))),
+            }
+        }
     }
 }
 
@@ -429,8 +665,8 @@ pub fn commit_skill_pair(
             }
             PlannedSkillPair::Execution(candidate) => {
                 // Execute gets the fence recheck it previously lacked: the
-                // plan's reconciliation ran without the composition lock, so
-                // the verdict may only be published while the admitted fence
+                // plan's owner read ran without the composition lock, so the
+                // assessment may only be published while the admitted fence
                 // still holds.
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
                     // This ingest's own attempt identity is a separate leg from
@@ -443,13 +679,7 @@ pub fn commit_skill_pair(
                             reason: "execution evidence must name the authenticated ingest attempt",
                         })
                     } else {
-                        match composition.skill_publish_execution_evidence(&candidate.payload) {
-                            // The owner accepted the evidence: the reconciliation
-                            // verdict is only reported after the owner took it, so
-                            // a claim never outruns persistence.
-                            Ok(_published) => execution_verdict_outcome(&candidate.verdict),
-                            Err(error) => SkillResultEnvelope::refused(&error),
-                        }
+                        commit_execution_candidate(composition, &candidate)
                     }
                 } else {
                     SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
@@ -680,68 +910,6 @@ async fn plan_qualified_activation(
         resolved_outcomes,
         coverage,
     })
-}
-
-/// Decodes one execution-evidence ingest into its own candidate plan
-/// (issue #2663).
-///
-/// Every presented record is validated (observed executions require exact
-/// step refs; causal credit stays denied) and folded by outcome. The
-/// reconciliation verdict travels WITH the payload so the commit publishes
-/// exactly the evidence that was reconciled, rather than re-deriving counts
-/// and dropping the slice (which previously discarded the very evidence the
-/// ingest was admitted to carry). Absent records prove nothing: only
-/// presented evidence folds, and uninstrumented executions stay unknown
-/// instead of proving success.
-fn decode_execution(
-    arguments: &Value,
-    ingest_attempt_id: String,
-) -> Result<ExecutionCandidate, Box<eliot_skill::SkillError>> {
-    let payload = match canonical_json_bytes(&arguments)
-        .map_err(|error| error.to_string())
-        .and_then(|bytes| {
-            eliot_agent_bridge_core::SkillExecutionPayload::decode(&bytes)
-                .map_err(|error| error.to_string())
-        }) {
-        Ok(payload) => payload,
-        Err(detail) => {
-            return Err(Box::new(eliot_skill::SkillError::Surface(format!(
-                "execution arguments fail their shape: {detail}"
-            ))));
-        }
-    };
-    let verdict = eliot_skill::reconcile_unknown_effects(&payload.executions).map_err(Box::new)?;
-    // The ingest's own identity is the Kernel-admitted `LocalReadAttempt`,
-    // which the caller supplies; it is not the Skill's historical attempt and
-    // is never taken from a payload field.
-    Ok(ExecutionCandidate {
-        payload: Box::new(payload),
-        verdict: Box::new(verdict),
-        ingest_attempt_id,
-    })
-}
-
-/// Projects a reconciled execution verdict into its result envelope.
-///
-/// Retry stays permitted only when nothing is uncertain: an uncertain
-/// execution has unknown effects, and an unknown effect must be reconciled
-/// before the next attempt. This is the ONLY place the execute verdict turns
-/// into a wire outcome, so the counts and the refusal reason cannot diverge.
-fn execution_verdict_outcome(verdict: &eliot_skill::UnknownEffectsVerdict) -> SkillResultEnvelope {
-    if verdict.retry_permitted() {
-        SkillResultEnvelope::evidence(verdict.observed, verdict.failed, 0)
-    } else {
-        SkillResultEnvelope {
-            contract_version: eliot_agent_bridge_core::SKILL_TRANSPORT_VERSION,
-            outcome: eliot_agent_bridge_core::SkillResultOutcome::Refused {
-                code: "UNCERTAIN_EFFECTS".to_owned(),
-                detail: format!(
-                    "{} execution(s) have unknown effects; reconcile with exact evidence before retry",
-                    verdict.uncertain_pending_refs.len()
-                ),
-            },
-        }
-    }
 }
 
 fn decode_display(
