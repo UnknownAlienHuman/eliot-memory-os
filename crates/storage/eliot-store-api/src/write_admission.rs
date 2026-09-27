@@ -110,6 +110,18 @@
 //! non-commit. No new canonical [`WriteReceipt`] issuer and no internal
 //! ordering ticket is defined here.
 //!
+//! That paragraph is code, not a comment:
+//! [`ReservedWriteOutcome`] is the closed three-arm outcome and
+//! [`ReservedWriteReconciliation`] is the bound identity-plus-receipt value.
+//! A commit is reachable only from a validated canonical receipt that matches
+//! this projection ([`ReservedWriteReconciliation::committed`]); a read that
+//! returned nothing is still-unknown ([`ReservedWriteReconciliation::still_unknown`])
+//! and stays there; a cancelled or expired envelope is still-unknown
+//! ([`ReservedWriteReconciliation::reconcile`]); and the promotion to
+//! proven-not-applied is a separate named act
+//! ([`ReservedWriteReconciliation::proven_not_applied`]). No arm finalizes the
+//! reservation ([`ReservedWriteReconciliation::finalizes_reservation`]).
+//!
 //! # Non-goals
 //!
 //! No wire-enum activation, no Store-client apply operation introduced in
@@ -124,7 +136,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     OperationId, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    RevisionHeadExpectation, StoreError, canonical_json_bytes, sha256_hex,
+    RevisionHeadExpectation, StoreError, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_contracts::StateFence;
 
@@ -619,6 +632,292 @@ impl ReservedWriteRequest {
         validate_transition_scope_coverage(self)?;
         Ok(())
     }
+}
+
+/// Closed Store-neutral outcome of reconciling one reserved-write operation.
+///
+/// The three arms are the only outcomes this projection can report, and they
+/// stay separate. `Committed` is the only arm that carries commit evidence;
+/// `ProvenNotApplied` is reserved for an exact-identity check that returned
+/// nothing; `StillUnknown` is what the absence of a receipt yields. There is
+/// deliberately no constructor that promotes a missing receipt to
+/// `ProvenNotApplied`: that transition requires the store-side check described
+/// on [`ReservedWriteReconciliation::proven_not_applied`], and it can never be
+/// derived from success, cancellation, or expiry.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReservedWriteOutcome {
+    /// A durable canonical [`WriteReceipt`] proves the commit.
+    Committed(Box<WriteReceipt>),
+    /// The exact operation identity was checked and found absent.
+    ProvenNotApplied,
+    /// The outcome remains unresolved; absence of a receipt is never proof of
+    /// non-application.
+    StillUnknown,
+}
+
+impl ReservedWriteOutcome {
+    /// Returns the stable bounded identity of this outcome arm.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Committed(_) => "committed",
+            Self::ProvenNotApplied => "proven_not_applied",
+            Self::StillUnknown => "still_unknown",
+        }
+    }
+}
+
+/// Closed owner-reported state of the reservation envelope at the moment a
+/// reconciliation read is taken.
+///
+/// This is not ORS state and this crate does not import the ORS
+/// implementation: the owner reports it, and the Store side only uses it to
+/// refuse an inference it is not entitled to make. It carries no authority
+/// and no sequence/epoch values.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReservationEnvelopeState {
+    /// The owner has not reported this reservation as finished.
+    Active,
+    /// The owner cancelled the reservation before the write was committed.
+    Cancelled,
+    /// The owner-reported expiry has passed.
+    Expired,
+}
+
+impl ReservationEnvelopeState {
+    /// Returns the stable bounded identity of this envelope state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Store-neutral projection of reconciling one ORS-admitted write reservation.
+///
+/// Reconciliation keeps using the original [`OperationId`] and the exact
+/// canonical receipt plus the reservation binding carried by the
+/// [`WriteAdmissionProjection`] that admitted the write. This type binds those
+/// two things together and checks them against each other; it issues no
+/// receipt, mints no ticket, and finalizes no reservation.
+///
+/// The three outcomes stay separate and this type is where that separation is
+/// enforced rather than described:
+///
+/// - a commit is reachable only through [`ReservedWriteReconciliation::committed`],
+///   which requires a bound, self-consistent, validated canonical receipt; no
+///   other input can produce that arm;
+/// - a cancelled or expired envelope can only reach
+///   [`ReservedWriteOutcome::StillUnknown`]
+///   ([`ReservedWriteReconciliation::reconcile`]), because ending the
+///   reservation says nothing about whether the write applied;
+/// - a receipt read that returned nothing is [`ReservedWriteOutcome::StillUnknown`]
+///   ([`ReservedWriteReconciliation::still_unknown`]), and the promotion to
+///   [`ReservedWriteOutcome::ProvenNotApplied`] is a separate, explicitly
+///   named act ([`ReservedWriteReconciliation::proven_not_applied`]).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReservedWriteReconciliation {
+    /// The ORIGINAL operation identity, never a fresh or derived one.
+    pub operation_id: OperationId,
+    /// The exact canonical receipt plus reservation binding, preserved.
+    pub admission: WriteAdmissionProjection,
+    /// The closed outcome reached for this operation.
+    pub outcome: ReservedWriteOutcome,
+}
+
+impl ReservedWriteReconciliation {
+    /// Resolves one observed receipt read under the original identity.
+    ///
+    /// This is the single entry point that reads a store answer. A receipt is
+    /// bound and checked against its admitting projection; no receipt is
+    /// still-unknown. An ended reservation envelope never yields a commit and
+    /// never yields proven-not-applied: it stays still-unknown, because
+    /// cancellation and expiry describe the reservation, not the write.
+    pub fn reconcile(
+        admission: &WriteAdmissionProjection,
+        observed: Option<WriteReceipt>,
+        envelope: ReservationEnvelopeState,
+    ) -> Result<Self, StoreError> {
+        match (observed, envelope) {
+            (Some(receipt), ReservationEnvelopeState::Active) => {
+                Self::committed(admission, receipt)
+            }
+            (Some(_), ReservationEnvelopeState::Cancelled | ReservationEnvelopeState::Expired) => {
+                Self::still_unknown(admission)
+            }
+            (None, _) => Self::still_unknown(admission),
+        }
+    }
+
+    /// Binds an observed canonical receipt to its admitting projection.
+    ///
+    /// The receipt must be the canonical receipt for this exact operation
+    /// identity, idempotency key, and canonical request hash, carry the
+    /// canonical receipt envelope issued by
+    /// [`issue_store_receipt_envelope`], and the projection it was admitted
+    /// under must still be self-consistent. Any divergence fails closed with a
+    /// typed [`StoreError`]; it is never repaired and never downgraded to a
+    /// weaker outcome.
+    ///
+    /// [`issue_store_receipt_envelope`]: crate::issue_store_receipt_envelope
+    pub fn committed(
+        admission: &WriteAdmissionProjection,
+        receipt: WriteReceipt,
+    ) -> Result<Self, StoreError> {
+        admission.validate()?;
+        receipt
+            .require_reconciliation_envelope()
+            .map_err(|_| StoreError::MissingReceiptEnvelope)?;
+        receipt.validate().map_err(|_| StoreError::InvalidReceipt)?;
+        validate_receipt_binding(admission, &receipt)?;
+        if receipt.status != WriteReceiptStatus::Committed {
+            return Err(StoreError::InvalidReceipt);
+        }
+        Ok(Self {
+            operation_id: admission.operation_id.clone(),
+            admission: admission.clone(),
+            outcome: ReservedWriteOutcome::Committed(Box::new(receipt)),
+        })
+    }
+
+    /// Records that the exact operation identity was checked and found absent.
+    ///
+    /// This is the ONLY path to [`ReservedWriteOutcome::ProvenNotApplied`],
+    /// and it is deliberately a separate act rather than a default: the caller
+    /// must have checked this exact identity against durable store evidence.
+    /// Absence of a receipt on its own never reaches here; a read that found
+    /// nothing is [`ReservedWriteOutcome::StillUnknown`] and stays there
+    /// ([`ReservedWriteReconciliation::unread`]).
+    pub fn proven_not_applied(admission: &WriteAdmissionProjection) -> Result<Self, StoreError> {
+        admission.validate()?;
+        Ok(Self {
+            operation_id: admission.operation_id.clone(),
+            admission: admission.clone(),
+            outcome: ReservedWriteOutcome::ProvenNotApplied,
+        })
+    }
+
+    /// Records that the outcome is still unresolved.
+    ///
+    /// This is the ONLY path to [`ReservedWriteOutcome::StillUnknown`], and it
+    /// covers every reason the outcome is unresolved: an exact-identity read
+    /// that returned no receipt, an unreadable store, or a cancelled/expired
+    /// reservation envelope. It has no second arm, so it can never establish
+    /// noncommit; promotion to [`ReservedWriteOutcome::ProvenNotApplied`] is
+    /// the separate, explicitly named
+    /// [`ReservedWriteReconciliation::proven_not_applied`].
+    ///
+    /// [`ReservedWriteReconciliation::reconcile`] routes every unresolved read
+    /// here, including a read that observed a receipt under an ended
+    /// reservation envelope.
+    pub fn still_unknown(admission: &WriteAdmissionProjection) -> Result<Self, StoreError> {
+        admission.validate()?;
+        Ok(Self {
+            operation_id: admission.operation_id.clone(),
+            admission: admission.clone(),
+            outcome: ReservedWriteOutcome::StillUnknown,
+        })
+    }
+
+    /// Checks the outcome against the original identity and receipt binding.
+    ///
+    /// A committed arm must carry a canonical receipt whose exact identity
+    /// matches both this value and its own admission projection. The other two
+    /// arms are checked only for consistency with the identity they are
+    /// reported under.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.admission.validate()?;
+        if self.operation_id != self.admission.operation_id {
+            return Err(StoreError::IdentityConflict);
+        }
+        if let ReservedWriteOutcome::Committed(receipt) = &self.outcome {
+            if receipt.status != WriteReceiptStatus::Committed {
+                return Err(StoreError::InvalidReceipt);
+            }
+            validate_receipt_binding(&self.admission, receipt)?;
+        }
+        Ok(())
+    }
+
+    /// Requires the exact canonical receipt proving a committed outcome.
+    ///
+    /// A non-committed arm has no commit evidence to return, and says so with
+    /// [`StoreError::ReceiptNotFound`] rather than an assumed success.
+    pub fn require_committed_receipt(&self) -> Result<&WriteReceipt, StoreError> {
+        match &self.outcome {
+            ReservedWriteOutcome::Committed(receipt) => Ok(receipt),
+            ReservedWriteOutcome::ProvenNotApplied | ReservedWriteOutcome::StillUnknown => {
+                Err(StoreError::ReceiptNotFound)
+            }
+        }
+    }
+
+    /// Reports whether this reconciliation finalized the reservation.
+    ///
+    /// Always `false`. A committed outcome proves the write and nothing about
+    /// the reservation: the owner of an ORS reservation closes it from its own
+    /// evidence, and success here is not that evidence.
+    #[must_use]
+    pub const fn finalizes_reservation(&self) -> bool {
+        false
+    }
+}
+
+/// The one Store-side refusal of a reserved write.
+///
+/// [`CanonicalStoreClient::apply_reserved_write`] has no successful default
+/// body: a client without an accepted reserved-write backend validates the
+/// closed request shape and then refuses, with no provider I/O, no durable
+/// evidence, and no delegation to the ordinary unreserved apply. This type
+/// names that refusal so the default body returns one named value instead of
+/// a bare error literal, and so the refusal is legible in product code as
+/// "reserved write is unsupported here" rather than as an undeclared named
+/// operation the caller happened to invoke.
+///
+/// It grants nothing and records nothing: the only effect is the returned
+/// [`StoreError`], which stays [`StoreError::UnknownOperation`] because this
+/// crate's wire error enum is a closed shared contract.
+///
+/// [`CanonicalStoreClient::apply_reserved_write`]: crate::CanonicalStoreClient::apply_reserved_write
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq)]
+pub struct ReservedWriteUnsupported;
+
+impl ReservedWriteUnsupported {
+    /// The single refusal value the unsupported default body returns.
+    pub const REFUSAL: Self = Self;
+
+    /// Converts the refusal into the error the default body reports.
+    #[must_use]
+    pub const fn into_error(self) -> StoreError {
+        StoreError::UnknownOperation
+    }
+}
+
+/// Checks the exact operation identity and reservation binding of one observed
+/// canonical receipt against the projection it was admitted under.
+///
+/// Equality of the original [`OperationId`], the idempotency key, and the
+/// canonical request hash is the receipt binding; the projection is first
+/// re-validated so its own canonical reservation-token digest is recomputed
+/// from exactly the same bytes the Kernel sealed. A mismatch is a typed
+/// [`StoreError`], never a silent repair and never a string.
+fn validate_receipt_binding(
+    admission: &WriteAdmissionProjection,
+    receipt: &WriteReceipt,
+) -> Result<(), StoreError> {
+    if receipt.operation_id != admission.operation_id
+        || receipt.idempotency_key != admission.idempotency_key
+        || receipt.canonical_request_hash != admission.canonical_request_hash
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    Ok(())
 }
 
 /// Checks preserved revision heads: bounded, unique, valid, same fence.
