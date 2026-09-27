@@ -331,9 +331,11 @@ pub enum AdmissionReservationLaunchPrerequisite {
         /// Proposed attempt whose admission reservation was expected.
         proposed_attempt_id: OperationIdentity,
     },
-    /// Claims are durable but were never activated. This holds even when a
-    /// canonical admission receipt is already present and activation has not
-    /// happened.
+    /// Claims are durable but were never activated, so they cannot provision or
+    /// launch. A staged record that already carried a canonical admission or
+    /// activation receipt is not representable:
+    /// [`AdmissionReservationRecord::validate`] refuses it, so this verifier
+    /// never has to decide what such a record would mean.
     Staged {
         /// Exact durable staged record.
         reservation: AdmissionReservationRecord,
