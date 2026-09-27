@@ -21,6 +21,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+mod resource_declaration;
+
+pub use resource_declaration::{InvalidResourceClaim, ResourceClaim, ResourceKind, ResourceWeight};
+
 pub const CONTRACT_NAME: &str = "eliot.instrument.build-test-graph";
 pub const CONTRACT_VERSION: (u16, u16, u16) = (1, 0, 0);
 /// Version of the stored plan semantics.  Every [`ChangeImpactPlan`] carries

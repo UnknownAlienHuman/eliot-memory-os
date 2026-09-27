@@ -23,8 +23,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::nextest_partition;
 
+use eliot_build_test_graph::InvalidResourceClaim;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use eliot_build_test_graph::{ResourceClaim, ResourceKind, ResourceWeight};
+
+/// A declared claim was refused by the shared declaration owner.
+fn invalid_claim(error: InvalidResourceClaim) -> ResourceError {
+    ResourceError::InvalidClaim {
+        field: error.field,
+        reason: error.reason,
+    }
+}
 
 /// Job classes ordered ahead of background work by I2.22.
 ///
@@ -105,64 +116,6 @@ impl JobClass {
     }
 }
 
-/// Kinds of exclusive runtime resource. A worktree does not isolate any of
-/// them, so a claim on one excludes every other claim on the same resource.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceKind {
-    /// A stateful service instance.
-    StatefulService,
-    /// A bound TCP/UDP port.
-    Port,
-    /// A mutable fixture directory or volume.
-    Fixture,
-    /// A database volume.
-    DatabaseVolume,
-}
-
-impl ResourceKind {
-    /// Every declared kind, in canonical order.
-    pub const ALL: [Self; 4] = [
-        Self::StatefulService,
-        Self::Port,
-        Self::Fixture,
-        Self::DatabaseVolume,
-    ];
-
-    /// Stable lease-record spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::StatefulService => "stateful_service",
-            Self::Port => "port",
-            Self::Fixture => "fixture",
-            Self::DatabaseVolume => "database_volume",
-        }
-    }
-}
-
-/// One exclusive runtime resource a test group requires.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceClaim {
-    pub kind: ResourceKind,
-    /// Declared resource name, unique within one job's claim set.
-    pub name: String,
-}
-
-impl ResourceClaim {
-    fn validate(&self) -> Result<(), ResourceError> {
-        let trimmed = self.name.trim();
-        if trimmed.is_empty() || trimmed.chars().any(char::is_control) || trimmed != self.name {
-            return Err(ResourceError::InvalidClaim {
-                field: "resource.name",
-                reason: "must be non-blank, control-free, and free of surrounding whitespace",
-            });
-        }
-        Ok(())
-    }
-}
-
 /// Declared resource weight, exclusive claims, and serial grouping for one
 /// test group or job.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -205,7 +158,7 @@ impl TestResourceProfile {
         }
         let mut seen = BTreeSet::new();
         for claim in &self.exclusive_resources {
-            claim.validate()?;
+            claim.validate().map_err(invalid_claim)?;
             if !seen.insert((claim.kind, claim.name.clone())) {
                 return Err(ResourceError::DuplicateClaim {
                     kind: claim.kind,
@@ -214,31 +167,6 @@ impl TestResourceProfile {
             }
         }
         Ok(())
-    }
-}
-
-/// Closed table of declared resource weights. The order is light to heavy.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceWeight {
-    /// Default and background weight.
-    #[default]
-    Light,
-    /// Ordinary test weight.
-    Moderate,
-    /// Weight for a group that saturates a constrained lane.
-    Heavy,
-}
-
-impl ResourceWeight {
-    /// The weight as a number, for weight sums in a lane budget.
-    #[must_use]
-    pub const fn as_u32(self) -> u32 {
-        match self {
-            Self::Light => 1,
-            Self::Moderate => 2,
-            Self::Heavy => 3,
-        }
     }
 }
 

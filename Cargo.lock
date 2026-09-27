@@ -2219,6 +2219,7 @@ dependencies = [
  "eliot-process",
  "eliot-process-executor",
  "eliot-verifier",
+ "serde",
  "serde_json",
  "thiserror",
 ]
@@ -3318,6 +3319,7 @@ name = "eliot-testd-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-process",
