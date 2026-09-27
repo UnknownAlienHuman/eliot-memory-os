@@ -259,6 +259,7 @@ Add-Record 'acl_boundaries' $aclStatus @{
     default_target_avoided = $true
     acl_snapshots = @($aclBoundaries)
     broad_write_grants = @($aclBroadWrite)
+    fallback = if ($aclBroadWrite.Count -eq 0) { '' } else { 'VM/lab isolated runner re-establishes the boundary; release evidence keeps this ACL snapshot with the selected runner' }
     reason = if ($aclBroadWrite.Count -eq 0) {
         'ACLs are readable and no broad inherited write grant was observed'
     }
@@ -424,6 +425,30 @@ Add-Record 'descendant_removal_and_sandbox' 'FALLBACK_REQUIRED' @{
 $failed = @($records | Where-Object { $_.status -notin @('PROVEN', 'FALLBACK_REQUIRED') })
 $proven = @($records | Where-Object { $_.status -eq 'PROVEN' }).Count
 $fallback = @($records | Where-Object { $_.status -eq 'FALLBACK_REQUIRED' }).Count
+# Typed per-claim gate for the deterministic aggregator
+# (tests/release-security/run-tests.ps1): one boolean per claim, true only
+# when the claim is locally proven or explicitly routed to a recorded
+# VM/lab fallback. Anything else fails closed below; the gate never turns
+# an unrouted claim green.
+$gateHeld = [ordered]@{}
+$selectedFallbacks = [ordered]@{}
+foreach ($record in $records) {
+    $gateName = 'claim_' + [string]$record.claim + '_held'
+    $fallbackText = ''
+    if ($record.evidence -is [System.Collections.IDictionary] -and $record.evidence.Contains('fallback')) {
+        $fallbackText = [string]$record.evidence['fallback']
+    }
+    if ([string]$record.status -eq 'PROVEN') {
+        $gateHeld[$gateName] = $true
+    }
+    elseif ([string]$record.status -eq 'FALLBACK_REQUIRED' -and -not [string]::IsNullOrWhiteSpace($fallbackText)) {
+        $gateHeld[$gateName] = $true
+        $selectedFallbacks[[string]$record.claim] = $fallbackText
+    }
+    else {
+        $gateHeld[$gateName] = $false
+    }
+}
 $result = [pscustomobject]@{
     component = 'eliot_build_sandbox_cache_proof_1923'
     status    = if ($failed.Count -eq 0) { 'VERIFIED' } else { 'FAILED' }
@@ -431,6 +456,10 @@ $result = [pscustomobject]@{
     fallbacks = $fallback
     lane      = $isolatedTarget
     claims    = $records
+    selected_fallbacks = $selectedFallbacks
+}
+foreach ($gateName in @($gateHeld.Keys)) {
+    $result | Add-Member -NotePropertyName $gateName -NotePropertyValue ([bool]$gateHeld[$gateName])
 }
 $result | ConvertTo-Json -Depth 6
 if ($failed.Count -ne 0) { throw 'BUILD_SANDBOX_PROOF: one or more claims left unproven and unrouted' }
