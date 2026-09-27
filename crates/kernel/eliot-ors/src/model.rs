@@ -5302,6 +5302,44 @@ pub enum HostRequestAttemptPhase {
     DeferredNoEffect,
 }
 
+/// Durable exclusive send claim for one Kernel→owner handoff of a retained
+/// host request (implements #2970).
+///
+/// The claim is the compare-and-swap ownership of a send attempt: it is written
+/// in the same transaction that advances the record to a non-reissuable routed
+/// contour, so a crash after the claim is durable reloads as non-reissuable and
+/// a concurrent loser observes the winner's claim instead of issuing a second
+/// owner handoff. An idempotent transition to the same state is not a claim.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestSendClaim {
+    /// Unique send-attempt identity.
+    pub claim_id: OpaqueLabel,
+    /// Record state the claimer expected to arm from.
+    pub expected_prior_state: HostRequestState,
+    /// Claiming Kernel session/connection identity.
+    pub claiming_session_ref: OpaqueLabel,
+    /// Wall-clock instant the claim was armed, for bounded recovery.
+    pub armed_at_unix_ms: u64,
+}
+
+impl HostRequestSendClaim {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        validate_text(self.claim_id.as_str(), "host_request_send_claim_id")?;
+        validate_text(
+            self.claiming_session_ref.as_str(),
+            "host_request_send_claim_session",
+        )?;
+        if self.armed_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_send_claim_armed_at",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 impl HostRequestAttempt {
     pub(crate) fn validate(&self, fence_digest: &str) -> Result<(), OrsError> {
         validate_text(self.attempt_id.as_str(), "host_request_attempt_id")?;
@@ -5430,6 +5468,11 @@ pub struct HostRequestRecord {
     /// replacement cannot free ownership by losing its local queue entry.
     #[serde(default)]
     pub attempt: Option<HostRequestAttempt>,
+    /// Exclusive Kernel→owner send claim, armed before the owner handoff
+    /// (implements #2970). Written in the same transaction that advances the
+    /// record to a non-reissuable routed contour.
+    #[serde(default)]
+    pub send_claim: Option<HostRequestSendClaim>,
     pub result_digest: Option<String>,
     /// Exact bounded result body for `ResultReceived`/`Terminal` readback
     /// (Implements #18: local read result).
@@ -5509,6 +5552,9 @@ impl HostRequestRecord {
         validate_digest(&self.payload_digest, "host_request_payload_digest")?;
         if let Some(attempt) = &self.attempt {
             attempt.validate(&self.fence_digest)?;
+        }
+        if let Some(send_claim) = &self.send_claim {
+            send_claim.validate()?;
         }
         validate_text(self.connection_ref.as_str(), "host_request_connection_ref")?;
         for (value, field) in [

@@ -2372,6 +2372,19 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
         attempt: &crate::HostRequestAttempt,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Acquires the exclusive Kernel→owner send claim for one retained host
+    /// request (implements #2970). Atomic first-writer-wins: the claim is
+    /// written in the same transaction that advances the record to a
+    /// non-reissuable routed contour, so a crash after the claim is durable
+    /// reloads as non-reissuable. A concurrent loser observes the winner's
+    /// claim and performs zero owner calls; a record already past the arming
+    /// point is returned unchanged for reconciliation.
+    fn acquire_host_request_send_claim(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        claim: &crate::HostRequestSendClaim,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Records a no-effect deferral for the exact active daemon attempt.
     fn defer_host_request_attempt(
         &self,
