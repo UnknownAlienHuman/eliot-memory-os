@@ -17,6 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_agent_contracts::{
+    CoordinationMapView, DeliveryPolicy, LivePeerMessageKind, LivePeerMessagePayload,
+    MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES,
+};
 use eliot_contracts::{ClockReading, EpochId, EpochRelation, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,11 +32,11 @@ pub const PEER_CHANNEL_REVISION: &str = "eliot.governor.peer-communication.v1";
 /// Closed wire schema accepted by [`decode_peer_envelope`].
 pub const PEER_MESSAGE_SCHEMA: &str = "peer-message/v1";
 /// Largest admitted inline payload, in bytes.
-pub const MAX_PEER_MESSAGE_BYTES: u64 = 65_536;
+pub const MAX_PEER_MESSAGE_BYTES: u64 = MAX_LIVE_PEER_PAYLOAD_BYTES as u64;
 /// Largest admitted inline text, in bytes.
 pub const MAX_PEER_INLINE_TEXT: usize = 8_192;
 /// Largest admitted evidence/artifact reference fan-out per record.
-pub const MAX_PEER_REFERENCES: usize = 16;
+pub const MAX_PEER_REFERENCES: usize = MAX_LIVE_PEER_REFERENCES;
 /// Largest admitted live (non-terminal) queue depth per stream.
 pub const MAX_PEER_STREAM_DEPTH: usize = 256;
 /// Largest admitted live (non-terminal) outbound backlog per sender.
@@ -204,6 +208,17 @@ impl LiveDeltaKind {
             "obstacle",
             "abandoned_dead_end",
         ]
+    }
+}
+
+const fn live_delta_kind(kind: LivePeerMessageKind) -> LiveDeltaKind {
+    match kind {
+        LivePeerMessageKind::RelevantFinding => LiveDeltaKind::RelevantFinding,
+        LivePeerMessageKind::AssumptionInvalidated => LiveDeltaKind::AssumptionInvalidated,
+        LivePeerMessageKind::DependencyDiscovered => LiveDeltaKind::DependencyDiscovered,
+        LivePeerMessageKind::PlanContradiction => LiveDeltaKind::PlanContradiction,
+        LivePeerMessageKind::Obstacle => LiveDeltaKind::Obstacle,
+        LivePeerMessageKind::AbandonedDeadEnd => LiveDeltaKind::AbandonedDeadEnd,
     }
 }
 
@@ -803,6 +818,12 @@ pub struct PeerMessage {
     pub request_id: String,
     pub kind: PeerMessageKind,
     pub delta_kind: Option<LiveDeltaKind>,
+    /// Typed payload for live deltas; absent on legacy and non-live rows.
+    #[serde(default)]
+    pub live_peer_payload: Option<LivePeerMessagePayload>,
+    /// Route capability is independent of payload boundary timing.
+    #[serde(default)]
+    pub live_delivery_profile: Option<DeliveryPolicy>,
     pub stream: PeerStreamId,
     pub stream_seq: u64,
     pub predecessor: Option<u64>,
@@ -840,7 +861,8 @@ impl PeerMessage {
             PeerMessageState::Staged
                 | PeerMessageState::DeliveryAttempted { .. }
                 | PeerMessageState::Unknown { .. }
-        )
+        ) || (self.live_peer_payload.is_some()
+            && matches!(self.state, PeerMessageState::Unavailable { .. }))
     }
 
     /// Redacted diagnostic view: inline text survives only for open
@@ -1022,6 +1044,142 @@ fn attest_peer_durability(
     }
 }
 
+#[derive(Clone)]
+struct LivePeerAdmission {
+    payload: LivePeerMessagePayload,
+    profile: DeliveryPolicy,
+}
+
+struct PeerMessageAdmission<'a> {
+    draft: &'a EnqueuePeerMessage,
+    stream: PeerStreamId,
+    recorded: PeerDurability,
+    recipient_live: bool,
+    now: u64,
+    live: Option<LivePeerAdmission>,
+}
+
+fn validate_live_peer_payload(
+    draft: &EnqueuePeerMessage,
+    payload: &LivePeerMessagePayload,
+    map: &CoordinationMapView,
+) -> Result<(), CoordinationError> {
+    payload
+        .validate_against_map(map)
+        .map_err(|_| CoordinationError::InvalidField("live_peer_payload"))?;
+    if draft.delta_kind != Some(live_delta_kind(payload.kind))
+        || draft
+            .inline_text
+            .as_deref()
+            .is_some_and(|text| text != payload.concise_delta.as_str())
+        || (draft.inline_text.is_none() && draft.payload_handle.is_none())
+        || payload.expires_at.as_deref()
+            != draft.expires_at.map(|expiry| expiry.to_string()).as_deref()
+        || payload.evidence_refs.iter().any(|reference| {
+            !draft
+                .evidence_refs
+                .iter()
+                .any(|handle| handle == reference.id.as_str())
+                && !draft
+                    .artifact_refs
+                    .iter()
+                    .any(|handle| handle == reference.id.as_str())
+        })
+        || !payload.recipients.iter().any(|recipient| {
+            map.resolve_recipient(recipient)
+                .is_ok_and(|entry| entry.work_item_id.as_str() == draft.work_item_id)
+        })
+    {
+        return Err(CoordinationError::InvalidField("live_peer_payload"));
+    }
+    let payload_bytes = eliot_contracts::canonical_json_bytes(payload)
+        .map_err(|_| CoordinationError::InvalidField("live_peer_payload"))?;
+    if payload_bytes.len() as u64 > MAX_PEER_MESSAGE_BYTES
+        || draft.payload_bytes != payload_bytes.len() as u64
+        || draft.payload_digest != eliot_contracts::sha256_hex(&payload_bytes)
+    {
+        return Err(CoordinationError::InvalidField("live_peer_payload"));
+    }
+    Ok(())
+}
+
+fn build_peer_message(
+    admission: PeerMessageAdmission<'_>,
+    seq: u64,
+    predecessor: Option<u64>,
+) -> PeerMessage {
+    let PeerMessageAdmission {
+        draft,
+        stream,
+        recorded,
+        recipient_live,
+        now,
+        live,
+    } = admission;
+    let embedded = draft
+        .embedded
+        .iter()
+        .map(|marker| EmbeddedMarker {
+            marker: marker.marker,
+            detail: marker.detail.clone(),
+            disposition: MarkerDisposition::Inert,
+        })
+        .collect();
+    let state = if let Some(live) = &live {
+        let reason = if live.profile == DeliveryPolicy::Unavailable {
+            "route profile is unavailable; mailbox item retained without passive awareness"
+        } else {
+            "safe-boundary delivery integration is unavailable; mailbox item retained"
+        };
+        PeerMessageState::Unavailable {
+            reason: reason.to_owned(),
+        }
+    } else if recipient_live {
+        PeerMessageState::Staged
+    } else {
+        PeerMessageState::Unavailable {
+            reason: format!(
+                "recipient session {} is not active",
+                draft.recipient_session_id
+            ),
+        }
+    };
+    PeerMessage {
+        message_id: draft.message_id.clone(),
+        request_id: draft.request_id.clone(),
+        kind: draft.kind,
+        delta_kind: draft.delta_kind,
+        live_peer_payload: live.as_ref().map(|value| value.payload.clone()),
+        live_delivery_profile: live.map(|value| value.profile),
+        stream,
+        stream_seq: seq,
+        predecessor,
+        sender_session_id: draft.sender_session_id.clone(),
+        scope: draft.scope.clone(),
+        authority_epoch: draft.authority_epoch.clone(),
+        state_fence: draft.state_fence.clone(),
+        payload_digest: draft.payload_digest.clone(),
+        payload_bytes: draft.payload_bytes,
+        payload_handle: draft.payload_handle.clone(),
+        inline_text: draft.inline_text.clone(),
+        evidence_refs: draft.evidence_refs.clone(),
+        artifact_refs: draft.artifact_refs.clone(),
+        privacy: draft.privacy,
+        disclosure_handle: draft.disclosure_handle.clone(),
+        revision: draft.revision,
+        created_at: now,
+        expires_at: draft.expires_at,
+        embedded,
+        durability: recorded,
+        state,
+        attempts: 0,
+        duplicate_deliveries: 0,
+        acknowledged_revision: None,
+        acknowledged_by: None,
+        attempt_history: Vec::new(),
+    }
+}
+
 fn peer_text(value: &str, field: &'static str) -> Result<(), CoordinationError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(CoordinationError::InvalidField(field));
@@ -1093,6 +1251,8 @@ impl CoordinationOwner {
         &self,
         request_id: &str,
         draft: &EnqueuePeerMessage,
+        live_payload: Option<&LivePeerMessagePayload>,
+        profile: Option<DeliveryPolicy>,
     ) -> Result<Option<PeerEnqueueReceipt>, CoordinationError> {
         let Some(message_id) = self.peer_request_index.get(request_id) else {
             return Ok(None);
@@ -1102,11 +1262,14 @@ impl CoordinationOwner {
             .get(message_id)
             .ok_or(CoordinationError::InvalidState)?;
         let identical = stored.kind == draft.kind
+            && stored.message_id == draft.message_id
             && stored.delta_kind == draft.delta_kind
             && stored.stream.recipient_session_id == draft.recipient_session_id
             && stored.stream.work_item_id == draft.work_item_id
             && stored.sender_session_id == draft.sender_session_id
             && stored.scope == draft.scope
+            && stored.authority_epoch == draft.authority_epoch
+            && stored.state_fence == draft.state_fence
             && stored.payload_digest == draft.payload_digest
             && stored.payload_bytes == draft.payload_bytes
             && stored.payload_handle == draft.payload_handle
@@ -1117,6 +1280,9 @@ impl CoordinationOwner {
             && stored.disclosure_handle == draft.disclosure_handle
             && stored.revision == draft.revision
             && stored.expires_at == draft.expires_at;
+        let identical = identical
+            && stored.live_peer_payload.as_ref() == live_payload
+            && stored.live_delivery_profile == profile;
         if !identical {
             return Err(CoordinationError::PeerSemanticConflict(
                 draft.message_id.clone(),
@@ -1145,15 +1311,7 @@ impl CoordinationOwner {
     fn peer_outstanding_from(&self, sender: &str) -> usize {
         self.peer_messages
             .values()
-            .filter(|message| {
-                message.sender_session_id == sender
-                    && matches!(
-                        message.state,
-                        PeerMessageState::Staged
-                            | PeerMessageState::DeliveryAttempted { .. }
-                            | PeerMessageState::Unknown { .. }
-                    )
-            })
+            .filter(|message| message.sender_session_id == sender && message.occupies_depth())
             .count()
     }
 
@@ -1161,13 +1319,7 @@ impl CoordinationOwner {
         self.peer_messages
             .values()
             .filter(|message| {
-                message.stream.recipient_session_id == recipient
-                    && matches!(
-                        message.state,
-                        PeerMessageState::Staged
-                            | PeerMessageState::DeliveryAttempted { .. }
-                            | PeerMessageState::Unknown { .. }
-                    )
+                message.stream.recipient_session_id == recipient && message.occupies_depth()
             })
             .count()
     }
@@ -1298,8 +1450,12 @@ impl CoordinationOwner {
     fn replay_enqueue_draft(
         &self,
         draft: &EnqueuePeerMessage,
+        live_payload: Option<&LivePeerMessagePayload>,
+        profile: Option<DeliveryPolicy>,
     ) -> Result<Option<PeerEnqueueReceipt>, CoordinationError> {
-        if let Some(replayed) = self.peer_message_exact_replay(&draft.request_id, draft)? {
+        if let Some(replayed) =
+            self.peer_message_exact_replay(&draft.request_id, draft, live_payload, profile)?
+        {
             return Ok(Some(replayed));
         }
         if let Some(stored) = self.peer_messages.get(&draft.message_id) {
@@ -1309,9 +1465,20 @@ impl CoordinationOwner {
                 && stored.stream.work_item_id == draft.work_item_id
                 && stored.sender_session_id == draft.sender_session_id
                 && stored.scope == draft.scope
+                && stored.authority_epoch == draft.authority_epoch
+                && stored.state_fence == draft.state_fence
                 && stored.payload_digest == draft.payload_digest
+                && stored.payload_bytes == draft.payload_bytes
+                && stored.payload_handle == draft.payload_handle
+                && stored.inline_text == draft.inline_text
+                && stored.evidence_refs == draft.evidence_refs
+                && stored.artifact_refs == draft.artifact_refs
+                && stored.privacy == draft.privacy
+                && stored.disclosure_handle == draft.disclosure_handle
                 && stored.revision == draft.revision
-                && stored.expires_at == draft.expires_at;
+                && stored.expires_at == draft.expires_at
+                && stored.live_peer_payload.as_ref() == live_payload
+                && stored.live_delivery_profile == profile;
             if identical {
                 let event = self
                     .event_by_request
@@ -1378,9 +1545,14 @@ impl CoordinationOwner {
         clock: &dyn PeerClockPort,
         durability: &dyn PeerDurabilityPort,
     ) -> Result<PeerEnqueueReceipt, CoordinationError> {
+        if draft.kind == PeerMessageKind::LivePeerDelta {
+            return Err(CoordinationError::MissingPeerField(
+                "typed_live_peer_payload".to_owned(),
+            ));
+        }
         let now = clock.now_ms();
         let recipient_live = self.validate_enqueue_draft(draft, now)?;
-        if let Some(replayed) = self.replay_enqueue_draft(draft)? {
+        if let Some(replayed) = self.replay_enqueue_draft(draft, None, None)? {
             return Ok(replayed);
         }
         let stream = PeerStreamId {
@@ -1389,7 +1561,103 @@ impl CoordinationOwner {
         };
         self.check_enqueue_backpressure(draft, &stream)?;
         let recorded = attest_peer_durability(durability)?;
-        self.admit_enqueue_message(draft, stream, recorded, recipient_live, now)
+        self.admit_enqueue_message(draft, stream, recorded, recipient_live, now, None)
+    }
+
+    fn replay_live_peer_delta(
+        &self,
+        draft: &EnqueuePeerMessage,
+        payload: &LivePeerMessagePayload,
+        profile: DeliveryPolicy,
+    ) -> Result<Option<PeerEnqueueReceipt>, CoordinationError> {
+        if let Some(replayed) = self.replay_enqueue_draft(draft, Some(payload), Some(profile))? {
+            return Ok(Some(replayed));
+        }
+        let Some(existing) = self.peer_messages.values().find(|message| {
+            message.stream.recipient_session_id == draft.recipient_session_id
+                && message.stream.work_item_id == draft.work_item_id
+                && message
+                    .live_peer_payload
+                    .as_ref()
+                    .is_some_and(|stored| stored.dedup_key == payload.dedup_key)
+        }) else {
+            return Ok(None);
+        };
+        let identical = existing.live_peer_payload.as_ref() == Some(payload)
+            && existing.sender_session_id == draft.sender_session_id
+            && existing.scope == draft.scope
+            && existing.live_delivery_profile == Some(profile)
+            && existing.state_fence == draft.state_fence
+            && existing.authority_epoch == draft.authority_epoch
+            && existing.privacy == draft.privacy
+            && existing.disclosure_handle == draft.disclosure_handle
+            && existing.payload_bytes == draft.payload_bytes
+            && existing.payload_digest == draft.payload_digest
+            && existing.payload_handle == draft.payload_handle
+            && existing.inline_text == draft.inline_text
+            && existing.evidence_refs == draft.evidence_refs
+            && existing.artifact_refs == draft.artifact_refs
+            && existing.revision == draft.revision
+            && existing.expires_at == draft.expires_at;
+        if !identical {
+            return Err(CoordinationError::PeerSemanticConflict(
+                draft.message_id.clone(),
+            ));
+        }
+        let event = self
+            .event_by_request
+            .get(&existing.request_id)
+            .cloned()
+            .ok_or(CoordinationError::InvalidState)?;
+        Ok(Some(PeerEnqueueReceipt {
+            message: existing.clone(),
+            event,
+            durability: existing.durability.clone(),
+            replayed: true,
+        }))
+    }
+
+    /// Admits a validated live delta into the existing durable mailbox.
+    /// Success means only durable admission; recipient delivery and
+    /// acknowledgement remain separate observations.
+    pub fn enqueue_live_peer_delta(
+        &mut self,
+        draft: &EnqueuePeerMessage,
+        payload: &LivePeerMessagePayload,
+        profile: DeliveryPolicy,
+        map: &CoordinationMapView,
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<PeerEnqueueReceipt, CoordinationError> {
+        if draft.kind != PeerMessageKind::LivePeerDelta {
+            return Err(CoordinationError::InvalidField("kind"));
+        }
+        let now = clock.now_ms();
+        let recipient_live = self.validate_enqueue_draft(draft, now)?;
+        validate_live_peer_payload(draft, payload, map)?;
+        if let Some(replayed) = self.replay_live_peer_delta(draft, payload, profile)? {
+            return Ok(replayed);
+        }
+        let stream = PeerStreamId {
+            recipient_session_id: draft.recipient_session_id.clone(),
+            work_item_id: draft.work_item_id.clone(),
+        };
+        self.check_enqueue_backpressure(draft, &stream)?;
+        let recorded = attest_peer_durability(durability)?;
+        if !matches!(&recorded, PeerDurability::Durable { .. }) {
+            return Err(CoordinationError::LivePeerDurabilityRequired);
+        }
+        self.admit_enqueue_message(
+            draft,
+            stream,
+            recorded,
+            recipient_live,
+            now,
+            Some(LivePeerAdmission {
+                payload: payload.clone(),
+                profile,
+            }),
+        )
     }
 
     /// Assigns the per-stream sequence and records one validated draft with
@@ -1401,6 +1669,7 @@ impl CoordinationOwner {
         recorded: PeerDurability,
         recipient_live: bool,
         now: u64,
+        live: Option<LivePeerAdmission>,
     ) -> Result<PeerEnqueueReceipt, CoordinationError> {
         let head = self
             .peer_streams
@@ -1414,57 +1683,18 @@ impl CoordinationOwner {
         let predecessor = if seq > 1 { Some(seq - 1) } else { None };
         head.next_seq = seq.saturating_add(1);
         head.admitted = head.admitted.saturating_add(1);
-        let embedded = draft
-            .embedded
-            .iter()
-            .map(|marker| EmbeddedMarker {
-                marker: marker.marker,
-                detail: marker.detail.clone(),
-                disposition: MarkerDisposition::Inert,
-            })
-            .collect();
-        let state = if recipient_live {
-            PeerMessageState::Staged
-        } else {
-            PeerMessageState::Unavailable {
-                reason: format!(
-                    "recipient session {} is not active",
-                    draft.recipient_session_id
-                ),
-            }
-        };
-        let message = PeerMessage {
-            message_id: draft.message_id.clone(),
-            request_id: draft.request_id.clone(),
-            kind: draft.kind,
-            delta_kind: draft.delta_kind,
-            stream: stream.clone(),
-            stream_seq: seq,
+        let message = build_peer_message(
+            PeerMessageAdmission {
+                draft,
+                stream: stream.clone(),
+                recorded: recorded.clone(),
+                recipient_live,
+                now,
+                live,
+            },
+            seq,
             predecessor,
-            sender_session_id: draft.sender_session_id.clone(),
-            scope: draft.scope.clone(),
-            authority_epoch: draft.authority_epoch.clone(),
-            state_fence: draft.state_fence.clone(),
-            payload_digest: draft.payload_digest.clone(),
-            payload_bytes: draft.payload_bytes,
-            payload_handle: draft.payload_handle.clone(),
-            inline_text: draft.inline_text.clone(),
-            evidence_refs: draft.evidence_refs.clone(),
-            artifact_refs: draft.artifact_refs.clone(),
-            privacy: draft.privacy,
-            disclosure_handle: draft.disclosure_handle.clone(),
-            revision: draft.revision,
-            created_at: now,
-            expires_at: draft.expires_at,
-            embedded,
-            durability: recorded.clone(),
-            state,
-            attempts: 0,
-            duplicate_deliveries: 0,
-            acknowledged_revision: None,
-            acknowledged_by: None,
-            attempt_history: Vec::new(),
-        };
+        );
         let event = self.event(
             &draft.request_id,
             format!("peer-message:{}", draft.message_id),
@@ -1517,15 +1747,20 @@ impl CoordinationOwner {
         peer_text(message_id, "message_id")?;
         peer_text(endpoint, "endpoint")?;
         let now = clock.now_ms();
-        if self.peer_expire_if_due(message_id, now).is_err() {
-            return Err(CoordinationError::PeerExpired(message_id.to_owned()));
-        }
         let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
             CoordinationError::NotFound {
                 kind: "peer_message",
                 id: message_id.to_owned(),
             }
         })?;
+        if snapshot.kind == PeerMessageKind::LivePeerDelta {
+            return Err(CoordinationError::PeerSafeBoundaryUnavailable(
+                message_id.to_owned(),
+            ));
+        }
+        if self.peer_expire_if_due(message_id, now).is_err() {
+            return Err(CoordinationError::PeerExpired(message_id.to_owned()));
+        }
         match &snapshot.state {
             PeerMessageState::Delivered { .. }
             | PeerMessageState::Acknowledged { .. }

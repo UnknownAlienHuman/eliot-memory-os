@@ -49,6 +49,11 @@ pub use peer_communication::{
     SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
 };
 
+pub use eliot_agent_contracts::{
+    DeliveryPolicy as LivePeerDeliveryProfile, LivePeerDeliveryPolicy, LivePeerMessageKind,
+    LivePeerMessagePayload, MessageUrgency, RecipientRef, RequestedReaction,
+};
+
 pub use work_lease_issuance::{
     WORK_LEASE_ISSUANCE_REVISION, WorkLeaseIssuanceDisposition, WorkLeaseIssuanceError,
     WorkLeaseIssuanceFailure, WorkLeaseIssuanceProvenance, WorkLeaseIssuanceResult,
@@ -160,6 +165,10 @@ pub enum CoordinationError {
     PeerDeliveryUnknown(String),
     #[error("peer privacy disclosure denied: {0}")]
     PeerPrivacyDenied(String),
+    #[error("live peer delta requires durable mailbox admission")]
+    LivePeerDurabilityRequired,
+    #[error("live peer delta has no wired safe-boundary delivery path: {0}")]
+    PeerSafeBoundaryUnavailable(String),
     #[error("peer cross-scope forwarding rejected: {0}")]
     PeerCrossScopeRejected(String),
     #[error("peer authority/effect injection rejected: {0}")]

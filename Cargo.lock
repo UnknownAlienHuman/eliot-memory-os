@@ -1201,6 +1201,7 @@ dependencies = [
 name = "eliot-coordination"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-contracts",
  "schemars",
  "serde",
