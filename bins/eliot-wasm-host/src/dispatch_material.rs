@@ -1473,7 +1473,9 @@ pub fn reclaim_claimed_file(
 /// the fixed name is renamed aside under the claimed-identity name and
 /// only aside bytes that still verify against the claim are deleted, so
 /// a replacement B landing after the pre-check is restored, never
-/// deleted. No single-owner condition is asserted — the owner publisher
+/// deleted. A matching readable served marker is required before reclaim:
+/// absent or uncertain served state leaves the claimed bytes for recovery.
+/// No single-owner condition is asserted — the owner publisher
 /// stages replacements and retires expired sets concurrently by design —
 /// which is exactly why every deletion re-verifies after the move.
 /// Residual windows: the Unix restore path without hard-link support
@@ -1506,6 +1508,14 @@ pub fn reclaim_claimed_delivery(
         };
     }
     let identity = claim.identity();
+    match read_served_marker(install_dir) {
+        Ok(Some(mark)) if mark.names(identity) => {}
+        Ok(_) | Err(_) => {
+            return ClaimedReclamation::RetainedForRecovery {
+                claimed: identity.clone(),
+            };
+        }
+    }
     let artifact = reclaim_claimed_file(
         install_dir,
         WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
@@ -1545,7 +1555,7 @@ pub fn reclaim_claimed_delivery(
     if reclamation_gone(&artifact)
         && reclamation_gone(&input)
         && reclamation_gone(&material)
-        && let Some(mark) = read_served_marker(install_dir)
+        && let Ok(Some(mark)) = read_served_marker(install_dir)
         && mark.names(claim.identity())
     {
         let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_FILE_NAME));
@@ -1646,24 +1656,58 @@ impl ServedDeliveryMarker {
     }
 }
 
-/// Reads the durable served marker, if any. Absent, oversize, or
-/// unparseable answers `None`: an unreadable marker must not wedge
-/// execution; the staged-identity behavior is the fallback. Bounded read:
-/// a legitimate marker is a few hundred bytes.
-#[must_use]
-pub fn read_served_marker(install_dir: &std::path::Path) -> Option<ServedDeliveryMarker> {
-    let bytes = std::fs::read(install_dir.join(WASM_HOST_SERVED_FILE_NAME)).ok()?;
-    if bytes.len() > 4096 {
-        return None;
+/// Reads the durable served marker, if any. Only an absent marker answers
+/// `Ok(None)`; read failures, oversize files, and malformed records fail
+/// closed so callers cannot treat uncertain served state as a fresh delivery.
+/// The bounded read accepts a few hundred bytes for a legitimate marker.
+pub fn read_served_marker(
+    install_dir: &std::path::Path,
+) -> Result<Option<ServedDeliveryMarker>, MaterialError> {
+    const MAX_BYTES: usize = 4096;
+
+    let path = install_dir.join(WASM_HOST_SERVED_FILE_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.len() > MAX_BYTES as u64 => {
+            return Err(MaterialError::TooLarge);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
     }
-    serde_json::from_slice(&bytes).ok()
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(MaterialError::Unreadable(other.kind().to_string())),
+                Ok(_) => Err(MaterialError::Unreadable(error.kind().to_string())),
+            };
+        }
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    };
+    let mut bounded = std::io::Read::take(file, (MAX_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    if bytes.len() > MAX_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    let marker: ServedDeliveryMarker =
+        serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
+    if marker.operation_id.trim().is_empty()
+        || marker.claim_id.trim().is_empty()
+        || marker.generation == 0
+    {
+        return Err(MaterialError::Malformed);
+    }
+    hex_digest(&marker.grant_digest, "served-marker-grant-digest")?;
+    Ok(Some(marker))
 }
 
 /// Writes the served marker atomically (process-scoped partial, flushed,
-/// then renamed): the reader never observes partial JSON. Best-effort
-/// durability signal: the serve already happened exactly once, so callers
-/// proceed on failure — without a marker only crash-recovery replay is
-/// lost, never the correctness of this serve.
+/// then renamed): the reader never observes partial JSON. Callers must
+/// propagate a write failure and retain the claimed set for recovery.
 pub fn write_served_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
