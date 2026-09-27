@@ -408,15 +408,6 @@ enum GenerationCutoverInnerFailure {
 }
 
 impl ServiceFenceObservation {
-    fn emit(self) {
-        observe_generation("kernel.generation.service_fence_requested", "attempt");
-        if self.succeeded {
-            observe_generation("kernel.generation.service_fenced", "success");
-        } else {
-            observe_generation("kernel.generation.service_fence_rejected", "rejected");
-        }
-    }
-
     /// Cutover-scoped fence observation: the same subordinate pair, correlated
     /// to its cutover call by the validated operation identity (W7).
     fn emit_for_cutover(self, cutover_id: &str) {
@@ -449,7 +440,7 @@ fn fence_service_after_generation_failure(
     ServiceFenceObservation {
         succeeded: result.is_ok(),
     }
-    .emit();
+    .emit_for_cutover("cutover-op-903");
     result
 }
 
