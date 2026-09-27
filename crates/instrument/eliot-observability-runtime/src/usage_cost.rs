@@ -880,16 +880,18 @@ impl UsageCostStore {
     }
 
     fn entry(&mut self, key: &UsageKey) -> Result<&mut UsageCostRecord, UsageCostError> {
-        if let Some(record) = self.facts.get_mut(key) {
-            return Ok(record);
-        }
-        if self.facts.len() >= MAX_USAGE_COST_BUCKETS {
+        // The bound applies to a NEW bucket only: an existing bucket is always
+        // writable, so the capacity check is made before the single mutable
+        // borrow that both the lookup and the insertion need.
+        if !self.facts.contains_key(key) && self.facts.len() >= MAX_USAGE_COST_BUCKETS {
             self.refused_facts = self.refused_facts.saturating_add(1);
             return Err(UsageCostError::BucketStoreFull {
                 buckets: MAX_USAGE_COST_BUCKETS,
             });
         }
-        let record = UsageCostRecord::empty(key.clone());
-        Ok(self.facts.entry(key.clone()).or_insert(record))
+        Ok(self
+            .facts
+            .entry(key.clone())
+            .or_insert_with(|| UsageCostRecord::empty(key.clone())))
     }
 }
