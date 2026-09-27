@@ -1453,8 +1453,10 @@ impl GrantGraph {
     /// [`RevocationHistoryError::MissingHistory`]: unavailable history is
     /// not absence of revocation and never restores as an empty closure.
     /// Stale (fence or revision drift) and unknown (invalid, unordered, or
-    /// non-revoked closure) evidence refuse likewise. Suppressed grants are
-    /// retained with their full lineage and join the restored revoked set,
+    /// non-revoked closure; unresolvable origin or dependent reference)
+    /// evidence refuse likewise, as does one closure identity reused with
+    /// changed content. Suppressed grants are retained with their full
+    /// lineage and join the restored revoked set,
     /// so neither a revoked origin nor its dependent grants can revive; the
     /// exact suppressed set and reasons are reported in the outcome.
     /// Unrelated valid grants restore exactly as the snapshot carries them.
@@ -1489,6 +1491,9 @@ impl GrantGraph {
     /// variant, not a string folded into a bounded cause, because an extra
     /// target is exactly the case that must never be reinterpreted as a
     /// second revocation origin.
+    /// [`RevocationHistoryError::IdentityConflict`] names one closure
+    /// identity presented twice with changed content: the committed result
+    /// is authoritative and nothing is applied.
     ///
     /// The legacy [`from_recovery_snapshot`](Self::from_recovery_snapshot)
     /// preserves its exact prior behavior for previously-admitted callers.
@@ -1545,11 +1550,7 @@ impl GrantGraph {
         // left exactly as the snapshot carried it.
         let mut admitted: Vec<AdmittedRevocationClosure> = Vec::with_capacity(closures.len());
         for closure in &closures {
-            if let Some(admitted_closure) =
-                graph.admit_origin_bound_closure(closure, &evidence.state_fence)?
-            {
-                admitted.push(admitted_closure);
-            }
+            admitted.push(graph.admit_origin_bound_closure(closure, &evidence.state_fence)?);
         }
         let suppressed = derive_suppressions(&graph, &admitted);
         for entry in &suppressed {
@@ -1564,15 +1565,16 @@ impl GrantGraph {
     /// exactly one declared origin, and admits it only when the whole
     /// origin-to-affected relation holds.
     ///
-    /// `Ok(None)` means the closure declares an origin that names no entity
-    /// of this graph and names no in-graph target either: it belongs to a
-    /// denominator this graph does not own, it can suppress nothing here,
-    /// and it keeps exactly the prior behavior. Proving that such a
-    /// reference is *another graph's* denominator rather than an unscoped
-    /// one is the history owner's obligation, because only the durable
-    /// history owner can partition by owner namespace; a reference under a
-    /// *bound* origin is a different case and is checked against this
-    /// namespace below.
+    /// A closure whose declared origin names no entity of this graph
+    /// refuses outright, whether or not it names in-graph targets: a
+    /// lookup miss proves nothing about another graph's denominator, and
+    /// partitioning multi-graph history by owner namespace is the durable
+    /// history owner's obligation before authority recovery, not a silent
+    /// skip inside it. Likewise, a dependent reference under a *bound*
+    /// origin that resolves to nothing in this namespace is unknown
+    /// evidence, never a no-op; only the closure's own origin reference
+    /// is exempt, because its namespace membership was already proven by
+    /// the bound resolution itself.
     ///
     /// Four decisions, all reached from
     /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history)
@@ -1598,7 +1600,9 @@ impl GrantGraph {
     ///    [`RevocationHistoryError::OriginTargetMismatch`]: a
     ///    record-supplied `dependent_refs` member never becomes a second
     ///    implicit revocation origin, and it is never folded into
-    ///    `TargetDrift`, which means a reachable target the closure omitted;
+    ///    `TargetDrift`, which means a reachable target the closure omitted.
+    ///    A dependent reference that resolves to nothing in this graph is
+    ///    unknown evidence, never a silent skip;
     /// 4. every reachable in-graph member must be represented by the
     ///    committed membership — named directly, owned by the declared
     ///    authority root, or inheriting from one of those — otherwise the
@@ -1613,7 +1617,7 @@ impl GrantGraph {
         &self,
         closure: &ValidatedRevocationClosure,
         fence: &StateFence,
-    ) -> Result<Option<AdmittedRevocationClosure>, RevocationHistoryError> {
+    ) -> Result<AdmittedRevocationClosure, RevocationHistoryError> {
         let origin = match self.resolve_revocation_origin(&closure.root_ref)? {
             BoundRevocationOrigin::Bound(origin) => origin,
             BoundRevocationOrigin::Foreign => {
@@ -1628,18 +1632,15 @@ impl GrantGraph {
                         ),
                     ));
                 }
-                return Ok(None);
+                return Err(RevocationHistoryError::UnknownHistory);
             }
             BoundRevocationOrigin::Ambiguous => {
                 return Err(RevocationHistoryError::UnknownHistory);
             }
         };
+        let bounds = eliot_influence::RevocationBounds::default_bounds();
         let denominator = self
-            .revocation_denominator_for_origin(
-                &origin,
-                fence,
-                &eliot_influence::RevocationBounds::default_bounds(),
-            )
+            .revocation_denominator_for_origin(&origin, fence, &bounds)
             .map_err(map_bounded_history_error)?;
         // A denominator that is not complete is a bounded prefix, so the
         // committed affected set cannot be compared against it at all.
@@ -1652,7 +1653,17 @@ impl GrantGraph {
             ));
         }
         for reference in &closure.affected {
-            if self.names_in_graph(reference) && !denominator.members.contains(reference.as_str()) {
+            // The origin reference itself is exempt: its namespace
+            // membership was already proven by the bound resolution above
+            // (a grant origin names an admitted grant; an authority-root
+            // origin is the retained marker, never a grant member). Every
+            // other affected reference is a dependent claim and must
+            // resolve in this namespace.
+            let known = self.names_in_graph(reference);
+            if !known && reference != &closure.root_ref {
+                return Err(RevocationHistoryError::UnknownHistory);
+            }
+            if known && !denominator.members.contains(reference.as_str()) {
                 return Err(RevocationHistoryError::OriginTargetMismatch(
                     OriginTargetMismatch {
                         closure_id: closure.closure_id.clone(),
@@ -1670,11 +1681,12 @@ impl GrantGraph {
                 eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
             ));
         }
-        Ok(Some(AdmittedRevocationClosure::admit(
+        Ok(AdmittedRevocationClosure::admit(
             closure,
             origin,
             denominator,
-        )))
+            bounds,
+        ))
     }
 
     /// The first denominator member the committed closure leaves
