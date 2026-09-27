@@ -22,6 +22,7 @@ pub mod cache_lane;
 pub mod process_owner;
 pub mod profile;
 pub mod profile_run;
+pub mod provider_denominator;
 pub mod registry;
 pub mod testd_port;
 
@@ -39,8 +40,16 @@ pub use profile::{
 };
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
-    ProfileRunError, StageEvidence, StageIdentity, StageLauncher, StageOrchestrator, StagePlan,
-    TestExecutionPlaneRoute, TestdPlaneAdmission,
+    ProfileRunError, ProviderDispatch, StageEvidence, StageIdentity, StageLauncher,
+    StageOrchestrator, StagePlan, TestExecutionPlaneRoute, TestdPlaneAdmission,
+    compose_provider_dispatch,
+};
+pub use provider_denominator::{
+    ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
+    ConformanceError, DENOMINATOR_CONTRACT, DENOMINATOR_CONTRACT_VERSION, ProviderAvailability,
+    ProviderDenominator, ProviderDenominatorError, ProviderDenominatorRow, ProviderDisposition,
+    ProviderFixtureSet, ProviderSupport, UNMAPPED_IN_PROCESS_INSTRUMENTS, declared_instruments,
+    disposition_for_parts, host_platform,
 };
 pub use registry::{
     ExecutableIdentityCause, ProviderRegistry, RegistryEntry, RegistryError,

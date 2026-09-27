@@ -753,3 +753,104 @@ impl TestdAdmissionPort for TestdPlaneAdmission {
         Ok(TestdAdmission::new(invocation.clone(), entry))
     }
 }
+
+/// The registry-composed dispatch decision for one admitted stage.
+///
+/// This is the single decision point where the current provider registry,
+/// the host's observed platform, and Testd's dispatch capability meet. It
+/// runs the whole pre-execution closure — exactly-one-entry resolution,
+/// generation and fingerprint freshness, host support, then Testd
+/// capability — and every rejection carries a typed
+/// [`ProviderDisposition`](crate::ProviderDisposition) so the stage stays
+/// counted in the declared denominator. A `Dispatch` decision is a
+/// precondition only: it grants no process, no task acceptance, and no
+/// Finish.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderDispatch {
+    /// The provider resolved, is current, is supported on this host, and is
+    /// dispatchable by Testd. The entry carries no process authority.
+    Dispatch {
+        /// The single current registry entry that owns the stage.
+        entry: Box<RegistryEntry>,
+    },
+    /// The provider was refused. It remains in the declared denominator.
+    Refused {
+        /// The exact typed reason.
+        disposition: crate::ProviderDisposition,
+    },
+}
+
+impl ProviderDispatch {
+    /// The owning entry, only on the dispatch path.
+    #[must_use]
+    pub fn entry(&self) -> Option<&RegistryEntry> {
+        match self {
+            Self::Dispatch { entry } => Some(entry),
+            Self::Refused { .. } => None,
+        }
+    }
+
+    /// The typed disposition for this stage.
+    #[must_use]
+    pub fn disposition(&self) -> crate::ProviderDisposition {
+        match self {
+            Self::Dispatch { .. } => crate::ProviderDisposition::Ready,
+            Self::Refused { disposition } => disposition.clone(),
+        }
+    }
+
+    /// Whether the stage may be dispatched.
+    #[must_use]
+    pub const fn is_dispatchable(&self) -> bool {
+        matches!(self, Self::Dispatch { .. })
+    }
+}
+
+/// Composes the current provider registry behind the Testd boundary.
+///
+/// Runs the whole pre-execution closure in order: exactly-one-entry
+/// resolution, generation and fingerprint freshness, host support, then
+/// Testd's closed dispatch capability. The closure is total: no rejection is
+/// an `Err`, so a missing, duplicate, ambiguous, stale, unsupported, or
+/// unmapped provider is reported as a typed [`ProviderDispatch::Refused`]
+/// carrying its exact cause rather than an error that could be dropped from
+/// a denominator. No process, build root, task, budget, or Finish authority
+/// is created here; only Testd dispatches.
+///
+/// Freshness inputs and the observed platform are supplied by the
+/// composition root, which owns the machine observations. A dispatch
+/// decision is a precondition only: the caller still has to run the
+/// provider and the runner still has to bind a launch-sealed executable
+/// identity before any result can take authoritative PASS.
+#[must_use]
+pub fn compose_provider_dispatch(
+    registry: &crate::ProviderRegistry,
+    instrument: &eliot_contracts::ContractId,
+    kind: InstrumentKind,
+    inputs: &crate::AvailabilityInputs<'_>,
+) -> ProviderDispatch {
+    let available = registry.availability_parts(instrument, kind, inputs);
+    if !available.is_available() {
+        return ProviderDispatch::Refused {
+            disposition: available.disposition(),
+        };
+    }
+    if !testd_dispatchable(kind) {
+        return ProviderDispatch::Refused {
+            disposition: crate::ProviderDisposition::Unsupported {
+                adapter: instrument.as_str().to_owned(),
+                kind,
+            },
+        };
+    }
+    // `availability_parts` already ran the freshness-pinned resolution, so
+    // the ready arm is exactly the single current entry it returned.
+    match available.entry() {
+        Some(entry) => ProviderDispatch::Dispatch {
+            entry: Box::new(entry.clone()),
+        },
+        None => ProviderDispatch::Refused {
+            disposition: crate::ProviderDisposition::Unmapped,
+        },
+    }
+}
