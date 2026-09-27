@@ -41,9 +41,10 @@ use eliot_kernel::kernel_diagnostics::{
     observe_entrypoint_with_detail, observe_terminal_error,
 };
 use eliot_kernel::{
-    EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
-    KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
-    compose_production_native_worker_front_door, compose_production_testd_front_door,
+    AuditAnchorBinding, EliotdReceiptRootBinding, KernelBuildError, KernelComposition,
+    KernelConfig, KernelDoctorRecoveryLedger, compose_dispatch_contour,
+    compose_production_doctor_front_door, compose_production_native_worker_front_door,
+    compose_production_testd_front_door,
 };
 
 #[cfg(windows)]
@@ -105,6 +106,19 @@ async fn main() {
         )
         .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
         kernel_config = kernel_config.with_eliotd_receipt_binding(receipt_binding);
+        // I16.10 (issue #1837): bind the periodic digest-anchor sink to the
+        // Watchdog failure domain. The bound directory is the
+        // installer-owned `watchdog_state_root` the Host injected with this
+        // same launch contour, under the same `runtime_state_roots_digest`
+        // that covers it — never a path this binary derives from its own work
+        // root. `AuditAnchorBinding::new` requires an absolute, already
+        // existing directory (the Kernel never creates the foreign one), and
+        // `set_anchor_sink` refuses a sink inside the work root, so the
+        // periodic `export_anchor` now lands where a rollback or loss of the
+        // Kernel work root cannot take it (A13.8).
+        let anchor_binding = AuditAnchorBinding::new(startup_binding.watchdog_state_root.clone())
+            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error.to_string()));
+        kernel_config = kernel_config.with_audit_anchor_binding(anchor_binding);
     }
     if let Some(prepared) = &prepared_store {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
