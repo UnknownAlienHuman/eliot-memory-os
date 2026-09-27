@@ -25,6 +25,7 @@ pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
 pub mod testd_port;
+pub mod work_envelope;
 
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use process_owner::{
@@ -57,6 +58,11 @@ pub use registry::{
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
+};
+pub use work_envelope::{
+    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity,
+    EnvelopedInstrumentResult, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
+    WorkEnvelopeError,
 };
 
 /// Stable identity of the shared instrument runner contract.

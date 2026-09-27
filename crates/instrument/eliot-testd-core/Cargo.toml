@@ -8,6 +8,7 @@ description = "Persistent scheduling and state core for the ELIOT instrument tes
 
 [dependencies]
 blake3 = "1.8.5"
+eliot-build-test-graph = { path = "../eliot-build-test-graph", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
 eliot-protocol.workspace = true
