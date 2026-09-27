@@ -102,7 +102,11 @@ pub enum OutcomeDisposition {
 }
 
 const MAX_TEXT_LEN: usize = 512;
-const MAX_REFS: usize = 16;
+/// Maximum evidence references or affected outputs one outcome may carry.
+///
+/// Public so an emitter can decline to broaden its scope instead of
+/// emitting a record its own owner would reject.
+pub const MAX_REFS: usize = 16;
 
 fn check_text(value: &str, field: &'static str) -> Result<(), OutcomeError> {
     if value.trim().is_empty() || value.len() > MAX_TEXT_LEN || value.chars().any(char::is_control)
@@ -235,6 +239,163 @@ pub fn fallback_outcome(
     };
     outcome.validate()?;
     Ok(outcome)
+}
+
+/// Exact sibling of [`FallbackOutcomeRequest`] for the generation scope.
+///
+/// I3.4 requires a reproduced failure on one exact generation/route
+/// fingerprint to be recorded against the generation owner instead of being
+/// hidden as a single harmless call error. `evidence_refs` and
+/// `generation_fingerprint` are load-bearing: both are rejected when absent by
+/// [`CapabilityOutcome::validate`], so a broad scope can never be asserted
+/// from absence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenerationChallengeOutcomeRequest {
+    /// Capability under test, e.g. `provider.dispatch`.
+    pub capability: String,
+    /// Mode the caller requested, e.g. `route-a`.
+    pub requested_mode: String,
+    /// Mode actually executed, e.g. `none` when the call never ran.
+    pub effective_mode: String,
+    /// Bounded human-readable reason for the degradation.
+    pub reason: String,
+    /// Evidence tied to this exact generation failure. Must be non-empty.
+    pub evidence_refs: Vec<String>,
+    /// Outputs or operations affected by the degraded execution, marked with
+    /// [`SURVIVING_OPERATION_PREFIX`] / [`REMOVED_PROMISE_PREFIX`].
+    pub affected_outputs_or_operations: Vec<String>,
+    /// Highest proof this degraded generation may still satisfy.
+    pub proof_ceiling: String,
+    /// Recovery, requalification, or expiry condition.
+    pub recovery_requalification_or_expiry: String,
+    /// Generation owner the scope is keyed to (the observed generation
+    /// identity, never a minted one).
+    pub generation_owner: String,
+    /// Exact generation/route fingerprint; empty is rejected.
+    pub generation_fingerprint: String,
+    /// Owner-set expiry in Unix milliseconds. `None` means explicit
+    /// requalification is the only recovery; no window is minted here.
+    pub valid_until_unix_ms: Option<u64>,
+}
+
+/// Emits the generation-scoped outcome for one reproducible exact-generation
+/// challenge failure.
+///
+/// Without this constructor [`DegradationScope::Generation`] is unreachable
+/// outside this module's own test module: [`fallback_outcome`] is
+/// `CALL`-scoped by construction, and the record has no other public
+/// generator. The scope, the record, and the registry view stay owned here;
+/// only the sibling emission is added.
+///
+/// # Errors
+///
+/// Returns [`OutcomeError::BroadScopeRequiresEvidence`] when
+/// `evidence_refs` is empty or `generation_fingerprint` is blank, and
+/// [`OutcomeError::Contract`] when any bound field is malformed.
+pub fn generation_challenge_outcome(
+    request: GenerationChallengeOutcomeRequest,
+) -> Result<CapabilityOutcome, OutcomeError> {
+    let outcome = CapabilityOutcome {
+        capability: request.capability,
+        requested_mode: request.requested_mode,
+        effective_mode: request.effective_mode,
+        degradation_scope: DegradationScope::Generation,
+        reason: request.reason,
+        evidence_refs: request.evidence_refs,
+        affected_outputs_or_operations: request.affected_outputs_or_operations,
+        proof_ceiling: request.proof_ceiling,
+        recovery_requalification_or_expiry: request.recovery_requalification_or_expiry,
+        scope_owner: request.generation_owner,
+        generation_fingerprint: request.generation_fingerprint,
+        valid_until_unix_ms: request.valid_until_unix_ms,
+    };
+    outcome.validate()?;
+    Ok(outcome)
+}
+
+/// Marker prefix naming an operation that survives a recorded degradation.
+pub const SURVIVING_OPERATION_PREFIX: &str = "survives:";
+
+/// Marker prefix naming a promise a recorded degradation removes.
+pub const REMOVED_PROMISE_PREFIX: &str = "removed:";
+
+/// Names one surviving operation inside
+/// [`CapabilityOutcome::affected_outputs_or_operations`].
+///
+/// A13.11 requires the displayed ceiling to subtract unavailable promises
+/// rather than report incomplete state as complete, so the single existing
+/// bounded list carries both sides under an explicit marker instead of a
+/// second parallel field on the record.
+#[must_use]
+pub fn surviving_operation(name: &str) -> String {
+    format!("{SURVIVING_OPERATION_PREFIX}{name}")
+}
+
+/// Names one removed promise inside
+/// [`CapabilityOutcome::affected_outputs_or_operations`].
+#[must_use]
+pub fn removed_promise(name: &str) -> String {
+    format!("{REMOVED_PROMISE_PREFIX}{name}")
+}
+
+/// The truthful subtraction projection of one adopted failure outcome.
+///
+/// A derived view, not a second record: it re-presents the single owner's
+/// outcome as the surviving operations, the removed promises, the evidence
+/// references, and the current scope, which is exactly what A13.11's
+/// "degradation is visible and local" rule has to display. An entry that
+/// carries neither marker is reported as a surviving operation, so an
+/// unmarked (legacy) list still projects to its weakest honest reading
+/// instead of losing the surviving side.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DegradationProjection {
+    /// Capability the outcome is keyed to.
+    pub capability: String,
+    /// Scope the outcome is keyed to at the time of the projection.
+    pub degradation_scope: DegradationScope,
+    /// Owner identity the scope is keyed to.
+    pub scope_owner: String,
+    /// Exact generation/route fingerprint; empty means unknown, never inferred.
+    pub generation_fingerprint: String,
+    /// Operations that still work under this degradation.
+    pub surviving_operations: Vec<String>,
+    /// Promises this degradation removes.
+    pub removed_promises: Vec<String>,
+    /// Evidence references backing the outcome; empty means the evidence is
+    /// absent and the outcome is unknown, not healthy.
+    pub evidence_refs: Vec<String>,
+    /// Highest proof the degraded execution may still satisfy.
+    pub proof_ceiling: String,
+}
+
+/// Projects one adopted outcome into its surviving/removed subtraction view.
+///
+/// Pure: it reads the record and never mints a scope, a proof, or an evidence
+/// reference. A record that fails validation still projects; the caller
+/// decides whether an unvalidated record may be acted on.
+#[must_use]
+pub fn project_degradation(outcome: &CapabilityOutcome) -> DegradationProjection {
+    let mut surviving_operations = Vec::new();
+    let mut removed_promises = Vec::new();
+    for entry in &outcome.affected_outputs_or_operations {
+        match entry.strip_prefix(SURVIVING_OPERATION_PREFIX) {
+            Some(name) => surviving_operations.push(name.to_owned()),
+            None => match entry.strip_prefix(REMOVED_PROMISE_PREFIX) {
+                Some(name) => removed_promises.push(name.to_owned()),
+                None => surviving_operations.push(entry.clone()),
+            },
+        }
+    }
+    DegradationProjection {
+        capability: outcome.capability.clone(),
+        degradation_scope: outcome.degradation_scope,
+        scope_owner: outcome.scope_owner.clone(),
+        generation_fingerprint: outcome.generation_fingerprint.clone(),
+        surviving_operations,
+        removed_promises,
+        evidence_refs: outcome.evidence_refs.clone(),
+        proof_ceiling: outcome.proof_ceiling.clone(),
+    }
 }
 
 /// Attempt receipt carrying the visible degradation outcomes for one attempt.
