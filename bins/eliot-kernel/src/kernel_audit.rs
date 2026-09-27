@@ -906,6 +906,16 @@ impl AuditEventDraft {
     }
 
     /// Returns the fencing-lease claim draft, classified by claim history.
+    ///
+    /// Issue #1807/W7 scope note: the three separately-keyed facts
+    /// (`transport_authentication`, `operation_authorization`,
+    /// `semantic_result_acceptance`) are deliberately NOT applied here. This
+    /// event reports the Kernel-side lease claim, not a transport authentication
+    /// and not an operation authorization, so emitting the keys would invite a
+    /// reader to infer a fact this boundary does not establish. The facts live on
+    /// `SESSION_BOUND`, `SESSION_REJECTED`, `DISPATCH_DAEMON_CLAIM` and
+    /// `RESULT_DAEMON_SUBMITTED`. Their absence here means "not applicable at
+    /// this boundary", not "not observed".
     #[must_use]
     pub fn lease_claim(
         envelope: &HostRequestEnvelope,
@@ -952,12 +962,19 @@ impl AuditEventDraft {
     /// envelope passed route admission and a live fencing-generation claim was
     /// minted for it, so the admitted operation identity is reported verbatim
     /// through [`admitted_operation_authorization`] rather than as a bare
-    /// boolean. Authenticated transport is observed here by construction of the
-    /// path, not by the presence of a field: dispatch is reachable only through
-    /// a session whose `bind_session` arm already returned `Ok`, so the same
-    /// authentication fact is recorded again at the stage that consumes it. No
-    /// semantic result exists at dispatch, so acceptance stays `not_reached`:
-    /// an admitted operation is not an accepted result.
+    /// boolean. No semantic result exists at dispatch, so acceptance stays
+    /// `not_reached`: an admitted operation is not an accepted result.
+    ///
+    /// `transport_authentication` is a BACK-REFERENCE, not a fresh
+    /// observation. The dispatch path re-verifies the envelope's own deadline
+    /// and admission, but it performs no transport-authority comparison of its
+    /// own: unlike the submission legs it does not re-check the session's
+    /// authority epoch, module generation or state fence against the envelope,
+    /// so naming this boundary as the place transport was observed would assert
+    /// a check that does not happen here. The fact was established once, at
+    /// `SESSION_BOUND`, and the joined session lineage on this record is what
+    /// carries it. Read this value as "established at session bound", not as
+    /// "re-proven at dispatch".
     #[must_use]
     pub fn dispatch_daemon_claim(
         envelope: &HostRequestEnvelope,
@@ -977,7 +994,7 @@ impl AuditEventDraft {
                 "fencing_generation": attempt.fencing_generation,
                 "scope_id": attempt.scope_id,
                 "facet_method": attempt.facet_method,
-                "transport_authentication": "observed_at_dispatch_boundary",
+                "transport_authentication": "established_at_session_bound",
                 "operation_authorization": admitted_operation_authorization(
                     attempt,
                     "admitted_for_dispatch",
@@ -997,14 +1014,19 @@ impl AuditEventDraft {
     /// the stored record, and that match is a live check at this call site.
     ///
     /// The authorized operation is reported only when the submitting daemon
-    /// actually carried the admitted attempt identity. A submission body
-    /// without an attempt is reported as `not_carried_on_submission` rather
-    /// than having an authorization reconstructed from the stored record, which
-    /// would be inferring a fact from the presence of a field. Acceptance of the
-    /// result is `not_assessed`: this event records a presented, fence-matched
-    /// result body, and the semantic qualification of that body is a separate
-    /// later step, so authentication here can never promote a model result
-    /// (issue #1809 owns candidate/disclosure qualification).
+    /// actually carried the admitted attempt identity, and that identity is
+    /// never taken from the stored record — reconstructing it there would be
+    /// inferring a fact from the presence of a field. `not_carried_on_submission`
+    /// is the fail-closed value for a body with no attempt; on the current call
+    /// sites it is defensive rather than reachable, because both
+    /// `submit_claimed_result` and `submit_observe_result` divert a
+    /// `body.attempt` of `None` to `result_stale_quarantined` before this draft
+    /// is built. It is kept so a future call site cannot silently start
+    /// reporting an authorization it did not receive. Acceptance of the result
+    /// is `not_assessed`: this event records a presented, fence-matched result
+    /// body, and the semantic qualification of that body is a separate later
+    /// step, so authentication here can never promote a model result (issue
+    /// #1809 owns candidate/disclosure qualification).
     #[must_use]
     pub fn result_daemon_submitted(
         session: &Session,
@@ -1042,6 +1064,15 @@ impl AuditEventDraft {
     }
 
     /// Returns the kernel-bound draft for one persisted result.
+    ///
+    /// Issue #1807/W7 scope note: as with `lease_claim`, the three
+    /// separately-keyed facts are deliberately NOT applied here — this event
+    /// binds a persisted record inside the Kernel and establishes no transport
+    /// authentication and no operation authorization of its own. Their absence
+    /// means "not applicable at this boundary", not "not observed". The
+    /// semantic-result acceptance fact belongs to
+    /// `RESULT_DAEMON_SUBMITTED` and to the semantic qualification that
+    /// follows it.
     #[must_use]
     pub fn result_kernel_bound(
         session: &Session,
@@ -1235,25 +1266,51 @@ impl AuditEventDraft {
     ///
     /// Issue #1807/W7. Reports the same three separately-keyed facts, the same
     /// `peer_identity_well_formed` observation and the same nonsecret owner
-    /// references under the same keys as [`Self::session_rejected`], so the
-    /// accepted and the refused handshake are directly comparable. A
-    /// declaration that these fields exist is not live execution evidence: each
-    /// value below states what this boundary actually observed, and every fact
-    /// that was not observed is named as such instead of being inferred from
-    /// the presence of an adjacent field.
+    /// reference *keys* as [`Self::session_rejected`], so a reader can compare
+    /// the two arms field by field. The two arms are comparable in their body
+    /// but deliberately NOT identical in their lineage, and the difference is
+    /// not an oversight: `session_rejected` has no accepted session, so it
+    /// derives `module_generation` and `authority_epoch` from the owner launch
+    /// descriptor, while this arm runs `fill_session` first and
+    /// [`AuditLineage::fill`] is first-write-wins, so its generation and epoch
+    /// remain the ones the live session policy itself established. The accepted
+    /// arm keeps the stronger source rather than overwriting it.
     ///
-    /// This arm is reached only after `Session::establish_with_server` returned
-    /// `Ok`, which is exactly where the OS pipe-admitted peer was validated and
-    /// the client's module generation, artifact hash, launch nonce and
-    /// authority epoch were proven equal to the live server policy. So
-    /// authenticated transport is genuinely observed here. The other two facts
-    /// are not, and the `bind_session` contract states that acceptance never
-    /// implies request admission: no operation is authorized at the binding
-    /// boundary, and no semantic result can exist before a request is even
-    /// admitted. `operation_authorization` therefore stays `not_assessed` and
-    /// `semantic_result_acceptance` stays `not_reached`; a successful
-    /// authentication is never allowed to promote a model result (issue #1809
-    /// owns candidate/disclosure qualification).
+    /// A declaration that these fields exist is not live execution evidence:
+    /// every fact this boundary did not observe is named as such instead of
+    /// being inferred from the presence of an adjacent field.
+    ///
+    /// **`transport_authentication` is per-role, not uniform.** Only the
+    /// `ACTIVE_DAEMON_CALLER` path runs `validate_eliotd_peer` and reaches
+    /// `Session::establish_with_server`, which compares the client's module
+    /// generation, artifact hash, launch nonce and authority epoch against the
+    /// live server policy. The other front-door roles (doctor, testd, native
+    /// worker, watchdog, host user-automation) bind through
+    /// `Session::establish`, which copies the client's asserted values, and
+    /// their own binding validators check module generation, artifact id,
+    /// artifact hash, same-authority epoch and fence compatibility but do NOT
+    /// join `client.launch_nonce`; `validate_doctor_client_binding` says so
+    /// outright — "there is no doctor launch descriptor on this base, so no
+    /// caller launch nonce is adopted as authority here". The value therefore
+    /// means "the pipe peer and this role's own binding checks passed here",
+    /// not "every server-policy field was proven here". A launch nonce carried
+    /// in this record's lineage is owner-proven only for the eliotd role.
+    ///
+    /// The other two facts are not observed at all, and the `bind_session`
+    /// contract states that acceptance never implies request admission: no
+    /// operation is authorized at the binding boundary, and no semantic result
+    /// can exist before a request is even admitted. `operation_authorization`
+    /// therefore stays `not_assessed` and `semantic_result_acceptance` stays
+    /// `not_reached`; a successful authentication is never allowed to promote a
+    /// model result (issue #1809 owns candidate/disclosure qualification).
+    ///
+    /// `owner_launch`/`owner_process_receipt` are populated only by
+    /// `validate_eliotd_peer`, which is `#[cfg(windows)]` and runs only for
+    /// `ACTIVE_DAEMON_CALLER`. A `null` therefore collapses three distinct
+    /// states: this role has no launch descriptor; the eliotd owner check was
+    /// not compiled in on this platform; or that check ran without collecting
+    /// its evidence. Read `null` as "no owner reference was recorded at this
+    /// boundary", never as "no owner check happened".
     #[must_use]
     pub fn session_bound(
         session: &Session,
