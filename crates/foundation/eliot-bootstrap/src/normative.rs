@@ -77,9 +77,9 @@ pub enum NormativePairReceiptError {
     /// The external pair key is not the key derived from its two digests.
     #[error("normative pair receipt pair_key does not match its document digests")]
     PairKeyMismatch,
-    /// The current pair repeats its complete predecessor identity.
-    #[error("normative pair receipt repeats its complete superseded identity")]
-    CurrentEqualsSuperseded,
+    /// A current digest repeats the superseded digest of the same document.
+    #[error("normative pair receipt field {field} repeats its superseded digest")]
+    CurrentEqualsSuperseded { field: &'static str },
 }
 
 /// Parse the accepted receipt supplied by an explicit repository boundary.
@@ -233,10 +233,25 @@ fn validate_digests(receipt: &NormativePairReceipt) -> Result<(), NormativePairR
             return Err(NormativePairReceiptError::InvalidDigest { field });
         }
     }
-    if receipt.architecture_sha256 == receipt.supersedes_architecture_sha256
-        && receipt.implementation_sha256 == receipt.supersedes_implementation_sha256
-    {
-        return Err(NormativePairReceiptError::CurrentEqualsSuperseded);
+    // Each document is rejected independently. The superseded digest of a
+    // partially-adopted pair is still a retired digest: stamping it as the
+    // current value of that one document must fail even when the other
+    // document has moved on to an accepted digest.
+    for (field, current, superseded) in [
+        (
+            "architecture_sha256",
+            receipt.architecture_sha256.as_str(),
+            receipt.supersedes_architecture_sha256.as_str(),
+        ),
+        (
+            "implementation_sha256",
+            receipt.implementation_sha256.as_str(),
+            receipt.supersedes_implementation_sha256.as_str(),
+        ),
+    ] {
+        if current == superseded {
+            return Err(NormativePairReceiptError::CurrentEqualsSuperseded { field });
+        }
     }
     Ok(())
 }
