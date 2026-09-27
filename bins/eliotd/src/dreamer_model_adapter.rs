@@ -207,6 +207,8 @@ pub struct KernelGenerationProjection {
 /// performs no Kernel reads — catalogue, policy, admission, binding, and the
 /// caller-opened attempt receipt arrive threaded per call, the Governor
 /// capability admission view is borrowed from the retained composition, and
+/// the outcome registry view is locked from that same composition so a broad
+/// degradation outcome outlives the attempt that recorded it, and
 /// execution leaves through the [`DreamerModelExecution`] port — so no
 /// Kernel client is retained here.
 pub struct GovernedDreamerModelAdapter<'a> {
@@ -263,11 +265,21 @@ impl<'a> GovernedDreamerModelAdapter<'a> {
             .composition
             .capability_admission()
             .map_err(|_| CompositionError::NotReady)?;
+        // The outcome registry is daemon-held (#1961), not per call: a
+        // generation-scope block recorded here must still be refusing the
+        // next attempt. The handle is borrowed, not locked, so the gate locks
+        // it only for its own synchronous decision and no guard is ever held
+        // across the provider execution await below.
+        let outcomes = self
+            .composition
+            .capability_outcomes()
+            .map_err(|_| CompositionError::NotReady)?;
         invoke_admitted_model(
             readiness,
             &admitted,
             coordinator_config,
             registry,
+            outcomes,
             input,
             intake,
             execution,
@@ -467,11 +479,15 @@ const FUNNEL_REFUSAL_CONTEXT: &str = "production admission";
 
 /// Recovery marker recorded on a generation-scoped challenge failure.
 ///
-/// Names the two defined recovery paths of the owning registry view:
-/// explicit requalification of the exact fingerprint, or reaching the
-/// owner-set expiry carried on the outcome.
-const GENERATION_RECOVERY: &str =
-    "requalify-exact-fingerprint-on-fresh-evidence-or-reach-outcome-expiry";
+/// Names the ONE recovery path this crate can actually perform: reaching the
+/// owner-set expiry carried on the outcome. The registry view also exposes
+/// `requalify_generation` as an explicit recovery, and it deliberately is not
+/// named here, because it has no production caller: the block's window is the
+/// evidence record's own `expires_at`, so the negative evidence and the block
+/// expire together and no in-window requalification event exists to trigger
+/// it. Claiming that path in the emitted record would put a recovery in the
+/// data that the daemon cannot perform.
+const GENERATION_RECOVERY: &str = "reach-outcome-expiry-on-the-retained-generation-block";
 
 /// What survives every degradation this gate records (A13.11).
 ///
@@ -564,11 +580,16 @@ fn render_projection(projection: &DegradationProjection) -> String {
 /// port's candidate bound by [`AgentResult::validate_for_binding`] —
 /// requested, logical, and observed identities plus usage, cancellation, and unknown
 /// outcomes cross unchanged and are never rewritten here.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the gate threads the identities the owner requires per invoke plus the held outcome registry handle; a struct would duplicate the owner's own request shape"
+)]
 pub(crate) async fn invoke_admitted_model(
     readiness: CompositionReadiness,
     admitted_fence: &StateFence,
     coordinator_config: &CoordinatorConfig,
     registry: &GovernorCapabilityAdmission,
+    outcomes: &std::sync::Mutex<CapabilityRegistryView>,
     input: &ModelInvokeInput,
     intake: &mut AttemptReceipt,
     execution: &impl DreamerModelExecution,
@@ -616,6 +637,7 @@ pub(crate) async fn invoke_admitted_model(
     let required = gate_model_capability(
         admitted_fence,
         registry,
+        outcomes,
         input,
         &generation_fingerprint,
         intake,
@@ -840,17 +862,37 @@ fn refuse_capability_call(
 /// Applies the #1961 exact-generation scope to one invoke.
 ///
 /// A reproduced failure on the exact capability, route fingerprint, and
-/// admitted generation is a generation finding, not a call error. The owning
-/// [`CapabilityRegistryView`] decides eligibility and refuses every route
-/// presenting that exact fingerprint; the outcome is attached to this
-/// attempt's receipt so the finding stays visible with its evidence and
+/// admitted generation is a generation finding, not a call error. The
+/// daemon-held [`CapabilityRegistryView`] decides eligibility and refuses
+/// every route presenting that exact fingerprint; the outcome is attached to
+/// this attempt's receipt so the finding stays visible with its evidence and
 /// current scope, and it is never installation-global state.
+///
+/// `outcomes` is the daemon's held view, not a per-call one, so the recorded
+/// finding outlives the attempt that produced it. It is consulted before any
+/// evidence is re-derived, so a later attempt on the same exact fingerprint
+/// reads the retained block instead of re-deriving one, and the
+/// generation-scope record survives as state instead of a per-call value.
+///
+/// The block is lifted by the owner's expiry, `clear_expired` against the
+/// recorded record's own window, and a new admitted generation carries a
+/// different fingerprint and is therefore unaffected. Stated honestly: the
+/// view also exposes `requalify_generation`, and that explicit recovery is NOT
+/// wired, because the block's window is the evidence record's own
+/// `expires_at` — the negative evidence and the block expire together, so no
+/// in-window requalification event exists. The honest extent of the guarantee
+/// is therefore that the generation finding is RETAINED and re-read, not that
+/// it refuses for longer than the fresh negative evidence already refused.
 ///
 /// Returns the refusal when the bound generation fingerprint is blocked, and
 /// `Ok(None)` when no required capability carries reproduced
 /// exact-fingerprint evidence at that generation — including when the
 /// Kernel-issued projection is unserved, so the generation stays unknown
 /// rather than inferred.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the decision needs the exact operation identities the owner binds per invoke; a struct would duplicate the owner's own outcome request"
+)]
 fn refuse_blocked_generation(
     required: &[String],
     input: &ModelInvokeInput,
@@ -858,8 +900,33 @@ fn refuse_blocked_generation(
     generation_fingerprint: &str,
     generation_owner: &str,
     requested_key: &str,
+    outcomes: &std::sync::Mutex<CapabilityRegistryView>,
     intake: &mut AttemptReceipt,
 ) -> Result<Option<CompositionError>, CompositionError> {
+    // Locked here, inside the gate's own synchronous body, so no guard is held
+    // across the provider execution await and every eligibility decision in
+    // this call reads the same retained state.
+    let mut outcomes = outcomes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Expiry is the owner's recovery path and runs against the retained view,
+    // so a block whose own window has passed stops refusing without any
+    // external trigger, and the eligibility decision below reads the same
+    // state it just pruned.
+    outcomes.clear_expired(input.now_unix_ms);
+    // The retained block is authoritative for this fingerprint. A live
+    // installation block is reported at its own broader scope rather than
+    // being restated as a generation finding; both refuse.
+    if outcomes.live_installation_blocks(input.now_unix_ms) > 0 {
+        return Ok(Some(owner_error(format!(
+            "capability admission is blocked installation-wide after a recorded broad-scope failure, so route {requested_key} on generation {generation} is not invoked"
+        ))));
+    }
+    if !outcomes.is_route_eligible(generation_fingerprint, None, input.now_unix_ms) {
+        return Ok(Some(owner_error(format!(
+            "capability is not admitted on generation {generation} of route {requested_key}: a retained exact-fingerprint failure already blocks that generation until its recovery or requalification"
+        ))));
+    }
     for capability in required {
         let Some(outcome) = exact_generation_outcome(
             capability,
@@ -874,11 +941,10 @@ fn refuse_blocked_generation(
         else {
             continue;
         };
-        let mut view = CapabilityRegistryView::default();
-        let disposition = view
+        let disposition = outcomes
             .record(&outcome)
             .map_err(|error| owner_error(format!("dreamer model generation record: {error}")))?;
-        view.clear_expired(input.now_unix_ms);
+        outcomes.clear_expired(input.now_unix_ms);
         // The block verdict stays bound to this operation through the
         // validated original record: the eligibility key is the digest the
         // record itself carries (checked by the owner's validate() during
@@ -892,7 +958,7 @@ fn refuse_blocked_generation(
             )));
         }
         if disposition != OutcomeDisposition::GlobalApplied
-            || view.is_route_eligible(&outcome.generation_fingerprint, None, input.now_unix_ms)
+            || outcomes.is_route_eligible(&outcome.generation_fingerprint, None, input.now_unix_ms)
         {
             return Err(owner_error(format!(
                 "evidenced generation outcome for {capability} did not block its exact fingerprint"
@@ -990,7 +1056,9 @@ fn verify_gate_preconditions(
 ///   reproduced failure on the exact fingerprint is recorded at
 ///   `GENERATION` scope, attached to this attempt's receipt, and admitted
 ///   through [`CapabilityRegistryView::is_route_eligible`], which refuses
-///   every route presenting that exact fingerprint and no other. A refusal
+///   every route presenting that exact fingerprint and no other. That view is
+///   the daemon-held one, so the block is also re-read on later attempts
+///   before any evidence is re-derived. A refusal
 ///   with no such evidence stays `CALL`-scoped (see
 ///   [`refuse_capability_call`]).
 /// - the funnel side runs through [`admit_production_route`]: the same
@@ -1007,6 +1075,7 @@ fn verify_gate_preconditions(
 fn gate_model_capability(
     admitted_fence: &StateFence,
     registry: &GovernorCapabilityAdmission,
+    outcomes: &std::sync::Mutex<CapabilityRegistryView>,
     input: &ModelInvokeInput,
     generation_fingerprint: &str,
     intake: &mut AttemptReceipt,
@@ -1029,9 +1098,11 @@ fn gate_model_capability(
         .as_str()
         .to_owned();
     // #1961 exact-generation scope: a reproduced failure on the exact
-    // fingerprint is a generation finding, not a call error. The owning
-    // registry view decides eligibility; the outcome stays visible on this
-    // attempt's receipt and never becomes installation-global state.
+    // fingerprint is a generation finding, not a call error. The daemon-held
+    // registry view decides eligibility, so a block recorded here keeps
+    // refusing later attempts until its own recovery; the outcome stays
+    // visible on this attempt's receipt and never becomes
+    // installation-global state.
     let generation_owner = format!("kernel-resource-generation:{generation}");
     if let Some(refusal) = refuse_blocked_generation(
         &required,
@@ -1040,6 +1111,7 @@ fn gate_model_capability(
         generation_fingerprint,
         &generation_owner,
         &requested_key,
+        outcomes,
         intake,
     )? {
         return Err(refusal);
@@ -1732,6 +1804,7 @@ mod tests {
             &fence,
             &config,
             &GovernorCapabilityAdmission::new(),
+            &std::sync::Mutex::new(CapabilityRegistryView::default()),
             &input,
             &mut intake,
             &execution,
@@ -2036,11 +2109,16 @@ mod tests {
         intake: &mut AttemptReceipt,
         execution: &SucceedingExecution,
     ) -> Result<AgentResult, CompositionError> {
+        // The production caller borrows the daemon-held handle; a test helper
+        // owns an equivalent one so the gate's own state handling is
+        // exercised without a composition.
+        let outcomes = std::sync::Mutex::new(CapabilityRegistryView::default());
         invoke_admitted_model(
             CompositionReadiness::Ready,
             &fixtures.fence,
             &fixtures.config,
             registry,
+            &outcomes,
             input,
             intake,
             execution,
