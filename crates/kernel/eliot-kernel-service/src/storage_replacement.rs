@@ -673,6 +673,9 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::SupervisionLeaseTicketAlreadyCommitted => invalid_field("lease_ticket_committed"),
         OrsError::InvalidSupervisionLeaseHistoryLimit => invalid_field("lease_history_limit"),
         OrsError::HostRequestIdentityConflict { .. } => invalid_field("host_request_identity"),
+        OrsError::HostRequestLegacyCorrelationUnresolved => {
+            invalid_field("host_request_legacy_correlation")
+        }
         OrsError::CampaignLearningStateViewConflict { .. } => {
             invalid_field("campaign_learning_state_view")
         }
