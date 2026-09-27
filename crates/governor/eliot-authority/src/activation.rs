@@ -1,7 +1,9 @@
 use std::{error::Error, fmt};
 
 use eliot_receipts::AuthorityBinding;
-use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_runtime_contracts::{
+    AuthorityActivationReceipt, AuthorityRevocationReceipt, KernelAuthoritySnapshot,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,6 +17,37 @@ pub struct GrantActivationRequest {
     pub grant_id: GrantId,
     pub snapshot_id: SnapshotId,
     pub binding: AuthorityBinding,
+}
+
+impl GrantActivationRequest {
+    /// Proves the Governor-side handoff binding for one grant activation:
+    /// the presented snapshot ID plus compact binding is not enough unless
+    /// the Kernel owner resolves the complete material, so the request
+    /// snapshot identity, the presented mechanical projection and the
+    /// activation receipt must agree exactly.
+    ///
+    /// The receipt must be the ACTIVE effective-authority boundary for the
+    /// presented projection (snapshot identity and fence epoch), the request
+    /// must name that same snapshot, and the presented fence must equal the
+    /// projection fence. A canonical ACTIVE row without its matching
+    /// effective projection and activation receipt admits no effect; any
+    /// mismatch is a caller-side inconsistent binding and refuses fail-closed.
+    pub fn validate_handoff(
+        &self,
+        projection: &KernelAuthoritySnapshot,
+        receipt: &AuthorityActivationReceipt,
+    ) -> Result<(), P07PortError> {
+        receipt
+            .validate_for_snapshot(projection)
+            .map_err(|_| P07PortError::InvalidBinding)?;
+        if self.snapshot_id.as_str() != projection.snapshot_id.as_str() {
+            return Err(P07PortError::InvalidBinding);
+        }
+        if self.binding.state_fence != projection.state_fence {
+            return Err(P07PortError::InvalidBinding);
+        }
+        Ok(())
+    }
 }
 
 /// Typed G-01 request presented to the P-07 revocation boundary.

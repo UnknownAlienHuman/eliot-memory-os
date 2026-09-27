@@ -716,24 +716,99 @@ impl GenerationCutoverReceipt {
     }
 }
 
+/// Version of the I6.10 mechanical projection carried by
+/// [`KernelAuthoritySnapshot`].
+///
+/// A reader dispatches on `projection_version` before interpreting any
+/// mechanical field, so a future projection revision is never read under v1
+/// semantics and a v1 payload is never upgraded silently.
+pub const KERNEL_AUTHORITY_PROJECTION_VERSION: u16 = 1;
+
 /// Kernel's current route and authority projection.
+///
+/// This is the immutable mechanical subset `eliotd` compiles before a
+/// `CapabilityToken`, lease, approval or operation-specific permit becomes
+/// effective (I6.10 "Kernel authority projection"): principal/session/token
+/// identity, allowed named operations and transition classes, exact
+/// scope/effect/data-class ceilings, State Fence with policy/config/lease
+/// revisions and Authority Epoch, expiry/heartbeat/revocation conditions,
+/// required approval/proof handles, and the source canonical receipt with the
+/// content digest that binds this exact material to `snapshot_id`.
+///
+/// A canonical ACTIVE label, route snapshot, authenticated connection or
+/// shape-valid receipt alone is not permission: altering an operation, scope,
+/// ceiling, approval or source receipt without a new snapshot identity
+/// refuses. The Kernel owner recomputes and binds `content_digest` at ORS
+/// commit; validators check presence, shape and equality, never minting.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelAuthoritySnapshot {
     /// Snapshot revision.
     pub snapshot_id: String,
+    /// Explicit projection version; must equal
+    /// [`KERNEL_AUTHORITY_PROJECTION_VERSION`].
+    pub projection_version: u16,
     /// Current authority epoch.
     pub authority_epoch: AuthorityEpoch,
+    /// Principal/session/token identity the subset was compiled for.
+    pub principal_ref: String,
+    /// Allowed named operations.
+    pub allowed_operations: Vec<String>,
+    /// Allowed transition classes.
+    pub transition_classes: Vec<String>,
+    /// Exact scope references.
+    pub scope_refs: Vec<String>,
+    /// Exact effect ceiling.
+    pub effect_ceiling: String,
+    /// Exact data classes.
+    pub data_classes: Vec<String>,
     /// Active generation routes.
     pub active_generations: Vec<ModuleGeneration>,
     /// Snapshot state fence.
     pub state_fence: StateFence,
+    /// Policy revision compiled into the subset.
+    pub policy_revision: u64,
+    /// Configuration revision compiled into the subset.
+    pub config_revision: u64,
+    /// Lease revision compiled into the subset.
+    pub lease_revision: u64,
+    /// Expiry as unix milliseconds; zero refuses.
+    pub expires_at_ms: u64,
+    /// Required heartbeat interval in milliseconds; zero refuses.
+    pub heartbeat_interval_ms: u64,
+    /// Revocation conditions that fence this projection.
+    pub revocation_conditions: Vec<String>,
+    /// Required approval handles; the approval binds the exact action.
+    pub approval_refs: Vec<String>,
+    /// Required proof handles.
+    pub proof_refs: Vec<String>,
+    /// Source canonical receipt this projection was compiled from.
+    pub source_receipt: String,
+    /// Snapshot hash committing the exact mechanical material above, as 64
+    /// lowercase hexadecimal characters.
+    pub content_digest: String,
 }
 
 impl KernelAuthoritySnapshot {
-    /// Validates the snapshot's identity and all generation records.
+    /// Validates the snapshot's identity, version, complete mechanical
+    /// subset and all generation records.
+    ///
+    /// Omitted or unresolved required constraints refuse activation; they
+    /// never become wildcards.
     pub fn validate(&self) -> Result<(), RuntimeContractError> {
         text(&self.snapshot_id, "snapshot_id")?;
+        if self.projection_version != KERNEL_AUTHORITY_PROJECTION_VERSION {
+            return Err(RuntimeContractError::InvalidField {
+                field: "projection_version",
+                reason: "unsupported kernel authority projection version",
+            });
+        }
+        text(&self.principal_ref, "principal_ref")?;
+        require_refs(&self.allowed_operations, "allowed_operations")?;
+        require_refs(&self.transition_classes, "transition_classes")?;
+        require_refs(&self.scope_refs, "scope_refs")?;
+        text(&self.effect_ceiling, "effect_ceiling")?;
+        require_refs(&self.data_classes, "data_classes")?;
         self.state_fence.validate()?;
         for generation in &self.active_generations {
             generation.validate()?;
@@ -744,8 +819,54 @@ impl KernelAuthoritySnapshot {
                 });
             }
         }
+        if self.expires_at_ms == 0 {
+            return Err(RuntimeContractError::InvalidField {
+                field: "expires_at_ms",
+                reason: "expiry must be non-zero",
+            });
+        }
+        if self.heartbeat_interval_ms == 0 {
+            return Err(RuntimeContractError::InvalidField {
+                field: "heartbeat_interval_ms",
+                reason: "heartbeat interval must be non-zero",
+            });
+        }
+        require_refs(&self.revocation_conditions, "revocation_conditions")?;
+        require_refs(&self.approval_refs, "approval_refs")?;
+        require_refs(&self.proof_refs, "proof_refs")?;
+        text(&self.source_receipt, "source_receipt")?;
+        content_digest(&self.content_digest, "content_digest")?;
         Ok(())
     }
+}
+
+/// Requires at least one non-blank reference in a mechanical subset list.
+fn require_refs(values: &[String], field: &'static str) -> Result<(), RuntimeContractError> {
+    if values.is_empty() {
+        return Err(RuntimeContractError::InvalidField {
+            field,
+            reason: "at least one entry is required",
+        });
+    }
+    for value in values {
+        text(value, field)?;
+    }
+    Ok(())
+}
+
+/// Validates a snapshot content digest: 64 lowercase hexadecimal characters.
+fn content_digest(value: &str, field: &'static str) -> Result<(), RuntimeContractError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(RuntimeContractError::InvalidField {
+            field,
+            reason: "must be 64 lowercase hexadecimal characters",
+        });
+    }
+    Ok(())
 }
 
 /// Receipt that makes an exact authority projection active.
@@ -771,6 +892,39 @@ impl AuthorityActivationReceipt {
             return Err(RuntimeContractError::InvalidReceipt {
                 receipt: "AuthorityActivationReceipt",
                 state: format!("{:?}", self.state),
+            });
+        }
+        Ok(())
+    }
+
+    /// Proves this receipt is the effective-authority boundary for exactly
+    /// the presented mechanical projection.
+    ///
+    /// Receipt shape validation alone does not verify a committed exact
+    /// activation: the receipt must be ACTIVE, the projection must carry the
+    /// complete versioned mechanical subset, both snapshot identities must be
+    /// equal, and the activation epoch must be exactly the projection fence
+    /// epoch. Altering an operation, scope, ceiling, approval or source
+    /// receipt cannot reuse a snapshot ID; it refuses here instead.
+    pub fn validate_for_snapshot(
+        &self,
+        snapshot: &KernelAuthoritySnapshot,
+    ) -> Result<(), RuntimeContractError> {
+        self.validate()?;
+        snapshot.validate()?;
+        if self.snapshot_id != snapshot.snapshot_id {
+            return Err(RuntimeContractError::InvalidField {
+                field: "snapshot_id",
+                reason: "activation receipt does not match the presented projection",
+            });
+        }
+        if !self
+            .authority_epoch
+            .is_same_authority(&snapshot.state_fence.authority_epoch)
+        {
+            return Err(RuntimeContractError::InvalidField {
+                field: "authority_epoch",
+                reason: "activation epoch is not the projection fence epoch",
             });
         }
         Ok(())
