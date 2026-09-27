@@ -412,7 +412,7 @@ impl CapabilityRegistry {
     #[must_use]
     pub fn is_admitted(&self, module_id: &str, generation: ResourceGeneration) -> bool {
         self.get(module_id, generation)
-            .is_some_and(|projection| projection.is_admitted())
+            .is_some_and(CapabilityProjection::is_admitted)
     }
 
     /// Removes and returns the projection for one `(module_id, generation)`.
