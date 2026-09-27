@@ -204,6 +204,7 @@ pub enum SignalProcessingState {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DeliveryState {
     Pending,
+    NextBoundaryPending,
     Delivered,
     Acknowledged,
 }
@@ -1034,11 +1035,37 @@ impl CriticalAttention {
         if principal != self.owner.principal {
             return Err(ProblemError::OwnerMismatch);
         }
-        if self.state == AttentionState::Resolved {
-            return Err(ProblemError::ImmutableState);
+        match self.state {
+            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
+                return Err(ProblemError::ImmutableState);
+            }
+            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        }
+        if self.delivery_state == DeliveryState::Acknowledged {
+            return Ok(());
         }
         self.delivery_state = DeliveryState::Acknowledged;
-        self.state = AttentionState::Acknowledged;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records that host-event push is unavailable and delivery must wait for
+    /// the next available boundary, without changing the obligation state.
+    pub fn defer_until_next_boundary(
+        &mut self,
+        expected_fence: &StateFence,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        match self.state {
+            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
+                return Err(ProblemError::ImmutableState);
+            }
+            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        }
+        if self.delivery_state == DeliveryState::NextBoundaryPending {
+            return Ok(());
+        }
+        self.delivery_state = DeliveryState::NextBoundaryPending;
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
@@ -1067,10 +1094,18 @@ impl CriticalAttention {
         same_fence(expected_fence, &self.state_fence)?;
         owner.validate()?;
         fence(&new_fence)?;
+        match self.state {
+            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
+                return Err(ProblemError::ImmutableState);
+            }
+            AttentionState::Escalated => {}
+            AttentionState::Active | AttentionState::Acknowledged => {
+                self.state = AttentionState::Active;
+            }
+        }
         self.owner = owner;
         self.state_fence = new_fence;
         self.delivery_state = DeliveryState::Pending;
-        self.state = AttentionState::Active;
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
