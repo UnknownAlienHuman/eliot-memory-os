@@ -114,10 +114,22 @@ impl AtomRepresentation {
 
 /// Atom-specific privacy and disclosure boundary.
 ///
-/// The label is carried for downstream enforcement only: no rule in this
-/// cell, `eliot-context-admission`, or `eliot-context-assembly` refuses on
-/// it. The A00.3 privacy boundary is enforced by
-/// `crates/governor/eliot-workscope` (`WorkScopeError::PrivacyDenied`).
+/// The label is ENFORCED, not merely carried, and an earlier version of this
+/// document said the opposite. `ContextCandidate::validate_public_privacy` refuses
+/// every candidate whose class is not `Public`
+/// (`ContextError::InvalidField("candidate.privacy")`), and it is called on the
+/// admission path twice over: once per candidate by `AdmissionInput::validate` in
+/// `admission_input.rs`, and once per admitted atom by the record projection in
+/// `admission.rs`. A `Secret` or `Restricted` atom therefore never reaches
+/// `eliot-context-admission` output, which is the opposite of "carried for downstream
+/// use only".
+///
+/// The WIDER A00.3 question — which routes and identities a non-public atom may reach
+/// once it is admitted — is a different rule with a different owner:
+/// `crates/governor/eliot-workscope` (`PrivacyProfile::admits`, denying with
+/// `WorkScopeError::PrivacyDenied`), and downstream non-public disclosure is withheld as
+/// `DeliveryDisposition::WithheldPrivacy` by `eliot-reactive-context-plan`. Naming that
+/// owner is the point of this paragraph; claiming it is the ONLY enforcer was not.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
 )]

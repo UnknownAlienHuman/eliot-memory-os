@@ -4,8 +4,13 @@
 //! or persists context. The returned [`ActiveUnderstandingView`] remains a
 //! candidate projection whose measurement is supplied by the caller.
 //!
-//! Privacy labels are carried, not enforced, here. Refusal is owned by
-//! `crates/governor/eliot-workscope` (`WorkScopeError::PrivacyDenied`).
+//! A `PrivacyClass` reaches this crate only on an ALREADY-ADMITTED atom: the non-`Public`
+//! refusal is the admission path's
+//! (`ContextCandidate::validate_public_privacy`, called from `AdmissionInput::validate`
+//! in `eliot-context-contracts`), not a rule this crate re-implements. The wider A00.3
+//! disclosure boundary is owned by `crates/governor/eliot-workscope`
+//! (`PrivacyProfile::admits`, `WorkScopeError::PrivacyDenied`), and non-public delivery is
+//! withheld as `DeliveryDisposition::WithheldPrivacy` by `eliot-reactive-context-plan`.
 
 #![forbid(unsafe_code)]
 
