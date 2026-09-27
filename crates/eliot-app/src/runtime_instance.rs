@@ -94,7 +94,7 @@ impl RuntimeInstance {
                 standalone: true,
             })
         } else {
-            let publication_root = config_runtime_root(config_path);
+            let publication_root = config_runtime_root(config_path)?;
             let identity = path_identity(&publication_root);
             let digest = blake3::hash(identity.as_bytes()).to_hex();
             Ok(Self {
@@ -384,19 +384,12 @@ pub(crate) fn default_config_path() -> Result<PathBuf> {
     Ok(eliot_home()?.join("config").join("governor.toml"))
 }
 
-pub(crate) fn config_runtime_root(config_path: &Path) -> PathBuf {
+pub(crate) fn config_runtime_root(config_path: &Path) -> Result<PathBuf> {
     config_path
         .parent()
         .and_then(Path::parent)
-        .unwrap_or_else(|| Path::new(".eliot-governor"))
-        .to_path_buf()
-}
-
-pub(crate) fn store_root_from_storage(storage: &str) -> PathBuf {
-    storage
-        .strip_prefix("rocksdb:")
-        .and_then(|path| Path::new(path).parent())
-        .map_or_else(|| PathBuf::from(".eliot-governor"), Path::to_path_buf)
+        .map(Path::to_path_buf)
+        .with_context(|| format!("config path has no runtime root: {}", config_path.display()))
 }
 
 pub(crate) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {

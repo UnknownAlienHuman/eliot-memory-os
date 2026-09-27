@@ -65,6 +65,13 @@ Documented exclusions (not findings):
   config/modules.
 - URL https://eliot.local/... : never matched by the literal filename tokens
   eliot.local.toml / eliot-governor.toml.
+
+Exact consumer inventory (issue #1219 W1/A1): CANONICAL_CONFIG_INVENTORY
+records every surviving config/*.toml with disposition RETAINED, its schema
+owner, exact production consumers, and gate binding; none is staged into
+release payloads. check_canonical_inventory() enforces it from verify():
+LCR-020 fails an unlisted config/*.toml and LCR-021 fails a consumer anchor
+that no longer evidences its config.
 """
 
 from __future__ import annotations
@@ -158,13 +165,118 @@ PENDING_ALLOWED_SECTIONS = frozenset({
 
 LEGACY_MODULE_DIR = "config/modules"
 
-CANONICAL_CONFIGS = (
-    "config/architecture-boundaries.toml",
-    "config/dependency-policy.toml",
-    "config/doc-code-conformance.toml",
-    "config/doc-traceability-retirement.toml",
-    "config/normative-reference-conformance.toml",
+@dataclass(frozen=True)
+class CanonicalConsumer:
+    """One exact production consumer anchor for a retained canonical config.
+
+    `anchor` is the consumer source file (relative to the root) and `entry`
+    is the exact production symbol evidencing the consumption. Every string
+    in `tokens` must appear in the anchor file; the config basename is always
+    one token for a direct consumer, while the doc-code-conformance front
+    door is pinned through its `main = _core.main` loader binding instead.
+    """
+
+    anchor: str
+    entry: str
+    tokens: tuple[str, ...]
+
+
+# Exact consumer and packaging inventory for every surviving file under
+# config/ (issue #1219 W1/A1). Disposition is RETAINED for all five: each has
+# one schema owner, at least one exact production consumer below, and a gate
+# binding (just architecture-boundaries / dependency-policy /
+# doc-code-conformance, all owned by scripts/verify.ps1 profiles).
+# None is staged into release payloads: the release/install scripts name no
+# config/ file for staging (the single `config/` mention in
+# build-eliot-windows-x64-release.ps1 is the STAGED_PAYLOAD_MANIFEST exclusion
+# note for config/migrations), and legacy reintroduction into those scripts
+# already fails via LCR-010..018. check_canonical_inventory() enforces this
+# table: an unlisted config/*.toml fails (LCR-020) and an inventoried
+# consumer that no longer evidences its config fails (LCR-021).
+CANONICAL_CONFIG_INVENTORY: tuple[tuple[str, tuple[CanonicalConsumer, ...]], ...] = (
+    (
+        "config/architecture-boundaries.toml",
+        (
+            # Primary: audit() reads this policy as its boundary source.
+            CanonicalConsumer(
+                "scripts/audit-architecture-boundaries.py",
+                "audit",
+                ("architecture-boundaries.toml", "def audit("),
+            ),
+            # Secondary: scan() reuses the boundary policy for hygiene.
+            CanonicalConsumer(
+                "scripts/audit-runtime-source-hygiene.py",
+                "scan",
+                ("architecture-boundaries.toml", "def scan("),
+            ),
+        ),
+    ),
+    (
+        "config/dependency-policy.toml",
+        (
+            # Primary: offline-source/current-advisories verifier; a missing
+            # manifest fails DEP-002.
+            CanonicalConsumer(
+                "scripts/verify-dependency-policy.py",
+                "main",
+                ("dependency-policy.toml", "def main("),
+            ),
+            # Secondary: release provisioner reads external_executables.
+            CanonicalConsumer(
+                "scripts/provision-surrealdb-release.py",
+                "main",
+                ("dependency-policy.toml", "def main("),
+            ),
+        ),
+    ),
+    (
+        "config/doc-code-conformance.toml",
+        (
+            # Primary: core loader default plus audit().
+            CanonicalConsumer(
+                "scripts/doc_code_conformance_core.py",
+                "audit",
+                ("doc-code-conformance.toml", "def audit("),
+            ),
+            # Gated front door: main = _core.main loads the core default.
+            CanonicalConsumer(
+                "scripts/verify-doc-code-conformance.py",
+                "main = _core.main",
+                ("doc_code_conformance_core", "main = _core.main"),
+            ),
+            # Secondary: closure audit reads the retired-reference allowlist.
+            CanonicalConsumer(
+                "scripts/docs_closure_audit.py",
+                "retired_reference_allowlist",
+                ("doc-code-conformance.toml", "def retired_reference_allowlist("),
+            ),
+        ),
+    ),
+    (
+        "config/doc-traceability-retirement.toml",
+        (
+            # DCC-014 via the verify-doc-code-conformance front door.
+            CanonicalConsumer(
+                "scripts/doc_code_conformance_lib/traceability_retirement.py",
+                "audit",
+                ("doc-traceability-retirement.toml", "def audit("),
+            ),
+        ),
+    ),
+    (
+        "config/normative-reference-conformance.toml",
+        (
+            # DCC-015..017 via the verify-doc-code-conformance front door.
+            CanonicalConsumer(
+                "scripts/doc_code_conformance_lib/normative_references.py",
+                "audit",
+                ("normative-reference-conformance.toml", "def audit("),
+            ),
+        ),
+    ),
 )
+
+CANONICAL_CONFIGS = tuple(path for path, _ in CANONICAL_CONFIG_INVENTORY)
 
 INSTALL_ROOTS = ("crates/kernel/eliot-installation",)
 
@@ -534,12 +646,80 @@ def check_tokens(root: Path) -> list[Finding]:
     return findings
 
 
+def check_canonical_inventory(root: Path) -> list[Finding]:
+    """Enforce the exact consumer inventory for every surviving config file.
+
+    LCR-020 fails a top-level config/*.toml that is neither a deleted legacy
+    file nor an inventoried canonical config: an ownerless config file is
+    never silently accepted. LCR-021 fails an inventoried consumer anchor
+    that no longer evidences its config, so consumer drift cannot rot the
+    inventory silently. Anchors whose top-level family directory is absent
+    from the root are skipped, the same absent-family tolerance as
+    _iter_family_files; minimal fixture roots stay green while the real tree
+    is fully enforced. A missing inventoried config is not reported here:
+    presence is enforced by each owner's own fail-closed loader (DEP-002,
+    DCC-014, the boundary-audit policy load).
+    """
+    findings: list[Finding] = []
+    inventory = {path: consumers for path, consumers in CANONICAL_CONFIG_INVENTORY}
+    config_dir = root / "config"
+    if config_dir.is_dir():
+        for path in sorted(config_dir.glob("*.toml")):
+            rel = _relative(root, path)
+            if rel not in LEGACY_FILES and rel not in inventory:
+                findings.append(
+                    Finding(
+                        "LCR-020",
+                        rel,
+                        0,
+                        "config file has no exact consumer/schema owner in "
+                        "CANONICAL_CONFIG_INVENTORY and is not a deleted legacy "
+                        "file; inventory it or delete it",
+                    )
+                )
+    for rel, consumers in CANONICAL_CONFIG_INVENTORY:
+        if not (root / rel).is_file():
+            continue
+        for consumer in consumers:
+            if not (root / consumer.anchor.split("/")[0]).exists():
+                continue
+            anchor = root / consumer.anchor
+            try:
+                content = anchor.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                findings.append(
+                    Finding(
+                        "LCR-021",
+                        rel,
+                        0,
+                        f"inventoried consumer {consumer.anchor}::{consumer.entry} "
+                        f"is missing or unreadable; {rel} lost its exact consumer",
+                    )
+                )
+                continue
+            missing = [token for token in consumer.tokens if token not in content]
+            if missing:
+                findings.append(
+                    Finding(
+                        "LCR-021",
+                        rel,
+                        0,
+                        f"inventoried consumer {consumer.anchor}::{consumer.entry} "
+                        f"no longer evidences {rel} "
+                        f"(absent: {', '.join(missing)[:120]}); update or remove "
+                        "the inventory record",
+                    )
+                )
+    return findings
+
+
 def verify(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(check_legacy_files_absent(root))
     pending_findings, _ = check_pending_retirement(root)
     findings.extend(pending_findings)
     findings.extend(check_tokens(root))
+    findings.extend(check_canonical_inventory(root))
     return sorted(findings, key=lambda f: (f.code, f.path, f.line))
 
 
