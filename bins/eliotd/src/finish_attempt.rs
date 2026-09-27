@@ -67,6 +67,10 @@ fn finish_rejection_cause(error: &FinishAttemptError) -> (AgentResponseDispositi
             AgentResponseDisposition::RecoveryRequired,
             "RECOVERY_REQUIRED",
         ),
+        FinishAttemptError::UnreconciledMaterialChange => (
+            AgentResponseDisposition::RecoveryRequired,
+            "OBSERVATION_GAP",
+        ),
         FinishAttemptError::Kernel(_) | FinishAttemptError::Store(_) => {
             (AgentResponseDisposition::Failed, "RUNTIME_FAILED")
         }

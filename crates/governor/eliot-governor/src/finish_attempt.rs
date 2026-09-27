@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence};
+use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
     OperationId, StateFence, TaskId, canonical_json_bytes, fences_match_exact, sha256_hex,
 };
@@ -49,6 +50,9 @@ pub enum FinishAttemptError {
     /// The strict finish service rejected the candidate or rehydrated state.
     #[error("finish owner rejected the attempt: {0}")]
     Finish(#[from] FinishError),
+    /// An unreconciled unknown-origin material change blocks governed acceptance.
+    #[error("finish acceptance is blocked by an unreconciled unknown-origin material change")]
+    UnreconciledMaterialChange,
     /// The canonical owner or composition rejected the operation.
     #[error("finish composition rejected the attempt: {0}")]
     Composition(#[from] CompositionError),
@@ -79,6 +83,7 @@ pub struct GovernorFinishAttempt<'a, P: ?Sized> {
     canonical: &'a CanonicalAdmissionOwner,
     coordination: &'a CoordinationOwner,
     observation: &'a ObservationJournal,
+    change_monitor: &'a ChangeMonitor,
     finish: &'a FinishService,
     kernel: &'a P,
     finish_owner_revision: u64,
@@ -96,6 +101,7 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
             canonical,
             coordination: &owners.coordination,
             observation: &owners.observation,
+            change_monitor: &owners.change_monitor,
             finish: &owners.finish,
             kernel,
             finish_owner_revision,
@@ -988,6 +994,9 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "finish owner revision is absent; finish persistence is unavailable".to_owned(),
             )));
+        }
+        if self.change_monitor.has_unknown_material_change() {
+            return Err(FinishAttemptError::UnreconciledMaterialChange);
         }
 
         let context = FinishContext {
