@@ -61,6 +61,23 @@ impl MetricsRegistry {
         }
     }
 
+    /// Runs one bounded edit of the shared registry under its own lock.
+    ///
+    /// [`crate::ExecutionPathMetrics`] and the other catalogue helpers record
+    /// through `&mut OpenMetrics`, and the registry's inner value is private, so
+    /// without this accessor a caller that owns the sanctioned recorders could
+    /// only build a *second* registry - and a scrape served from it would never
+    /// carry a single execution-path series. This is the seam that keeps ONE
+    /// registry: the edit runs under the same lock the served exposition is
+    /// rendered from, so a sample recorded through it is immediately visible to
+    /// [`Self::expose`] and to the installed exporter.
+    ///
+    /// A poisoned registry yields `None` rather than panicking on the diagnostic
+    /// path; the caller reports the refusal instead of inventing a sample.
+    pub fn with_open_metrics<R>(&self, edit: impl FnOnce(&mut OpenMetrics) -> R) -> Option<R> {
+        self.0.lock().ok().map(|mut registry| edit(&mut registry))
+    }
+
     /// Renders the current `OpenMetrics` exposition.
     #[must_use]
     pub fn expose(&self) -> String {

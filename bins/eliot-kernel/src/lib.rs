@@ -56,6 +56,11 @@ mod control_plane;
 /// and the captured operational log windows. It emits references, gaps, and
 /// one next step, never rolling log content and never an assigned cause.
 pub mod diagnostic_brief;
+/// Execution-path `OpenMetrics` wiring (issue #1841, I16.1/I16.2/I16.5): the
+/// bounded schema, labels, registry and exporter stay owned by
+/// `eliot-observability-runtime`; this module only installs that stack and maps
+/// observations the Kernel's own owners already hold onto its catalogue.
+pub mod execution_metrics;
 /// Kernel-owned durable audit evidence (issue #1837; I16): the single
 /// BLAKE3-chained audit chain plus the single Watchdog-domain anchor sink.
 /// Every authority/lifecycle boundary appends through the composition's
@@ -134,6 +139,29 @@ pub(crate) use shutdown_drain::{
     ShutdownPhase, ShutdownTerminal, coordinator_for, reverse_quiescence_order,
 };
 /// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
+/// Records that a supervision lease expired, at the exact decision that refuses
+/// the renewal.
+///
+/// I16.5 lists lease expiry among the metrics an operator needs, and
+/// `decide_daemon_supervision_progress_renewal` is the only place the Kernel
+/// decides it: the renewal is refused because the lease aged out, so a gauge
+/// raised anywhere else would be a second opinion about an authority that
+/// decision owns. The route label is the renewal path itself, not a daemon or
+/// session name, so the label cardinality stays bounded by the number of renewal
+/// paths.
+#[cfg(windows)]
+fn observe_supervision_lease_expiry() {
+    use eliot_observability_runtime::{ModuleIdentity, WorkClass};
+    let Some(metrics) = execution_metrics::kernel_metrics() else {
+        return;
+    };
+    metrics.record(metrics.record_lease_expiry(
+        ModuleIdentity::InternalRust,
+        WorkClass::Control,
+        "kernel.daemon_supervision_renewal",
+    ));
+}
+
 mod idle_lease_census;
 pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
 pub(crate) use startup_coordinator::StartupCoordinator;
@@ -3377,6 +3405,7 @@ impl KernelComposition {
             )
         })?;
         if progress.stale_renewal_expired(policy, now_ms) {
+            observe_supervision_lease_expiry();
             return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
         }
         if request.observation.validate().is_ok() {
@@ -3388,6 +3417,7 @@ impl KernelComposition {
             Err(error) => {
                 progress.note_missed_renewal();
                 if progress.stale_renewal_expired(policy, now_ms) {
+                    observe_supervision_lease_expiry();
                     return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
                 }
                 return Err(error.into());

@@ -85,6 +85,14 @@ pub struct KernelConfig {
     /// sink below the Kernel work root; the sink is always exactly one
     /// directory and the Kernel never creates the foreign one.
     pub audit_anchor_binding: Option<AuditAnchorBinding>,
+    /// Loopback `host:port` the bounded `OpenMetrics` endpoint binds, when the
+    /// operator admitted one (issue #1841, I16.2).
+    ///
+    /// `None` is the honest default: samples are still recorded into the shared
+    /// registry, but nothing is served, because the Kernel never invents a port
+    /// for an operational surface. A non-loopback value is refused at install
+    /// rather than narrowed, so this field cannot turn into an off-box endpoint.
+    pub metrics_listen: Option<String>,
     /// Production startup must opt into consuming the exact authority receipt
     /// from the already protected process handoff descriptor. Tests and
     /// library-only process-authority compositions do not silently synthesize
@@ -118,6 +126,7 @@ impl KernelConfig {
             #[cfg(windows)]
             supervision_lease_authority: None,
             audit_anchor_binding: None,
+            metrics_listen: None,
             #[cfg(windows)]
             require_descriptor_supervision_authority: false,
         }
@@ -273,6 +282,20 @@ impl KernelConfig {
     #[must_use]
     pub fn with_audit_anchor_binding(mut self, binding: AuditAnchorBinding) -> Self {
         self.audit_anchor_binding = Some(binding);
+        self
+    }
+
+    /// Admits the loopback address the bounded `OpenMetrics` endpoint binds
+    /// (issue #1841, I16.2).
+    ///
+    /// The address is an operator/Host admission, not a Kernel default: the
+    /// Kernel refuses to invent a port for an operational surface, and
+    /// `install_kernel_execution_metrics` refuses a non-loopback value. Passing
+    /// the configuration on without calling this leaves the registry populated
+    /// and nothing served, which is the state this builder makes explicit.
+    #[must_use]
+    pub fn with_metrics_listen(mut self, address: impl Into<String>) -> Self {
+        self.metrics_listen = Some(address.into());
         self
     }
 }

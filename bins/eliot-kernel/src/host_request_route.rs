@@ -61,6 +61,7 @@ use super::{
 use eliot_contracts::RequestId;
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
+use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel,
@@ -77,6 +78,7 @@ use eliot_protocol::{
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, ScopeId};
+use std::collections::BTreeMap;
 
 mod daemon_claim_queue;
 
@@ -99,6 +101,35 @@ const HOST_REQUEST_REQUEST_BINDING_PREFIX: &str = "hostreq-request-id:";
 const HOST_REQUEST_CANCELLATION_BINDING_PREFIX: &str = "hostreq-cancellation-id:";
 const HOST_REQUEST_IDENTITY_BINDING_LABEL: &str =
     "eliot.kernel.host-request.operation-identity-binding.v1";
+
+/// Publishes the local-read queue depth and live-claim count (I16.5, #1841).
+///
+/// `queued` is the depth the admission gate has just compared against
+/// `MAX_QUEUED_LOCAL_READS`, and the claim count is the number of queued pairs
+/// whose attempt is live - the same `LocalReadAttemptState::is_live` predicate
+/// the claim path uses, so the gauge cannot disagree with the claim gate. Both
+/// counts convert with a saturating `try_from`: an unreachable count saturates
+/// rather than wrapping into a plausible smaller number.
+fn observe_local_read_queue_gauges(
+    index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
+    queued: usize,
+) {
+    let Some(metrics) = crate::execution_metrics::kernel_metrics() else {
+        return;
+    };
+    let live_claims = index
+        .values()
+        .flatten()
+        .filter(|candidate| candidate.local_read_attempt.is_live())
+        .count();
+    metrics.record(metrics.record_queue_and_claims(
+        ModuleIdentity::LocalHttpAdapter,
+        WorkClass::Interactive,
+        "kernel.local_read_queue",
+        u32::try_from(queued).unwrap_or(u32::MAX),
+        u32::try_from(live_claims).unwrap_or(u32::MAX),
+    ));
+}
 
 /// Typed frame operations carrying one [`HostRequestEnvelope`] through the
 /// closed frame gateway.
@@ -1872,6 +1903,10 @@ impl KernelComposition {
         }
         // Issue #1837: durable audit evidence for queue admission.
         self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
+        // I16.5 (issue #1841): the queue gauges are read from the owner's own
+        // live index at admission, so a sample measures the current contour
+        // rather than a total carried forward.
+        observe_local_read_queue_gauges(&index, queued);
         Ok(())
     }
 
