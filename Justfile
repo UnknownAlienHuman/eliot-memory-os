@@ -151,3 +151,44 @@ merge-compile:
 
 verify-list:
     pwsh -NoProfile -File scripts/verify.ps1 -List
+
+# #764 affected-component WASM lane (serialized after #750, never wired into
+# `quick`/`verify`; #750 stays the owner of workspace verification).
+#
+# `{{quote(...)}}` keeps each forwarded value one shell literal, so no caller
+# input can terminate the command and reach the shell as a second statement.
+# Module-name validation, registry membership, manifest/world/capsule freeze,
+# the isolated lane target root and the fixed exact-manifest argv are owned by
+# scripts/wasm_component_lane.py; these recipes only forward the module name
+# and the controller evidence. No cargo invocation, no --workspace, no
+# target-dir and no module list live here.
+#
+# wasm_registry: the helper deliberately contains NO module list, so the
+# caller supplies the accepted registry. The default is the bounded TEST
+# FIXTURE scripts/testdata/wasm-component-lane/registry.json, whose own
+# _provenance field reads "TEST FIXTURE ONLY - not authority" - it is a
+# fail-closed placeholder, NOT the canonical registry, and the integrator owns
+# the canonical shared registry. Until a real accepted registry is supplied the
+# placeholder resolves only the fixture guest and no production module is
+# reachable. Override per invocation with the controller's accepted registry:
+#   just wasm_registry="<accepted-registry>.json" wasm-build <module>
+# wasm_base_sha/wasm_head_sha: controller-supplied frozen source evidence.
+# Workers never fetch, pull or rebase here, so the defaults are the helper's
+# own 40-zero placeholder SHAs rather than a git-derived or invented value; an
+# unsupplied binding stays visibly unbound in the receipt instead of silently
+# claiming an identity.
+wasm_registry := "scripts/testdata/wasm-component-lane/registry.json"
+wasm_base_sha := "0000000000000000000000000000000000000000"
+wasm_head_sha := "0000000000000000000000000000000000000000"
+
+# Exact-manifest build of one registered component under the helper's isolated
+# lane target root for #870's wasm32-wasip2 target.
+#
+wasm-build module:
+    python scripts/wasm_component_lane.py --build {{quote(module)}} --registry {{quote(wasm_registry)}} --base-sha {{quote(wasm_base_sha)}} --head-sha {{quote(wasm_head_sha)}}
+
+# Declared-capsule-only test of one registered component; never the workspace
+# gate, never a second package list.
+#
+wasm-test module:
+    python scripts/wasm_component_lane.py --test {{quote(module)}} --registry {{quote(wasm_registry)}} --base-sha {{quote(wasm_base_sha)}} --head-sha {{quote(wasm_head_sha)}}
