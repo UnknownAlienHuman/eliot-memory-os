@@ -663,6 +663,33 @@ impl Frame {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.protocol_version.validate()?;
         text(&self.connection_id, "connection_id")?;
+        let expected_kind = match self.message_type {
+            MessageType::Start
+            | MessageType::Ready
+            | MessageType::Challenge
+            | MessageType::Fatal
+            | MessageType::EventAck => FrameKind::Control,
+            MessageType::Health => FrameKind::Heartbeat,
+            MessageType::Execute
+            | MessageType::Quiesce
+            | MessageType::Checkpoint
+            | MessageType::RestoreCheckpoint
+            | MessageType::DrainStatus
+            | MessageType::Shutdown => FrameKind::Request,
+            MessageType::Result => FrameKind::Response,
+            MessageType::Event => FrameKind::Event,
+            MessageType::Cancel => FrameKind::Cancel,
+        };
+        // Start and Health also have request forms; the existing Control Start
+        // handshake and Heartbeat Health observation are not requests.
+        let request_form = self.kind == FrameKind::Request
+            && matches!(self.message_type, MessageType::Start | MessageType::Health);
+        if self.kind != expected_kind && !request_form {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "message type requires its canonical frame kind",
+            });
+        }
         if matches!(self.kind, FrameKind::Request | FrameKind::Cancel) && self.request_id.is_none()
         {
             return Err(ProtocolError::InvalidField {
