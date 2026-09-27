@@ -20,7 +20,6 @@ pub struct InstallationRoots {
 
 impl InstallationRoots {
     /// Creates and validates a root set for one profile.
-    #[allow(dead_code, reason = "retained for crate-local root composition")]
     pub(crate) fn new(
         profile: InstallationProfile,
         immutable_binaries: impl Into<String>,
