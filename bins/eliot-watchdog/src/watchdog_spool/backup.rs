@@ -438,10 +438,12 @@ pub struct WatchdogSpoolFence {
     /// for [`Self::denominator`]: the denominator is the exact retained-record
     /// count and its marker subset, while this is what the I8.2 sensor map
     /// says was actually observed per channel. The two are validated
-    /// independently and the conjunction this crate performs is in
-    /// `WatchdogComposition::readiness`, which gates
-    /// `WatchdogReadiness::coverage_claimed` on the report the same cell
-    /// published. `None` is unknown coverage, never complete coverage.
+    /// independently, and **nothing in this crate conjoins them**: the
+    /// denominator is re-derived only against the entries this fence holds, and
+    /// `WatchdogComposition::readiness` gates
+    /// `WatchdogReadiness::coverage_claimed` on admitted authority and this
+    /// report alone, with no denominator term. `None` is unknown coverage, never
+    /// complete coverage.
     channel_coverage: Option<IntervalCoverageReport>,
     /// Source installation the capture was taken from.
     pub source_installation: String,
@@ -535,7 +537,10 @@ impl WatchdogSpoolFence {
     ///   re-checked against the rules that redacted them;
     /// - the capture anchor (`captured_at_ms` is the newest observation held)
     ///   and the content digest (re-derived from these entries);
-    /// - the bound identity shapes, and the fence schema version.
+    /// - the bound identity shapes, and the fence schema version;
+    /// - when a channel-coverage report is held, its own dispositions, re-derived
+    ///   from its own samples and the current sensor map by
+    ///   [`IntervalCoverageReport::validate`].
     ///
     /// What it deliberately cannot re-check: the exact cross-owner fence
     /// protocol behind `canonical_ref` / `ors_ref`. The fence stores no
@@ -546,14 +551,18 @@ impl WatchdogSpoolFence {
     ///
     /// A changed member, a changed denominator, or a swapped digest is therefore
     /// [`SpoolError::Corrupt`] — incomplete/corrupt, never a known-empty or
-    /// full-coverage page.
+    /// full-coverage page. A channel-coverage report whose dispositions do not
+    /// re-derive from its own evidence is corrupt for the same reason; the
+    /// report is an in-process value, so that is a self-consistency check and
+    /// not a check against a persisted artifact.
     ///
     /// # Errors
     ///
     /// Returns [`SpoolError::Corrupt`] when any re-derived counter, window,
-    /// digest, or identity above disagrees with the fence, and
-    /// [`SpoolError::Serialization`] when an entry cannot be canonically
-    /// encoded.
+    /// digest, or identity above disagrees with the fence, when a held
+    /// channel-coverage report is not consistent with the sensor map and its own
+    /// observed classes, and [`SpoolError::Serialization`] when an entry cannot
+    /// be canonically encoded.
     pub fn validate(&self) -> Result<(), SpoolError> {
         self.check_header_shape()?;
         self.validate_entries()?;
@@ -1257,16 +1266,20 @@ fn check_capture_params(params: &CaptureFenceParams) -> Result<(), SpoolError> {
 /// and the content digest.
 ///
 /// `channel_coverage` is this owner's independently published per-channel I8.2
-/// coverage for the interval the capture is taken in, or `None` when no
-/// interval has been closed yet. It is retained beside the denominator rather
-/// than folded into it: the denominator is the exact retained-record count and
-/// its marker subset, the channel coverage is what the sensor map says was
-/// observed, and the full-coverage conjunction this crate performs is in
-/// `WatchdogComposition::readiness`. A
-/// supplied report is re-validated here and again on every later read, so a
-/// disposition that was not derived from the evidence it carries cannot reach
-/// a reader. The channel coverage is deliberately **not** part of the content
-/// digest, which stays derived from the retained entries alone.
+/// coverage for the interval the owner most recently **closed**, or `None` when
+/// no interval has been closed yet. It is deliberately not "the interval this
+/// capture was taken in": the owner-bound port supplies the same last closed
+/// report it holds, which is at most one tick older than the capture. It is
+/// retained beside the denominator rather than folded into it: the denominator
+/// is the exact retained-record count and its marker subset, the channel
+/// coverage is what the sensor map says was observed, the two are validated
+/// independently, and nothing in this crate conjoins them. A supplied report is
+/// re-derived here by [`IntervalCoverageReport::validate`] and again from the
+/// copy this fence holds in [`read_page`], so a disposition that was not derived
+/// from the evidence it carries cannot reach a reader; that re-check runs over
+/// an in-process value, because the report has no serialization and is not
+/// stored anywhere. The channel coverage is deliberately **not** part of the
+/// content digest, which stays derived from the retained entries alone.
 ///
 /// The content digest is derived from the redacted entries this fence stores —
 /// the same representation [`WatchdogSpoolFence::validate`] re-derives — so it
@@ -1310,9 +1323,13 @@ pub fn capture_fence(
 /// unknown coverage, never as complete coverage.
 ///
 /// The channel coverage is deliberately **not** part of the content digest,
-/// which stays derived from the retained entries alone. It is re-validated here
-/// and again on every later page read, so a disposition that was not derived
-/// from the evidence it carries cannot reach a reader.
+/// which stays derived from the retained entries alone. It is re-derived from
+/// its own samples by [`IntervalCoverageReport::validate`] here, and again from
+/// the copy this fence holds every time [`read_page`] calls
+/// [`WatchdogSpoolFence::validate`], so a disposition that disagrees with the
+/// evidence it carries cannot reach a reader. That re-check is over an
+/// in-process value: the report has no serialization and is not stored, so a
+/// differing revision can never arrive from a persisted artifact.
 ///
 /// # Errors
 ///

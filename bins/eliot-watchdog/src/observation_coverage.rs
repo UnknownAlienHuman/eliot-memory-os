@@ -30,13 +30,16 @@
 //! held had to be dropped.
 //!
 //! One published interval is exactly one supervision tick, opened at the top of
-//! the tick and closed at its end, so a sample is never carried across a window
-//! it did not cover. A tick that opens an interval and does not reach its close —
-//! an admission refusal or a lost Host cuts it short — does not have that
-//! interval silently replaced: [`IntervalCoverageCell::begin_interval`] publishes
-//! the abandoned window as a named `INTERVAL_NOT_CLOSED` omission. A skipped
-//! tick is therefore a recorded gap, never a silently discarded publisher and
-//! never a reset interval reported as full coverage.
+//! the tick and closed when that tick body ends, on the ordinary fall-through
+//! and on each `continue` alike, so a sample is never carried across a window
+//! it did not cover and an ordinary degraded tick still publishes the evidence
+//! it did observe. A window that is still open when the next tick opens its own
+//! can only be one whose close did not take effect — a poisoned cell, or a tick
+//! that did not finish — and it is not silently replaced:
+//! [`IntervalCoverageCell::begin_interval`] publishes it as a named
+//! `INTERVAL_NOT_CLOSED` omission. Such a tick is therefore a recorded gap,
+//! never a silently discarded publisher and never a reset interval reported as
+//! full coverage.
 //!
 //! I8.2 names a fifth disposition, `JOURNAL_REPLAYED`, for a completely
 //! replayed supported interval. It is deliberately **absent** here: this crate
@@ -68,9 +71,13 @@ use crate::SpoolError;
 /// Revision of the sensor/capability map shape itself.
 ///
 /// A map-shape revision, not a digest and not an identity: a future change to
-/// the channel set, the class set, or the record shape increments it, and a
-/// fence whose retained report carries a different revision fails
-/// re-validation instead of being read under the newer meaning.
+/// the channel set, the class set, or the record shape increments it, and
+/// [`IntervalCoverageReport::valid`] refuses a report stamped with any other
+/// value. It is an in-memory stamp on a report this process just derived: the
+/// report has no serialization and no retained or on-disk form, so no artifact,
+/// fence, or later reader ever loads an older revision. It is not a guard over a
+/// persisted one, and it is deliberately not a digest — there is nothing here to
+/// hash and no original recorded value to compare a hash against.
 pub const SENSOR_MAP_REVISION: u16 = 2;
 
 /// One of the eleven Windows sensors I8.2 enumerates.
@@ -962,10 +969,10 @@ impl RecordOutcome {
 /// Accumulates one open interval's live samples, per channel.
 ///
 /// One publisher holds exactly one supervision tick. The cell opens a fresh
-/// publisher at the start of every tick and closes it at the end, so a sample
-/// can never be carried across a window it did not cover; a tick that does not
-/// reach its close hands the publisher to
-/// [`record_unclosed`](Self::record_unclosed) instead of dropping it.
+/// publisher at the start of every tick and closes it when that tick body ends,
+/// so a sample can never be carried across a window it did not cover; a window
+/// whose close did not take effect is handed to
+/// [`record_unclosed`](Self::record_unclosed) instead of being dropped.
 #[derive(Clone, Debug)]
 pub struct IntervalCoveragePublisher {
     start_ms: u64,
@@ -1020,15 +1027,15 @@ impl IntervalCoveragePublisher {
         self.publish_at(end_ms, true)
     }
 
-    /// Records this interval as one the tick never closed, observed at `end_ms`.
+    /// Records this interval as one no tick ever closed, observed at `end_ms`.
     ///
-    /// The samples in it were really taken live inside its window, but the tick
-    /// that opened it was cut short before it declared an end — an admission
-    /// refusal or a lost Host — so `end_ms` is only the instant a later tick saw
-    /// the omission, not a close this tick performed. Every wired channel
-    /// therefore carries `INTERVAL_NOT_CLOSED` and none of them is
-    /// `CONTINUOUS`: an interval that was not closed is a named omission, never
-    /// coverage, and it is published rather than discarded.
+    /// The samples in it were really taken live inside its window, but nothing
+    /// declared an end for it — the cell's lock was poisoned, or a tick did not
+    /// finish — so `end_ms` is only the instant a later tick saw the omission,
+    /// not a close a tick performed. Every wired channel therefore carries
+    /// `INTERVAL_NOT_CLOSED` and none of them is `CONTINUOUS`: an interval that
+    /// was not closed is a named omission, never coverage, and it is published
+    /// rather than discarded.
     #[must_use]
     pub fn record_unclosed(self, end_ms: u64) -> IntervalCoverageReport {
         self.publish_at(end_ms, false)
@@ -1052,10 +1059,11 @@ impl IntervalCoveragePublisher {
 
 /// One finished coverage interval plus whether its blocking channel set changed.
 ///
-/// "Finished" is not the same as "closed": an interval a tick opened and did not
-/// finish is published through this type too, carrying `INTERVAL_NOT_CLOSED` on
-/// every wired channel, so a skipped tick reaches the operator as a recorded
-/// omission rather than as a silently discarded interval.
+/// "Finished" is not the same as "closed": an interval no tick closed is
+/// published through this type too, carrying `INTERVAL_NOT_CLOSED` on every
+/// wired channel. That omission is exceptional and is emitted every time it
+/// happens, so an unfinished tick reaches the operator on the tick it occurred
+/// rather than only when the blocking set happens to move.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntervalCoveragePublication {
     report: IntervalCoverageReport,
@@ -1071,9 +1079,12 @@ impl IntervalCoveragePublication {
 
     /// True when the set of channels blocking full coverage changed.
     ///
-    /// Bounded-volume operator evidence: the blind set is a measured property
-    /// of this build, so it is reported when it changes rather than on every
-    /// tick.
+    /// Bounded-volume operator evidence for a **closed** interval: the blind set
+    /// is a measured property of this build, so a steady set is reported when
+    /// it changes rather than on every tick. It is deliberately not a gate on an
+    /// interval that was never closed — an unclosed window is emitted whatever
+    /// this returns, because the omission is the exceptional event and is not
+    /// per-tick noise.
     #[must_use]
     pub const fn blocking_changed(&self) -> bool {
         self.blocking_changed
@@ -1149,16 +1160,17 @@ impl IntervalCoverageCell {
 
     /// Opens the interval for one supervision tick at `start_ms`.
     ///
-    /// The tick that opened the previous interval has finished by contract, so
-    /// a publisher still open here belongs to a tick that did **not** reach its
-    /// close. That window is not silently replaced: it is turned into a report
-    /// carrying `INTERVAL_NOT_CLOSED` on every wired channel and returned, so
-    /// the caller publishes the omission instead of dropping the interval.
-    /// `None` means the previous interval was closed, or no tick had opened one,
-    /// or the cell's lock is poisoned.
+    /// The tick body closes the previous interval on every one of its exit
+    /// paths, so a publisher still open here means that close did not take
+    /// effect — a poisoned cell, or a tick that did not finish. That window is
+    /// not silently replaced: it is turned into a report carrying
+    /// `INTERVAL_NOT_CLOSED` on every wired channel and returned, so the caller
+    /// publishes the omission instead of dropping the interval. `None` means the
+    /// previous interval was closed, or no tick had opened one, or the cell's
+    /// lock is poisoned.
     ///
-    /// The last publication is cleared with the new open interval, so a
-    /// skipped tick invalidates the previous publication instead of silently
+    /// The last publication is cleared with the new open interval, so an
+    /// unfinished tick invalidates the previous publication instead of silently
     /// widening the window a sample covers, and while an interval is in progress
     /// `latest` is `None`: an interval in progress establishes no coverage.
     pub fn begin_interval(&self, start_ms: u64) -> Option<IntervalCoveragePublication> {

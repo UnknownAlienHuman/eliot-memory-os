@@ -72,8 +72,8 @@ fn record_coverage_sample(
 ///
 /// `interval_closed` is `false` for the window a tick opened and did not
 /// finish, which the cell reports as a named omission; both cases reach this
-/// reader, so a skipped tick is published rather than dropped. It restates at
-/// the top level what the cell already decided, and the per-record
+/// reader, so an unfinished tick is published rather than dropped. It restates
+/// at the top level what the cell already decided, and the per-record
 /// `interval_closed` copied into `channels` is the authoritative one.
 ///
 /// This is the reader that makes the publication a publication rather than a
@@ -81,17 +81,33 @@ fn record_coverage_sample(
 /// the declared interval, the live and replayed portions, the dropped samples,
 /// whether the interval closed, the named gaps, the sensor map revision, and
 /// the validity verdict — is read here and emitted, so none of it is
-/// write-only. The set is emitted when the blocking channels change, which is a
-/// measured property of the current sensor map and of the samples the last
-/// interval actually held, so the volume is bounded rather than per-tick; the
-/// readiness projection and the owner-bound capture path read the same cell on
-/// every tick and every capture. A poisoned cell, or a close with no interval
-/// open, publishes nothing at all — never a claim.
+/// write-only.
+///
+/// What is emitted, and how often, differs by case and both follow the record:
+/// a **closed** interval is emitted when the set of blocking channels changed,
+/// because that set is largely a measured property of the current sensor map
+/// and of the samples the last interval actually held, so a steady set is
+/// change-gated rather than per-tick noise. An **unclosed** interval is emitted
+/// every single time it happens, because the omission belongs to the tick it
+/// occurred on and change-gating it would emit one line for an indefinite run
+/// of unfinished ticks. That is bounded by the tick body, which closes its own
+/// interval on every exit, so an unclosed interval is an exceptional event
+/// rather than an ordinary degraded one. The readiness projection and the
+/// owner-bound capture path read the same cell on every tick and every capture.
+/// A poisoned cell, or a close with no interval open, publishes nothing at
+/// all — never a claim.
 fn publish_interval_coverage(publication: &IntervalCoveragePublication, interval_closed: bool) {
-    if !publication.blocking_changed() {
+    let report = publication.report();
+    // Every record of a report shares one close state, so this is the report's
+    // own: it asks whether the tick that produced these samples declared an end
+    // for the window they belong to.
+    let unclosed = report
+        .records()
+        .iter()
+        .any(|record| !record.interval_closed());
+    if !unclosed && !publication.blocking_changed() {
         return;
     }
-    let report = publication.report();
     let interval = report.interval();
     let channels: Vec<_> = report
         .records()
@@ -135,6 +151,33 @@ fn publish_interval_coverage(publication: &IntervalCoveragePublication, interval
         channels = ?channels,
         "one supervision tick's per-channel I8.2 observation coverage published"
     );
+}
+
+/// Ends one supervision tick's coverage interval when the tick body is left.
+///
+/// One published interval belongs to exactly one tick, so it has to end when that
+/// tick ends — on the ordinary fall-through and on each `continue` alike. An
+/// admission refusal and a lost Host are ordinary degraded outcomes in which
+/// this owner still read a channel and recorded a live sample, and leaving the
+/// window open there made the next tick republish that earned sample as
+/// `INTERVAL_NOT_CLOSED` / `UNKNOWN`: present evidence discarded because an
+/// unrelated branch was taken. Closing on drop removes that coupling — a new exit
+/// path cannot forget a close it has no reason to know about.
+///
+/// It adds no owner, no second cell, and no flag a caller must remember to set.
+/// [`IntervalCoverageCell::close_interval`] returns `None` when no interval is
+/// open, so a second close is a no-op by construction rather than a double
+/// publication, and a poisoned cell still publishes nothing.
+struct CoverageIntervalCloser<'cell> {
+    cell: &'cell IntervalCoverageCell,
+}
+
+impl Drop for CoverageIntervalCloser<'_> {
+    fn drop(&mut self) {
+        if let Some(closed) = self.cell.close_interval(current_unix_ms().unwrap_or(0)) {
+            publish_interval_coverage(&closed, true);
+        }
+    }
 }
 
 /// Runtime-owned watchdog composition.
@@ -306,12 +349,14 @@ impl WatchdogComposition {
                             () = tokio::time::sleep(interval) => {}
                         }
                         // I8.2 (#1755 W5): one published coverage interval is
-                        // exactly one tick. Opening it here also reports the
-                        // window the previous tick left open — a tick cut short
-                        // by an admission refusal or a lost Host is published
-                        // as a named `INTERVAL_NOT_CLOSED` omission rather than
-                        // silently replaced, so a sample can never be carried
-                        // across a window it did not cover and a skipped tick
+                        // exactly one tick. Opening it here also reports a
+                        // window the previous tick left open: the closer below
+                        // ends that tick's interval on every one of its exit
+                        // paths, so a window found open here is one whose close
+                        // did not take effect. It is published as a named
+                        // `INTERVAL_NOT_CLOSED` omission rather than silently
+                        // replaced, so a sample can never be carried across a
+                        // window it did not cover and an unfinished tick
                         // invalidates the last publication instead of widening
                         // it.
                         if let Some(abandoned) =
@@ -319,6 +364,7 @@ impl WatchdogComposition {
                         {
                             publish_interval_coverage(&abandoned, false);
                         }
+                        let _interval_closer = CoverageIntervalCloser { cell: &coverage };
                         // Host liveness is an independent sibling observation.
                         // It must run even when a lease is missing, stale, or
                         // otherwise unavailable during first install/recovery.
@@ -438,10 +484,9 @@ impl WatchdogComposition {
                                     .await;
                             }
                         }
-                        if let Some(closed) = coverage.close_interval(current_unix_ms().unwrap_or(0))
-                        {
-                            publish_interval_coverage(&closed, true);
-                        }
+                        // The interval is closed by `_interval_closer` when this
+                        // tick body ends, so the degraded `continue` paths above
+                        // and this fall-through publish through the same close.
                     }
                 }
             },
