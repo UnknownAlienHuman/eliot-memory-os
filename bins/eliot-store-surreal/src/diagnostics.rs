@@ -1269,7 +1269,7 @@ pub fn report_events(log: &BoundedEventLog) {
     if !startup_subscriber_installed() {
         return;
     }
-    for event in log.iter() {
+    for event in log {
         let _ = writeln!(std::io::stderr(), "{SERVICE_NAME}: {event}");
     }
 }

@@ -1608,13 +1608,6 @@ pub fn validate_request_frame_with_log(
 /// health, readiness, and Dreamer ledger requests keep their own bounded
 /// validation (already run by the wire decode) and perform no canonical
 /// mutation.
-fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
-    let mut events = BoundedEventLog::new();
-    let outcome = enforce_admitted_operation_with_log(request, &mut events);
-    report_events(&events);
-    outcome
-}
-
 fn enforce_admitted_operation_with_log(
     request: &Request,
     events: &mut BoundedEventLog,
@@ -3281,6 +3274,13 @@ mod tests {
             "op-dreamer-gate",
             "idem-dreamer-gate",
         );
-        assert!(enforce_admitted_operation(&Request::DreamerJob { context, request }).is_ok());
+        let mut events = BoundedEventLog::new();
+        assert!(
+            enforce_admitted_operation_with_log(
+                &Request::DreamerJob { context, request },
+                &mut events
+            )
+            .is_ok()
+        );
     }
 }
