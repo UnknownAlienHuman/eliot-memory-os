@@ -45,11 +45,12 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRef, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OrderingHeadExpectation, PreparedTransition,
-    ReadConsistency, RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation,
-    StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
+    CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
+    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
+    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +98,23 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 /// Response `kind` of the bounded notification inbox projection.
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
+
+/// Response `kind` of the ORS process-stream recovery view (issue #269, I14.26).
+///
+/// Availability and the exact gap set, and nothing else: no stream bytes and no
+/// parser, evaluator, task or finish claim. It rides the same-fence
+/// `store_recovery` answer because that is the recovery readback the retained
+/// daemon client already performs, so the ORS half reaches its reader without a
+/// second recovery operation or a second dispatch vocabulary.
+#[cfg(windows)]
+const PROCESS_STREAM_RECOVERY_STATUS_KIND: &str = "process_stream_recovery_status";
+/// Per-operation status when ORS retained a readable recovery row.
+#[cfg(windows)]
+const PROCESS_STREAM_RECOVERY_RETAINED_KIND: &str = "retained";
+/// Per-operation status when ORS could not produce the row at all. The typed
+/// disposition beside it names which of the two failure classes it was.
+#[cfg(windows)]
+const PROCESS_STREAM_RECOVERY_UNREADABLE_KIND: &str = "unreadable";
 
 /// Authenticated P-07 root-transition activation route (`#2962`).
 ///
@@ -545,6 +563,25 @@ struct LocalReadOperation {
 #[serde(deny_unknown_fields)]
 struct StoreRecoveryOperation {
     request: StoreRecoveryRequest,
+    /// Issue #269 / I14.26: exact process-operation identities whose retained
+    /// ORS stream-recovery state the Kernel additionally serves on this
+    /// same-fence recovery read.
+    ///
+    /// The selector is a Kernel-owned field on the Kernel-owned carrier, not a
+    /// Store field, and it names a DIFFERENT identity space than
+    /// `request.records`: those are `(namespace, key)` Store recovery records,
+    /// while these are process-operation identities whose durable ORS key is
+    /// `(operation_id, stream)`. Reading one through the other would be a
+    /// category error, so the two never share a selector.
+    ///
+    /// `None` — the shape every existing caller sends — answers explicit `null`
+    /// and reads no ORS row, so this addition changes no existing answer and
+    /// costs the retained daemon no extra read. The selector is bounded by the
+    /// Store's own recovery-record denominator so the extra view can never grow
+    /// wider than the recovery packet it rides on, and every entry is proved as
+    /// a real ORS operation identity before the durable read.
+    #[serde(default)]
+    process_stream_recovery_operations: Option<Vec<String>>,
 }
 
 /// Closed Governor owner-bundle publish operation (`#2100`).
@@ -5622,6 +5659,18 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
+        // Rejection before reading, exactly as the sibling routes do it: the
+        // process-stream selector is proved here, while it is still pure, so a
+        // blank, unusable or over-bound entry never reaches the gateway or the
+        // retained ORS.
+        let stream_identities = match Self::admit_process_stream_recovery_operations(
+            operation.process_stream_recovery_operations.as_deref(),
+        ) {
+            Ok(identities) => identities,
+            Err(reason) => {
+                return Ok(Self::store_error_response_text("store_recovery", &reason));
+            }
+        };
         let gateway = self.retained_store_gateway()?;
         match gateway.recovery(operation.request).await {
             Ok(snapshot) => {
@@ -5632,10 +5681,111 @@ impl KernelComposition {
                 // reconciled before normal writes are enabled.
                 self.record_startup_evidence(6)
                     .map_err(|_| TransportError::SessionFenced)?;
-                Ok(store_recovery_response(&snapshot))
+                Ok(store_recovery_response(
+                    &snapshot,
+                    &self.process_stream_recovery_status_view(&stream_identities),
+                ))
             }
             Err(error) => Ok(Self::store_error_response_text("store_recovery", &error)),
         }
+    }
+
+    /// Proves the process-stream recovery selector before any durable read.
+    ///
+    /// Pure, so an empty, over-bound or unusable selector is refused here rather
+    /// than after the Store recovery has already answered. An absent selector is
+    /// the existing caller's shape and yields an empty view, which the response
+    /// projects as explicit `null` rather than as an empty family.
+    #[cfg(windows)]
+    fn admit_process_stream_recovery_operations(
+        requested: Option<&[String]>,
+    ) -> Result<Vec<eliot_ors::OperationIdentity>, String> {
+        let Some(requested) = requested else {
+            return Ok(Vec::new());
+        };
+        if requested.is_empty() {
+            return Err(
+                "process_stream_recovery_operations must name at least one operation".to_owned(),
+            );
+        }
+        if requested.len() > MAX_RECOVERY_OWNER_RECORDS {
+            return Err(format!(
+                "process_stream_recovery_operations exceeds the bounded recovery denominator of {MAX_RECOVERY_OWNER_RECORDS}"
+            ));
+        }
+        requested
+            .iter()
+            .map(|value| {
+                eliot_ors::OperationIdentity::new(value.clone())
+                    .map_err(|error| format!("process_stream_recovery_operations: {error}"))
+            })
+            .collect()
+    }
+
+    /// Serves the ORS process-stream recovery status for the selected
+    /// operations (issue #269 W6, I14.26).
+    ///
+    /// I14.26 states that the Kernel assembles the recovery view from ORS, and
+    /// the retained daemon client already reads recovery status on this exact
+    /// operation, so the ORS half is served beside the Store snapshot rather
+    /// than through a second recovery vocabulary.
+    ///
+    /// Three properties are load-bearing and none of them is a claim about
+    /// stream content:
+    ///
+    /// - The durable read is
+    ///   [`RedbRecoveryStore::process_stream_recovery_status`] and the projection
+    ///   is the ORS-owned [`eliot_ors::ProcessStreamRecoveryStatusProjection`].
+    ///   Nothing is recomputed here: availability, the exact gap set, the
+    ///   immutable locator handle, the ready-receipt handle, the exact durable
+    ///   coverage and both typed state axes are copied field for field.
+    /// - No raw bytes cross. The ORS view has no byte-bearing field at all, so
+    ///   stdout/stderr payload is structurally absent from the answer rather
+    ///   than redacted from it.
+    /// - No semantic proof is asserted. There is no parser, evaluator, task or
+    ///   finish field to project, `evidence_scope` is a single-variant value
+    ///   that names exactly bytes-and-coverage, and `reports_complete_evidence`
+    ///   is ORS's own conjunction over the copied typed axes.
+    ///
+    /// An unreadable row is answered as ORS's own typed disposition
+    /// (codec-version mismatch versus interrupted read) instead of being
+    /// flattened into a transport error, so a caller can tell a stale codec from
+    /// an interrupted read, and an empty stream list means ORS retains no row
+    /// for that operation — never that the operation had no streams.
+    #[cfg(windows)]
+    fn process_stream_recovery_status_view(
+        &self,
+        identities: &[eliot_ors::OperationIdentity],
+    ) -> serde_json::Value {
+        if identities.is_empty() {
+            return serde_json::Value::Null;
+        }
+        let operations = identities
+            .iter()
+            .map(|identity| {
+                let status = match self.p07_ors.process_stream_recovery_status(identity) {
+                    Ok(views) => serde_json::json!({
+                        "kind": PROCESS_STREAM_RECOVERY_RETAINED_KIND,
+                        "streams": views
+                            .iter()
+                            .map(process_stream_recovery_stream_view)
+                            .collect::<Vec<_>>(),
+                    }),
+                    Err(error) => serde_json::json!({
+                        "kind": PROCESS_STREAM_RECOVERY_UNREADABLE_KIND,
+                        "disposition": process_stream_recovery_load_disposition(&error),
+                    }),
+                };
+                serde_json::json!({
+                    "operation_id": identity.as_str(),
+                    "status": status,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "kind": PROCESS_STREAM_RECOVERY_STATUS_KIND,
+            "operations": operations,
+        })
     }
 
     #[cfg(not(windows))]
@@ -7729,10 +7879,81 @@ fn validate_store_session_fence(
     Ok(())
 }
 
-fn store_recovery_response(snapshot: &StoreRecoverySnapshot) -> serde_json::Value {
+/// Projects one ORS process-stream recovery view onto the wire (issue #269).
+///
+/// Every value is the ORS view's own field, serialized by ORS's own
+/// `Serialize` impls, so the Kernel neither re-derives nor reshapes it. `None`
+/// stays an explicit `null` rather than an omitted key (I5.16), and the
+/// `reports_complete_evidence` flag is ORS's own conjunction over the typed axes
+/// that are projected beside it — it is a mechanical restatement, never an
+/// independent judgement about the stream.
+#[cfg(windows)]
+fn process_stream_recovery_stream_view(
+    view: &eliot_ors::ProcessStreamRecoveryStatusProjection,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": view.operation_id,
+        "stream": view.stream,
+        "transport": view.transport,
+        "persistence": view.persistence,
+        "availability": view.availability,
+        "durable_locator": view.durable_locator,
+        "ready_receipt_ref": view.ready_receipt_ref,
+        "durable_coverage": view.durable_coverage,
+        "gaps": view.gaps,
+        "reconciliation": view.reconciliation,
+        "activation": view.activation,
+        "evidence_scope": view.evidence_scope,
+        "reports_complete_evidence": view.reports_complete_evidence(),
+    })
+}
+
+/// Projects ORS's typed recovery-load disposition without collapsing it.
+///
+/// The two variants stay distinguishable on the wire, because they call for
+/// different actions: a codec-version mismatch means this ORS build must not
+/// read the row at all, while an interrupted read means the row itself is not
+/// currently readable. Neither becomes a generic code or a bare string.
+#[cfg(windows)]
+fn process_stream_recovery_load_disposition(
+    error: &eliot_ors::ProcessStreamRecoveryLoadError,
+) -> serde_json::Value {
+    match error {
+        eliot_ors::ProcessStreamRecoveryLoadError::CodecVersionMismatch { found, current } => {
+            serde_json::json!({
+                "kind": "codec_version_mismatch",
+                "found_contract_version": found,
+                "current_contract_version": current,
+            })
+        }
+        eliot_ors::ProcessStreamRecoveryLoadError::InterruptedRead { reason } => {
+            serde_json::json!({
+                "kind": "interrupted_read",
+                "reason": reason,
+            })
+        }
+    }
+}
+
+/// Same-fence Store recovery answer, plus the ORS process-stream recovery view.
+///
+/// The extra `process_stream_recovery` member is a SIBLING of `kind`/`value`
+/// inside the typed application object, so the retained daemon client's
+/// `kind_value` reader — which resolves `kind` then `value` by name — keeps
+/// decoding the identical `StoreRecoverySnapshot` it always did. It is explicit
+/// `null` when the request selected no operation (I5.16: a field that does not
+/// apply stays explicit `None`), never omitted, so the answer shape is stable.
+fn store_recovery_response(
+    snapshot: &StoreRecoverySnapshot,
+    process_stream_recovery: &serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
-        "value": { "kind": "store_recovery", "value": snapshot },
+        "value": {
+            "kind": "store_recovery",
+            "value": snapshot,
+            "process_stream_recovery": process_stream_recovery,
+        },
         "recovery": null,
     })
 }
