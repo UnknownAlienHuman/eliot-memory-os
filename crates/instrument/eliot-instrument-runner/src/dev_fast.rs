@@ -669,8 +669,9 @@ pub fn check_zero_execution(expected: u64, executed: u64) -> Result<(), DevFastE
 /// Pass requires all of: the aggregate succeeded, the receipt binds this
 /// exact profile revision/candidate/disposition, the frozen selection is
 /// `Ready` or exact `Empty` (never `WidenedTier` or `Incomplete`), the
-/// expected/executed counts satisfy [`check_zero_execution`], and the
-/// observed candidate equals the frozen candidate. A substituted
+/// receipt's selected and omitted rows match that frozen selection, its
+/// coverage is complete, its expected and observed execution counts match,
+/// and the observed candidate equals the frozen candidate. A substituted
 /// executable, changed candidate, missing mandatory stage, unmatched
 /// output, or incomplete cleanup never returns Pass.
 pub fn dev_fast_disposition(
@@ -715,6 +716,25 @@ pub fn dev_fast_disposition(
             "receipt does not bind the frozen selection".to_owned(),
         ));
     }
+    let frozen_expected_count = u64::try_from(frozen.selected.len()).unwrap_or(u64::MAX);
+    if receipt.candidate != frozen.candidate
+        || receipt.plan_digest != frozen.plan_digest
+        || receipt.discovery_digest != frozen.discovery_digest
+        || receipt.discovered_count != frozen.discovered_count
+        || receipt.disposition != frozen.disposition
+        || receipt.selected != frozen.selected
+        || receipt.omitted != frozen.omitted
+        || receipt.expected_count != frozen_expected_count
+    {
+        return Err(DevFastError::ReceiptMismatch(
+            "receipt selection fields do not match the frozen selection".to_owned(),
+        ));
+    }
+    if receipt.unknown_coverage || !receipt.impact_gaps.is_empty() {
+        return Err(DevFastError::IncompleteCoverage(
+            "selection receipt carries unknown coverage or impact gaps".to_owned(),
+        ));
+    }
     if !matches!(
         frozen.disposition,
         FrozenDisposition::Ready | FrozenDisposition::Empty
@@ -731,6 +751,15 @@ pub fn dev_fast_disposition(
         });
     }
     check_zero_execution(receipt.expected_count, receipt.executed_count)?;
+    if receipt.expected_count != receipt.executed_count {
+        return Err(DevFastError::MandatoryStage {
+            stage: DEV_FAST_STAGE_RUN.to_owned(),
+            status: format!(
+                "incomplete execution count: expected {}, observed {}",
+                receipt.expected_count, receipt.executed_count
+            ),
+        });
+    }
     Ok(())
 }
 
