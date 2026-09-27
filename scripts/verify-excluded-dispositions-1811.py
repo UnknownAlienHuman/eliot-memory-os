@@ -803,9 +803,15 @@ def main() -> int:
     rows = data.get("crate", [])
     by_path = {str(r.get("path")): r for r in rows}
     declared_paths = [str(r.get("path")) for r in rows]
+    declared_names = [str(r.get("package")) for r in rows]
     if len(by_path) != len(rows):
-        duplicates = sorted({path for path in declared_paths if declared_paths.count(path) > 1})
-        failures.append(f"duplicate inventory rows: {duplicates}")
+        failures.append(
+            f"duplicate inventory rows: {sorted({p for p in declared_paths if declared_paths.count(p) > 1})}"
+        )
+    if len(set(declared_names)) != len(declared_names):
+        failures.append(
+            f"duplicate inventory package identities: {sorted({n for n in declared_names if declared_names.count(n) > 1})}"
+        )
 
     discovered = discover_standalone(root)
     members, exclude = workspace_sets(root)
