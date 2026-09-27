@@ -307,8 +307,8 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // The consuming start proves nothing about the outcome by itself:
     // `start_claimed` maps every executor failure (including the
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
-    // `inspect` in `observe_and_finish` is the only observation that
-    // dispositions the attempt.
+    // worker-owned `inspect` is the only observation that dispositions the
+    // attempt.
     let start_result = block_on_one_shot(crate::start_claimed_from_store(
         store,
         job,
@@ -428,6 +428,74 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
     let started_at_ms = clock_ms(&started_at).unwrap_or_else(current_clock_ms);
     let deadline_ms =
         started_at_ms.saturating_add(profile_wall_timeout_ms(job.invocation.profile.as_str())?);
+    let outcome = supervise_operation(
+        store,
+        job,
+        lease,
+        executor,
+        collector,
+        SupervisionInput {
+            operation_id,
+            start_note,
+            deadline_ms,
+            lease_ms,
+        },
+    )?;
+
+    if outcome.durable_cancelled || outcome.owner_lost {
+        // A durable cancellation or a replaced fence already removed this
+        // worker's write authority. Physical cancellation above is best
+        // effort; this worker must never write through the cleared/replaced
+        // lease.
+        return Ok(());
+    }
+    let finish_now = current_clock_ms();
+    let current = store
+        .get(&job.job_id)?
+        .ok_or_else(|| TestdError::Corrupt("job disappeared before finish".to_owned()))?;
+    if current.state == JobState::Cancelled && current.lease.is_none() {
+        return Ok(());
+    }
+    if current.state != JobState::Running || current.lease.as_ref() != Some(&*lease) {
+        return Ok(());
+    }
+    if lease.expires_at_ms <= finish_now.saturating_add(SUPERVISION_POLL_INTERVAL_MS) {
+        *lease = store.renew_lease(&job.job_id, &*lease, finish_now, lease_ms)?;
+    }
+    finish_observed_attempt(store, job, lease, collector, &current, outcome, started_at)
+}
+
+struct SupervisionInput {
+    operation_id: OperationId,
+    start_note: Option<String>,
+    deadline_ms: u64,
+    lease_ms: u64,
+}
+
+struct SupervisionOutcome {
+    execution: ExecutionStatus,
+    reason: String,
+    reconcile_note: Option<String>,
+    durable_cancelled: bool,
+    owner_lost: bool,
+}
+
+/// Inspects and reconciles the exact operation while renewing the durable
+/// lease that admitted it.
+fn supervise_operation<E: ProcessExecutor + 'static>(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &mut Lease,
+    executor: &E,
+    collector: &EvidenceCollector,
+    input: SupervisionInput,
+) -> Result<SupervisionOutcome, TestdError> {
+    let SupervisionInput {
+        operation_id,
+        start_note,
+        deadline_ms,
+        lease_ms,
+    } = input;
     let mut execution = ExecutionStatus::Unknown;
     let mut reason =
         "terminal observation did not prove an outcome; reconcile by exact identity".to_owned();
@@ -508,26 +576,31 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
         std::thread::sleep(Duration::from_millis(SUPERVISION_POLL_INTERVAL_MS));
     }
 
-    if durable_cancelled || owner_lost {
-        // A durable cancellation or a replaced fence already removed this
-        // worker's write authority. Physical cancellation above is best
-        // effort; this worker must never write through the cleared/replaced
-        // lease.
-        return Ok(());
-    }
-    let finish_now = current_clock_ms();
-    let current = store
-        .get(&job.job_id)?
-        .ok_or_else(|| TestdError::Corrupt("job disappeared before finish".to_owned()))?;
-    if current.state == JobState::Cancelled && current.lease.is_none() {
-        return Ok(());
-    }
-    if current.state != JobState::Running || current.lease.as_ref() != Some(&*lease) {
-        return Ok(());
-    }
-    if lease.expires_at_ms <= finish_now.saturating_add(SUPERVISION_POLL_INTERVAL_MS) {
-        *lease = store.renew_lease(&job.job_id, &*lease, finish_now, lease_ms)?;
-    }
+    Ok(SupervisionOutcome {
+        execution,
+        reason,
+        reconcile_note,
+        durable_cancelled,
+        owner_lost,
+    })
+}
+
+/// Captures terminal evidence and finishes the already-revalidated attempt.
+fn finish_observed_attempt(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &mut Lease,
+    collector: &EvidenceCollector,
+    current: &TestJob,
+    outcome: SupervisionOutcome,
+    started_at: ClockReading,
+) -> Result<(), TestdError> {
+    let SupervisionOutcome {
+        mut execution,
+        mut reason,
+        reconcile_note,
+        ..
+    } = outcome;
     let finished_at = observation_clock(current_clock_ms());
     let records = collector.snapshot();
     let synthetic = match capture_inline_previews(

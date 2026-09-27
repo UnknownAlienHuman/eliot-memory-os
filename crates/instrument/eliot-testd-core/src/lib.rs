@@ -81,8 +81,9 @@ pub use typed_evidence::{
 //   as validated slots and the Drive seals exactly the rendered argv,
 //   never raw caller text.
 // * `env_allowlist` is the exact non-secret environment for the child.
-//   The productive libtest-json profile receives only the explicitly
-//   registered feature gate below; no ambient environment is inherited.
+//   Productive nextest profiles, including discovery, receive only the
+//   explicitly registered feature gate below; no ambient environment is
+//   inherited.
 // * the working directory is never stored here: the Drive always uses the
 //   generation root supplied with the admitted material, never a
 //   caller-chosen directory.
@@ -135,14 +136,6 @@ pub const TESTD_SLOT_BINARY: &str = "--bin";
 /// Slot flag binding the scoped per-test retry count (`--retries <n>`,
 /// scoped profile only).
 pub const TESTD_SLOT_RETRIES: &str = "--retries";
-/// Maximum retries admitted in one scoped slot set. Mirrors the nextest
-/// owner's `MAX_SCOPED_RETRIES` without taking the dependency.
-pub const TESTD_SCOPED_MAX_RETRIES: u32 = 10;
-/// Maximum exact filters admitted in one scoped slot set. Each filter is
-/// one invocation argument after the exact separator, so 60 filters plus
-/// the scope pairs, the retry pair, and the separator stay within the
-/// invocation argument bound.
-pub const TESTD_SCOPED_MAX_FILTERS: usize = 60;
 /// Exact environment required by nextest 0.9.143's experimental libtest JSON
 /// reporter. The value is owner-registered and is never read from ambient
 /// process state.
@@ -172,18 +165,9 @@ pub const TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 pub const TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 /// Independent descendant ceiling for the productive nextest profile.
 pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
-/// Bounded wall timeout for discovery, in milliseconds.
-pub const TESTD_LIST_PROFILE_WALL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
-/// Bounded CPU ceiling for discovery, in milliseconds.
-pub const TESTD_LIST_PROFILE_CPU_TIME_MS: u64 = 4 * 60 * 1_000;
-/// Bounded memory ceiling for discovery, in bytes.
-pub const TESTD_LIST_PROFILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Bounded stdout capture for discovery, in bytes.
-pub const TESTD_LIST_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
-/// Bounded stderr capture for discovery, in bytes.
-pub const TESTD_LIST_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
-/// Bounded descendant ceiling for discovery.
-pub const TESTD_LIST_PROFILE_MAX_DESCENDANTS: u32 = 32;
+/// Discovery shares the productive nextest wall timeout and resource
+/// envelope. Keep this name for the Testd worker's existing timeout lookup.
+pub const TESTD_LIST_PROFILE_WALL_TIMEOUT_MS: u64 = TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS;
 
 /// Closed executable binding for one admitted testd profile.
 ///
@@ -284,15 +268,18 @@ impl TestdExecutableBinding {
                 reason: "the registered profile takes fixed argv; caller arguments are refused",
             });
         }
-        let expected_environment: Vec<(String, String)> =
-            if self.profile == TESTD_PRODUCTIVE_PROFILE || self.profile == TESTD_SCOPED_PROFILE {
-                TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
-                    .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let expected_environment: Vec<(String, String)> = if self.profile
+            == TESTD_PRODUCTIVE_PROFILE
+            || self.profile == TESTD_LIST_PROFILE
+            || self.profile == TESTD_SCOPED_PROFILE
+        {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if self.env_allowlist != expected_environment {
             return Err(TestdError::Invalid {
                 field: "env_allowlist",
@@ -324,7 +311,10 @@ impl TestdExecutableBinding {
 }
 
 fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u32) {
-    if profile == TESTD_PRODUCTIVE_PROFILE || profile == TESTD_SCOPED_PROFILE {
+    if matches!(
+        profile,
+        TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+    ) {
         (
             TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS,
             Some(TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS),
@@ -332,15 +322,6 @@ fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u3
             TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES,
             TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES,
             TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS,
-        )
-    } else if profile == TESTD_LIST_PROFILE {
-        (
-            TESTD_LIST_PROFILE_WALL_TIMEOUT_MS,
-            Some(TESTD_LIST_PROFILE_CPU_TIME_MS),
-            Some(TESTD_LIST_PROFILE_MEMORY_BYTES),
-            TESTD_LIST_PROFILE_STDOUT_BYTES,
-            TESTD_LIST_PROFILE_STDERR_BYTES,
-            TESTD_LIST_PROFILE_MAX_DESCENDANTS,
         )
     } else {
         (
@@ -450,7 +431,10 @@ pub fn testd_profile_binding_with_slots(
             TESTD_PRODUCTIVE_PROFILE_PROGRAM.to_owned()
         },
         fixed_argv,
-        env_allowlist: if profile == TESTD_PRODUCTIVE_PROFILE || profile == TESTD_SCOPED_PROFILE {
+        env_allowlist: if profile == TESTD_PRODUCTIVE_PROFILE
+            || profile == TESTD_LIST_PROFILE
+            || profile == TESTD_SCOPED_PROFILE
+        {
             TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -545,7 +529,10 @@ fn canonical_definition_digest(profile: &str, argv: &[String]) -> Result<String,
     }
     let empty: Vec<(String, String)> = Vec::new();
     let limits = profile_limits(profile);
-    let env_allowlist = if profile == TESTD_PRODUCTIVE_PROFILE || profile == TESTD_SCOPED_PROFILE {
+    let env_allowlist = if profile == TESTD_PRODUCTIVE_PROFILE
+        || profile == TESTD_LIST_PROFILE
+        || profile == TESTD_SCOPED_PROFILE
+    {
         TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -727,7 +714,7 @@ pub fn parse_testd_slot_suffix(
             field: "invocation.arguments",
             reason: "slot retry count is not a canonical number",
         })?;
-        if retries > TESTD_SCOPED_MAX_RETRIES || retries.to_string() != *token {
+        if retries.to_string() != *token {
             return Err(TestdError::Invalid {
                 field: "invocation.arguments",
                 reason: "slot retry count is not a canonical number",
@@ -751,10 +738,10 @@ pub fn parse_testd_slot_suffix(
             });
         }
         let filters = &suffix[index + 2..];
-        if filters.is_empty() || filters.len() > TESTD_SCOPED_MAX_FILTERS {
+        if filters.is_empty() {
             return Err(TestdError::Invalid {
                 field: "invocation.arguments",
-                reason: "slot filter set is empty or exceeds its bound",
+                reason: "slot filter set is empty",
             });
         }
         for filter in filters {
@@ -797,21 +784,6 @@ pub fn render_testd_slotted_argv(
         return Err(TestdError::Invalid {
             field: "invocation.arguments",
             reason: "retries and filters are scoped-run slots only",
-        });
-    }
-    if slots
-        .retries
-        .is_some_and(|retries| retries > TESTD_SCOPED_MAX_RETRIES)
-    {
-        return Err(TestdError::Invalid {
-            field: "invocation.arguments",
-            reason: "slot retry count is not a canonical number",
-        });
-    }
-    if slots.filters.len() > TESTD_SCOPED_MAX_FILTERS {
-        return Err(TestdError::Invalid {
-            field: "invocation.arguments",
-            reason: "slot filter set is empty or exceeds its bound",
         });
     }
     for filter in &slots.filters {
@@ -930,17 +902,14 @@ pub fn testd_scoped_invocation(
 
 /// Validates one Cargo package/binary slot name.
 ///
-/// Admitted names are 1..=64 ASCII word characters or `-`: no whitespace,
-/// no shell metacharacter, no leading `-` (so the value can never become
-/// a flag), and no control character. Mirrors the nextest owner's slot
-/// validation without taking the dependency.
+/// Admitted names use Cargo's common ASCII package/target characters and
+/// cannot start with `-`. Mirrors the nextest owner's slot validation.
 fn validate_slot_name(value: &str) -> Result<(), TestdError> {
     if value.is_empty()
-        || value.len() > 64
         || value.starts_with('-')
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+'))
     {
         return Err(TestdError::Invalid {
             field: "invocation.arguments",
@@ -950,21 +919,10 @@ fn validate_slot_name(value: &str) -> Result<(), TestdError> {
     validate_text(value, "invocation.arguments")
 }
 
-/// Validates one exact test filter: non-blank, bounded, control-free, and
-/// free of shell metacharacters, so the sealed argv carries the
-/// discovered identity verbatim. Mirrors the nextest owner's filter
-/// validation without taking the dependency.
+/// Validates one exact test filter. Filters are passed as individual argv
+/// values after `--`; controls are rejected and no shell command is built.
 fn validate_slot_filter(value: &str) -> Result<(), TestdError> {
-    if value.trim().is_empty()
-        || value.len() > 512
-        || value.chars().any(char::is_control)
-        || value.chars().any(|char| {
-            matches!(
-                char,
-                ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\\' | '"' | '\''
-            )
-        })
-    {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(TestdError::Invalid {
             field: "invocation.arguments",
             reason: "slot filter is not an exact discovered test identity",

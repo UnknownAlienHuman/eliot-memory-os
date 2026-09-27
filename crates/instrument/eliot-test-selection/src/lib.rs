@@ -26,10 +26,6 @@ pub const PLANNER_VERSION: &str = "impact-test-selection-v1";
 pub const FROZEN_SELECTION_VERSION: &str = "dev-fast-frozen-selection-v1";
 /// Version of the persisted `TestSelectionReceipt` semantics (I18.6 step 9).
 pub const SELECTION_RECEIPT_VERSION: &str = "eliot-test-selection-receipt-v1";
-/// Maximum selected tests retained in one frozen selection.
-pub const MAX_FROZEN_SELECTED: usize = 10_000;
-/// Maximum omitted tests retained in one frozen selection.
-pub const MAX_FROZEN_OMITTED: usize = 100_000;
 
 /// Failures which prevent a selection request from being admitted.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -535,11 +531,6 @@ impl FrozenSelection {
         text(&self.plan_digest, "plan_digest")?;
         text(&self.candidate, "candidate")?;
         text(&self.discovery_digest, "discovery_digest")?;
-        if self.selected.len() > MAX_FROZEN_SELECTED || self.omitted.len() > MAX_FROZEN_OMITTED {
-            return Err(SelectionError::Canonicalization(
-                "frozen selection exceeds its retention bound".to_owned(),
-            ));
-        }
         let mut value = self.clone();
         value.frozen_digest.clear();
         let computed = canonical_json_bytes(&value)
@@ -656,11 +647,6 @@ pub fn freeze_selection(
             .collect();
         (Vec::new(), omitted, 0)
     };
-    if selected.len() > MAX_FROZEN_SELECTED || omitted.len() > MAX_FROZEN_OMITTED {
-        return Err(SelectionError::Canonicalization(
-            "frozen selection exceeds its retention bound".to_owned(),
-        ));
-    }
     let disposition = if plan.evidence_fresh() {
         if selected.is_empty() {
             FrozenDisposition::Empty
@@ -892,11 +878,6 @@ impl TestSelectionReceipt {
             return Err(SelectionError::InvalidLimit {
                 field: "profile_revision",
             });
-        }
-        if self.selected.len() > MAX_FROZEN_SELECTED || self.omitted.len() > MAX_FROZEN_OMITTED {
-            return Err(SelectionError::Canonicalization(
-                "selection receipt exceeds its retention bound".to_owned(),
-            ));
         }
         let mut value = self.clone();
         value.receipt_digest.clear();

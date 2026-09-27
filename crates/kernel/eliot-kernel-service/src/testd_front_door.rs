@@ -128,10 +128,6 @@ pub const TESTD_SLOT_RETRIES: &str = "--retries";
 pub const TESTD_SLOT_EXACT: &str = "--exact";
 /// Separator between nextest options and exact filters, mirrored.
 pub const TESTD_SLOT_SEPARATOR: &str = "--";
-/// Maximum retries admitted in one scoped slot set, mirrored.
-pub const TESTD_SCOPED_MAX_RETRIES: u32 = 10;
-/// Maximum exact filters admitted in one scoped slot set, mirrored.
-pub const TESTD_SCOPED_MAX_FILTERS: usize = 60;
 /// Exact non-secret environment required by the experimental reporter.
 pub const TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT: &[(&str, &str)] =
     &[("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1")];
@@ -159,18 +155,6 @@ pub const TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 pub const TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 /// Independent productive nextest descendant ceiling.
 pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
-/// Bounded discovery wall timeout in milliseconds, mirrored.
-pub const TESTD_LIST_PROFILE_WALL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
-/// Bounded discovery CPU ceiling in milliseconds, mirrored.
-pub const TESTD_LIST_PROFILE_CPU_TIME_MS: u64 = 4 * 60 * 1_000;
-/// Bounded discovery memory ceiling in bytes, mirrored.
-pub const TESTD_LIST_PROFILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Bounded discovery stdout capture in bytes, mirrored.
-pub const TESTD_LIST_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
-/// Bounded discovery stderr capture in bytes, mirrored.
-pub const TESTD_LIST_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
-/// Bounded discovery descendant ceiling, mirrored.
-pub const TESTD_LIST_PROFILE_MAX_DESCENDANTS: u32 = 32;
 
 /// Computes the canonical definition digest over the static admitted
 /// profile fields.
@@ -208,7 +192,10 @@ fn testd_profile_definition_digest_for_slots(
     }
     let empty: Vec<(String, String)> = Vec::new();
     let (argv, limits) = testd_mirrored_argv_and_limits(profile, slot_suffix)?;
-    let environment = if profile == TESTD_PRODUCTIVE_PROFILE || profile == TESTD_SCOPED_PROFILE {
+    let environment = if matches!(
+        profile,
+        TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+    ) {
         TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -287,17 +274,7 @@ fn testd_mirrored_argv_and_limits(
     if profile == TESTD_LIST_PROFILE {
         let argv =
             render_testd_slotted_argv(profile, &parse_testd_slot_suffix(profile, slot_suffix)?)?;
-        return Ok((
-            argv,
-            (
-                TESTD_LIST_PROFILE_WALL_TIMEOUT_MS,
-                Some(TESTD_LIST_PROFILE_CPU_TIME_MS),
-                Some(TESTD_LIST_PROFILE_MEMORY_BYTES),
-                TESTD_LIST_PROFILE_STDOUT_BYTES,
-                TESTD_LIST_PROFILE_STDERR_BYTES,
-                TESTD_LIST_PROFILE_MAX_DESCENDANTS,
-            ),
-        ));
+        return Ok((argv, productive_mirrored_limits()));
     }
     if profile == TESTD_SCOPED_PROFILE {
         let argv =
@@ -382,7 +359,7 @@ fn parse_testd_slot_suffix(
         let retries: u32 = token
             .parse()
             .map_err(|_| invalid("slot retry count is not a canonical number"))?;
-        if retries > TESTD_SCOPED_MAX_RETRIES || retries.to_string() != *token {
+        if retries.to_string() != *token {
             return Err(invalid("slot retry count is not a canonical number"));
         }
         slots.retries = Some(retries);
@@ -400,8 +377,8 @@ fn parse_testd_slot_suffix(
             return Err(invalid("slot filters require the exact separator"));
         }
         let filters = &suffix[index + 2..];
-        if filters.is_empty() || filters.len() > TESTD_SCOPED_MAX_FILTERS {
-            return Err(invalid("slot filter set is empty or exceeds its bound"));
+        if filters.is_empty() {
+            return Err(invalid("slot filter set is empty"));
         }
         for filter in filters {
             validate_slot_filter(filter)?;
@@ -444,21 +421,6 @@ fn render_testd_slotted_argv(
             reason: "retries and filters are scoped-run slots only",
         });
     }
-    if slots
-        .retries
-        .is_some_and(|retries| retries > TESTD_SCOPED_MAX_RETRIES)
-    {
-        return Err(KernelServiceError::InvalidField {
-            field: "testd_admission.sealed_slot_suffix",
-            reason: "slot retry count is not a canonical number",
-        });
-    }
-    if slots.filters.len() > TESTD_SCOPED_MAX_FILTERS {
-        return Err(KernelServiceError::InvalidField {
-            field: "testd_admission.sealed_slot_suffix",
-            reason: "slot filter set is empty or exceeds its bound",
-        });
-    }
     for filter in &slots.filters {
         validate_slot_filter(filter)?;
     }
@@ -488,11 +450,10 @@ fn render_testd_slotted_argv(
 /// Validates one Cargo package/binary slot name through the mirrored rule.
 fn validate_slot_name(value: &str) -> Result<(), KernelServiceError> {
     if value.is_empty()
-        || value.len() > 64
         || value.starts_with('-')
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+'))
         || value.chars().any(char::is_control)
     {
         return Err(KernelServiceError::InvalidField {
@@ -505,16 +466,7 @@ fn validate_slot_name(value: &str) -> Result<(), KernelServiceError> {
 
 /// Validates one exact test filter through the mirrored rule.
 fn validate_slot_filter(value: &str) -> Result<(), KernelServiceError> {
-    if value.trim().is_empty()
-        || value.len() > 512
-        || value.chars().any(char::is_control)
-        || value.chars().any(|char| {
-            matches!(
-                char,
-                ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\\' | '"' | '\''
-            )
-        })
-    {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(KernelServiceError::InvalidField {
             field: "testd_admission.sealed_slot_suffix",
             reason: "slot filter is not an exact discovered test identity",
@@ -900,15 +852,17 @@ impl TestdAdmission {
                 reason: "profile binding digest mismatch",
             });
         }
-        let expected_environment =
-            if self.profile == TESTD_PRODUCTIVE_PROFILE || self.profile == TESTD_SCOPED_PROFILE {
-                TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
-                    .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+        let expected_environment = if matches!(
+            self.profile.as_str(),
+            TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+        ) {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if self.environment != expected_environment {
             return Err(KernelServiceError::InvalidField {
                 field: "testd_admission.environment",
@@ -1300,7 +1254,10 @@ fn build_testd_admission(
             profile,
             sealed_slot_suffix,
         )?,
-        environment: if profile == TESTD_PRODUCTIVE_PROFILE || profile == TESTD_SCOPED_PROFILE {
+        environment: if matches!(
+            profile,
+            TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+        ) {
             TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))

@@ -573,6 +573,7 @@ fn validate_admission(
         ));
     }
     let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+        || admission.profile == eliot_testd_core::TESTD_LIST_PROFILE
         || admission.profile == eliot_testd_core::TESTD_SCOPED_PROFILE
     {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT

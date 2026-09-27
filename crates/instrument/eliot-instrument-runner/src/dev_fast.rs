@@ -309,11 +309,6 @@ impl DevFastBudgets {
                 field: "max_selection_cost",
             });
         }
-        if per_test_retries > eliot_instrument_nextest::MAX_SCOPED_RETRIES {
-            return Err(DevFastError::OutOfBound {
-                field: "per_test_retries",
-            });
-        }
         Ok(Self {
             discovery_timeout_ms,
             discovery_max_bytes,
@@ -744,11 +739,16 @@ pub fn dev_fast_disposition(
 ///
 /// Registration validates every stage against its spec class, so a
 /// dangling or mismatched dev-fast stage fails here, never at launch.
-pub fn dev_fast_registry(generation: u64) -> Result<InstrumentRegistry, DevFastError> {
+pub fn dev_fast_registry(
+    generation: u64,
+    receipts: Vec<crate::registry::SupplyChainReceipt>,
+) -> Result<InstrumentRegistry, DevFastError> {
     use crate::profile::{builtin_specs, compiler_profile, test_profile};
     let specs = builtin_specs()?;
     let profiles = vec![compiler_profile()?, test_profile()?, dev_fast_profile()?];
-    Ok(InstrumentRegistry::build(specs, profiles, generation)?)
+    Ok(InstrumentRegistry::build(
+        specs, profiles, generation, receipts,
+    )?)
 }
 
 /// Compiles `dev-fast` through the single shared profile compiler and

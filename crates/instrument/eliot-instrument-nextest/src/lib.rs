@@ -34,15 +34,7 @@ pub const NEXTEST_STDERR_CONTENT_TYPE: &str = "text/plain";
 pub const NEXTEST_LIST_CONTENT_TYPE: &str = "application/x-nextest-list-json";
 /// Maximum complete stream accepted by the bounded parser.
 pub const MAX_NEXTEST_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum inventory document accepted by the bounded list parser.
-pub const MAX_NEXTEST_LIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 256 * 1024;
-/// Maximum discovered tests retained in one normalized inventory.
-pub const MAX_DISCOVERED_TESTS: usize = 100_000;
-/// Maximum selected filters rendered into one scoped run command.
-pub const MAX_SCOPED_FILTERS: usize = 10_000;
-/// Maximum retries rendered into one scoped run command.
-pub const MAX_SCOPED_RETRIES: u32 = 10;
 
 /// A validated nextest command projection.  Arguments are kept as individual
 /// values and are never rendered into a shell command line.
@@ -122,7 +114,7 @@ impl NextestCommand {
     /// `cargo-nextest run` executable.
     ///
     /// Scope renders from the validated [`NextestScope`] only: an optional
-    /// package, an optional binary, a bounded retry count, and exact test
+    /// package, an optional binary, a retry count, and exact test
     /// filters after `--` with `--exact`, so every filter matches the
     /// discovery identity exactly instead of by substring.
     pub fn run_scoped(
@@ -200,17 +192,8 @@ impl NextestScope {
         if let Some(binary) = &self.binary {
             checked_scope_name(binary.clone(), "binary")?;
         }
-        if self.filters.len() > MAX_SCOPED_FILTERS {
-            return Err(NextestError::TooManyFilters);
-        }
         for filter in &self.filters {
             checked_filter(filter)?;
-        }
-        if self
-            .retries
-            .is_some_and(|retries| retries > MAX_SCOPED_RETRIES)
-        {
-            return Err(NextestError::RetriesOutOfRange);
         }
         Ok(())
     }
@@ -402,9 +385,10 @@ impl DiscoveredInventory {
 /// parser, and run-event bytes never parse here. Duplicate identities,
 /// unlisted suites, unsupported testcase records, a `test-count` mismatch,
 /// or an over-bound document fail closed; the caller retains the exact raw
-/// bytes separately under [`NEXTEST_LIST_CONTENT_TYPE`].
+/// bytes separately under [`NEXTEST_LIST_CONTENT_TYPE`]. The existing
+/// [`MAX_NEXTEST_OUTPUT_BYTES`] capture bound applies to discovery too.
 pub fn parse_list_json(bytes: &[u8]) -> Result<DiscoveredInventory, NextestError> {
-    if bytes.len() > MAX_NEXTEST_LIST_BYTES {
+    if bytes.len() > MAX_NEXTEST_OUTPUT_BYTES {
         return Err(NextestError::OutputTooLarge);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| NextestError::MalformedInventory)?;
@@ -457,9 +441,6 @@ pub fn parse_list_json(bytes: &[u8]) -> Result<DiscoveredInventory, NextestError
                 return Err(NextestError::DuplicateInventoryRecord);
             }
             tests.push(discovered);
-            if tests.len() > MAX_DISCOVERED_TESTS {
-                return Err(NextestError::OutputTooLarge);
-            }
         }
     }
     tests.sort();
@@ -661,10 +642,6 @@ pub enum NextestError {
     },
     #[error("nextest inventory holds an unlisted suite; discovery is incomplete")]
     IncompleteDiscovery,
-    #[error("scoped nextest scope exceeds the bounded filter count")]
-    TooManyFilters,
-    #[error("scoped nextest retries exceed the admitted bound")]
-    RetriesOutOfRange,
     #[error("nextest scope slot is not an admitted value: {0}")]
     InvalidSlot(String),
     #[error(transparent)]
@@ -682,15 +659,13 @@ fn checked_text(value: String, field: &'static str) -> Result<String, NextestErr
 
 /// Validates one Cargo package/binary slot name for argv rendering.
 ///
-/// Admitted names are 1..=64 ASCII word characters or `-`: no whitespace,
-/// no shell metacharacter, no leading `-` (so the value can never become a
-/// flag), and no control character.
+/// Admitted names use Cargo's common ASCII package/target characters, have no
+/// leading `-`, and contain no controls. No shell string is constructed.
 fn checked_scope_name(value: String, field: &'static str) -> Result<String, NextestError> {
-    if value.len() > 64
-        || value.starts_with('-')
+    if value.starts_with('-')
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+'))
     {
         return Err(NextestError::InvalidSlot(format!(
             "{field} is not an admitted Cargo target name"
@@ -701,20 +676,10 @@ fn checked_scope_name(value: String, field: &'static str) -> Result<String, Next
 
 /// Validates one exact test filter for `--exact --` rendering.
 ///
-/// Filters are exact discovered test identities: non-blank, bounded,
-/// control-free, and free of shell metacharacters and newlines, so the
-/// rendered argv carries the identity verbatim.
+/// Filters are exact discovered test identities passed as individual argv
+/// values after `--`; controls are rejected and no shell command is built.
 fn checked_filter(value: &str) -> Result<(), NextestError> {
-    if value.trim().is_empty()
-        || value.len() > 512
-        || value.chars().any(char::is_control)
-        || value.chars().any(|char| {
-            matches!(
-                char,
-                ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\\' | '"' | '\''
-            )
-        })
-    {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(NextestError::InvalidSlot(
             "filter is not an exact discovered test identity".to_owned(),
         ));
