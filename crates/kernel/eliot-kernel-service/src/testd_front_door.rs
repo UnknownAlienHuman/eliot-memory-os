@@ -1443,7 +1443,9 @@ pub fn reconcile_testd_admission(
     if admission.cancelled != envelope.cancellation {
         return Ok(false);
     }
-    if admission.profile != TESTD_ADMITTED_PROFILE {
+    if admission.profile != envelope.profile
+        || admission.sealed_slot_suffix != envelope.sealed_slot_suffix
+    {
         return Ok(false);
     }
     if admission.profile_binding_digest
