@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_receipts::{
     OperationBinding, ReceiptDispositionKind, ReceiptEnvelope, SessionBinding, WorkScopeBinding,
 };
@@ -11,15 +12,59 @@ use crate::{
     validate_text,
 };
 
-/// Exact action frame from which effect proposals are derived.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Impact classification for one effectful action (I6.3).
+///
+/// Governor computes the baseline class from registered detectors; a caller
+/// may raise it, never lower it. The class drives the action/authorization
+/// binding: `Material` and `Critical` effects require the full A10.3
+/// action-model fields and owner-verified approvals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ImpactClass {
+    /// No state or effect.
+    Observe,
+    /// Local state with cheap deterministic rollback.
+    Reversible,
+    /// Durable behavior/state/artifact or multi-file/module effect.
+    Material,
+    /// Security, authority, schema, destructive/external irreversible effect.
+    Critical,
+    /// Policy excludes the action regardless of rationale.
+    Forbidden,
+}
+
+impl ImpactClass {
+    /// Returns true for effects that require the full action-model binding.
+    #[must_use]
+    pub const fn requires_action_model(self) -> bool {
+        matches!(self, Self::Material | Self::Critical)
+    }
+
+    /// Returns true when the impact class forbids the effect outright.
+    #[must_use]
+    pub const fn is_forbidden(self) -> bool {
+        matches!(self, Self::Forbidden)
+    }
+}
+
+/// Exact action frame from which effect proposals are derived (I6.6).
+///
+/// The contract binds the exact immutable payload, operation/idempotency
+/// identity, allowed resources/effect set, approval/policy/lease/epoch,
+/// executor version/boundary and receipt/stop obligations. Governor derives
+/// the baseline impact; a caller cannot lower it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ActionContract {
     pub action_id: String,
+    pub task_id: String,
     pub intent: String,
     pub work_scope: WorkScopeBinding,
     pub authority_ref: String,
     pub read_set: BTreeSet<String>,
     pub effect_set: BTreeSet<String>,
+    pub impact_class: ImpactClass,
+    pub preserved_invariants: BTreeSet<String>,
     pub expected_observable: String,
     pub verifier_ref: String,
     pub rollback_or_compensation: String,
@@ -30,11 +75,14 @@ impl ActionContract {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         action_id: impl Into<String>,
+        task_id: impl Into<String>,
         intent: impl Into<String>,
         work_scope: WorkScopeBinding,
         authority_ref: impl Into<String>,
         read_set: impl IntoIterator<Item = String>,
         effect_set: impl IntoIterator<Item = String>,
+        impact_class: ImpactClass,
+        preserved_invariants: impl IntoIterator<Item = String>,
         expected_observable: impl Into<String>,
         verifier_ref: impl Into<String>,
         rollback_or_compensation: impl Into<String>,
@@ -42,11 +90,14 @@ impl ActionContract {
     ) -> Result<Self, AuthorityError> {
         let contract = Self {
             action_id: action_id.into(),
+            task_id: task_id.into(),
             intent: intent.into(),
             work_scope,
             authority_ref: authority_ref.into(),
             read_set: read_set.into_iter().collect(),
             effect_set: effect_set.into_iter().collect(),
+            impact_class,
+            preserved_invariants: preserved_invariants.into_iter().collect(),
             expected_observable: expected_observable.into(),
             verifier_ref: verifier_ref.into(),
             rollback_or_compensation: rollback_or_compensation.into(),
@@ -54,6 +105,7 @@ impl ActionContract {
         };
         for (value, field) in [
             (&contract.action_id, "action_id"),
+            (&contract.task_id, "task_id"),
             (&contract.intent, "intent"),
             (&contract.authority_ref, "authority_ref"),
             (&contract.expected_observable, "expected_observable"),
@@ -74,6 +126,7 @@ impl ActionContract {
             .read_set
             .iter()
             .chain(&contract.effect_set)
+            .chain(&contract.preserved_invariants)
             .chain(&contract.stop_conditions)
         {
             validate_text(value, "action_contract_set")?;
@@ -84,6 +137,70 @@ impl ActionContract {
             .validate()
             .map_err(|_| AuthorityError::FenceMismatch)?;
         Ok(contract)
+    }
+
+    /// Compiles this action frame into a [`ProposedEffect`] bound to one
+    /// exact operation.
+    ///
+    /// The proposal carries no authority: it binds the exact immutable
+    /// payload (canonical contract digest), the operation/idempotency
+    /// identity, and the allowed resource/effect set. The `resource_ref`
+    /// must be a member of the contract's `effect_set`; the operation's
+    /// state fence must match the contract's work-scope fence; and the
+    /// operation's effect class must not exceed the contract's impact class.
+    /// A `Forbidden` impact refuses outright.
+    ///
+    /// This is the proposal step only. Authorization ([`EffectAuthorizer`])
+    /// and receipt retention ([`EffectReceipt`]) are separate steps.
+    pub fn compile_proposal(
+        &self,
+        operation: OperationBinding,
+        operation_name: impl Into<String>,
+        resource_ref: impl Into<String>,
+    ) -> Result<ProposedEffect, AuthorityError> {
+        if self.impact_class.is_forbidden() {
+            return Err(AuthorityError::EffectCeilingExceeded);
+        }
+        let operation_name = operation_name.into();
+        let resource_ref = resource_ref.into();
+        validate_text(&operation_name, "operation_name")?;
+        validate_text(&resource_ref, "resource_ref")?;
+        if !self.effect_set.contains(&resource_ref) {
+            return Err(AuthorityError::UnauthorizedResource);
+        }
+        if operation.state_fence != self.work_scope.state_fence {
+            return Err(AuthorityError::FenceMismatch);
+        }
+        if effect_rank(operation.effect) > effect_rank_for_impact(self.impact_class) {
+            return Err(AuthorityError::EffectCeilingExceeded);
+        }
+        let canonical_payload_sha256 = {
+            let bytes = canonical_json_bytes(self)
+                .map_err(|_| AuthorityError::InvalidField("canonical_payload"))?;
+            sha256_hex(&bytes)
+        };
+        ProposedEffect::new(
+            self.action_id.clone(),
+            operation,
+            operation_name,
+            resource_ref,
+            canonical_payload_sha256,
+        )
+    }
+}
+
+/// Maps an [`ImpactClass`] to the maximum [`EffectClass`] rank it permits.
+///
+/// `Observe` permits only observation effects; `Reversible` permits
+/// reversible mutations; `Material` and `Critical` permit external
+/// effects; `Forbidden` permits nothing (refused before this is called).
+fn effect_rank_for_impact(impact: ImpactClass) -> u8 {
+    use eliot_receipts::EffectClass;
+    match impact {
+        ImpactClass::Observe => effect_rank(EffectClass::Observation),
+        ImpactClass::Reversible => effect_rank(EffectClass::ReversibleMutation),
+        ImpactClass::Material | ImpactClass::Critical => effect_rank(EffectClass::ExternalEffect),
+        ImpactClass::Forbidden => 0,
     }
 }
 
@@ -420,6 +537,52 @@ impl EffectAuthorizer {
         Ok(authorized)
     }
 
+    /// Compiles one effectful action into the proposed → authorized → receipt
+    /// sequence (I6.6).
+    ///
+    /// The action contract is first compiled into a [`ProposedEffect`] (the
+    /// proposal step: exact payload digest, operation identity, allowed
+    /// resource/effect set). The proposal is then authorized against the
+    /// lease (the authorization step: current lease/epoch/fence, executor
+    /// boundary, receipt obligations). The retained receipt starts as
+    /// [`EffectOutcome::UnknownOutcome`] — compilation authorizes the effect
+    /// but does not fabricate an observed outcome.
+    ///
+    /// The same logical request returns its original decision (idempotent
+    /// replay). A changed payload, owner namespace, executor or incompatible
+    /// binding conflicts rather than silently using the old record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_effectful_action(
+        &mut self,
+        contract: &ActionContract,
+        operation: OperationBinding,
+        operation_name: impl Into<String>,
+        resource_ref: impl Into<String>,
+        executor_boundary: impl Into<String>,
+        lease: &mut ActionLease,
+        current_work_scope: &WorkScopeBinding,
+        current_session: &SessionBinding,
+        now: LogicalTime,
+    ) -> Result<CompiledEffect, AuthorityError> {
+        let proposed = contract.compile_proposal(operation, operation_name, resource_ref)?;
+        let authorized = self.authorize(
+            lease,
+            proposed,
+            executor_boundary,
+            current_work_scope,
+            current_session,
+            now,
+        )?;
+        let receipt = EffectReceipt::unknown(
+            authorized.clone(),
+            "effect compiled; outcome pending observation",
+        )?;
+        Ok(CompiledEffect {
+            authorized,
+            receipt,
+        })
+    }
+
     /// Marks every CURRENT pending effect whose validity depended on a
     /// revoked root as contestable (first challenge) or reopened (already
     /// contested, challenged again by a new root), per I12.20 S1.
@@ -603,6 +766,52 @@ impl EffectReceipt {
             return Err(AuthorityError::InvalidLifecycleTransition);
         }
         Self::terminal(self.authorized_effect, outcome, canonical_receipt)
+    }
+}
+
+/// The compiled proposed → authorized → receipt sequence for one effectful
+/// action (I6.6).
+///
+/// The receipt starts as [`EffectOutcome::UnknownOutcome`]: compilation
+/// authorizes the effect but does not fabricate an observed outcome. The
+/// receipt transitions to a terminal outcome only through
+/// [`EffectReceipt::reconcile`] with the exact observed canonical receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledEffect {
+    authorized: AuthorizedEffect,
+    receipt: EffectReceipt,
+}
+
+impl CompiledEffect {
+    /// Returns the proposal (no authority).
+    #[must_use]
+    pub fn proposed(&self) -> &ProposedEffect {
+        &self.authorized.proposal
+    }
+
+    /// Returns the exact authorization bound to the lease and executor.
+    #[must_use]
+    pub fn authorized(&self) -> &AuthorizedEffect {
+        &self.authorized
+    }
+
+    /// Returns the retained outcome receipt (initially unknown).
+    #[must_use]
+    pub fn receipt(&self) -> &EffectReceipt {
+        &self.receipt
+    }
+
+    /// Reconciles the unknown outcome with the exact observed canonical
+    /// receipt. A terminal receipt cannot be reconciled again.
+    pub fn reconcile(
+        &mut self,
+        outcome: EffectOutcome,
+        canonical_receipt: ReceiptEnvelope,
+    ) -> Result<(), AuthorityError> {
+        let receipt = std::mem::replace(&mut self.receipt, self.receipt.clone());
+        let reconciled = receipt.reconcile(outcome, canonical_receipt)?;
+        self.receipt = reconciled;
+        Ok(())
     }
 }
 

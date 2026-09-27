@@ -484,11 +484,14 @@ fn unknown_outcome_has_no_fabricated_final_receipt() -> TestResult {
     let (scope, session, binding) = bindings(1, 1)?;
     let action = ActionContract::new(
         "action:unknown",
+        "task:unknown",
         "write an exact reversible test value",
         scope.clone(),
         "authority:test",
         ["repo:before".to_owned()],
         ["repo:write".to_owned()],
+        eliot_authority::ImpactClass::Reversible,
+        ["repo:invariant".to_owned()],
         "repo contains the test value",
         "verifier:test",
         "restore repo:before",
