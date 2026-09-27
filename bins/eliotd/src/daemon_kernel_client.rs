@@ -1930,6 +1930,14 @@ impl DaemonKernelClient {
                     && envelope.identity.capability == name
             })
         }) {
+            // Issue #1839: structured route-mismatch evidence for the live
+            // claim. The pair is rejected closed without execution.
+            let _ = crate::diagnostics::RejectionRecord::of(
+                crate::diagnostics::RejectionReason::RouteMismatch,
+                crate::diagnostics::OwningComponent::Kernel,
+                "Kernel local_read_claim returned a non-query pair",
+            )
+            .emit();
             return Err(super::DaemonError::Kernel(
                 "Kernel local_read_claim returned a pair outside the local-read tools".to_owned(),
             ));
@@ -1965,6 +1973,14 @@ impl DaemonKernelClient {
             envelope.identity.capability != "eliot.packet"
                 || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.packet")
         }) {
+            // Issue #1839: structured route-mismatch evidence for the live
+            // claim. The pair is rejected closed without execution.
+            let _ = crate::diagnostics::RejectionRecord::of(
+                crate::diagnostics::RejectionReason::RouteMismatch,
+                crate::diagnostics::OwningComponent::Kernel,
+                "Kernel campaign_packet_claim returned a non-packet pair",
+            )
+            .emit();
             return Err(super::DaemonError::Kernel(
                 "Kernel campaign_packet_claim returned a non-packet pair".to_owned(),
             ));

@@ -27,12 +27,16 @@ use eliot_protocol::{
 };
 use eliot_store_api::ScopeId;
 
-use crate::{KernelComposition, Session, TransportError, activation_deadline_expired, unix_ms};
+use crate::{
+    AuditEventDraft, KernelComposition, Session, TransportError, activation_deadline_expired,
+    unix_ms,
+};
 
 use super::{
-    DaemonReadQueue, HostRequestOperationRef, LOCAL_READ_ENQUEUE_SALT, LocalReadAdmission,
-    LocalReadAttemptState, LocalReadSubmitDisposition, MAX_QUEUED_LOCAL_READS,
-    StaleLocalReadObservation, StaleLocalReadReason, check_local_read_admission,
+    DaemonReadQueue, ExpiredClaimObservation, ExpiryRetireLane, HostRequestOperationRef,
+    LOCAL_READ_ENQUEUE_SALT, LocalReadAdmission, LocalReadAttemptState, LocalReadSubmitDisposition,
+    MAX_QUEUED_LOCAL_READS, StaleLocalReadObservation, StaleLocalReadReason,
+    check_local_read_admission,
 };
 
 impl KernelComposition {
@@ -650,6 +654,14 @@ impl KernelComposition {
             || stored.request_digest != body.request_sha256
             || stored.capability_ref.as_str() != "eliot.task-controller"
         {
+            // Issue #1839: durable audit evidence for the refused route.
+            if stored.capability_ref.as_str() != "eliot.task-controller" {
+                self.audit_observe(AuditEventDraft::route_mismatch_submit(
+                    session,
+                    &stored,
+                    "task-controller",
+                ));
+            }
             return Err(TransportError::SessionFenced);
         }
         if stored.state == HostRequestState::ResultReceived
@@ -659,7 +671,15 @@ impl KernelComposition {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
-            return Err(TransportError::Timeout);
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane: "task-controller",
+                retire: Some(ExpiryRetireLane::TaskController),
+                phase: "submit",
+                presented_attempt_id: Some(body.attempt.attempt_id.as_str()),
+                presented_generation: Some(body.attempt.fencing_generation),
+            });
         }
         let (envelope, state) = self.task_controller_queued_pair(body)?;
         if let Some(observation) = task_controller_stale_attempt(body, &state, session, &envelope) {
@@ -716,6 +736,12 @@ impl KernelComposition {
             || stored.request_digest != body.request_sha256
             || stored.capability_ref.as_str() != "eliot.finish"
         {
+            // Issue #1839: durable audit evidence for the refused route.
+            if stored.capability_ref.as_str() != "eliot.finish" {
+                self.audit_observe(AuditEventDraft::route_mismatch_submit(
+                    session, &stored, "finish",
+                ));
+            }
             return Err(TransportError::SessionFenced);
         }
         if stored.state == HostRequestState::ResultReceived
@@ -725,7 +751,15 @@ impl KernelComposition {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
-            return Err(TransportError::Timeout);
+            return self.expired_claim_timeout(ExpiredClaimObservation {
+                session: Some(session),
+                stored: &stored,
+                lane: "finish",
+                retire: Some(ExpiryRetireLane::Finish),
+                phase: "submit",
+                presented_attempt_id: Some(body.attempt.attempt_id.as_str()),
+                presented_generation: Some(body.attempt.fencing_generation),
+            });
         }
         let (envelope, state) = self.finish_queued_pair(body)?;
         if let Some(observation) = finish_stale_attempt(body, &state, session, &envelope) {

@@ -901,6 +901,9 @@ pub enum RejectionReason {
     NeedsProposal,
     /// No eligible route; typed outcome, never a local fallback.
     NoRoute,
+    /// Claimed pair route diverges from the requested lane; the pair is
+    /// rejected closed without execution (issue #1839).
+    RouteMismatch,
     /// Local wiring contract violation.
     Contract,
     /// Receipt does not bind the exact definition digest and reservation.
@@ -937,6 +940,7 @@ impl RejectionReason {
             Self::Narrowed => "narrowed",
             Self::NeedsProposal => "needs-proposal",
             Self::NoRoute => "no-route",
+            Self::RouteMismatch => "route-mismatch",
             Self::Contract => "contract",
             Self::ReceiptBinding => "receipt-binding",
             Self::DuplicateLaunch => "duplicate-launch",
