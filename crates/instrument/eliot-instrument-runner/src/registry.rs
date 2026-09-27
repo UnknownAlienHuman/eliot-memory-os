@@ -831,8 +831,31 @@ impl ProviderRegistry {
         invocation: &InstrumentInvocation,
         freshness: &RegistryFreshness<'_>,
     ) -> Result<&'a RegistryEntry, RegistryError> {
-        let entry = self.resolve(invocation)?;
-        let instrument = invocation.instrument.as_str().to_owned();
+        self.resolve_current_parts(&invocation.instrument, invocation.kind, freshness)
+    }
+
+    /// The same freshness-pinned resolution over an admitted
+    /// `(instrument, kind)` pair instead of a full invocation.
+    ///
+    /// Classification-only callers hold no invocation authority material
+    /// (no State Fence, session, or lease) and must not fabricate it to ask
+    /// whether an entry is current. The closure is byte-for-byte the
+    /// [`ProviderRegistry::resolve_current`] one over the same admitted
+    /// pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ProviderRegistry::resolve_parts`] failures plus
+    /// [`RegistryError::Stale`] for generation, normative-pair, or
+    /// fingerprint drift.
+    pub fn resolve_current_parts<'a>(
+        &'a self,
+        instrument: &ContractId,
+        kind: InstrumentKind,
+        freshness: &RegistryFreshness<'_>,
+    ) -> Result<&'a RegistryEntry, RegistryError> {
+        let entry = self.resolve_parts(instrument, kind)?;
+        let instrument = instrument.as_str().to_owned();
         if self.generation != freshness.generation || entry.generation != freshness.generation {
             return Err(RegistryError::Stale {
                 instrument,
