@@ -292,7 +292,7 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
             .into_iter()
             .map(|dimension| QualityDimensionResult {
                 dimension,
-                passed: true,
+                state: QualityDimensionState::Passed,
                 evidence: vec![id("quality-evidence")],
                 measurements: Vec::new(),
                 failed_invariant: None,

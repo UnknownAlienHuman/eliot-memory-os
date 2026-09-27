@@ -10,7 +10,7 @@ use eliot_context_contracts::{
     IntegrationCoverageProfile, LossPolicy, MeasurementRef, MeasurementStatus,
     PriorDeliveryBinding, PrivacyClass, ProofBinding, ProviderDisposition, ProviderId,
     ProviderRole, ProviderRoleDenominator, QualityDimension, QualityDimensionResult,
-    QualityScorecard, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
+    QualityDimensionState, QualityScorecard, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
     SerializedContextMeasurement, SessionDeliverySnapshot, SnapshotCompleteness,
     SnapshotDenominator, SourceSnapshot,
 };
@@ -131,7 +131,7 @@ fn quality(binding: &ContextBinding) -> QualityScorecard {
             .into_iter()
             .map(|dimension| QualityDimensionResult {
                 dimension,
-                passed: true,
+                state: QualityDimensionState::Passed,
                 evidence: vec![id("quality-evidence")],
                 measurements: Vec::new(),
                 failed_invariant: None,

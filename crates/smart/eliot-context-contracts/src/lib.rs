@@ -71,7 +71,10 @@ pub use measurement::{
     MeasurementStatus, SerializedContextMeasurement, StuEstimate, TokenizerObservation,
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
-pub use quality::{QualityDimension, QualityDimensionResult, QualityScorecard};
+pub use quality::{
+    QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult, QualityDimensionState,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+};
 pub use reactive_attention::{
     AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,
     CriticalAttentionMember, CriticalAttentionProjection,
