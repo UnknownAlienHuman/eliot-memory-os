@@ -58,3 +58,17 @@ pub use task_controller::{
     TaskControllerAction, TaskControllerAttempt, TaskControllerCampaignOwnerMaterials,
     TaskControllerInvocation, TaskControllerResultBody,
 };
+
+mod stop_boundary;
+
+pub use stop_boundary::{
+    STOP_BOUNDARY_RECORD_WIRE_ID, STOP_BOUNDARY_RECORD_WIRE_VERSION, StopBoundaryActionCoverage,
+    StopBoundaryActionPlan, StopBoundaryCoverage, StopBoundaryCoverageGap, StopBoundaryCursorState,
+    StopBoundaryCursorUnknownReason, StopBoundaryDescendant, StopBoundaryEffectDisposition,
+    StopBoundaryEnumeration, StopBoundaryEventPosition, StopBoundaryEventPositions,
+    StopBoundaryGeneration, StopBoundaryGenerationUnknownReason, StopBoundaryOperation,
+    StopBoundaryPageRef, StopBoundaryPositionState, StopBoundaryPositionUnknownReason,
+    StopBoundaryRecord, StopBoundaryRequiredAction, StopBoundarySourceBinding,
+    StopBoundarySourceContent, StopBoundarySourceContentAbsence,
+    StopBoundarySourceContentUnknownReason, StopBoundarySourceCursor,
+};
