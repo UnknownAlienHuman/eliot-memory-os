@@ -103,8 +103,8 @@ pub use store::{
 };
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, VersionedArtifact,
-    VersionedArtifactCutoverRecord, VersionedArtifactRegistry, VersionedArtifactRetirement,
-    VersionedArtifactStatus,
+    VersionedArtifactCutoverRecord, VersionedArtifactEntry, VersionedArtifactRegistry,
+    VersionedArtifactRetirement, VersionedArtifactStatus,
 };
 
 /// Stable wire/storage contract version for this crate.
