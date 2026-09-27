@@ -34,6 +34,7 @@ use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use eliot_instrument_scip::{MAX_SCIP_BYTES, SCIP_INSTRUMENT};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Recorded normalizer/parser/evaluator authority for adapters that own no parser.
@@ -1207,7 +1208,8 @@ fn dotnet_entry(
 /// before any child process is created. Parser and profile generations stay
 /// replaceable through ordinary module/daemon cutover: a new generation
 /// ships a new receipt, never a Rust DLL ABI.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupplyChainReceipt {
     /// Instrument contract identity the receipt pins.
     pub instrument: ContractId,
@@ -1273,6 +1275,35 @@ impl SupplyChainReceipt {
             spec_digest,
             generation,
         })
+    }
+
+    /// Pins one supply-chain receipt from a machine-derived observation.
+    ///
+    /// The machine owner observes the admitted executable file, then pins the
+    /// observed content digest and tool version against the admitted spec
+    /// digest at this generation. An unobserved tool version passes through
+    /// as `None`: no version is attested on that path, so none is claimed,
+    /// while a pinned version still gates at launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnresolvedExecutable`] when the executable
+    /// identity, observed digest, spec digest, or version text is malformed.
+    pub fn from_observation(
+        instrument: ContractId,
+        executable: String,
+        identity: &ResolvedExecutableIdentity,
+        spec_digest: String,
+        generation: u64,
+    ) -> Result<Self, RegistryError> {
+        Self::new(
+            instrument,
+            executable,
+            identity.content_digest.clone(),
+            identity.tool_version.clone(),
+            spec_digest,
+            generation,
+        )
     }
 
     /// Registry key: the admitted instrument contract name.
@@ -1377,6 +1408,11 @@ impl SupplyChainTable {
     /// Looks up the admitted receipt for one instrument contract name.
     pub fn get(&self, instrument: &str) -> Option<&SupplyChainReceipt> {
         self.receipts.get(instrument)
+    }
+
+    /// Admitted receipts in sorted instrument-identity order.
+    pub fn receipts(&self) -> Vec<&SupplyChainReceipt> {
+        self.receipts.values().collect()
     }
 
     /// Deterministic identity over the admitted receipts.

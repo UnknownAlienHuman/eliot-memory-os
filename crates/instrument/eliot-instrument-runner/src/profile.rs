@@ -22,6 +22,7 @@ use eliot_instrument_cargo::CONTRACT_NAME as CARGO_CONTRACT_NAME;
 use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::registry::{ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable};
@@ -71,6 +72,10 @@ pub const ISOLATED_NETWORK_POLICY: &str = "eliot.policy.network.isolated-process
 /// it with its own semaphore and circuit state. A system-wide pool never
 /// overrides the module limit, so no global pool exists here.
 pub const BUILTIN_MAX_CONCURRENCY: u32 = 1;
+/// Stable schema name of the canonical registry snapshot.
+pub const REGISTRY_SNAPSHOT_SCHEMA: &str = "eliot.instrument.registry-snapshot";
+/// Exact schema wire version of the canonical registry snapshot.
+pub const REGISTRY_SNAPSHOT_SCHEMA_VERSION: &str = "1.0.0";
 
 /// Failures raised while admitting, resolving, or compiling profiles.
 ///
@@ -196,6 +201,12 @@ pub enum ProfileError {
     /// A contract identity failed validation while assembling definitions.
     #[error(transparent)]
     Contract(#[from] ContractError),
+    /// A registry snapshot is malformed or names an unsupported schema.
+    #[error("registry snapshot is malformed: {detail}")]
+    Snapshot {
+        /// How the snapshot fails shape or schema validation.
+        detail: String,
+    },
 }
 
 /// Validates one required text value.
@@ -225,7 +236,8 @@ const fn kind_rank(kind: InstrumentKind) -> u8 {
 /// Module/Instrument manifest without changing this enum, the Kernel, or
 /// any coarse invocation class. Each class projects to exactly one coarse
 /// [`InstrumentKind`] for stage binding.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum InstrumentClass {
     /// Source identity and version-control observation.
     SourceIdentity,
@@ -280,7 +292,8 @@ impl InstrumentClass {
 /// replaceable concrete kind, so a new kind generation is admitted as a new
 /// identifier rather than a mutation. Unregistered kind IDs fail before
 /// launch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstrumentKindId {
     /// Opaque kind name, keyed by the admitting registry.
     name: ContractId,
@@ -327,7 +340,8 @@ impl InstrumentKindId {
 /// bound of its own. A present value is the admitted ceiling the grant binds;
 /// enforcement stays with the plane that owns the process, never with a
 /// global pool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     /// Admitted wall-clock ceiling in milliseconds, when the spec sets one.
     pub timeout_ms: Option<u64>,
@@ -407,7 +421,8 @@ pub struct InstrumentSpecParams {
 /// carries command text or agent-supplied combinations: stages resolve to
 /// typed invocations validated against this admission before any child
 /// process is created.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstrumentSpec {
     /// Opaque versioned kind identity.
     pub kind: InstrumentKindId,
@@ -503,7 +518,8 @@ impl InstrumentSpec {
 }
 
 /// One declared profile stage with durable identity and dependencies.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageDecl {
     /// Durable stage identity within the profile revision.
     pub stage_id: String,
@@ -556,7 +572,8 @@ impl StageDecl {
 /// Stages are keyed by durable identity in a [`BTreeMap`], so iteration order
 /// is sorted and stable. Construction rejects duplicates, dangling
 /// dependencies, self-dependencies, and cycles before anything executes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageDag {
     stages: BTreeMap<String, StageDecl>,
 }
@@ -730,7 +747,8 @@ impl<'a> IntoIterator for &'a StageDag {
 }
 
 /// Declared scope classes carried by one [`InstrumentProfile`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileScopeClasses {
     /// Target layout class; exact roots bind at resolve time.
     pub target_layout: String,
@@ -769,7 +787,8 @@ impl ProfileScopeClasses {
 /// classes. Exact revisions, roots, fences, and environment projections bind
 /// at resolve time through [`InstrumentProfileResolver`]; the profile text
 /// itself never names a concrete path, command, or task.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstrumentProfile {
     /// Canonical profile name, such as `compiler` or `test`.
     pub name: String,
@@ -1243,6 +1262,172 @@ impl InstrumentRegistry {
         material.push('\0');
         sha256_hex(material.as_bytes())
     }
+
+    /// Persists the admitted specs, profiles, receipts, and generation.
+    ///
+    /// The snapshot carries every admitted definition in sorted-identity
+    /// order, so the same registry always persists to the same bytes. The
+    /// bytes travel to durable storage through the Governor write path,
+    /// which owns canonical-store authority; this registry never writes
+    /// canonical state itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Snapshot`] when the snapshot cannot be
+    /// encoded.
+    pub fn persist(&self) -> Result<String, ProfileError> {
+        let snapshot = InstrumentRegistrySnapshot {
+            schema: REGISTRY_SNAPSHOT_SCHEMA.to_owned(),
+            version: REGISTRY_SNAPSHOT_SCHEMA_VERSION.to_owned(),
+            generation: self.generation,
+            specs: self.specs.values().cloned().collect(),
+            profiles: self.profiles.values().cloned().collect(),
+            receipts: self.supply_chain.receipts().into_iter().cloned().collect(),
+        };
+        serde_json::to_string(&snapshot).map_err(|error| ProfileError::Snapshot {
+            detail: error.to_string(),
+        })
+    }
+
+    /// Recovers a registry persisted by [`InstrumentRegistry::persist`].
+    ///
+    /// Recovery treats the snapshot as untrusted input: the schema identity
+    /// is checked first, then every spec, stage, profile, and receipt is
+    /// rebuilt through its validated constructor, and the rebuilt
+    /// definitions are re-admitted through [`InstrumentRegistry::build`], so
+    /// orphan receipts, spec drift, generation mismatch, and cyclic stage
+    /// graphs fail closed here exactly as they do at first admission. A
+    /// receipt admitted at generation N is therefore recovered and
+    /// re-validated at generation N+1 instead of being trusted blindly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Snapshot`] when the bytes are malformed or
+    /// name an unsupported schema, or the admission error when a rebuilt
+    /// definition fails validation.
+    pub fn recover(encoded: &str) -> Result<Self, ProfileError> {
+        let snapshot: InstrumentRegistrySnapshot =
+            serde_json::from_str(encoded).map_err(|error| ProfileError::Snapshot {
+                detail: error.to_string(),
+            })?;
+        if snapshot.schema != REGISTRY_SNAPSHOT_SCHEMA
+            || snapshot.version != REGISTRY_SNAPSHOT_SCHEMA_VERSION
+        {
+            return Err(ProfileError::Snapshot {
+                detail: format!(
+                    "unsupported registry snapshot '{}@{}'",
+                    snapshot.schema, snapshot.version
+                ),
+            });
+        }
+        let mut specs = Vec::with_capacity(snapshot.specs.len());
+        for spec in snapshot.specs {
+            specs.push(rebuild_spec(spec)?);
+        }
+        let mut profiles = Vec::with_capacity(snapshot.profiles.len());
+        for profile in snapshot.profiles {
+            profiles.push(rebuild_profile(profile)?);
+        }
+        let mut receipts = Vec::with_capacity(snapshot.receipts.len());
+        for receipt in snapshot.receipts {
+            receipts.push(rebuild_receipt(receipt)?);
+        }
+        Self::build(specs, profiles, snapshot.generation, receipts)
+    }
+}
+
+/// Versioned durable form of the canonical admission registry (I10.8.1).
+///
+/// The snapshot persists the admitted [`InstrumentSpec`] definitions,
+/// [`InstrumentProfile`] definitions, and executable
+/// [`SupplyChainReceipt`]s at one registry generation. Profiles travel
+/// alongside specs and receipts because recovery re-admits the whole
+/// registry through [`InstrumentRegistry::build`]: without the profiles the
+/// recovered registry could admit no stage graph at generation N+1.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistrySnapshot {
+    /// Stable snapshot schema name.
+    pub schema: String,
+    /// Exact snapshot schema wire version.
+    pub version: String,
+    /// Registry generation the admission was validated against.
+    pub generation: u64,
+    /// Admitted spec definitions in sorted kind-identity order.
+    pub specs: Vec<InstrumentSpec>,
+    /// Admitted profile definitions in sorted name/revision order.
+    pub profiles: Vec<InstrumentProfile>,
+    /// Admitted supply-chain receipts in sorted instrument-identity order.
+    pub receipts: Vec<SupplyChainReceipt>,
+}
+
+/// Rebuilds one deserialized spec through its validated constructor.
+fn rebuild_spec(spec: InstrumentSpec) -> Result<InstrumentSpec, ProfileError> {
+    let kind = InstrumentKindId::new(
+        ContractId::new(spec.kind.as_str().to_owned())?,
+        spec.kind.version(),
+    )?;
+    InstrumentSpec::new(InstrumentSpecParams {
+        kind,
+        class: spec.class,
+        revision: spec.revision,
+        executable: spec.executable,
+        executable_version: spec.executable_version,
+        parser: spec.parser,
+        parser_generation: spec.parser_generation,
+        environment_profile: spec.environment_profile,
+        schema: spec.schema,
+        argument_template: spec.argument_template,
+        credential_policy: spec.credential_policy,
+        network_policy: spec.network_policy,
+        limits: spec.limits,
+        max_concurrency: spec.max_concurrency,
+    })
+}
+
+/// Rebuilds one deserialized profile through its validated constructors.
+fn rebuild_profile(profile: InstrumentProfile) -> Result<InstrumentProfile, ProfileError> {
+    let stages: Vec<StageDecl> = profile.dag.stages.into_values().collect();
+    let mut decls = Vec::with_capacity(stages.len());
+    for stage in stages {
+        decls.push(StageDecl::new(
+            stage.stage_id,
+            stage.spec,
+            stage.kind,
+            stage.depends_on,
+            stage.required,
+            stage.external,
+        )?);
+    }
+    let dag = StageDag::build(&profile.name, decls)?;
+    let classes = ProfileScopeClasses::new(
+        profile.classes.target_layout,
+        profile.classes.environment,
+        profile.classes.workscope,
+    )?;
+    InstrumentProfile::new(
+        profile.name,
+        profile.revision,
+        profile.spec_revision,
+        profile.kinds,
+        dag,
+        classes,
+    )
+}
+
+/// Rebuilds one deserialized receipt through its validated constructor.
+fn rebuild_receipt(receipt: SupplyChainReceipt) -> Result<SupplyChainReceipt, ProfileError> {
+    SupplyChainReceipt::new(
+        receipt.instrument,
+        receipt.executable,
+        receipt.content_digest,
+        receipt.tool_version,
+        receipt.spec_digest,
+        receipt.generation,
+    )
+    .map_err(|error| ProfileError::Snapshot {
+        detail: error.to_string(),
+    })
 }
 
 /// Target layout bound at resolve time: admitted roots, never profile text.
