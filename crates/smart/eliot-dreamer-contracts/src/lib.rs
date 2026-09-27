@@ -56,8 +56,9 @@ pub use bundle::{
     SourceDisposition, omit_handle,
 };
 pub use candidate::{
-    CandidateDisposition, CandidateProposal, CandidateResult, PRESERVATION_DIMENSIONS,
-    PreservationDimension, PreservationReport, propose_candidate,
+    CandidateDisposition, CandidateEvidenceBinding, CandidateEvidenceReferenceBinding,
+    CandidateProposal, CandidateResult, PRESERVATION_DIMENSIONS, PreservationDimension,
+    PreservationReport, propose_candidate,
 };
 pub use classification::{
     AdmittedTargetRef, ClassificationAssignmentSnapshot, ClassificationCandidate,

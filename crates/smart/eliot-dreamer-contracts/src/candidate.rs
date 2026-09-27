@@ -8,6 +8,7 @@
 //! independent dimensions with no averaging: one failed or unknown dimension
 //! fails the whole report.
 
+use eliot_evidence::EvidentiaryReference;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -253,6 +254,120 @@ impl CandidateResult {
             check_text(handle, "source_handles", 128)?;
         }
         self.preservation.overall()?;
+        Ok(())
+    }
+
+    /// Binds exact source references to every existing source handle.
+    ///
+    /// This is an explicit evidence-bearing view of a candidate. The base
+    /// candidate remains inert and is not silently upgraded by adding prose.
+    pub fn bind_evidentiary_references(
+        &self,
+        evidentiary_references: Vec<CandidateEvidenceReferenceBinding>,
+    ) -> Result<CandidateEvidenceBinding, ContractViolation> {
+        let binding = CandidateEvidenceBinding {
+            candidate: self.clone(),
+            evidentiary_references,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+}
+
+/// Candidate content and the exact frozen references that justify its handles.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateEvidenceBinding {
+    /// Inert candidate whose source handles are resolved below.
+    pub candidate: CandidateResult,
+    /// Exact, revision-bound references for those handles.
+    pub evidentiary_references: Vec<CandidateEvidenceReferenceBinding>,
+}
+
+/// Explicit mapping from an existing candidate handle to a typed reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateEvidenceReferenceBinding {
+    /// Existing opaque source handle carried by the candidate.
+    pub source_handle: String,
+    /// Frozen source reference resolved by that handle.
+    pub reference: EvidentiaryReference,
+}
+
+impl CandidateEvidenceBinding {
+    /// Validates the candidate and requires an exact reference for every handle.
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        self.candidate.validate()?;
+        if self.evidentiary_references.len() != self.candidate.source_handles.len() {
+            return Err(ContractViolation::BindingMismatch {
+                field: "candidate.evidentiary_references",
+                reason: "each source handle must resolve to one exact evidentiary reference"
+                    .to_owned(),
+            });
+        }
+
+        for (index, evidence_binding) in self.evidentiary_references.iter().enumerate() {
+            evidence_binding.reference.validate_load_bearing()?;
+            check_text(
+                &evidence_binding.source_handle,
+                "candidate.evidentiary_references.source_handle",
+                128,
+            )?;
+            if evidence_binding.reference.scope != self.candidate.scope_id {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.evidentiary_references.scope",
+                    reason: "reference scope must equal the candidate scope".to_owned(),
+                });
+            }
+            if self.evidentiary_references[..index]
+                .iter()
+                .any(|prior| prior.source_handle == evidence_binding.source_handle)
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.evidentiary_references.source_handle",
+                    reason: "candidate source handles must be bound exactly once".to_owned(),
+                });
+            }
+            if self.evidentiary_references[..index].iter().any(|prior| {
+                prior.reference.reference_id == evidence_binding.reference.reference_id
+            }) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.evidentiary_references.reference_id",
+                    reason: "reference identities must be unique".to_owned(),
+                });
+            }
+            if !self
+                .candidate
+                .source_handles
+                .iter()
+                .any(|handle| handle == &evidence_binding.source_handle)
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.evidentiary_references.source_handle",
+                    reason: "binding names a source handle absent from the candidate".to_owned(),
+                });
+            }
+        }
+        for (index, handle) in self.candidate.source_handles.iter().enumerate() {
+            if self.candidate.source_handles[..index].contains(handle) {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.source_handles",
+                    reason: "candidate source handles must be distinct for one-to-one binding"
+                        .to_owned(),
+                });
+            }
+            if !self
+                .evidentiary_references
+                .iter()
+                .any(|binding| &binding.source_handle == handle)
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "candidate.source_handles",
+                    reason: "every candidate source handle must resolve to one exact reference"
+                        .to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 }

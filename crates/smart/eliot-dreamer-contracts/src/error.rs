@@ -92,6 +92,9 @@ pub fn sorted_set_eq(left: &[String], right: &[String]) -> bool {
 /// Closed validation failure for any Dreamer contract shape in this crate.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ContractViolation {
+    /// Typed validation failure from the shared evidentiary-reference contract.
+    #[error(transparent)]
+    Evidence(#[from] eliot_evidence::EvidenceError),
     /// A closed enum received an unknown wire spelling.
     #[error("unknown variant for {field}: {value}")]
     UnknownVariant {

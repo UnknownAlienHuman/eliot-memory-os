@@ -17,6 +17,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod evidentiary_reference;
+pub use evidentiary_reference::{
+    DependentReviewRoute, EvidenceRendering, EvidenceWeight, EvidentiaryReference,
+    FaithfulnessEvaluationRecord, FaithfulnessOutcome, FrozenSourceRevision, SourceAnchor,
+};
+
 /// Stable identity of this contract surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.evidence";
 /// Current wire revision of this contract surface.
