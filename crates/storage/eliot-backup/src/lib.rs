@@ -1732,11 +1732,10 @@ fn validate_journal_record(
             if intent.transaction_id != transaction.transaction_id
                 || intent.phase != record.phase
                 || record.receipt.is_some()
-                || intent.input_digest
-                    != sha256(&(transaction.transaction_id.as_str(), &record.phase))?
             {
                 return Err(BackupError::RestoreJournalCorrupt);
             }
+            validate_resumed_intent(transaction, record)?;
         }
         RestoreJournalState::ReceiptPersisted => {
             let intent = record
@@ -1756,11 +1755,20 @@ fn validate_journal_record(
             {
                 return Err(BackupError::RestoreJournalCorrupt);
             }
+            // A stored intent is never accepted because it agrees with another
+            // stored digest: it is re-derived from the current plan-derived
+            // transaction and this record's phase (issue #949, PR #2492).
+            validate_resumed_intent(transaction, record)?;
             validate_effect_receipt(intent, receipt)?;
-            if matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
-                && record.final_receipt.is_none()
-            {
-                return Err(BackupError::RestoreJournalCorrupt);
+            // The final phase carries the isolated restore receipt. It is
+            // revalidated here, before this row advances to `Completed` and
+            // before any caller can observe it (issue #949, PR #2492).
+            if matches!(record.phase, RestorePhase::FinalizeIsolatedRoot) {
+                let final_receipt = record
+                    .final_receipt
+                    .as_ref()
+                    .ok_or(BackupError::RestoreJournalCorrupt)?;
+                validate_resumed_final_receipt(plan, bundle, transaction, receipt, final_receipt)?;
             }
         }
         RestoreJournalState::Completed => {
@@ -1778,16 +1786,96 @@ fn validate_journal_record(
             {
                 return Err(BackupError::RestoreJournalCorrupt);
             }
+            validate_resumed_intent(transaction, record)?;
         }
     }
     Ok(())
 }
 
+/// Binds a resumed stored intent to the intent the current plan derives.
+///
+/// A stored intent cannot authenticate itself: agreement between two stored
+/// `input_digest` values (or a lone stored digest) is not the plan binding this
+/// executor requires. Every resumed state that carries an intent —
+/// `IntentPersisted`, `ReceiptPersisted`, `Completed` and `RollbackRequired` —
+/// is therefore re-derived through the same [`restore_intent`] derivation the
+/// fresh `Ready` path writes, using the current transaction and the record's
+/// own phase. A self-consistent but wrong digest is refused before any further
+/// target call or journal advancement (issue #949, PR #2492).
+fn validate_resumed_intent(
+    transaction: &RestoreTransaction,
+    record: &RestoreJournalRecord,
+) -> Result<(), BackupError> {
+    let expected = restore_intent(transaction, &record.phase)?;
+    let intent = record
+        .intent
+        .as_ref()
+        .ok_or(BackupError::RestoreJournalCorrupt)?;
+    if *intent != expected {
+        return Err(BackupError::RestoreJournalCorrupt);
+    }
+    Ok(())
+}
+
+/// Revalidates a resumed final `RestoreReceipt` for this executor.
+///
+/// `effect_receipt_sha256` hashes the separate effect receipt and therefore
+/// covers none of `cutover_performed`, `operational_recovery_ready` or
+/// `canonical_only`: a `Completed` row could otherwise return a receipt whose
+/// own validator rejects it (issue #949, PR #2492). Every resumed final
+/// receipt — a final `ReceiptPersisted` row before it advances and a
+/// `Completed` row before it is returned — is therefore passed through its
+/// owner validator [`RestoreReceipt::validate`] and this executor's exact
+/// restrictions are re-derived from the current plan rather than trusted:
+/// the expected receipt identity, the current bundle, plan, destination and
+/// restored fence, the exact stored effect receipt, the class proof level, and
+/// `canonical_only` as the requested class requires, with no cutover and no
+/// operational readiness (I5.13: cutover requires separate authority).
+fn validate_resumed_final_receipt(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
+    transaction: &RestoreTransaction,
+    effect_receipt: &RestoreEffectReceipt,
+    final_receipt: &RestoreReceipt,
+) -> Result<(), BackupError> {
+    final_receipt.validate()?;
+    if final_receipt.receipt_id != restore_receipt_id(plan)
+        || final_receipt.bundle_sha256 != transaction.bundle_sha256
+        || final_receipt.plan_id != plan.plan_id
+        || final_receipt.target_id != plan.target.target_id
+        || final_receipt.restored_fence != plan.restored_fence
+        || final_receipt.effect_receipt_sha256 != sha256(effect_receipt)?
+        || final_receipt.evidence_level != RestoreEvidenceLevel::for_class(bundle.manifest.class)
+        || final_receipt.canonical_only != executor_canonical_only(bundle.manifest.class)
+        || final_receipt.cutover_performed
+        || final_receipt.operational_recovery_ready
+    {
+        return Err(BackupError::RestoreJournalMismatch);
+    }
+    Ok(())
+}
+
+/// The identity of the isolated restore receipt this executor issues for one
+/// plan. A resumed receipt must carry exactly this identity.
+fn restore_receipt_id(plan: &RestorePlan) -> String {
+    format!("restore-receipt-{}", plan.plan_id)
+}
+
+/// The `canonical_only` value this executor derives from the requested backup
+/// class. It is never read back from a stored receipt (I5.13: a degraded or
+/// scope archive preserves semantic data only and is never advertised as
+/// operational recovery).
+const fn executor_canonical_only(class: BackupClass) -> bool {
+    !matches!(class, BackupClass::FullRecovery)
+}
+
 /// Binds a resumed `Completed` record to the current plan. A stored record
 /// cannot authenticate itself by bundle digest alone: the stored
 /// intent/receipt must bind the current transaction and final phase, and the
-/// final receipt must bind the current plan, destination, restored fence, and
-/// class proof level (issue #949). A forged foreign intent/receipt pair that
+/// final receipt must pass its own validator and bind the current plan,
+/// destination, restored fence, class proof level, class-correct
+/// `canonical_only` and the executor's no-cutover / no-readiness restriction
+/// (issue #949, PR #2492). A forged foreign intent/receipt pair that
 /// agrees with each other still fails here.
 fn validate_completed_record(
     plan: &RestorePlan,
@@ -1815,25 +1903,14 @@ fn validate_completed_record(
         .receipt
         .as_ref()
         .ok_or(BackupError::RestoreJournalCorrupt)?;
-    if intent.transaction_id != transaction.transaction_id
-        || intent.phase != record.phase
-        || intent.input_digest != sha256(&(transaction.transaction_id.as_str(), &record.phase))?
-        || effect_receipt.transaction_id != transaction.transaction_id
+    validate_resumed_intent(transaction, record)?;
+    if effect_receipt.transaction_id != transaction.transaction_id
         || effect_receipt.phase != record.phase
     {
         return Err(BackupError::RestoreJournalCorrupt);
     }
     validate_effect_receipt(intent, effect_receipt)?;
-    if final_receipt.bundle_sha256 != transaction.bundle_sha256
-        || final_receipt.plan_id != plan.plan_id
-        || final_receipt.target_id != plan.target.target_id
-        || final_receipt.restored_fence != plan.restored_fence
-        || final_receipt.effect_receipt_sha256 != sha256(effect_receipt)?
-        || final_receipt.evidence_level != RestoreEvidenceLevel::for_class(bundle.manifest.class)
-    {
-        return Err(BackupError::RestoreJournalMismatch);
-    }
-    Ok(())
+    validate_resumed_final_receipt(plan, bundle, transaction, effect_receipt, final_receipt)
 }
 
 fn restore_intent(
@@ -1943,14 +2020,14 @@ fn validate_applied_effect(
     }
     evidence.validate_against_plan(plan, bundle)?;
     Ok(Some(RestoreReceipt {
-        receipt_id: format!("restore-receipt-{}", plan.plan_id),
+        receipt_id: restore_receipt_id(plan),
         plan_id: plan.plan_id.clone(),
         bundle_sha256: transaction.bundle_sha256.clone(),
         target_id: plan.target.target_id.clone(),
         restored_fence: plan.restored_fence.clone(),
         effect_receipt_sha256: sha256(&applied.receipt)?,
         evidence_level: RestoreEvidenceLevel::for_class(bundle.manifest.class),
-        canonical_only: bundle.manifest.class != BackupClass::FullRecovery,
+        canonical_only: executor_canonical_only(bundle.manifest.class),
         operational_recovery_ready: false,
         cutover_performed: false,
     }))
