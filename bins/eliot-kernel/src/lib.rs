@@ -51,6 +51,11 @@ mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
+/// Kernel problem-diagnostic projection (issue #1844; I16.7): the bounded
+/// `LogWindowRef`/`DiagnosticBrief` compiler over the canonical audit chain
+/// and the captured operational log windows. It emits references, gaps, and
+/// one next step, never rolling log content and never an assigned cause.
+pub mod diagnostic_brief;
 /// Kernel-owned durable audit evidence (issue #1837; I16): the single
 /// BLAKE3-chained audit chain plus the single Watchdog-domain anchor sink.
 /// Every authority/lifecycle boundary appends through the composition's
