@@ -2035,6 +2035,7 @@ dependencies = [
  "eliot-kernel-core",
  "eliot-kernel-service",
  "eliot-notify",
+ "eliot-notify-core",
  "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
@@ -2690,6 +2691,7 @@ dependencies = [
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "eliot-config",
  "eliot-contracts",
  "eliot-kernel-core",

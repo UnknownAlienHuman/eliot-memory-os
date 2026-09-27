@@ -24,11 +24,12 @@ use eliot_notify_core::{
     NotificationStateRequest, NotificationStateResponse, NotifyCore, OneShotLedgerPort,
     ResolutionAuthorization, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
     UserAutomationInvocation, UserAutomationPreflightProjection, VerificationPorts,
-    WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN,
-    WATCHDOG_SOURCE_ID, WatchdogSignaturePort, validate_fallback_envelope_size,
-    validate_fallback_freshness, watchdog_notification_id, watchdog_request_hash,
-    watchdog_request_id, watchdog_signature_payload,
+    WATCHDOG_PRODUCT_ID, WATCHDOG_SOURCE_ID, WatchdogSignaturePort,
+    validate_fallback_envelope_size, validate_fallback_freshness, watchdog_notification_id,
+    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
 };
+#[cfg(test)]
+use eliot_notify_core::{WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN};
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
     PortOutcome, ProviderError, ProviderErrorCode, UnknownReason, WorkScopePath,
@@ -1483,7 +1484,7 @@ pub fn load_kernel_verification_ports() -> Result<VerificationPorts, NotifyBuild
     Ok(verification_ports_from_exchange(client))
 }
 
-const FALLBACK_VERIFIER_RELATIVE: &str = "Eliot/notify/watchdog-verification.json";
+use eliot_notify_core::NOTIFY_FALLBACK_VERIFIER_RELATIVE as FALLBACK_VERIFIER_RELATIVE;
 pub(crate) const FALLBACK_LEDGER_RELATIVE: &str = "Eliot/notify/watchdog-ledger.json";
 const FALLBACK_ENVELOPE_RELATIVE: &str = "Eliot/notify/watchdog-fallback-envelope.json";
 pub(crate) const FALLBACK_BYTES_LIMIT: u64 = 64 * 1024;

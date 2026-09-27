@@ -8,8 +8,14 @@
 
 #![forbid(unsafe_code)]
 
+mod notify_declaration;
 mod user_automation;
 
+pub use notify_declaration::{
+    FallbackVerificationDeclaration, NOTIFY_FALLBACK_VERIFIER_RELATIVE, NotifyDeclarationError,
+    NotifyDeclarationInputs, RenderedNotifyDeclaration, decode_fallback_key_hex,
+    render_notify_fallback_declaration, validate_fallback_declaration,
+};
 pub use user_automation::{
     UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
     UserAutomationFailureNotification, UserAutomationFailureRequest, UserAutomationInvocation,
