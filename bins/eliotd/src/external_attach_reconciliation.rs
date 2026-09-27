@@ -2,7 +2,7 @@
 //! (issue #1782, I11.11 lines 25 and 27-42).
 //!
 //! I11.11 line 25, verbatim: "`Start work` first exposes the
-//! `WorkScopeCandidateSet`, ScopeBindingGuard and
+//! `WorkScopeCandidateSet`, `ScopeBindingGuard` and
 //! `OnboardingReadinessReceipt`; it cannot hide an ambiguous clone, missing
 //! task or conflicting governing document behind an automatic agent launch."
 //! I11.11 line 27, verbatim: "Attaching an already-running external agent does
@@ -88,18 +88,18 @@ use eliot_workscope::{
 pub const EXTERNAL_ATTACH_RECONCILIATION_REQUIRED: &str = "EXTERNAL_ATTACH_RECONCILIATION_REQUIRED";
 
 /// Rejects one free-form reference: non-blank and free of control characters.
-fn reference(field: &'static str, value: &str) -> Result<String, BridgeError> {
+fn reference(field: &'static str, value: &str) -> Result<String, Box<BridgeError>> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
-        return Err(BridgeError::InvalidContract {
+        return Err(Box::new(BridgeError::InvalidContract {
             field,
             reason: "reference must be non-blank and free of control characters",
-        });
+        }));
     }
     Ok(value.to_owned())
 }
 
 /// Rejects one duplicate-bearing reference collection.
-fn references(field: &'static str, values: &[String]) -> Result<(), BridgeError> {
+fn references(field: &'static str, values: &[String]) -> Result<(), Box<BridgeError>> {
     for value in values {
         reference(field, value)?;
     }
@@ -107,10 +107,10 @@ fn references(field: &'static str, values: &[String]) -> Result<(), BridgeError>
     unique.sort_unstable();
     unique.dedup();
     if unique.len() != values.len() {
-        return Err(BridgeError::InvalidContract {
+        return Err(Box::new(BridgeError::InvalidContract {
             field,
             reason: "reference collection must not contain duplicates",
-        });
+        }));
     }
     Ok(())
 }
@@ -141,12 +141,12 @@ impl PreAttachBlindInterval {
     pub fn new(
         last_observation_boundary_unix_ms: u64,
         attach_unix_ms: u64,
-    ) -> Result<Self, BridgeError> {
+    ) -> Result<Self, Box<BridgeError>> {
         if attach_unix_ms <= last_observation_boundary_unix_ms {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "attach_time_and_pre_attach_blind_interval",
                 reason: "attach time must be after the last observation boundary",
-            });
+            }));
         }
         Ok(Self {
             last_observation_boundary_unix_ms,
@@ -179,7 +179,7 @@ pub struct ExternalAgentIdentity {
 }
 
 impl ExternalAgentIdentity {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         reference(
             "external_process_session_route_and_actual_identity.external_process_ref",
             &self.external_process_ref,
@@ -225,7 +225,7 @@ pub struct ObservedAttachCandidates {
 }
 
 impl ObservedAttachCandidates {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         reference(
             "observed_workspace_instance_scope_and_task_candidates.candidate_set.observed_root_ref",
             &self.candidate_set.observed_root_ref,
@@ -251,7 +251,7 @@ pub struct WorkspaceArtifactDelta {
 }
 
 impl WorkspaceArtifactDelta {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         reference(
             "last_known_base_and_current_workspace_artifact_delta.last_known_base_ref",
             &self.last_known_base_ref,
@@ -310,7 +310,7 @@ pub struct ImportedPreAttachCoverage {
 }
 
 impl ImportedPreAttachCoverage {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         references(
             "imported_transcript_event_and_tool_coverage.transcript_event_refs",
             &self.transcript_event_refs,
@@ -347,7 +347,7 @@ pub struct ExternalEffectDisposition {
 }
 
 impl ExternalEffectDisposition {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         references(
             "known_unknown_or_unattributed_external_effects.known_unattributed_effect_refs",
             &self.known_unattributed_effect_refs,
@@ -385,7 +385,7 @@ pub struct ScopeAuthorityDisposition {
 }
 
 impl ScopeAuthorityDisposition {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         self.scope_binding
             .validate()
             .map_err(|_error| BridgeError::InvalidContract {
@@ -422,7 +422,7 @@ pub enum PendingAttachAction {
 }
 
 impl PendingAttachAction {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         match self {
             Self::NoneRequired => Ok(()),
             Self::Verification { verification_refs } => references(
@@ -436,7 +436,8 @@ impl PendingAttachAction {
             Self::HumanDecision { decision_ref } => reference(
                 "required_verification_cleanup_or_human_decision.decision_ref",
                 decision_ref,
-            ),
+            )
+            .map(|_| ()),
         }
     }
 }
@@ -467,7 +468,7 @@ pub struct ContinuationDisposition {
 }
 
 impl ContinuationDisposition {
-    fn validate(&self) -> Result<(), BridgeError> {
+    fn validate(&self) -> Result<(), Box<BridgeError>> {
         let new_attempt_ref = match &self.new_attempt_ref {
             Some(value) => {
                 reference(
@@ -485,10 +486,10 @@ impl ContinuationDisposition {
             ContinuationKind::NewBoundedAttempt => new_attempt_ref.is_some(),
         };
         if !consistent {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "continuation_kind_and_new_attempt_identity",
                 reason: "a new attempt identity is present exactly for a new bounded attempt",
-            });
+            }));
         }
         Ok(())
     }
@@ -574,7 +575,7 @@ impl ExternalAttachReconciliationReceipt {
     /// The continuation/attempt-identity pairing and the blind interval are
     /// checked here, so a decoded or reconstructed receipt cannot claim an
     /// attributed continuation without an established owner.
-    pub fn validate(&self) -> Result<(), BridgeError> {
+    pub fn validate(&self) -> Result<(), Box<BridgeError>> {
         self.external_process_session_route_and_actual_identity
             .validate()?;
         if self
@@ -584,10 +585,10 @@ impl ExternalAttachReconciliationReceipt {
                 .attach_time_and_pre_attach_blind_interval
                 .last_observation_boundary_unix_ms
         {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "attach_time_and_pre_attach_blind_interval",
                 reason: "attach time must be after the last observation boundary",
-            });
+            }));
         }
         self.observed_workspace_instance_scope_and_task_candidates
             .validate()?;
@@ -612,16 +613,16 @@ impl ExternalAttachReconciliationReceipt {
             || standing.is_task_completion()
             || standing.is_agent_attributed_experience()
         {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "imported_transcript_event_and_tool_coverage",
                 reason: "pre-attach coverage is candidate material and can never be proof, task completion, or agent-attributed experience",
-            });
+            }));
         }
         if self.admits_material_continuation() && !self.ownership_established() {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "continuation_kind_and_new_attempt_identity",
                 reason: "an attributed continuation requires established process/session and workspace ownership",
-            });
+            }));
         }
         Ok(())
     }
@@ -694,7 +695,7 @@ pub struct ExternalAttachObservation {
 /// unrequested.
 pub fn reconcile_external_attach(
     observation: &ExternalAttachObservation,
-) -> Result<ExternalAttachReconciliationReceipt, BridgeError> {
+) -> Result<ExternalAttachReconciliationReceipt, Box<BridgeError>> {
     let blind_interval = PreAttachBlindInterval::new(
         observation.last_observation_boundary_unix_ms,
         observation.attach_unix_ms,
@@ -711,16 +712,16 @@ pub fn reconcile_external_attach(
         && observation.authority.workspace_ownership_established();
     let continuation_kind_and_new_attempt_identity = if ownership_established {
         if observation.unowned_continuation.is_some() {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "observation.unowned_continuation",
                 reason: "established ownership continues under the attached identity; no read-only or new bounded attempt applies",
-            });
+            }));
         }
         if observation.new_attempt_ref.is_some() {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "observation.new_attempt_ref",
                 reason: "an attributed continuation keeps the attached attempt identity",
-            });
+            }));
         }
         ContinuationDisposition {
             kind: ContinuationKind::AttributedContinuation,
@@ -728,18 +729,18 @@ pub fn reconcile_external_attach(
         }
     } else {
         let Some(choice) = observation.unowned_continuation else {
-            return Err(BridgeError::InvalidContract {
+            return Err(Box::new(BridgeError::InvalidContract {
                 field: "observation.unowned_continuation",
                 reason: "without established process/session or workspace ownership the attach must be read-only or a new bounded attempt",
-            });
+            }));
         };
         match choice {
             UnownedContinuation::ReadOnly => {
                 if observation.new_attempt_ref.is_some() {
-                    return Err(BridgeError::InvalidContract {
+                    return Err(Box::new(BridgeError::InvalidContract {
                         field: "observation.new_attempt_ref",
                         reason: "a read-only attach mints no new attempt identity",
-                    });
+                    }));
                 }
                 ContinuationDisposition {
                     kind: ContinuationKind::ReadOnlyAttach,
@@ -748,10 +749,10 @@ pub fn reconcile_external_attach(
             }
             UnownedContinuation::NewBoundedAttempt => {
                 let Some(new_attempt_ref) = observation.new_attempt_ref.as_deref() else {
-                    return Err(BridgeError::InvalidContract {
+                    return Err(Box::new(BridgeError::InvalidContract {
                         field: "observation.new_attempt_ref",
                         reason: "a new bounded attempt requires a new attempt identity",
-                    });
+                    }));
                 };
                 ContinuationDisposition {
                     kind: ContinuationKind::NewBoundedAttempt,
@@ -802,7 +803,7 @@ pub fn reconcile_external_attach(
 pub fn admit_material_continuation(
     effect: RequestedEffect,
     attach: Option<&ExternalAttachReconciliationReceipt>,
-) -> Result<(), BridgeError> {
+) -> Result<(), Box<BridgeError>> {
     if !effect.requires_material_readiness() {
         return Ok(());
     }
@@ -813,7 +814,7 @@ pub fn admit_material_continuation(
     if attach.admits_material_continuation() {
         return Ok(());
     }
-    Err(BridgeError::ExternalAttachReconciliationRequired)
+    Err(Box::new(BridgeError::ExternalAttachReconciliationRequired))
 }
 
 /// Why `Start work` may not hide the presented state behind an automatic agent

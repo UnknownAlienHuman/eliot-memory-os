@@ -2720,7 +2720,7 @@ impl DaemonComposition {
     pub fn record_external_attach_reconciliation(
         &mut self,
         receipt: &ExternalAttachReconciliationReceipt,
-    ) -> Result<(), eliot_agent_bridge_core::BridgeError> {
+    ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
         receipt.validate()?;
         self.external_attach = Some(Box::new(receipt.clone()));
         Ok(())
@@ -2759,7 +2759,7 @@ impl DaemonComposition {
     pub fn admit_material_continuation_after_attach(
         &self,
         effect: eliot_workscope::RequestedEffect,
-    ) -> Result<(), eliot_agent_bridge_core::BridgeError> {
+    ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
         admit_material_continuation(effect, self.external_attach.as_deref())
     }
 
