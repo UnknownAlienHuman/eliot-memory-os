@@ -2334,6 +2334,22 @@ pub trait OperationalRecoveryStore: Send + Sync {
         target: crate::HostRequestState,
         result_digest: Option<&str>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Atomically records a daemon attempt before returning the executable
+    /// claim. A different owner closes the row as `Unknown` while retaining
+    /// the prior attempt for reconciliation.
+    fn claim_host_request_attempt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Records a no-effect deferral for the exact active daemon attempt.
+    fn defer_host_request_attempt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Persists one bounded local-read result body alongside its digest
     /// (Implements #18: local read result).
     ///
@@ -6365,6 +6381,166 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Persists the daemon attempt and `Routed` phase before exposing a claim.
+    /// Exact same-owner polls recover the original attempt. A different owner
+    /// fences the operation as `Unknown` and leaves the original attempt in
+    /// place so a replacement cannot silently acquire writer ownership.
+    pub fn claim_host_request_attempt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        if attempt.phase != crate::HostRequestAttemptPhase::Claimed {
+            return Err(OrsError::InvalidTransition);
+        }
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.operation_id != *operation_id || existing.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        attempt.validate(&existing.fence_digest)?;
+        let next = match existing.attempt.as_ref() {
+            None if matches!(
+                existing.state,
+                crate::HostRequestState::Admitted | crate::HostRequestState::Routed
+            ) && existing.result_digest.is_none()
+                && existing.result_response.is_none() =>
+            {
+                let mut next = existing.clone();
+                next.state = crate::HostRequestState::Routed;
+                next.attempt = Some(attempt.clone());
+                next
+            }
+            Some(current) if current.phase == crate::HostRequestAttemptPhase::DeferredNoEffect => {
+                let next_generation = current
+                    .generation
+                    .checked_add(1)
+                    .ok_or(OrsError::InvalidTransition)?;
+                if existing.state != crate::HostRequestState::Routed
+                    || attempt.generation != next_generation
+                    || existing.result_digest.is_some()
+                    || existing.result_response.is_some()
+                {
+                    return Err(OrsError::InvalidTransition);
+                }
+                let mut next = existing.clone();
+                next.attempt = Some(attempt.clone());
+                next
+            }
+            Some(current)
+                if current.owner_connection_ref == attempt.owner_connection_ref
+                    && current.owner_launch_nonce == attempt.owner_launch_nonce
+                    && current.owner_session_epoch == attempt.owner_session_epoch
+                    && current.fence_digest == attempt.fence_digest
+                    && current.phase == crate::HostRequestAttemptPhase::Claimed =>
+            {
+                write.commit().map_err(storage)?;
+                return Ok(Some(existing));
+            }
+            Some(_)
+                if matches!(
+                    existing.state,
+                    crate::HostRequestState::Admitted
+                        | crate::HostRequestState::Routed
+                        | crate::HostRequestState::Submitted
+                        | crate::HostRequestState::PossiblyEffected
+                ) =>
+            {
+                let mut next = existing.clone();
+                next.state = crate::HostRequestState::Unknown;
+                next
+            }
+            _ => {
+                write.commit().map_err(storage)?;
+                return Ok(Some(existing));
+            }
+        };
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Records the daemon owner's explicit no-effect deferral for the exact
+    /// current attempt and retires that attempt before a later claim can mint
+    /// its successor generation.
+    pub fn defer_host_request_attempt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut record) = existing else {
+            return Ok(None);
+        };
+        record.validate()?;
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        if current != *attempt {
+            return Err(OrsError::InvalidTransition);
+        }
+        if current.phase == crate::HostRequestAttemptPhase::DeferredNoEffect
+            && record.state == crate::HostRequestState::Routed
+        {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        if current.phase != crate::HostRequestAttemptPhase::Claimed
+            || !matches!(
+                record.state,
+                crate::HostRequestState::Admitted | crate::HostRequestState::Routed
+            )
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        current.phase = crate::HostRequestAttemptPhase::DeferredNoEffect;
+        record.attempt = Some(current);
+        record.state = crate::HostRequestState::Routed;
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
     }
 
     /// Persists one bounded local-read result body alongside its digest.
@@ -21696,6 +21872,24 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn claim_host_request_attempt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::claim_host_request_attempt(self, operation_id, request_digest, attempt)
+    }
+
+    fn defer_host_request_attempt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::defer_host_request_attempt(self, operation_id, request_digest, attempt)
+    }
+
     fn persist_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -22205,6 +22399,28 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store
             .advance_host_request(operation_id, request_digest, target, result_digest)
+    }
+
+    /// Persists a daemon attempt before returning its executable claim.
+    pub fn claim_host_request_attempt(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .claim_host_request_attempt(operation_id, request_digest, attempt)
+    }
+
+    /// Records the exact current attempt's no-effect deferral.
+    pub fn defer_host_request_attempt(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .defer_host_request_attempt(operation_id, request_digest, attempt)
     }
 
     /// Persists one bounded local-read result body alongside its digest.
@@ -23009,6 +23225,7 @@ mod host_request_result_tests {
             generation: 1,
             deadline_unix_ms: 9_999_999,
             state: HostRequestState::Requested,
+            attempt: None,
             result_digest: None,
             result_response: None,
             commit_order: 0,
