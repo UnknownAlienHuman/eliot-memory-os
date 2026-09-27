@@ -122,9 +122,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::improvement_admission::{
-    ImprovementAdmissionDecision, ImprovementAdmissionError, ImprovementAdmissionPolicy,
-    ImprovementBlockCause, ImprovementBlockRemedy, ImprovementCandidateView,
-    ImprovementEvidenceView, ImprovementRejectCause, admit_improvement_candidate,
+    IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT, ImprovementAdmissionDecision,
+    ImprovementAdmissionError, ImprovementAdmissionPolicy, ImprovementBlockCause,
+    ImprovementBlockRemedy, ImprovementCandidateView, ImprovementEvidenceView,
+    ImprovementRejectCause, admit_improvement_candidate,
 };
 
 /// Governor maintenance owner for the improvement pipeline (`G-19`).
@@ -939,6 +940,104 @@ pub enum ImprovementTerminalDisposition {
         /// other branches.
         handoff: Box<ImprovementCanaryHandoff>,
     },
+}
+
+/// One improvement-candidate declaration entering the Governor contract
+/// through the `improvement_candidate` ingress step.
+///
+/// The ingress step exists because the improvement candidate contract
+/// (`eliot-improvement`) and this pipeline are one cognitive mechanism with one
+/// production owner. A caller therefore hands the ingress the candidate's exact
+/// identities plus the owner-issued bounded-run records, and it builds the
+/// Governor-side candidate view itself. The improvement package cannot supply
+/// that view, so it cannot widen its own ceiling: `proof_ceiling`,
+/// `requested_effect`, `direct_promotion`, `active_permit`, and
+/// `promotion_receipt` are fixed here rather than read from the declaration.
+///
+/// It is a proposal-side step, not a new authority. Ingesting a candidate grants
+/// nothing, promotes nothing, and admits nothing on its own; the only path past
+/// the ingress is the ordinary bounded experiment to independent evaluation to
+/// Governor admission sequence, and the only positive result remains a
+/// non-authorizing canary handoff.
+#[derive(Clone, Copy, Debug)]
+pub struct ImprovementCandidateIngress<'a> {
+    /// Improvement candidate identity, exactly as the improvement package's
+    /// intake produced it.
+    pub candidate_id: &'a str,
+    /// Campaign the candidate learns from.
+    pub campaign_id: &'a str,
+    /// Closure candidate identity (`#819`).
+    pub closure_id: &'a str,
+    /// Closure evidence digest, opaque at this boundary.
+    pub closure_digest: &'a str,
+    /// Admitted work scope the candidate owner proved. An absent or blank
+    /// binding is not defaulted here: it stays a named gap that the admission
+    /// gate disposes as a typed block.
+    pub admitted_scope_ref: Option<&'a str>,
+    /// Governor-side proposal declaring the mechanism, expected delta, and
+    /// every exact current-evidence, target, budget, deadline, privacy, and
+    /// invalidation binding.
+    pub proposal: &'a ImprovementProposal,
+    /// Testd-owned bounded experiment plan. Only the Testd owner may have
+    /// executed it.
+    pub experiment: &'a ExperimentPlan,
+    /// Independent evaluation record of that exact run, produced by the
+    /// Instrument verifier family and carrying an executed status.
+    pub evidence: &'a ActivationEvidence,
+    /// Rollback contract named before admission.
+    pub rollback: &'a RollbackContract,
+    /// Independent admission-review evidence observed by the Governor owner.
+    pub admission_evidence: &'a ImprovementEvidenceView,
+    /// Policy governing Governor admission.
+    pub policy: &'a ImprovementAdmissionPolicy,
+}
+
+/// Admits one improvement-candidate declaration into the Governor contract.
+///
+/// The single production entry point of this module and the only way a
+/// candidate reaches the bounded experiment path. It builds the Governor-side
+/// candidate view from the declaration with the non-self-promoting values fixed
+/// in code, then runs the ordinary advisory-only pipeline, so the improvement
+/// package can never hand this pipeline a widened ceiling, a self-issued
+/// permit, or a self-issued promotion receipt.
+///
+/// Ingesting grants nothing. The result is the pipeline's own terminal
+/// disposition: rejected, inconclusive, blocked, requiring reconciliation,
+/// no-progress, or a non-authorizing canary handoff. There is no variant that
+/// promotes, activates, installs, completes, or issues authority.
+pub fn ingest_improvement_candidate(
+    ingress: ImprovementCandidateIngress<'_>,
+) -> Result<ImprovementTerminalDisposition, PipelineError> {
+    let candidate = ImprovementCandidateView {
+        candidate_id: ingress.candidate_id.to_string(),
+        campaign_id: ingress.campaign_id.to_string(),
+        closure_id: ingress.closure_id.to_string(),
+        closure_digest: ingress.closure_digest.to_string(),
+        // The improvement package prepares advisory promotion input on its own
+        // side. This owner does not re-read or reinterpret it, and a candidate
+        // that never prepared one is admitted on its own evidence.
+        promotion_input_id: None,
+        promotion_digest: None,
+        admitted_scope_ref: ingress.admitted_scope_ref.map(str::to_string),
+        // Fixed in code, never read from the declaration: the package cannot
+        // widen its own proof ceiling, effect class, or promotion state.
+        proof_ceiling: IMPROVEMENT_PROOF_CEILING.to_string(),
+        requested_effect: IMPROVEMENT_REQUESTED_EFFECT.to_string(),
+        direct_promotion: false,
+        active_permit: None,
+        promotion_receipt: None,
+        operation_ref: ingress.proposal.operation_ref.clone(),
+        idempotency_key: ingress.proposal.idempotency_key.clone(),
+    };
+    run_improvement_candidate_pipeline(ImprovementPipelineInputs {
+        proposal: ingress.proposal,
+        experiment: ingress.experiment,
+        evidence: ingress.evidence,
+        rollback: ingress.rollback,
+        candidate: &candidate,
+        admission_evidence: ingress.admission_evidence,
+        policy: ingress.policy,
+    })
 }
 
 /// Borrowed inputs for one pure pipeline run.
