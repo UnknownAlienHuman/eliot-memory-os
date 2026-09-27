@@ -967,6 +967,15 @@ impl WatchdogSpool {
     /// a restart cannot reset the threshold, and only
     /// [`Self::observe_governor_recovery`] closes an open episode.
     ///
+    /// `admission_ordinal` is the ordinal half of the owner-issued admission
+    /// sequence, and the generation half is the lineage's own. The owner issues
+    /// that sequence before it calls this, so the order the rule enforces is the
+    /// order of the owner's own admission events and not the order in which
+    /// write transactions happened to commit. An observation that is not
+    /// strictly after the episode's latest accepted one is refused whole, so it
+    /// can never move the episode's position backward; the wall-clock reading it
+    /// also carries is retained as diagnostic evidence only.
+    ///
     /// Rule advancement and emission are one owner transaction. The expected
     /// rule state is read and validated inside a single write transaction, one
     /// observation is applied to it, any threshold intent is appended through
@@ -1005,6 +1014,7 @@ impl WatchdogSpool {
         proof: intent::GovernorUnavailability,
         observation_digest: &str,
         lineage: intent::IntentLineage,
+        admission_ordinal: u64,
         observed_at_ms: u64,
     ) -> Result<intent::GovernorIntentOutcome, SpoolError> {
         let producer_generation = lineage.watchdog_generation();
@@ -1055,6 +1065,7 @@ impl WatchdogSpool {
             reason,
             observed_at_ms,
             producer_generation,
+            admission_ordinal,
             emission: emission.clone(),
         })?;
         Self::write_intent_rule_state_in(&write, &state)?;
@@ -1195,13 +1206,17 @@ impl WatchdogSpool {
     /// of that admission, and a recovery presented by a generation older than
     /// the one that last advanced the episode is refused as obsolete, so a late
     /// success from a superseded admission generation cannot close it.
+    /// `admission_ordinal` is the ordinal half of the owner-issued admission
+    /// sequence the owner issued for this recovery, and it is what orders the
+    /// recovery against the episode's latest accepted observation.
     ///
     /// Recovery is serialized against observations under the same writer
     /// discipline: the episode and its revision are re-read and re-validated
-    /// inside one write transaction, and a recovery that predates the newest
-    /// accepted outage observation is refused, so a later recovery can neither
-    /// silently overwrite a concurrently accepted newer observation nor report a
-    /// refusal as a closure.
+    /// inside one write transaction, and a recovery whose owner-issued sequence
+    /// is not strictly after the episode's latest accepted one is refused, so a
+    /// later recovery can neither silently overwrite a concurrently accepted
+    /// newer observation — including one observed in the same millisecond, which
+    /// no timestamp comparison can separate — nor report a refusal as a closure.
     ///
     /// Closing withdraws nothing. It claims no canonical resolution: the
     /// episode's spooled intents stay retained and unacknowledged until the
@@ -1211,10 +1226,12 @@ impl WatchdogSpool {
     /// # Errors
     ///
     /// Returns [`SpoolError`] when the rule state is not canonical, the recovery
-    /// identity is uninitialized, or the state cannot be written.
+    /// identity is uninitialized, carries no owner-issued admission sequence, or
+    /// the state cannot be written.
     pub(crate) fn observe_governor_recovery(
         &self,
         presenting_generation: u64,
+        admission_ordinal: u64,
         observed_at_ms: u64,
     ) -> Result<bool, SpoolError> {
         let write = self
@@ -1222,16 +1239,17 @@ impl WatchdogSpool {
             .begin_write()
             .map_err(|error| SpoolError::Database(error.to_string()))?;
         let mut state = Self::read_intent_rule_state_in(&write)?;
-        let closed_episode_id = match state.close_episode(presenting_generation, observed_at_ms)? {
-            // Nothing changed in either case, so the uncommitted transaction is
-            // dropped and the caller is told no episode was closed by this call.
-            intent::GovernorEpisodeClosure::AlreadyClosed
-            | intent::GovernorEpisodeClosure::Obsolete => {
-                drop(write);
-                return Ok(false);
-            }
-            intent::GovernorEpisodeClosure::Closed { episode_id } => episode_id,
-        };
+        let closed_episode_id =
+            match state.close_episode(presenting_generation, admission_ordinal, observed_at_ms)? {
+                // Nothing changed in either case, so the uncommitted transaction is
+                // dropped and the caller is told no episode was closed by this call.
+                intent::GovernorEpisodeClosure::AlreadyClosed
+                | intent::GovernorEpisodeClosure::Obsolete => {
+                    drop(write);
+                    return Ok(false);
+                }
+                intent::GovernorEpisodeClosure::Closed { episode_id } => episode_id,
+            };
         Self::write_intent_rule_state_in(&write, &state)?;
         write
             .commit()
@@ -1371,7 +1389,13 @@ impl WatchdogSpool {
     /// path. A caller that is about to advance the rule uses
     /// [`Self::read_intent_rule_state_in`] inside its own write transaction
     /// instead.
-    fn read_intent_rule_state(&self) -> Result<intent::GovernorIntentRuleState, SpoolError> {
+    ///
+    /// The Watchdog owner also reads it once at construction, to re-seed its own
+    /// admission sequence above the position its durable episode row already
+    /// records, so a restarted owner never replays an ordinal it already issued.
+    pub(crate) fn read_intent_rule_state(
+        &self,
+    ) -> Result<intent::GovernorIntentRuleState, SpoolError> {
         let read = self
             .database
             .begin_read()
@@ -1878,6 +1902,20 @@ struct WatchdogIntentRuleStateRecord {
     state: intent::GovernorIntentRuleState,
 }
 
+/// Storage encoding of a superseded deterministic-rule state row that recorded
+/// no owner-issued admission order.
+///
+/// It exists so an existing row is read strictly and then explicitly
+/// dispositioned, never reinterpreted as current state and never treated as
+/// fresh empty state. Its retained wall-clock timestamp is carried forward as
+/// diagnostic evidence and is never read as an order.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogIntentRuleStateSupersededRecord {
+    schema_version: u16,
+    state: intent::GovernorIntentRuleStateSuperseded,
+}
+
 /// Storage encoding of one superseded deterministic-rule state row.
 ///
 /// It exists so an existing row is read strictly and then explicitly
@@ -1913,10 +1951,12 @@ fn encode_intent_rule_state(
 /// Decodes one stored rule row under the exact revision that wrote it.
 ///
 /// A current row is decoded strictly and validated. A superseded row is decoded
-/// strictly as the superseded shape and carried forward with an explicit
-/// incomplete-history disposition. Any other revision, and any row that does not
-/// decode, fails closed as corruption: neither becomes fresh empty state, and a
-/// rule whose history cannot be read never silently restarts its escalation.
+/// strictly as that revision's own shape and carried forward with an explicit
+/// incomplete-history disposition, so a revision that recorded wall-clock time
+/// but no owner-issued order is never read as if it had recorded an order. Any
+/// other revision, and any row that does not decode, fails closed as corruption:
+/// neither becomes fresh empty state, and a rule whose history cannot be read
+/// never silently restarts its escalation.
 fn decode_intent_rule_state(bytes: &[u8]) -> Result<intent::GovernorIntentRuleState, SpoolError> {
     let revision: WatchdogIntentRuleStateRevision =
         serde_json::from_slice(bytes).map_err(|error| {
@@ -1924,28 +1964,21 @@ fn decode_intent_rule_state(bytes: &[u8]) -> Result<intent::GovernorIntentRuleSt
         })?;
     match revision.schema_version {
         intent::INTENT_RULE_SCHEMA_VERSION => {
-            let record: WatchdogIntentRuleStateRecord =
-                serde_json::from_slice(bytes).map_err(|error| {
-                    SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
-                })?;
-            if record.state.schema_version != record.schema_version {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule state schema drifted from its storage row".to_owned(),
-                ));
-            }
+            let record: WatchdogIntentRuleStateRecord = decode_strict_rule_row(bytes)?;
+            check_rule_row_revision(record.schema_version, record.state.schema_version)?;
             record.state.validate()?;
             Ok(record.state)
         }
+        intent::INTENT_RULE_SUPERSEDED_SCHEMA_VERSION => {
+            let record: WatchdogIntentRuleStateSupersededRecord = decode_strict_rule_row(bytes)?;
+            check_rule_row_revision(record.schema_version, record.state.schema_version)?;
+            let state = record.state.without_owner_order();
+            state.validate()?;
+            Ok(state)
+        }
         intent::INTENT_RULE_LEGACY_SCHEMA_VERSION => {
-            let record: WatchdogIntentRuleStateLegacyRecord = serde_json::from_slice(bytes)
-                .map_err(|error| {
-                    SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
-                })?;
-            if record.state.schema_version != record.schema_version {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule state schema drifted from its storage row".to_owned(),
-                ));
-            }
+            let record: WatchdogIntentRuleStateLegacyRecord = decode_strict_rule_row(bytes)?;
+            check_rule_row_revision(record.schema_version, record.state.schema_version)?;
             let state = record.state.dispositioned();
             state.validate()?;
             Ok(state)
@@ -1955,6 +1988,25 @@ fn decode_intent_rule_state(bytes: &[u8]) -> Result<intent::GovernorIntentRuleSt
             revision.schema_version
         ))),
     }
+}
+
+/// Decodes one rule row strictly into the exact shape its revision wrote.
+fn decode_strict_rule_row<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, SpoolError> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
+    })
+}
+
+/// Fails closed when a rule row's own storage revision disagrees with the
+/// revision its carried state claims, so a row can never be reinterpreted under
+/// a revision it was not written under.
+fn check_rule_row_revision(row_revision: u16, state_revision: u16) -> Result<(), SpoolError> {
+    if row_revision != state_revision {
+        return Err(SpoolError::Corrupt(
+            "watchdog intent rule state schema drifted from its storage row".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Storage encoding of one durable submit-once reconciliation receipt.

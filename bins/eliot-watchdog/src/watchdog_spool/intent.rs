@@ -55,6 +55,25 @@
 //! lifetime counters beside it are diagnostics and never stand in for the
 //! identity of an emitted record.
 //!
+//! Admission order (#2651 external audit 5847943170): the episode's position is
+//! ordered by one owner-issued [`GovernorAdmissionSequence`], never by wall
+//! clock. The owner issues that sequence to itself in its own single admission
+//! event stream, for an observed outage proof and for a live admission alike,
+//! before it opens the write transaction that will accept the event — so the
+//! order the rule enforces is the order of the owner's own events rather than
+//! the order two redb write transactions happened to commit in. A recovery
+//! whose sequence is not strictly after the episode's latest accepted one is
+//! refused, which closes the same-millisecond race a wall-clock comparison
+//! cannot see, and an out-of-order observation is refused instead of moving the
+//! episode's latest position backward. Wall-clock time stays on the row as
+//! diagnostic evidence and can still refuse a recovery, but it can never
+//! establish that one observation happened after another.
+//!
+//! Migration: a row written before this ordering existed carries wall-clock
+//! time and no owner sequence, so it is dispositioned as incomplete history
+//! rather than repaired — see
+//! [`GovernorIntentRuleStateSuperseded::without_owner_order`].
+//!
 //! Emission and closure are separate durable facts. Closing an episode
 //! withdraws nothing: the spooled intents stay retained and unacknowledged
 //! until the fenced Kernel route reconciles them, and neither emission nor
@@ -183,6 +202,103 @@ impl IntentLineage {
     #[must_use]
     pub(crate) const fn watchdog_generation(&self) -> u64 {
         self.watchdog_generation
+    }
+}
+
+/// One owner-issued monotonic admission observation sequence.
+///
+/// This is the serialization authority of an open episode. The Watchdog owner
+/// issues it to itself, from its own single admission event stream, for **both**
+/// an observed Governor-unavailability proof and a live Governor admission, and
+/// it issues the value *before* opening the write transaction that will accept
+/// the event. That is what makes the order it states an order of the owner's own
+/// events instead of the order two redb write transactions happened to commit
+/// in, which is the difference a wall-clock comparison can never make.
+///
+/// The generation half is reused, never invented: it is the Watchdog generation
+/// [`IntentLineage`] already binds and this rule already trusts as the identity
+/// that may advance or close an episode. The ordinal half is a per-generation
+/// counter the owner advances once per admission event and re-seeds from its own
+/// durable episode row on start, so a restarted owner continues above the
+/// position it already recorded instead of replaying it. It is not a nonce, not
+/// a random identifier, not a hash of a payload, and not a clock reading: two
+/// events in the same millisecond still receive distinct, correctly ordered
+/// values, and a clock step cannot reorder them.
+///
+/// Wall-clock time is deliberately absent. It is retained on the row as
+/// diagnostic evidence and can refuse a recovery, but it can never establish
+/// that one observation happened after another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GovernorAdmissionSequence {
+    generation: u64,
+    ordinal: u64,
+}
+
+impl GovernorAdmissionSequence {
+    /// Binds one owner-issued admission sequence from the owner generation and
+    /// the owner's own ordinal for that generation.
+    ///
+    /// A zero generation is not a usable sequence: it is exactly the value
+    /// [`GovernorIntentRuleState::episode_admission_sequence`] and
+    /// [`Self::ordinal`] absence is spelled with, and no caller may present it
+    /// as one.
+    pub(crate) const fn new(generation: u64, ordinal: u64) -> Self {
+        Self {
+            generation,
+            ordinal,
+        }
+    }
+
+    /// Returns the Watchdog generation half of this sequence.
+    #[must_use]
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the owner's per-generation ordinal half of this sequence.
+    #[must_use]
+    pub(crate) const fn ordinal(self) -> u64 {
+        self.ordinal
+    }
+
+    /// True when both halves are initialized, so this really is an owner-issued
+    /// sequence rather than the absence of one.
+    #[must_use]
+    pub(crate) const fn is_usable(self) -> bool {
+        self.generation != 0 && self.ordinal != 0
+    }
+
+    /// True when this sequence is strictly after `previous`, which is the
+    /// episode's latest accepted admission sequence, or `None` when the episode
+    /// records no position to order against at all.
+    ///
+    /// Three cases, and no fourth:
+    ///
+    /// * A different owner generation decides it. A generation above the
+    ///   episode's current producer is a newer owner and is strictly after
+    ///   whatever ordinal it carries; a generation below it is an obsolete
+    ///   owner and is never after. This reuses the generation comparison the
+    ///   rule already applied across an episode and extends it into the same
+    ///   generation.
+    /// * Within one owner generation the ordinal is the only order there is, so
+    ///   this is true exactly when the ordinal is greater.
+    /// * An episode whose latest accepted observation records no ordinal has no
+    ///   order at all. Nothing can be proven strictly after it, so this is
+    ///   false: a position is never invented for a history that never recorded
+    ///   one, and such an episode waits for a newer owner generation or an
+    ///   operator.
+    #[must_use]
+    pub(crate) const fn is_strictly_after(self, previous: Option<Self>) -> bool {
+        match previous {
+            None => true,
+            Some(previous) => {
+                if self.generation == previous.generation {
+                    previous.ordinal != 0 && self.ordinal > previous.ordinal
+                } else {
+                    self.generation > previous.generation
+                }
+            }
+        }
     }
 }
 
@@ -484,11 +600,22 @@ const _: () = assert!(INCIDENT_INTENT_OBSERVATION_THRESHOLD > PROBLEM_INTENT_OBS
 ///
 /// The current revision states the open episode explicitly: its stable
 /// identity, its preserved original observation lineage, the replacement
-/// producer that continues it, its threshold-progress counter, its finite
-/// threshold evidence, and the exact spool reference of each threshold intent
-/// it committed. The superseded revision is read once and explicitly
-/// dispositioned through [`INTENT_RULE_LEGACY_SCHEMA_VERSION`].
-pub(crate) const INTENT_RULE_SCHEMA_VERSION: u16 = 2;
+/// producer that continues it, the owner-issued admission sequence of the
+/// observation that most recently advanced it, its threshold-progress counter,
+/// its finite threshold evidence, and the exact spool reference of each
+/// threshold intent it committed. Superseded revisions are read once and
+/// explicitly dispositioned through [`INTENT_RULE_SUPERSEDED_SCHEMA_VERSION`]
+/// and [`INTENT_RULE_LEGACY_SCHEMA_VERSION`].
+pub(crate) const INTENT_RULE_SCHEMA_VERSION: u16 = 3;
+
+/// Storage revision of the rule record that carried a complete episode but no
+/// owner-issued admission order.
+///
+/// Retained only so an existing row can be read, carried forward, and marked
+/// with an explicit incomplete-history disposition: it recorded wall-clock
+/// time, which is diagnostic evidence and never a serialization authority, and
+/// no order is reconstructed from it.
+pub(crate) const INTENT_RULE_SUPERSEDED_SCHEMA_VERSION: u16 = 2;
 
 /// Storage revision of the superseded rule record.
 ///
@@ -497,8 +624,9 @@ pub(crate) const INTENT_RULE_SCHEMA_VERSION: u16 = 2;
 /// reinterpreted as current state or as fresh empty state.
 pub(crate) const INTENT_RULE_LEGACY_SCHEMA_VERSION: u16 = 1;
 
-const _: () = assert!(INTENT_RULE_LEGACY_SCHEMA_VERSION < INTENT_RULE_SCHEMA_VERSION);
-const _: () = assert!(INTENT_RULE_SCHEMA_VERSION == 2);
+const _: () = assert!(INTENT_RULE_LEGACY_SCHEMA_VERSION < INTENT_RULE_SUPERSEDED_SCHEMA_VERSION);
+const _: () = assert!(INTENT_RULE_SUPERSEDED_SCHEMA_VERSION < INTENT_RULE_SCHEMA_VERSION);
+const _: () = assert!(INTENT_RULE_SCHEMA_VERSION == 3);
 
 /// Watchdog-owned intent class of one retained spool record.
 ///
@@ -581,14 +709,17 @@ pub(crate) enum GovernorIntentLegacyHistory {
     /// This record was written under the current schema, so its episode
     /// identity and threshold-emission references are its own and complete.
     Current,
-    /// This record was migrated from the superseded schema. The superseded
-    /// schema reset its episode on every emission, so it recorded neither the
-    /// identity of the episode those emissions belonged to nor a reference to
-    /// the records it had already committed. The retained counters and last
-    /// observation are carried forward verbatim, and nothing is inferred from
-    /// them: the lifetime counters are never read as continuity, and an
-    /// ambiguous reset is never labelled a verified recovery, so a migrated
-    /// episode stays open instead of being silently closed.
+    /// This record was migrated from a superseded schema. The superseded
+    /// schemas reset the episode on every emission or recorded only wall-clock
+    /// time, so they recorded neither the identity of the episode those
+    /// emissions belonged to, nor a reference to the records already committed,
+    /// nor any owner-issued order between the observations they did record. The
+    /// retained counters, last observation, and episode state are carried
+    /// forward verbatim, and nothing is inferred from them: the lifetime
+    /// counters are never read as continuity, an ambiguous reset is never
+    /// labelled a verified recovery, and a retained timestamp is never read as
+    /// an order. A migrated episode therefore records no owner-issued admission
+    /// sequence and stays open instead of being silently closed.
     Incomplete,
 }
 
@@ -722,6 +853,12 @@ pub(crate) struct GovernorIntentObservationRecord {
     pub(crate) observed_at_ms: u64,
     /// Watchdog generation that produced the observation.
     pub(crate) producer_generation: u64,
+    /// Ordinal half of the owner-issued admission sequence the owner issued for
+    /// this observation, paired with [`Self::producer_generation`] into the one
+    /// sequence that orders it. It is issued before the caller's write
+    /// transaction opens, so it states where this observation sits in the
+    /// owner's own event stream rather than in the transaction order.
+    pub(crate) admission_ordinal: u64,
     /// The exact threshold intent this observation committed in the same owner
     /// transaction, or `None` when it crossed no threshold.
     pub(crate) emission: Option<(WatchdogIntentClass, GovernorIntentEmission)>,
@@ -766,6 +903,19 @@ pub(crate) struct GovernorIntentRuleState {
     /// generation above the opening one is recorded here as an honest
     /// replacement producer while the opening lineage stays intact beside it.
     pub(crate) episode_producer_generation: Option<u64>,
+    /// Ordinal half of the owner-issued admission observation sequence of the
+    /// newest observation this episode accepted; the generation half is
+    /// [`Self::episode_producer_generation`], which already names the owner that
+    /// most recently advanced the episode. The pair is the episode's position
+    /// and the only thing that orders a later outage or recovery against it.
+    ///
+    /// `0` states that the episode's latest accepted observation carries no
+    /// owner sequence at all: either no episode is open, or this row was
+    /// migrated from a schema that recorded wall-clock time but no owner order.
+    /// That is the explicit incomplete-history disposition, and it is never
+    /// repaired by inventing a position — see
+    /// [`GovernorIntentRuleStateSuperseded::without_owner_order`].
+    pub(crate) episode_admission_sequence: u64,
     /// Threshold progress of the open episode.
     ///
     /// It saturates at [`INCIDENT_INTENT_OBSERVATION_THRESHOLD`] and is
@@ -782,8 +932,10 @@ pub(crate) struct GovernorIntentRuleState {
     /// evidence frame or fail on it.
     pub(crate) threshold_evidence: Vec<String>,
     /// Owner-clock time of the newest observation this rule accepted. It is
-    /// declared coverage information, not a per-observation log, so it states
-    /// the last observation rather than growing with the episode.
+    /// declared coverage information and diagnostic evidence only, never a
+    /// serialization authority: it states the last observation rather than
+    /// growing with the episode, and it can refuse a recovery but can never
+    /// establish that one observation happened after another.
     pub(crate) last_observed_at_ms: u64,
     pub(crate) last_reason: GapRecoveryReason,
     /// The exact `problem_intent` this open episode committed, when it has.
@@ -826,6 +978,7 @@ impl GovernorIntentRuleState {
             episode_id: None,
             episode_opened_by_generation: None,
             episode_producer_generation: None,
+            episode_admission_sequence: 0,
             threshold_progress_observations: 0,
             threshold_evidence: Vec::new(),
             last_observed_at_ms: 0,
@@ -892,13 +1045,15 @@ impl GovernorIntentRuleState {
     }
 
     /// Checks that a closed episode retains no episode state at all, and that an
-    /// open one carries a stable identity, a coherent observation lineage, and
-    /// exactly one evidence digest per unit of threshold progress.
+    /// open one carries a stable identity, a coherent observation lineage, an
+    /// owner-issued admission sequence, and exactly one evidence digest per unit
+    /// of threshold progress.
     fn validate_episode_identity(&self) -> Result<(), SpoolError> {
         if self.episode_phase.is_closed() {
             if self.episode_id.is_some()
                 || self.episode_opened_by_generation.is_some()
                 || self.episode_producer_generation.is_some()
+                || self.episode_admission_sequence != 0
                 || self.threshold_progress_observations != 0
                 || !self.threshold_evidence.is_empty()
                 || self.problem_intent_emission.is_some()
@@ -958,6 +1113,18 @@ impl GovernorIntentRuleState {
         if self.threshold_evidence.len() != self.threshold_progress_observations as usize {
             return Err(SpoolError::Corrupt(
                 "watchdog intent rule threshold evidence is not one digest per unit of threshold progress"
+                    .to_owned(),
+            ));
+        }
+        // An open episode under the current schema always recorded a real
+        // owner-issued sequence, so its position can be ordered. Only an
+        // explicitly migrated episode may carry none, and that absence is the
+        // disposition that keeps its history from being read as an order.
+        if self.legacy_history == GovernorIntentLegacyHistory::Current
+            && self.episode_admission_sequence == 0
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule open episode records no owner-issued admission sequence"
                     .to_owned(),
             ));
         }
@@ -1120,13 +1287,21 @@ impl GovernorIntentRuleState {
     /// overflow the counter, duplicate a threshold record, nor fail on the
     /// bounded evidence frame.
     ///
+    /// The observation advances the episode only if its owner-issued admission
+    /// sequence is strictly after the episode's latest accepted one. An
+    /// out-of-order observation is refused whole — nothing is written — so it
+    /// can never move the episode's position backward, and its wall-clock time
+    /// is never allowed to stand in for the order it failed to prove.
+    ///
     /// # Errors
     ///
     /// Returns [`SpoolError::Corrupt`] when the stored state is not canonical,
     /// the observation identity is unusable, the observation was already
     /// resolved in this episode, its producer generation precedes the episode's,
-    /// a threshold the episode already emitted is offered again, or a committed
-    /// emission does not sit exactly on the threshold it claims.
+    /// its owner-issued admission sequence is not strictly after the episode's
+    /// latest accepted one, a threshold the episode already emitted is offered
+    /// again, or a committed emission does not sit exactly on the threshold it
+    /// claims.
     pub(crate) fn record_observation(
         &mut self,
         record: GovernorIntentObservationRecord,
@@ -1137,6 +1312,7 @@ impl GovernorIntentRuleState {
             reason,
             observed_at_ms,
             producer_generation,
+            admission_ordinal,
             emission,
         } = record;
         if observed_at_ms == 0
@@ -1145,6 +1321,16 @@ impl GovernorIntentRuleState {
         {
             return Err(SpoolError::Corrupt(
                 "watchdog intent rule observation is not a usable bounded identity".to_owned(),
+            ));
+        }
+        // One source for the generation: the sequence takes it from the lineage
+        // the observation already carries, so the owner identity that orders the
+        // observation and the one that may advance the episode cannot disagree.
+        let admission = GovernorAdmissionSequence::new(producer_generation, admission_ordinal);
+        if !admission.is_usable() {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule observation carries no owner-issued admission sequence"
+                    .to_owned(),
             ));
         }
         if self.committed_emission(&observation_digest).is_some()
@@ -1161,7 +1347,7 @@ impl GovernorIntentRuleState {
         if let Some((_, committed)) = emission.as_ref() {
             validate_intent_emission(committed)?;
         }
-        self.open_or_continue_episode(&observation_digest, producer_generation)?;
+        self.open_or_continue_episode(&observation_digest, admission)?;
         let saturated =
             self.threshold_progress_observations >= INCIDENT_INTENT_OBSERVATION_THRESHOLD;
         if !saturated {
@@ -1172,6 +1358,9 @@ impl GovernorIntentRuleState {
         if let Some((intent_class, committed)) = emission {
             self.apply_threshold_emission(intent_class, committed)?;
         }
+        // Declared coverage, not an order: an accepted observation is already
+        // proven to be the latest one, so this states when it was seen without
+        // becoming the thing that decides what is latest.
         self.last_observed_at_ms = observed_at_ms;
         self.last_reason = reason;
         self.revision = self.revision.saturating_add(1);
@@ -1179,16 +1368,33 @@ impl GovernorIntentRuleState {
         Ok(self.threshold_progress_observations)
     }
 
-    /// Opens a new episode, or continues the open one without ever restarting it.
+    /// Returns the owner-issued admission sequence this episode's latest
+    /// accepted observation recorded, or `None` when the episode records no
+    /// owner lineage to order against at all.
+    ///
+    /// `Some` with a zero ordinal is the explicit incomplete-history case: the
+    /// episode names the owner generation that last advanced it but no order
+    /// within that generation.
+    fn latest_admission_sequence(&self) -> Option<GovernorAdmissionSequence> {
+        Some(GovernorAdmissionSequence::new(
+            self.episode_producer_generation?,
+            self.episode_admission_sequence,
+        ))
+    }
+
+    /// Opens a new episode, or continues the open one without ever restarting it
+    /// and without ever letting it move backward.
     fn open_or_continue_episode(
         &mut self,
         observation_digest: &str,
-        producer_generation: u64,
+        admission: GovernorAdmissionSequence,
     ) -> Result<(), SpoolError> {
+        let producer_generation = admission.generation();
         if self.episode_phase.is_closed() {
             self.episode_id = Some(observation_digest.to_owned());
             self.episode_opened_by_generation = Some(producer_generation);
             self.episode_producer_generation = Some(producer_generation);
+            self.episode_admission_sequence = admission.ordinal();
             self.episode_phase = GovernorIntentEpisodePhase::Counting;
             return Ok(());
         }
@@ -1208,6 +1414,17 @@ impl GovernorIntentRuleState {
                     .to_owned(),
             ));
         }
+        // The owner-issued admission sequence is the serialization authority.
+        // This runs before any counter, evidence, phase, or position is touched,
+        // so an observation the owner cannot prove is the latest one is refused
+        // whole: it advances nothing, it mints nothing, and it cannot drag the
+        // episode's position backward to a wall-clock reading it merely carries.
+        if !admission.is_strictly_after(self.latest_admission_sequence()) {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule observation is not ordered after the episode's latest accepted observation by its owner-issued admission sequence"
+                    .to_owned(),
+            ));
+        }
         // Record the observing generation as this episode's current producer.
         // A generation above the opening one is a replacement producer
         // recorded honestly beside the preserved opening lineage, and a
@@ -1215,6 +1432,7 @@ impl GovernorIntentRuleState {
         // adopts this generation while that unknown lineage stays unknown
         // rather than being invented.
         self.episode_producer_generation = Some(producer_generation);
+        self.episode_admission_sequence = admission.ordinal();
         Ok(())
     }
 
@@ -1270,24 +1488,44 @@ impl GovernorIntentRuleState {
     /// The caller must be the current validated admission-success path; the
     /// method has no timer, no export acknowledgement, and no episode to close
     /// for it. The episode and its revision are re-read and re-validated by the
-    /// caller's single writer transaction, and a recovery that is older than the
-    /// newest accepted outage observation cannot silently overwrite that newer
-    /// observation.
+    /// caller's single writer transaction.
+    ///
+    /// Admission order decides the closure, never wall clock. A recovery closes
+    /// the episode only when the owner-issued admission sequence it carries is
+    /// strictly after the sequence of the episode's latest accepted outage
+    /// observation. That is what refuses a recovery that raced a concurrently
+    /// accepted newer outage in the *same millisecond*: the two carry equal
+    /// owner-clock times, so a timestamp comparison cannot separate them, while
+    /// their owner-issued sequences always can. The retained staleness refusal on
+    /// wall-clock time is kept unchanged and still refuses on its own — it can
+    /// only ever refuse, never permit — so demoting the clock to diagnostic
+    /// evidence removes no existing refusal.
     ///
     /// # Errors
     ///
     /// Returns [`SpoolError::Corrupt`] when the stored state is not canonical,
-    /// the recovery identity is uninitialized, or an open episode carries no
-    /// stable identity.
+    /// the recovery identity is uninitialized, carries no owner-issued admission
+    /// sequence, or an open episode carries no stable identity.
     pub(crate) fn close_episode(
         &mut self,
         presenting_generation: u64,
+        admission_ordinal: u64,
         observed_at_ms: u64,
     ) -> Result<GovernorEpisodeClosure, SpoolError> {
         self.validate()?;
         if observed_at_ms == 0 || presenting_generation == 0 {
             return Err(SpoolError::Corrupt(
                 "watchdog intent rule recovery identity is uninitialized".to_owned(),
+            ));
+        }
+        // One source for the generation again: the sequence takes it from the
+        // presenting generation, so the identity that orders the recovery and
+        // the identity that may close the episode cannot disagree.
+        let admission = GovernorAdmissionSequence::new(presenting_generation, admission_ordinal);
+        if !admission.is_usable() {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule recovery carries no owner-issued admission sequence"
+                    .to_owned(),
             ));
         }
         if self.episode_phase.is_closed() {
@@ -1301,13 +1539,17 @@ impl GovernorIntentRuleState {
         let obsolete_generation = self
             .episode_producer_generation
             .is_some_and(|producer| presenting_generation < producer);
-        if obsolete_generation || observed_at_ms < self.last_observed_at_ms {
+        if obsolete_generation
+            || observed_at_ms < self.last_observed_at_ms
+            || !admission.is_strictly_after(self.latest_admission_sequence())
+        {
             return Ok(GovernorEpisodeClosure::Obsolete);
         }
         self.episode_phase = GovernorIntentEpisodePhase::Closed;
         self.episode_id = None;
         self.episode_opened_by_generation = None;
         self.episode_producer_generation = None;
+        self.episode_admission_sequence = 0;
         self.threshold_progress_observations = 0;
         self.threshold_evidence.clear();
         self.problem_intent_emission = None;
@@ -1328,9 +1570,9 @@ impl GovernorIntentRuleState {
 /// Explicit disposition of one live recovery against the open episode.
 ///
 /// The variants are deliberately distinct so a refused recovery can never be
-/// reported as a closure: only a recovery that is not older than the newest
-/// accepted outage observation, and is not presented by an obsolete Watchdog
-/// generation, closes an episode.
+/// reported as a closure: only a recovery whose owner-issued admission sequence
+/// is strictly after the episode's latest accepted observation, and is not
+/// presented by an obsolete Watchdog generation, closes an episode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GovernorEpisodeClosure {
     /// No episode was open, so the recovery changed nothing.
@@ -1343,10 +1585,85 @@ pub(crate) enum GovernorEpisodeClosure {
         /// Stable identity of the episode this recovery closed.
         episode_id: String,
     },
-    /// The recovery was refused as stale: it predates the newest accepted
-    /// outage observation, or it was presented by an obsolete Watchdog
-    /// generation. The newer observation stands.
+    /// The recovery was refused as stale: it was not issued after the episode's
+    /// latest accepted observation, it predates that observation on the owner
+    /// clock, or it was presented by an obsolete Watchdog generation. The
+    /// newer observation stands. An episode whose latest accepted observation
+    /// carries no owner-issued sequence is refused here too, because nothing can
+    /// be proven strictly after an order the row never recorded.
     Obsolete,
+}
+
+/// Deterministic-rule record that stated a complete episode but recorded no
+/// owner-issued admission order, read once and explicitly dispositioned.
+///
+/// It carried the whole current episode — identity, lineage, progress, finite
+/// evidence, and the exact record each threshold committed — and it also carried
+/// a wall-clock `last_observed_at_ms`. That timestamp is diagnostic coverage
+/// evidence and never was a serialization authority, and this revision recorded
+/// no order among the observations it did retain. Nothing is reconstructed from
+/// it here: the episode state is carried forward verbatim, the missing order is
+/// recorded as absence, and a position is never invented.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GovernorIntentRuleStateSuperseded {
+    pub(crate) schema_version: u16,
+    pub(crate) revision: u64,
+    pub(crate) episode_phase: GovernorIntentEpisodePhase,
+    pub(crate) legacy_history: GovernorIntentLegacyHistory,
+    pub(crate) episode_id: Option<String>,
+    pub(crate) episode_opened_by_generation: Option<u64>,
+    pub(crate) episode_producer_generation: Option<u64>,
+    pub(crate) threshold_progress_observations: u32,
+    pub(crate) threshold_evidence: Vec<String>,
+    pub(crate) last_observed_at_ms: u64,
+    pub(crate) last_reason: GapRecoveryReason,
+    pub(crate) problem_intent_emission: Option<GovernorIntentEmission>,
+    pub(crate) incident_intent_emission: Option<GovernorIntentEmission>,
+    pub(crate) problem_intents_spooled: u64,
+    pub(crate) incident_intents_spooled: u64,
+}
+
+impl GovernorIntentRuleStateSuperseded {
+    /// Returns the current-schema state this record maps to.
+    ///
+    /// Everything the record genuinely knew is carried forward verbatim: the
+    /// episode phase, its stable identity, its opening and producing lineage,
+    /// its threshold progress, its finite evidence, the exact record each
+    /// threshold committed, its declared last observation, and its lifetime
+    /// diagnostic counters.
+    ///
+    /// Deliberately **not** inferred: the owner-issued admission order. This
+    /// revision had a wall-clock timestamp and no owner sequence, so its
+    /// `last_observed_at_ms` is retained as diagnostic evidence and is never
+    /// read as an order, and the position is recorded as the explicit absence
+    /// that it is. The record therefore carries the incomplete-history
+    /// disposition: an open migrated episode names the generation that last
+    /// advanced it but no order within that generation, so nothing can be
+    /// proven strictly after it and no recovery may close it until a newer owner
+    /// generation advances it or an operator intervenes. A migrated episode is
+    /// never silently closed and its history is never repaired by guesswork.
+    #[must_use]
+    pub(crate) fn without_owner_order(self) -> GovernorIntentRuleState {
+        GovernorIntentRuleState {
+            schema_version: INTENT_RULE_SCHEMA_VERSION,
+            revision: self.revision,
+            episode_phase: self.episode_phase,
+            legacy_history: GovernorIntentLegacyHistory::Incomplete,
+            episode_id: self.episode_id,
+            episode_opened_by_generation: self.episode_opened_by_generation,
+            episode_producer_generation: self.episode_producer_generation,
+            episode_admission_sequence: 0,
+            threshold_progress_observations: self.threshold_progress_observations,
+            threshold_evidence: self.threshold_evidence,
+            last_observed_at_ms: self.last_observed_at_ms,
+            last_reason: self.last_reason,
+            problem_intent_emission: self.problem_intent_emission,
+            incident_intent_emission: self.incident_intent_emission,
+            problem_intents_spooled: self.problem_intents_spooled,
+            incident_intents_spooled: self.incident_intents_spooled,
+        }
+    }
 }
 
 /// Superseded deterministic-rule record, read once and explicitly dispositioned.
@@ -1385,6 +1702,14 @@ impl GovernorIntentRuleStateLegacy {
     /// failures — and its ambiguous reset is never labelled a verified
     /// recovery, so an open migrated episode stays open and a later genuine
     /// threshold crossing commits one new, nameable record.
+    ///
+    /// It also recorded no owner-issued admission order, so the position is
+    /// carried forward as the explicit absence it is. Because this revision
+    /// recorded no producing generation either, there is no owner identity to
+    /// order a later event against at all: the first current-schema observation
+    /// that advances the migrated episode establishes its position, and until
+    /// then the episode is ordered by the same owner-clock staleness refusal the
+    /// current code already applied. No order is invented in the meantime.
     #[must_use]
     pub(crate) fn dispositioned(self) -> GovernorIntentRuleState {
         let progress = self
@@ -1407,6 +1732,7 @@ impl GovernorIntentRuleStateLegacy {
             episode_id: self.episode_observation_digests.first().cloned(),
             episode_opened_by_generation: None,
             episode_producer_generation: None,
+            episode_admission_sequence: 0,
             threshold_progress_observations: progress,
             threshold_evidence: self.episode_observation_digests,
             last_observed_at_ms: self.last_observed_at_ms,
