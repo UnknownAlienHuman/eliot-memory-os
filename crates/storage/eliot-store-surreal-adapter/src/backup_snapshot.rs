@@ -87,6 +87,18 @@
 //! value behind the *same* mutex, so a begin reserves before it enumerates and
 //! concurrent begins cannot each pass an unlocked size check.
 //!
+//! That same acquisition also makes a logical begin single-owner. An in-progress
+//! begin records a claim on the exact request digest *and* on the
+//! operation/idempotency namespace it claims ([`BeginProgressClaim`]): a
+//! concurrent identical begin is answered with the existing typed pending outcome
+//! instead of enumerating a second observation and presenting it as the same
+//! capture, and a different canonical input under an already claimed namespace is
+//! refused as an identity conflict. A digest index alone cannot detect the second
+//! case, which is why the claimed namespace travels with the entry and is
+//! compared. A deliberate refresh therefore needs its own new logical capture —
+//! it never resets the open one — and a replay after expiry or retirement keeps
+//! its historical identity and cannot renew the window.
+//!
 //! What the charges are and are not. They are conservative, versioned *charges*
 //! of the structures this owner retains, derived from the existing named
 //! per-capture limits in `eliot_store_api::backup_io` plus
@@ -131,8 +143,8 @@ use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
     BlobResidency, BlobResidencyDomain, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS,
-    MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, OrderingHead, RequestMeta, RevisionHead,
-    SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator,
+    MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, OperationId, OrderingHead, RequestMeta,
+    RevisionHead, SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator,
     SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage,
     StateFence, StoreError, canonical_json_bytes, sha256_hex,
 };
@@ -1280,9 +1292,14 @@ fn fail_closed_deadline(base_ms: u64, span_ms: u64) -> u64 {
 /// The map is reached through `Deref`/`DerefMut` so the existing entry-level
 /// transitions read exactly as they always did; the budget and the frontier are
 /// additional fields of the *same* value, guarded by the *same* lock. There is
-/// deliberately no second lock, no second registry and no second writer.
+/// deliberately no second lock, no second registry and no second writer. The
+/// in-progress begin index is such a field too, for the same reason: one
+/// acquisition resolves the retained decision, records the claim and reserves the
+/// allowance, so a begin cannot be admitted twice.
 struct CaptureRegistry {
     captures: HashMap<String, SnapshotState>,
+    /// Logical begins that hold an in-progress claim and are not yet installed.
+    begins_in_progress: HashMap<String, BeginProgressClaim>,
     budget: CaptureBudget,
     /// Ordered deadlines so a maintenance pass is bounded by the work that is
     /// actually due, not by the size of the registry.
@@ -1309,6 +1326,7 @@ fn registry() -> &'static Mutex<CaptureRegistry> {
     REGISTRY.get_or_init(|| {
         Mutex::new(CaptureRegistry {
             captures: HashMap::new(),
+            begins_in_progress: HashMap::new(),
             budget: CaptureBudget::owner_default(),
             expiry: std::collections::BTreeSet::new(),
         })
@@ -1319,7 +1337,29 @@ fn lock_registry() -> Result<std::sync::MutexGuard<'static, CaptureRegistry>, St
     registry().lock().map_err(|_| StoreError::Unavailable)
 }
 
-/// Reserves one genuinely new begin's whole allowance, atomically.
+/// One in-flight begin's claim on a logical begin that is not yet installed.
+///
+/// The index is keyed by the exact request digest, so an identical begin finds
+/// its entry and learns the logical begin is already owned. A digest key alone
+/// cannot see a *different* canonical input claiming the same
+/// operation/idempotency namespace, so the claimed namespace travels with the
+/// entry and the namespace check compares it — that comparison is what makes
+/// "changed input under the same logical begin" a conflict rather than a second
+/// capture.
+///
+/// An entry exists only while its owning begin is in flight. It cannot be
+/// replaced while held: a begin records its claim only after finding neither an
+/// installed capture nor a live claim under its digest, and only that same begin
+/// removes it.
+struct BeginProgressClaim {
+    /// The operation identity the owning begin claimed.
+    operation_id: OperationId,
+    /// The idempotency key the owning begin claimed.
+    idempotency_key: String,
+}
+
+/// Reserves one genuinely new begin's whole allowance and its in-progress claim,
+/// atomically.
 ///
 /// Every dimension is reserved under the one registry lock the caller already
 /// holds, so two concurrent distinct begins cannot both pass an unlocked size
@@ -1334,14 +1374,30 @@ fn lock_registry() -> Result<std::sync::MutexGuard<'static, CaptureRegistry>, St
 /// * one terminal-record entry *and* its bytes, so a registry whose normal
 ///   capacity is full can still complete the payload-to-terminal transition for
 ///   every capture it admitted.
-fn reserve_begin(registry: &mut CaptureRegistry) -> Result<BeginReservation, StoreError> {
+///
+/// The in-progress claim is recorded last, after every charge succeeded, so a
+/// begin refused by the budget leaves no claim behind and can never wedge the
+/// logical begin it did not own.
+fn reserve_begin(
+    registry: &mut CaptureRegistry,
+    digest: &str,
+    request: &SnapshotBeginRequest,
+) -> Result<BeginReservation, StoreError> {
     let budget = &mut registry.budget;
     budget.reserve(BudgetDimension::BeginsInProgress, 1)?;
     if let Err(error) = reserve_capture_units(budget) {
         budget.release(BudgetDimension::BeginsInProgress, 1);
         return Err(error);
     }
+    registry.begins_in_progress.insert(
+        digest.to_owned(),
+        BeginProgressClaim {
+            operation_id: request.operation.operation_id.clone(),
+            idempotency_key: request.operation.idempotency_key.clone(),
+        },
+    );
     Ok(BeginReservation {
+        digest: digest.to_owned(),
         capture_bytes: RESERVED_CAPTURE_BYTES,
         settled: false,
     })
@@ -1382,20 +1438,25 @@ fn reserve_capture_units(budget: &mut CaptureBudget) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The units one in-progress begin holds, released or transferred exactly once.
+/// The units and the in-progress claim one begin holds, released or transferred
+/// exactly once.
 ///
 /// The reservation is taken before the provider is read and owned across that
 /// await. It is not `Clone` and no registry mutex is ever held across the await
 /// it spans (I5.7); a future dropped here releases exactly its own units and
-/// touches nothing else in the registry.
+/// claim and touches nothing else in the registry.
 ///
-/// Every path settles it exactly once: rejection, cancellation and a
-/// publish-versus-cancel race all reach `Drop` armed, and only a successful
+/// Every path settles it exactly once: rejection, cancellation, a
+/// publish-versus-cancel race and the publish-time duplicate that answers from a
+/// successor's retained handle all reach `Drop` armed, and only a successful
 /// publish reaches [`BeginReservation::settle`].
 struct BeginReservation {
+    /// The exact request digest this begin claimed, the in-progress index key.
+    digest: String,
     /// Bytes this reservation holds against the retained-byte dimension.
     capture_bytes: u64,
-    /// Set once the units have been transferred to an installed capture.
+    /// Set once the units and the claim have been transferred to an installed
+    /// capture.
     settled: bool,
 }
 
@@ -1406,21 +1467,25 @@ impl BeginReservation {
     /// allowance down to the actual retained charge, which can only shrink it.
     /// The transient enumeration allowance is released, because the decoded
     /// observation is dropped before the member payload is installed. The
-    /// in-progress unit is released, because the begin is now an installed
-    /// capture. The live-capture slot and the reserved terminal-record space
-    /// are *kept* charged: they are the installed capture's own units now, and
-    /// the entry releases them when its payload is actually freed and when the
+    /// in-progress unit and the in-progress claim are released together with the
+    /// publish, because the installed capture now owns this logical begin; a
+    /// replay arriving after this point reads the retained handle instead of an
+    /// in-progress claim. The live-capture slot and the reserved terminal-record
+    /// space are *kept* charged: they are the installed capture's own units now,
+    /// and the entry releases them when its payload is actually freed and when the
     /// entry is actually removed.
-    fn settle(&mut self, budget: &mut CaptureBudget, actual_capture_bytes: u64) {
-        budget
+    fn settle(&mut self, states: &mut CaptureRegistry, actual_capture_bytes: u64) {
+        release_begin_claim(states, &self.digest);
+        states
+            .budget
             .retained_bytes
             .settle_to(self.capture_bytes, actual_capture_bytes);
         self.capture_bytes = actual_capture_bytes;
-        budget.release(
+        states.budget.release(
             BudgetDimension::EnumerationBytes,
             RESERVED_ENUMERATION_BYTES,
         );
-        budget.release(BudgetDimension::BeginsInProgress, 1);
+        states.budget.release(BudgetDimension::BeginsInProgress, 1);
         self.settled = true;
     }
 }
@@ -1431,16 +1496,28 @@ impl Drop for BeginReservation {
             return;
         }
         // Poisoned accounting is an observable recovery limitation, not
-        // successful cleanup: the units stay charged, so admission stays
-        // backpressured instead of silently gaining headroom.
+        // successful cleanup: the units and the claim stay recorded, so
+        // admission stays backpressured and the logical begin stays claimed
+        // rather than silently gaining headroom or admitting a second begin over
+        // a capture whose owner can no longer be named.
         let Ok(mut registry) = registry().lock() else {
             return;
         };
+        release_begin_claim(&mut registry, &self.digest);
         release_capture_units(&mut registry.budget, self.capture_bytes);
         registry
             .budget
             .release(BudgetDimension::BeginsInProgress, 1);
     }
+}
+
+/// Removes exactly one in-progress begin's claim, and nothing else.
+///
+/// An entry is inserted only when the digest is unclaimed and is removed only by
+/// the begin that inserted it, so this can neither release a concurrent begin's
+/// claim nor clear one that was never recorded.
+fn release_begin_claim(registry: &mut CaptureRegistry, digest: &str) {
+    registry.begins_in_progress.remove(digest);
 }
 
 /// Returns every unit a begin reservation owns, in the reverse of the order it
@@ -1544,6 +1621,47 @@ fn retained_begin_handle(
         .captures
         .get(digest)
         .map(|state| state.issued.clone()))
+}
+
+/// Resolves a begin against the in-progress claims the owner already holds.
+///
+/// This is the in-flight half of [`retained_begin_handle`]: the registry entry
+/// answers a replay of an *installed* capture, this answers a concurrent second
+/// begin of a logical capture whose owner is still enumerating. `Ok(())` means
+/// the logical begin is unclaimed and the caller may open it.
+///
+/// Two refusals, both already-typed and both reached before any enumeration:
+///
+/// * a different canonical input under an already claimed
+///   operation/idempotency namespace is [`StoreError::IdentityConflict`]. This
+///   is the I5.27 rule — "Reusing an idempotency key with a different canonical
+///   request hash returns `IDENTITY_CONFLICT` and performs no transition" — and
+///   the digest key alone cannot detect it, which is why the claimed namespace
+///   travels with the entry and is compared here.
+/// * the exact repeated begin whose owner is still enumerating is
+///   [`capture_claim_pending`], the same typed pending outcome a page or end call
+///   gets while it does not own the capture's current progress. Its owner has
+///   issued no handle yet, so the honest answer is that the capture is pending:
+///   re-enumerating current data here would present a second observation as the
+///   old capture, and returning a handle derived from it would hand out an
+///   identity this owner never issued.
+fn claim_begin(
+    states: &CaptureRegistry,
+    digest: &str,
+    request: &SnapshotBeginRequest,
+) -> Result<(), StoreError> {
+    for (claimed, progress) in &states.begins_in_progress {
+        if claimed != digest
+            && progress.operation_id == request.operation.operation_id
+            && progress.idempotency_key == request.operation.idempotency_key
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+    }
+    if states.begins_in_progress.contains_key(digest) {
+        return Err(capture_claim_pending());
+    }
+    Ok(())
 }
 
 /// Reports whether a capture can no longer serve: owner expiry passed (or
@@ -2764,10 +2882,13 @@ fn resolve_claim(state: &SnapshotState, claim: &CaptureCallClaim) -> Result<(), 
 ///
 /// A close that answers here cannot know the final counts, because the live
 /// page claim may still advance them, and a second page call cannot know which
-/// progress state it would extend. `eliot_store_api::StoreError` has no pending
-/// variant, so the typed conflict it does offer for a call that does not own
-/// the capture's current progress revision is used instead of inventing one
-/// here.
+/// progress state it would extend. The same outcome answers a concurrent begin
+/// whose logical capture is still being enumerated by its owner (see
+/// [`claim_begin`]): the owning begin has issued no handle yet, so the honest
+/// answer is a pending capture rather than a handle from a second observation.
+/// `eliot_store_api::StoreError` has no pending variant, so the typed conflict it
+/// does offer for a call that does not own the capture's current progress
+/// revision is used instead of inventing one here.
 fn capture_claim_pending() -> StoreError {
     StoreError::RevisionConflict
 }
@@ -3256,20 +3377,24 @@ pub(crate) async fn begin_snapshot(
     // [`snapshot_owner_maintenance_tick`] when no request arrives at all.
     snapshot_owner_maintenance_tick(started_at_ms)?;
     let snapshot_digest = request.compute_digest().map_err(redact_snapshot_error)?;
-    // Resolve the exact logical begin AND reserve its whole allowance under one
-    // acquisition of the one registry lock. An exact replay returns the retained
-    // handle and the retained progress without enumerating and without charging
-    // anything; a different canonical input under an already claimed
-    // operation/idempotency namespace is refused. Only a genuinely new begin
-    // reserves, and because the check and the reservation share one acquisition,
-    // two concurrent begins cannot both pass an unlocked size check.
+    // Resolve the exact logical begin AND reserve its whole allowance and its
+    // single-owner claim under one acquisition of the one registry lock. An exact
+    // replay returns the retained handle and the retained progress without
+    // enumerating and without charging anything; a concurrent identical begin is
+    // answered with the typed pending outcome because its owner is already
+    // enumerating this very capture; a different canonical input under an already
+    // claimed operation/idempotency namespace is refused. Only a genuinely new
+    // begin reserves, and because the check and the reservation share one
+    // acquisition, two concurrent begins cannot both pass an unlocked size check
+    // and two cannot both enumerate the same logical capture.
     let mut reservation = {
         let mut states = lock_registry()?;
         states.budget.refuse_if_unusable()?;
         if let Some(retained) = retained_begin_handle(&states, &snapshot_digest, &request)? {
             return Ok(retained);
         }
-        reserve_begin(&mut states)?
+        claim_begin(&states, &snapshot_digest, &request)?;
+        reserve_begin(&mut states, &snapshot_digest, &request)?
     };
     // The reservation is owned across this await and returned exactly once on
     // every exit below: an error, a cancellation, or a publish-versus-cancel
@@ -3320,7 +3445,7 @@ pub(crate) async fn begin_snapshot(
     // absence are both rechecked under it, so a successor that claimed this
     // logical request while this call enumerated is never overwritten; this call
     // returns that successor's retained handle and releases only its own
-    // reservation through `Drop`.
+    // reservation — units and in-progress claim — through `Drop`.
     let mut states = lock_registry()?;
     states.budget.refuse_if_unusable()?;
     if let Some(state) = states.captures.get(&snapshot_digest) {
@@ -3365,7 +3490,7 @@ pub(crate) async fn begin_snapshot(
         stage: ExpiryStage::Retire,
         digest: snapshot_digest,
     });
-    reservation.settle(&mut states.budget, actual_capture_bytes);
+    reservation.settle(&mut states, actual_capture_bytes);
     Ok(handle)
 }
 
