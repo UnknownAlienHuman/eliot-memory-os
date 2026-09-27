@@ -258,6 +258,8 @@ pub struct GovernedStageReport {
     pub evidence_detail: String,
     /// Machine-derived executable identity digest, when observed.
     pub executable_digest: Option<String>,
+    /// Pre-launch admission grant digest, when recorded for the run.
+    pub grant_digest: Option<String>,
     /// Executor operation reference, bound at launch.
     pub operation_id: Option<String>,
     /// Canonical handle of the persisted run record, when a store was supplied.
@@ -730,6 +732,7 @@ fn persist_stage_report(
         "evidence_state": evidence_state,
         "evidence_detail": evidence_detail,
         "executable_digest": run.executable_digest,
+        "grant_digest": run.grant_digest,
         "operation_id": run.stage.operation_id,
     });
     let run_blob = match blob_store {
@@ -751,6 +754,7 @@ fn persist_stage_report(
         evidence_state: evidence_state.to_owned(),
         evidence_detail,
         executable_digest: run.executable_digest.clone(),
+        grant_digest: run.grant_digest.clone(),
         operation_id: run.stage.operation_id.clone(),
         run_blob,
     })
