@@ -5,8 +5,8 @@
 //! name never grants authority by itself. This module is the server-enforced
 //! policy: [`compile_capability`] intersects the role default with `WorkScope`
 //! narrowing and delegated authority, binds the result to the exact role,
-//! scope, task/work item, route, `GovernanceProfile` revision, `State Fence`
-//! (authority epoch), lease epoch and expiry, and [`CapabilityContext`]
+//! scope, task/work item, route, `GovernanceProfile` revision, exact
+//! `State Fence`, lease epoch and expiry, and [`CapabilityContext`]
 //! revokes the preceding capability context on every explicit
 //! [`CapabilityContext::transition`], updating the [`IndependenceProfile`].
 //!
@@ -21,7 +21,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use eliot_contracts::EpochId;
+use eliot_contracts::StateFence;
 use thiserror::Error;
 
 /// Closed operation vocabulary enforced by [`CapabilityToken::authorize`].
@@ -282,8 +282,8 @@ pub struct ScopeBinding {
     pub route: String,
     /// `GovernanceProfile` revision the capability was compiled against.
     pub governance_revision: String,
-    /// State Fence authority epoch the capability is bound to.
-    pub authority_epoch: EpochId,
+    /// Exact State Fence the capability is bound to.
+    pub state_fence: StateFence,
     /// Owner-assigned lease epoch; bumped on every role transition.
     pub lease_epoch: u64,
     /// Owner-observed issuance time (Unix ms).
@@ -548,7 +548,7 @@ impl CapabilityContext {
         now_unix_ms: u64,
     ) -> Result<RoleTransitionRecord, RoleLeaseError> {
         let prev_role = self.active.role;
-        let downgraded = match (&prev_role, new_role, downgrade) {
+        let downgrade_record = match (&prev_role, new_role, downgrade) {
             (AgentRole::Verifier, to, None) if to.is_mutating() => {
                 return Err(RoleLeaseError::DowngradeRecordRequired {
                     from: prev_role,
@@ -557,17 +557,13 @@ impl CapabilityContext {
             }
             (AgentRole::Verifier, to, Some(record)) if to.is_mutating() => {
                 record.validate(prev_role, new_role, now_unix_ms)?;
-                self.independence.downgraded = true;
-                self.independence.downgrade_records.push(record);
-                true
+                Some(record)
             }
             (_, _, Some(record)) => {
                 record.validate(prev_role, new_role, now_unix_ms)?;
-                self.independence.downgraded = true;
-                self.independence.downgrade_records.push(record);
-                true
+                Some(record)
             }
-            (_, _, None) => false,
+            (_, _, None) => None,
         };
         if new_binding.lease_epoch <= self.active.binding.lease_epoch {
             return Err(RoleLeaseError::LeaseEpochNotAdvanced {
@@ -577,7 +573,12 @@ impl CapabilityContext {
         }
         let new_context_id = new_context_id.into();
         validate_context_id(&new_context_id)?;
-        if new_context_id == self.active.context_id {
+        if new_context_id == self.active.context_id
+            || self
+                .revoked
+                .iter()
+                .any(|context| context.context_id == new_context_id)
+        {
             return Err(RoleLeaseError::ContextIdReused {
                 context_id: new_context_id,
             });
@@ -595,7 +596,7 @@ impl CapabilityContext {
             prev_role,
             new_role,
             lease_epoch: new_binding.lease_epoch,
-            independence_downgraded: downgraded,
+            independence_downgraded: downgrade_record.is_some(),
         };
         let prev = CapabilityToken {
             revoked: true,
@@ -605,6 +606,10 @@ impl CapabilityContext {
         self.revoked.push(prev);
         self.active = token;
         self.independence.roles_held.push(new_role);
+        if let Some(record) = downgrade_record {
+            self.independence.downgraded = true;
+            self.independence.downgrade_records.push(record);
+        }
         self.transitions.push(record.clone());
         Ok(record)
     }
@@ -646,6 +651,9 @@ impl IndependenceDowngrade {
 /// Every variant fails closed: no denial implies a narrower permission.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum RoleLeaseError {
+    /// Validation failure from the canonical State Fence contract.
+    #[error(transparent)]
+    Contract(#[from] eliot_contracts::ContractError),
     /// The role label is not part of the I7.21 acceptance vocabulary.
     #[error("unknown role label {label:?}: role names never grant authority")]
     UnknownRole {
@@ -782,8 +790,8 @@ pub enum RoleLeaseError {
 /// The allow set is `default(role) ∩ workscope ∩ delegated`; `WorkScope` and
 /// delegation may only narrow. Any attempt to grant a forbidden or unknown
 /// operation fails closed. The token binds the exact role, scope,
-/// task/work item, route, `GovernanceProfile` revision, `State Fence` authority
-/// epoch, lease epoch and expiry.
+/// task/work item, route, `GovernanceProfile` revision, exact `State Fence`,
+/// lease epoch and expiry.
 ///
 /// # Errors
 ///
@@ -866,6 +874,7 @@ fn validate_binding(role: AgentRole, binding: &ScopeBinding) -> Result<(), RoleL
     validate_non_empty("task_id", &binding.task_id)?;
     validate_non_empty("route", &binding.route)?;
     validate_non_empty("governance_revision", &binding.governance_revision)?;
+    binding.state_fence.validate()?;
     if role.requires_work_item() {
         match binding.work_item_id.as_ref() {
             Some(item) => validate_non_empty("work_item_id", item)?,
