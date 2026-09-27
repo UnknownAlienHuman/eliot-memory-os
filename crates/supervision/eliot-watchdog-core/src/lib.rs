@@ -387,6 +387,7 @@ pub fn unix_timestamp(now: SystemTime) -> u64 {
 }
 
 mod reconciliation;
+mod rules;
 mod signals;
 
 pub use signals::{
@@ -403,4 +404,12 @@ pub use reconciliation::{
     WatchdogSpoolReconciliationError, WatchdogSpoolSinkDisposition,
     acknowledgement_advances_cursor, export_retry_identity_equal, is_duplicate_ack,
     validate_acknowledgement, validate_batch, validate_batch_freshness, validate_cursor,
+};
+
+pub use rules::{
+    CompetentIntegrationCoverage, IntegrationGapEvaluation, IntegrationGapObservation,
+    IntegrationGapRule, IntegrationGapSensor, IntegrationGapSignalCandidate,
+    IntegrationGapSignalContext, IntegrationGapUnknown, ProviderAttemptIdentity,
+    ProviderEventIdentity, StateFenceProjection, evaluate_provider_host_event_gap,
+    provider_host_event_gap_rule,
 };
