@@ -560,20 +560,15 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             });
         }
         if input.safety_required {
-            let (decision, reason) = if !input.route_available {
-                (
-                    AutomationDecision::Escalate,
-                    DecisionReason::RouteUnavailable,
-                )
-            } else if !input.budget_available {
-                (AutomationDecision::Defer, DecisionReason::BudgetUnavailable)
-            } else if input.user_session_required && !input.user_session_available {
-                (
-                    AutomationDecision::Defer,
-                    DecisionReason::UserSessionRequired,
-                )
+            // This input is only a caller-projected flag; the maintenance
+            // evaluator does not own the registered protected-obligation
+            // authority needed to admit safety work. Preserve `off` without a
+            // proactive recommendation, and otherwise defer to the protected
+            // recovery owner instead of letting the flag authorize effects.
+            let (decision, reason) = if input.mode == MaintenanceAutomationMode::Off {
+                (AutomationDecision::Block, DecisionReason::AutomationOff)
             } else {
-                (AutomationDecision::Start, DecisionReason::SafetyRecovery)
+                (AutomationDecision::Defer, DecisionReason::SafetyRecovery)
             };
             return Ok(Self::decision(input, decision, reason));
         }
