@@ -6122,14 +6122,15 @@ fn map_introduction_transition_error(
 
 /// Maps a rich-call rejection to the thin-port typed error.
 ///
-/// `NotAdmitted` is a Kernel-side admission refusal (fenced/epoch-gated
-/// authority, expiry, or reserve exhaustion — never a receipt).
+/// `NotAdmitted` is reserved for transport admission refusal or a missing P-07
+/// route. Proven Kernel authority, expiry, and reserve failures use distinct
+/// `Refused` causes instead of collapsing to one admission code.
 /// `InvalidBinding` is caller-side material that is internally inconsistent
 /// (owner/fence/epoch/ceiling/lineage mismatch). `IdentityConflict` preserves
-/// known operation-identity disagreement; `Unavailable` is reserved for a
-/// genuinely missing hydration or durability owner (ORS, recovery view,
-/// dependency). The mapping is fail-closed: no branch grants authority and no
-/// secret or provider detail crosses the error surface.
+/// known operation-identity disagreement. Failures with proven P-07 causes use
+/// `Refused` so the wire preserves their closed type; no error payload or
+/// provider detail crosses the boundary. The mapping is fail-closed: no branch
+/// grants authority.
 fn map_thin_error(error: &KernelError) -> eliot_authority::P07PortError {
     use eliot_authority::P07PortError;
     match error {
@@ -6143,16 +6144,36 @@ fn map_thin_error(error: &KernelError) -> eliot_authority::P07PortError {
                 eliot_authority::P07RefusalCause::CrossLineageAuthorityEpoch
             },
         },
-        KernelError::FenceMismatch
-        | KernelError::Expired { .. }
-        | KernelError::ControlReserveExhausted
-        | KernelError::NormalCapacityExhausted { .. }
-        | KernelError::ProtectedReserveExhausted { .. }
-        | KernelError::EmergencySlotUnavailable { .. }
-        | KernelError::ControlGuaranteeLost { .. } => P07PortError::NotAdmitted,
-        KernelError::DependencyUnavailable(_)
-        | KernelError::RecoveryUnavailable(_)
-        | KernelError::RecoveryState(_) => P07PortError::Unavailable,
+        KernelError::FenceMismatch => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::StaleStateFence,
+        },
+        KernelError::Expired { .. } => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::AuthorityReceiptExpired,
+        },
+        KernelError::ControlReserveExhausted => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::ControlReserveExhausted,
+        },
+        KernelError::NormalCapacityExhausted { .. } => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::NormalCapacityExhausted,
+        },
+        KernelError::ProtectedReserveExhausted { .. } => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::ProtectedReserveExhausted,
+        },
+        KernelError::EmergencySlotUnavailable { .. } => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::EmergencySlotUnavailable,
+        },
+        KernelError::ControlGuaranteeLost { .. } => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::ControlGuaranteeLost,
+        },
+        KernelError::DependencyUnavailable(_) => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::DependencyUnavailable,
+        },
+        KernelError::RecoveryUnavailable(_) => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::RecoveryUnavailable,
+        },
+        KernelError::RecoveryState(_) => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::RecoveryStateFailure,
+        },
         KernelError::IdempotencyConflict => P07PortError::IdentityConflict,
         KernelError::InvalidField {
             field: "binding.authority_owner",

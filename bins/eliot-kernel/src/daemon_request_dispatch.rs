@@ -155,6 +155,7 @@ const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
 const P07_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
 const P07_DISPOSITION_RECOVERY_REQUIRED: &str = "RECOVERY_REQUIRED";
 const P07_DISPOSITION_INVALID_REQUEST: &str = "INVALID_REQUEST";
+const P07_DISPOSITION_DENIED: &str = "DENIED";
 const P07_DISPOSITION_FAILED: &str = "FAILED";
 const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 
@@ -921,6 +922,33 @@ fn p07_cause_classification(
         ),
         Cause::P07OwnerUnavailable => (
             eliot_kernel_service::REASON_CAPABILITY_UNAVAILABLE,
+            P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::AuthorityReceiptExpired => (
+            "DEADLINE_EXCEEDED",
+            P07_DISPOSITION_DENIED,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::ControlReserveExhausted
+        | Cause::NormalCapacityExhausted
+        | Cause::ProtectedReserveExhausted
+        | Cause::EmergencySlotUnavailable => (
+            "DEFERRED_CAPACITY",
+            P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::ControlGuaranteeLost | Cause::RecoveryUnavailable | Cause::RecoveryStateFailure => (
+            "RECOVERY_REQUIRED",
+            P07_DISPOSITION_RECOVERY_REQUIRED,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::DependencyUnavailable => (
+            "ENVIRONMENT_UNAVAILABLE",
             P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
             Directive::OwnerEscalation,
             TransportError::SessionFenced,

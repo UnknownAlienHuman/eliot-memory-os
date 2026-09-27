@@ -142,6 +142,24 @@ pub enum P07RefusalCause {
     /// The P-07 owner boundary required for grant or introduction lifecycle
     /// operations is not bound.
     P07OwnerUnavailable,
+    /// The presented authority receipt expired before this operation.
+    AuthorityReceiptExpired,
+    /// The legacy control reserve could not admit the operation.
+    ControlReserveExhausted,
+    /// Normal-work admission capacity was exhausted.
+    NormalCapacityExhausted,
+    /// Protected control-reserve capacity was exhausted.
+    ProtectedReserveExhausted,
+    /// The emergency admission slot was unavailable.
+    EmergencySlotUnavailable,
+    /// The control guarantee required for this operation was lost.
+    ControlGuaranteeLost,
+    /// A required dependency was unavailable.
+    DependencyUnavailable,
+    /// The recovery owner or recovery view was unavailable.
+    RecoveryUnavailable,
+    /// The durable recovery-state operation failed.
+    RecoveryStateFailure,
 }
 
 impl P07RefusalCause {
@@ -161,6 +179,15 @@ impl P07RefusalCause {
             Self::OperationIdentityAlreadyCommitted => "operation-identity-already-committed",
             Self::CommitOutcomeUnproven => "commit-outcome-unproven",
             Self::P07OwnerUnavailable => "p07-owner-unavailable",
+            Self::AuthorityReceiptExpired => "authority-receipt-expired",
+            Self::ControlReserveExhausted => "control-reserve-exhausted",
+            Self::NormalCapacityExhausted => "normal-capacity-exhausted",
+            Self::ProtectedReserveExhausted => "protected-reserve-exhausted",
+            Self::EmergencySlotUnavailable => "emergency-slot-unavailable",
+            Self::ControlGuaranteeLost => "control-guarantee-lost",
+            Self::DependencyUnavailable => "dependency-unavailable",
+            Self::RecoveryUnavailable => "recovery-unavailable",
+            Self::RecoveryStateFailure => "recovery-state-failure",
         }
     }
 
@@ -181,6 +208,15 @@ impl P07RefusalCause {
             "operation-identity-already-committed" => Some(Self::OperationIdentityAlreadyCommitted),
             "commit-outcome-unproven" => Some(Self::CommitOutcomeUnproven),
             "p07-owner-unavailable" => Some(Self::P07OwnerUnavailable),
+            "authority-receipt-expired" => Some(Self::AuthorityReceiptExpired),
+            "control-reserve-exhausted" => Some(Self::ControlReserveExhausted),
+            "normal-capacity-exhausted" => Some(Self::NormalCapacityExhausted),
+            "protected-reserve-exhausted" => Some(Self::ProtectedReserveExhausted),
+            "emergency-slot-unavailable" => Some(Self::EmergencySlotUnavailable),
+            "control-guarantee-lost" => Some(Self::ControlGuaranteeLost),
+            "dependency-unavailable" => Some(Self::DependencyUnavailable),
+            "recovery-unavailable" => Some(Self::RecoveryUnavailable),
+            "recovery-state-failure" => Some(Self::RecoveryStateFailure),
             _ => None,
         }
     }
@@ -189,18 +225,18 @@ impl P07RefusalCause {
 /// Errors at the typed P-07 port.
 ///
 /// `Unavailable` stays first for wire compatibility with the pure G-01
-/// fragment. `NotAdmitted` reports a Kernel-side admission refusal (fenced or
-/// epoch-gated authority, transport admission refusal, or a missing P-07
-/// route — never a receipt). `InvalidBinding` reports a caller-side binding
-/// that is internally inconsistent (owner/fence/epoch/receipt mismatch).
+/// fragment. `NotAdmitted` reports a transport admission refusal or missing
+/// P-07 route. Known Kernel authority, expiry, capacity, dependency, and
+/// recovery failures use `Refused` with their distinct proven cause. It never
+/// means a receipt. `InvalidBinding` reports a caller-side binding that is
+/// internally inconsistent (owner/fence/epoch/receipt mismatch).
 /// `UnknownOutcome` reports a possible commit with a lost acknowledgement and
 /// must never be collapsed to unavailable/non-executed: the exact request is
 /// retained under its snapshot until exact reconciliation.
 ///
-/// `Refused` carries the exact cause the presentation path already proved for
-/// a refusal that none of the variants above describes precisely. A variant is
-/// used only when its own contract names the condition; a `Refused` cause is
-/// never inferred from prose and never defaulted to a generic code.
+/// `Refused` carries the exact cause already proved at the P-07 presentation
+/// boundary. A cause is never inferred from prose or defaulted to a generic
+/// code.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum P07PortError {
     Unavailable,
