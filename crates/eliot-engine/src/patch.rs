@@ -22,10 +22,12 @@ use tokio::process::Command;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 const MAX_OUTPUT_SUMMARY_BYTES: usize = 512;
-/// Visible quarantine attribution carried by every verifier run executed
-/// through the legacy command lane (issue #1813 W6): the run executed the
-/// quarantined private command map, so no governed profile revision, stage
-/// graph, or receipt may rest on it.
+/// Acceptance-eligibility quarantine carried by every verifier run executed
+/// through the legacy command lane (issue #1813 W6, issue #1852 W3): the run
+/// executed the quarantined private command map, so no governed profile
+/// revision, stage graph, or receipt may rest on it, and the run itself is
+/// acceptance-ineligible no matter its status. Every eligibility predicate
+/// (`required_verifiers_passed`, the finish gate) reads this marker.
 const QUARANTINED_LEGACY_LANE: &str =
     "[quarantined legacy verifier lane: no governed profile receipt; issue #1813 W6]";
 
@@ -441,9 +443,10 @@ impl<'a> VerifierHarness<'a> {
         // execute its admitted stage DAG, which this composition root cannot
         // provision yet, so it fails closed with an explicit missing proof
         // instead of executing the quarantined command map under a governed
-        // name. Quarantined legacy names keep their current behavior with no
-        // governed claim, and every such run is visibly attributed as
-        // quarantined in its summary.
+        // name. Quarantined legacy names keep their observable execution with
+        // no governed claim, and every such run is visibly attributed as
+        // quarantined in its summary and acceptance-ineligible in every
+        // eligibility predicate (issue #1852 W3).
         let instrument_registry =
             InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
                 EngineError::ServiceNotReady {
@@ -531,6 +534,9 @@ impl<'a> VerifierHarness<'a> {
             VerifierStatus::Failed
         };
         let summary = format!("{QUARANTINED_LEGACY_LANE} {}", command_summary(&output));
+        // The quarantine marker above is the acceptance-eligibility signal,
+        // not display text: eligibility predicates reject quarantined runs
+        // even when the legacy command itself exited 0 (issue #1852 W3).
         Ok(verifier_run(
             project_id,
             task_id,
@@ -659,6 +665,14 @@ impl CompletionGate {
                 }
             }
             Err(_) => reasons.push("instrument_profile_registry_unavailable".to_owned()),
+        }
+        // Quarantined legacy-lane runs can never satisfy DONE_VERIFIED
+        // (issue #1852 W3): the private command map is not an accepted
+        // verification source even when the legacy command itself exited 0.
+        for run in verifier_runs.iter().filter(|run| run.required_for_done) {
+            if is_quarantined_legacy_run(run) {
+                reasons.push(format!("quarantined_legacy_verifier:{}", run.name));
+            }
         }
         if !proof
             .evidence
@@ -1208,7 +1222,10 @@ fn append_command_summary(reasons: &mut Vec<String>, output: &BoundedCommandOutp
 fn append_failed_verifiers(reasons: &mut Vec<String>, runs: &[VerifierRun]) {
     reasons.extend(
         runs.iter()
-            .filter(|run| run.required_for_done && run.status != VerifierStatus::Passed)
+            .filter(|run| {
+                run.required_for_done
+                    && (run.status != VerifierStatus::Passed || is_quarantined_legacy_run(run))
+            })
             .map(|run| format!("verifier_failed:{}:{:?}", run.name, run.status)),
     );
 }
@@ -1230,10 +1247,18 @@ fn truncate_lossy(bytes: &[u8]) -> String {
     text.chars().take(MAX_OUTPUT_SUMMARY_BYTES).collect()
 }
 
+/// Acceptance-eligibility quarantine for the legacy command lane (issue
+/// #1852 W3): a run executed through the private command map carries
+/// [`QUARANTINED_LEGACY_LANE`] as its summary prefix, and no such run may
+/// satisfy a required verifier, no matter its status.
+fn is_quarantined_legacy_run(run: &VerifierRun) -> bool {
+    run.summary.starts_with(QUARANTINED_LEGACY_LANE)
+}
+
 fn required_verifiers_passed(runs: &[VerifierRun]) -> bool {
     runs.iter()
         .filter(|run| run.required_for_done)
-        .all(|run| run.status == VerifierStatus::Passed)
+        .all(|run| run.status == VerifierStatus::Passed && !is_quarantined_legacy_run(run))
 }
 
 fn verifier_run_ref(run: &VerifierRun) -> VerifierRunRef {
