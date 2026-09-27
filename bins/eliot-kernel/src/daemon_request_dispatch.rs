@@ -128,6 +128,13 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+/// Typed refusal kind answered by the four P-07 authority arms (`#1110`).
+/// Refusals are completed application answers, never missing frames or receipts.
+const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
+/// I7.20 dispositions emitted only where the P-07 variant establishes a
+/// precise agent-facing classification.
+const P07_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
+const P07_DISPOSITION_RECOVERY_REQUIRED: &str = "RECOVERY_REQUIRED";
 /// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
 ///
 /// This is the exact string published as `USER_AUTOMATION_ROUTE` in
@@ -797,23 +804,111 @@ fn p07_binding_agrees_with_session(
     Ok(())
 }
 
-/// Maps one retained-port refusal to the typed dispatch failure. Admission
-/// refusals and an unready production route fail closed as fenced without
-/// minting authority; a binding that disagrees with retained owner state under
-/// a known identity (changed payload, stale revision, disagreeing material)
-/// conflicts so the caller re-serves fresh state instead of retrying blindly —
-/// the same contract as the owner-bundle publish arm. Only a possible commit
-/// with a lost acknowledgement surfaces as an unknown outcome for exact
-/// reconciliation.
-fn map_p07_port_error(error: &eliot_authority::P07PortError) -> TransportError {
+/// One P-07 refusal projected to the Kernel observation and a wire payload
+/// that preserves the exact P-07 variant. I7.20 fields are present only where
+/// the variant establishes a precise disposition and reason.
+struct P07PortRefusal {
+    transport: TransportError,
+    p07_error: &'static str,
+    snapshot_id: Option<String>,
+    disposition: Option<&'static str>,
+    reason_code: Option<&'static str>,
+}
+
+/// Maps one retained-port refusal to the existing typed dispatch failure and
+/// P-07 wire variant. Only identity conflict and unknown outcome establish an
+/// exact I7.20 classification here; only unknown outcome may report a possible
+/// commit, and it retains its original snapshot identity.
+fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
     match error {
-        eliot_authority::P07PortError::UnknownOutcome { .. } => TransportError::UnknownOutcome,
-        eliot_authority::P07PortError::InvalidBinding
-        | eliot_authority::P07PortError::IdentityConflict => TransportError::IdentityConflict,
-        eliot_authority::P07PortError::NotAdmitted | eliot_authority::P07PortError::Unavailable => {
-            TransportError::SessionFenced
-        }
+        eliot_authority::P07PortError::UnknownOutcome { snapshot_id } => P07PortRefusal {
+            transport: TransportError::UnknownOutcome,
+            p07_error: "UnknownOutcome",
+            snapshot_id: Some(snapshot_id.as_str().to_owned()),
+            disposition: Some(P07_DISPOSITION_RECOVERY_REQUIRED),
+            reason_code: Some(eliot_kernel_service::REASON_UNKNOWN_OUTCOME),
+        },
+        eliot_authority::P07PortError::IdentityConflict => P07PortRefusal {
+            transport: TransportError::IdentityConflict,
+            p07_error: "IdentityConflict",
+            snapshot_id: None,
+            disposition: Some(P07_DISPOSITION_STALE_OR_CONFLICT),
+            reason_code: Some(eliot_kernel_service::REASON_IDENTITY_CONFLICT),
+        },
+        eliot_authority::P07PortError::InvalidBinding => P07PortRefusal {
+            transport: TransportError::IdentityConflict,
+            p07_error: "InvalidBinding",
+            snapshot_id: None,
+            disposition: None,
+            reason_code: None,
+        },
+        eliot_authority::P07PortError::NotAdmitted => P07PortRefusal {
+            transport: TransportError::SessionFenced,
+            p07_error: "NotAdmitted",
+            snapshot_id: None,
+            disposition: None,
+            reason_code: None,
+        },
+        eliot_authority::P07PortError::Unavailable => P07PortRefusal {
+            transport: TransportError::SessionFenced,
+            p07_error: "Unavailable",
+            snapshot_id: None,
+            disposition: None,
+            reason_code: None,
+        },
     }
+}
+
+/// Completes a decided P-07 refusal as a normal, closed `WireOutcome` answer.
+/// A missing frame is indistinguishable from a lost acknowledgement and makes
+/// a refusal that certainly did not commit look like an unknown commit.
+fn p07_refusal_response(
+    operation: &'static str,
+    error: &eliot_authority::P07PortError,
+) -> serde_json::Value {
+    let refusal = map_p07_port_error(error);
+    super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(&refusal.transport));
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "kind": P07_AUTHORITY_REFUSAL_KIND,
+            "value": {
+                "disposition": refusal.disposition,
+                "reason_code": refusal.reason_code,
+                "p07_error": refusal.p07_error,
+                "snapshot_id": refusal.snapshot_id,
+                "operation": operation,
+            },
+        },
+        "recovery": null,
+    })
+}
+
+/// Builds the ordinary correlated response frame for a front-door P-07
+/// preflight refusal discovered before the owner port is called.
+fn p07_refusal_frame(
+    session: &Session,
+    request_id: RequestId,
+    operation: &'static str,
+    error: &eliot_authority::P07PortError,
+) -> Result<Frame, TransportError> {
+    let mut frame = status_frame(
+        session,
+        FrameKind::Response,
+        MessageType::Result,
+        p07_refusal_response(operation, error),
+    )?;
+    frame.request_id = Some(request_id);
+    frame.validate()?;
+    Ok(frame)
+}
+
+/// P-07 lifecycle targets are resolved against the owner-projected classes in
+/// the current `GrantGraph` snapshot; no second membership rule is introduced.
+#[derive(Clone, Copy, Debug)]
+enum P07LifecycleTarget<'a> {
+    Grant(&'a str),
+    Introduction(&'a str),
 }
 
 impl KernelComposition {
@@ -832,6 +927,61 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(guard)
+    }
+
+    /// Confirms that the exact grant or introduction and snapshot are present
+    /// in the current, internally consistent owner revision before mutation.
+    fn admit_p07_target_against_current_grant_graph(
+        &self,
+        target: P07LifecycleTarget<'_>,
+        snapshot_id: &str,
+    ) -> Result<(), eliot_authority::P07PortError> {
+        use eliot_kernel_core::RootGrantHydrationSource as _;
+
+        let guard = self
+            .p07_owner
+            .lock()
+            .map_err(|_| eliot_authority::P07PortError::Unavailable)?;
+        let Some(bound) = guard.as_ref() else {
+            return Err(eliot_authority::P07PortError::Unavailable);
+        };
+        let current_revision = bound.bound_revision();
+        if current_revision == 0 || bound.source().revision() != current_revision {
+            return Err(eliot_authority::P07PortError::Unavailable);
+        }
+        let admitted = match target {
+            P07LifecycleTarget::Grant(grant_id) => bound
+                .source()
+                .admitted_grant_hydrations()
+                .map_err(|_| eliot_authority::P07PortError::Unavailable)?
+                .into_iter()
+                .find(|hydration| hydration.intent.grant_id == grant_id)
+                .map(|hydration| {
+                    (
+                        hydration.intent.snapshot_id,
+                        hydration.intent.grant_graph_revision,
+                    )
+                }),
+            P07LifecycleTarget::Introduction(introduction_id) => bound
+                .source()
+                .admitted_introductions()
+                .map_err(|_| eliot_authority::P07PortError::Unavailable)?
+                .into_iter()
+                .find(|hydration| hydration.intent.introduction_id == introduction_id)
+                .map(|hydration| {
+                    (
+                        hydration.intent.snapshot_id,
+                        hydration.intent.grant_graph_revision,
+                    )
+                }),
+        };
+        let Some((admitted_snapshot_id, admitted_revision)) = admitted else {
+            return Err(eliot_authority::P07PortError::NotAdmitted);
+        };
+        if admitted_snapshot_id != snapshot_id || admitted_revision != current_revision {
+            return Err(eliot_authority::P07PortError::IdentityConflict);
+        }
+        Ok(())
     }
 }
 #[derive(Deserialize)]
@@ -2465,6 +2615,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Grant(&operation.grant_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "activate_grant",
+                        &refusal,
+                    );
+                }
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -2479,15 +2640,21 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::activate_grant(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_activation_receipt",
-                    "value": value,
-                }))
+                match eliot_authority::P07AuthorityPort::activate_grant(bound.port(), &request) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_activation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("activate_grant", &refusal)),
+                }
             }
             "revoke_grant" => {
                 let operation: GrantRevocationOperation =
@@ -2497,6 +2664,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Grant(&operation.grant_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "revoke_grant",
+                        &refusal,
+                    );
+                }
                 let request = eliot_authority::GrantRevocationRequest {
                     grant_id: eliot_authority::GrantId::new(operation.grant_id)
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -2506,15 +2684,21 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::revoke_grant(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_revocation_receipt",
-                    "value": value,
-                }))
+                match eliot_authority::P07AuthorityPort::revoke_grant(bound.port(), &request) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_revocation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("revoke_grant", &refusal)),
+                }
             }
             "activate_introduction" => {
                 let operation: IntroductionActivationOperation =
@@ -2526,6 +2710,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Introduction(&operation.introduction_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "activate_introduction",
+                        &refusal,
+                    );
+                }
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -2542,17 +2737,24 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt = eliot_authority::P07AuthorityPort::activate_introduction(
+                match eliot_authority::P07AuthorityPort::activate_introduction(
                     bound.port(),
                     &request,
-                )
-                .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_activation_receipt",
-                    "value": value,
-                }))
+                ) {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_activation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("activate_introduction", &refusal)),
+                }
             }
             "revoke_introduction" => {
                 let operation: IntroductionRevocationOperation =
@@ -2564,6 +2766,17 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Introduction(&operation.introduction_id),
+                    &operation.snapshot_id,
+                ) {
+                    return p07_refusal_frame(
+                        session,
+                        request_id.clone(),
+                        "revoke_introduction",
+                        &refusal,
+                    );
+                }
                 let request = eliot_authority::IntroductionRevocationRequest {
                     introduction_id: eliot_authority::IntroductionId::new(
                         operation.introduction_id,
@@ -2575,15 +2788,22 @@ impl KernelComposition {
                 };
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt =
-                    eliot_authority::P07AuthorityPort::revoke_introduction(bound.port(), &request)
-                        .map_err(|error| map_p07_port_error(&error))?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": "authority_revocation_receipt",
-                    "value": value,
-                }))
+                match eliot_authority::P07AuthorityPort::revoke_introduction(bound.port(), &request)
+                {
+                    Ok(receipt) => {
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "kind": "authority_revocation_receipt",
+                                "value": value,
+                            },
+                            "recovery": null,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response("revoke_introduction", &refusal)),
+                }
             }
             ACTIVATE_ROOT_TRANSITION_OPERATION => {
                 let operation: RootTransitionActivationOperation =
@@ -2636,7 +2856,7 @@ impl KernelComposition {
                     bound.port(),
                     &request,
                 )
-                .map_err(|error| map_p07_port_error(&error))?;
+                .map_err(|error| map_p07_port_error(&error).transport)?;
                 receipt
                     .validate(&request)
                     .map_err(|_| TransportError::SessionFenced)?;

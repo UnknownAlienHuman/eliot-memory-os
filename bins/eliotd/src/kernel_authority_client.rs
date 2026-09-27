@@ -39,6 +39,7 @@ use eliot_authority::{
 };
 use eliot_contracts::StateFence;
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
+use eliot_kernel_service::{REASON_IDENTITY_CONFLICT, REASON_UNKNOWN_OUTCOME};
 use eliot_receipts::{AuthorityBinding, AuthorityRequestSubject};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 
@@ -60,6 +61,8 @@ const ACTIVATE_ROOT_TRANSITION_OPERATION: &str = "activate_root_transition";
 
 const ACTIVATION_RECEIPT_KIND: &str = "authority_activation_receipt";
 const REVOCATION_RECEIPT_KIND: &str = "authority_revocation_receipt";
+/// Closed Kernel application kind for a decided P-07 refusal.
+const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
 const ROOT_TRANSITION_RECEIPT_KIND: &str = "authority_root_transition_receipt";
 
 /// The exact session capability this adapter presents as its authenticated
@@ -141,8 +144,7 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(ACTIVATE_GRANT_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, ACTIVATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(&value, ACTIVATION_RECEIPT_KIND, ACTIVATE_GRANT_OPERATION)?;
         decode_activation_receipt(value, request)
     }
 
@@ -163,8 +165,7 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(REVOKE_GRANT_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, REVOCATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(&value, REVOCATION_RECEIPT_KIND, REVOKE_GRANT_OPERATION)?;
         decode_revocation_receipt(value, request.snapshot_id.as_str(), &fence)
     }
 
@@ -185,8 +186,11 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(ACTIVATE_INTRODUCTION_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, ACTIVATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(
+            &value,
+            ACTIVATION_RECEIPT_KIND,
+            ACTIVATE_INTRODUCTION_OPERATION,
+        )?;
         decode_activation_receipt_for(value, request.snapshot_id.as_str(), &request.binding)
     }
 
@@ -207,8 +211,11 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(REVOKE_INTRODUCTION_OPERATION, payload)
             .map_err(|error| map_transport(error, &request.snapshot_id))?;
-        let value = kind_value(&value, REVOCATION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        let value = p07_route_value(
+            &value,
+            REVOCATION_RECEIPT_KIND,
+            REVOKE_INTRODUCTION_OPERATION,
+        )?;
         decode_revocation_receipt(value, request.snapshot_id.as_str(), &fence)
     }
 
@@ -336,6 +343,76 @@ fn map_transport(error: KernelPortError, snapshot_id: &SnapshotId) -> P07PortErr
         KernelPortError::Unknown(_) => P07PortError::UnknownOutcome {
             snapshot_id: snapshot_id.clone(),
         },
+    }
+}
+
+/// Decodes an answered P-07 route, checking for its typed refusal before
+/// comparing the success receipt kind. A completed refusal is not a transport
+/// loss and must not become `UnknownOutcome`.
+fn p07_route_value(
+    value: &serde_json::Value,
+    receipt_kind: &str,
+    operation: &str,
+) -> Result<serde_json::Value, P07PortError> {
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some(P07_AUTHORITY_REFUSAL_KIND) {
+        return Err(p07_refusal_error(value, operation));
+    }
+    kind_value(value, receipt_kind).map_err(|_| P07PortError::InvalidBinding)
+}
+
+/// Preserves the exact existing P-07 error variant and any recovery snapshot.
+/// This bounded P-07 wire emits only supported I7.20 classifications; full
+/// I7.20 projection remains incomplete until the owner supplies richer cause
+/// detail for the other variants.
+fn p07_refusal_error(value: &serde_json::Value, expected_operation: &str) -> P07PortError {
+    let refusal = value.get("value");
+    let operation = refusal
+        .and_then(|body| body.get("operation"))
+        .and_then(serde_json::Value::as_str);
+    if operation != Some(expected_operation) {
+        return P07PortError::InvalidBinding;
+    }
+    let disposition = refusal
+        .and_then(|body| body.get("disposition"))
+        .and_then(serde_json::Value::as_str);
+    let reason_code = refusal
+        .and_then(|body| body.get("reason_code"))
+        .and_then(serde_json::Value::as_str);
+    let p07_error = refusal
+        .and_then(|body| body.get("p07_error"))
+        .and_then(serde_json::Value::as_str);
+    let wire_snapshot = refusal.and_then(|body| body.get("snapshot_id"));
+    match (p07_error, disposition, reason_code) {
+        (Some("IdentityConflict"), Some("STALE_OR_CONFLICT"), Some(REASON_IDENTITY_CONFLICT))
+            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
+        {
+            P07PortError::IdentityConflict
+        }
+        (Some("InvalidBinding"), None, None)
+            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
+        {
+            P07PortError::InvalidBinding
+        }
+        (Some("Unavailable"), None, None)
+            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
+        {
+            P07PortError::Unavailable
+        }
+        (Some("NotAdmitted"), None, None)
+            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
+        {
+            P07PortError::NotAdmitted
+        }
+        (Some("UnknownOutcome"), Some("RECOVERY_REQUIRED"), Some(REASON_UNKNOWN_OUTCOME)) => {
+            let Some(snapshot_value) = wire_snapshot.and_then(serde_json::Value::as_str) else {
+                return P07PortError::InvalidBinding;
+            };
+            let Ok(snapshot_id) = SnapshotId::new(snapshot_value.to_owned()) else {
+                return P07PortError::InvalidBinding;
+            };
+            P07PortError::UnknownOutcome { snapshot_id }
+        }
+        _ => P07PortError::InvalidBinding,
     }
 }
 
