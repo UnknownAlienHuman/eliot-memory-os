@@ -147,7 +147,7 @@ where
         .transpose()
 }
 
-fn decode_entry(sequence: u64, bytes: &[u8]) -> Result<WatchdogSpoolEntry, SpoolError> {
+pub(crate) fn decode_entry(sequence: u64, bytes: &[u8]) -> Result<WatchdogSpoolEntry, SpoolError> {
     if bytes.len() > SPOOL_MAX_RECORD_BYTES {
         return Err(SpoolError::Corrupt(format!(
             "record {sequence} exceeds the bounded frame size"
@@ -224,16 +224,89 @@ pub(crate) fn validate_header(
     Ok(())
 }
 
+/// Validates the retained table without materializing every entry.
+///
+/// Returns the last sequence for the high-water check. This mirrors
+/// `validate_header`'s counter, byte, and ordering checks while keeping memory
+/// bounded to one decoded record at a time.
+pub(crate) fn validate_header_stream<T>(
+    header: &WatchdogSpoolHeader,
+    table: &T,
+) -> Result<u64, SpoolError>
+where
+    T: ReadableTable<u64, &'static [u8]>,
+{
+    let mut record_count = 0_u64;
+    let mut bytes = 0_u64;
+    let mut first_sequence = None;
+    let mut last_sequence = None;
+    let mut ordered = true;
+
+    for item in table
+        .iter()
+        .map_err(|error| SpoolError::Database(error.to_string()))?
+    {
+        let (key, value) = item.map_err(|error| SpoolError::Database(error.to_string()))?;
+        let sequence = key.value();
+        if sequence == SPOOL_HEADER_KEY {
+            continue;
+        }
+        let entry = decode_entry(sequence, value.value())?;
+        let entry_bytes = serde_json::to_vec(&entry)
+            .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+        record_count = record_count.saturating_add(1);
+        bytes = bytes.saturating_add(entry_bytes.len() as u64);
+        if last_sequence.is_some_and(|last| entry.sequence <= last) {
+            ordered = false;
+        }
+        first_sequence.get_or_insert(entry.sequence);
+        last_sequence = Some(entry.sequence);
+    }
+
+    if header.schema_version != SPOOL_SCHEMA_VERSION
+        || header.next_sequence == 0
+        || header.first_sequence == 0
+        || header.record_count != record_count
+        || header.record_count > SPOOL_MAX_RECORDS
+        || header.bytes > SPOOL_MAX_BYTES
+        || bytes != header.bytes
+    {
+        return Err(SpoolError::Corrupt(
+            "spool header counters or schema are inconsistent".to_owned(),
+        ));
+    }
+
+    let expected_first = first_sequence.unwrap_or(header.next_sequence);
+    if header.first_sequence != expected_first
+        || !ordered
+        || last_sequence.is_some_and(|last| last >= header.next_sequence)
+    {
+        return Err(SpoolError::Corrupt(
+            "spool sequence ordering is inconsistent".to_owned(),
+        ));
+    }
+
+    Ok(last_sequence.unwrap_or(0))
+}
+
 pub(crate) fn validate_high_water(
     header: &WatchdogSpoolHeader,
     entries: &[WatchdogSpoolEntry],
+    high_water: u64,
+) -> Result<(), SpoolError> {
+    let last = entries.last().map_or(0, |entry| entry.sequence);
+    validate_high_water_last(header, last, high_water)
+}
+
+pub(crate) fn validate_high_water_last(
+    header: &WatchdogSpoolHeader,
+    last: u64,
     high_water: u64,
 ) -> Result<(), SpoolError> {
     let expected = header
         .next_sequence
         .checked_sub(1)
         .ok_or_else(|| SpoolError::Corrupt("spool header next sequence is invalid".to_owned()))?;
-    let last = entries.last().map_or(0, |entry| entry.sequence);
     if high_water != expected || high_water < last {
         return Err(SpoolError::Corrupt(
             "high-water metadata does not bind the spool sequence".to_owned(),

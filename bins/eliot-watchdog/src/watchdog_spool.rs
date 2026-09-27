@@ -42,8 +42,8 @@ pub use backup::{
 };
 pub use codec::{WatchdogSpoolEntry, WatchdogSpoolHeader, WatchdogSpoolPayload};
 use codec::{
-    collect_entries, decode_header, decode_high_water, encode_header, read_high_water,
-    validate_high_water,
+    collect_entries, decode_entry, decode_header, decode_high_water, encode_header,
+    read_high_water, validate_header_stream, validate_high_water, validate_high_water_last,
 };
 pub(crate) use codec::{encode_entry, encode_high_water, validate_header};
 
@@ -1522,22 +1522,13 @@ impl WatchdogSpool {
         );
         limits.validate()?;
         validate_cursor(predecessor, high_water)?;
-        let (entries, live_high_water, stored) = self.read_export_snapshot()?;
-        if high_water > live_high_water {
-            return Err(WatchdogSpoolReconciliationError::InvalidCursor.into());
-        }
-        check_export_predecessor(&stored, predecessor)?;
+        let window = self.read_export_window_snapshot(predecessor, high_water, &limits)?;
         if predecessor.acknowledged_sequence == high_water {
             let batch = build_empty_export_batch(predecessor, high_water)?;
             validate_batch(&batch, high_water)?;
             return Ok((batch, Vec::new()));
         }
-        match select_export_window(
-            &entries,
-            predecessor.acknowledged_sequence,
-            high_water,
-            &limits,
-        )? {
+        match window {
             ExportWindow::Ready(selected) => {
                 let (batch, raws) = build_export_batch(predecessor, high_water, &selected)?;
                 validate_batch(&batch, high_water)?;
@@ -1755,6 +1746,53 @@ impl WatchdogSpool {
     }
 
     /// Reads one validated export snapshot inside a single read transaction.
+    fn read_export_window_snapshot(
+        &self,
+        predecessor: &WatchdogSpoolCursor,
+        high_water: u64,
+        limits: &WatchdogSpoolExportLimits,
+    ) -> Result<ExportWindow, SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = read.open_table(SPOOL_TABLE).map_err(|error| {
+            SpoolError::Corrupt(format!("spool export cannot open the spool table: {error}"))
+        })?;
+        let header_bytes = table
+            .get(SPOOL_HEADER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| SpoolError::Corrupt("spool header is missing".to_owned()))?;
+        let header = decode_header(&header_bytes)?;
+        let last_sequence = validate_header_stream(&header, &table)?;
+        let high_water_table = read.open_table(SPOOL_HIGH_WATER_TABLE).map_err(|error| {
+            SpoolError::Corrupt(format!("high-water metadata is unavailable: {error}"))
+        })?;
+        let live_high_water = read_high_water(&high_water_table)?
+            .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))?;
+        validate_high_water_last(&header, last_sequence, live_high_water)?;
+        let stored = match read.open_table(SPOOL_EXPORT_CURSOR_TABLE) {
+            Ok(cursor_table) => decode_export_cursor_value(&cursor_table)?,
+            Err(redb::TableError::TableDoesNotExist(_)) => unbound_export_cursor(),
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        if high_water > live_high_water {
+            return Err(WatchdogSpoolReconciliationError::InvalidCursor.into());
+        }
+        check_export_predecessor(&stored, predecessor)?;
+        if predecessor.acknowledged_sequence == high_water {
+            return Ok(ExportWindow::Ready(Vec::new()));
+        }
+        select_export_window(
+            &table,
+            predecessor.acknowledged_sequence,
+            high_water,
+            limits,
+        )
+    }
+
+    /// Reads a validated spool snapshot for the bounded pending-intent query.
     fn read_export_snapshot(
         &self,
     ) -> Result<(Vec<WatchdogSpoolEntry>, u64, WatchdogSpoolCursor), SpoolError> {
@@ -2239,12 +2277,15 @@ enum ExportWindow {
 /// record afterwards for forensic linkage. At least one record is always
 /// selected. Any retention hole inside the window fails closed instead of
 /// skipping a sequence.
-fn select_export_window(
-    entries: &[WatchdogSpoolEntry],
+fn select_export_window<T>(
+    table: &T,
     acknowledged: u64,
     high_water: u64,
     limits: &WatchdogSpoolExportLimits,
-) -> Result<ExportWindow, SpoolError> {
+) -> Result<ExportWindow, SpoolError>
+where
+    T: ReadableTable<u64, &'static [u8]>,
+{
     let first_needed = acknowledged
         .checked_add(1)
         .ok_or(WatchdogSpoolReconciliationError::PredecessorMismatch)?;
@@ -2254,17 +2295,19 @@ fn select_export_window(
     let mut selected = Vec::new();
     let mut bytes_total: u64 = 0;
     let mut expected = first_needed;
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.sequence >= first_needed && entry.sequence <= item_cap_end)
+    for item in table
+        .range(first_needed..=item_cap_end)
+        .map_err(|error| SpoolError::Database(error.to_string()))?
     {
+        let (key, value) = item.map_err(|error| SpoolError::Database(error.to_string()))?;
+        let entry = decode_entry(key.value(), value.value())?;
         if entry.sequence != expected {
             return Err(SpoolError::Corrupt(
                 "watchdog spool retention no longer covers the export cursor; refusing to skip sequences"
                     .to_owned(),
             ));
         }
-        let raw = encode_entry(entry)?;
+        let raw = encode_entry(&entry)?;
         if !selected.is_empty()
             && (selected.len() >= limits.max_items
                 || bytes_total.saturating_add(raw.len() as u64) > limits.max_bytes)
