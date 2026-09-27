@@ -170,7 +170,9 @@ impl RouteInstallationIdentity {
 }
 
 /// One identity layer that can make dependent evidence stale (I3.4).
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteIdentityLayer {
     /// Host family.
@@ -509,7 +511,12 @@ impl ActualRouteReceipt {
             .zip(self.observed.billing_mode.clone())
             .zip(self.observed.serializer_fingerprint.clone())
             .map(
-                |(auth, provider, billing, serializer)| RouteScopeFingerprint {
+                // `_billing`: the evidence `scope_fingerprint` has no billing
+                // field, because I3.4's mandatory stale set is
+                // runtime/adapter/provider/serializer. Billing still takes part
+                // in the requested-vs-observed comparison below; it is not part
+                // of the evidence scope and must not silently become one.
+                |(((auth, provider), _billing), serializer)| RouteScopeFingerprint {
                     runtime_hash: Some(self.requested_fingerprint.runtime_hash.clone()),
                     adapter_hash: Some(self.requested_fingerprint.adapter_hash.clone()),
                     os_architecture: Some(self.installation.os_architecture.clone()),
@@ -574,7 +581,7 @@ impl From<&CapabilityEvidenceRecord> for RouteEvidenceSummary {
 }
 
 /// Why the Governor refused to admit a route.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteRefusalReason {
     /// The runtime exposed no usable route identity, so no evidence scope
