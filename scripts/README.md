@@ -59,6 +59,7 @@ committed as repository authority.
 | `gen_user_automation_zone_table.py` | Generate pinned IANA zone table for Kernel UserAutomation occurrence validator (#2805) | Pinned IANA zone table generation only |
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
+| `generate_reason_codes.py` | Render the I7.20 reason-code projection (`docs/generated/reason-codes.md`) from the `eliot-protocol` Rust registry, verified against the normative I7.20 canonical set; `--check` fails on a stale projection (#1743) | Generated reason-code projection only |
 
 The three public documentation entrypoints are intentionally small front doors.
 Their `*_core.py` modules retain the established implementations while the front
