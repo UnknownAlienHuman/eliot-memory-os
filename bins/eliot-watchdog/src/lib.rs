@@ -57,6 +57,7 @@ const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
+mod audit_anchor_sink;
 mod backup_control;
 mod diagnostics;
 mod heartbeat_transport;
@@ -144,6 +145,10 @@ pub(crate) use service_registration_projection::{
     read_approved_service_registration, validate_bound_service_registrations,
 };
 
+pub use audit_anchor_sink::{
+    AnchorRejection, AnchorSinkObservation, AuditAnchorSinkError, VerifiedAuditAnchorHead,
+    WatchdogAuditAnchorSink, watchdog_anchor_dir,
+};
 pub use backup_control::{
     AcceptedWatchdogBackupMethod, BackupControlError, BackupControlHandle, WatchdogBackupOutcome,
     WatchdogBackupRequest, accepted_watchdog_backup_methods, register_backup_control,

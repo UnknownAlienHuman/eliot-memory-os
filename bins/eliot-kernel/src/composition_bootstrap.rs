@@ -21,17 +21,17 @@ use super::{
     AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner, ContractId,
     DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
     GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
-    KernelAuditChain, KernelBackupCapture, KernelBackupRestore, KernelBuildError,
-    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
-    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
-    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
-    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
-    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
-    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
-    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
-    USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
-    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
-    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    KernelAuditChain, KernelAuditFallback, KernelBackupCapture, KernelBackupRestore,
+    KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey, KernelError,
+    KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
+    KernelSupervisionLeaseAuthority, ModuleGeneration, ModuleGenerationState,
+    OperationalRecoveryStore, OrsError, OrsGenerationCoordinator, PROTOCOL_VERSION,
+    PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
+    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
+    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
+    StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform, audit_spool_dir,
+    bind_canonical_owner, is_lower_sha256, owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1052,6 +1052,8 @@ impl KernelComposition {
         let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
         let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
         let eliotd_receipt_binding = config.eliotd_receipt_binding.clone();
+        let audit_spool_binding = config.audit_spool_binding.clone();
+        let audit_fallback_profile = config.audit_fallback_profile_or_default();
         if let Some(binding) = &eliotd_receipt_binding {
             binding.validate().map_err(|error| {
                 observe_entrypoint_with_detail(
@@ -1465,6 +1467,17 @@ impl KernelComposition {
                 .set_anchor_sink(binding, &work_root)
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         }
+        // Issue #1840: open the single audit-fallback handle over the spool
+        // directory and reconcile retained records before the restart
+        // boundary seals. The fallback open never fails boot; a degraded
+        // spool stage stays visible through the reconcile report.
+        let spool_dir = match audit_spool_binding.as_ref() {
+            Some(binding) => binding.dir().to_path_buf(),
+            None => audit_spool_dir(&work_root),
+        };
+        let mut audit_fallback = KernelAuditFallback::open(&spool_dir, audit_fallback_profile);
+        let reconcile_report = audit_fallback.reconcile(&mut kernel_audit, unix_ms());
+        observe_entrypoint_with_detail(EntrypointStage::Composition, &reconcile_report.summary());
         let prior_head_seq = kernel_audit.head_seq();
         let prior_head_hash = kernel_audit.head_hash().to_owned();
         kernel_audit
@@ -1491,6 +1504,7 @@ impl KernelComposition {
             p07_owner_transition: std::sync::RwLock::new(()),
             p07_ors: Arc::clone(&ors),
             kernel_audit: Mutex::new(kernel_audit),
+            audit_fallback: Mutex::new(audit_fallback),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
             runtime,

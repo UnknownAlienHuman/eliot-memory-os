@@ -28,13 +28,14 @@
 //! record owns lifecycle state; audit is its evidence projection. An append
 //! failure is never silent: it emits the stable
 //! `KERNEL_AUDIT_APPEND_FAILED` terminal through the #895 diagnostics
-//! facade. The I16.11 cascade holds the two result legs durably: the submit
-//! path spools both drafts fsync-sealed before the ORS completion, and
-//! `audit_chain_records` reconciles that spool against the validated ORS
-//! record before reading, so a completed result always yields its full
-//! ordered chain. Residual: the Watchdog-domain spool leg and the
-//! last-resort control slot are not implemented; other legs stay visible
-//! only through that terminal until the next successful append. Anchor
+//! facade. The I16.11 cascade has two legs. The submit path spools both
+//! drafts fsync-sealed before the ORS completion and `audit_chain_records`
+//! reconciles that spool against the validated ORS record before reading, so a
+//! completed result always yields its full ordered chain. A failed append
+//! itself runs the independent cascade owned by
+//! [`crate::audit_fallback::KernelAuditFallback`] (issue #1840): the failed
+//! draft is retained in the independently persisted audit spool, else the
+//! last-resort channel, else the visible control-loss state. Anchor
 //! auto-export runs
 //! every [`KERNEL_AUDIT_ANCHOR_INTERVAL_RECORDS`] records plus on explicit
 //! export; a failed auto-export likewise stays visible through
@@ -469,6 +470,20 @@ impl AuditEventKind {
         Self::ALL.contains(&kind)
     }
 
+    /// Returns the closed-kind static matching a runtime kind string.
+    ///
+    /// The #1840 spool reconcile path rebuilds drafts through this lookup,
+    /// so a spooled kind either resolves to its canonical static or is
+    /// retained as unknown-kind evidence; a non-canonical kind can never
+    /// leak into the chain through a rebuilt draft.
+    #[must_use]
+    pub(crate) fn canonical(kind: &str) -> Option<&'static str> {
+        Self::ALL
+            .iter()
+            .find(|candidate| **candidate == kind)
+            .copied()
+    }
+
     /// Returns the I16.9 assurance class for one canonical kind.
     #[must_use]
     pub fn assurance_class(kind: &str) -> AuditAssuranceClass {
@@ -862,6 +877,42 @@ impl AuditEventDraft {
             lineage: AuditLineage::empty(),
             body: serde_json::Value::Null,
         }
+    }
+
+    /// Rebuilds a draft from spooled parts for #1840 reconciliation.
+    ///
+    /// The caller resolves `kind` through [`AuditEventKind::canonical`];
+    /// [`KernelAuditChain::append`] reseals the cursor/version lineage slots
+    /// at the new sequence, so spooled pre-finalize lineage stays valid.
+    #[must_use]
+    pub(crate) fn from_parts(
+        kind: &'static str,
+        lineage: AuditLineage,
+        body: serde_json::Value,
+    ) -> Self {
+        Self {
+            kind,
+            lineage,
+            body,
+        }
+    }
+
+    /// Returns the draft kind for #1840 spool retention.
+    #[must_use]
+    pub(crate) fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    /// Returns the draft lineage for #1840 spool retention.
+    #[must_use]
+    pub(crate) fn lineage(&self) -> &AuditLineage {
+        &self.lineage
+    }
+
+    /// Returns the draft body for #1840 spool retention.
+    #[must_use]
+    pub(crate) fn body(&self) -> &serde_json::Value {
+        &self.body
     }
 
     /// Returns the chain (re)opened draft sealing the restart boundary.
@@ -2430,23 +2481,40 @@ fn append_missing_result_leg(
 }
 
 impl crate::KernelComposition {
-    /// Appends one audit event through the composition's single chain.
+    /// Observes one audit event through the I16.11 fallback cascade.
     ///
     /// Uniform observational posture: best-effort, never changes an
-    /// authority decision. A failed append emits the stable
-    /// `KERNEL_AUDIT_APPEND_FAILED` terminal and returns `None` (I16.11:
-    /// silent success is forbidden).
+    /// authority decision. The draft runs the composition's single chain
+    /// first and then the single audit fallback (issue #1840): a failed
+    /// append is retained in the audit spool, else the last-resort
+    /// channel, else the visible control-loss state. Every chain failure
+    /// still emits the stable `KERNEL_AUDIT_APPEND_FAILED` terminal plus
+    /// the cascade retention code (I16.11: silent success is forbidden).
+    /// Lock order is chain-then-fallback, matching reconciliation.
     pub(crate) fn audit_observe(&self, draft: AuditEventDraft) -> Option<AuditRecord> {
         let now = crate::unix_ms();
         let Ok(mut chain) = self.kernel_audit.lock() else {
             crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
             return None;
         };
-        if let Ok(record) = chain.append(draft, now) {
-            Some(record)
-        } else {
+        let Ok(mut fallback) = self.audit_fallback.lock() else {
+            if let Ok(record) = chain.append(draft, now) {
+                return Some(record);
+            }
             crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
-            None
+            return None;
+        };
+        match fallback.observe(&mut chain, draft, now) {
+            crate::audit_fallback::AuditFallbackOutcome::Appended(record) => Some(record),
+            outcome => {
+                crate::kernel_diagnostics::observe_terminal_error(
+                    KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+                );
+                if let Some(code) = outcome.retention_code() {
+                    crate::kernel_diagnostics::observe_terminal_error(code);
+                }
+                None
+            }
         }
     }
 
@@ -2687,6 +2755,32 @@ impl crate::KernelComposition {
             let head_seq = chain.head_seq();
             let head_hash = chain.head_hash().to_owned();
             (head_seq, head_hash)
+        })
+    }
+
+    /// Reconciles spooled audit records into canonical state (issue #1840).
+    ///
+    /// Best-effort like every observation: lock order is chain-then-
+    /// fallback, matching the observe path. Returns `None` when either
+    /// lock is poisoned.
+    pub fn reconcile_audit_spool(&self) -> Option<crate::audit_fallback::AuditReconcileReport> {
+        let now = crate::unix_ms();
+        let mut chain = self.kernel_audit.lock().ok()?;
+        let mut fallback = self.audit_fallback.lock().ok()?;
+        Some(fallback.reconcile(&mut chain, now))
+    }
+
+    /// Counts spool records still awaiting reconciliation.
+    pub fn audit_spool_pending(&self) -> u64 {
+        self.audit_fallback
+            .lock()
+            .map_or(0, |fallback| fallback.pending_spool_records())
+    }
+
+    /// Returns the control-loss counters (`total`, `held`).
+    pub fn audit_control_loss(&self) -> (u64, usize) {
+        self.audit_fallback.lock().map_or((0, 0), |fallback| {
+            (fallback.control_loss_total(), fallback.held_control_loss())
         })
     }
 }
