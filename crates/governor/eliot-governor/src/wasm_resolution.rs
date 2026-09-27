@@ -420,7 +420,7 @@ impl GovernorWasmAdmission {
     /// was actually produced and admitted, so a promotion cannot be gated on a
     /// permanently un-evaluated quadruple.
     fn promotion_receipt(&self) -> Result<Sha256Digest, PortError> {
-        let verdicts = LifecycleVerdictBinding::from_receipt(&self.promotion_receipt);
+        let verdicts = LifecycleVerdictBinding::from_receipt(&self.component_promotion);
         digest_canonical(&(
             &self.promotion.corpus_digest,
             &self.promotion.expected_result_digest,

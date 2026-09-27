@@ -219,7 +219,7 @@ impl MigrationDisposition {
 /// I18.42 requires "canary rollback and old-epoch rejection": a promotion is
 /// only complete when rollback to the named generation is proven and an
 /// old-epoch request is proven rejected.
-#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RollbackEvidence {
     /// The prior compatible generation that receives new requests on rollback.
@@ -362,7 +362,7 @@ impl ComponentContourEvidence {
     }
 
     /// The backends this evidence actually covered.
-    const fn backend_identities(&self) -> &[ComponentBackend] {
+    fn backend_identities(&self) -> &[ComponentBackend] {
         match self {
             Self::SingleContour => &[],
             Self::MultiContour(evidence) => &evidence.backend_identities,
@@ -612,7 +612,6 @@ pub fn recorded_contour_count(component_id: &str) -> Option<ContourCount> {
 }
 
 /// Returns the multi-contour components in the shipped inventory.
-#[must_use]
 pub fn multi_contour_components() -> impl Iterator<Item = &'static ComponentContourRecord> {
     COMPONENT_CONTOUR_INVENTORY
         .iter()
@@ -625,6 +624,10 @@ pub fn multi_contour_components() -> impl Iterator<Item = &'static ComponentCont
 /// so promotion cannot be gated on a quadruple that is permanently
 /// un-evaluated. These are read from the receipt's own evidence: each is
 /// `true` only when the corresponding class was produced and admitted.
+/// A `false` verdict is un-evaluated evidence, never a pass, and the four
+/// fields mirror the lifecycle projection's own verdict axes, so the boolean
+/// record is deliberate here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LifecycleVerdictBinding {
     /// Shadow divergence was produced and resolved.
