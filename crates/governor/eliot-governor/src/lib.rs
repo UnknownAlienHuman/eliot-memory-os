@@ -69,6 +69,7 @@ mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
 mod reactive_admission;
+mod route_registry;
 mod scan_disclosure_owner;
 mod scope_identity_admission;
 mod skill_lifecycle;
@@ -164,6 +165,12 @@ pub use owner_closure_provider::{
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
     assess_reactive_risk, bind_atom_risk,
+};
+pub use route_registry::{
+    ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute, RouteAdmission,
+    RouteAdmissionDecision, RouteBehaviorFingerprint, RouteEvidenceSummary, RouteIdentityLayer,
+    RouteInstallationIdentity, RouteRefusalReason, RouteRegistryError, RuntimeRoute,
+    diverging_scope_layers,
 };
 pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{
