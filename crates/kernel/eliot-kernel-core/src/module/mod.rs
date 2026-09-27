@@ -15,13 +15,16 @@
 //! - [`runtime_health`] — the authenticated compatibility and health carrier
 //!   consumed by Host and native-worker;
 //! - [`generation_readiness`] — the generation-readiness gate consuming the
-//!   completed I6.4 module contract and its resolved required-capability graph.
+//!   completed I6.4 module contract and its resolved required-capability graph;
+//! - [`module_lifecycle_order`] — the provider-first startup and
+//!   reverse-required drain order over that resolved graph.
 
 pub mod compatibility_handshake;
 pub mod control_reserve_front_door;
 pub mod epoch_and_fence;
 pub mod generation_readiness;
 pub mod generation_routing;
+pub mod module_lifecycle_order;
 pub mod notification_state;
 pub mod process_health;
 pub mod recovery_state_view;

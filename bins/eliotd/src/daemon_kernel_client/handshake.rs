@@ -16,7 +16,9 @@ use eliot_protocol::{
     ServerHello,
 };
 #[cfg(windows)]
-use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
+use eliot_runtime_contracts::{
+    ModuleContract, ModuleGeneration, ModuleGenerationState, compare_published_projection,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -133,6 +135,11 @@ pub(super) fn client_hello(
     // Kernel is a handshake-requested capability (carried by
     // `ClientHello.capabilities` below), not a runtime module-graph edge, so it
     // is deliberately absent here: the two lists are never conflated.
+    //
+    // The projection published below is compared field-by-field with the
+    // contract parsed from the exact `module.toml` bytes admitted from the
+    // accepted artifact location, so a substituted manifest or an edited
+    // declaration is refused instead of published.
     let contract = ModuleContract {
         module_id: module_id.clone(),
         version: ContractVersion::new(1, 0, 0),
@@ -165,6 +172,8 @@ pub(super) fn client_hello(
         telemetry: "telemetry/eliotd-v1".to_owned(),
         removal_boundary: "eliotd".to_owned(),
     };
+    compare_published_projection(&binding.admitted_manifest, &contract)
+        .map_err(|error| KernelClientError::Contract(error.to_string()))?;
     let generation = ModuleGeneration {
         module_id,
         generation: binding.module_generation,

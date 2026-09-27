@@ -18,11 +18,13 @@ use thiserror::Error;
 
 mod activation_lifecycle;
 mod control_reserve;
+mod hot_artifact_map;
 mod hot_path;
 mod hot_path_profile;
 mod i14_backpressure;
 mod installation_activation;
 mod module_graph;
+mod module_manifest;
 mod restart_policy;
 mod runtime_live;
 mod supervision_authority;
@@ -39,6 +41,9 @@ pub use control_reserve::{
     BottleneckCapacityProfile, BottleneckCoverageState, BottleneckOwnerBinding, CapacityBottleneck,
     CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
     ControlReserveProfile, EmergencyOperationClass, NormalWorkClass, frozen_bottleneck_owner_map,
+};
+pub use hot_artifact_map::{
+    HotArtifactKind, HotArtifactMap, HotArtifactRecord, admitted_hot_artifact_map,
 };
 pub use hot_path::{
     HOT_PATH_CONTRACT_NAME, HOT_PATH_CONTRACT_VERSION, HOT_PATH_MANIFEST_VERSION,
@@ -84,6 +89,10 @@ pub use installation_activation::{
 pub use module_graph::{
     CapabilityRole, ExternalCapabilityBinding, RequiredCapabilityEdge, RequiredCapabilityGraph,
     UnresolvedCapability, resolve_required_capability_graph,
+};
+pub use module_manifest::{
+    AdmittedModuleManifest, MODULE_MANIFEST_FILE_NAME, MODULE_MANIFEST_SCHEMA_VERSION,
+    ModuleManifest, admit_module_manifest, admitted_manifest_path, compare_published_projection,
 };
 pub use restart_policy::{
     AutomaticRestartDecision, RestartClass, RestartDependency, RestartDependencyKind,
@@ -193,6 +202,32 @@ pub enum RuntimeContractError {
     /// A capability is declared with conflicting dependency roles.
     #[error("module '{module}' declares capability '{capability}' with conflicting roles")]
     CapabilityRoleConflict { module: String, capability: String },
+    /// The manifest bytes are not a parsable protected manifest document.
+    #[error("module manifest is not a protected manifest document: {reason}")]
+    MalformedModuleManifest { reason: String },
+    /// The manifest declares a schema version this loader does not admit.
+    #[error("module manifest schema version {found} is not the admitted version {supported}")]
+    UnsupportedManifestSchemaVersion { found: u32, supported: u32 },
+    /// The manifest names an artifact other than the accepted build identity.
+    #[error(
+        "module manifest declares artifact '{declared}' but the accepted build identity is '{accepted}'"
+    )]
+    ManifestArtifactMismatch { declared: String, accepted: String },
+    /// The published handshake projection differs from the admitted bytes.
+    #[error(
+        "module '{module}' publishes contract digest '{published}' but the admitted manifest bytes carry '{admitted}'"
+    )]
+    PublishedProjectionMismatch {
+        module: String,
+        admitted: String,
+        published: String,
+    },
+    /// A hot artifact record names no real loader or consumer.
+    #[error("hot artifact '{module}' names no {field}")]
+    HotArtifactLoaderMissing { module: String, field: &'static str },
+    /// The frozen hot artifact map claims one artifact identity twice.
+    #[error("hot artifact map claims '{identity}' more than once")]
+    DuplicateHotArtifact { identity: String },
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), RuntimeContractError> {
@@ -678,14 +713,10 @@ impl ModuleContract {
         let required = capability_list(&self.required_capabilities, "required_capabilities")?;
         let optional = capability_list(&self.optional_capabilities, "optional_capabilities")?;
         let advisory = capability_list(&self.advisory_capabilities, "advisory_capabilities")?;
-        if provided.intersection(&required).next().is_some() {
+        if let Some(capability) = provided.intersection(&required).next() {
             return Err(RuntimeContractError::SelfCapabilityDependency {
                 module: self.module_id.to_string(),
-                capability: provided
-                    .intersection(&required)
-                    .next()
-                    .expect("non-empty intersection")
-                    .clone(),
+                capability: capability.clone(),
             });
         }
         if let Some(capability) = required.intersection(&optional).next() {

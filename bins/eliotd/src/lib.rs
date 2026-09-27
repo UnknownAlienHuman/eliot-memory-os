@@ -308,6 +308,10 @@ struct KernelLaunchBinding {
     launch_nonce: String,
     kernel_artifact_sha256: String,
     daemon_artifact_sha256: String,
+    /// Immutable `module.toml` admitted from the accepted artifact location and
+    /// bound to `daemon_artifact_sha256`. The Kernel handshake publishes only a
+    /// projection that matches these exact bytes.
+    admitted_manifest: eliot_runtime_contracts::AdmittedModuleManifest,
 }
 
 /// Errors raised while loading or composing the daemon.

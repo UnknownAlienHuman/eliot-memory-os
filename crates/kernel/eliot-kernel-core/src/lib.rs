@@ -83,10 +83,15 @@ pub use module::control_reserve_front_door::{
 };
 pub use module::epoch_and_fence::{EpochActivation, LineageChange, RouteFence, RouteScope};
 pub use module::generation_readiness::{
-    GenerationReadiness, GenerationReadinessProjection, evaluate_generation_readiness,
-    evaluate_module_set_readiness,
+    GenerationContractIdentity, GenerationReadiness, GenerationReadinessProjection,
+    evaluate_admitted_generation_readiness, evaluate_generation_readiness,
+    evaluate_module_set_readiness, graph_identity, recheck_after_provider_change,
 };
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
+pub use module::module_lifecycle_order::{
+    LifecycleOrder, LifecycleStep, ProviderObservation, drain_ready_now,
+    provider_first_lifecycle_order, startup_ready_now,
+};
 pub use module::notification_state::{
     Acknowledgement, DeadlineOrReview, DeliveryChannel, DeliveryState, Notification,
     NotificationDraft, NotificationError, NotificationSeverity, NotificationStore, Resolution,
