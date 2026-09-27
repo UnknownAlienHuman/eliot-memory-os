@@ -44,6 +44,7 @@ mod protocol;
 mod reactive_state;
 #[cfg(test)]
 mod reactive_state_tests;
+mod storage_replacement;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
@@ -177,6 +178,11 @@ pub use reactive_state::{
     ResourceSnapshotReadRequest, ResourceSnapshotReadResponse, ResourceSnapshotRequest,
     ResourceSnapshotResponse, handle_reactive_ledger_read, handle_reactive_ledger_request,
     handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
+};
+pub use storage_replacement::{
+    CANONICAL_STORE_CAPABILITY, IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT,
+    StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
+    StorageRollbackDisposition,
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
