@@ -20,9 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::EpochId;
 use eliot_process::{
-    CancellationReceipt, EnvironmentProjection, Generation, ImageId, JobId, OperationId,
-    ProcessExecutionView, ProcessLifecycle, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
-    SecretRef, SessionId,
+    CancellationReceipt, EnvironmentInheritance, EnvironmentProjection, Generation, ImageId, JobId,
+    OperationId, ProcessExecutionView, ProcessLifecycle, ProcessStartReceipt, ProcessTreeId,
+    ResourceLimits, SecretRef, SessionId,
 };
 use eliot_protocol::ProtocolVersion;
 use eliot_receipts::ProofCeiling;
@@ -2770,6 +2770,21 @@ pub const OPENCODE_BRIDGE_CAPABILITIES: [&str; 2] = [
     OPENCODE_BRIDGE_CAPABILITY_OBSERVATION_SUBMIT,
     OPENCODE_BRIDGE_CAPABILITY_MUTATION_GATE,
 ];
+/// Exact child environment name carrying the pinned bridge endpoint URL.
+/// Read by the `OpenCode` plugin (`integrations/opencode/plugins/eliot.js`).
+pub const OPENCODE_BRIDGE_ENV_URL: &str = "ELIOT_OPENCODE_BRIDGE_URL";
+/// Exact child environment name carrying the protected bootstrap channel.
+/// Consumed by the one-shot bootstrap transport; never a secret value.
+pub const OPENCODE_BRIDGE_ENV_BOOTSTRAP: &str = "ELIOT_OPENCODE_BRIDGE_BOOTSTRAP";
+/// Protected named-pipe channel served by the `OpenCode` one-shot bootstrap
+/// authority (issue #2898, step 4). An introduction selects this transport by
+/// carrying exactly this channel; `None` selects the exclusively pre-bound
+/// listener path with bind-conflict refusal instead.
+pub const OPENCODE_BOOTSTRAP_PIPE_NAME: &str = r"\\.\pipe\eliot\opencode\one-shot";
+/// Time-to-live of one issued bootstrap ticket, in milliseconds. Mirrors the
+/// Operator handoff TTL: a ticket is a single first-contact authenticator,
+/// not a reconnect token or durable credential.
+pub const OPENCODE_BOOTSTRAP_TTL_MS: u64 = 5_000;
 
 /// Exact `OpenCode` process binding carried by one bridge introduction.
 ///
@@ -3181,6 +3196,258 @@ impl OpenCodeBridgeIntroduction {
             return Err(BrokerError::StaleRegistrationIdentity);
         }
         Ok(())
+    }
+
+    /// Projects the exact child environment for the bound `OpenCode` process
+    /// (issue #2898, step 3).
+    ///
+    /// The introduction is first revalidated at `now_ms` (version, shape,
+    /// window, digest binding): an expired or tampered introduction never
+    /// reaches a child map. The non-secret map carries only the pinned
+    /// endpoint URL and, when the introduction selects pipe bootstrap, the
+    /// protected channel name; the credential travels solely as the opaque
+    /// [`SecretRef`] in `secret_refs`. [`EnvironmentProjection::new`]
+    /// refuses secret-like names or values in the plain map, so the request
+    /// credential (notably `ELIOT_OPENCODE_BRIDGE_TOKEN`) cannot be
+    /// projected here: the admitted secret projection materializes it only
+    /// into the exact approved child at spawn, and it stays out of durable
+    /// registration, command lines, logs, route profiles, model context,
+    /// and ordinary launch maps.
+    pub fn child_environment_projection(
+        &self,
+        now_ms: u64,
+    ) -> Result<EnvironmentProjection, BrokerError> {
+        self.validate(now_ms)?;
+        let mut non_secret = BTreeMap::new();
+        non_secret.insert(OPENCODE_BRIDGE_ENV_URL.to_owned(), self.endpoint.clone());
+        if let Some(channel) = self.bootstrap_channel.as_deref() {
+            non_secret.insert(OPENCODE_BRIDGE_ENV_BOOTSTRAP.to_owned(), channel.to_owned());
+        }
+        EnvironmentProjection::new(
+            non_secret,
+            vec![self.credential.clone()],
+            EnvironmentInheritance::None,
+        )
+        .map_err(|_| BrokerError::CredentialMaterialDisclosed("introduction.child_environment"))
+    }
+}
+
+/// Single-use first-contact ticket redeemable on the protected
+/// [`OPENCODE_BOOTSTRAP_PIPE_NAME`] channel (issue #2898, step 4).
+///
+/// The ticket names the exact bridge incarnation it introduces (endpoint,
+/// generations, session, bound introduction digest) and carries one
+/// broker-minted nonce. It contains no Bearer [REDACTED]: the pipe transport
+/// authenticates the peer (SID/process/image/generation) against the bound
+/// [`OpenCodeProcessBinding`] and yields the current HTTP endpoint plus the
+/// one-use request credential through the owner's secret boundary only after
+/// this ticket is consumed exactly once.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeBootstrapTicket {
+    pub pipe_name: String,
+    pub broker_generation: u64,
+    pub bridge_generation: u64,
+    pub interactive_session_id: String,
+    pub introduction_digest: String,
+    pub endpoint: String,
+    pub bootstrap_nonce: String,
+}
+
+impl OpenCodeBootstrapTicket {
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        if self.pipe_name != OPENCODE_BOOTSTRAP_PIPE_NAME {
+            return Err(BrokerError::InvalidField("bootstrap_ticket.pipe_name"));
+        }
+        if self.broker_generation == 0 || self.bridge_generation == 0 {
+            return Err(BrokerError::InvalidField("bootstrap_ticket.generation"));
+        }
+        text(
+            &self.interactive_session_id,
+            "bootstrap_ticket.interactive_session_id",
+        )?;
+        hex_digest(
+            &self.introduction_digest,
+            "bootstrap_ticket.introduction_digest",
+        )?;
+        validate_opencode_endpoint(&self.endpoint)?;
+        text(&self.bootstrap_nonce, "bootstrap_ticket.bootstrap_nonce")?;
+        Ok(())
+    }
+}
+
+/// Bootstrap request accepted by the authority. It deliberately names only
+/// the bound introduction: endpoint, generations, session, channel, and
+/// nonce are broker-selected, never caller-selected.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeBootstrapRequest {
+    pub introduction_digest: String,
+}
+
+/// Bound facts released to the pipe transport on exactly-once redemption.
+///
+/// The transport authenticates the peer against `process_binding`, then
+/// yields `endpoint` plus the one-use request credential resolved through
+/// the owner's secret boundary. The credential itself never appears here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeBootstrapGrant {
+    pub introduction_digest: String,
+    pub endpoint: String,
+    pub server_identity: String,
+    pub process_binding: OpenCodeProcessBinding,
+}
+
+/// One issued ticket: the exact ticket bytes it authenticates, its absolute
+/// expiry, and whether it has already been redeemed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BootstrapTicketState {
+    ticket: OpenCodeBootstrapTicket,
+    expires_at: u64,
+    consumed: bool,
+}
+
+/// One-shot User Broker bootstrap authority for the `OpenCode` bridge route.
+///
+/// Mirrors [`OperatorHandoffAuthority`]: owner-issued, generation-bound,
+/// expiring, single-use tickets. The authority is bound to exactly one
+/// introduction (digest, endpoint, server identity, generations, session,
+/// process binding); a request naming any other introduction is denied, and
+/// a redeemed or expired ticket can never be reused. Peer authentication
+/// and the one-use credential yield are the pipe transport's job behind this
+/// redemption — this crate holds no Windows, process, or credential
+/// implementation.
+#[derive(Clone, Debug)]
+pub struct OpenCodeBootstrapAuthority {
+    introduction_digest: String,
+    endpoint: String,
+    server_identity: String,
+    broker_generation: u64,
+    bridge_generation: u64,
+    interactive_session_id: String,
+    process_binding: OpenCodeProcessBinding,
+    tickets: BTreeMap<String, BootstrapTicketState>,
+}
+
+impl OpenCodeBootstrapAuthority {
+    /// Binds the authority to one pipe-bootstrap introduction.
+    ///
+    /// The introduction must select exactly [`OPENCODE_BOOTSTRAP_PIPE_NAME`]:
+    /// an introduction without a bootstrap channel (or with any other
+    /// channel) takes the exclusively pre-bound listener path instead and is
+    /// refused here.
+    pub fn new(introduction: &OpenCodeBridgeIntroduction) -> Result<Self, BrokerError> {
+        if introduction.bootstrap_channel.as_deref() != Some(OPENCODE_BOOTSTRAP_PIPE_NAME) {
+            return Err(BrokerError::InvalidField("introduction.bootstrap_channel"));
+        }
+        if introduction.broker_generation.get() == 0 || introduction.bridge_generation.get() == 0 {
+            return Err(BrokerError::InvalidField("introduction.generation"));
+        }
+        text(
+            &introduction.interactive_session_id,
+            "introduction.interactive_session_id",
+        )?;
+        hex_digest(
+            &introduction.introduction_digest,
+            "introduction.introduction_digest",
+        )?;
+        validate_opencode_endpoint(&introduction.endpoint)?;
+        hex_digest(
+            &introduction.server_identity,
+            "introduction.server_identity",
+        )?;
+        introduction.process_binding.validate()?;
+        Ok(Self {
+            introduction_digest: introduction.introduction_digest.clone(),
+            endpoint: introduction.endpoint.clone(),
+            server_identity: introduction.server_identity.clone(),
+            broker_generation: introduction.broker_generation.get(),
+            bridge_generation: introduction.bridge_generation.get(),
+            interactive_session_id: introduction.interactive_session_id.clone(),
+            process_binding: introduction.process_binding.clone(),
+            tickets: BTreeMap::new(),
+        })
+    }
+
+    /// Mints one owner-issued, generation-bound, expiring, single-use
+    /// [`OpenCodeBootstrapTicket`].
+    ///
+    /// The nonce is minted here, never taken from `request`: the request
+    /// shape carries no nonce, channel, endpoint, or timestamp field, so a
+    /// caller cannot choose the authenticator or pre-claim an expiry. A
+    /// request naming a foreign introduction digest fails closed through
+    /// [`BrokerError::Denied`].
+    pub fn issue(
+        &mut self,
+        request: &OpenCodeBootstrapRequest,
+        observed_at: u64,
+    ) -> Result<OpenCodeBootstrapTicket, BrokerError> {
+        if request.introduction_digest != self.introduction_digest || observed_at == 0 {
+            return Err(BrokerError::Denied);
+        }
+        let expires_at = observed_at
+            .checked_add(OPENCODE_BOOTSTRAP_TTL_MS)
+            .ok_or(BrokerError::Denied)?;
+        let nonce = Uuid::new_v4().simple().to_string();
+        text(&nonce, "bootstrap_nonce")?;
+        let ticket = OpenCodeBootstrapTicket {
+            pipe_name: OPENCODE_BOOTSTRAP_PIPE_NAME.to_owned(),
+            broker_generation: self.broker_generation,
+            bridge_generation: self.bridge_generation,
+            interactive_session_id: self.interactive_session_id.clone(),
+            introduction_digest: self.introduction_digest.clone(),
+            endpoint: self.endpoint.clone(),
+            bootstrap_nonce: nonce.clone(),
+        };
+        ticket.validate()?;
+        if self.tickets.contains_key(&nonce) {
+            return Err(BrokerError::ReplayConflict);
+        }
+        self.tickets.insert(
+            nonce,
+            BootstrapTicketState {
+                ticket: ticket.clone(),
+                expires_at,
+                consumed: false,
+            },
+        );
+        Ok(ticket)
+    }
+
+    /// Redeems one ticket exactly once and returns the bound grant.
+    ///
+    /// A second presentation of a consumed nonce, a ticket whose bound
+    /// session/generations/nonce does not match the issued row, and a ticket
+    /// past its expiry are distinct refusals — [`BrokerError::ReplayConflict`]
+    /// and [`BrokerError::StaleLease`] — so first contact can never be
+    /// inferred from replaying a previous ticket and a competing loopback
+    /// listener gains no reusable secret from it.
+    pub fn consume(
+        &mut self,
+        ticket: &OpenCodeBootstrapTicket,
+        now: u64,
+    ) -> Result<OpenCodeBootstrapGrant, BrokerError> {
+        ticket.validate()?;
+        {
+            let state = self
+                .tickets
+                .get_mut(&ticket.bootstrap_nonce)
+                .ok_or(BrokerError::ReplayConflict)?;
+            if state.consumed || now >= state.expires_at || state.ticket != *ticket {
+                return Err(if now >= state.expires_at {
+                    BrokerError::StaleLease
+                } else {
+                    BrokerError::ReplayConflict
+                });
+            }
+            state.consumed = true;
+        }
+        Ok(OpenCodeBootstrapGrant {
+            introduction_digest: self.introduction_digest.clone(),
+            endpoint: self.endpoint.clone(),
+            server_identity: self.server_identity.clone(),
+            process_binding: self.process_binding.clone(),
+        })
     }
 }
 

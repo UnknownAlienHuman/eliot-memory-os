@@ -32,13 +32,15 @@
 //!   listener without the credential cannot manufacture a usable permit.
 //!
 //! First-contact note: plain loopback location is not server identity. The
-//! introduction pins the exact endpoint and server incarnation, the
-//! listener is exclusively pre-bound (a bind conflict refuses the route
-//! instead of letting a squatter inherit it), and the credential is
-//! short-lived, single-generation, and process-bound. A protected
-//! named-pipe bootstrap with peer SID/process verification remains the
-//! named stronger path (the introduction carries `bootstrap_channel` for
-//! it); it is not implemented in this unit.
+//! introduction pins the exact endpoint and server incarnation, and the
+//! handler refuses an introduction pinned to any other port than the
+//! serving listener; the listener is exclusively pre-bound (a bind conflict
+//! refuses the route instead of letting a squatter inherit it), and the
+//! credential is short-lived, single-generation, and process-bound. The
+//! User Broker owns the one-shot bootstrap authority behind the protected
+//! named-pipe channel (the introduction carries `bootstrap_channel` for
+//! it); the pipe transport with peer SID/process verification is not
+//! implemented in this unit.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -815,6 +817,10 @@ pub struct ActionGateRequest {
 /// authority revisions, expiry, and the decision receipt commitment.
 #[derive(Clone, Debug)]
 pub struct ActionGateDecision {
+    /// Echo of the evaluated [`ActionGateRequest::request_hash`]. The handler
+    /// permits only a decision echoing the exact request it evaluated: a
+    /// crossed or stale decision degrades to `recorded`, never `allow`.
+    pub request_hash: String,
     /// True only when the owner permits this exact effect.
     pub allow: bool,
     /// Current policy revision the decision was evaluated under.
@@ -1270,6 +1276,7 @@ struct JoinedIntroduction {
 
 fn join_introduction<I, C>(
     head: &ParsedHostEventHead,
+    bound_port: u16,
     introductions: &I,
     credentials: &C,
 ) -> Result<JoinedIntroduction, HostEventReject>
@@ -1297,6 +1304,18 @@ where
             ),
         };
         return Err(reject);
+    }
+    let pinned_port = LoopbackEndpoint::parse(&introduction.endpoint)
+        .map(|endpoint| endpoint.port())
+        .ok();
+    if pinned_port != Some(bound_port) {
+        // The introduction pins a different bridge incarnation than this
+        // listener serves: a foreign or stale listener must not admit it.
+        return Err(HostEventReject::new(
+            404,
+            DISPOSITION_INVALID_REQUEST,
+            REASON_ROUTE_UNAVAILABLE,
+        ));
     }
     if introductions.is_revoked(&introduction.revocation_id) {
         return Err(HostEventReject::new(
@@ -1341,16 +1360,19 @@ where
 
 /// Handles one bounded `POST /v1/host-events` request end to end.
 ///
-/// Pipeline: introduction join (current, valid window, not revoked, live
-/// session probe) → credential resolve and constant-time compare →
-/// capability check → closed payload decode with the `gate.rs` validators
-/// → normalization → durable admission through the existing bridge-event
-/// route → `ActionGate` join for `tool.execute.before` only → owner-verified
-/// versioned response. Every failure is a typed rejection; no failure path
-/// emits a permit.
+/// Pipeline: introduction join (current, valid window, endpoint pinned to
+/// this listener, not revoked, live session probe) → credential resolve and
+/// constant-time compare → capability check → closed payload decode with the
+/// `gate.rs` validators → normalization → durable admission through the
+/// existing bridge-event route → `ActionGate` join for `tool.execute.before`
+/// only → owner-verified versioned response. `bound_port` is the serving
+/// listener's explicit port: an introduction pinned to any other endpoint is
+/// refused, so a foreign or stale listener cannot admit it. Every failure is
+/// a typed rejection; no failure path emits a permit.
 pub fn handle_host_event<A, G, I, C>(
     head: &ParsedHostEventHead,
     body: &[u8],
+    bound_port: u16,
     ports: &mut HostEventPorts<A, G, I, C>,
 ) -> HttpOutcome
 where
@@ -1359,7 +1381,8 @@ where
     I: IntroductionStore,
     C: CredentialResolver,
 {
-    let joined = match join_introduction(head, &ports.introductions, &ports.credentials) {
+    let joined = match join_introduction(head, bound_port, &ports.introductions, &ports.credentials)
+    {
         Ok(joined) => joined,
         Err(reject) => return HttpOutcome::rejected(reject, None),
     };
@@ -1481,6 +1504,32 @@ fn base_submission(event_id: &str, body: &[u8], value: &serde_json::Value) -> Ho
     }
 }
 
+/// Returns whether one evaluated `allow` decision is well-bound to the
+/// exact request it evaluated: no deny reason, a current expiry, the exact
+/// request-hash echo, and non-empty policy/authority revisions plus a
+/// decision receipt commitment. Anything else degrades to `recorded`.
+fn gate_allow_is_well_bound(
+    decision: &ActionGateDecision,
+    request_hash: &str,
+    now_ms: u64,
+) -> bool {
+    decision.reason_code.is_none()
+        && decision.expires_at_ms > now_ms
+        && decision.request_hash == request_hash
+        && !decision.policy_revision.is_empty()
+        && !decision.authority_revision.is_empty()
+        && !decision.decision_receipt.is_empty()
+}
+
+/// Applies one well-bound `allow` decision to the response fields.
+fn apply_gate_allow(fields: &mut HostEventResponseFields, decision: ActionGateDecision) {
+    fields.decision = DECISION_ALLOW;
+    fields.policy_revision = Some(decision.policy_revision);
+    fields.authority_revision = Some(decision.authority_revision);
+    fields.expires_at_ms = Some(decision.expires_at_ms);
+    fields.decision_receipt = Some(decision.decision_receipt);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_gate_event<A, G, I, C>(
     introduction: &OpenCodeBridgeIntroduction,
@@ -1558,14 +1607,10 @@ where
     fields.effect_digest = Some(validated.effect_digest.clone());
     match ports.gate.decide(introduction, &receipt, &request) {
         Ok(decision) if decision.allow => {
-            if decision.reason_code.is_some() || decision.expires_at_ms <= now_ms {
+            if !gate_allow_is_well_bound(&decision, &request.request_hash, now_ms) {
                 return HttpOutcome::ok(encode_host_event_response(&fields, credential));
             }
-            fields.decision = DECISION_ALLOW;
-            fields.policy_revision = Some(decision.policy_revision);
-            fields.authority_revision = Some(decision.authority_revision);
-            fields.expires_at_ms = Some(decision.expires_at_ms);
-            fields.decision_receipt = Some(decision.decision_receipt);
+            apply_gate_allow(&mut fields, decision);
             HttpOutcome::ok(encode_host_event_response(&fields, credential))
         }
         Ok(decision) => {
@@ -2035,6 +2080,6 @@ async fn handle_connection<A, G, I, C>(
             _ => return,
         }
     }
-    let outcome = handle_host_event(&head, &body, ports);
+    let outcome = handle_host_event(&head, &body, expected_port, ports);
     write_outcome(&mut writer, &outcome).await;
 }
