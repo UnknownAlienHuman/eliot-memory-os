@@ -24,11 +24,25 @@
 //! Runtime boundary: a malformed, mismatched, over-bound, cancelled, or
 //! past-deadline request fails closed as [`ConflictAnalysisError`] with zero
 //! effects. Semantic shortfalls (partial denominators, blocked probes,
-//! nondiscriminative probes, unknown owners) are inert terminal outcomes
-//! carried by [`ConflictAnalysisCandidate`], never errors that invite a blind
-//! retry. A complete analysis remains unresolved without a separately supplied
-//! external resolution receipt, which is retained verbatim and never reissued
-//! or reinterpreted here.
+//! nondiscriminative probes, unnameable decision owners) are inert terminal
+//! outcomes carried by [`ConflictAnalysisCandidate`], never errors that invite
+//! a blind retry. A complete analysis remains unresolved without a separately
+//! supplied external resolution receipt, which is retained verbatim and never
+//! reissued or reinterpreted here.
+//!
+//! Every terminal outcome is read from input the analysis already holds; none
+//! is invented, defaulted, or inferred from prose. Cancellation and the frozen
+//! deadline give [`ConflictOutcome::Blocked`] and [`ConflictOutcome::Stale`].
+//! The canonical `ConflictSet` lifecycle gives [`ConflictOutcome::Rejected`]
+//! for a set its owner already decided, which this cell never reissues;
+//! [`ConflictOutcome::Unsupported`] for a supersession that names no resolved
+//! part and is therefore unproven; and [`ConflictOutcome::Abstention`] for a
+//! closed set with empty residue, which leaves no open conflict and so no
+//! partial path. Each of those three preserves every position, objection, and
+//! lineage group of the set it was handed, and none of them resolves it.
+//! [`DecisionOwnerKind::Unknown`] is read the same way: the set's own authority
+//! owners either name a decision owner or they do not, and where they do not,
+//! the recommendation stays unnamed instead of adopting a kind-derived default.
 //!
 //! Absence note: this file contains no persistence, identifier allocation,
 //! graph traversal beyond the bounded member lists, source acquisition, probe
@@ -2138,6 +2152,42 @@ fn check_deadline_and_cancel(policy: &ConflictAnalysisPolicy) -> Option<Conflict
     None
 }
 
+/// Checks the canonical `ConflictSet` lifecycle before any interpretation.
+///
+/// Every leg reads the set's own state axis (I13.2
+/// `state: open | investigating | decided | superseded | resolved`) and never
+/// repairs it. A set its owner already decided is refused and handed back to
+/// that boundary, because this cell never reissues or reinterprets a decision.
+/// A supersession that names no resolved part is unproven, and an unproven
+/// supersession is neither a live set nor addressable history, so the request is
+/// handed to the boundary that can prove it. A closed set with empty residue
+/// leaves no open conflict, so no analysis and no partial path is offered. The
+/// three legs are disjoint: only one lifecycle value can apply, and closure
+/// implies the empty residue it requires.
+fn check_lifecycle_boundary(conflict_set: &ConflictSet) -> Option<(ConflictOutcome, &'static str)> {
+    if conflict_set.lifecycle == ConflictLifecycle::Decided {
+        return Some((
+            ConflictOutcome::Rejected,
+            "the set is already decided by its named owner; this cell reissues no decision and hands the request back to that boundary",
+        ));
+    }
+    if conflict_set.lifecycle == ConflictLifecycle::Superseded
+        && conflict_set.resolved_parts.is_empty()
+    {
+        return Some((
+            ConflictOutcome::Unsupported,
+            "the set claims supersession but names no resolved part, so the supersession is unproven and this boundary cannot support the request",
+        ));
+    }
+    if conflict_set.is_closed() {
+        return Some((
+            ConflictOutcome::Abstention,
+            "the set is closed with empty residue, so no open conflict is left to analyze and no partial path is offered",
+        ));
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Lineage grouping (authoritative roots, never agent or citation counts).
 // ---------------------------------------------------------------------------
@@ -2800,6 +2850,12 @@ fn recommend_probes(
 // ---------------------------------------------------------------------------
 
 /// Recommends the exact external owner for the affected boundary.
+///
+/// The kind is named, never assigned: no owner is messaged, launched, or
+/// authorized here, and the recommendation is a proposal that the emitted
+/// candidate carries. Where the set's own authority evidence names no decider,
+/// the kind stays [`DecisionOwnerKind::Unknown`] rather than falling back to the
+/// conflict-kind default.
 fn recommend_owner(
     conflict_set: &ConflictSet,
     supplements: &ConflictSupplements,
@@ -2854,6 +2910,20 @@ fn recommend_owner(
             kind = DecisionOwnerKind::Multiple;
             rationale = String::from("multiple unresolved owners remain in conflict");
             contract_needed = String::from("owner-scoped evidence for each unresolved owner");
+        } else if !conflict_set.owners.contains(&conflict_set.decision_owner) {
+            // I13.2 keeps `authority_and_owners` and `decision_owner` as two
+            // separate fields. When the named decider is not one of the set's
+            // own authority owners, that evidence names no decider, and with the
+            // multiple-owner leg already excluded there is no single owner left
+            // to name. Adopting the kind-derived default here would report a
+            // coverage the grounded evidence does not carry.
+            kind = DecisionOwnerKind::Unknown;
+            rationale = String::from(
+                "the set names a decision owner outside its own authority owner set, so no single owner can be named from the grounded evidence",
+            );
+            contract_needed = String::from(
+                "authority owner set containing the decision owner, or an owner-issued assignment naming the decider",
+            );
         }
     }
     let owner_handle = conflict_set.decision_owner.as_str().to_owned();
@@ -2926,13 +2996,16 @@ fn check_preservation(
     } else {
         "reversibility shortfall: no rollback boundary".to_owned()
     };
-    let authority_passed = !owner.owner_handle.trim().is_empty()
-        && owner.kind != DecisionOwnerKind::Unknown
-        || owner.kind == DecisionOwnerKind::Unknown;
-    let authority_note =
-        "candidate claims no authority beyond proposal; recommendation names the external owner"
-            .to_owned();
-    let _ = authority_passed;
+    let authority_passed = !owner.owner_handle.trim().is_empty();
+    let authority_note = if owner.kind == DecisionOwnerKind::Unknown {
+        String::from(
+            "candidate claims no authority beyond proposal; no owner could be named from the grounded evidence, so the unnamed recommendation and its gap stay visible",
+        )
+    } else {
+        String::from(
+            "candidate claims no authority beyond proposal; recommendation names the external owner",
+        )
+    };
     let dependency_passed = groups.len() <= MAX_LINEAGE && recommended_probes.len() <= MAX_PROBES;
     let dependency_note = if dependency_passed {
         "all lineage, probe, and owner dependencies are closed and named".to_owned()
@@ -2985,7 +3058,7 @@ fn check_preservation(
             },
             DimensionVerdict {
                 dimension: PreservationDimension::AuthorityCeiling,
-                passed: true,
+                passed: authority_passed,
                 known: true,
                 note: authority_note,
             },
@@ -3287,7 +3360,15 @@ fn emit_candidate(
 /// names but never assigns, messages, launches, or authorizes anything.
 ///
 /// Malformed or mismatched inputs fail closed as [`ConflictAnalysisError`].
-/// Semantic shortfalls emit inert terminal outcomes without effect.
+/// Semantic shortfalls emit inert terminal outcomes without effect: the
+/// cancellation and frozen-deadline envelope gives
+/// [`ConflictOutcome::Blocked`] or [`ConflictOutcome::Stale`], the canonical
+/// `ConflictSet` lifecycle gives [`ConflictOutcome::Rejected`],
+/// [`ConflictOutcome::Unsupported`], or [`ConflictOutcome::Abstention`] through
+/// [`check_lifecycle_boundary`], and a coverage shortfall gives
+/// [`ConflictOutcome::Partial`] only when the policy admits a partial emission.
+/// Each terminal leg still preserves every position, objection, and lineage
+/// group of the set it was handed; none resolves the conflict.
 ///
 /// # Errors
 ///
@@ -3323,7 +3404,15 @@ pub fn analyze_conflict(
         .map_err(|err| ConflictAnalysisError::Denominator {
             detail: redact(&err.to_string()),
         })?;
-    if let Some(early) = check_deadline_and_cancel(policy) {
+    let terminal = check_deadline_and_cancel(policy)
+        .map(|outcome| {
+            (
+                outcome,
+                "cancelled or past-deadline requests emit no effect",
+            )
+        })
+        .or_else(|| check_lifecycle_boundary(conflict_set));
+    if let Some((early, early_note)) = terminal {
         let classes = classify_conflict(conflict_set);
         let mut positions: Vec<PositionAnalysis> = Vec::with_capacity(conflict_set.positions.len());
         let mut index = 0usize;
@@ -3345,7 +3434,7 @@ pub fn analyze_conflict(
             &risks,
             &[],
             &owner,
-            "cancelled or past-deadline requests emit no effect",
+            early_note,
         );
     }
     let classes = classify_conflict(conflict_set);
@@ -3415,18 +3504,27 @@ pub fn analyze_conflict(
 }
 
 /// Maps a terminal outcome to the closest hub rejection hint, if any.
+///
+/// The hint is a lossy convenience for a caller that already speaks the closed
+/// hub vocabulary, never the outcome itself: [`ConflictOutcome`] and its
+/// `as_str` spelling stay the exact, lossless discriminator. `Blocked` and
+/// `Stale` map to the code that names their single production site
+/// ([`CurationRejectionCode::Cancelled`] for `policy.cancelled`,
+/// [`CurationRejectionCode::DeadlineExceeded`] for the frozen deadline).
+/// `Abstention` and `Rejected` share `IdentityMismatch` because the eight hub
+/// codes have no counterpart for either boundary handoff, so the hint must not
+/// pretend to distinguish what it cannot name; the typed outcome does.
 #[must_use]
 pub fn outcome_rejection_hint(outcome: &ConflictOutcome) -> Option<CurationRejectionCode> {
     match outcome {
         ConflictOutcome::Complete => None,
-        ConflictOutcome::Partial | ConflictOutcome::Blocked => {
-            Some(CurationRejectionCode::PreservationFailed)
-        }
-        ConflictOutcome::Stale | ConflictOutcome::Abstention => {
+        ConflictOutcome::Partial => Some(CurationRejectionCode::PreservationFailed),
+        ConflictOutcome::Blocked => Some(CurationRejectionCode::Cancelled),
+        ConflictOutcome::Stale => Some(CurationRejectionCode::DeadlineExceeded),
+        ConflictOutcome::Abstention | ConflictOutcome::Rejected => {
             Some(CurationRejectionCode::IdentityMismatch)
         }
         ConflictOutcome::Unsupported => Some(CurationRejectionCode::UnsupportedJobShape),
-        ConflictOutcome::Rejected => Some(CurationRejectionCode::IdentityMismatch),
     }
 }
 
