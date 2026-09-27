@@ -346,6 +346,34 @@ impl ProtectedControlLease {
 /// the dominant holders; per-path labels remain a follow-up.
 const NORMAL_ADMISSION_OPERATION: &str = "normal-admission";
 
+/// One shared `shadow_no_authority` refusal for every effect a candidate
+/// Kernel must not perform while it has no authority (I14.16 steps 3-4).
+///
+/// I14.16 step 4 requires the candidate to reject ORS/store writes, normal
+/// work admission, and Session/lease/epoch issuance. The state field is
+/// [`KernelServiceState::ShadowNoAuthority`]; the refusal is the crate's
+/// existing [`KernelServiceError::AdmissionClosed`] carrying the exact
+/// current state, so no second error type, digest, receipt, or state is
+/// introduced. Immutable/read-only inspection is not gated here: it is a
+/// separate, admission-free path and the shadow phase is exactly the contour
+/// I14.16 step 3 permits.
+impl KernelService {
+    /// Refuses an authority-bearing effect while this candidate is in
+    /// `shadow_no_authority`.
+    ///
+    /// The check is deliberately a method on the service rather than a
+    /// predicate on the enum: it is consulted on each effect path so a status
+    /// field is never merely *described* by a doc comment while nothing reads
+    /// it. A candidate in any other state returns `Ok` and the caller keeps
+    /// its own existing gate.
+    pub fn admit_shadow_effect(&self) -> Result<(), KernelServiceError> {
+        if self.state == KernelServiceState::ShadowNoAuthority {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        Ok(())
+    }
+}
+
 /// Classifies one protected `operation_id` into the closed Slice A
 /// [`ControlOperationClass`] family (issue #65).
 ///
@@ -1152,7 +1180,12 @@ impl KernelService {
     /// lineage (Implements #64); cross-lineage advancement is impossible by
     /// construction. The scalar control-reserve fence advances alongside for
     /// compatibility but never authorizes canonical work.
+    ///
+    /// I14.16 step 4: a `shadow_no_authority` candidate issues no epoch. The
+    /// shadow gate is consulted here, before the first fence comparison, so no
+    /// partial advance can precede the refusal.
     pub fn advance_authority_epoch(&mut self) -> Result<EpochId, KernelServiceError> {
+        self.admit_shadow_effect()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
@@ -1329,6 +1362,10 @@ impl KernelService {
     /// duration of issuance. Normal work must use [`Self::acquire_admission`]
     /// and never this path.
     ///
+    /// I14.16 step 4: a `shadow_no_authority` candidate issues no Session or
+    /// authority receipt. The shadow gate runs before the capacity acquire so a
+    /// refused issuance consumes no protected permit.
+    ///
     /// Residual (#65): this stays on the legacy `acquire_control` migration
     /// path because generic receipt issuance carries no closed
     /// [`ControlOperationClass`] label to typecheck against
@@ -1342,6 +1379,7 @@ impl KernelService {
         now_ms: i64,
         expiry_ms: Option<i64>,
     ) -> Result<eliot_kernel_core::AuthorityReceipt, KernelServiceError> {
+        self.admit_shadow_effect()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
@@ -1709,12 +1747,17 @@ impl KernelService {
     /// returns `Conflict` and takes no effect. Only mechanical failures
     /// (closed admission, fenced generation, ORS storage) surface as `Err`;
     /// every typed refusal is an `Ok` response value.
+    ///
+    /// I14.16 step 4: a `shadow_no_authority` candidate issues no worker lease
+    /// and writes no ORS claim. The shadow gate runs before `stage_..` below,
+    /// so a refused claim leaves ORS untouched.
     pub fn admit_native_worker_claim<S: OperationalRecoveryStore>(
         &self,
         store: &S,
         request: &NativeWorkerClaimRequest,
         now_unix_ms: u64,
     ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        self.admit_shadow_effect()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
@@ -1977,6 +2020,10 @@ impl KernelService {
     /// plus the durable `Ready` state; a distinct ready-receipt type, ready
     /// deduplication across ready ids, and blocked-report handling belong to
     /// later waves.
+    ///
+    /// I14.16 step 4: a `shadow_no_authority` candidate advances no ORS claim
+    /// to `Ready` and therefore publishes no readiness receipt, exactly as the
+    /// transition table already refuses `publish_ready` from this state.
     #[allow(
         clippy::too_many_arguments,
         reason = "Wave B passes ready evidence as primitives so no new public contract type is minted"
@@ -1993,6 +2040,7 @@ impl KernelService {
         ready_at_unix_ms: u64,
         now_unix_ms: u64,
     ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        self.admit_shadow_effect()?;
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
