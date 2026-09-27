@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod architecture_self_model;
 mod backup_io;
 mod blackboard;
 mod dreamer_job;
@@ -71,6 +72,13 @@ pub use backup_io::{
     SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
     SnapshotPage, SnapshotSourceIdentity, SnapshotValidationReceipt, classify_restore_conflict,
     is_backup_io_capability, reconcile_same_operation,
+};
+
+pub use architecture_self_model::{
+    AdoptedArchitectureRevision, ArchitectureConformanceEntry, ArchitectureConformanceGap,
+    ArchitectureConformanceState, ArchitectureGapCause, ArchitectureInvalidation,
+    SelfKnowledgeCategory, SelfKnowledgeEvidence, SystemSelfModel,
+    invalidate_architecture_self_model, validate_architecture_self_model,
 };
 
 pub use blackboard::{
