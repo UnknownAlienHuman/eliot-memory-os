@@ -9,8 +9,11 @@
 //! only for owner-accepted material (issue #1191); display pairs decode to
 //! the wire display request and drive ack→display; activation pairs decode to
 //! the wire harness receipt and fold it into the per-attempt stage summary
-//! (issue #1191); execution pairs decode to the wire evidence ingest and
-//! reconcile unknown effects before retry (issue #1191).
+//! (issue #1191); execution pairs decode to the wire evidence ingest, publish
+//! it through the Skill lifecycle owner, and reconcile the OWNER's retained
+//! window into an explicit assessment before retry (issue #1191 / #2664) —
+//! never a page-local retry boolean, and never a clearance the evidence alone
+//! cannot support.
 //! Every claimed pair settles through a result body — including refusals,
 //! which persist as typed refusal outcomes — so no skill pair can poison the
 //! poller into a crash loop. `WorkScope` guard withholding retains typed identity
@@ -34,6 +37,18 @@ use thiserror::Error;
 use super::DaemonComposition;
 use super::daemon_kernel_client::DaemonKernelClient;
 use super::skill_acceptance_read::{AcceptanceRecord, AcceptanceResolution, AcceptanceVerdict};
+
+/// Closed source label for the Skill lifecycle view whose retained execution
+/// window an assessment is read from. The revision is the view's own
+/// `lifecycle_revision`, which advances on every accepted ingest, so a
+/// receiver can tell which owner state the assessment was taken at.
+const SOURCE_SKILL_LIFECYCLE_VIEW: &str = "skill_lifecycle_view";
+/// Closed source label naming the attempt/effect owner whose expected
+/// execution/effect set an assessment would be measured against. No such owner
+/// issues one today, so the assessment reports the set as not established and
+/// names this gap rather than inventing a denominator.
+const SOURCE_ATTEMPT_EFFECT_OWNER: &str = "attempt_effect_owner";
+
 ///
 /// Driver refusals (stale, drift, unavailable, fence) are NOT errors here —
 /// they persist as typed refusal outcomes through [`SkillResultEnvelope`],
@@ -89,10 +104,11 @@ enum PlannedSkillPair {
     /// resolved, and the coverage those reads achieved. `useful` is already
     /// owner-qualified here — the bare wire receipt is not.
     Activation(ActivationCandidate),
-    /// Execution evidence is reconciled and published through the lifecycle
-    /// owner, then committed against a fresh fence recheck. The decoded
-    /// payload and its reconciliation verdict travel together so the commit
-    /// publishes the SAME evidence the plan reconciled.
+    /// Execution evidence is published through the lifecycle owner, then the
+    /// OWNER's retained window is reconciled into an explicit assessment and
+    /// committed against a fresh fence recheck. The decoded payload travels
+    /// with the plan so the commit publishes the SAME evidence that was
+    /// admitted, and the assessment is derived after the owner took it.
     Execution(Box<ExecutionCandidate>),
     /// The acceptance read returned an owner-backed record at this fence.
     AcceptedIntake {
@@ -138,13 +154,16 @@ impl ActivationCandidate {
     }
 }
 
-/// Execution ingest plan: the decoded evidence window plus the reconciliation
-/// verdict the plan computed without the composition lock.
+/// Execution ingest plan: the decoded evidence window the commit must publish
+/// exactly as admitted.
+///
+/// No verdict travels with it (issue #2664): the reconciliation assessment is
+/// derived after the owner accepts the page, from the window the OWNER returns,
+/// so it covers retained evidence from earlier pages instead of the submitted
+/// page alone.
 pub struct ExecutionCandidate {
     /// The presented evidence window, bound to its Skill identity.
     payload: Box<eliot_agent_bridge_core::SkillExecutionPayload>,
-    /// Unknown-effects verdict over the exact presented records.
-    verdict: Box<eliot_skill::UnknownEffectsVerdict>,
     /// This ingest's own authenticated attempt id, from the Kernel route.
     ingest_attempt_id: String,
 }
@@ -429,9 +448,9 @@ pub fn commit_skill_pair(
             }
             PlannedSkillPair::Execution(candidate) => {
                 // Execute gets the fence recheck it previously lacked: the
-                // plan's reconciliation ran without the composition lock, so
-                // the verdict may only be published while the admitted fence
-                // still holds.
+                // page's publication and the assessment derived from it may
+                // only run while the admitted fence still holds, so a stale
+                // plan cannot overwrite newer owner state.
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
                     // This ingest's own attempt identity is a separate leg from
                     // the historical executions being observed; evidence that
@@ -443,11 +462,14 @@ pub fn commit_skill_pair(
                             reason: "execution evidence must name the authenticated ingest attempt",
                         })
                     } else {
+                        let page_records = candidate.payload.executions.len() as u64;
                         match composition.skill_publish_execution_evidence(&candidate.payload) {
-                            // The owner accepted the evidence: the reconciliation
-                            // verdict is only reported after the owner took it, so
-                            // a claim never outruns persistence.
-                            Ok(_published) => execution_verdict_outcome(&candidate.verdict),
+                            // The owner accepted the evidence: the assessment
+                            // is only reported after the owner took it, so a
+                            // claim never outruns persistence, and it is derived
+                            // from the window the OWNER now holds — never from
+                            // the submitted page alone.
+                            Ok(published) => execution_verdict_outcome(&published, page_records),
                             Err(error) => SkillResultEnvelope::refused(&error),
                         }
                     }
@@ -686,13 +708,18 @@ async fn plan_qualified_activation(
 /// (issue #2663).
 ///
 /// Every presented record is validated (observed executions require exact
-/// step refs; causal credit stays denied) and folded by outcome. The
-/// reconciliation verdict travels WITH the payload so the commit publishes
-/// exactly the evidence that was reconciled, rather than re-deriving counts
-/// and dropping the slice (which previously discarded the very evidence the
-/// ingest was admitted to carry). Absent records prove nothing: only
-/// presented evidence folds, and uninstrumented executions stay unknown
-/// instead of proving success.
+/// step refs; causal credit stays denied) and the payload travels WITH the
+/// plan, so the commit publishes exactly the evidence that was admitted rather
+/// than re-deriving counts and dropping the slice (which previously discarded
+/// the very evidence the ingest was admitted to carry).
+///
+/// NO reconciliation verdict is computed here, and that is the point
+/// (issue #2664): a verdict derived from the submitted page alone answers only
+/// "does THIS page contain an uncertain row", which is not the attempt. The
+/// assessment is derived after the owner accepts the page, from the window the
+/// owner returns for it. Absent records prove nothing: only presented evidence
+/// folds, and uninstrumented executions stay unknown instead of proving
+/// success.
 fn decode_execution(
     arguments: &Value,
     ingest_attempt_id: String,
@@ -710,36 +737,70 @@ fn decode_execution(
             ))));
         }
     };
-    let verdict = eliot_skill::reconcile_unknown_effects(&payload.executions).map_err(Box::new)?;
     // The ingest's own identity is the Kernel-admitted `LocalReadAttempt`,
     // which the caller supplies; it is not the Skill's historical attempt and
     // is never taken from a payload field.
     Ok(ExecutionCandidate {
         payload: Box::new(payload),
-        verdict: Box::new(verdict),
         ingest_attempt_id,
     })
 }
 
-/// Projects a reconciled execution verdict into its result envelope.
+/// Projects the owner's retained window into the explicit reconciliation
+/// assessment and its result envelope (issue #2664, I7.25 / I14.21).
 ///
-/// Retry stays permitted only when nothing is uncertain: an uncertain
-/// execution has unknown effects, and an unknown effect must be reconciled
-/// before the next attempt. This is the ONLY place the execute verdict turns
-/// into a wire outcome, so the counts and the refusal reason cannot diverge.
-fn execution_verdict_outcome(verdict: &eliot_skill::UnknownEffectsVerdict) -> SkillResultEnvelope {
-    if verdict.retry_permitted() {
-        SkillResultEnvelope::evidence(verdict.observed, verdict.failed, 0)
-    } else {
-        SkillResultEnvelope {
-            contract_version: eliot_agent_bridge_core::SKILL_TRANSPORT_VERSION,
-            outcome: eliot_agent_bridge_core::SkillResultOutcome::Refused {
-                code: "UNCERTAIN_EFFECTS".to_owned(),
-                detail: format!(
-                    "{} execution(s) have unknown effects; reconcile with exact evidence before retry",
-                    verdict.uncertain_pending_refs.len()
-                ),
+/// `view` is the lifecycle owner's own view AFTER it accepted this page: the
+/// assessment is computed over the evidence the owner holds, never over the
+/// submitted page in isolation, so a genuine B-only page cannot clear an
+/// execution the owner still holds as unresolved (issue #2664 acceptance).
+///
+/// The expected set is `NotEstablished` and is named as such. No attempt/effect
+/// owner issues one today, and a caller-provided set, a record count, a short
+/// last page or an empty pending list may never stand in for it — so
+/// `expected`/`missing` report `not_established` instead of a plausible zero,
+/// and a window that resolves every member it can see still cannot report a
+/// complete set. Partial evidence is still returned in full; it is not
+/// discarded to reach a clean answer.
+fn execution_verdict_outcome(
+    view: &eliot_skill::SkillLifecycleView,
+    page_records: u64,
+) -> SkillResultEnvelope {
+    let window = &view.execution_evidence;
+    let assessment = eliot_skill::reconcile_unknown_effects(
+        eliot_skill::activation::ExecutionAssessmentWindow {
+            window,
+            scope: eliot_skill::activation::AssessmentScope::OwnerRetainedWindow {
+                source_revision: eliot_skill::SourceRevision {
+                    source: SOURCE_SKILL_LIFECYCLE_VIEW.to_owned(),
+                    revision: Some(view.lifecycle_revision),
+                },
+                window_records: window.len() as u64,
+                page_records,
             },
+            expected_set: eliot_skill::activation::ExpectedExecutionSet::NotEstablished {
+                owner: SOURCE_ATTEMPT_EFFECT_OWNER.to_owned(),
+            },
+            coverage: eliot_skill::EvidenceCoverage::Complete,
+        },
+    );
+    match assessment {
+        Ok(verdict) => SkillResultEnvelope::evidence(verdict),
+        // Refused would imply nothing was stored, and the owner HAS taken
+        // this page by the time the assessment runs, so the page is reported
+        // as stored alongside the failure to assess it.
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::skill_evidence",
+                event = "eliotd.skill_evidence_assessment_failed",
+                skill_id = %view.skill_id(),
+                window_records = window.len(),
+                page_records,
+                reason = %error,
+                "the Skill lifecycle owner accepted this execution evidence, but no reconciliation assessment could be derived from the retained window; the page stays stored and clears nothing"
+            );
+            SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+                "execution evidence was stored by the Skill lifecycle owner, but its reconciliation assessment failed: {error}"
+            )))
         }
     }
 }

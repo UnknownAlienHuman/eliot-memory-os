@@ -405,18 +405,23 @@ pub enum SkillResultOutcome {
     /// is a positive claim, and it is reached only after the ingest compared
     /// the presented outcome references against real owner records.
     Attempt(Box<eliot_skill::AttemptLifecycleSummary>),
-    /// Execution evidence reconciled: exact presented outcome counts with the
-    /// still-uncertain remainder. Retry is permitted only when
-    /// `uncertain_pending` is zero; uncertain effects block retry until
-    /// reconciled by exact evidence.
-    Evidence {
-        /// Presented executions with a fully observed outcome.
-        observed: u64,
-        /// Presented executions with a known failed outcome.
-        failed: u64,
-        /// Presented executions whose effects are still unknown.
-        uncertain_pending: u64,
-    },
+    /// Execution evidence reconciled (issue #2664, I7.25 / I14.21).
+    ///
+    /// Carries the explicit assessment, not a retry boolean: what it was
+    /// computed over (`scope`), the owner-issued expected set or the honest
+    /// not-established state, expected/observed/missing counts, coverage, the
+    /// per-execution disposition with its exact identity and content
+    /// commitment, and the exact pending identities. The clearance is
+    /// EVIDENCE for the existing retry/admission gate: a committed result
+    /// replays the ORIGINAL result, and a known failure is only routed to the
+    /// existing same-identity retry gate — neither is an independently issued
+    /// execution permit. `Box` is serde-transparent, so the wire shape is the
+    /// assessment object itself.
+    ///
+    /// A legacy zero-pending `Evidence` result is legacy and unqualified: it
+    /// decoded as a bare count and proved no completeness, so it is never
+    /// reinterpreted as complete evidence.
+    Evidence(Box<eliot_skill::UnknownEffectsVerdict>),
     /// The owner records that established (or failed to establish) the
     /// usefulness claim carried by an `Attempt` outcome above, each with the
     /// owner revision it was read at.
@@ -495,17 +500,15 @@ impl SkillResultEnvelope {
 
     /// Builds an evidence-reconciliation outcome from one validated ingest.
     ///
-    /// Carries the exact presented outcome counts. A non-zero
-    /// `uncertain_pending` means retry stays blocked until those executions
-    /// are reconciled by exact evidence.
-    pub fn evidence(observed: u64, failed: u64, uncertain_pending: u64) -> Self {
+    /// Carries the whole assessment so the receiver can see the scope it was
+    /// computed over, whether an owner established the expected set, the
+    /// per-execution dispositions and the exact pending identities — never a
+    /// bare count that could be read as a complete set.
+    #[must_use]
+    pub fn evidence(verdict: eliot_skill::UnknownEffectsVerdict) -> Self {
         Self {
             contract_version: SKILL_TRANSPORT_VERSION,
-            outcome: SkillResultOutcome::Evidence {
-                observed,
-                failed,
-                uncertain_pending,
-            },
+            outcome: SkillResultOutcome::Evidence(Box::new(verdict)),
         }
     }
 

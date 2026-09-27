@@ -9,10 +9,18 @@
 //! dependency/Tool Definition staleness gate that blocks Material use until
 //! governed review or restore. Absent adherence evidence stays unknown;
 //! aggregate counts never substitute for the exact receipt.
+//!
+//! It also owns the unknown-effects reconciliation assessment (issue #2664):
+//! one unique current-state projection of a bounded evidence window, per
+//! execution dispositions, and an explicit clearance that replaces the
+//! page-local retry boolean. A submitted page is an observation, never a
+//! denominator — without an owner-issued expected execution/effect set the
+//! window cannot be shown complete, so it clears nothing. The assessment is
+//! evidence for the existing retry/admission gate and never issues a permit.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -926,170 +934,640 @@ fn fold_attempt_evidence(
     Ok(fold)
 }
 
-/// Execution counters folded from exact step/artifact/verifier evidence.
-/// Public so production evidence ingest (daemon execution drive) and the
-/// lifecycle derivation fold through the same named counter type.
+/// Execution counters folded from the ONE unique current-state projection of
+/// step/artifact/verifier evidence. Public so production evidence ingest
+/// (daemon execution drive) and the lifecycle derivation fold through the
+/// same named counter type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionFold {
-    /// Presented executions with a fully observed outcome.
+    /// Distinct executions whose current state is an observed outcome.
     pub executed: u64,
-    /// Observed executions carrying verifier refs.
+    /// Distinct observed executions whose effect disposition is complete: a
+    /// verifier run over the observed effect.
     pub verified: u64,
-    /// Presented executions with a known failed outcome.
+    /// Distinct executions whose current state is a known failure.
     pub failed: u64,
-    /// Presented executions with unknown effects.
+    /// Distinct executions whose effects are still unknown.
     pub uncertain: u64,
 }
 
-/// Production verdict of the unknown-effects reconciliation gate (issue
-/// #1191).
+/// Exact source-event/evidence identity of one retained execution record,
+/// with the commitment over its own recorded content.
 ///
-/// Counts distinct presented executions by latest presented outcome and
-/// names every execution still [`ExecutionOutcome::Uncertain`]. Retry is
-/// permitted only when nothing is uncertain: an uncertain execution has
-/// unknown effects, and an unknown effect must be reconciled — superseded by
-/// exact observed or failed evidence for the same execution — before the next
-/// attempt. Repeated records for one execution fold idempotently through
-/// their latest outcome instead of double-counting. Absence of an execution
-/// record is absence of evidence, never an observed claim: only presented
-/// records fold, so uninstrumented executions stay unknown instead of
-/// proving success.
+/// `evidence_ref` is the identity the record is filed under and
+/// `content_digest` a digest over that record's canonical content. Two
+/// presentations of one record share both whatever their outcome, so an exact
+/// replay is recognisable without reading the outcome; the same identity with
+/// a different digest is a conflict, never a rewrite (I14.21: a changed
+/// record is not the same evidence, and no blind duplicate effect follows).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceIdentity {
+    /// Exact evidence identity the record was presented under.
+    pub evidence_ref: String,
+    /// Digest over the record's own canonical content.
+    pub content_digest: String,
+}
+
+/// What the current-state projection says about ONE execution's effects, and
+/// therefore what that execution may do next.
+///
+/// This is the I14.21 partition per operation, never an aggregate: `committed
+/// → reconcile ORS`, `known rollback → retry under the same identity`,
+/// `unknown → pause Ordering Scope, preserve the operation`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEffectState {
+    /// Exact committed effect/result found: reconcile and return the ORIGINAL
+    /// result. That effect is not executed again.
+    CommittedResult,
+    /// Observed status WITHOUT a complete effect disposition (no verifier run
+    /// over the effect). No retry safety is inferred from the status alone.
+    ObservedWithoutEffectDisposition,
+    /// Known execution failure. The effect is not a committed result, but a
+    /// failure is a STATUS: the original retry policy and its existing
+    /// same-identity gate decide whether a retry is permitted, never this
+    /// projection.
+    KnownFailure,
+    /// Unknown effects. No retry-qualified clearance; the identity stays
+    /// pending until an owner-authorized resolution exists for it.
+    Uncertain,
+    /// One evidence identity presented with different content, or with
+    /// unordered/contradictory revisions. Nothing resolves and the conflict
+    /// stays visible.
+    ContradictoryRevisions,
+}
+
+impl ExecutionEffectState {
+    /// Whether this state leaves the execution's effect unresolved, so its
+    /// exact identity must be retained as pending rather than counted away.
+    /// Only a committed result or a known failure is a settled effect state,
+    /// and even a known failure settles nothing about retry safety: that is the
+    /// original retry policy's decision.
+    #[must_use]
+    pub const fn leaves_effect_unresolved(self) -> bool {
+        matches!(
+            self,
+            Self::Uncertain | Self::ContradictoryRevisions | Self::ObservedWithoutEffectDisposition
+        )
+    }
+}
+
+/// One execution's current state in the unique projection, with the exact
+/// identity and content commitment the state was read from.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionDisposition {
+    /// `execution_ref` the member is filed under.
+    pub execution_ref: String,
+    /// Exact identity and content commitment this state was read from.
+    pub identity: ExecutionEvidenceIdentity,
+    /// The current state, and what it means downstream.
+    pub state: ExecutionEffectState,
+}
+
+/// A count that depends on a denominator no owner established.
+///
+/// Absence of the owner is reported as its own state and never as `0`: a zero
+/// expected count would read as a complete set, which is exactly the inference
+/// this assessment refuses to make from a submitted page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentCount {
+    /// No owner established the set this count is measured against.
+    NotEstablished,
+    /// The owner-issued set established the count.
+    Counted(u64),
+}
+
+/// Upper bound on the per-execution dispositions one assessment carries.
+///
+/// An assessment is actionable evidence, not a history dump: it is bounded by
+/// one bounded ingest window (the Skill transport admits at most 256 execution
+/// records per page) and holds nothing between calls.
+/// `disposition_count` always carries the exact total, so a truncated list is
+/// visible to the receiver instead of being silently short.
+pub const MAX_ASSESSMENT_DISPOSITIONS: usize = 256;
+
+/// What one assessment was actually computed over.
+///
+/// The scope is never a completeness claim: completeness is decided by the
+/// expected set and the coverage, and a page-local scope can never be shown to
+/// cover an attempt. Page statistics and attempt-wide statistics are separate
+/// fields and are never conflated.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum AssessmentScope {
+    /// Exactly the submitted ingest page, with no retained window behind it.
+    /// A genuine B-only page is this: it says nothing about an execution
+    /// retained from an earlier page, so it can never clear one.
+    SubmittedPage {
+        /// Records this submitted page carried.
+        page_records: u64,
+    },
+    /// The window the lifecycle owner returned after accepting this ingest —
+    /// the retained set it merged the page into — read at this owner revision.
+    OwnerRetainedWindow {
+        /// Closed source and revision the owner returned the window at.
+        source_revision: SourceRevision,
+        /// Attempt-wide records in the window the owner returned.
+        window_records: u64,
+        /// Records this ingest contributed to that window (page statistics).
+        page_records: u64,
+    },
+}
+
+/// The owner-issued expected execution/effect set an assessment is measured
+/// against, or the honest state that no owner issued one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ExpectedExecutionSet {
+    /// No owner issued an expected set for this attempt, so the denominator is
+    /// NOT ESTABLISHED. This is the honest state, not a defect to be papered
+    /// over with a plausible count: `expected`/`missing` below stay
+    /// `NotEstablished`, and no window — not even one whose pending list is
+    /// empty — may be reported as a complete set (I7.25: silence about
+    /// adherence is unknown, not compliance).
+    NotEstablished {
+        /// What the assessment looked to for the set, so the gap is named
+        /// instead of left implicit.
+        owner: String,
+    },
+    /// The owner-issued set, read at the revision it was read at: the exact
+    /// expected execution/effect members, finite.
+    ///
+    /// An empty `members` list here is a LEGITIMATE OWNER-PROVEN EMPTY SET and
+    /// is categorically different from an invalid empty input page, which the
+    /// transport refuses before any assessment exists.
+    Issued {
+        /// Owner revision the set was read at.
+        source_revision: SourceRevision,
+        /// Exact expected execution/effect identities the owner issued.
+        members: Vec<String>,
+    },
+}
+
+/// What the evidence alone establishes about the executions it names.
+///
+/// Every state here is EVIDENCE. None of them is an execution permit, and the
+/// only two that look permissive are deliberately weaker than a permit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearanceState {
+    /// No retry-qualified clearance. The exact unresolved identities and the
+    /// recovery action are retained; nothing is executed on this evidence.
+    NotCleared,
+    /// Every NAMED execution resolves to an exact committed result: reconcile
+    /// and return the ORIGINAL results. That effect is not executed again —
+    /// this replays a recorded result and grants no authority.
+    CommittedResultsToReplay,
+    /// Every NAMED execution is a known failure with no recorded effect. This
+    /// is ELIGIBLE FOR THE EXISTING SAME-IDENTITY RETRY GATE and nothing
+    /// more: the original retry policy and its existing gate decide whether the
+    /// attempt may run. It is NOT an independently issued execution permit,
+    /// and a status alone is not retry safety.
+    EligibleForSameIdentityRetryGate,
+}
+
+/// Why no retry-qualified clearance follows, so the receiver gets an actionable
+/// recovery action instead of a bare count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearanceBlocker {
+    /// An execution's effects are unknown. The exact identities are in
+    /// `dispositions`: I14.21 pauses Ordering Scope and preserves the
+    /// operation, and a Human/Doctor chooses the evidence-backed
+    /// reconciliation. No blind duplicate effect.
+    UncertainEffect,
+    /// An observed status without a complete effect disposition. No retry
+    /// safety is inferred from the status alone.
+    IncompleteEffectDisposition,
+    /// One evidence identity carried different content, or unordered
+    /// contradictory revisions. Nothing resolves until the owner issues an
+    /// authoritative resolution.
+    ContradictoryRevisions,
+    /// The evidence window behind this assessment was not obtained completely.
+    IncompleteCoverage,
+    /// No owner issued the expected set, so this set cannot be shown complete
+    /// even when nothing is pending.
+    ExpectedSetNotEstablished,
+    /// The owner-issued set names expected members this window did not
+    /// evidence.
+    MissingExpectedMembers,
+    /// The evidence set is completely resolved, but the policy/lease/authority
+    /// that may admit execution is not established here: evidence may be
+    /// complete while execution remains denied.
+    AuthorityNotEstablished,
+}
+
+/// The explicit reconciliation verdict for one bounded evidence window
+/// (issue #1191 / #2664, I7.25 / I14.21).
+///
+/// It replaces a page-local retry boolean. A submitted page is an OBSERVATION,
+/// never a denominator: without an owner-issued expected execution/effect set
+/// the set cannot be shown complete, so a page with no uncertain member
+/// reports [`ClearanceState::NotCleared`] with
+/// [`ClearanceBlocker::ExpectedSetNotEstablished`] rather than a permission.
+/// Silence about unresolved effects is unknown, never compliance (I7.25:28),
+/// and an aggregate count never substitutes for the exact record behind it
+/// (I7.25:38) — hence the per-execution dispositions beside the counts.
+///
+/// The verdict is evidence for the existing retry/admission gate. It never
+/// creates a permission: a committed result replays the ORIGINAL result, and a
+/// known failure is only routed to the EXISTING same-identity retry gate,
+/// which the original retry policy still owns.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnknownEffectsVerdict {
-    /// Distinct presented executions whose latest outcome is fully observed.
+    /// What this assessment was computed over.
+    pub scope: AssessmentScope,
+    /// The owner-issued expected set, or the honest not-established state.
+    pub expected_set: ExpectedExecutionSet,
+    /// Expected member count, or `NotEstablished` when no owner issued one.
+    pub expected: AssessmentCount,
+    /// Expected members this window did not evidence, or `NotEstablished`.
+    /// Never derived from a short last page: a count is established only from
+    /// a settled read.
+    pub missing: AssessmentCount,
+    /// Distinct executions whose current state is an observed outcome.
     pub observed: u64,
-    /// Distinct presented executions whose latest outcome is known failed.
+    /// Distinct executions whose current state is a known failure.
     pub failed: u64,
-    /// `execution_ref`s whose latest presented outcome is still unknown, in
-    /// first-presented order.
-    pub uncertain_pending_refs: Vec<String>,
+    /// Distinct executions whose effects are still unknown.
+    pub uncertain: u64,
+    /// How completely the window behind this assessment was obtained.
+    pub coverage: EvidenceCoverage,
+    /// Per-execution current-state disposition, bounded by
+    /// [`MAX_ASSESSMENT_DISPOSITIONS`]; `disposition_count` is always the
+    /// exact total, so a truncated list is visible.
+    pub dispositions: Vec<ExecutionDisposition>,
+    /// Exact number of distinct executions in the projection.
+    pub disposition_count: u64,
+    /// Exact number of dispositions whose effect is unresolved, even when the
+    /// carried list is truncated.
+    pub pending_count: u64,
+    /// What the evidence establishes, and why nothing more follows.
+    pub clearance: ReconciliationClearance,
+}
+
+/// The explicit assessment: the state the evidence establishes plus the
+/// blocker that keeps a permission from following.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationClearance {
+    /// What the evidence alone establishes.
+    pub state: ClearanceState,
+    /// The primary reason no retry-qualified clearance follows. `None` only
+    /// when `state` already states a resolved, non-permissive path.
+    pub blocker: Option<ClearanceBlocker>,
 }
 
 impl UnknownEffectsVerdict {
     pub fn validate(&self) -> Result<(), SkillError> {
+        match (self.clearance.state, self.clearance.blocker) {
+            (ClearanceState::NotCleared, None) => {
+                return Err(SkillError::InvalidField {
+                    field: "verdict.clearance",
+                    reason: "a verdict that clears nothing must name its blocker",
+                });
+            }
+            (state, Some(_)) if state != ClearanceState::NotCleared => {
+                return Err(SkillError::InvalidField {
+                    field: "verdict.clearance",
+                    reason: "a resolved path carries no clearance blocker",
+                });
+            }
+            _ => {}
+        }
         unique(
-            self.uncertain_pending_refs.iter().cloned(),
-            "verdict.uncertain_pending_refs",
+            self.dispositions
+                .iter()
+                .map(|disposition| disposition.execution_ref.clone()),
+            "verdict.dispositions",
         )?;
-        for reference in &self.uncertain_pending_refs {
-            text(reference, "verdict.uncertain_pending_ref")?;
+        for disposition in &self.dispositions {
+            text(
+                &disposition.execution_ref,
+                "verdict.disposition.execution_ref",
+            )?;
+            text(
+                &disposition.identity.evidence_ref,
+                "verdict.disposition.evidence_ref",
+            )?;
+            digest(
+                &disposition.identity.content_digest,
+                "verdict.disposition.content_digest",
+            )?;
+        }
+        if self.dispositions.len() > MAX_ASSESSMENT_DISPOSITIONS
+            || u64::try_from(self.dispositions.len()).unwrap_or(u64::MAX) > self.disposition_count
+            || self.pending_count > self.disposition_count
+            || self.observed + self.failed + self.uncertain > self.disposition_count
+        {
+            return Err(SkillError::InvalidField {
+                field: "verdict.dispositions",
+                reason: "dispositions cannot outrun the exact projected totals",
+            });
+        }
+        if let ExpectedExecutionSet::Issued { members, .. } = &self.expected_set {
+            unique(members.iter().cloned(), "verdict.expected_set.members")?;
+            for member in members {
+                text(member, "verdict.expected_set.member")?;
+            }
         }
         Ok(())
     }
+}
 
-    /// Retry is permitted only when no presented execution has unknown
-    /// effects. A failed execution is a known effect — the retry is a new
-    /// attempt, not a repeated unknown — while an uncertain one blocks until
-    /// reconciled.
-    #[must_use]
-    pub const fn retry_permitted(&self) -> bool {
-        self.uncertain_pending_refs.is_empty()
+/// The one bounded evidence window an assessment is computed over.
+///
+/// `window` is the evidence the caller obtained from its owner — the retained
+/// attempt-wide set when one exists, otherwise exactly the submitted page —
+/// and `scope` names which of the two it is, so a page is never read as an
+/// attempt. `expected_set` is the denominator, or the honest
+/// not-established state; `coverage` is how completely the window itself was
+/// obtained, never whether the ATTEMPT is complete.
+pub struct ExecutionAssessmentWindow<'a> {
+    /// The evidence records the projection reads.
+    pub window: &'a [SkillExecutionEvidence],
+    /// What this window is.
+    pub scope: AssessmentScope,
+    /// The owner-issued expected set, or the honest not-established state.
+    pub expected_set: ExpectedExecutionSet,
+    /// How completely the window was obtained.
+    pub coverage: EvidenceCoverage,
+}
+
+/// The ONE unique current-state projection of an evidence window, computed
+/// before any counter is derived. Every counter in this module — the
+/// reconciliation verdict and the lifecycle counters alike — reads it, so the
+/// two can no longer disagree about duplicates (I7.25: an aggregate count
+/// never substitutes for the exact record behind it).
+///
+/// A member is one exact evidence identity. Identical records (same identity
+/// and same content commitment) fold idempotently whatever their outcome, so an
+/// exact replay of Observed, Failed or Uncertain behaves identically and
+/// inflates nothing. The same identity with different content is a conflict:
+/// nothing orders two contradictory revisions on caller input, so neither
+/// supersedes the other and both stay visible.
+struct ExecutionProjection {
+    members: Vec<ExecutionDisposition>,
+}
+
+impl ExecutionProjection {
+    fn project(window: &[SkillExecutionEvidence]) -> Result<Self, SkillError> {
+        let mut members: Vec<ExecutionDisposition> = Vec::new();
+        for execution in window {
+            execution.validate()?;
+            let evidence_ref = execution.execution_ref.clone();
+            let content_digest = execution_content_digest(execution)?;
+            match members
+                .iter_mut()
+                .find(|member| member.execution_ref == evidence_ref)
+            {
+                Some(member) if member.identity.content_digest == content_digest => {}
+                Some(member) => member.state = ExecutionEffectState::ContradictoryRevisions,
+                None => members.push(ExecutionDisposition {
+                    execution_ref: evidence_ref,
+                    identity: ExecutionEvidenceIdentity {
+                        evidence_ref: execution.execution_ref.clone(),
+                        content_digest,
+                    },
+                    state: effect_state(execution),
+                }),
+            }
+        }
+        Ok(Self { members })
+    }
+
+    fn count(&self, states: &[ExecutionEffectState]) -> u64 {
+        self.members
+            .iter()
+            .filter(|member| states.contains(&member.state))
+            .count() as u64
+    }
+
+    /// Lifecycle counters over the unique current state. `executed` counts
+    /// executions with an observed outcome and `verified` those whose effect
+    /// disposition is complete (a verifier run over the observed effect), so
+    /// one execution can never be counted twice.
+    fn counts(&self) -> ExecutionFold {
+        let committed = [ExecutionEffectState::CommittedResult];
+        let observed = [
+            ExecutionEffectState::CommittedResult,
+            ExecutionEffectState::ObservedWithoutEffectDisposition,
+        ];
+        ExecutionFold {
+            executed: self.count(&observed),
+            verified: self.count(&committed),
+            failed: self.count(&[ExecutionEffectState::KnownFailure]),
+            uncertain: self.count(&[ExecutionEffectState::Uncertain]),
+        }
+    }
+
+    /// Expected and missing member counts, measured against the OWNER-issued
+    /// set only and only from a settled read: a truncated page cannot prove
+    /// that an expected member is absent, and no owner-issued set leaves both
+    /// counts not established rather than zero.
+    fn expected_counts(
+        &self,
+        assessment: &ExecutionAssessmentWindow<'_>,
+    ) -> (AssessmentCount, AssessmentCount) {
+        let issued = match &assessment.expected_set {
+            ExpectedExecutionSet::Issued { members, .. } => Some(members),
+            ExpectedExecutionSet::NotEstablished { .. } => None,
+        };
+        match issued {
+            Some(members) if assessment.coverage.is_settled() => {
+                let unevidenced = members
+                    .iter()
+                    .filter(|member| {
+                        !self
+                            .members
+                            .iter()
+                            .any(|observed| &&observed.execution_ref == member)
+                    })
+                    .count();
+                (
+                    AssessmentCount::Counted(members.len() as u64),
+                    AssessmentCount::Counted(unevidenced as u64),
+                )
+            }
+            _ => (
+                AssessmentCount::NotEstablished,
+                AssessmentCount::NotEstablished,
+            ),
+        }
+    }
+
+    /// The explicit clearance this projection supports, decided fail-closed in
+    /// a fixed order: an unresolved effect first, then incomplete coverage,
+    /// then the two paths the evidence alone can state, then the denominator.
+    fn clearance(
+        &self,
+        assessment: &ExecutionAssessmentWindow<'_>,
+        missing: AssessmentCount,
+    ) -> ReconciliationClearance {
+        let not_cleared = |blocker| ReconciliationClearance {
+            state: ClearanceState::NotCleared,
+            blocker: Some(blocker),
+        };
+        let unresolved = self
+            .members
+            .iter()
+            .map(|member| member.state)
+            .find(|state| state.leaves_effect_unresolved());
+        if let Some(state) = unresolved {
+            return match state {
+                ExecutionEffectState::ContradictoryRevisions => {
+                    not_cleared(ClearanceBlocker::ContradictoryRevisions)
+                }
+                ExecutionEffectState::Uncertain => not_cleared(ClearanceBlocker::UncertainEffect),
+                _ => not_cleared(ClearanceBlocker::IncompleteEffectDisposition),
+            };
+        }
+        if !assessment.coverage.is_settled() {
+            return not_cleared(ClearanceBlocker::IncompleteCoverage);
+        }
+        // Both remaining positive paths are bounded to the NAMED dispositions
+        // and claim nothing about members no owner has enumerated: an exact
+        // committed result is replayed, never executed again, and a known
+        // failure is only routed to the existing same-identity retry gate.
+        let named = !self.members.is_empty();
+        if named
+            && self
+                .members
+                .iter()
+                .all(|member| member.state == ExecutionEffectState::CommittedResult)
+        {
+            return ReconciliationClearance {
+                state: ClearanceState::CommittedResultsToReplay,
+                blocker: None,
+            };
+        }
+        if named
+            && self
+                .members
+                .iter()
+                .all(|member| member.state == ExecutionEffectState::KnownFailure)
+        {
+            return ReconciliationClearance {
+                state: ClearanceState::EligibleForSameIdentityRetryGate,
+                blocker: None,
+            };
+        }
+        match &assessment.expected_set {
+            ExpectedExecutionSet::NotEstablished { .. } => {
+                not_cleared(ClearanceBlocker::ExpectedSetNotEstablished)
+            }
+            ExpectedExecutionSet::Issued { .. } if matches!(missing, AssessmentCount::Counted(count) if count > 0) => {
+                not_cleared(ClearanceBlocker::MissingExpectedMembers)
+            }
+            // Every named execution is resolved and the issued set is fully
+            // evidenced; execution is still denied here, because the
+            // policy/lease/authority owner — not this evidence — admits it.
+            ExpectedExecutionSet::Issued { .. } => {
+                not_cleared(ClearanceBlocker::AuthorityNotEstablished)
+            }
+        }
     }
 }
 
-/// Reconciles unknown execution effects before retry (issue #1191).
+/// Digest over one record's own canonical content: the content commitment a
+/// replay is recognised by. It is compared against the ORIGINAL recorded value
+/// of the member it belongs to, never recomputed over a substituted record.
+fn execution_content_digest(execution: &SkillExecutionEvidence) -> Result<String, SkillError> {
+    let bytes = canonical_json_bytes(execution)
+        .map_err(|error| SkillError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// The current effect state of one record. An observed effect WITH a verifier
+/// run over it is a committed result; an observed status without one has an
+/// incomplete effect disposition. A failure is a known status, and an
+/// uncertain record has unknown effects.
+fn effect_state(execution: &SkillExecutionEvidence) -> ExecutionEffectState {
+    match execution.outcome {
+        ExecutionOutcome::Observed if !execution.verifier_refs.is_empty() => {
+            ExecutionEffectState::CommittedResult
+        }
+        ExecutionOutcome::Observed => ExecutionEffectState::ObservedWithoutEffectDisposition,
+        ExecutionOutcome::Failed => ExecutionEffectState::KnownFailure,
+        ExecutionOutcome::Uncertain => ExecutionEffectState::Uncertain,
+    }
+}
+
+/// Reconciles the evidence window into one explicit assessment before retry
+/// (issue #1191 / #2664, I7.25 / I14.21).
 ///
-/// Validates every presented [`SkillExecutionEvidence`] and folds one
-/// outcome per distinct execution: the latest presented outcome wins, so an
-/// exact observed or failed record supersedes an earlier uncertain one for
-/// the same execution, a later uncertain record re-opens it, and repeated
-/// records fold idempotently. Observed executions require exact step refs,
-/// non-default causal credit requires exact step refs and never claims sole
-/// cause, and missing instrumentation never becomes an observed claim —
-/// unreported executions simply do not fold. The returned verdict names the
-/// still-uncertain execution refs; the caller refuses retry while
-/// [`UnknownEffectsVerdict::retry_permitted`] is false.
+/// ONE current-state projection is computed first ([`ExecutionProjection`]),
+/// and every count below is read from it, so a duplicate, a superseded record
+/// and a lifecycle counter can no longer disagree. The verdict then states
+/// what the evidence establishes and what it does not:
+///
+/// * a contradictory identity, an uncertain effect, an observed status without
+///   a complete effect disposition, incomplete coverage or an unestablished
+///   expected set clears nothing, and the exact unresolved identities are
+///   retained;
+/// * an exact committed effect is reconciled and its ORIGINAL result returned,
+///   never executed again;
+/// * a known failure is routed to the EXISTING same-identity retry gate, which
+///   the original retry policy still owns — this is not an execution permit;
+/// * a complete resolved set still leaves execution denied unless the
+///   policy/lease/authority owner admits it.
+///
+/// Completion is never inferred from a short last page, a record count, an
+/// empty pending list, or the caller's word: without an owner-issued expected
+/// set, `expected`/`missing` stay [`AssessmentCount::NotEstablished`] and the
+/// verdict cannot report a complete set.
 pub fn reconcile_unknown_effects(
-    executions: &[SkillExecutionEvidence],
+    assessment: ExecutionAssessmentWindow<'_>,
 ) -> Result<UnknownEffectsVerdict, SkillError> {
-    // Latest presented outcome wins per execution. Windows are
-    // payload-bounded, so the linear scan stays small.
-    let mut latest: Vec<(String, ExecutionOutcome)> = Vec::new();
-    for execution in executions {
-        execution.validate()?;
-        match latest
-            .iter_mut()
-            .find(|(reference, _)| *reference == execution.execution_ref)
-        {
-            Some(slot) => slot.1 = execution.outcome,
-            None => latest.push((execution.execution_ref.clone(), execution.outcome)),
-        }
-    }
-    // Independent re-derivation over the raw records: every folded outcome
-    // must match its latest presented record, so a verdict that clears a
-    // still-uncertain execution — or miscounts a superseded one — never
-    // publishes.
-    for (reference, outcome) in &latest {
-        let confirmed = executions
-            .iter()
-            .rfind(|execution| &execution.execution_ref == reference)
-            .is_some_and(|record| record.outcome == *outcome);
-        if !confirmed {
-            return Err(SkillError::IdentityMismatch);
-        }
-    }
-    let mut observed = 0_u64;
-    let mut failed = 0_u64;
-    let mut uncertain_pending_refs = Vec::new();
-    for (reference, outcome) in &latest {
-        match outcome {
-            ExecutionOutcome::Observed => {
-                observed = observed.saturating_add(1);
-            }
-            ExecutionOutcome::Failed => {
-                failed = failed.saturating_add(1);
-            }
-            ExecutionOutcome::Uncertain => {
-                uncertain_pending_refs.push(reference.clone());
-            }
-        }
-    }
+    let projection = ExecutionProjection::project(assessment.window)?;
+    let counts = projection.counts();
+    let disposition_count = projection.members.len() as u64;
+    let pending_count = projection
+        .members
+        .iter()
+        .filter(|member| member.state.leaves_effect_unresolved())
+        .count() as u64;
+    let (expected, missing) = projection.expected_counts(&assessment);
+    let clearance = projection.clearance(&assessment, missing);
     let verdict = UnknownEffectsVerdict {
-        observed,
-        failed,
-        uncertain_pending_refs,
+        scope: assessment.scope,
+        expected_set: assessment.expected_set,
+        expected,
+        missing,
+        observed: counts.executed,
+        failed: counts.failed,
+        uncertain: counts.uncertain,
+        coverage: assessment.coverage,
+        dispositions: projection
+            .members
+            .iter()
+            .take(MAX_ASSESSMENT_DISPOSITIONS)
+            .cloned()
+            .collect(),
+        disposition_count,
+        pending_count,
+        clearance,
     };
     verdict.validate()?;
     Ok(verdict)
 }
 
-/// Counts presented execution records by outcome; observed executions with
-/// verifier refs count as verified. Causal credit is never a sole-cause claim:
-/// evidence validation accepts only the distributed, uncertain or associated
-/// representations, each bound to exact step refs. This is the record-count
-/// fold behind [`derive_lifecycle_view`]: unlike
-/// [`reconcile_unknown_effects`], which folds one latest outcome per distinct
-/// execution for the retry gate, it counts every presented record, so the two
-/// agree exactly on duplicate-free windows and intentionally differ when one
-/// execution carries repeated records.
+/// Counts the executions in the ONE unique current-state projection of an
+/// evidence window; observed executions with a verifier run over the effect
+/// count as verified. Causal credit is never a sole-cause claim: evidence
+/// validation accepts only the distributed, uncertain or associated
+/// representations, each bound to exact step refs. This is the counter fold
+/// behind [`derive_lifecycle_view`] and behind
+/// [`reconcile_unknown_effects`], which read the same projection, so an exact
+/// replay cannot inflate one counter and not the other.
 pub fn fold_execution_evidence(
     executions: &[SkillExecutionEvidence],
 ) -> Result<ExecutionFold, SkillError> {
-    let mut fold = ExecutionFold {
-        executed: 0,
-        verified: 0,
-        failed: 0,
-        uncertain: 0,
-    };
-    for execution in executions {
-        execution.validate()?;
-        match execution.outcome {
-            ExecutionOutcome::Observed => {
-                fold.executed = fold.executed.saturating_add(1);
-                if !execution.verifier_refs.is_empty() {
-                    fold.verified = fold.verified.saturating_add(1);
-                }
-            }
-            ExecutionOutcome::Failed => {
-                fold.failed = fold.failed.saturating_add(1);
-            }
-            ExecutionOutcome::Uncertain => {
-                fold.uncertain = fold.uncertain.saturating_add(1);
-            }
-        }
-    }
-    Ok(fold)
+    Ok(ExecutionProjection::project(executions)?.counts())
 }
 
 /// Folds validated conflicts involving one skill into its interaction view:
