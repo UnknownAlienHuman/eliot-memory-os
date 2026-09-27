@@ -635,6 +635,13 @@ fn task_envelope(
         "actor_ref".to_owned(),
         serde_json::Value::String(event.actor_ref.clone()),
     );
+    parameters.insert(
+        "task_event_json".to_owned(),
+        serde_json::Value::String(
+            serde_json::to_string(event)
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        ),
+    );
     if let Some(recipe) = campaign_recipe {
         validate_campaign_recipe_anchor(recipe, identity, &operation_id, &record.task_id, fence)?;
         parameters.insert(
