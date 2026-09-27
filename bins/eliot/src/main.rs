@@ -51,6 +51,7 @@ use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
 mod controlboard_status;
+mod dashboard;
 mod dev_crate_check;
 mod first_run_flow;
 mod plugin_preview;
@@ -147,6 +148,18 @@ enum Command {
         #[command(subcommand)]
         command: ControlBoardCommand,
     },
+    /// Administrative, automation and recovery surface: open the
+    /// role-filtered terminal dashboard over the same authenticated
+    /// `ControlBoard` projection that `controlboard status` prints. I11.1
+    /// makes this CLI the mandatory admin/automation/recovery fallback; this
+    /// is the optional lightweight terminal view of it, not an
+    /// agent/provider prompt loop. Read-only: no prompt loop, no provider
+    /// selection, no arbitrary command execution, no persisted state, and no
+    /// mutation action. Requires an interactive terminal; under redirected or
+    /// noninteractive output it refuses without entering raw mode and directs
+    /// the caller to `eliot controlboard status`.
+    #[command(name = "dashboard")]
+    Dashboard,
     /// Backup creation/restore previews, issuance, isolated restore runs, key coverage (#1873; previews never issue; restore runs never cut over), and the three advertised `create`/`verify`/`restore-test` catalogue commands routed through the authenticated Kernel front door (#963).
     Backup {
         #[command(subcommand)]
@@ -755,6 +768,7 @@ fn run() -> Result<i32> {
         Command::Doctor { command } => run_doctor(command),
         Command::Release { command } => run_release(command),
         Command::ControlBoard { command } => run_controlboard(command),
+        Command::Dashboard => dashboard::run_dashboard(),
         Command::Backup { command } => backup_entry::run_backup(command),
         Command::Scope { command } => Ok(run_scope(command)),
         Command::Dev { command } => Ok(run_dev(command)),
