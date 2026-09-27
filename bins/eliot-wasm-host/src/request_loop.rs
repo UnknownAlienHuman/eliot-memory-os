@@ -68,8 +68,12 @@ use std::sync::mpsc::{
 };
 use std::time::Duration;
 
+<<<<<<< HEAD
 use eliot_contracts::sha256_hex;
 use eliot_wasm_runtime::lifecycle::InFlightDisposition;
+=======
+use eliot_wasm_runtime::lifecycle::{DIVERGENCE_REASON_CODE, DivergenceReport};
+>>>>>>> 1858fd69 (fix: give the WASM conformance corpus and divergence reporting production consumers (#21))
 use eliot_wasm_runtime::{
     EngineBinding, GuestInterruptHandle, InvocationRequest, InvocationResult, Sha256Digest,
     VerificationVerdict,
@@ -626,6 +630,12 @@ pub struct WasmHostResultFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<String>,
     pub rollback_candidate: bool,
+    /// Canonical explicit-divergence reason code, present exactly when the
+    /// sealed execution disagreed with its declared reference.
+    pub divergence_code: Option<String>,
+    /// Explicit leg-level divergence report, present exactly when the
+    /// sealed execution disagreed with its declared reference.
+    pub divergence: Option<DivergenceReport>,
 }
 
 fn disposition_text(disposition: eliot_wasm_runtime::InvocationDisposition) -> String {
@@ -677,6 +687,7 @@ fn usage_frames(result: &InvocationResult) -> (Option<u64>, Option<u64>, Option<
 
 /// Projects one classified invocation result onto the correlated frame.
 ///
+<<<<<<< HEAD
 /// The observed worker command fixes the frame's operation, phase, and
 /// worker-command identities: a Cancel outcome answers [`OP_CANCEL`] in the
 /// `contain` phase, a Reconcile outcome answers [`OP_RECONCILE`] in the
@@ -686,16 +697,25 @@ fn usage_frames(result: &InvocationResult) -> (Option<u64>, Option<u64>, Option<
 /// budget-omitted stay distinct. Sequence and terminal disposition are
 /// assigned by the loop when the frame joins the retained sequence, not
 /// here.
+=======
+/// The explicit divergence report travels separately from the typed error:
+/// the error keeps its stable classification while the report carries the
+/// leg-level evidence and the canonical divergence reason code.
+>>>>>>> 1858fd69 (fix: give the WASM conformance corpus and divergence reporting production consumers (#21))
 fn project_result(
     binding: &AdmittedBinding,
     engine: &EngineBinding,
     command: WorkerCommand,
     result: &InvocationResult,
+    divergence: Option<DivergenceReport>,
 ) -> WasmHostResultFrame {
     let (shadow, canary, rollback, cutover) = lifecycle_frame(evaluate_lifecycle_verdicts(result));
     let (trap, cancelled, drain, rollback_candidate) =
         seated_frame(evaluate_seated_verdicts(result));
     let (fuel_consumed, peak_memory_bytes, table_elements, epoch_ticks) = usage_frames(result);
+    let divergence_code = divergence
+        .as_ref()
+        .map(|_| DIVERGENCE_REASON_CODE.to_owned());
     WasmHostResultFrame {
         wire_id: WASM_HOST_RESULT_WIRE_ID,
         wire_version: WASM_HOST_RESULT_WIRE_VERSION,
@@ -741,6 +761,8 @@ fn project_result(
         cancelled,
         drain,
         rollback_candidate,
+        divergence_code,
+        divergence,
     }
 }
 
@@ -1007,6 +1029,8 @@ fn denial_frame(
         cancelled: false,
         drain: None,
         rollback_candidate: false,
+        divergence_code: None,
+        divergence: None,
     }
 }
 
@@ -2028,8 +2052,14 @@ fn command_phase(command: WorkerCommand) -> &'static str {
 struct WorkerOutcome {
     command: WorkerCommand,
     result: Result<InvocationResult, String>,
+<<<<<<< HEAD
     /// Whether this Shutdown request won the runner's P-11 request race.
     shutdown_request_won: Option<bool>,
+=======
+    /// Explicit divergence report, present exactly when the executed
+    /// outcome was a sealed differential mismatch.
+    divergence: Option<DivergenceReport>,
+>>>>>>> 1858fd69 (fix: give the WASM conformance corpus and divergence reporting production consumers (#21))
 }
 
 /// The tracked engine worker's channels and join handle.
@@ -2087,11 +2117,25 @@ fn spawn_worker(runtime: AdmittedRuntime, bound: usize) -> EngineWorker {
                     Err("SHUTDOWN".to_owned())
                 }
             };
+<<<<<<< HEAD
+=======
+            // Pure readback over the retained outcome: the report exists
+            // exactly when the executed outcome was a sealed differential
+            // mismatch, and costs one cache lookup otherwise.
+            let divergence = match (&result, attempt.as_ref()) {
+                (Ok(_), Some(pending)) => runner.divergence_report(&pending.invocation_id),
+                _ => None,
+            };
+>>>>>>> 1858fd69 (fix: give the WASM conformance corpus and divergence reporting production consumers (#21))
             if outcome_tx
                 .send(WorkerOutcome {
                     command,
                     result,
+<<<<<<< HEAD
                     shutdown_request_won,
+=======
+                    divergence,
+>>>>>>> 1858fd69 (fix: give the WASM conformance corpus and divergence reporting production consumers (#21))
                 })
                 .is_err()
             {
@@ -2383,6 +2427,7 @@ impl BoundedRequestLoop {
             self.shutdown_request_won = outcome.shutdown_request_won;
             return None;
         }
+<<<<<<< HEAD
         // The observed command fixes the frame's operation/phase identity:
         // a Cancel outcome answers `OP_CANCEL` in the `contain` phase, a
         // Reconcile outcome answers `OP_RECONCILE` in the `reconcile` phase.
@@ -2404,6 +2449,27 @@ impl BoundedRequestLoop {
                 Some(command),
                 code.as_str(),
             ),
+=======
+        let WorkerOutcome {
+            command: _,
+            result,
+            divergence,
+        } = outcome;
+        let frame = match result {
+            Ok(result) => {
+                let projected = project_result(&self.binding, &self.engine, &result, divergence);
+                enforce_frame_budget(projected, self.binding.max_output_bytes)
+            }
+            Err(code) => {
+                let field = if code == "NO_ATTEMPT" {
+                    "attempt-identity"
+                } else {
+                    "execution-refused"
+                };
+                let denial = denial_frame(&self.binding, OP_INVOKE, denied(field));
+                enforce_frame_budget(denial, self.binding.max_output_bytes)
+            }
+>>>>>>> 1858fd69 (fix: give the WASM conformance corpus and divergence reporting production consumers (#21))
         };
         frame.sequence = self.next_sequence;
         frame.observation_predecessors = self
