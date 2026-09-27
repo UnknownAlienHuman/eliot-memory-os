@@ -439,10 +439,7 @@ pub use wasm_runtime_port_grant::{
     HostBinaryFacts, KernelObservedGrantFacts, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
     WasmPortGrant, handle_wasm_port_grant, issue_wasm_port_grant, validate_wasm_port_grant,
 };
-pub use work_class_admission::{
-    AdmissionClass, AdmittedWork, CancellationState, ExecutionState, PoolLimit, SHEDDING_ORDER,
-    WorkAdmissionRefusal, WorkAdmissionRequest, WorkClassBudgets, WorkPoolBudget,
-};
+pub use work_class_admission::KernelWorkClassAdmission;
 
 #[cfg(all(test, windows))]
 use canonical_store_runtime::attach_then_retain_canonical_store;
@@ -675,7 +672,7 @@ pub struct KernelComposition {
     /// cancellation state. `None` only while the operator budget profile is
     /// absent, in which case the admission entrypoint refuses closed rather
     /// than admitting against a Kernel-invented bound.
-    work_class_admission: Option<WorkClassScheduler>,
+    work_class_admission: Option<KernelWorkClassAdmission>,
 }
 
 impl KernelComposition {

@@ -71,7 +71,7 @@ impl KernelComposition {
             return Err(WorkAdmissionRefusal::ProfileAbsent);
         };
         let now_unix_ms = crate::unix_ms();
-        let mut scheduler = scheduler
+        let scheduler = scheduler
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match scheduler.admit(class, request, now_unix_ms) {

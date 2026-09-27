@@ -1233,7 +1233,7 @@ impl AuditEventDraft {
     ) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.controller = Some("kernel".to_owned());
-        Self::fill(&mut lineage.work_item, request.work_id.as_str());
+        lineage.work_item = Some(request.work_id.clone());
         let (bound, bottleneck, disposition, work_outcome, shedding_order) = match refusal {
             eliot_kernel_core::WorkAdmissionRefusal::PoolExhausted {
                 limit,
