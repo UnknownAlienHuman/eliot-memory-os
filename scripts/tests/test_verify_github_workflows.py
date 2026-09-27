@@ -19,10 +19,40 @@ _spec.loader.exec_module(vgw)
 
 parse_workflow_events = vgw.parse_workflow_events
 check_workflows = vgw.check_workflows
+check_action_pin_divergence = vgw.check_action_pin_divergence
+collect_action_identities = vgw.collect_action_identities
 check_python_requirements = vgw.check_python_requirements
 check_nuget_lock = vgw.check_nuget_lock
 check_pip_install_lock = vgw.check_pip_install_lock
 verify_all = vgw.verify_all
+
+CHECKOUT_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
+CACHE_SHA = "1bd1e32a3bdc45362d1e726936510720a7c30a57"
+OTHER_SHA = "a" * 40
+# An otherwise conforming manual-dispatch workflow, so a rejection in an
+# action-identity test can only come from the action rule under test.
+GATE = (
+    "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n"
+    "    runs-on: ubuntu-latest\n    steps:\n      {body}\n"
+)
+
+
+def _write_workflow(root: Path, filename: str, text: str) -> None:
+    wf_dir = root / ".github" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    (wf_dir / filename).write_text(text, encoding="utf-8")
+
+
+def _step_uses(ref: str) -> str:
+    return GATE.format(body=f"- uses: {ref}")
+
+
+def _job_uses(ref: str) -> str:
+    # Job-level reusable workflow `uses:` carries no leading dash.
+    return (
+        "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\n"
+        "jobs:\n  t:\n    uses: " + ref + "\n"
+    )
 
 
 class TestVerifyGithubWorkflows(unittest.TestCase):
@@ -163,6 +193,128 @@ class TestVerifyGithubWorkflows(unittest.TestCase):
             )
             findings = check_pip_install_lock(root)
             self.assertEqual(findings, [])
+
+    def test_workflow_unapproved_action_owner_rejected(self) -> None:
+        # A syntactically valid full 40-hex SHA is not on its own an approved
+        # identity: the owner must be in the closed approved set.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "test.yml", _step_uses(f"evilcorp/checkout@{CHECKOUT_SHA}"))
+            findings = check_workflows(root)
+            self.assertTrue(any(f.code == "GWF-002" and "evilcorp" in f.detail for f in findings))
+
+    def test_workflow_approved_action_owner_full_sha_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "test.yml", _step_uses(f"actions/checkout@{CHECKOUT_SHA} # v4.2.2"))
+            self.assertEqual(check_workflows(root), [])
+
+    def test_workflow_reusable_workflow_uses_is_covered(self) -> None:
+        # Job-level `uses:` has no leading dash. The dash-optional ACTION_REF_RE
+        # is the only thing that parses it; a mutable ref here must fail.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "test.yml", _job_uses("actions/reusable/.github/workflows/x.yml@v1"))
+            findings = check_workflows(root)
+            self.assertTrue(any(f.code == "GWF-002" and "v1" in f.detail for f in findings))
+
+    def test_workflow_reusable_workflow_pinned_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "test.yml", _job_uses(f"actions/reusable/.github/workflows/x.yml@{CHECKOUT_SHA}"))
+            self.assertEqual(check_workflows(root), [])
+
+    def test_workflow_expression_ref_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "test.yml", _step_uses("actions/checkout@${{ env.ACTION_SHA }}"))
+            findings = check_workflows(root)
+            self.assertTrue(any(f.code == "GWF-002" for f in findings))
+
+    def test_workflow_reusable_expression_ref_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "test.yml", _job_uses("actions/reusable/.github/workflows/x.yml@${{ inputs.ref }}"))
+            self.assertTrue(any(f.code == "GWF-002" for f in check_workflows(root)))
+
+    def test_workflow_malformed_action_name_rejected(self) -> None:
+        # No owner segment: not an owner/repository identity at all.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "test.yml", _step_uses(f"checkout@{CHECKOUT_SHA}"))
+            findings = check_workflows(root)
+            self.assertTrue(any(f.code == "GWF-010" for f in findings))
+
+    def test_workflow_short_and_branch_refs_rejected(self) -> None:
+        for ref in ("actions/checkout@11bd7190", "actions/checkout@main", "actions/checkout@*"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                _write_workflow(root, "test.yml", _step_uses(ref))
+                self.assertTrue(
+                    any(f.code == "GWF-002" for f in check_workflows(root)), f"ref {ref} was accepted"
+                )
+
+    def test_divergent_action_pin_rejected(self) -> None:
+        # Same action, two different SHAs across two workflows: each reference
+        # is individually well-formed, so only the repository-level check fails.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "a.yml", _step_uses(f"actions/checkout@{CHECKOUT_SHA}"))
+            _write_workflow(root, "b.yml", _step_uses(f"actions/checkout@{OTHER_SHA}"))
+            findings = check_action_pin_divergence(root)
+            self.assertTrue(any(f.code == "GWF-011" for f in findings))
+
+    def test_divergence_included_in_verify_all(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "a.yml", _step_uses(f"actions/checkout@{CHECKOUT_SHA}"))
+            _write_workflow(root, "b.yml", _step_uses(f"actions/checkout@{OTHER_SHA}"))
+            self.assertTrue(any(f.code == "GWF-011" for f in verify_all(root)))
+
+    def test_consistent_action_pin_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "a.yml", _step_uses(f"actions/checkout@{CHECKOUT_SHA}"))
+            _write_workflow(root, "b.yml", _step_uses(f"actions/checkout@{CHECKOUT_SHA} # v4.2.2"))
+            self.assertEqual(check_action_pin_divergence(root), [])
+
+    def test_collected_action_identities_are_derived_and_sorted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_workflow(root, "b.yml", _step_uses(f"actions/cache@{CACHE_SHA} # v4.2.0"))
+            _write_workflow(
+                root,
+                "a.yml",
+                _step_uses(f"actions/checkout@{CHECKOUT_SHA} # v4.2.2")
+                + _job_uses(f"actions/reusable/.github/workflows/x.yml@{OTHER_SHA}"),
+            )
+            identities = collect_action_identities(root)
+            self.assertEqual(
+                [(i["workflow"], i["action"], i["ref"]) for i in identities],
+                [
+                    (".github/workflows/a.yml", "actions/checkout", CHECKOUT_SHA),
+                    (".github/workflows/a.yml", "actions/reusable/.github/workflows/x.yml", OTHER_SHA),
+                    (".github/workflows/b.yml", "actions/cache", CACHE_SHA),
+                ],
+            )
+            # Deterministic: a second derivation of the same tree is identical.
+            self.assertEqual(collect_action_identities(root), identities)
+
+    def test_repository_action_identities_are_fully_covered(self) -> None:
+        # Every live third-party `uses:` in this repository must be recorded,
+        # including the job-scope (no dash) `uses:` form, and all on one SHA per
+        # action. This is the complete-coverage property, not a fixture example.
+        repo_root = Path(__file__).resolve().parents[2]
+        identities = collect_action_identities(repo_root)
+        refs_by_action: dict[str, set[str]] = {}
+        for record in identities:
+            refs_by_action.setdefault(record["action"], set()).add(record["ref"])
+        self.assertEqual(len(identities), 12)
+        self.assertEqual(set(refs_by_action), {"actions/checkout", "actions/cache"})
+        for action, refs in refs_by_action.items():
+            self.assertEqual(len(refs), 1, f"{action} has divergent refs {refs}")
+        for record in identities:
+            self.assertRegex(record["ref"], r"^[0-9a-fA-F]{40}$")
 
     def test_current_repository_passes(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
