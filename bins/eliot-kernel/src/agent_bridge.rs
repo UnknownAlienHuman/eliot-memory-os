@@ -847,6 +847,11 @@ impl KernelComposition {
     ) -> Result<Option<AgentActivationResolutionTicket>, TransportError> {
         observe_bridge("kernel.bridge_activation_claim", "attempt");
         let _transition = self.agent_bridge_transition_read()?;
+        // I1.11 step 10 (issue #1892 W5): this is the release point for every
+        // queued attach, and the ordered startup gate is applied by its single
+        // caller immediately above this function, so no queued ticket can be
+        // consumed, ordered, or leased while the gate is closed. Reaching here
+        // therefore already means the gate reported front-door readiness.
         let mut pending = self
             .agent_activation_pending
             .lock()

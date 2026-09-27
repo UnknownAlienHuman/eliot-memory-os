@@ -585,6 +585,38 @@ impl StartupCoordinator {
         Ok(())
     }
 
+    /// Queued-attach release admission (I1.11 step 10: "Kernel publishes
+    /// front-door readiness and releases queued attaches").
+    ///
+    /// The attach queue holds requests that arrived before the ordered startup
+    /// cursor reached step 10. Releasing one is exactly the front-door
+    /// publication, so the decision reads the same
+    /// [`Self::is_front_door_ready`] field [`Self::startup_status`] publishes as
+    /// `front_door_ready` — there is no second readiness fact, no latched
+    /// queue-side copy, and no independent queue check that could drift from
+    /// the ordered gate. Step 10 is only reachable through the contiguous I1.11
+    /// cursor, so reaching it also proves steps 1-9 (including required
+    /// capability evaluation) completed.
+    ///
+    /// The refusal reuses the existing [`StartupRejection`] and the existing
+    /// [`StartupPrerequisite`] vocabulary unchanged: while step 10 is
+    /// unreached, `blocking_prerequisite()` already names the first incomplete
+    /// mandatory gate, and a refusal is never reported as success.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] naming the unmet
+    /// prerequisite.
+    pub(crate) fn admit_queued_attach_release(&self) -> Result<(), StartupRejection> {
+        if self.is_front_door_ready() {
+            return Ok(());
+        }
+        let gate = self
+            .blocking_prerequisite()
+            .unwrap_or(StartupPrerequisite::OrsReconciliation);
+        Err(StartupRejection::new(gate, "queued attach release"))
+    }
+
     /// Material/Critical authority admission for one Governance Profile.
     /// Rejects with the named unmet startup prerequisite first; once startup
     /// is complete the profile ceiling alone decides.

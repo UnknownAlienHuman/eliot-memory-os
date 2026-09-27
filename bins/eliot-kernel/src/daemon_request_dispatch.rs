@@ -2206,17 +2206,40 @@ impl KernelComposition {
                     claim
                         .validate()
                         .map_err(|_| TransportError::SessionFenced)?;
-                    self.claim_agent_activation_ticket(
-                        &claim.dependency_ref,
-                        &claim.dependency_revision,
-                    )
-                    .map(|ticket| {
-                        serde_json::json!({
-                            "status": "known",
-                            "value": { "ticket": ticket },
-                            "recovery": null,
-                        })
-                    })
+                    // I1.11 step 10 (issue #1892 W5): the ordered startup
+                    // gate owns the queued-attach release. A claim made before
+                    // the gate reports front-door readiness is refused with the
+                    // named unmet startup prerequisite, mirroring the
+                    // normal-write refusal shape, so no queued ticket is
+                    // consumed, ordered, or leased and the claimant simply
+                    // re-observes readiness on its next poll. This is the only
+                    // place the gate is applied on the release path; a claim
+                    // failure inside the open gate still fences exactly as
+                    // before, so the closed gate adds no new refusal path.
+                    match self.admit_queued_attach_release() {
+                        Ok(()) => self
+                            .claim_agent_activation_ticket(
+                                &claim.dependency_ref,
+                                &claim.dependency_revision,
+                            )
+                            .map(|ticket| {
+                                serde_json::json!({
+                                    "status": "known",
+                                    "value": { "ticket": ticket },
+                                    "recovery": null,
+                                })
+                            }),
+                        Err(rejection) => {
+                            observe_daemon_request(
+                                "kernel.daemon_queued_attach_release",
+                                "startup_gate_closed",
+                            );
+                            Ok(Self::queued_attach_release_gate_response(
+                                self,
+                                &rejection.to_string(),
+                            ))
+                        }
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -7777,6 +7800,32 @@ impl KernelComposition {
                 "message": error.to_string(),
             },
         }))
+    }
+
+    /// Returns the typed refusal when the ordered startup gate has not yet
+    /// reported front-door readiness, so a queued attach is not released
+    /// (I1.11 step 10, issue #1892 W5).
+    ///
+    /// Implements #1892 A3: the named unmet startup prerequisite travels in
+    /// `recovery` exactly as the normal-write and Material-authority refusals
+    /// report it, and is read from the production [`Self::startup_status`]
+    /// surface rather than from a second readiness source. `status` and
+    /// `value.kind` keep the existing `agent_activation_claim` response shape,
+    /// so a polling daemon parses it unchanged and re-observes readiness on its
+    /// next poll instead of learning that a queued ticket was consumed.
+    fn queued_attach_release_gate_response(&self, message: &str) -> serde_json::Value {
+        let status = self.startup_status(GovernanceProfile::minimal());
+        let prerequisite = status
+            .blocking_prerequisite
+            .unwrap_or("front-door-readiness");
+        serde_json::json!({
+            "status": "error",
+            "value": { "kind": "agent_activation_claim", "value": null },
+            "recovery": {
+                "prerequisite": prerequisite,
+                "message": message,
+            },
+        })
     }
 
     /// Returns the typed rejection when startup or the Governance Profile
