@@ -408,6 +408,8 @@ pub enum LearningClosureError {
     Malformed { detail: String },
     #[error("closure candidates never carry promotion output")]
     PromotionOutputForbidden,
+    #[error("a separate authorized owner receipt is required for SCOPED_UPDATE_PROMOTED")]
+    PromotionReceiptRequired,
 }
 
 /// Assemble one evidence-bound closure candidate.
@@ -1922,9 +1924,9 @@ fn evidence_refs_digest(refs: &ClosureEvidenceRefs) -> String {
 ///
 /// Every field is private, so the record is built only by
 /// [`assemble_campaign_learning_closure_with_evidence`] and read only through
-/// accessors: the eighteen evidence groups and the digest binding cannot be
-/// substituted by field assignment. The record is still deserializable, so a
-/// value read back from storage MUST be checked with
+/// accessors: the typed disposition, eighteen evidence groups and their digest
+/// binding cannot be substituted by field assignment. The record is still
+/// deserializable, so a value read back from storage MUST be checked with
 /// [`CampaignLearningClosure::verify_integrity`], which recomputes the evidence
 /// and record digests from the record's own contents and refuses any mismatch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1933,6 +1935,7 @@ pub struct CampaignLearningClosure {
     task_id: String,
     state_fence_ref: String,
     candidate: Box<CampaignLearningClosureCandidate>,
+    disposition: ClosureDisposition,
     evidence: ClosureEvidenceRefs,
     evidence_digest: String,
     digest: String,
@@ -1969,6 +1972,11 @@ impl CampaignLearningClosure {
         &self.candidate
     }
 
+    /// The explicit disposition that closes this episode, read-only.
+    pub fn disposition(&self) -> &ClosureDisposition {
+        &self.disposition
+    }
+
     /// The canonical evidence references this closure stores, read-only.
     pub fn evidence(&self) -> &ClosureEvidenceRefs {
         &self.evidence
@@ -1979,7 +1987,8 @@ impl CampaignLearningClosure {
         &self.evidence_digest
     }
 
-    /// Fingerprint over the candidate, the task/fence binding and the evidence.
+    /// Fingerprint over the candidate, task/fence binding, disposition and
+    /// evidence.
     pub fn digest(&self) -> &str {
         &self.digest
     }
@@ -1989,14 +1998,19 @@ impl CampaignLearningClosure {
     /// This is the readback gate that makes the stored digests load-bearing
     /// rather than decorative. An empty evidence group is refused with
     /// [`LearningClosureError::IncompleteCanonicalEvidence`], naming every one
-    /// of them; a tampered evidence digest, record digest, id, task binding or
-    /// fence binding is refused with
-    /// [`LearningClosureError::IntegrityMismatch`].
+    /// of them; `SCOPED_UPDATE_PROMOTED` is refused with
+    /// [`LearningClosureError::PromotionReceiptRequired`] because this record
+    /// cannot bind its separate owner receipt. A tampered accepted disposition,
+    /// evidence digest, record digest, id, task binding or fence binding is
+    /// refused with [`LearningClosureError::IntegrityMismatch`].
     ///
     /// The bound candidate's own `digest` is recorded, not recomputed here:
     /// re-deriving it needs the four evidence inputs, the prior history and
     /// the policy, which this record does not store.
     pub fn verify_integrity(&self) -> Result<(), LearningClosureError> {
+        if self.disposition == ClosureDisposition::ScopedUpdatePromoted {
+            return Err(LearningClosureError::PromotionReceiptRequired);
+        }
         let groups = evidence_refs_complete(&self.evidence);
         if !groups.is_empty() {
             return Err(LearningClosureError::IncompleteCanonicalEvidence { groups });
@@ -2011,6 +2025,7 @@ impl CampaignLearningClosure {
             &self.candidate,
             &self.task_id,
             &self.state_fence_ref,
+            self.disposition,
             &evidence_digest,
         );
         if digest != self.digest {
@@ -2040,11 +2055,20 @@ pub enum ClosureRecordAssembly {
     Disposition(LearningClosureDisposition),
 }
 
+/// Caller-supplied closure decision and its canonical evidence references.
+pub struct ClosureCompletion {
+    pub disposition: ClosureDisposition,
+    pub canonical_evidence_refs: ClosureEvidenceRefs,
+}
+
 /// Assemble the durable closure record with the canonical evidence it stores.
 ///
 /// The same six typed evidence inputs and the same pure decision core as
 /// [`assemble_campaign_learning_closure`], plus the canonical evidence reference
-/// groups the closure is required to store. This entry REFUSES to produce a
+/// groups the closure is required to store and exactly one typed disposition,
+/// supplied together as [`ClosureCompletion`].
+/// `ScopedUpdatePromoted` is refused until the record can bind the separate
+/// authorized owner receipt it requires. This entry refuses to produce a
 /// closure whose evidence is incomplete: every empty group is named in
 /// [`LearningClosureError::IncompleteCanonicalEvidence`] instead of being
 /// dropped, because an unnamed empty group hides lost learning exactly as
@@ -2060,8 +2084,15 @@ pub fn assemble_campaign_learning_closure_with_evidence(
     exact_outcome_harm_and_economics_evidence: OutcomeHarmAndEconomicsEvidence,
     prior_closure_history: PriorClosureHistory,
     closure_policy: ClosurePolicy,
-    canonical_evidence_refs: ClosureEvidenceRefs,
+    completion: ClosureCompletion,
 ) -> Result<ClosureRecordAssembly, LearningClosureError> {
+    let ClosureCompletion {
+        disposition,
+        canonical_evidence_refs,
+    } = completion;
+    if disposition == ClosureDisposition::ScopedUpdatePromoted {
+        return Err(LearningClosureError::PromotionReceiptRequired);
+    }
     let missing_groups = evidence_refs_complete(&canonical_evidence_refs);
     if !missing_groups.is_empty() {
         return Err(LearningClosureError::IncompleteCanonicalEvidence {
@@ -2084,13 +2115,20 @@ pub fn assemble_campaign_learning_closure_with_evidence(
         ClosureAssembly::Candidate(candidate) => candidate,
     };
     let evidence_digest = evidence_refs_digest(&canonical_evidence_refs);
-    let digest = closure_record_digest(&candidate, &task_id, &state_fence_ref, &evidence_digest);
+    let digest = closure_record_digest(
+        &candidate,
+        &task_id,
+        &state_fence_ref,
+        disposition,
+        &evidence_digest,
+    );
     Ok(ClosureRecordAssembly::Closed(Box::new(
         CampaignLearningClosure {
             closure_id: closure_record_id(&candidate.campaign_id, &digest),
             task_id,
             state_fence_ref,
             candidate,
+            disposition,
             evidence: canonical_evidence_refs,
             evidence_digest,
             digest,
@@ -2100,12 +2138,14 @@ pub fn assemble_campaign_learning_closure_with_evidence(
 
 /// Full closure-record digest: the candidate digest (already bound to the four
 /// evidence inputs, prior history and policy), the task and State Fence
-/// binding, and the stored canonical evidence references. Removing or changing
-/// any load-bearing group, ref, task or fence changes it.
+/// binding, the explicit disposition, and the stored canonical evidence
+/// references. Removing or changing any load-bearing group, ref, task, fence or
+/// disposition changes it.
 fn closure_record_digest(
     candidate: &CampaignLearningClosureCandidate,
     task_id: &str,
     state_fence_ref: &str,
+    disposition: ClosureDisposition,
     evidence_digest: &str,
 ) -> String {
     let mut hasher = Hasher::new();
@@ -2115,6 +2155,7 @@ fn closure_record_digest(
     field(&mut hasher, &candidate.digest);
     field(&mut hasher, task_id);
     field(&mut hasher, state_fence_ref);
+    field(&mut hasher, disposition.as_str());
     field(&mut hasher, evidence_digest);
     hasher.finalize().to_hex().to_string()
 }
