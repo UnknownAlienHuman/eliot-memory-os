@@ -1082,3 +1082,72 @@ impl PhysicalRouteObservationReceipt {
         }
     }
 }
+
+/// Typed role of one model attempt at the model-neutral domain boundary
+/// (issue #1832, I10.11). Every outbound provider call carries exactly one
+/// of these roles; free-text-only role encoding is rejected by the schema.
+///
+/// The role is a property of the attempt, not of the model or the route: a
+/// fallback call is a new [`ModelAttemptRole::Fallback`] attempt, never a
+/// silent continuation of the original attempt under a different route.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ModelAttemptRole {
+    /// Classify a candidate, route, or policy decision.
+    Classifier,
+    /// Judge or score a candidate against a rubric.
+    Judge,
+    /// Produce the primary answer for the current task step.
+    Answer,
+    /// Retry a failed or timed-out attempt under the same logical decision.
+    Retry,
+    /// Fallback to an alternative route after a primary-route failure.
+    Fallback,
+    /// Audit or verify a completed result.
+    Audit,
+    /// Count tokens for a request or response.
+    TokenCount,
+    /// Shadow-run a route without producing a user-visible effect.
+    Shadow,
+}
+
+impl ModelAttemptRole {
+    /// Reports whether this role may produce a user-visible effect.
+    #[must_use]
+    pub const fn is_material(self) -> bool {
+        !matches!(self, Self::TokenCount | Self::Shadow)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelAttemptRole;
+
+    #[test]
+    fn model_attempt_role_round_trips_through_schema() {
+        for role in [
+            ModelAttemptRole::Classifier,
+            ModelAttemptRole::Judge,
+            ModelAttemptRole::Answer,
+            ModelAttemptRole::Retry,
+            ModelAttemptRole::Fallback,
+            ModelAttemptRole::Audit,
+            ModelAttemptRole::TokenCount,
+            ModelAttemptRole::Shadow,
+        ] {
+            let json = serde_json::to_string(&role).expect("role serializes");
+            let decoded: ModelAttemptRole = serde_json::from_str(&json).expect("role deserializes");
+            assert_eq!(role, decoded);
+        }
+    }
+
+    #[test]
+    fn non_material_roles_are_not_material() {
+        assert!(!ModelAttemptRole::TokenCount.is_material());
+        assert!(!ModelAttemptRole::Shadow.is_material());
+        assert!(ModelAttemptRole::Answer.is_material());
+        assert!(ModelAttemptRole::Fallback.is_material());
+    }
+}
