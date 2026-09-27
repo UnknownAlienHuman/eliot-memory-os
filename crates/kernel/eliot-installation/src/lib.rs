@@ -6870,7 +6870,10 @@ fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> Port
             eliot_platform_windows::WindowsAdapterError::IdentityMismatch
             | eliot_platform_windows::WindowsAdapterError::AclMismatch
             | eliot_platform_windows::WindowsAdapterError::AlreadyExists
-            | eliot_platform_windows::WindowsAdapterError::Failed => ProviderErrorCode::Failed,
+            | eliot_platform_windows::WindowsAdapterError::Failed
+            | eliot_platform_windows::WindowsAdapterError::RevertToSelf { .. } => {
+                ProviderErrorCode::Failed
+            }
             eliot_platform_windows::WindowsAdapterError::NotFound
             | eliot_platform_windows::WindowsAdapterError::Unavailable => {
                 ProviderErrorCode::Unavailable
