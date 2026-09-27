@@ -3780,8 +3780,8 @@ impl KernelComposition {
                     // payload handoff before the acknowledgement below.
                     // Digest-only submits keep the legacy shape untouched.
                     let observe_tool = payload.get("tool").cloned();
-                    let (receipt, record) = self
-                        .admit_and_queue_observe_submit(envelope, observe_tool.as_ref())?;
+                    let (receipt, record) =
+                        self.admit_and_queue_observe_submit(envelope, observe_tool.as_ref())?;
                     host_request_admitted_response(&receipt, &record)
                 }
                 AGENT_HOST_REQUEST_CANCEL_OPERATION => {
