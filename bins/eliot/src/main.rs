@@ -437,9 +437,9 @@ enum InstallationCommand {
         #[arg(long, value_parser = absolute_path)]
         payload: PathBuf,
         /// Optional exact path of an executable the operator declares running;
-        /// staging fails closed on collision. This is an independent fact from
-        /// the `running_target` observation, which is recorded from a live
-        /// Windows process snapshot and is not derived from this flag.
+        /// staging fails closed on collision, and its basename is additionally
+        /// covered by the `running_target` live snapshot search when it
+        /// differs from the staged executable name.
         #[arg(long, value_parser = absolute_path)]
         running_exe: Option<PathBuf>,
         /// Optional previous versioned directory recorded for module rollback.
