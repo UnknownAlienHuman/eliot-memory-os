@@ -275,33 +275,129 @@ fn decode_record_row(
     })
 }
 
-/// Reads learning rows for the current query in key order.
+/// One bounded page of the current-fence learning eligible set.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LearningReadPage {
+    /// Eligible rows past the skip window, never more than the page limit.
+    pub records: Vec<StoredLearningRecord>,
+    /// True only when a further eligible row exists beyond `records`;
+    /// the eligible set was traversed until it ended, never truncated
+    /// by an unexamined suffix.
+    pub more: bool,
+}
+
+/// Reads the eligible learning rows for the current query in key order.
 ///
-/// Rows are scope-gated in the query; the optional kind filter narrows
-/// to one closed record kind. The admission fence is arbitrated by the
-/// caller in Rust, mirroring the experience reads.
+/// The complete scope / kind / fence predicate is applied IN THE QUERY,
+/// before `ORDER BY` and `LIMIT`, so the page limit bounds eligible rows
+/// and a current-fence row is never hidden behind an other-fence prefix.
+/// The fence binds as the same `state_fence` value the canonical
+/// transaction compares against, so the predicate is exact.
+///
+/// `skip` counts eligible rows already consumed by earlier pages. It is
+/// served by keyset continuation: each round fetches at most
+/// `limit + 1` eligible rows after the last row actually returned, so a
+/// continuation never re-materializes the consumed prefix. The scan ends
+/// only when a round returns no further eligible row, so an empty page is
+/// an authoritative empty eligible set, not an unexamined suffix.
 pub(crate) async fn read_learning_for_read(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
     scope_id: &str,
     kind_filter: Option<&str>,
+    fence: &StateFence,
+    skip: u64,
+    limit: usize,
+) -> Result<LearningReadPage, AdapterError> {
+    let probe = limit.saturating_add(1);
+    let mut remaining_skip = skip;
+    let mut records: Vec<StoredLearningRecord> = Vec::new();
+    let mut after: Option<(String, String, String)> = None;
+    loop {
+        let rows = read_learning_page(
+            db,
+            config,
+            scope_id,
+            kind_filter,
+            fence,
+            after.as_ref(),
+            probe,
+        )
+        .await?;
+        let Some(last) = rows.last() else {
+            return Ok(LearningReadPage {
+                records,
+                more: false,
+            });
+        };
+        let last_key = (
+            last.record_kind.clone(),
+            last.handle.clone(),
+            last.record_digest.clone(),
+        );
+        let row_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        if remaining_skip >= row_count {
+            remaining_skip -= row_count;
+            after = Some(last_key);
+            continue;
+        }
+        let skipped = usize::try_from(remaining_skip).unwrap_or(usize::MAX);
+        remaining_skip = 0;
+        let mut eligible = rows;
+        eligible.drain(..skipped);
+        let room = limit.saturating_sub(records.len());
+        if eligible.len() > room {
+            eligible.truncate(room);
+            records.extend(eligible);
+            return Ok(LearningReadPage {
+                records,
+                more: true,
+            });
+        }
+        records.extend(eligible);
+        after = Some(last_key);
+    }
+}
+
+/// Reads one bounded keyset page of eligible learning rows in key order.
+///
+/// The whole predicate travels bound: scope, optional kind, the exact
+/// admission fence, and the optional exclusive key of the last row the
+/// previous round returned. The row key is the same joined address the
+/// write path creates, so keyset order is total and stable.
+async fn read_learning_page(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    scope_id: &str,
+    kind_filter: Option<&str>,
+    fence: &StateFence,
+    after: Option<&(String, String, String)>,
     limit: usize,
 ) -> Result<Vec<StoredLearningRecord>, AdapterError> {
-    let sql = if kind_filter.is_some() {
-        format!(
-            "SELECT * FROM {} WHERE scope_id = $learning_scope AND record_kind = $learning_kind ORDER BY record_kind, handle, record_digest LIMIT {limit};",
-            schema::table::LEARNING_RECORD
-        )
-    } else {
-        format!(
-            "SELECT * FROM {} WHERE scope_id = $learning_scope ORDER BY record_kind, handle, record_digest LIMIT {limit};",
-            schema::table::LEARNING_RECORD
-        )
-    };
+    let mut predicate =
+        String::from("scope_id = $learning_scope AND state_fence = $learning_fence");
+    if kind_filter.is_some() {
+        predicate.push_str(" AND record_kind = $learning_kind");
+    }
+    if after.is_some() {
+        predicate.push_str(
+            " AND (record_kind > $learning_after_kind OR (record_kind = $learning_after_kind AND (handle > $learning_after_handle OR (handle = $learning_after_handle AND record_digest > $learning_after_digest))))",
+        );
+    }
+    let sql = format!(
+        "SELECT * FROM {} WHERE {predicate} ORDER BY record_kind, handle, record_digest LIMIT {limit};",
+        schema::table::LEARNING_RECORD
+    );
     let mut bindings = Map::new();
     bindings.insert("learning_scope".to_owned(), json!(scope_id));
+    bindings.insert("learning_fence".to_owned(), json!(fence));
     if let Some(kind) = kind_filter {
         bindings.insert("learning_kind".to_owned(), json!(kind));
+    }
+    if let Some((record_kind, handle, record_digest)) = after {
+        bindings.insert("learning_after_kind".to_owned(), json!(record_kind));
+        bindings.insert("learning_after_handle".to_owned(), json!(handle));
+        bindings.insert("learning_after_digest".to_owned(), json!(record_digest));
     }
     let mut response = client::query(db, config, "learning.read_records", &sql, bindings).await?;
     let errors = response.take_errors();
