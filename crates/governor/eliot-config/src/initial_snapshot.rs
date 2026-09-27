@@ -586,31 +586,31 @@ impl VerifiedInitialConfigSnapshot {
 
     /// Returns the authenticated canonical envelope digest.
     #[must_use]
-    pub const fn envelope_digest(&self) -> &str {
+    pub fn envelope_digest(&self) -> &str {
         &self.envelope_sha256
     }
 
     /// Returns the authenticated signer identity.
     #[must_use]
-    pub const fn signer_id(&self) -> &str {
+    pub fn signer_id(&self) -> &str {
         &self.signer_id
     }
 
     /// Returns the authenticated external key reference.
     #[must_use]
-    pub const fn key_id(&self) -> &str {
+    pub fn key_id(&self) -> &str {
         &self.key_id
     }
 
     /// Returns the authenticated public-key fingerprint.
     #[must_use]
-    pub const fn public_key_fingerprint(&self) -> &str {
+    pub fn public_key_fingerprint(&self) -> &str {
         &self.public_key_fingerprint
     }
 
     /// Returns the authenticated detached signature.
     #[must_use]
-    pub const fn signature(&self) -> &str {
+    pub fn signature(&self) -> &str {
         &self.signature
     }
 }
