@@ -96,11 +96,11 @@ use eliot_workscope::{
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingSingleFlight,
-    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
-    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
-    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
+    OnboardingSingleFlight, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
+    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
+    ResolutionRequest, ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
@@ -853,6 +853,17 @@ pub enum CompositionError {
     /// Durable recovery did not prove the complete owner set.
     #[error("Governor recovery failed: {0}")]
     Recovery(String),
+    /// Material readiness denied one effect with its exact receipt, directive,
+    /// and missing-input details preserved for the caller.
+    #[error(
+        "material readiness denied {effect:?} for receipt {receipt_ref}: {directive:?}; missing inputs: {missing_inputs:?}"
+    )]
+    MaterialReadinessDenied {
+        receipt_ref: String,
+        effect: RequestedEffect,
+        directive: MaterialReadinessDirective,
+        missing_inputs: Vec<String>,
+    },
     /// A scope-sensitive operation failed its observed `WorkScope` guard; the
     /// structured report preserves the exact identity legs and receipt.
     #[error(
@@ -5562,9 +5573,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// An admission is then bound to the retained authenticated instance:
     /// the presented receipt must name exactly the live `WorkScope` binding
     /// read at the retained fence. Without a retained binding there is no
-    /// authenticated instance to bind, so the write fails closed. A denial
-    /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
-    /// the typed directive token; nothing is committed on any failure.
+    /// authenticated instance to bind, so the write fails closed. A malformed
+    /// bundle fails as [`CompositionError::Recovery`]. A typed denial is
+    /// returned as [`CompositionError::MaterialReadinessDenied`] with its
+    /// receipt, requested effect, directive, and exact missing inputs; nothing
+    /// is committed on any failure.
     pub fn check_material_readiness_for_write(
         &self,
         readiness: &MaterialReadinessInputs<'_>,
@@ -5605,14 +5618,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         match self.check_material_readiness_for_write(readiness, observed, sources, privacy)? {
             MaterialAdmission::Admitted { .. } => self.commit_canonical(identity, envelope).await,
             MaterialAdmission::Denied {
+                receipt_ref,
+                effect,
                 directive,
                 missing_inputs,
-                ..
-            } => Err(CompositionError::Recovery(format!(
-                "material readiness denies canonical write: {}; missing: {}",
-                directive.kind_str(),
-                missing_inputs.join(",")
-            ))),
+            } => Err(CompositionError::MaterialReadinessDenied {
+                receipt_ref,
+                effect,
+                directive,
+                missing_inputs,
+            }),
         }
     }
 
