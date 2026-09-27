@@ -51,6 +51,7 @@ use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
 mod controlboard_status;
+mod dev_crate_check;
 mod first_run_flow;
 mod plugin_preview;
 mod release_surface;
@@ -155,6 +156,11 @@ enum Command {
     Scope {
         #[command(subcommand)]
         command: scope_observe::ScopeCommand,
+    },
+    /// Per-crate Instrument Plane verification surfaces (#1913).
+    Dev {
+        #[command(subcommand)]
+        command: dev_crate_check::DevCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -751,6 +757,7 @@ fn run() -> Result<i32> {
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Backup { command } => backup_entry::run_backup(command),
         Command::Scope { command } => Ok(run_scope(command)),
+        Command::Dev { command } => Ok(run_dev(command)),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -1174,6 +1181,19 @@ fn run_scope(command: scope_observe::ScopeCommand) -> i32 {
                 error.exit_code()
             }
         },
+    }
+}
+
+fn run_dev(command: dev_crate_check::DevCommand) -> i32 {
+    match dev_crate_check::run(command) {
+        Ok(value) => {
+            println!("{value}");
+            0
+        }
+        Err(error) => {
+            println!("{}", error.envelope());
+            error.exit_code()
+        }
     }
 }
 
