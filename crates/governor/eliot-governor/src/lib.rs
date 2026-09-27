@@ -37,6 +37,7 @@ mod campaign_source_publishers;
 mod campaign_task_sources;
 mod canonical_projections;
 mod capability_evidence;
+pub mod capability_registry;
 mod composition;
 mod context_inputs;
 mod cue_composition;

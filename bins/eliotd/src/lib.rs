@@ -176,6 +176,10 @@ pub use dreamer_model_adapter::{
     DAEMON_GENERATION_PROJECTION_OPERATION, DreamerModelExecution, GovernedDreamerModelAdapter,
     KernelGenerationProjection, ModelInvokeInput, query_kernel_generation,
 };
+pub use eliot_governor::capability_registry::{
+    CapabilityAdmission, CapabilityProjection, CapabilityProjectionInput, CapabilityRegistry,
+    CapabilityRegistryError, PolicySupervisionInput,
+};
 pub use experience_runtime::{
     CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
     ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,

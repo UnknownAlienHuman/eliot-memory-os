@@ -1,9 +1,14 @@
-//! Governor-owned Module Catalog contracts.
+//! Governor-owned Module Catalog contracts (I1.9 Module Catalog).
 //!
-//! The catalog owns desired semantic configuration and admission intent. It
-//! does not own PIDs, pipes, Job Objects, process health, route cutover, or
-//! Kernel operational recovery state. A generation admission is an immutable
-//! handoff to the Kernel Generation Registry; it is not activation authority.
+//! The catalog owns desired semantic configuration and admission intent: the
+//! desired module manifests, the semantically admitted/allowed versions, the
+//! dependencies, the capability intent, the policy and the removal boundary.
+//! It does not own PIDs, pipes, Job Objects, uncommitted health, host artifact
+//! approval, route cutover, or Kernel operational recovery state — the type
+//! carries only hashes, references and declared intent, so none of those
+//! operational values can be recorded here. A generation admission is an
+//! immutable handoff to the Kernel Generation Registry; it is not activation
+//! authority.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]

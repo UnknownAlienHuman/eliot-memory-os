@@ -13,6 +13,7 @@ mod cutover_ownership;
 mod doctor;
 mod effect_operation_lease;
 mod execution_manifest;
+mod generation_registry;
 mod model;
 mod process_stream_recovery;
 mod reservation_model;
@@ -62,6 +63,10 @@ pub use execution_manifest::{
     KernelRestartEvidence, KernelServiceAdmission, ManifestDependencyEntry, ManifestEffectCeiling,
     ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
     RevocationAcknowledgement, verify_kernel_execution_restart,
+};
+pub use generation_registry::{
+    GenerationDrainState, GenerationOperationalState, GenerationProcessHandles, GenerationRegistry,
+    GenerationRegistryRecord, GenerationRouteState,
 };
 pub use model::ProviderCapabilityLookup;
 pub use model::*;

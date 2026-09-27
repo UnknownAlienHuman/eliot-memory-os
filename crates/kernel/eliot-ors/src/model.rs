@@ -3435,6 +3435,8 @@ pub enum OrsError {
     DuplicateConflict,
     #[error("reservation was not found")]
     ReservationNotFound,
+    #[error("generation registry record was not found")]
+    GenerationRegistryRecordNotFound,
     #[error("reservation lifecycle transition is invalid")]
     InvalidTransition,
     #[error("writer epoch is stale or does not own the reservation")]
