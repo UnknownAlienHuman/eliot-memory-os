@@ -4504,11 +4504,8 @@ impl RedbRecoveryStore {
             .open_table(HOST_REQUEST_LOGICAL_KEYS)
             .map_err(storage)?;
         for occurrence in Self::legacy_host_request_occurrences(record) {
-            let presence_key = Self::host_request_legacy_presence_key(
-                record.kind,
-                session.as_str(),
-                &occurrence,
-            );
+            let presence_key =
+                Self::host_request_legacy_presence_key(record.kind, session.as_str(), &occurrence);
             if let Some(value) = links.get(presence_key.as_str()).map_err(storage)? {
                 let presence: HostRequestLegacyPresence = decode(value.value())?;
                 if presence.kind != record.kind
