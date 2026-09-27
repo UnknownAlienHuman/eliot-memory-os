@@ -430,7 +430,9 @@ enum InstallationCommand {
         /// Absolute payload executable file staged into the versioned directory.
         #[arg(long, value_parser = absolute_path)]
         payload: PathBuf,
-        /// Optional running executable; staging fails closed on collision.
+        /// Optional exact path of an executable the operator declares running;
+        /// staging fails closed on collision. The running state itself is
+        /// observed from a live process snapshot, not taken from this flag.
         #[arg(long, value_parser = absolute_path)]
         running_exe: Option<PathBuf>,
         /// Optional previous versioned directory recorded for module rollback.
@@ -2102,6 +2104,9 @@ fn update_installer_error_code(error: &update_installer::UpdateInstallerError) -
         update_installer::UpdateInstallerError::RunningBinaryWouldBeOverwritten { .. } => {
             "INSTALLATION_UPDATE_RUNNING_GUARD"
         }
+        update_installer::UpdateInstallerError::RunningObservationFailed { .. } => {
+            "INSTALLATION_UPDATE_RUNNING_OBSERVATION_FAILED"
+        }
         update_installer::UpdateInstallerError::VersionedDirExists { .. } => {
             "INSTALLATION_UPDATE_VERSION_EXISTS"
         }
@@ -2210,6 +2215,7 @@ fn run_installation_stage_update(
             "release_approval_required": record.kind.requires_release_approval(),
             "installed_dir": record.installed_dir,
             "executable": record.executable_path,
+            "running_target": record.running_target,
             "generation": record.generation,
             "rollback_from": record.rollback_from,
             "scope": INSTALLATION_SCOPE,

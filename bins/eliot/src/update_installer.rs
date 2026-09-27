@@ -1,7 +1,9 @@
 //! Typed update channels and versioned update installation (I3.8).
 //!
 //! Update packages are installed into new versioned directories; the installer
-//! never overwrites a running binary. The only declared channels are `stable`,
+//! never overwrites a running binary. Whether the update target is running is
+//! observed from a live process snapshot before any filesystem effect, not
+//! asserted by the operator. The only declared channels are `stable`,
 //! `preview`, and `local-dev`. Kernel/Host updates are release-level
 //! operations requiring the release approval path, while optional module
 //! updates are normal hot-generation operations carrying explicit
@@ -166,12 +168,31 @@ fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
 }
 
+/// Observed liveness of an update target executable.
+///
+/// This is a fact taken from a live process snapshot before any filesystem
+/// effect, never an operator assertion. `NotRunning` is only ever reported
+/// from a completed snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunningTargetObservation {
+    /// A live process carries the target's executable basename.
+    Running {
+        /// The executable basename the live process snapshot matched.
+        process_basename: String,
+    },
+    /// The live process snapshot observed no process with that basename.
+    NotRunning,
+}
+
 /// A staged update installation request.
 #[derive(Debug)]
 pub struct InstallUpdateRequest<'a> {
     /// Installation root; the versioned directory is created below it.
     pub install_root: &'a Path,
-    /// Currently running executable, if any. Never overwritten.
+    /// Optional exact path of an executable the operator declares as running.
+    /// This is an additional exact path-identity check on top of the observed
+    /// running state, not the source of that state.
     pub running_executable: Option<&'a Path>,
     /// Package metadata for the update.
     pub package: &'a PackageMetadata,
@@ -202,6 +223,8 @@ pub struct UpdateRecord {
     pub generation: String,
     /// Previous versioned directory; set only for module-generation updates.
     pub rollback_from: Option<PathBuf>,
+    /// Running state of the update target, observed before staging.
+    pub running_target: RunningTargetObservation,
 }
 
 /// Update installer failures. All variants fail closed before overwriting.
@@ -213,6 +236,8 @@ pub enum UpdateInstallerError {
     InvalidPackage { reason: String },
     #[error("refusing to overwrite the running binary at '{path}'")]
     RunningBinaryWouldBeOverwritten { path: String },
+    #[error("cannot observe whether '{path}' is running: {reason}")]
+    RunningObservationFailed { path: String, reason: String },
     #[error(
         "versioned directory already exists at '{path}': updates always create a new versioned directory"
     )]
@@ -268,19 +293,63 @@ pub fn running_binary_would_be_overwritten(running: &Path, new_executable: &Path
     }
 }
 
+/// Observe, from a live process snapshot, whether the executable named by
+/// `executable` is currently running (I3.8: the installer never overwrites a
+/// running binary).
+///
+/// The snapshot owner matches the exact executable basename across the whole
+/// machine, so the result is deliberately conservative in one direction:
+/// [`RunningTargetObservation::Running`] proves that *some* live process runs
+/// that executable name, not which copy runs or from which directory. It never
+/// proves that a particular path is or is not executing, and it never
+/// replaces the exact path-identity check in
+/// [`running_binary_would_be_overwritten`].
+///
+/// # Errors
+///
+/// Returns [`UpdateInstallerError::InvalidPackage`] when `executable` has no
+/// single-segment file name, and
+/// [`UpdateInstallerError::RunningObservationFailed`] when the live process
+/// snapshot is unavailable or errors. There is no path that reports
+/// [`RunningTargetObservation::NotRunning`] without a completed snapshot.
+pub fn observe_running_executable(
+    executable: &Path,
+) -> Result<RunningTargetObservation, UpdateInstallerError> {
+    let Some(basename) = executable.file_name().and_then(|name| name.to_str()) else {
+        return Err(UpdateInstallerError::InvalidPackage {
+            reason: "update target executable must name a single path segment".to_owned(),
+        });
+    };
+    match eliot_platform_windows::any_running_process_named(basename) {
+        Ok(true) => Ok(RunningTargetObservation::Running {
+            process_basename: basename.to_owned(),
+        }),
+        Ok(false) => Ok(RunningTargetObservation::NotRunning),
+        Err(error) => Err(UpdateInstallerError::RunningObservationFailed {
+            path: executable.display().to_string(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
 /// Install an update package into a new versioned directory.
 ///
-/// The running executable is never overwritten: when
-/// `request.running_executable` resolves to the staged executable path or its
-/// parent versioned directory, installation fails closed with
+/// The running executable is never overwritten. Before any filesystem effect
+/// the running state of the update target is **observed** from a live process
+/// snapshot ([`observe_running_executable`]) and carried into the returned
+/// [`UpdateRecord`]; an unavailable snapshot fails closed with
+/// [`UpdateInstallerError::RunningObservationFailed`] rather than assuming the
+/// target is idle. When `request.running_executable` additionally resolves to
+/// the staged executable path or its parent versioned directory, installation
+/// fails closed with
 /// [`UpdateInstallerError::RunningBinaryWouldBeOverwritten`]. Kernel/Host
 /// packages fail closed without `release_approved`.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid metadata, a missing release approval, a
-/// running-binary collision, an already-existing versioned directory, or any
-/// staging I/O failure.
+/// failed running-state observation, a running-binary collision, an
+/// already-existing versioned directory, or any staging I/O failure.
 pub fn install_update(
     request: &InstallUpdateRequest<'_>,
 ) -> Result<UpdateRecord, UpdateInstallerError> {
@@ -300,6 +369,9 @@ pub fn install_update(
         &request.package.version,
     );
     let executable_path = installed_dir.join(staged_executable_name(&request.package.name));
+    // Detect before staging and before any filesystem effect: the running
+    // state is read from a live process snapshot, not supplied by the caller.
+    let running_target = observe_running_executable(&executable_path)?;
     if let Some(running) = request.running_executable
         && running_binary_would_be_overwritten(running, &executable_path)
     {
@@ -345,6 +417,7 @@ pub fn install_update(
             UpdateKind::ModuleGeneration => request.previous_version_dir.map(Path::to_path_buf),
             UpdateKind::KernelHostRelease => None,
         },
+        running_target,
     })
 }
 
