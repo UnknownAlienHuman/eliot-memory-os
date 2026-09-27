@@ -2069,6 +2069,8 @@ pub mod admitted_material {
             "connection_id": format!("native-worker-conn-{binding_digest}"),
             "authority_epoch": request.get("authority_epoch").cloned().unwrap_or(serde_json::Value::Null),
             "state_fence": request.get("state_fence").cloned().unwrap_or(serde_json::Value::Null),
+            "module_catalog_revision": join.module_catalog_revision,
+            "capability_cell": join.capability_cell,
             "lease_id": format!("native-worker-lease-{binding_digest}"),
             "lease_expires_at_unix_ms": lease_expires_at,
             "renewal_id": format!("native-worker-renewal-{binding_digest}"),

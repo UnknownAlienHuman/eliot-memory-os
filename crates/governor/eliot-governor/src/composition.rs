@@ -5737,6 +5737,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// This method performs no transport: the caller commits a sibling
     /// `PreparedTransition` through the existing `commit_canonical` path and
     /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
+    /// The admitted capability cell and Module Catalog revision are required
+    /// caller-supplied owner inputs; this method does not infer either value.
     /// All parameters are required; blank or malformed input fails closed.
     #[allow(
         clippy::too_many_arguments,
@@ -5768,9 +5770,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         protocol_digest: &str,
         command_ref: &str,
         facet_manifest_ref: &str,
+        capability_cell: eliot_contracts::CapabilityCellId,
         introduction_refs: Vec<String>,
         supporting_grant_refs: Vec<String>,
         grant_graph_revision: u64,
+        module_catalog_revision: u64,
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
@@ -5842,9 +5846,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             protocol_digest: protocol_digest.to_owned(),
             command_ref: command_ref.to_owned(),
             facet_manifest_ref: facet_manifest_ref.to_owned(),
+            capability_cell,
             introduction_refs,
             supporting_grant_refs,
             grant_graph_revision,
+            module_catalog_revision,
             effective_ceiling,
             credential_refs,
             resource_refs,
@@ -5917,9 +5923,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         protocol_digest: &str,
         command_ref: &str,
         facet_manifest_ref: &str,
+        capability_cell: eliot_contracts::CapabilityCellId,
         introduction_refs: Vec<String>,
         supporting_grant_refs: Vec<String>,
         grant_graph_revision: u64,
+        module_catalog_revision: u64,
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
@@ -5961,9 +5969,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             protocol_digest,
             command_ref,
             facet_manifest_ref,
+            capability_cell,
             introduction_refs,
             supporting_grant_refs,
             grant_graph_revision,
+            module_catalog_revision,
             effective_ceiling,
             credential_refs,
             resource_refs,
@@ -10101,9 +10111,11 @@ mod tests {
                 &"f".repeat(64),
                 "cmd-1",
                 "facet-1",
+                eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id"),
                 vec!["intro-1".to_owned()],
                 vec!["grant-1".to_owned()],
                 1,
+                7,
                 eliot_store_api::EffectClass::ReversibleMutation,
                 vec!["cred-1".to_owned()],
                 vec!["res-1".to_owned()],
