@@ -3,9 +3,10 @@
 //! T11 section 5, slice T11.3 (part A, Governor): resolve admitted binding
 //! receipts and source existence from the reconstructed cue role
 //! ([`crate::context_inputs`]), then call the Smart owner entrypoint
-//! `eliot_cue_index::build_cue_snapshot` with an authoritative zero-edge set
-//! (`relation_edges=&[]`, `registry_revision=None`; `None` is valid only for
-//! an empty edge set per `crates/smart/eliot-cue-index/src/build.rs:24-32`).
+//! `eliot_cue_index::build_cue_snapshot_closed` with the exact cue-owner
+//! denominator and an authoritative zero-edge set (`relation_edges=&[]`,
+//! `registry_revision=None`, `weights=&[]`; empty weights are valid only for
+//! an empty edge set).
 //!
 //! This is input reconstruction, not an admitted `ActiveUnderstandingView`:
 //!
@@ -20,7 +21,7 @@
 //!   the build is propagated, never swallowed into an empty set;
 //! - the built candidate is post-verified against the same source closure
 //!   (scope, fence, profile, heads, binding digests) before it is exposed,
-//!   including a `rebuild_cue_snapshot` round-trip through the owner.
+//!   including a `rebuild_cue_snapshot_closed` round-trip through the owner.
 //!
 //! The read-owner cache ([`CueReconstructionCache`]) is keyed by
 //! scope, source revisions (dependency heads plus admitted binding digests),
@@ -32,9 +33,10 @@ use std::collections::BTreeMap;
 use eliot_context_candidates::ProjectionState;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::{
-    AdmittedCueBindingProjection, CueSnapshotBuildCandidate, NormalizationProfile, SnapshotId,
-    WorkScopeId,
+    AdmittedCueBindingProjection, CueProjectionDenominator, CueSnapshotBuildCandidate,
+    NormalizationProfile, SnapshotId, WorkScopeId,
 };
+use eliot_store_api::{NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -185,11 +187,20 @@ pub fn reconstruct_cue_snapshot(
     for (index, projection) in bindings.iter().enumerate() {
         check_binding_closure(index, projection, &scope, &inputs.state_fence)?;
     }
-    let key = cache_key(inputs, &bindings, &scope, snapshot_id, profile)?;
+    let source_revision = cue_source_revision(inputs)?;
+    let denominator = CueProjectionDenominator::new(bindings.len(), 0, 0, 0, source_revision);
+    denominator
+        .validate_against(bindings.len(), 0)
+        .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
+    let key = cache_key(
+        inputs,
+        &bindings,
+        &scope,
+        snapshot_id,
+        profile,
+        source_revision,
+    )?;
     if let Some(retained) = cache.get(&key) {
-        retained
-            .validate()
-            .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
         if retained.scope_id != scope
             || retained.snapshot.state_fence != inputs.state_fence
             || retained.snapshot.rebuild.normalization_profile != *profile
@@ -200,13 +211,21 @@ pub fn reconstruct_cue_snapshot(
                 "retained candidate no longer matches its closure key".to_owned(),
             ));
         }
+        post_verify_candidate(
+            retained,
+            &scope,
+            snapshot_id,
+            profile,
+            &inputs.state_fence,
+            &denominator,
+        )?;
         return Ok(CueReconstruction {
             candidate: retained.clone(),
             cache_key: key,
             cache_hit: true,
         });
     }
-    let candidate = eliot_cue_index::build_cue_snapshot(
+    let candidate = eliot_cue_index::build_cue_snapshot_closed(
         &scope,
         snapshot_id.clone(),
         profile.clone(),
@@ -214,6 +233,8 @@ pub fn reconstruct_cue_snapshot(
         &bindings,
         &[],
         None,
+        &denominator,
+        &[],
     )
     .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
     post_verify_candidate(
@@ -222,6 +243,7 @@ pub fn reconstruct_cue_snapshot(
         snapshot_id,
         profile,
         &inputs.state_fence,
+        &denominator,
     )?;
     cache.insert(key.clone(), candidate.clone());
     Ok(CueReconstruction {
@@ -237,6 +259,7 @@ struct KeyShape<'a> {
     scope: &'a str,
     heads_sha256: String,
     bindings_sha256: String,
+    source_revision: u64,
     profile_id: &'a str,
     profile_revision: u32,
     profile_digest: &'a str,
@@ -251,6 +274,7 @@ fn cache_key(
     scope: &WorkScopeId,
     snapshot_id: &SnapshotId,
     profile: &NormalizationProfile,
+    source_revision: u64,
 ) -> Result<CueCacheKey, CueCompositionError> {
     let refused = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
     let heads_bytes = canonical_json_bytes(&inputs.heads_after)
@@ -268,6 +292,7 @@ fn cache_key(
         scope: scope.as_str(),
         heads_sha256: sha256_hex(&heads_bytes),
         bindings_sha256: sha256_hex(&bindings_bytes),
+        source_revision,
         profile_id: &profile.profile_id,
         profile_revision: profile.profile_revision,
         profile_digest: profile.digest.as_str(),
@@ -276,6 +301,110 @@ fn cache_key(
     };
     let bytes = canonical_json_bytes(&shape).map_err(|_| refused("key is not canonical"))?;
     Ok(CueCacheKey(sha256_hex(&bytes)))
+}
+
+/// Derives the exact nonzero cue-owner revision from the cue read and its
+/// coherent before/after scope-head closure.
+fn cue_source_revision(inputs: &SevenRoleInputs) -> Result<u64, CueCompositionError> {
+    let mismatch = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
+    if inputs.heads_before != inputs.heads_after
+        || inputs.heads_before.scope_id != inputs.scope_id
+        || inputs.heads_after.scope_id != inputs.scope_id
+        || inputs.heads_before.state_fence != inputs.state_fence
+        || inputs.heads_after.state_fence != inputs.state_fence
+    {
+        return Err(mismatch(
+            "cue source revision is not bound to one coherent scope-head closure",
+        ));
+    }
+    inputs
+        .heads_before
+        .validate()
+        .map_err(|error| mismatch(&format!("invalid before-head closure: {error}")))?;
+    inputs
+        .heads_after
+        .validate()
+        .map_err(|error| mismatch(&format!("invalid after-head closure: {error}")))?;
+
+    let identity =
+        inputs.cue.identity.as_ref().ok_or_else(|| {
+            mismatch("cue role has no read identity for an admitted source revision")
+        })?;
+    if inputs.cue.operation != NamedReadOperation::GetUnderstandingProjectionInputs
+        || identity.operation() != NamedReadOperation::GetUnderstandingProjectionInputs
+        || identity.source().operation != NamedReadOperation::GetUnderstandingProjectionInputs
+        || identity.scope_id() != Some(&inputs.scope_id)
+        || identity.state_fence() != &inputs.state_fence
+        || identity.consistency() != ReadConsistency::ExactFence
+    {
+        return Err(mismatch(
+            "cue read identity does not bind the exact scoped projection read",
+        ));
+    }
+    if identity.observed_revision_heads() != inputs.cue.revision_heads.as_slice() {
+        return Err(mismatch(
+            "cue response heads differ from the read identity heads",
+        ));
+    }
+
+    let scope_key = RevisionKey::new(format!("scope:{}", inputs.scope_id))
+        .map_err(|error| mismatch(&format!("invalid cue scope revision key: {error}")))?;
+    let cue_head = exact_revision_head(
+        &inputs.cue.revision_heads,
+        &scope_key,
+        &inputs.state_fence,
+        "cue role",
+    )?;
+    let identity_head = exact_revision_head(
+        identity.observed_revision_heads(),
+        &scope_key,
+        &inputs.state_fence,
+        "cue read identity",
+    )?;
+    let before_head = exact_revision_head(
+        &inputs.heads_before.revision_heads,
+        &scope_key,
+        &inputs.state_fence,
+        "before-head closure",
+    )?;
+    let after_head = exact_revision_head(
+        &inputs.heads_after.revision_heads,
+        &scope_key,
+        &inputs.state_fence,
+        "after-head closure",
+    )?;
+    if cue_head != identity_head || cue_head != before_head || cue_head != after_head {
+        return Err(mismatch(
+            "cue source revision differs across the role identity and coherent scope heads",
+        ));
+    }
+    Ok(cue_head.revision)
+}
+
+fn exact_revision_head<'a>(
+    heads: &'a [RevisionHead],
+    expected_key: &RevisionKey,
+    state_fence: &StateFence,
+    owner: &str,
+) -> Result<&'a RevisionHead, CueCompositionError> {
+    let mismatch = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
+    let mut matches = heads.iter().filter(|head| &head.key == expected_key);
+    let head = matches
+        .next()
+        .ok_or_else(|| mismatch(&format!("{owner} has no exact cue scope revision head")))?;
+    if matches.next().is_some() {
+        return Err(mismatch(&format!(
+            "{owner} has duplicate cue scope revision heads"
+        )));
+    }
+    head.validate()
+        .map_err(|error| mismatch(&format!("{owner} cue scope revision is invalid: {error}")))?;
+    if head.state_fence != *state_fence {
+        return Err(mismatch(&format!(
+            "{owner} cue scope revision has a different state fence"
+        )));
+    }
+    Ok(head)
 }
 
 /// Decodes the cue role payload into admitted bindings.
@@ -372,17 +501,17 @@ fn check_binding_closure(
 /// Post-verifies the built candidate against the same source closure before
 /// exposing it.
 ///
-/// Checks scope, fence, profile, snapshot identity, and the authoritative
-/// empty edge set, validates through the owner, and round-trips an owner
-/// rebuild (valid for zero edges with `registry_revision=None`). Any
-/// mismatch fails closed; a provider error is never converted into an empty
-/// set.
+/// Checks scope, fence, profile, snapshot identity, the retained denominator,
+/// and the authoritative empty edge set, then round-trips a closed owner
+/// rebuild. Any mismatch fails closed; a provider error is never converted
+/// into an empty set.
 fn post_verify_candidate(
     candidate: &CueSnapshotBuildCandidate,
     scope: &WorkScopeId,
     snapshot_id: &SnapshotId,
     profile: &NormalizationProfile,
     fence: &StateFence,
+    denominator: &CueProjectionDenominator,
 ) -> Result<(), CueCompositionError> {
     let mismatch = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
     candidate
@@ -409,9 +538,29 @@ fn post_verify_candidate(
             "candidate carries relation edges outside the zero-edge set",
         ));
     }
-    let rebuilt = eliot_cue_index::rebuild_cue_snapshot(candidate, None)
+    let closure = candidate
+        .snapshot
+        .retained_closure()
+        .ok_or_else(|| mismatch("candidate has no retained closed snapshot closure"))?;
+    if candidate.snapshot.source_revision != denominator.source_revision
+        || closure.denominator != *denominator
+        || closure.rows.len() != denominator.expected_rows
+        || !closure.relation_edges.is_empty()
+        || !closure.edge_weights.is_empty()
+    {
+        return Err(mismatch(
+            "candidate retained closure differs from the exact cue denominator or zero-edge input",
+        ));
+    }
+    let rebuilt = eliot_cue_index::rebuild_cue_snapshot_closed(candidate, None, denominator, &[])
         .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
-    if rebuilt.build_digest != candidate.build_digest {
+    let candidate_bytes = candidate
+        .canonical_payload_bytes()
+        .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
+    let rebuilt_bytes = rebuilt
+        .canonical_payload_bytes()
+        .map_err(|error| CueCompositionError::CueBuild(error.to_string()))?;
+    if rebuilt.build_digest != candidate.build_digest || rebuilt_bytes != candidate_bytes {
         return Err(mismatch(
             "candidate does not round-trip through the owner rebuild",
         ));
