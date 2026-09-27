@@ -129,6 +129,7 @@ mod registry_wire;
 mod runtime_root_contract;
 mod scm_approval;
 mod signed_activation;
+mod survey;
 mod transaction;
 
 pub use installation_registry::RedbInstallationRegistry;
@@ -165,6 +166,7 @@ pub(crate) use integration_discovery::WindowsPathIdentity;
 pub use integration_discovery::{
     IntegrationCategory, IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry,
 };
+pub use survey::*;
 
 pub use activation::{
     InstallationActivationApproval, InstallationActivationApprovalBinding,
