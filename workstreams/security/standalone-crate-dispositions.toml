@@ -54,6 +54,15 @@
 # quoted verbatim from each manifest. Generated SBOM/license/advisory artifacts
 # stay out of Git per docs/DEPENDENCY_POLICY.md repository hygiene.
 #
+# Per-row `evidence_reference` states the gate's own admission state for that
+# package, not a supply-chain evidence record. `deny-all` is the only value this
+# gate admits: no evidence-qualified separate-package route is open, so any
+# build/release input edge onto the package is rejected by name, and the
+# retained gate receipt records the same declaration per package. A row that
+# declares anything else fails closed rather than implying an evidence record
+# that does not exist. Generated SBOM/license/advisory artifacts stay out of Git
+# per docs/DEPENDENCY_POLICY.md repository hygiene.
+#
 # Per-row owner sources: `[package.metadata.eliot]` in the crate Cargo.toml and
 # `lifecycle_owner` / `agent_task.integration_owner` in the crate module.toml
 # where present. Production-boundary claim verified at the base commit by
@@ -85,6 +94,7 @@ lifecycle_owner_source = "workstreams/research/assignments/692-source-assurance-
 integration_owner = "undeclared (promotion-time Governor admission owner per #18)"
 integration_owner_source = "workstreams/research/assignments/692-source-assurance-role-separation.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -104,6 +114,7 @@ lifecycle_owner_source = "crates/smart/eliot-context-compiler-wasm/module.toml"
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-context-compiler-wasm/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -123,6 +134,7 @@ lifecycle_owner_source = "crates/smart/eliot-cue-activation-wasm/module.toml"
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-cue-activation-wasm/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -142,6 +154,7 @@ lifecycle_owner_source = "crates/smart/eliot-dreamer-curation-wasm/module.toml"
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-dreamer-curation-wasm/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -161,6 +174,7 @@ lifecycle_owner_source = "crates/smart/eliot-dreamer-cycle-wasm/module.toml"
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-dreamer-cycle-wasm/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -180,6 +194,7 @@ lifecycle_owner_source = "crates/smart/eliot-dreamer-orientation-wasm/module.tom
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-dreamer-orientation-wasm/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -199,6 +214,7 @@ lifecycle_owner_source = "crates/smart/eliot-dreamer-research-wasm/module.toml"
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-dreamer-research-wasm/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -218,6 +234,7 @@ lifecycle_owner_source = "crates/smart/eliot-memory-applicability/module.toml"
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-memory-applicability/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
@@ -237,4 +254,5 @@ lifecycle_owner_source = "crates/smart/eliot-memory-curation-screen-wasm/module.
 integration_owner = "cognitive-wave-integrator"
 integration_owner_source = "crates/smart/eliot-memory-curation-screen-wasm/module.toml"
 production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+evidence_reference = "deny-all"
 remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"

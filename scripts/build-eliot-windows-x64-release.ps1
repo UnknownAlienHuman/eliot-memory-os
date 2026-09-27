@@ -1489,19 +1489,88 @@ function Assert-IsolatedSourceTree([string]$Repo, [string]$SourceCommit, [string
     }
 }
 
-function Test-ExcludedDispositions([string]$Repo) {
+function Get-ExcludedDispositionReceiptPath([string]$Repo) {
+    # Issue #1811: the gate receipt is a retained build output, never a tracked
+    # source file. `.eliot/` is the repository's ignored evidence root.
+    Join-Path (Join-Path $Repo '.eliot/excluded-dispositions') 'gate-receipt.json'
+}
+
+function Test-ExcludedDispositions([string]$Repo, [string]$SourceCommit) {
     # Issue #1811: reject any build/release consumption of an excluded or
     # standalone-workspace package without provenance, lock, toolchain,
     # license, and SBOM evidence. The Python gate owns the denominator
-    # (tree discovery) and the disposition inventory; this seam only fails
-    # closed when the gate fails.
+    # (tree discovery) and the disposition inventory; this seam fails closed
+    # when the gate fails and retains the gate's versioned receipt so the
+    # decision is bound to this build plan instead of printed as PASS text.
     $gate = Join-Path $Repo 'scripts/verify-excluded-dispositions-1811.py'
     if (-not (Test-Path -LiteralPath $gate -PathType Leaf)) {
         throw 'release excluded-disposition gate is missing: scripts/verify-excluded-dispositions-1811.py'
     }
-    & python $gate --root $Repo
+    $receiptPath = Get-ExcludedDispositionReceiptPath $Repo
+    & python $gate --root $Repo --trust-class T0 --receipt-out $receiptPath
     if ($LASTEXITCODE -ne 0) {
         throw "release excluded-disposition gate rejected undeclared excluded input (see EXCLUDED_DISPOSITIONS output above; required evidence: provenance, lock, toolchain, license, SBOM)"
+    }
+    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+        throw 'release excluded-disposition gate did not retain its receipt'
+    }
+    $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+    if ([string]$receipt.schema -cne 'eliot.excluded-disposition-gate-receipt.v1' -or
+        [string]$receipt.result -cne 'PASS' -or
+        [string]$receipt.trust_class -cne 'T0' -or
+        [string]$receipt.admission_policy -cne 'deny-all' -or
+        [string]$receipt.inputs.source.commit -cne $SourceCommit -or
+        [int]$receipt.denominator.standalone_package_count -le 0 -or
+        @($receipt.denominator.packages).Count -ne [int]$receipt.denominator.standalone_package_count -or
+        @($receipt.consumer_edges).Count -ne 0 -or
+        @($receipt.locked_standalone_packages).Count -ne 0) {
+        throw 'retained excluded-disposition gate receipt does not record the pinned zero-consumer deny-all denominator'
+    }
+    [ordered]@{
+        schema = [string]$receipt.schema
+        gate = 'scripts/verify-excluded-dispositions-1811.py'
+        receipt_path = '.eliot/excluded-dispositions/gate-receipt.json'
+        receipt_sha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        trust_class = [string]$receipt.trust_class
+        admission_policy = [string]$receipt.admission_policy
+        cache_namespace = [string]$receipt.cache_namespace
+        source_commit = [string]$receipt.inputs.source.commit
+        standalone_package_count = [int]$receipt.denominator.standalone_package_count
+        consumer_count = @($receipt.consumer_edges).Count
+        locked_standalone_count = @($receipt.locked_standalone_packages).Count
+        evidence_reference = 'deny-all (per-package; no evidence-qualified separate-package route is admitted)'
+    }
+}
+
+function Assert-ExcludedDispositionReceipt([string]$Repo, [string]$SourceCommit, [object]$Binding) {
+    # Issue #1811: re-check the retained receipt against the final staged input
+    # manifest before publication. A changed source commit, lock, toolchain,
+    # inventory, verifier, trust class or inventoried package byte invalidates
+    # the decision, and a receipt that crosses trust classes is refused.
+    $gate = Join-Path $Repo 'scripts/verify-excluded-dispositions-1811.py'
+    $receiptPath = Get-ExcludedDispositionReceiptPath $Repo
+    if ((Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+        [string]$Binding.receipt_sha256) {
+        throw 'retained excluded-disposition gate receipt changed after the pre-build check'
+    }
+    $recheckPath = Join-Path (Join-Path $Repo '.eliot/excluded-dispositions') 'gate-recheck-receipt.json'
+    & python $gate --root $Repo --trust-class ([string]$Binding.trust_class) `
+        --receipt $receiptPath --receipt-out $recheckPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "final staged input manifest does not match the retained excluded-disposition gate receipt (see EXCLUDED_DISPOSITIONS output above)"
+    }
+    $recheck = Get-Content -LiteralPath $recheckPath -Raw | ConvertFrom-Json
+    if ([string]$recheck.cache_namespace -cne [string]$Binding.cache_namespace -or
+        [string]$recheck.inputs.source.commit -cne $SourceCommit -or
+        [string]$recheck.trust_class -cne [string]$Binding.trust_class -or
+        [int]$recheck.denominator.standalone_package_count -ne [int]$Binding.standalone_package_count) {
+        throw 'final staged input manifest re-check does not bind the release excluded-disposition receipt'
+    }
+    [ordered]@{
+        recheck_path = '.eliot/excluded-dispositions/gate-recheck-receipt.json'
+        recheck_sha256 = (Get-FileHash -LiteralPath $recheckPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        cache_namespace = [string]$recheck.cache_namespace
+        result = [string]$recheck.result
     }
 }
 
@@ -3440,7 +3509,7 @@ if (-not $PlanOnly -and -not $BuildOperator -and -not $OperatorSource) {
 Push-Location $repo
 try {
     $preBuildIsolation = Assert-IsolatedSourceTree $repo $sourceCommit 'pre-build'
-    Test-ExcludedDispositions $repo
+    $dispositionReceipt = Test-ExcludedDispositions $repo $sourceCommit
     $stageToolchain = Get-ToolchainBuildReceipt $repo $sourceCommit $cargoMetadata 'stage' $legacyGovernorPresent
     if ($SkipBuild) {
         throw 'SkipBuild is not permitted for staged releases because it cannot prove Governor source provenance'
@@ -3924,6 +3993,7 @@ try {
         public_distribution_ready = $false
         payload_denominator_policy = 'registry-selected-only-no-wholesale'
         staged_payload_manifest_sha256 = $stagedPayloadManifestHash
+        excluded_dispositions = $dispositionReceipt
         source_isolation = [ordered]@{
             pre_build = $preBuildIsolation
             post_build = $postBuildIsolation
@@ -4001,9 +4071,21 @@ This bundle is intentionally unsigned. Before public distribution:
         [void]$checksums.Remove('governor_approval')
     }
     $checksums | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'SHA256SUMS.json') -Encoding utf8
+    # Issue #1811: the final release manifest must reference the exact retained
+    # gate receipt, and the staged input manifest is re-checked against it
+    # before publication.
+    $stagedRelease = Get-Content -LiteralPath (Join-Path $bundle 'RELEASE.json') -Raw | ConvertFrom-Json
+    if ([string]$stagedRelease.excluded_dispositions.receipt_sha256 -cne [string]$dispositionReceipt.receipt_sha256 -or
+        [string]$stagedRelease.excluded_dispositions.cache_namespace -cne [string]$dispositionReceipt.cache_namespace -or
+        [string]$stagedRelease.excluded_dispositions.source_commit -cne $sourceCommit) {
+        throw 'staged RELEASE.json does not reference the retained excluded-disposition gate receipt'
+    }
+    $dispositionRecheck = Assert-ExcludedDispositionReceipt $repo $sourceCommit $dispositionReceipt
     $verification = Test-ReleaseBundle $bundle $GovernorRetirementApproval
     $plan.status = 'STAGED_UNSIGNED'
     $plan.verification = $verification
+    $plan.excluded_dispositions = $dispositionReceipt
+    $plan.excluded_dispositions_recheck = $dispositionRecheck
     $plan | ConvertTo-Json -Depth 5
 }
 finally {
