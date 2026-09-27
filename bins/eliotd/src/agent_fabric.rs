@@ -1159,22 +1159,7 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
             ));
         }
     }
-    for (key, admission) in &snapshot.semantic_admissions {
-        admission.validate().map_err(contract_rejection)?;
-        if key != admission.admission_id.as_str() {
-            return Err(FabricError::BrokenOwnershipLink(
-                "semantic admission map key does not match record identity".to_owned(),
-            ));
-        }
-        if !snapshot
-            .semantic_definitions
-            .contains_key(admission.definition_id.as_str())
-        {
-            return Err(FabricError::BrokenOwnershipLink(
-                "semantic admission without stored definition".to_owned(),
-            ));
-        }
-    }
+    verify_snapshot_admissions(snapshot)?;
     for (key, execution) in &snapshot.semantic_executions {
         execution.validate().map_err(contract_rejection)?;
         if key != execution.execution_id.as_str() {
@@ -1222,6 +1207,152 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
         check_supersession(prior, next).map_err(contract_rejection)?;
     }
     Ok(())
+}
+
+/// Revalidates every persisted semantic admission against its immutable
+/// definition while retaining valid terminal dispositions as history.
+fn verify_snapshot_admissions(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    let mut admission_by_definition = BTreeMap::new();
+    for (key, admission) in &snapshot.semantic_admissions {
+        admission.validate().map_err(contract_rejection)?;
+        if key != admission.admission_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic admission map key does not match record identity".to_owned(),
+            ));
+        }
+        if admission_by_definition
+            .insert(admission.definition_id.as_str(), key.as_str())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "semantic definition {} has conflicting stored admissions",
+                admission.definition_id.as_str()
+            )));
+        }
+        let definition = snapshot
+            .semantic_definitions
+            .get(admission.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink(
+                    "semantic admission without stored definition".to_owned(),
+                )
+            })?;
+        if definition.lifecycle == SwarmPlanDefinitionLifecycle::Draft
+            || !admission.binds(definition)
+        {
+            return Err(FabricError::BrokenOwnershipLink(
+                "semantic admission does not bind its frozen definition".to_owned(),
+            ));
+        }
+        if !admission
+            .admitted_ceilings
+            .narrowed_from(&definition.ceilings)
+        {
+            return Err(FabricError::SemanticDrift(
+                "stored semantic admission widens definition ceilings".to_owned(),
+            ));
+        }
+        match (definition.lifecycle, admission.disposition) {
+            (
+                SwarmPlanDefinitionLifecycle::Superseded,
+                SwarmPlanAdmissionDisposition::Superseded
+                | SwarmPlanAdmissionDisposition::Cancelled,
+            )
+            | (SwarmPlanDefinitionLifecycle::Cancelled, SwarmPlanAdmissionDisposition::Cancelled)
+            | (SwarmPlanDefinitionLifecycle::Frozen, _) => {}
+            _ => {
+                return Err(FabricError::BrokenOwnershipLink(
+                    "semantic admission disposition contradicts definition lifecycle".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reconstructs the definition-to-admission cache from committed owner
+/// records, rejecting torn or contradictory joins instead of allowing map
+/// insertion to choose one admission silently.
+fn rebuild_admission_by_definition(
+    snapshot: &FabricSnapshot,
+) -> Result<BTreeMap<String, String>, FabricError> {
+    let mut admission_by_definition = BTreeMap::new();
+
+    for (key, definition) in &snapshot.definitions {
+        if key != definition.definition_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "definition map key does not match record identity".to_owned(),
+            ));
+        }
+    }
+
+    for (key, reservation) in &snapshot.reservations {
+        if key != &reservation.reservation_id {
+            return Err(FabricError::BrokenOwnershipLink(
+                "reservation map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition = snapshot
+            .definitions
+            .get(reservation.definition_id.as_str())
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink("reservation without stored definition".to_owned())
+            })?;
+        if reservation.definition_id != definition.definition_id
+            || reservation.definition_digest != definition.definition_digest
+            || reservation.work_class != definition.work_class
+        {
+            return Err(FabricError::ReceiptBinding(
+                "stored reservation does not bind its exact definition".to_owned(),
+            ));
+        }
+    }
+
+    for (key, admission) in &snapshot.admissions {
+        if key != admission.admission_id.as_str() {
+            return Err(FabricError::BrokenOwnershipLink(
+                "admission map key does not match record identity".to_owned(),
+            ));
+        }
+        let definition_key = admission.definition_id.as_str();
+        let definition = snapshot.definitions.get(definition_key).ok_or_else(|| {
+            FabricError::BrokenOwnershipLink("admission without stored definition".to_owned())
+        })?;
+        if admission.definition_id != definition.definition_id
+            || admission.definition_digest != definition.definition_digest
+            || admission.work_class != definition.work_class
+        {
+            return Err(FabricError::ReceiptBinding(
+                "stored admission does not bind its exact definition".to_owned(),
+            ));
+        }
+        let reservation = snapshot
+            .reservations
+            .get(&admission.reservation_id)
+            .ok_or_else(|| {
+                FabricError::BrokenOwnershipLink("admission without stored reservation".to_owned())
+            })?;
+        if admission.reservation_id != reservation.reservation_id
+            || admission.definition_id != reservation.definition_id
+            || admission.definition_digest != reservation.definition_digest
+            || admission.work_class != reservation.work_class
+            || admission.fence != reservation.fence
+        {
+            return Err(FabricError::ReceiptBinding(
+                "stored admission does not bind its exact reservation".to_owned(),
+            ));
+        }
+        if admission_by_definition
+            .insert(definition_key.to_owned(), key.clone())
+            .is_some()
+        {
+            return Err(FabricError::DefinitionConflict(format!(
+                "definition {definition_key} has conflicting stored admissions"
+            )));
+        }
+    }
+
+    Ok(admission_by_definition)
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -3003,6 +3134,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
@@ -3013,13 +3145,6 @@ impl AgentFabric {
         let mut definition_bytes = BTreeMap::new();
         for (key, definition) in &snapshot.definitions {
             definition_bytes.insert(key.clone(), definition.definition_digest.clone());
-        }
-        let mut admission_by_definition = BTreeMap::new();
-        for (admission_key, admission) in &snapshot.admissions {
-            admission_by_definition.insert(
-                admission.definition_id.as_str().to_owned(),
-                admission_key.clone(),
-            );
         }
         let mut intent_by_operation = BTreeMap::new();
         for (dispatch_id, intent) in &snapshot.intents {
@@ -3089,6 +3214,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
             config.clone(),
@@ -3097,13 +3223,6 @@ impl AgentFabric {
         let mut definition_bytes = BTreeMap::new();
         for (key, definition) in &snapshot.definitions {
             definition_bytes.insert(key.clone(), definition.definition_digest.clone());
-        }
-        let mut admission_by_definition = BTreeMap::new();
-        for (admission_key, admission) in &snapshot.admissions {
-            admission_by_definition.insert(
-                admission.definition_id.as_str().to_owned(),
-                admission_key.clone(),
-            );
         }
         let mut intent_by_operation = BTreeMap::new();
         for (dispatch_id, intent) in &snapshot.intents {
