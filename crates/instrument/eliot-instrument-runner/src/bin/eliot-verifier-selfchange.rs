@@ -839,12 +839,8 @@ fn read_bundle(bundle: &Path) -> Result<BootstrapEvidence, CliError> {
             Some(scenario) => Some(guardian_scenario(&scenario)?),
             None => None,
         },
-        discriminator: discriminator(object, "discriminator", "discriminator")?,
-        candidate_discriminator: discriminator(
-            object,
-            "candidate_discriminator",
-            "candidate_discriminator",
-        )?,
+        discriminator: discriminator(object, "discriminator")?,
+        candidate_discriminator: discriminator(object, "candidate_discriminator")?,
         launch: launch(required(object, "launch")?)?,
         finish: match optional_field::<serde_json::Value>(object, "finish")? {
             Some(finish) => {
@@ -945,16 +941,15 @@ fn guardian_scenario(value: &serde_json::Value) -> Result<GuardianScenarioRecord
 fn discriminator(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
-    context: &str,
 ) -> Result<DiscriminatorCommand, CliError> {
     let value = required(object, key)?;
     let command = value
         .as_object()
         .ok_or_else(|| CliError::Bundle(format!("'{key}' is not an object")))?;
     Ok(DiscriminatorCommand {
-        executable: absolute_path(command, context, "executable")?,
+        executable: absolute_path(command, key, "executable")?,
         argv: string_list(command, "argv")?,
-        working_directory: absolute_path(command, context, "working_directory")?,
+        working_directory: absolute_path(command, key, "working_directory")?,
     })
 }
 
