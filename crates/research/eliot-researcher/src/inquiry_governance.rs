@@ -4272,8 +4272,15 @@ impl UnadmittedReference {
     /// reference binding now does, so the encoding moved to the one owner rather
     /// than being copied, and two spellings of a fence preimage would be two
     /// identities for the same fence.
+    ///
+    /// `v1` -> `v2` with that move. The fence's five components were five
+    /// top-level preimage fields and are now one `state_fence` field, so the
+    /// bytes changed under an unchanged name — which is the same defect the
+    /// `source-record/v2` and `frozen-inquiry/v3` bumps exist to prevent. A
+    /// diagnostic sealed under the old spelling cannot re-verify under this one
+    /// and needs re-sealing, not a grandfathered admission.
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("unadmitted-reference/v1;");
+        let mut preimage = String::from("unadmitted-reference/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
         push_field(&mut preimage, "reference", &self.reference);
