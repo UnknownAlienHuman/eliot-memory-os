@@ -284,10 +284,16 @@ fn close_with_retry(composition: &mut BrokerComposition) -> Result<(), String> {
 fn heartbeat_failure(composition: BrokerComposition, detail: String) -> ! {
     // A failed heartbeat has an unknown ORS outcome, so issuing a second
     // close request here could duplicate or misclassify the authoritative
-    // fence.  Dropping the composition first closes the broker-owned
-    // kill-on-close Job contour; its durable Active/Unknown snapshot remains
-    // for the next authenticated startup heartbeat/reconciliation pass.
-    drop(composition);
+    // fence.  The composition is deliberately NOT dropped here: since #1889
+    // this broker generation owns a kill-on-close Job Object that contains
+    // this very process, so dropping it would terminate the broker inside
+    // `drop` and the `BROKER_HEARTBEAT_REJECTED` diagnostic below would never
+    // be written.  `std::process::exit` does not run destructors, so the
+    // kill-on-close contour and every other handle are released by process
+    // teardown after the diagnostic is flushed, and the durable
+    // Active/Unknown snapshot remains for the next authenticated startup
+    // heartbeat/reconciliation pass either way.
+    let _composition = composition;
     exit(PROVIDER_REJECTED_EXIT, "BROKER_HEARTBEAT_REJECTED", detail)
 }
 
