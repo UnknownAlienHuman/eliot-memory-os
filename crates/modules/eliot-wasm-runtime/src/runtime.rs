@@ -9,6 +9,8 @@ use eliot_security_contracts::{
     IntegrityStatus, QuarantineState,
 };
 
+use crate::capsule::{ModuleContractKit, invoke_typed};
+use crate::component_contract::TypedContractError;
 use crate::lifecycle::{DivergenceReport, classify_reference_divergence};
 use crate::replacement::{
     DrainSnapshot, GenerationCoordinator, GenerationRecord, PrepareRequest, PreparedSummary,
@@ -161,6 +163,37 @@ impl WasmRuntime {
 
     /// Resolves external authority, starts through P-03, invokes, and caches.
     pub fn execute(&mut self, request: InvocationRequest) -> InvocationResult {
+        self.execute_inner(None, request)
+    }
+
+    /// Typed entry over the same Governor/authority/source/promotion/process
+    /// path as [`Self::execute`]. The caller supplies the Governor-admitted
+    /// [`ModuleContractKit`]; the sealed admission built inside still owns
+    /// world, artifact, interface, engine, and limit identity, and
+    /// [`ModuleContractKit::check_invocation`] enforces kit/admission
+    /// equality before the invocation reaches the injected engine through
+    /// the real neutral [`ComponentEnginePort`] API. A kit failure never
+    /// reaches the engine and is `Rejected`; engine and post-engine envelope
+    /// failures keep the exact raw-path taxonomy below. This adds no second
+    /// engine or authority owner: the same injected ports serve both paths.
+    ///
+    /// [`ComponentEnginePort`]: crate::ports::ComponentEnginePort
+    pub fn execute_typed(
+        &mut self,
+        kit: &ModuleContractKit,
+        request: InvocationRequest,
+    ) -> InvocationResult {
+        if let Err(error) = kit.validate() {
+            return plain_result(&request, InvocationDisposition::Rejected, error.into());
+        }
+        self.execute_inner(Some(kit), request)
+    }
+
+    fn execute_inner(
+        &mut self,
+        kit: Option<&ModuleContractKit>,
+        request: InvocationRequest,
+    ) -> InvocationResult {
         if let Err(error) = request.validate() {
             return plain_result(&request, InvocationDisposition::Rejected, error);
         }
@@ -188,7 +221,7 @@ impl WasmRuntime {
                 RuntimeError::Cancelled,
             );
         }
-        let cached = execute_uncached(self.ports.as_mut(), request);
+        let cached = execute_uncached(self.ports.as_mut(), request, kit);
         let result = cached.result.clone();
         self.cache_insert(cached.request.invocation_id.clone(), cached);
         result
@@ -418,6 +451,7 @@ impl WasmRuntime {
 fn execute_uncached(
     ports: Option<&mut RuntimePorts>,
     request: InvocationRequest,
+    kit: Option<&ModuleContractKit>,
 ) -> CachedInvocation {
     let Some(ports) = ports else {
         return cached_plain(
@@ -492,14 +526,56 @@ fn execute_uncached(
         );
     }
     let invocation = engine_invocation(&request, &admission, process_binding, start_receipt);
-    let Ok(report) = ports.engine.invoke(&invocation) else {
-        return cached_with_engine_unknown(
-            request,
-            admission,
-            envelope,
-            invocation,
-            RuntimeError::UnknownOutcome,
-        );
+    let report = if let Some(kit) = kit {
+        if let Err(error) = kit.check_invocation(&invocation) {
+            return cached_with_admission(
+                request,
+                admission,
+                InvocationDisposition::Rejected,
+                error.into(),
+            );
+        }
+        match invoke_typed(ports.engine.as_mut(), kit, &invocation) {
+            Ok(report) => report,
+            Err(
+                TypedContractError::EngineDenied
+                | TypedContractError::EngineUnavailable
+                | TypedContractError::EngineUnknown,
+            ) => {
+                return cached_with_engine_unknown(
+                    request,
+                    admission,
+                    envelope,
+                    invocation,
+                    RuntimeError::UnknownOutcome,
+                );
+            }
+            // The explicit pre-engine check above already passed, so only
+            // the post-engine envelope violations remain: the engine
+            // executed, but its report disagrees with the typed envelope.
+            // This mirrors the raw-path envelope branch below, which is
+            // `Unknown` with `EngineContractViolation`.
+            Err(_) => {
+                return cached_with_engine_unknown(
+                    request,
+                    admission,
+                    envelope,
+                    invocation,
+                    RuntimeError::EngineContractViolation,
+                );
+            }
+        }
+    } else {
+        let Ok(report) = ports.engine.invoke(&invocation) else {
+            return cached_with_engine_unknown(
+                request,
+                admission,
+                envelope,
+                invocation,
+                RuntimeError::UnknownOutcome,
+            );
+        };
+        report
     };
     let terminal_report = Some(report.clone());
     let p03_verified = if matches!(report.termination, EngineTermination::Completed) {
