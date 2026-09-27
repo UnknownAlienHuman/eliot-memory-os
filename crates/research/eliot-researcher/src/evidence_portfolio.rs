@@ -4015,6 +4015,32 @@ pub enum PrecisionKind {
     Version,
     /// Causal mechanism assertion.
     Causal,
+    /// Line-anchored assertion: the claimed line or line range of a citation.
+    ///
+    /// I21.7 names a *line* among the four things a file-level or
+    /// document-level support does not automatically support, and
+    /// [`Self::Coordinate`] already carries the general form of that rule over
+    /// the whole anchor ladder. This arm names the line rung so the residue says
+    /// *which* overreach it was instead of collapsing a false line anchor into an
+    /// unnamed coordinate, and it reads the ladder through the one
+    /// [`coordinate_rank`] owner rather than keeping a second rank table for the
+    /// single rung — the same single-owner reason
+    /// [`Self::Causal`] gives for reusing the declared-set form.
+    ///
+    /// The `line` and `byte_range` rungs this arm ranks against are the ones
+    /// `eliot_research_exchange_api::AnchorPrecision` spells, so this crate
+    /// never carries a rung the contract type cannot express.
+    Line,
+    /// Population-wide assertion: the population the statement holds for.
+    ///
+    /// A population is not a position inside a source, so this rung deliberately
+    /// has no place on the anchor ladder and must not be given one. It is
+    /// supported only when the support *declares* the asserted population, in
+    /// the same `|`-separated declared-set form [`Self::Causal`] already reads
+    /// for mechanisms: a document that happens to discuss a population does not
+    /// thereby evidence a statement about all of it, and an undeclared
+    /// population is refused rather than inferred from the basis prose.
+    Population,
     /// Coordinate/anchor assertion: the claimed anchor precision of a citation.
     ///
     /// I21.7: "A source that supports a file-level or document-level claim does
@@ -4022,6 +4048,12 @@ pub enum PrecisionKind {
     /// population-wide statement." The coordinate form of that rule is this
     /// kind: a citation may not claim an anchor finer than the support it
     /// actually carries.
+    ///
+    /// This is the ladder-wide arm; [`Self::Line`] is the named line rung of the
+    /// same rule. The `symbol` rung I21.7 lists beside `line` has no arm here
+    /// and no rung on `AnchorPrecision` either, so a symbol claim is
+    /// unrepresentable on this path rather than checked against a rank table the
+    /// contract type does not own.
     Coordinate,
 }
 
@@ -4063,6 +4095,12 @@ pub struct UnsupportedPrecisionItem {
 /// `source` is the coarsest anchor and `byte_range` the finest. A spelling this
 /// function does not know has no rank, and an unknown rank is never treated as
 /// coarse enough to admit a fine anchor.
+///
+/// This is the single rank table in this crate, shared by
+/// [`PrecisionKind::Coordinate`] and [`PrecisionKind::Line`]. It is derived from
+/// `AnchorPrecision`, not owned by it, so a rung may be added here only when
+/// `AnchorPrecision` carries the same spelling — the `symbol` rung I21.7 names
+/// is absent from both, which is why no arm ranks it.
 fn coordinate_rank(name: &str) -> Option<u8> {
     match name {
         "source" => Some(0),
@@ -4191,6 +4229,27 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             .supported
             .split('|')
             .any(|mechanism| mechanism.trim() == assertion.asserted.trim()),
+        // The line rung reads the same ladder `Coordinate` reads, through the
+        // same `coordinate_rank` owner, and differs only in the residue it
+        // produces. A second rank table for one rung would be the second,
+        // differently shaped vocabulary the `Coordinate` doc comment exists to
+        // prevent.
+        PrecisionKind::Line => match (
+            coordinate_rank(assertion.asserted.trim()),
+            coordinate_rank(assertion.supported.trim()),
+        ) {
+            (Some(asserted_rank), Some(supported_rank)) => asserted_rank <= supported_rank,
+            // An unrecognised spelling is never treated as supported, exactly as
+            // for `Coordinate`: an unknown rank fails closed.
+            _ => false,
+        },
+        // Declared-set membership, on the delimiter `Causal` already reads. The
+        // support has to name the population; nothing is inferred from the basis
+        // prose or from the asserted value's own shape.
+        PrecisionKind::Population => assertion
+            .supported
+            .split('|')
+            .any(|population| population.trim() == assertion.asserted.trim()),
         PrecisionKind::Coordinate => match (
             coordinate_rank(assertion.asserted.trim()),
             coordinate_rank(assertion.supported.trim()),
@@ -4220,6 +4279,17 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             PrecisionKind::Causal => (
                 "false causal mechanism without evidenced mechanism",
                 "name only evidenced mechanisms or declare correlation",
+            ),
+            PrecisionKind::Line => (
+                "a citation anchored at a line or line range finer than the admitted support would \
+                 be unbacked text",
+                "narrow the anchor to the supported precision or admit a source that supports it",
+            ),
+            PrecisionKind::Population => (
+                "a population-wide claim from support that declares a different or narrower \
+                 population",
+                "restate at the population the admitted coverage declares, or admit coverage of \
+                 the claimed population",
             ),
             PrecisionKind::Coordinate => (
                 "a citation at an anchor finer than the admitted support would be unbacked text",
