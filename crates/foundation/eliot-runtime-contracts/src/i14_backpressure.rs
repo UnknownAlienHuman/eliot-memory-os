@@ -83,7 +83,7 @@ pub struct BottleneckObservationV1 {
 
 /// Observed availability in the unit declared for one bottleneck.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(deny_unknown_fields, rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BottleneckAvailability {
     /// Owner observed less available capacity than the request requires.
     Exhausted { available_amount: u64 },
