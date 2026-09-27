@@ -17,7 +17,7 @@
 //! its execution owner (or the exact capability that is absent), and where its
 //! result is observed.
 //!
-//! Three properties are load-bearing, and they match the three the existing
+//! Four properties are load-bearing, and they match the three the existing
 //! [`crate::maintenance_trigger_evaluator`] seam states for itself:
 //!
 //! * **No drift from the enum.** Every family is written exactly once, in a
@@ -39,9 +39,15 @@
 //!   element I14.22 names — into a typed [`MaintenanceFamilyDecision`] value
 //!   rather than only into prose on an operational line. A triggered family that
 //!   cannot start is therefore reportable by something other than a rotatable
-//!   log, which is what the daemon's own persistent notification record
-//!   (`crate::notification_state_emit`) needs in order to state the exact
-//!   unavailable dependency instead of a generic cause.
+//!   log.
+//!
+//!   Stated rather than implied: the daemon's persistent notification record
+//!   (`crate::notification_state_emit::automation_failure_key`) is a different
+//!   owner's record and it currently builds its `required_action` from the
+//!   Governor's closed [`DecisionReason`] alone, so it does not yet carry
+//!   [`MaintenanceFamilyDecision`]. This module supplies the value; wiring that
+//!   owner to it is a separate change in a file this issue does not own, and it
+//!   is not claimed here.
 //! * **No direct execution.** This module never runs maintenance work, never
 //!   constructs an executor, and never calls a family owner. I14.22 requires
 //!   every start to be a Durable Job request, and the catalog resolves only
@@ -507,6 +513,13 @@ pub struct MaintenanceRecommendation {
     pub expected_benefit: &'static str,
     /// The cost class an admitted job for this family carries.
     pub cost: MaintenanceCostClass,
+    /// Whether the family's effect additionally needs its own route and
+    /// authority policy. I14.22: paid model calls, swarms, destructive
+    /// forgetting or purge, configuration publication, software updates and
+    /// migrations "require their separate route/authority policy even when the
+    /// maintenance family is automatic", so clearing the maintenance route is
+    /// not by itself sufficient for these families.
+    pub effect_policy: MaintenanceEffectPolicy,
     /// The expiry position. It names the absent owner instead of inventing a
     /// deadline, because no owner publishes a maintenance expiry to `eliotd`.
     pub expiry: &'static str,
@@ -522,12 +535,13 @@ impl MaintenanceRecommendation {
     pub fn text(&self) -> String {
         format!(
             "{action} Reason: {reason}. Expected benefit: {benefit}. Cost: {cost}. \
-             Evidence a result must carry: {evidence}. Expiry: {expiry}. \
-             Safe deferral: {deferral}.",
+             Effect policy: {effect}. Evidence a result must carry: {evidence}. \
+             Expiry: {expiry}. Safe deferral: {deferral}.",
             action = self.required_action,
             reason = self.reason,
             benefit = self.expected_benefit,
             cost = self.cost.class_name(),
+            effect = self.effect_policy.effect_description(),
             evidence = self.evidence.join("+"),
             expiry = self.expiry,
             deferral = self.deferral_consequence,
@@ -755,6 +769,7 @@ impl MaintenanceFamilyEntry {
             evidence: self.observation.receipt_refs,
             expected_benefit: self.obligation,
             cost: self.cost_class(),
+            effect_policy: self.effect_policy,
             expiry: UNPUBLISHED_MAINTENANCE_EXPIRY,
             deferral_consequence: format!(
                 "the trigger identity is keyed by {keys}, so repeated blocked starts of this family coalesce onto one record instead of re-notifying, the maintenance debt stays durable and is surfaced on the next eligible startup, and nothing reports this family as maintained",
