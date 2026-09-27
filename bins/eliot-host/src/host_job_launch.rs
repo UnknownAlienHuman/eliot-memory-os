@@ -369,10 +369,16 @@ impl HostJobBranches {
                 "branch Job Object is not a Host-owned outer kill domain".to_owned(),
             ));
         }
+        // Issue #1685: the requested approved limits travel through the #1888
+        // outer-kill-domain constructor and are bound to the observed enforced
+        // limits while still suspended; a divergence rejects the candidate
+        // before resume. Core branches carry kill-on-close containment with no
+        // job-memory ceiling, so no ceiling is threaded here.
+        let resource_limits = JobObjectLimits::default();
         let child = SuspendedJobChild::spawn_named_host_outer_kill_domain(
             spec,
             identity.clone(),
-            JobObjectLimits::default(),
+            resource_limits,
         )
         .map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
@@ -382,6 +388,12 @@ impl HostJobBranches {
         let expected = executable;
         let validated = child
             .validate(|evidence| {
+                // Issue #1685: bind the observed enforced limits to the
+                // requested approved limits while still suspended. A divergence
+                // rejects the candidate before resume; it never executes.
+                if evidence.enforced_limits() != Some(resource_limits) {
+                    return Err("approved job limits diverged before resume".to_owned());
+                }
                 let observed = std::fs::canonicalize(&evidence.process().image_path)
                     .map_err(|error| error.to_string())?;
                 if observed != expected {
