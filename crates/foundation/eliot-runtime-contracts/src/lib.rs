@@ -16,6 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod activation_lifecycle;
 mod control_reserve;
 mod hot_path;
 mod hot_path_profile;
@@ -28,6 +29,11 @@ mod supervision_incarnation;
 mod supervision_lease;
 mod watchdog_admission;
 
+pub use activation_lifecycle::{
+    ActivationContourState, ActivationLifecycle, ResumeBrokerIdentity, ResumeIdentityFamily,
+    ResumeIdentitySnapshot, ResumeIdentityVerdict, ResumeProcessIdentity, ResumeRevalidation,
+    revalidate_resume_identities,
+};
 pub use control_reserve::{
     BottleneckCapacityProfile, BottleneckCoverageState, BottleneckOwnerBinding, CapacityBottleneck,
     CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
