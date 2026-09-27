@@ -78,6 +78,44 @@
 //! existing durable backup/evidence owner, and no new snapshot database exists
 //! here.
 //!
+//! Aggregate admission is bounded, not just per capture. A per-capture limit
+//! does not bound a process-lifetime registry, so this owner charges a finite
+//! multidimensional budget vector ([`CaptureBudget`]) for begins in progress,
+//! live captures, retained payload/metadata bytes, terminal/tombstone entries and
+//! bytes, transient enumeration/response bytes, in-flight page/close calls and
+//! expiry cleanup work. The vector and the capture map are fields of the *same*
+//! value behind the *same* mutex, so a begin reserves before it enumerates and
+//! concurrent begins cannot each pass an unlocked size check.
+//!
+//! What the charges are and are not. They are conservative, versioned *charges*
+//! of the structures this owner retains, derived from the existing named
+//! per-capture limits in `eliot_store_api::backup_io` plus
+//! [`PER_MEMBER_CHARGE_BYTES`]; they are not a heap measurement and no RSS claim
+//! is made from serialized size. The transport's only finite limit on the
+//! enumeration call is `query_timeout_ms` in *time*: it carries no response
+//! ceiling, and the whole provider response is already decoded into
+//! `serde_json::Value` before this module sees any of it. That decode is
+//! unbounded and nothing here bounds it. What is bounded is everything this
+//! module builds on top of the decoded rows — see [`read_enumeration`] and
+//! [`decoded_class_bytes`].
+//!
+//! Reclamation does not depend on client traffic. Every installed capture
+//! registers a retirement deadline in the owner's expiry frontier
+//! ([`CaptureRegistry::expiry`]), and every retained terminal record registers
+//! its own bounded release deadline, so a bounded pass ([`run_expiry_pass`])
+//! reclaims both by walking only the deadlines that have come due — never the
+//! whole registry under the lock. That pass runs opportunistically from `begin`,
+//! which a begin-only client still reaches, and from page/end, and the
+//! supervised owner can drive the same entry point
+//! ([`snapshot_owner_maintenance_tick`]) when no request arrives at all.
+//! Retirement and evidence retention stay distinct: the heavy payload and the
+//! retained page response are freed while identity, source point, served
+//! accounting, interruption ledger and the final receipt survive, and the
+//! terminal-record space a capture needs for that transition is reserved *before*
+//! the capture is opened, so full normal capacity can never be the reason
+//! cleanup cannot proceed. The map is process memory and nothing here is
+//! restart-persistent.
+//!
 //! Reads only: this module never acquires `adapter.write_lock`, issues no
 //! DDL/migration, performs no restore, and defines no archive format. Every
 //! provider statement is a fixed adapter-owned `&'static str` assembled at
@@ -812,7 +850,18 @@ struct SnapshotState {
     /// Bytes accounted locally in those pages.
     bytes_served: u64,
     last_digest: String,
+    /// When the owner-issued window opened, observed *before* the expensive
+    /// setup of the begin that installed this capture.
+    ///
+    /// Elapsed-duration accounting starts here, so a slow setup cannot grant a
+    /// fresh insertion a new full duration.
     opened_at_ms: u64,
+    /// Bytes this entry currently charges against the aggregate retained-byte
+    /// dimension: the settled actual payload and retained-page allowance, or
+    /// zero once the accounted terminal transition freed them. The begin's
+    /// worst-case reservation is settled into this field at publish, and it is
+    /// released only when the payload is actually freed or the entry removed.
+    charged_capture_bytes: u64,
 }
 
 /// The heavyweight member payload of a live capture.
@@ -838,15 +887,573 @@ struct RetainedClose {
     retained_until_ms: u64,
 }
 
-/// Module-private capture registry keyed by handle digest.
-fn registry() -> &'static Mutex<HashMap<String, SnapshotState>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, SnapshotState>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// Conservative per-member retention charge, in bytes.
+///
+/// **No document names this value.** It is derived from the exact identifier
+/// shapes this module builds — [`MEMBER_ID_VERSION`] (21 bytes) plus a class
+/// token, plus a [`domain_key`] token, plus a 64-character SHA-256 digest, plus
+/// one `content_digest` and one `residency_digest` string — and rounded up to
+/// 512 bytes to cover the per-allocation headers, `String` capacities and `Vec`
+/// element slots one member costs. It bounds a *charge*; it is not a heap
+/// measurement and no RSS claim is made from it.
+const PER_MEMBER_CHARGE_BYTES: u64 = 512;
+
+/// Worst-case retained bytes one admitted capture may hold.
+///
+/// Derived entirely from existing named limits: [`MAX_SNAPSHOT_BYTES`] of
+/// source content, plus the per-member identity allowance for a full
+/// [`MAX_SNAPSHOT_MEMBERS`] denominator and for the one retained page response
+/// at [`MAX_SNAPSHOT_PAGE_MEMBERS`]. This is the "worst-case admitted
+/// allowance" a begin reserves before the provider is read, so a capture that
+/// is admitted can never later exceed what admission already accounted for.
+const RESERVED_CAPTURE_BYTES: u64 = MAX_SNAPSHOT_BYTES
+    + (MAX_SNAPSHOT_MEMBERS as u64 * PER_MEMBER_CHARGE_BYTES)
+    + RETAINED_PAGE_BYTES;
+
+/// Bytes the one retained page response is charged.
+///
+/// Derived from the existing named per-page ceiling
+/// [`MAX_SNAPSHOT_PAGE_MEMBERS`] × [`PER_MEMBER_CHARGE_BYTES`]: a live capture
+/// holds at most one retained page response, and it is freed by the accounted
+/// terminal transition.
+const RETAINED_PAGE_BYTES: u64 = MAX_SNAPSHOT_PAGE_MEMBERS as u64 * PER_MEMBER_CHARGE_BYTES;
+
+/// Worst-case transient enumeration/response bytes one in-progress begin holds.
+///
+/// Derived from the existing named content ceiling [`MAX_SNAPSHOT_BYTES`]: the
+/// decoded provider enumeration is refused as soon as its observed rows exceed
+/// it (see [`read_enumeration`]), so no admitted begin can transiently hold
+/// more than this.
+const RESERVED_ENUMERATION_BYTES: u64 = MAX_SNAPSHOT_BYTES;
+
+/// Bytes one retained terminal/tombstone record is charged.
+///
+/// **No document names this value.** It is derived from the retained record's
+/// own shape: the owner-issued handle's four identity strings, the operation
+/// identity, the end receipt's counters and completeness tag, and the bounded
+/// [`MAX_INTERRUPTION_REASONS`]-entry reason ledger — eight bounded strings at
+/// [`PER_MEMBER_CHARGE_BYTES`] each, doubled to cover the registry key and the
+/// receipt body, then rounded to 8 KiB.
+const TERMINAL_ENTRY_BYTES: u64 = 8 * 1024;
+
+/// Bounded capture begins that may hold a reservation at once.
+///
+/// **No document names this aggregate count.** Owner default: it admits
+/// independent begin-only clients enough concurrency to make progress while
+/// keeping the worst-case admitted allowance of
+/// [`BUDGET_MAX_LIVE_CAPTURES`] × [`RESERVED_CAPTURE_BYTES`] the true ceiling
+/// on concurrent enumeration work.
+const BUDGET_MAX_BEGINS_IN_PROGRESS: u64 = 4;
+
+/// Bounded live captures installed in the registry at once.
+///
+/// **No document names this aggregate count.** Owner default, chosen as the
+/// smallest value that keeps a real backup session (open, several pages, close)
+/// serviceable next to a second one while still bounding the retained set to
+/// [`BUDGET_MAX_RETAINED_BYTES`].
+const BUDGET_MAX_LIVE_CAPTURES: u64 = 8;
+
+/// Bounded retained capture payload and metadata bytes.
+///
+/// **No document names this aggregate byte budget.** Owner default: exactly the
+/// worst-case allowance of every live capture, so the retained-byte dimension
+/// is derived from [`RESERVED_CAPTURE_BYTES`] rather than chosen independently.
+const BUDGET_MAX_RETAINED_BYTES: u64 = BUDGET_MAX_LIVE_CAPTURES * RESERVED_CAPTURE_BYTES;
+
+/// Bounded retained terminal/tombstone entries.
+///
+/// **No document names this aggregate count.** Owner default, four times
+/// [`BUDGET_MAX_LIVE_CAPTURES`]: every live capture holds its terminal-record
+/// space from begin, so a saturated registry can still close every capture it
+/// admitted instead of being unable to reclaim one.
+const BUDGET_MAX_TERMINAL_ENTRIES: u64 = 4 * BUDGET_MAX_LIVE_CAPTURES;
+
+/// Bounded retained terminal/tombstone bytes.
+///
+/// Derived from [`BUDGET_MAX_TERMINAL_ENTRIES`] × [`TERMINAL_ENTRY_BYTES`], so
+/// the byte dimension is never chosen independently of the entry dimension.
+const BUDGET_MAX_TERMINAL_BYTES: u64 = BUDGET_MAX_TERMINAL_ENTRIES * TERMINAL_ENTRY_BYTES;
+
+/// Bounded page/close calls in flight across the whole registry.
+///
+/// **No document names this aggregate count.** Owner default, twice the live
+/// capture ceiling: every live capture admits exactly one in-flight claim, so
+/// this dimension is the aggregate statement of that per-capture rule and is
+/// never the tighter of the two.
+const BUDGET_MAX_ACTIVE_PAGE_CALLS: u64 = 2 * BUDGET_MAX_LIVE_CAPTURES;
+
+/// Bounded expiry work one maintenance pass may perform.
+///
+/// **No document names this value.** Owner default: the pass walks only the
+/// deadlines that have actually come due, so this bounds the pass without
+/// bounding the registry.
+const BUDGET_MAX_CLEANUP_STEPS: u64 = 32;
+
+/// The one dimension this owner accounts separately, and the exact static field
+/// a refusal of it names.
+///
+/// I14.3: "Reserve accounting is multidimensional. Admission checks the exact
+/// bottleneck vector rather than one scalar percentage; exhaustion of CPU,
+/// memory, pipe bytes, ORS writes, disk queue or handles may independently close
+/// normal/background admission while preserving the applicable recovery/control
+/// lane. Each disposition names the exhausted resource and the work shed,
+/// deferred or quarantined." The field names the resource; the paired reason
+/// names the work that was shed and the condition that makes a retry valid.
+///
+/// The `snapshot.budget.v1.` prefix in every field below is the versioned
+/// identity of this charge model, I5.27: "Canonical
+/// encoding is deterministic and versioned". A refusal therefore names both the
+/// exhausted dimension and the charge model that refused it, so a future
+/// re-version of the vector cannot be read as the same verdict. The version is
+/// carried by the field name alone: this module mints no extra signature,
+/// digest, receipt, nonce or generation to carry it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BudgetDimension {
+    /// Begins holding a reservation but not yet installed.
+    BeginsInProgress,
+    /// Installed captures still holding a member payload.
+    LiveCaptures,
+    /// Retained member payload and metadata bytes.
+    RetainedBytes,
+    /// Retained terminal/tombstone entries.
+    TerminalEntries,
+    /// Retained terminal/tombstone bytes.
+    TerminalBytes,
+    /// Transient enumeration/response bytes held by an in-progress begin.
+    EnumerationBytes,
+    /// Page/close calls currently inside their provider await.
+    ActivePageCalls,
+    /// Expiry maintenance work one pass may still perform.
+    CleanupSteps,
 }
 
-fn lock_registry()
--> Result<std::sync::MutexGuard<'static, HashMap<String, SnapshotState>>, StoreError> {
+impl BudgetDimension {
+    /// The exact exhausted dimension named in the bounded error surface.
+    const fn field(self) -> &'static str {
+        match self {
+            Self::BeginsInProgress => "snapshot.budget.v1.begins_in_progress",
+            Self::LiveCaptures => "snapshot.budget.v1.live_captures",
+            Self::RetainedBytes => "snapshot.budget.v1.retained_bytes",
+            Self::TerminalEntries => "snapshot.budget.v1.terminal_entries",
+            Self::TerminalBytes => "snapshot.budget.v1.terminal_bytes",
+            Self::EnumerationBytes => "snapshot.budget.v1.enumeration_bytes",
+            Self::ActivePageCalls => "snapshot.budget.v1.active_page_calls",
+            Self::CleanupSteps => "snapshot.budget.v1.cleanup_steps",
+        }
+    }
+
+    /// The retry/cleanup condition that makes a retry of this dimension valid.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::BeginsInProgress => {
+                "concurrent capture begins hold every in-progress slot; retry once a begin publishes or is refused"
+            }
+            Self::LiveCaptures => {
+                "every live capture slot is reserved or installed; close a capture or let one expire, then retry"
+            }
+            Self::RetainedBytes => {
+                "retained capture bytes are saturated; close a capture or let one expire to free its payload, then retry"
+            }
+            Self::TerminalEntries => {
+                "retained terminal record slots are saturated; retry once an expired terminal record is released"
+            }
+            Self::TerminalBytes => {
+                "retained terminal record bytes are saturated; retry once an expired terminal record is released"
+            }
+            Self::EnumerationBytes => {
+                "in-progress enumerations hold every transient byte slot; retry once one publishes or is refused"
+            }
+            Self::ActivePageCalls => {
+                "in-flight page and close calls hold every call slot; retry once one settles"
+            }
+            Self::CleanupSteps => {
+                "one bounded expiry maintenance pass is saturated; retry on a later begin or supervised tick"
+            }
+        }
+    }
+}
+
+/// Names one exhausted budget dimension and its valid retry condition.
+fn budget_refusal(dimension: BudgetDimension) -> StoreError {
+    StoreError::InvalidField {
+        field: dimension.field(),
+        reason: dimension.reason(),
+    }
+}
+
+/// Static error field for capture accounting that can no longer be trusted.
+const CAPTURE_BUDGET_UNUSABLE_FIELD: &str = "snapshot.budget.v1.accounting";
+
+/// Static error reason for capture accounting that can no longer be trusted.
+///
+/// The refusal closes new admission. It never certifies zero usage: no counter
+/// is reset and no entry is cleared to recover availability.
+const CAPTURE_BUDGET_UNUSABLE_REASON: &str = "capture accounting could not be reconciled; new admission stays closed and the recorded charges are unchanged";
+
+/// One finite, owner-issued budget dimension: a hard limit and a running charge.
+struct Charge {
+    dimension: BudgetDimension,
+    limit: u64,
+    charged: u64,
+}
+
+impl Charge {
+    const fn new(dimension: BudgetDimension, limit: u64) -> Self {
+        Self {
+            dimension,
+            limit,
+            charged: 0,
+        }
+    }
+
+    /// Reserves `units`, refusing rather than overcommitting.
+    ///
+    /// Checked arithmetic: a reservation that would overflow is a refusal, never
+    /// a wrapped charge that understates the load.
+    fn reserve(&mut self, units: u64) -> Result<(), StoreError> {
+        let next = self
+            .charged
+            .checked_add(units)
+            .ok_or_else(|| budget_refusal(self.dimension))?;
+        if next > self.limit {
+            return Err(budget_refusal(self.dimension));
+        }
+        self.charged = next;
+        Ok(())
+    }
+
+    /// Releases `units` this owner actually held.
+    ///
+    /// `false` means the release exceeded the recorded charge, which is an
+    /// ownership or reconciliation defect. It is never absorbed: the recorded
+    /// charge is left exactly as it is — never zeroed — so the defect stays
+    /// visible instead of becoming fabricated headroom.
+    fn release(&mut self, units: u64) -> bool {
+        if units > self.charged {
+            return false;
+        }
+        self.charged -= units;
+        true
+    }
+
+    /// Settles a worst-case reservation to the charge actually transferred.
+    ///
+    /// The actual charge is always at most the reservation, so this can only
+    /// shrink the dimension; it never grows it and never re-arms headroom a
+    /// caller already exhausted.
+    fn settle_to(&mut self, reserved: u64, actual: u64) {
+        debug_assert!(
+            actual <= reserved,
+            "a settled charge may only shrink below its worst-case reservation"
+        );
+        self.charged = self.charged.saturating_sub(reserved);
+        self.charged = self.charged.saturating_add(actual.min(reserved));
+    }
+}
+
+/// The finite aggregate budget vector this owner accounts against.
+///
+/// One value, guarded by the same mutex as the capture map: there is no second
+/// lock, no second registry and no second writer. Admission reads and charges
+/// this vector under that one lock, so two concurrent begins cannot both pass
+/// an unlocked size check.
+struct CaptureBudget {
+    begins_in_progress: Charge,
+    live_captures: Charge,
+    retained_bytes: Charge,
+    terminal_entries: Charge,
+    terminal_bytes: Charge,
+    enumeration_bytes: Charge,
+    active_page_calls: Charge,
+    cleanup_steps: Charge,
+    /// Sticky: set when a charge could not be reconciled. New admission stays
+    /// closed until the process restarts, and no counter is reset to recover
+    /// availability.
+    unusable: bool,
+}
+
+impl CaptureBudget {
+    /// The finite validated owner default. Never an unlimited fallback: every
+    /// dimension is a literal finite limit, and the two derived byte dimensions
+    /// are computed from the named per-capture limits above.
+    const fn owner_default() -> Self {
+        Self {
+            begins_in_progress: Charge::new(
+                BudgetDimension::BeginsInProgress,
+                BUDGET_MAX_BEGINS_IN_PROGRESS,
+            ),
+            live_captures: Charge::new(BudgetDimension::LiveCaptures, BUDGET_MAX_LIVE_CAPTURES),
+            retained_bytes: Charge::new(BudgetDimension::RetainedBytes, BUDGET_MAX_RETAINED_BYTES),
+            terminal_entries: Charge::new(
+                BudgetDimension::TerminalEntries,
+                BUDGET_MAX_TERMINAL_ENTRIES,
+            ),
+            terminal_bytes: Charge::new(BudgetDimension::TerminalBytes, BUDGET_MAX_TERMINAL_BYTES),
+            enumeration_bytes: Charge::new(
+                BudgetDimension::EnumerationBytes,
+                BUDGET_MAX_LIVE_CAPTURES * RESERVED_ENUMERATION_BYTES,
+            ),
+            active_page_calls: Charge::new(
+                BudgetDimension::ActivePageCalls,
+                BUDGET_MAX_ACTIVE_PAGE_CALLS,
+            ),
+            cleanup_steps: Charge::new(BudgetDimension::CleanupSteps, BUDGET_MAX_CLEANUP_STEPS),
+            unusable: false,
+        }
+    }
+
+    /// Reserves `units` against one dimension.
+    fn reserve(&mut self, dimension: BudgetDimension, units: u64) -> Result<(), StoreError> {
+        self.charge_mut(dimension).reserve(units)
+    }
+
+    /// Releases `units` against one dimension, or marks accounting unusable.
+    ///
+    /// A release larger than the recorded charge never zeroes anything: the
+    /// charge stands and admission closes (I14.3 fail-closed).
+    fn release(&mut self, dimension: BudgetDimension, units: u64) {
+        if !self.charge_mut(dimension).release(units) {
+            self.unusable = true;
+        }
+    }
+
+    /// Fails closed when the accounting itself cannot be trusted.
+    fn refuse_if_unusable(&self) -> Result<(), StoreError> {
+        if self.unusable {
+            return Err(StoreError::InvalidField {
+                field: CAPTURE_BUDGET_UNUSABLE_FIELD,
+                reason: CAPTURE_BUDGET_UNUSABLE_REASON,
+            });
+        }
+        Ok(())
+    }
+
+    fn charge_mut(&mut self, dimension: BudgetDimension) -> &mut Charge {
+        match dimension {
+            BudgetDimension::BeginsInProgress => &mut self.begins_in_progress,
+            BudgetDimension::LiveCaptures => &mut self.live_captures,
+            BudgetDimension::RetainedBytes => &mut self.retained_bytes,
+            BudgetDimension::TerminalEntries => &mut self.terminal_entries,
+            BudgetDimension::TerminalBytes => &mut self.terminal_bytes,
+            BudgetDimension::EnumerationBytes => &mut self.enumeration_bytes,
+            BudgetDimension::ActivePageCalls => &mut self.active_page_calls,
+            BudgetDimension::CleanupSteps => &mut self.cleanup_steps,
+        }
+    }
+}
+
+/// One retirement/release deadline a capture owes the expiry frontier.
+///
+/// The frontier is a deadline index, not a cursor: a pass reads only the
+/// deadlines that have actually come due, so the whole registry is never walked
+/// under the lock on any call. An entry that a pass cannot act on yet stays in
+/// the index, so a sweep can never silently forget it.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ExpiryDeadline {
+    at_ms: u64,
+    stage: ExpiryStage,
+    digest: String,
+}
+
+/// Which accounted step a due deadline authorises.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum ExpiryStage {
+    /// The owner window closed: run the accounted payload-to-terminal transition.
+    Retire,
+    /// The retained terminal record's replay horizon ended: release the entry.
+    Release,
+}
+
+/// Computes a fail-closed deadline from an observed base and a declared span.
+///
+/// An overflow means the observation is not trustworthy, so the deadline comes
+/// due immediately rather than never. `saturating_add` would return
+/// `u64::MAX` and make the entry permanently un-retirable, which is exactly the
+/// unbounded lease this refuses.
+fn fail_closed_deadline(base_ms: u64, span_ms: u64) -> u64 {
+    base_ms.checked_add(span_ms).unwrap_or(0)
+}
+
+/// The module-private capture registry, its aggregate budget and its expiry
+/// frontier — one mutable owner behind one mutex.
+///
+/// The map is reached through `Deref`/`DerefMut` so the existing entry-level
+/// transitions read exactly as they always did; the budget and the frontier are
+/// additional fields of the *same* value, guarded by the *same* lock. There is
+/// deliberately no second lock, no second registry and no second writer.
+struct CaptureRegistry {
+    captures: HashMap<String, SnapshotState>,
+    budget: CaptureBudget,
+    /// Ordered deadlines so a maintenance pass is bounded by the work that is
+    /// actually due, not by the size of the registry.
+    expiry: std::collections::BTreeSet<ExpiryDeadline>,
+}
+
+impl std::ops::Deref for CaptureRegistry {
+    type Target = HashMap<String, SnapshotState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.captures
+    }
+}
+
+impl std::ops::DerefMut for CaptureRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.captures
+    }
+}
+
+/// Module-private capture registry keyed by handle digest.
+fn registry() -> &'static Mutex<CaptureRegistry> {
+    static REGISTRY: OnceLock<Mutex<CaptureRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        Mutex::new(CaptureRegistry {
+            captures: HashMap::new(),
+            budget: CaptureBudget::owner_default(),
+            expiry: std::collections::BTreeSet::new(),
+        })
+    })
+}
+
+fn lock_registry() -> Result<std::sync::MutexGuard<'static, CaptureRegistry>, StoreError> {
     registry().lock().map_err(|_| StoreError::Unavailable)
+}
+
+/// Reserves one genuinely new begin's whole allowance, atomically.
+///
+/// Every dimension is reserved under the one registry lock the caller already
+/// holds, so two concurrent distinct begins cannot both pass an unlocked size
+/// check: the second observes the first's charges and is refused with the exact
+/// exhausted dimension. The units reserved here are, in order:
+///
+/// * one in-progress begin;
+/// * one live-capture slot;
+/// * the worst-case admitted allowance of [`RESERVED_CAPTURE_BYTES`];
+/// * the worst-case transient enumeration allowance of
+///   [`RESERVED_ENUMERATION_BYTES`];
+/// * one terminal-record entry *and* its bytes, so a registry whose normal
+///   capacity is full can still complete the payload-to-terminal transition for
+///   every capture it admitted.
+fn reserve_begin(registry: &mut CaptureRegistry) -> Result<BeginReservation, StoreError> {
+    let budget = &mut registry.budget;
+    budget.reserve(BudgetDimension::BeginsInProgress, 1)?;
+    if let Err(error) = reserve_capture_units(budget) {
+        budget.release(BudgetDimension::BeginsInProgress, 1);
+        return Err(error);
+    }
+    Ok(BeginReservation {
+        capture_bytes: RESERVED_CAPTURE_BYTES,
+        settled: false,
+    })
+}
+
+/// Reserves the four per-capture dimensions a begin owns, in a fixed order.
+///
+/// Split from [`reserve_begin`] only so the already-taken in-progress unit can
+/// be returned exactly once on the failure path; both run inside the one
+/// acquisition.
+fn reserve_capture_units(budget: &mut CaptureBudget) -> Result<(), StoreError> {
+    budget.reserve(BudgetDimension::LiveCaptures, 1)?;
+    if let Err(error) = budget.reserve(BudgetDimension::RetainedBytes, RESERVED_CAPTURE_BYTES) {
+        budget.release(BudgetDimension::LiveCaptures, 1);
+        return Err(error);
+    }
+    if let Err(error) = budget.reserve(
+        BudgetDimension::EnumerationBytes,
+        RESERVED_ENUMERATION_BYTES,
+    ) {
+        budget.release(BudgetDimension::RetainedBytes, RESERVED_CAPTURE_BYTES);
+        budget.release(BudgetDimension::LiveCaptures, 1);
+        return Err(error);
+    }
+    // Terminal-record space is reserved *before* the capture is opened, so full
+    // normal capacity can never be the reason a cleanup cannot proceed.
+    budget.reserve(BudgetDimension::TerminalEntries, 1)?;
+    if let Err(error) = budget.reserve(BudgetDimension::TerminalBytes, TERMINAL_ENTRY_BYTES) {
+        budget.release(BudgetDimension::TerminalEntries, 1);
+        budget.release(
+            BudgetDimension::EnumerationBytes,
+            RESERVED_ENUMERATION_BYTES,
+        );
+        budget.release(BudgetDimension::RetainedBytes, RESERVED_CAPTURE_BYTES);
+        budget.release(BudgetDimension::LiveCaptures, 1);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The units one in-progress begin holds, released or transferred exactly once.
+///
+/// The reservation is taken before the provider is read and owned across that
+/// await. It is not `Clone` and no registry mutex is ever held across the await
+/// it spans (I5.7); a future dropped here releases exactly its own units and
+/// touches nothing else in the registry.
+///
+/// Every path settles it exactly once: rejection, cancellation and a
+/// publish-versus-cancel race all reach `Drop` armed, and only a successful
+/// publish reaches [`BeginReservation::settle`].
+struct BeginReservation {
+    /// Bytes this reservation holds against the retained-byte dimension.
+    capture_bytes: u64,
+    /// Set once the units have been transferred to an installed capture.
+    settled: bool,
+}
+
+impl BeginReservation {
+    /// Transfers the reservation to the capture just installed.
+    ///
+    /// The retained-byte dimension settles from the worst-case admitted
+    /// allowance down to the actual retained charge, which can only shrink it.
+    /// The transient enumeration allowance is released, because the decoded
+    /// observation is dropped before the member payload is installed. The
+    /// in-progress unit is released, because the begin is now an installed
+    /// capture. The live-capture slot and the reserved terminal-record space
+    /// are *kept* charged: they are the installed capture's own units now, and
+    /// the entry releases them when its payload is actually freed and when the
+    /// entry is actually removed.
+    fn settle(&mut self, budget: &mut CaptureBudget, actual_capture_bytes: u64) {
+        budget
+            .retained_bytes
+            .settle_to(self.capture_bytes, actual_capture_bytes);
+        self.capture_bytes = actual_capture_bytes;
+        budget.release(
+            BudgetDimension::EnumerationBytes,
+            RESERVED_ENUMERATION_BYTES,
+        );
+        budget.release(BudgetDimension::BeginsInProgress, 1);
+        self.settled = true;
+    }
+}
+
+impl Drop for BeginReservation {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // Poisoned accounting is an observable recovery limitation, not
+        // successful cleanup: the units stay charged, so admission stays
+        // backpressured instead of silently gaining headroom.
+        let Ok(mut registry) = registry().lock() else {
+            return;
+        };
+        release_capture_units(&mut registry.budget, self.capture_bytes);
+        registry
+            .budget
+            .release(BudgetDimension::BeginsInProgress, 1);
+    }
+}
+
+/// Returns every unit a begin reservation owns, in the reverse of the order it
+/// was taken.
+fn release_capture_units(budget: &mut CaptureBudget, capture_bytes: u64) {
+    budget.release(BudgetDimension::TerminalBytes, TERMINAL_ENTRY_BYTES);
+    budget.release(BudgetDimension::TerminalEntries, 1);
+    budget.release(
+        BudgetDimension::EnumerationBytes,
+        RESERVED_ENUMERATION_BYTES,
+    );
+    budget.release(BudgetDimension::RetainedBytes, capture_bytes);
+    budget.release(BudgetDimension::LiveCaptures, 1);
 }
 
 /// Issues the next capture incarnation identity.
@@ -921,11 +1528,11 @@ fn require_retained_handle(
 /// is what makes the namespace claim observable. A deliberate refresh needs its
 /// own new logical capture; it never resets the open one.
 fn retained_begin_handle(
+    states: &CaptureRegistry,
     digest: &str,
     request: &SnapshotBeginRequest,
 ) -> Result<Option<SnapshotHandle>, StoreError> {
-    let states = lock_registry()?;
-    for (claimed, state) in states.iter() {
+    for (claimed, state) in &states.captures {
         if claimed != digest
             && state.issued.operation_id == request.operation.operation_id
             && state.issued.idempotency_key == request.operation.idempotency_key
@@ -933,12 +1540,25 @@ fn retained_begin_handle(
             return Err(StoreError::IdentityConflict);
         }
     }
-    Ok(states.get(digest).map(|state| state.issued.clone()))
+    Ok(states
+        .captures
+        .get(digest)
+        .map(|state| state.issued.clone()))
 }
 
 /// Reports whether a capture can no longer serve: owner expiry passed (or
 /// non-positive, which is fail-closed expired) or the capture duration bound
 /// is overrun. `try_from` keeps the `i64` expiry conversion exact.
+///
+/// Both deadline conventions of this module are preserved exactly as they
+/// already were: the absolute expiry is **inclusive** — a capture whose expiry
+/// equals the observation is still live — and the terminal replay horizon is
+/// **exclusive**, released only once the observation is strictly past it.
+///
+/// A backward or unknown clock observation is fail-closed expired rather than
+/// granted a fresh duration. `saturating_sub` would map a backward reading to
+/// zero elapsed time and hand the capture another full lease on every step, so
+/// the direction is checked explicitly instead.
 fn is_retired(
     expires_at_unix_ms: i64,
     opened_at_ms: u64,
@@ -951,7 +1571,10 @@ fn is_retired(
     if !u64::try_from(expires_at_unix_ms).is_ok_and(|expiry| expiry >= now_ms) {
         return true;
     }
-    now_ms.saturating_sub(opened_at_ms) > max_duration_ms
+    if now_ms < opened_at_ms {
+        return true;
+    }
+    now_ms - opened_at_ms > max_duration_ms
 }
 
 /// Gates on readiness/generation (no fallback client, no ambient DB) and then
@@ -1174,6 +1797,7 @@ async fn read_enumeration(
         .map_err(redact_snapshot_error)?;
     let point = parse_capture_point(meta, fence)?;
     let mut rows = Vec::new();
+    let mut observed_bytes: u64 = 0;
     for offset in 0..captured_member_classes().count() {
         let offset = offset + 3;
         let class_rows: Vec<Map<String, Value>> = response
@@ -1183,9 +1807,47 @@ async fn read_enumeration(
         if class_rows.len() > crate::client::MEMBER_CLASS_ROW_LIMIT {
             return Err(StoreError::PayloadTooLarge);
         }
+        // The transient size bound, enforced here — at the observation boundary,
+        // before any further materialization. The decoded observation is charged
+        // and checked against the existing named content ceiling
+        // [`MAX_SNAPSHOT_BYTES`] as each class arrives, so a store larger than the
+        // supported capture is refused as a whole rather than truncated into a
+        // smaller-but-complete-looking denominator.
+        observed_bytes = observed_bytes.saturating_add(decoded_class_bytes(&class_rows));
+        if observed_bytes > MAX_SNAPSHOT_BYTES {
+            return Err(StoreError::PayloadTooLarge);
+        }
         rows.push(class_rows);
     }
     Ok((point, rows))
+}
+
+/// Charges the decoded representation of one provider class result.
+///
+/// This is a *charge*, not a heap measurement: `serde_json::to_string` re-encodes
+/// the exact decoded structure this function already holds, without
+/// canonicalization, so key ordering can only move the number and the claim stays
+/// a bounded charge of the observed rows. A row that cannot be re-encoded is not
+/// measurable, so it is charged out rather than charged as free.
+///
+/// Unbounded decode, named explicitly: the transport's only finite limits on this
+/// call are `query_timeout_ms` in *time* and nothing at all in *bytes*
+/// (`client/session.rs` carries no response-size ceiling), and
+/// `RpcResults::from_value` has already decoded the whole provider response into
+/// `serde_json::Value` before this module sees any of it. Nothing here bounds that
+/// decode, and the registry's counter does not either. What this bound does prove
+/// is narrower and real: every structure this module *builds on top of* the
+/// decoded rows — the member vector, the key index, the reference closure, the
+/// scope projection and the retained page copies — is refused before it is
+/// materialized.
+fn decoded_class_bytes(rows: &[Map<String, Value>]) -> u64 {
+    rows.iter().fold(0_u64, |total, row| {
+        let charge = match serde_json::to_string(row) {
+            Ok(encoded) => u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+            Err(_) => u64::MAX,
+        };
+        total.saturating_add(charge)
+    })
 }
 
 /// Digest of the exact canonical bytes of one observed row.
@@ -1907,7 +2569,7 @@ const MAX_INTERRUPTION_REASONS: usize = 8;
 /// A claim from another incarnation never annotates this entry: a replaced
 /// capture keeps its own evidence untouched.
 fn merge_interruption(
-    states: &mut HashMap<String, SnapshotState>,
+    states: &mut CaptureRegistry,
     digest: &str,
     incarnation: u64,
     reason: InterruptionReason,
@@ -1952,11 +2614,7 @@ fn merge_interruption(
 /// (the source advanced), `INTERRUPTION_WINDOW_CLOSED` (the owner window or
 /// duration bound closed), `INTERRUPTION_PAGE_BOUND` and
 /// `INTERRUPTION_CAPTURE_EXHAUSTED` all stay terminal forever.
-fn resolve_transient_read(
-    states: &mut HashMap<String, SnapshotState>,
-    digest: &str,
-    incarnation: u64,
-) {
+fn resolve_transient_read(states: &mut CaptureRegistry, digest: &str, incarnation: u64) {
     let Some(state) = states.get_mut(digest) else {
         return;
     };
@@ -2023,7 +2681,7 @@ impl CaptureCallClaim {
     /// Explicit completion disarms the local claim only after the state
     /// transition it belongs to, so an exit that fails before its transition
     /// leaves the claim armed and `Drop` releases it.
-    fn settle(&mut self, states: &mut HashMap<String, SnapshotState>) {
+    fn settle(&mut self, states: &mut CaptureRegistry) {
         release_claim_slot(states, &self.digest, self.claim_id);
         self.settled = true;
     }
@@ -2055,9 +2713,14 @@ impl Drop for CaptureCallClaim {
 /// Releases exactly one call's claim slot, and nothing else.
 ///
 /// A slot that no longer carries this claim id belongs to a successor, so this
-/// can neither release a successor's claim nor annotate or delete it.
-fn release_claim_slot(states: &mut HashMap<String, SnapshotState>, digest: &str, claim_id: u64) {
-    let Some(state) = states.get_mut(digest) else {
+/// can neither release a successor's claim nor annotate or delete it, and the
+/// aggregate in-flight-call charge is returned only for the slot this claim id
+/// actually owned. That identity check is what makes the publish-versus-cancel
+/// and page-versus-retire races charge-correct: a late release of a superseded
+/// claim releases nothing, because the units it would have released were
+/// already returned by the release that cleared the slot.
+fn release_claim_slot(registry: &mut CaptureRegistry, digest: &str, claim_id: u64) {
+    let Some(state) = registry.captures.get_mut(digest) else {
         return;
     };
     if state
@@ -2066,6 +2729,7 @@ fn release_claim_slot(states: &mut HashMap<String, SnapshotState>, digest: &str,
         .is_some_and(|slot| slot.claim_id == claim_id)
     {
         state.claim = None;
+        registry.budget.release(BudgetDimension::ActivePageCalls, 1);
     }
 }
 
@@ -2160,54 +2824,106 @@ fn capture_is_retired(state: &SnapshotState, now_ms: u64) -> bool {
     )
 }
 
-/// Applies the accounted expiry transition to every capture but `keep`.
+/// Runs one bounded pass of the owner-lifecycle expiry maintenance.
 ///
-/// This is not a deletion pass any more. A retired capture is converted into the
-/// same terminal record an explicit close would produce — the exact served
-/// counters it reached, an `Expired` completeness, its identity and its
-/// interruption ledger retained, its heavy payload freed — so an operator can
-/// still read what a capture that nobody closed actually served. Only after that
-/// accounted transition, and only for a capture whose replay horizon has ended,
-/// is the bounded record released.
-///
-/// A capture with a live call claim is skipped entirely: no claim may lose the
-/// payload it is currently serving from, and #2691's supervised sweep reaches the
-/// same transition later.
-fn account_expired_captures(states: &mut HashMap<String, SnapshotState>, now_ms: u64, keep: &str) {
-    let expired: Vec<String> = states
-        .iter()
-        .filter(|(digest, state)| {
-            digest.as_str() != keep
-                && state.claim.is_none()
-                && state.terminal.is_none()
-                && capture_is_retired(state, now_ms)
-        })
-        .map(|(digest, _)| digest.clone())
-        .collect();
-    for digest in expired {
-        account_expiry(states, &digest);
-    }
-    release_expired_terminal_records(states, now_ms);
+/// This is the narrow owner-lifecycle entry point: it needs no provider I/O, no
+/// page, no end and no caller-supplied handle, so the supervised owner can tick
+/// it when clients have disappeared and no request arrives at all. It is
+/// fail-closed and idempotent — ticking it twice, or racing it with a request,
+/// applies the same accounted transitions at most once each.
+pub(crate) fn snapshot_owner_maintenance_tick(now_ms: u64) -> Result<(), StoreError> {
+    let mut states = lock_registry()?;
+    states.budget.refuse_if_unusable()?;
+    run_expiry_pass(&mut states, now_ms, None);
+    Ok(())
 }
 
-/// Performs the accounted payload-to-terminal transition for one retired capture.
+/// Applies at most one bounded pass of due expiry work.
+///
+/// The pass is bounded twice over, and both bounds are owner-issued: it visits
+/// only deadlines that have actually come due in the [`CaptureRegistry::expiry`]
+/// index, never the whole registry, and it performs at most
+/// [`BUDGET_MAX_CLEANUP_STEPS`] accounted steps. A capture with a live call
+/// claim is skipped — no claim may lose the payload it is currently serving —
+/// and its deadline stays in the index, so skipping never forgets it.
+fn run_expiry_pass(states: &mut CaptureRegistry, now_ms: u64, keep: Option<&str>) {
+    // The work this pass performs is itself a charged dimension, so an
+    // unbounded sweep cannot hide inside the accounting: the charge is taken
+    // before any step and returned when the pass ends. A saturated cleanup
+    // dimension is a refusal, never a silent full pass.
+    if states
+        .budget
+        .reserve(BudgetDimension::CleanupSteps, BUDGET_MAX_CLEANUP_STEPS)
+        .is_err()
+    {
+        return;
+    }
+    let mut steps = 0_u64;
+    while steps < BUDGET_MAX_CLEANUP_STEPS {
+        let due = states
+            .expiry
+            .iter()
+            .find(|deadline| deadline.at_ms <= now_ms && keep != Some(deadline.digest.as_str()))
+            .cloned();
+        let Some(deadline) = due else {
+            break;
+        };
+        // The entry is removed from the frontier only once the accounted step
+        // for it is taken; a step that declines to act re-arms the deadline, so
+        // unresolved evidence is retried instead of being forgotten or evicted.
+        states.expiry.remove(&deadline);
+        steps = steps.saturating_add(1);
+        let settled = match deadline.stage {
+            ExpiryStage::Retire => account_expiry(states, &deadline.digest, now_ms),
+            ExpiryStage::Release => release_terminal_record(states, &deadline.digest, now_ms),
+        };
+        if !settled {
+            states.expiry.insert(deadline);
+        }
+    }
+    states.budget.release(BudgetDimension::CleanupSteps, steps);
+}
+
+/// Performs the accounted payload-to-terminal transition for one retired
+/// capture. Reports whether the frontier may drop this deadline.
+///
+/// `now_ms` is the same observation the pass compared the deadline against, so
+/// one pass reads the clock once and the frontier index and the retirement
+/// decision cannot disagree.
 ///
 /// The bound point is deliberately not re-read for a capture whose owner window
 /// has closed: a receipt must not claim the source stayed still across a window
 /// this store no longer vouches for, so no stable-point receipt is fabricated.
-fn account_expiry(states: &mut HashMap<String, SnapshotState>, digest: &str) {
-    let Some(state) = states.get(digest) else {
-        return;
+fn account_expiry(states: &mut CaptureRegistry, digest: &str, now_ms: u64) -> bool {
+    let Some(state) = states.captures.get(digest) else {
+        // Nothing is installed under this digest, so there is no evidence and no
+        // owner to act for: the deadline retires.
+        return true;
     };
+    if state.terminal.is_some() {
+        // Already through the accounted transition; its own replay horizon
+        // deadline governs the entry from here.
+        return true;
+    }
+    if state.claim.is_some() {
+        // A live call claim is still serving from this payload. The deadline is
+        // re-armed and retried, so a claim can never be starved of its data and
+        // never loses it either.
+        return false;
+    }
+    if !capture_is_retired(state, now_ms) {
+        return false;
+    }
     let incarnation = state.incarnation;
     let Some(receipt) = expiry_receipt(state) else {
         // A ledger whose frozen counters disagree with the live counters is a
         // receipt defect. This module never answers a defect by deleting
         // evidence: the entry is kept exactly as it is and the next maintenance
         // pass retries the same transition.
-        return;
+        return false;
     };
     retain_terminal_close(states, digest, incarnation, receipt);
+    true
 }
 
 /// Derives the expiry receipt of one retired capture from retained evidence.
@@ -2217,27 +2933,38 @@ fn expiry_receipt(state: &SnapshotState) -> Option<SnapshotEndReceipt> {
     build_end_receipt(state, completeness, members_served, bytes_served).ok()
 }
 
-/// Releases bounded terminal records whose replay horizon has ended.
+/// Releases one bounded terminal record whose replay horizon has ended.
 ///
 /// This is the only place a capture entry is removed, and it removes only a
 /// terminal record whose owner replay horizon has passed and whose no live claim
 /// can still be using. A live capture, a claimed capture and a retained receipt
-/// inside its horizon are all left alone.
-fn release_expired_terminal_records(states: &mut HashMap<String, SnapshotState>, now_ms: u64) {
-    let expired: Vec<String> = states
-        .iter()
-        .filter(|(_, state)| {
-            state.claim.is_none()
-                && state
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|closed| now_ms > closed.retained_until_ms)
-        })
-        .map(|(digest, _)| digest.clone())
-        .collect();
-    for digest in expired {
-        states.remove(&digest);
+/// inside its horizon are all left alone, and the terminal-record units this
+/// entry's own begin reserved are returned only here, when the entry actually
+/// goes away. Reports whether the frontier may drop this deadline.
+fn release_terminal_record(states: &mut CaptureRegistry, digest: &str, now_ms: u64) -> bool {
+    let releasable = states.captures.get(digest).is_some_and(|state| {
+        state.claim.is_none()
+            && state
+                .terminal
+                .as_ref()
+                .is_some_and(|closed| now_ms > closed.retained_until_ms)
+    });
+    if !releasable {
+        // Either the entry is gone, still live, still claimed, or still inside
+        // its replay horizon. The horizon is exclusive at the exact instant it
+        // passes, matching the close path, so the deadline is re-armed and
+        // retried rather than released early.
+        return false;
     }
+    states.captures.remove(digest);
+    // The heavy payload was already freed by the accounted terminal transition,
+    // so its retained bytes were returned there. Only the two terminal-record
+    // dimensions are released now, and only because the record itself is gone.
+    states.budget.release(BudgetDimension::TerminalEntries, 1);
+    states
+        .budget
+        .release(BudgetDimension::TerminalBytes, TERMINAL_ENTRY_BYTES);
+    true
 }
 
 /// Reports whether one capture proved the complete authoritative denominator
@@ -2348,13 +3075,21 @@ fn build_end_receipt(
 /// always exists before the payload it was derived from is released: a crash or
 /// a cancellation between the two leaves the capture live with its payload
 /// still intact, never a closed capture with no record of what it served.
+///
+/// This is where retirement and evidence retention stay distinct: the heavy
+/// payload and the retained page response are freed, while the exact identity,
+/// bound source point, served accounting, interruption ledger and the final
+/// receipt all survive. The aggregate charges follow the data exactly — the
+/// live-capture slot and the retained payload bytes are returned, and the
+/// terminal-record units the begin reserved stay charged *because the retained
+/// record is what now holds them*, until the record itself is released.
 fn retain_terminal_close(
-    states: &mut HashMap<String, SnapshotState>,
+    states: &mut CaptureRegistry,
     digest: &str,
     incarnation: u64,
     receipt: SnapshotEndReceipt,
 ) {
-    let Some(state) = states.get_mut(digest) else {
+    let Some(state) = states.captures.get_mut(digest) else {
         return;
     };
     if state.incarnation != incarnation || state.terminal.is_some() {
@@ -2362,17 +3097,132 @@ fn retain_terminal_close(
     }
     // The replay horizon is the capture's own declared duration bound, not an
     // invented window: inside it an exact repeated end is answered from this
-    // record, and after it maintenance releases the bounded record.
-    let retained_until_ms = state
-        .opened_at_ms
-        .saturating_add(state.begin.bounds.max_duration_ms);
+    // record, and after it maintenance releases the bounded record. It is
+    // computed from the observation taken *before* the expensive setup, so a
+    // slow setup shortens the horizon instead of extending it.
+    let retained_until_ms =
+        fail_closed_deadline(state.opened_at_ms, state.begin.bounds.max_duration_ms);
+    let charged_capture_bytes = state.charged_capture_bytes;
     state.payload = None;
     state.last_page = None;
+    state.charged_capture_bytes = 0;
     state.progress_revision = state.progress_revision.saturating_add(1);
     state.terminal = Some(RetainedClose {
         receipt,
         retained_until_ms,
     });
+    states.budget.release(BudgetDimension::LiveCaptures, 1);
+    states
+        .budget
+        .release(BudgetDimension::RetainedBytes, charged_capture_bytes);
+    // The retained record's own bounded release is now due from the expiry
+    // frontier, so reclamation of a closed capture does not depend on any
+    // further page or end traffic.
+    states.expiry.insert(ExpiryDeadline {
+        at_ms: retained_until_ms,
+        stage: ExpiryStage::Release,
+        digest: digest.to_owned(),
+    });
+}
+
+/// The frozen totals one reconciled observation produced.
+///
+/// Only the two aggregates the installed entry retains; the served set itself
+/// stays in the payload and is never copied here.
+struct ReconciledObservation {
+    /// Summed observed content bytes of the denominator.
+    total_bytes: u64,
+    /// Pages the frozen served set occupies at the closed per-page ceiling.
+    total_pages: u64,
+}
+
+/// Reconciles one observed enumeration against the request and the admitted
+/// generation, and freezes the totals the installed entry retains.
+///
+/// Every per-capture limit enforced here is an existing named one
+/// ([`MAX_SNAPSHOT_MEMBERS`], [`MAX_SNAPSHOT_BYTES`], [`MAX_SNAPSHOT_PAGES`])
+/// or the caller's own declared bound. None of them is relaxed by the aggregate
+/// budget: the aggregate budget decides whether a capture may be *admitted*, and
+/// this decides whether an admitted observation is *servable*.
+fn reconcile_observation(
+    adapter: &SurrealStoreAdapter,
+    enumeration: &Enumeration,
+    request: &SnapshotBeginRequest,
+) -> Result<ReconciledObservation, StoreError> {
+    let point = &enumeration.point;
+    if point.schema_generation != adapter.config.expected_schema_generation.as_str() {
+        return Err(StoreError::Unavailable);
+    }
+    bind_source_identity(adapter, point, request)?;
+    let ordered_members = &enumeration.members;
+    reconcile_denominator(ordered_members, &request.denominator)?;
+    // An empty observed set is only a bindable denominator when the enumeration
+    // actually read every admitted canonical class and found nothing. A
+    // declared-empty denominator with no provider evidence is not a zero-member
+    // capture; it is refused.
+    if ordered_members.is_empty() && !enumeration.evidence.is_authoritative_zero() {
+        return Err(StoreError::Empty {
+            field: "snapshot.members",
+        });
+    }
+    let member_count = ordered_members.len() as u64;
+    if member_count > request.bounds.max_members || member_count > MAX_SNAPSHOT_MEMBERS as u64 {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let total_bytes = ordered_members.iter().fold(0_u64, |total, member| {
+        total.saturating_add(member.residency.byte_count)
+    });
+    if total_bytes > request.bounds.max_bytes || total_bytes > MAX_SNAPSHOT_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    // One work unit per member; the per-request ceiling is enforced here and the
+    // frozen global ceiling through `bounds.validate()` in request validation.
+    if member_count > request.bounds.max_work {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let total_pages = member_count.div_ceil(SNAPSHOT_PAGE_CHUNK);
+    if total_pages > request.bounds.max_pages || total_pages > MAX_SNAPSHOT_PAGES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(ReconciledObservation {
+        total_bytes,
+        total_pages,
+    })
+}
+
+/// Refuses a new begin whose requested lifetime cannot be honoured, before any
+/// provider enumeration and before any budget is reserved.
+///
+/// Two independent refusals, both static-text typed. The first is the request's
+/// own window: already expired, or shorter than the adapter's real per-RPC
+/// timeout, which is `SurrealAdapterConfig::query_timeout_ms` and the only bound
+/// this module actually has on a provider call (`client/session.rs` bounds every
+/// RPC by exactly that duration and carries no byte ceiling). A deadline check
+/// after an uninterruptible call is not a bound on that call, so a window that
+/// cannot even cover one round trip is refused rather than admitted.
+fn refuse_unservable_window(
+    adapter: &SurrealStoreAdapter,
+    request: &SnapshotBeginRequest,
+    started_at_ms: u64,
+) -> Result<(), StoreError> {
+    if is_retired(
+        request.expires_at_unix_ms,
+        started_at_ms,
+        request.bounds.max_duration_ms,
+        started_at_ms,
+    ) {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.expires_at_unix_ms",
+            reason: "requested capture window has already expired",
+        });
+    }
+    if request.bounds.max_duration_ms < adapter.config.query_timeout_ms {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.bounds.max_duration_ms",
+            reason: "capture window is shorter than one adapter query timeout, so no page can be served",
+        });
+    }
+    Ok(())
 }
 
 /// Opens a coherent capture under one owner-issued consistency point.
@@ -2386,61 +3236,72 @@ pub(crate) async fn begin_snapshot(
     if ctx.state_fence != request.scope.state_fence {
         return Err(StoreError::FenceMismatch);
     }
+    // Local elapsed-duration accounting starts here, *before* the expensive
+    // setup below, so a slow principal check, source-class census or expiry pass
+    // cannot hand a fresh insertion a new full duration. The same observation
+    // becomes this capture's `opened_at_ms`, so the window this request asked for
+    // is the window it actually gets.
+    let started_at_ms = crate::write_execution::current_time_ms();
+    // An already-expired or unservable request is refused before any provider
+    // enumeration, so it performs no enumeration and creates no live capture at
+    // all. A retained expired begin stays reachable as history through the replay
+    // path below; replay cannot renew it and cannot admit a new live capture.
+    refuse_unservable_window(adapter, &request, started_at_ms)?;
     // The acting principal is named, not assumed, before any protected read.
     bind_capture_principal(adapter, SNAPSHOT_BEGIN_OPERATION)?;
     verify_canonical_source_classes(adapter.config.expected_schema_generation.as_str())?;
-    // Resolve the exact logical begin through the registry BEFORE the source is
-    // read. An exact replay returns the retained handle and the retained
-    // progress; re-enumerating here would present a second observation as the
-    // old capture, and the consistency point embeds the observed scope digest,
-    // so the replayed handle would differ from the one actually in force.
+    // Bounded opportunistic maintenance: `begin` is the one path a client that
+    // never pages and never closes still reaches, so expiry progresses on
+    // begin-only traffic. The supervised owner can drive the same pass through
+    // [`snapshot_owner_maintenance_tick`] when no request arrives at all.
+    snapshot_owner_maintenance_tick(started_at_ms)?;
     let snapshot_digest = request.compute_digest().map_err(redact_snapshot_error)?;
-    if let Some(retained) = retained_begin_handle(&snapshot_digest, &request)? {
-        return Ok(retained);
-    }
-    // The denominator and the scope projection are read from the provider, in one
-    // coherent transaction with the point they claim, and the caller's claims are
-    // reconciled against what was observed. The caller never supplies the served
-    // set.
-    let enumeration = enumerate_canonical_members(adapter, &request).await?;
+    // Resolve the exact logical begin AND reserve its whole allowance under one
+    // acquisition of the one registry lock. An exact replay returns the retained
+    // handle and the retained progress without enumerating and without charging
+    // anything; a different canonical input under an already claimed
+    // operation/idempotency namespace is refused. Only a genuinely new begin
+    // reserves, and because the check and the reservation share one acquisition,
+    // two concurrent begins cannot both pass an unlocked size check.
+    let mut reservation = {
+        let mut states = lock_registry()?;
+        states.budget.refuse_if_unusable()?;
+        if let Some(retained) = retained_begin_handle(&states, &snapshot_digest, &request)? {
+            return Ok(retained);
+        }
+        reserve_begin(&mut states)?
+    };
+    // The reservation is owned across this await and returned exactly once on
+    // every exit below: an error, a cancellation, or a publish-versus-cancel
+    // race all reach its `Drop` armed. No registry mutex is held here (I5.7).
+    let enumeration = match enumerate_canonical_members(adapter, &request).await {
+        Ok(enumeration) => enumeration,
+        Err(error) => return Err(error),
+    };
+    let observation = reconcile_observation(adapter, &enumeration, &request)?;
     let point = enumeration.point;
-    if point.schema_generation != adapter.config.expected_schema_generation.as_str() {
-        return Err(StoreError::Unavailable);
-    }
-    bind_source_identity(adapter, &point, &request)?;
     let ordered_members = enumeration.members;
     let evidence = enumeration.evidence;
     let scope_digest = enumeration.scope.digest;
-    reconcile_denominator(&ordered_members, &request.denominator)?;
-    // An empty observed set is only a bindable denominator when the
-    // enumeration actually read every admitted canonical class and found
-    // nothing. A declared-empty denominator with no provider evidence is not a
-    // zero-member capture; it is refused.
-    if ordered_members.is_empty() && !evidence.is_authoritative_zero() {
-        return Err(StoreError::Empty {
-            field: "snapshot.members",
+    // Recheck the lifetime budget before publishing. A begin that spent its whole
+    // window inside enumeration must not be installed as a fresh capture with a
+    // new full duration; the reservation is returned by `Drop` on this path.
+    if is_retired(
+        request.expires_at_unix_ms,
+        started_at_ms,
+        request.bounds.max_duration_ms,
+        crate::write_execution::current_time_ms(),
+    ) {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.bounds.max_duration_ms",
+            reason: "capture window elapsed during source enumeration",
         });
     }
-
-    let member_count = ordered_members.len() as u64;
-    if member_count > request.bounds.max_members || member_count > MAX_SNAPSHOT_MEMBERS as u64 {
-        return Err(StoreError::PayloadTooLarge);
-    }
-    let total_bytes = ordered_members.iter().fold(0_u64, |total, member| {
-        total.saturating_add(member.residency.byte_count)
-    });
-    if total_bytes > request.bounds.max_bytes || total_bytes > MAX_SNAPSHOT_BYTES {
-        return Err(StoreError::PayloadTooLarge);
-    }
-    // One work unit per member; the per-request ceiling is enforced here and
-    // the frozen global ceiling through `bounds.validate()` above.
-    if member_count > request.bounds.max_work {
-        return Err(StoreError::PayloadTooLarge);
-    }
-    let total_pages = member_count.div_ceil(SNAPSHOT_PAGE_CHUNK);
-    if total_pages > request.bounds.max_pages || total_pages > MAX_SNAPSHOT_PAGES {
-        return Err(StoreError::PayloadTooLarge);
-    }
+    // The actual retained charge: the observed content denominator plus the
+    // worst-case allowance for the one retained page response this owner will
+    // hold. It is always at most the reserved worst case, so settling the
+    // reservation into it can only shrink the dimension.
+    let actual_capture_bytes = observation.total_bytes.saturating_add(RETAINED_PAGE_BYTES);
 
     // Constructed only now, after the source observation is validated, and
     // retained with the entry rather than returned as a throwaway value.
@@ -2455,8 +3316,14 @@ pub(crate) async fn begin_snapshot(
     };
     handle.validate()?;
 
+    // One more acquisition for the publish. The incarnation and the entry's
+    // absence are both rechecked under it, so a successor that claimed this
+    // logical request while this call enumerated is never overwritten; this call
+    // returns that successor's retained handle and releases only its own
+    // reservation through `Drop`.
     let mut states = lock_registry()?;
-    if let Some(state) = states.get(&snapshot_digest) {
+    states.budget.refuse_if_unusable()?;
+    if let Some(state) = states.captures.get(&snapshot_digest) {
         // Another begin for the same logical request claimed this capture while
         // this one was enumerating. The retained decision is authoritative: a
         // deliberate refresh needs its own new logical capture, never a reset of
@@ -2464,7 +3331,12 @@ pub(crate) async fn begin_snapshot(
         // window because the entry is left exactly as it is.
         return Ok(state.issued.clone());
     }
-    states.insert(
+    // The retirement deadline is registered before the entry becomes visible, so
+    // a capture is never installed without a frontier entry that will reclaim it
+    // even if no page or end call ever arrives.
+    let retire_at_ms = fail_closed_deadline(started_at_ms, request.bounds.max_duration_ms)
+        .min(u64::try_from(request.expires_at_unix_ms).unwrap_or(0));
+    states.captures.insert(
         snapshot_digest.clone(),
         SnapshotState {
             issued: handle.clone(),
@@ -2478,15 +3350,22 @@ pub(crate) async fn begin_snapshot(
             payload: Some(CapturePayload { ordered_members }),
             last_page: None,
             terminal: None,
-            total_bytes,
-            total_pages,
+            total_bytes: observation.total_bytes,
+            total_pages: observation.total_pages,
             pages_served: 0,
             members_served: 0,
             bytes_served: 0,
-            last_digest: snapshot_digest,
-            opened_at_ms: crate::write_execution::current_time_ms(),
+            last_digest: snapshot_digest.clone(),
+            opened_at_ms: started_at_ms,
+            charged_capture_bytes: actual_capture_bytes,
         },
     );
+    states.expiry.insert(ExpiryDeadline {
+        at_ms: retire_at_ms,
+        stage: ExpiryStage::Retire,
+        digest: snapshot_digest,
+    });
+    reservation.settle(&mut states.budget, actual_capture_bytes);
     Ok(handle)
 }
 
@@ -2519,7 +3398,7 @@ fn check_cursor(state: &SnapshotState, cursor: &SnapshotCursor) -> Result<(), St
 /// claim this call still owns. Each reason keeps its own typed refusal, so a
 /// structural bound still reports the bound rather than a generic refusal.
 fn interrupt_capture(
-    states: &mut HashMap<String, SnapshotState>,
+    states: &mut CaptureRegistry,
     claim: &mut CaptureCallClaim,
     reason: InterruptionReason,
     refusal: StoreError,
@@ -2541,7 +3420,7 @@ fn interrupt_capture(
 /// the transition rather than before it, so the served page and the released
 /// claim are one accounted step.
 fn serve_next_page(
-    states: &mut HashMap<String, SnapshotState>,
+    states: &mut CaptureRegistry,
     claim: &mut CaptureCallClaim,
     cursor: SnapshotCursor,
 ) -> Result<SnapshotPage, StoreError> {
@@ -2693,7 +3572,7 @@ fn is_replay_cursor(page: &SnapshotPage, cursor: &SnapshotCursor) -> bool {
 /// issue an honest `Expired` or `Partial` receipt instead of deleting the only
 /// record of what was served.
 fn prepare_page(
-    states: &mut HashMap<String, SnapshotState>,
+    states: &mut CaptureRegistry,
     digest: &str,
     presented: &SnapshotHandle,
     ctx: &RequestMeta,
@@ -2705,7 +3584,7 @@ fn prepare_page(
     };
     require_retained_handle(state, presented)?;
     let incarnation = state.incarnation;
-    account_expired_captures(states, now_ms, digest);
+    run_expiry_pass(states, now_ms, Some(digest));
     let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
     if state.terminal.is_some() {
         // The capture is closed and retains only its terminal receipt. New page
@@ -2771,8 +3650,16 @@ fn prepare_page(
     }
     let expected_revision = state.progress_revision;
     let claim_id = next_claim_id();
-    let state = states.get_mut(digest).ok_or_else(unknown_snapshot_handle)?;
-    state.claim = Some(CaptureClaimSlot {
+    // The in-flight call slot is an aggregate dimension, so the aggregate is
+    // refused *before* this call's claim slot is installed. A refusal here
+    // leaves the capture exactly as it was: no claim, no progress movement, no
+    // interruption.
+    states.budget.reserve(BudgetDimension::ActivePageCalls, 1)?;
+    states
+        .captures
+        .get_mut(digest)
+        .ok_or_else(unknown_snapshot_handle)?
+        .claim = Some(CaptureClaimSlot {
         claim_id,
         kind: CaptureCallKind::Page,
         expected_revision,
@@ -2993,7 +3880,7 @@ enum CloseAdmission {
 /// receipt is fabricated: the capture's payload is already gone, and a fresh
 /// derivation would be a new claim about a capture that no longer exists.
 fn prepare_close(
-    states: &mut HashMap<String, SnapshotState>,
+    states: &mut CaptureRegistry,
     digest: &str,
     presented: &SnapshotHandle,
     ctx: &RequestMeta,
@@ -3004,7 +3891,7 @@ fn prepare_close(
     };
     require_retained_handle(state, presented)?;
     let incarnation = state.incarnation;
-    account_expired_captures(states, now_ms, digest);
+    run_expiry_pass(states, now_ms, Some(digest));
     let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
     if let Some(closed) = state.terminal.as_ref() {
         if now_ms > closed.retained_until_ms {
@@ -3024,8 +3911,17 @@ fn prepare_close(
     let window_closed = capture_is_retired(state, now_ms);
     let expected_revision = state.progress_revision;
     let claim_id = next_claim_id();
-    let state = states.get_mut(digest).ok_or_else(unknown_snapshot_handle)?;
-    state.claim = Some(CaptureClaimSlot {
+    // The same aggregate in-flight call slot the page path reserves, refused
+    // before this close's claim slot exists. Recovery and control capacity is
+    // preserved by construction: the terminal transition a close performs needs
+    // no in-flight call slot, and its terminal-record space was reserved at
+    // begin, so a saturated call dimension can never block reclamation.
+    states.budget.reserve(BudgetDimension::ActivePageCalls, 1)?;
+    states
+        .captures
+        .get_mut(digest)
+        .ok_or_else(unknown_snapshot_handle)?
+        .claim = Some(CaptureClaimSlot {
         claim_id,
         kind: CaptureCallKind::End,
         expected_revision,
