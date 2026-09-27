@@ -23,15 +23,20 @@ blake3.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
+# The Kernel owns the Doctor repair front door, so it invokes the shipped
+# `DiagnosticBrief` contract shape directly (issue #1847, I16.7) instead of
+# reshaping it. The shape is not changed here.
+eliot-doctor-core.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
-# Path edge (issue #1842, I16.3/I16.9): eliot-observability is a workspace
-# member but has no [workspace.dependencies] entry, so a path+version edge
-# keeps root Cargo.toml and workspace membership byte-identical, exactly as
-# bins/eliotd declares it. No version upgrade: versions match the member
-# manifest.
+# Path edge (issue #1842, I16.3/I16.9; also used by #1847): eliot-observability
+# is a workspace member but has no [workspace.dependencies] entry, so a
+# path+version edge keeps root Cargo.toml and workspace membership
+# byte-identical, exactly as bins/eliotd declares it. No version upgrade:
+# versions match the member manifest.
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
+eliot-observability-runtime.workspace = true
 eliot-ors.workspace = true
 eliot-process-executor.workspace = true
 eliot-protocol.workspace = true

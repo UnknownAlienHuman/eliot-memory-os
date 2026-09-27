@@ -330,6 +330,15 @@ impl AuditEventKind {
     pub const SHUTDOWN_DRAIN_COMMITTED: &'static str = "shutdown.drain_committed";
     /// The shutdown terminal published.
     pub const SHUTDOWN_TERMINAL_PUBLISHED: &'static str = "shutdown.terminal_published";
+    /// A supervised process generation crashed and its crash record was written.
+    pub const PROCESS_CRASHED: &'static str = "process.crashed";
+    /// A supervised process generation was restarted after a crash.
+    pub const PROCESS_RESTARTED: &'static str = "process.restarted";
+    /// Restart intensity reached the configured budget and was exhausted.
+    pub const PROCESS_RESTART_EXHAUSTED: &'static str = "process.restart_exhausted";
+    /// The capability is quarantined: disabled while the Problem State stays
+    /// open (I1.4 `quarantine`).
+    pub const PROCESS_QUARANTINED: &'static str = "process.quarantined";
 
     /// Every canonical kind, in schema order.
     pub const ALL: &'static [&'static str] = &[
@@ -364,6 +373,10 @@ impl AuditEventKind {
         Self::SHUTDOWN_DRAIN_REQUESTED,
         Self::SHUTDOWN_DRAIN_COMMITTED,
         Self::SHUTDOWN_TERMINAL_PUBLISHED,
+        Self::PROCESS_CRASHED,
+        Self::PROCESS_RESTARTED,
+        Self::PROCESS_RESTART_EXHAUSTED,
+        Self::PROCESS_QUARANTINED,
     ];
 
     /// Returns whether `kind` is in the closed canonical set.
@@ -373,6 +386,14 @@ impl AuditEventKind {
     }
 
     /// Returns the I16.9 assurance class for one canonical kind.
+    ///
+    /// I16.4 lists crash, restart, restart-intensity exhaustion and quarantine
+    /// as required operational events, and I1.4 makes repeated crash a
+    /// recovery boundary: a restarted generation invalidates the previous
+    /// one, and quarantine disables a capability. All four are therefore
+    /// `Critical` full-capture boundaries together with the existing
+    /// process-failure and shutdown classes; `PROCESS_RESTARTED` is included
+    /// because the restart is the moment authority moves to a new generation.
     #[must_use]
     pub fn assurance_class(kind: &str) -> AuditAssuranceClass {
         match kind {
@@ -388,6 +409,10 @@ impl AuditEventKind {
             | Self::CANCEL_REQUESTED
             | Self::PROCESS_LAUNCH_FAILED
             | Self::PROCESS_FAILED
+            | Self::PROCESS_CRASHED
+            | Self::PROCESS_RESTARTED
+            | Self::PROCESS_RESTART_EXHAUSTED
+            | Self::PROCESS_QUARANTINED
             | Self::SHUTDOWN_DRAIN_REQUESTED
             | Self::SHUTDOWN_DRAIN_COMMITTED
             | Self::SHUTDOWN_TERMINAL_PUBLISHED => AuditAssuranceClass::Critical,
@@ -631,6 +656,52 @@ impl AuditLineage {
     /// Sets the actual route receipt digest.
     pub fn fill_route_receipt_actual(&mut self, receipt_sha256: &str) {
         Self::fill(&mut self.route_receipt_actual, receipt_sha256);
+    }
+
+    /// Computes the I16.12 missing-field declaration without sealing the
+    /// event cursor.
+    ///
+    /// [`AuditLineage::finalize`] computes the same list at append time, but
+    /// it also writes the sequenced cursor, which a non-sequenced projection
+    /// must not claim. This returns exactly the same slot names for the same
+    /// lineage state, so a crash context lists precisely the slots the
+    /// composition had no value for.
+    #[must_use]
+    pub fn missing_fields_for_crash_context(
+        &self,
+        state_fence_digest: Option<&str>,
+    ) -> Vec<String> {
+        let mut missing = Vec::new();
+        for (slot, name) in [
+            (&self.trace_id, "trace_id"),
+            (&self.operation_id, "operation_id"),
+            (&self.task_id, "task_id"),
+            (&self.work_item, "work_item"),
+            (&self.attempt_id, "attempt_id"),
+            (&self.job_id, "job_id"),
+            (&self.principal, "principal"),
+            (&self.session_id, "session_id"),
+            (&self.controller, "controller"),
+            (&self.work_scope, "work_scope"),
+            (&self.adapter_instance, "adapter_instance"),
+            (&self.process_identity, "process_identity"),
+            (&self.native_session, "native_session"),
+            (&self.parent_child_locators, "parent_child_locators"),
+            (&self.route_receipt_requested, "route_receipt_requested"),
+            (&self.route_receipt_actual, "route_receipt_actual"),
+            (&self.worktree, "worktree"),
+            (&self.environment_lease, "environment_lease"),
+            (&self.module_generation, "module_generation"),
+            (&self.authority_epoch, "authority_epoch"),
+        ] {
+            if slot.is_none() {
+                missing.push(name.to_owned());
+            }
+        }
+        if self.state_fence.is_none() || state_fence_digest.is_none() {
+            missing.push("state_fence".to_owned());
+        }
+        missing
     }
 
     fn fill(slot: &mut Option<String>, value: &str) {
@@ -1206,6 +1277,108 @@ impl AuditEventDraft {
             body: serde_json::json!({
                 "terminal": terminal,
                 "pending_count": pending_count,
+            }),
+        }
+    }
+
+    /// Returns the crash draft for one generation that crashed.
+    ///
+    /// The body carries only identity and digest material: the structured
+    /// crash report identity and its content digest, the symbol-artifact
+    /// reference and digest that resolve the report, and the redacted fault
+    /// class. No payload, message, or free-text error crosses the audit
+    /// boundary (I15.4).
+    #[must_use]
+    pub fn process_crashed(
+        module_generation_ref: &str,
+        fault_class: &str,
+        crash_report_id: &str,
+        crash_report_digest: &str,
+        symbol_artifact_ref: &str,
+        symbol_artifact_sha256: &str,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.controller = Some("kernel".to_owned());
+        AuditLineage::fill(&mut lineage.module_generation, module_generation_ref);
+        Self {
+            kind: AuditEventKind::PROCESS_CRASHED,
+            lineage,
+            body: serde_json::json!({
+                "fault_class": fault_class,
+                "crash_report_id": crash_report_id,
+                "crash_report_digest": crash_report_digest,
+                "symbol_artifact_ref": symbol_artifact_ref,
+                "symbol_artifact_sha256": symbol_artifact_sha256,
+            }),
+        }
+    }
+
+    /// Returns the restarted draft for one replacement generation.
+    ///
+    /// `restart_attempts` is the running restart intensity after this
+    /// restart and `restart_budget` the configured threshold it is measured
+    /// against, so the record shows both the observed intensity and the bound
+    /// it may not exceed.
+    #[must_use]
+    pub fn process_restarted(
+        module_generation_ref: &str,
+        restart_attempts: u32,
+        restart_budget: u32,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.controller = Some("kernel".to_owned());
+        AuditLineage::fill(&mut lineage.module_generation, module_generation_ref);
+        Self {
+            kind: AuditEventKind::PROCESS_RESTARTED,
+            lineage,
+            body: serde_json::json!({
+                "restart_attempts": restart_attempts,
+                "restart_budget": restart_budget,
+            }),
+        }
+    }
+
+    /// Returns the restart-exhausted draft for one out-of-budget restart.
+    ///
+    /// The intensity recorded is the attempt that was refused, so the record
+    /// proves the bound was reached rather than merely approached.
+    #[must_use]
+    pub fn process_restart_exhausted(
+        module_generation_ref: &str,
+        restart_attempts: u32,
+        restart_budget: u32,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.controller = Some("kernel".to_owned());
+        AuditLineage::fill(&mut lineage.module_generation, module_generation_ref);
+        Self {
+            kind: AuditEventKind::PROCESS_RESTART_EXHAUSTED,
+            lineage,
+            body: serde_json::json!({
+                "restart_attempts": restart_attempts,
+                "restart_budget": restart_budget,
+            }),
+        }
+    }
+
+    /// Returns the quarantined draft for the capability disabled after
+    /// restart-budget exhaustion (I1.4 `quarantine`).
+    #[must_use]
+    pub fn process_quarantined(
+        module_generation_ref: &str,
+        restart_attempts: u32,
+        restart_budget: u32,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.controller = Some("kernel".to_owned());
+        AuditLineage::fill(&mut lineage.module_generation, module_generation_ref);
+        Self {
+            kind: AuditEventKind::PROCESS_QUARANTINED,
+            lineage,
+            body: serde_json::json!({
+                "quarantine": "restart_budget_exhausted",
+                "restart_attempts": restart_attempts,
+                "restart_budget": restart_budget,
             }),
         }
     }
@@ -1911,5 +2084,34 @@ impl crate::KernelComposition {
             let head_hash = chain.head_hash().to_owned();
             (head_seq, head_hash)
         })
+    }
+
+    /// Returns the live I16.3 lineage the front door admits against.
+    ///
+    /// The returned slots are the composition's own authority identity — the
+    /// State Fence, module generation, and authority epoch every admitted
+    /// request is checked against — read without a canonicalization step and
+    /// never taken from a request envelope. A poisoned policy lock yields the
+    /// empty lineage rather than a reconstructed value, so the caller reports
+    /// the slots as missing (I16.12) instead of guessing them.
+    pub(crate) fn front_door_lineage(&self) -> AuditLineage {
+        let Ok(policy) = self.front_door_policy.lock() else {
+            return AuditLineage::empty();
+        };
+        let mut lineage = AuditLineage::empty();
+        lineage.state_fence = Some(policy.module_generation.state_fence.clone());
+        lineage.module_generation = Some(
+            policy
+                .module_generation
+                .state_fence
+                .resource_generation
+                .value()
+                .to_string(),
+        );
+        lineage.authority_epoch = Some(authority_epoch_text(
+            &policy.module_generation.state_fence.authority_epoch,
+        ));
+        lineage.controller = Some("kernel".to_owned());
+        lineage
     }
 }

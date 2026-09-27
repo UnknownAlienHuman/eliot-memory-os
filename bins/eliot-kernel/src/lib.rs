@@ -56,6 +56,13 @@ mod control_plane;
 /// and the captured operational log windows. It emits references, gaps, and
 /// one next step, never rolling log content and never an assigned cause.
 pub mod diagnostic_brief;
+/// Structured crash and restart-intensity evidence for the Windows runtime
+/// (issue #1847; I16.2, I16.4, I16.5, I16.7, I16.11, I16.12). Wires the merged
+/// observability runtime (`#1836`) crash report, critical path, and Windows
+/// Event Log surface into the real `main`, the closed audit chain, and the
+/// existing Doctor front door. Observes only: it mints no lifecycle, repair,
+/// or authority value.
+pub mod crash_recovery;
 /// Kernel-owned durable audit evidence (issue #1837; I16): the single
 /// BLAKE3-chained audit chain plus the single Watchdog-domain anchor sink.
 /// Every authority/lifecycle boundary appends through the composition's

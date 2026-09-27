@@ -36,6 +36,10 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use eliot_kernel::crash_recovery::{
+    crash_context, crash_context_from_composition, install_crash_context,
+    install_kernel_observability, install_panic_hook,
+};
 use eliot_kernel::kernel_diagnostics::{
     EntrypointStage, install_kernel_diagnostics, observe_entrypoint, observe_terminal_error,
 };
@@ -65,6 +69,14 @@ async fn main() {
         Err(error) => exit_error("INVALID_CONFIGURATION", &error.to_string()),
     };
     observe_entrypoint(EntrypointStage::LaunchConfig);
+    // I16.2/I16.4 (#1847): the structured crash path is installed at the first
+    // point the work root is known and before any further launch work, so a
+    // panic anywhere below writes the structured crash record, the symbol
+    // artifact reference and the redacted runtime context. Installing it later
+    // would leave the launch funnel itself unguarded.
+    install_kernel_observability(&options.work_root);
+    install_panic_hook(&options.work_root);
+    install_crash_context(crash_context(&options.work_root));
     #[cfg(windows)]
     let startup_binding = match startup_binding::KernelStartupBinding::from_environment() {
         Ok(binding) => binding,
@@ -168,6 +180,11 @@ async fn main() {
         },
     );
     observe_entrypoint(EntrypointStage::Composition);
+    // The crash context installed before composition carried only the launch
+    // identity. The live composition knows the admitted authority epoch, module
+    // generation and State Fence, so the crash record is refreshed from it here
+    // (I16.3 lineage; I16.12 — an unbound slot stays missing, never invented).
+    install_crash_context(crash_context_from_composition(&kernel));
     #[cfg(windows)]
     {
         // DISPATCH-WIRE E1 (issue #461): compose the production

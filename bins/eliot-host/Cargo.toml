@@ -18,6 +18,8 @@ eliot-contracts.workspace = true
 eliot-host-control-endpoint.workspace = true
 eliot-notify = { path = "../eliot-notify", version = "0.1.0" }
 eliot-host-service.workspace = true
+eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
+eliot-observability-runtime.workspace = true
 eliot-kernel-core.workspace = true
 eliot-installation.workspace = true
 eliot-ipc.workspace = true
