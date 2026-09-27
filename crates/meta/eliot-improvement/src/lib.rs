@@ -50,6 +50,38 @@ pub use evidence_sources::{
 };
 pub use intake::{IntakeOutcome, IntakeRequest, intake_from_evidence};
 
+// Shared export integration for the learning-closure cell (#973).  Seven of the
+// cell's public names are deliberately NOT re-exported here:
+//
+// - `MODULE_ID`, `SOURCE_LAYER`, `RUNTIME_LAYER`, `CAUSAL_PROPERTY`,
+//   `PRODUCT_PULSE` and `SUPPORTED_SCHEMA_VERSIONS` are declared by both
+//   `learning_closure` and `promotion_input`, and one package-root name cannot
+//   carry two values.  The four the existing promotion-input block already binds
+//   (`MODULE_ID`, `SOURCE_LAYER`, `RUNTIME_LAYER`, `CAUSAL_PROPERTY`) stay bound
+//   to it, so this list mirrors that block's convention exactly.
+// - `EvidenceSource` is a *different* enum that this crate root already exports
+//   from `evidence_sources` (the evidence-sourcing enum), so re-exporting the
+//   closure cell's own `EvidenceSource` would collide with it.
+//
+// Every excluded name stays reachable at
+// `eliot_improvement::learning_closure::<NAME>`, so the closure cell keeps its
+// own identity.  The closure cell's assembly functions and record types are
+// re-exported so the package public API is importable normally, which is the
+// integration the two module routers reserved for this owner.  Closure stays
+// candidate material: nothing here can activate, promote or finish anything.
+pub use learning_closure::{
+    AdmissionState, AttemptDelta, AttemptOutcomesAndDeltas, AttemptRecord, AttemptStatus,
+    CampaignAndTarget, CampaignLearningClosure, CampaignLearningClosureCandidate,
+    CausalAttribution, ClosureAssembly, ClosureCompletion, ClosureDisposition, ClosureDue,
+    ClosureEvidenceRefs, ClosureLifecycleEvent, ClosurePolicy, ClosureRecordAssembly,
+    ClosureStatus, DeltaKind, DenominatorAccounting, EconomicsRecord, ExternalHandoff, HarmRecord,
+    LearningClosureDisposition, LearningClosureError, LearningDebt, LearningDebtProjection,
+    LifecycleStage, OutcomeHarmAndEconomicsEvidence, OutcomeKind, OutcomeRecord,
+    OverlayAndActivationAssessments, OverlayRecord, PriorClosure, PriorClosureHistory,
+    StageAssessment, allowed_disposition, assemble_campaign_learning_closure,
+    assemble_campaign_learning_closure_with_evidence, closure_evidence_digest,
+    evidence_refs_complete, trigger_closure_due,
+};
 pub use promotion_input::{
     AGENT_ORDER, CAUSAL_PROPERTY, ClosureBinding, MODULE_ID, PriorPromotionHistory,
     PromotionCandidate, PromotionGateEvidence, PromotionInputError, PromotionInputPolicy,
