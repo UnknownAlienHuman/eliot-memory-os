@@ -17,7 +17,7 @@
 //! its execution owner (or the exact capability that is absent), and where its
 //! result is observed.
 //!
-//! Three properties are load-bearing, and they match the three the existing
+//! Four properties are load-bearing, and they match the three the existing
 //! [`crate::maintenance_trigger_evaluator`] seam states for itself:
 //!
 //! * **No drift from the enum.** Every family is written exactly once, in a
@@ -32,6 +32,22 @@
 //!   selects the mode per family through a Human policy; no such policy owner
 //!   exists in `eliotd` yet, so the catalog names the denial instead of
 //!   defaulting to a permissive mode.
+//! * **A durable decision, not only a log line.**
+//!   [`MaintenanceFamilyEntry::decide`] resolves the whole record — the selected
+//!   mode, the deduplication scope, the route, the owner or the exact
+//!   unavailable dependency, and the one actionable recommendation with each
+//!   element I14.22 names — into a typed [`MaintenanceFamilyDecision`] value
+//!   rather than only into prose on an operational line. A triggered family that
+//!   cannot start is therefore reportable by something other than a rotatable
+//!   log.
+//!
+//!   Stated rather than implied: the daemon's persistent notification record
+//!   (`crate::notification_state_emit::automation_failure_key`) is a different
+//!   owner's record and it currently builds its `required_action` from the
+//!   Governor's closed [`DecisionReason`] alone, so it does not yet carry
+//!   [`MaintenanceFamilyDecision`]. This module supplies the value; wiring that
+//!   owner to it is a separate change in a file this issue does not own, and it
+//!   is not claimed here.
 //! * **No direct execution.** This module never runs maintenance work, never
 //!   constructs an executor, and never calls a family owner. I14.22 requires
 //!   every start to be a Durable Job request, and the catalog resolves only
@@ -46,7 +62,8 @@
 #![forbid(unsafe_code)]
 
 use eliot_maintenance::{
-    AutomationTriggerDecision, MaintenanceAutomationMode, MaintenanceFamily, MaintenanceTrigger,
+    AutomationDecision, AutomationTriggerDecision, DecisionReason, MaintenanceAutomationMode,
+    MaintenanceFamily, MaintenanceTrigger,
 };
 
 use crate::SERVICE_NAME;
@@ -68,6 +85,17 @@ pub const SYSTEM_OBSERVATION_PATH: &str = "eliot_system";
 /// names for the `mode` field, and this catalog is the single place that
 /// states it.
 pub const UNRESOLVED_POLICY_MODE: MaintenanceAutomationMode = MaintenanceAutomationMode::Off;
+
+/// The expiry position every preserved maintenance recommendation carries.
+///
+/// I14.22 requires a preserved recommendation to state its expiry. No owner
+/// publishes a maintenance expiry to this daemon — the seam that builds the
+/// trigger input holds `expires_at_ms` at `None` and names the absent authority
+/// in [`crate::maintenance_trigger_evaluator::UNRESOLVED_AUTHORITIES`] — so the
+/// recommendation states that absence instead of inventing a deadline nobody
+/// owns. It is recorded here once so all fifteen families report the same exact
+/// gap instead of each inventing its own.
+pub const UNPUBLISHED_MAINTENANCE_EXPIRY: &str = "no owner publishes a maintenance expiry to eliotd, so this recommendation carries no deadline of its own; it is not dropped silently, because the record it produces is keyed by the family deduplication scope and is reopened when that key changes";
 
 /// The exact identity components that make two maintenance triggers
 /// equivalent, and therefore what duplicate suppression compares.
@@ -403,6 +431,35 @@ impl MaintenanceRoute {
     }
 }
 
+/// The cost class an admitted job for a family carries.
+///
+/// I14.22 requires each Durable Job to carry a budget, and requires the
+/// recommendation preserved when a start is refused to state its cost. Both are
+/// answered from the family's own registered conditions rather than from a
+/// runtime resource reading, so the answer is a pure function of the catalog
+/// and never a measurement that could differ between two identical catalogs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceCostClass {
+    /// This family does not require an admitted budget slice, so its route and
+    /// effect policy are the whole cost condition.
+    NoAdmittedBudgetRequired,
+    /// An admitted budget slice is one of this family's required conditions, so
+    /// a start may not proceed on a route that spends admitted model or swarm
+    /// budget without one.
+    AdmittedBudgetRequired,
+}
+
+impl MaintenanceCostClass {
+    /// Stable wire name, so the cost class is inspectable beside the mode.
+    #[must_use]
+    pub const fn class_name(self) -> &'static str {
+        match self {
+            Self::NoAdmittedBudgetRequired => "NO_ADMITTED_BUDGET_REQUIRED",
+            Self::AdmittedBudgetRequired => "ADMITTED_BUDGET_REQUIRED",
+        }
+    }
+}
+
 /// One registered I14.22 family with everything I14.22 requires the registry
 /// to record about it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,6 +483,152 @@ pub struct MaintenanceFamilyEntry {
     pub owner: MaintenanceExecutionOwner,
     /// Where this family's result is observed.
     pub observation: MaintenanceResultObservation,
+}
+
+/// The ONE actionable recommendation I14.22 requires a refused or deferred
+/// maintenance start to preserve, with each of the elements I14.22 names held as
+/// its own typed field.
+///
+/// I14.22: "ELIOT preserves one actionable recommendation with reason, evidence,
+/// expected benefit, cost, expiry and safe deferral consequence. It does not
+/// repeatedly notify or pretend maintenance occurred." Every field below is a
+/// pure function of the family's registered entry plus the route the entry
+/// resolves to. None is written per family, so the recommendation cannot
+/// contradict the mode, the conditions, the owner, the deduplication scope or
+/// the admission blockers it is rendered from, and there is exactly one of them
+/// per family rather than a list of vague hints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceRecommendation {
+    /// The single action a Human or an owning component is required to take.
+    /// Never empty, and never a list.
+    pub required_action: String,
+    /// Why the family does not start now: the exact absent route or the exact
+    /// absent execution owner, never a general cause.
+    pub reason: String,
+    /// The receipt references a result for this family must carry, so the
+    /// recommendation is anchored to auditable material rather than to a wish.
+    pub evidence: &'static [&'static str],
+    /// What discharging this family's obligation buys. It is the obligation
+    /// itself, which is the I14.22 sentence that names the work.
+    pub expected_benefit: &'static str,
+    /// The cost class an admitted job for this family carries.
+    pub cost: MaintenanceCostClass,
+    /// Whether the family's effect additionally needs its own route and
+    /// authority policy. I14.22: paid model calls, swarms, destructive
+    /// forgetting or purge, configuration publication, software updates and
+    /// migrations "require their separate route/authority policy even when the
+    /// maintenance family is automatic", so clearing the maintenance route is
+    /// not by itself sufficient for these families.
+    pub effect_policy: MaintenanceEffectPolicy,
+    /// The expiry position. It names the absent owner instead of inventing a
+    /// deadline, because no owner publishes a maintenance expiry to `eliotd`.
+    pub expiry: &'static str,
+    /// The safe consequence of leaving the work unstarted, derived from the
+    /// family's own deduplication scope.
+    pub deferral_consequence: String,
+}
+
+impl MaintenanceRecommendation {
+    /// Renders the one recommendation as the single operator-facing sentence
+    /// the durable record and the operational diagnostics both carry.
+    #[must_use]
+    pub fn text(&self) -> String {
+        format!(
+            "{action} Reason: {reason}. Expected benefit: {benefit}. Cost: {cost}. \
+             Effect policy: {effect}. Evidence a result must carry: {evidence}. \
+             Expiry: {expiry}. Safe deferral: {deferral}.",
+            action = self.required_action,
+            reason = self.reason,
+            benefit = self.expected_benefit,
+            cost = self.cost.class_name(),
+            effect = self.effect_policy.effect_description(),
+            evidence = self.evidence.join("+"),
+            expiry = self.expiry,
+            deferral = self.deferral_consequence,
+        )
+    }
+}
+
+/// The durable, inspectable decision the catalog records for one triggered
+/// family.
+///
+/// I14.22 makes the derived `AutomationTriggerDecision` inspectable and says it
+/// "may emit a decision, Human-board item or Durable Job request". The
+/// Governor-owned evaluator produces the decision and the reason; this value is
+/// the catalog's half of the same record, and it is what a later reader needs
+/// in order to answer, for a family that could not start, which mode was
+/// selected, which owner or exact absent dependency was resolved, whether the
+/// route admits a start, and what the one actionable recommendation is. Without
+/// it the only carrier is a log line, which I14.22's own observability rules
+/// treat as rotatable rather than as the durable record.
+///
+/// No field here is a second decision or reason vocabulary: the Governor's own
+/// [`AutomationDecision`] and [`DecisionReason`] are carried through unchanged,
+/// and the catalog contributes only the registered facts and the resolved route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceFamilyDecision {
+    /// The registered family this decision concerns.
+    pub family: MaintenanceFamily,
+    /// The I14.22 obligation this decision discharges once it starts.
+    pub obligation: &'static str,
+    /// The automation mode selected for this family.
+    pub mode: MaintenanceAutomationMode,
+    /// The family's own eligibility predicates.
+    pub eligibility: MaintenanceEligibility,
+    /// The route, capability and session conditions a start must clear.
+    pub conditions: &'static [MaintenanceCondition],
+    /// The idempotency and deduplication scope the trigger identity is keyed by.
+    pub dedup: MaintenanceDedupScope,
+    /// Where this family's start must go, or the exact capability that is absent.
+    pub route: MaintenanceRoute,
+    /// Whether that route admits a start today.
+    pub admits_start: bool,
+    /// The shared Durable Job admission blockers.
+    pub admission_blockers: &'static [MaintenanceAdmissionBlocker],
+    /// Where this family's result is observed.
+    pub observation: MaintenanceResultObservation,
+    /// The one actionable, reasoned recommendation for this family.
+    pub recommendation: MaintenanceRecommendation,
+    /// The Governor owner's own deterministic action, carried unchanged.
+    pub governor_decision: AutomationDecision,
+    /// The Governor owner's own stable reason, carried unchanged.
+    pub governor_reason: DecisionReason,
+    /// Whether the Governor owner admits one job from this decision.
+    pub governor_admits_job: bool,
+    /// The trigger identity the deduplication scope is applied to.
+    pub trigger_id: String,
+    /// The affected scope the decision ran under.
+    pub scope_ref: String,
+}
+
+impl MaintenanceFamilyDecision {
+    /// The execution owner when one exists, or the exact absent dependency.
+    ///
+    /// Never empty, so a reader never has to distinguish "no owner recorded"
+    /// from "owner withheld".
+    #[must_use]
+    pub const fn owner_or_dependency(&self) -> &'static str {
+        self.route.target()
+    }
+
+    /// The `path::symbol` of the execution owner, when one exists.
+    #[must_use]
+    pub const fn execution_owner(&self) -> Option<&'static str> {
+        match self.route {
+            MaintenanceRoute::DurableJobRequest { owner, .. } => Some(owner),
+            MaintenanceRoute::Blocked { .. } => None,
+        }
+    }
+
+    /// The exact condition names a start must clear, for inspection.
+    #[must_use]
+    pub fn condition_names(&self) -> Vec<&'static str> {
+        self.conditions
+            .iter()
+            .copied()
+            .map(MaintenanceCondition::condition_name)
+            .collect()
+    }
 }
 
 impl MaintenanceFamilyEntry {
@@ -493,16 +696,6 @@ impl MaintenanceFamilyEntry {
         }
     }
 
-    /// The exact condition names a start must clear, for inspection.
-    #[must_use]
-    pub fn condition_names(&self) -> Vec<&'static str> {
-        self.conditions
-            .iter()
-            .copied()
-            .map(MaintenanceCondition::condition_name)
-            .collect()
-    }
-
     /// The exact I14.22 origin names that may raise a trigger, for inspection.
     #[must_use]
     pub fn origin_names(&self) -> Vec<&'static str> {
@@ -520,32 +713,99 @@ impl MaintenanceFamilyEntry {
             .collect()
     }
 
+    /// The cost class an admitted job for this family carries, read from the
+    /// family's own required conditions.
+    #[must_use]
+    pub fn cost_class(&self) -> MaintenanceCostClass {
+        if self
+            .conditions
+            .contains(&MaintenanceCondition::AdmittedBudget)
+        {
+            MaintenanceCostClass::AdmittedBudgetRequired
+        } else {
+            MaintenanceCostClass::NoAdmittedBudgetRequired
+        }
+    }
+
     /// The one actionable, reasoned recommendation for a Human or an owning
     /// component.
     ///
     /// It is built from the typed fields rather than written per family, so it
     /// can never contradict the mode, the conditions, the owner, or the
     /// blockers. I14.22 requires exactly one actionable recommendation with a
-    /// reason, and forbids repeated notification or pretending maintenance
-    /// occurred.
+    /// reason, evidence, expected benefit, cost, expiry and a safe deferral
+    /// consequence, and forbids repeated notification or pretending maintenance
+    /// occurred; each of those six is a field of the returned value.
     #[must_use]
-    pub fn recommendation(&self) -> String {
-        let family = self.family;
-        let mode = self.mode;
-        let effect = self.effect_policy.effect_description();
-        let conditions = self.condition_names().join("+");
+    pub fn recommendation(&self) -> MaintenanceRecommendation {
         let route = self.start_route();
-        let blockers = admission_blocker_text(&route);
-        match route {
-            MaintenanceRoute::DurableJobRequest { .. } => format!(
-                "{family} is registered, mode {mode:?}, and its execution owner is {owner}. It will not start until a maintenance Durable Job request can be submitted: {missing}. Durable Job admission is still blocked by {blockers}. Conditions: {conditions}. Effect policy: {effect}.",
-                owner = route.target(),
-                missing = route.missing(),
+        let (required_action, reason) = match route {
+            MaintenanceRoute::DurableJobRequest { owner, .. } => (
+                format!(
+                    "Submit a maintenance Durable Job request for {family} to its execution owner {owner} once that route is reachable.",
+                    family = self.family,
+                ),
+                format!(
+                    "{family} has a real execution owner but eliotd holds no route to it: {missing}",
+                    family = self.family,
+                    missing = route.missing(),
+                ),
             ),
-            MaintenanceRoute::Blocked { .. } => format!(
-                "{family} is registered, mode {mode:?}, and has no execution owner: {dependency}. It will not start. Clear that dependency, then submit a maintenance Durable Job request; admission is blocked by {blockers}. Conditions: {conditions}. Effect policy: {effect}.",
-                dependency = route.target(),
+            MaintenanceRoute::Blocked { .. } => (
+                format!(
+                    "Provide an execution owner for {family}, then submit a maintenance Durable Job request for it.",
+                    family = self.family,
+                ),
+                format!(
+                    "{family} is registered and has no execution owner at all: {dependency}",
+                    family = self.family,
+                    dependency = route.target(),
+                ),
             ),
+        };
+        MaintenanceRecommendation {
+            required_action,
+            reason,
+            evidence: self.observation.receipt_refs,
+            expected_benefit: self.obligation,
+            cost: self.cost_class(),
+            effect_policy: self.effect_policy,
+            expiry: UNPUBLISHED_MAINTENANCE_EXPIRY,
+            deferral_consequence: format!(
+                "the trigger identity is keyed by {keys}, so repeated blocked starts of this family coalesce onto one record instead of re-notifying, the maintenance debt stays durable and is surfaced on the next eligible startup, and nothing reports this family as maintained",
+                keys = self.dedup.key_parts().join("+"),
+            ),
+        }
+    }
+
+    /// The durable, inspectable decision for one triggered family.
+    ///
+    /// This is the catalog's half of the record the Governor owner's decision
+    /// belongs to, and it is a pure function of this entry plus the decision the
+    /// Governor already made: no I/O, no probe, no clock, and no default. The
+    /// Governor stays the single producer of the decision and the reason; this
+    /// only resolves the route, the owner or the exact unavailable dependency,
+    /// and the one recommendation that goes with them.
+    #[must_use]
+    pub fn decide(&self, decision: &AutomationTriggerDecision) -> MaintenanceFamilyDecision {
+        let route = self.start_route();
+        MaintenanceFamilyDecision {
+            family: self.family,
+            obligation: self.obligation,
+            mode: self.mode,
+            eligibility: self.eligibility,
+            conditions: self.conditions,
+            dedup: self.dedup,
+            admits_start: route.admits_start(),
+            admission_blockers: route.admission_blockers(),
+            route,
+            observation: self.observation,
+            recommendation: self.recommendation(),
+            governor_decision: decision.decision,
+            governor_reason: decision.reason,
+            governor_admits_job: decision.admits_job,
+            trigger_id: decision.trigger_id.clone(),
+            scope_ref: decision.scope_ref.clone(),
         }
     }
 
@@ -559,44 +819,56 @@ impl MaintenanceFamilyEntry {
     /// one actionable recommendation. That is what makes a triggered family
     /// inspectable instead of silently ignored, and it is emitted on the same
     /// `eliotd::diagnostics` target the rest of the daemon uses.
+    ///
+    /// Every field emitted here is read off the [`MaintenanceFamilyDecision`]
+    /// that [`MaintenanceFamilyEntry::decide`] resolves, so the operational line
+    /// and the durable decision value cannot report different facts about the
+    /// same trigger. The line itself is a rotating operational log; the decision
+    /// value is what a later durable record carries.
     pub fn record_start_route(&self, decision: &AutomationTriggerDecision) {
-        let route = self.start_route();
-        let blockers = admission_blocker_text(&route);
+        let recorded = self.decide(decision);
+        let route = recorded.route;
+        let blockers = admission_blocker_text(recorded.admission_blockers);
         tracing::info!(
             target: "eliotd::diagnostics",
             event = "eliotd.maintenance_family_route",
             service = SERVICE_NAME,
-            family = %self.family,
-            obligation = self.obligation,
-            mode = ?self.mode,
-            dedup_scope = self.dedup.scope_name(),
-            dedup_key = ?self.dedup.key_parts(),
-            conditions = %self.condition_names().join("+"),
+            family = %recorded.family,
+            obligation = recorded.obligation,
+            mode = ?recorded.mode,
+            dedup_scope = recorded.dedup.scope_name(),
+            dedup_key = ?recorded.dedup.key_parts(),
+            conditions = %recorded.condition_names().join("+"),
             origins = %self.origin_names().join("+"),
-            unattended_safe = self.eligibility.unattended_safe,
+            unattended_safe = recorded.eligibility.unattended_safe,
             separate_authority = self.effect_policy.needs_separate_authority(),
             route = ?route,
-            owner_or_dependency = route.target(),
+            owner_or_dependency = recorded.owner_or_dependency(),
+            execution_owner = ?recorded.execution_owner(),
             missing_route = route.missing(),
-            admits_start = route.admits_start(),
+            admits_start = recorded.admits_start,
             admission_blockers = %blockers,
+            cost_class = recorded.recommendation.cost.class_name(),
             observation_path = SYSTEM_OBSERVATION_PATH,
-            effect_evidence_owner = self.observation.effect_evidence_owner,
-            receipt_refs = %self.observation.receipt_refs.join("+"),
-            governor_decision = ?decision.decision,
-            governor_reason = ?decision.reason,
-            governor_admits_job = decision.admits_job,
-            trigger = %crate::diagnostics::sanitize_identity(&decision.trigger_id),
-            scope = %crate::diagnostics::sanitize_identity(&decision.scope_ref),
-            recommendation = %self.recommendation(),
+            effect_evidence_owner = recorded.observation.effect_evidence_owner,
+            receipt_refs = %recorded.observation.receipt_refs.join("+"),
+            governor_decision = ?recorded.governor_decision,
+            governor_reason = ?recorded.governor_reason,
+            governor_admits_job = recorded.governor_admits_job,
+            trigger = %crate::diagnostics::sanitize_identity(&recorded.trigger_id),
+            scope = %crate::diagnostics::sanitize_identity(&recorded.scope_ref),
+            recommendation = %recorded.recommendation.text(),
         );
     }
 }
 
 /// Joins the shared Durable Job admission blockers into one inspectable line.
-fn admission_blocker_text(route: &MaintenanceRoute) -> String {
-    route
-        .admission_blockers()
+///
+/// This is a complete record, not the recommendation: the recommendation names
+/// ONE binding dependency, and this line is where the remaining shared blockers
+/// stay inspectable.
+fn admission_blocker_text(blockers: &[MaintenanceAdmissionBlocker]) -> String {
+    blockers
         .iter()
         .copied()
         .map(MaintenanceAdmissionBlocker::as_str)
