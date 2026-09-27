@@ -282,6 +282,28 @@ fn observe_generation(event: &'static str, outcome: &'static str) {
     );
 }
 
+/// F-LOG-KERNEL-4 (#903 W7): cutover-scoped gateway observations.
+///
+/// Same #895-only shape as [`observe_generation`] plus the cutover call's own
+/// validated operation identity (`CutoverDecision::cutover_id`, already echoed
+/// on the authenticated `GenerationCutoverOutcome` reply; I15.4, I07.20, W6),
+/// policy-screened and bounded by `bound_field` before formatting. Concurrent
+/// cutovers correlate by identity with no dedup cache, no new probe, and no
+/// lock-held emission.
+fn observe_generation_cutover(event: &'static str, outcome: &'static str, cutover_id: &str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    let cutover_bound = bound_field(cutover_id);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        cutover_id = cutover_bound.text(),
+        "generation gateway observation"
+    );
+}
+
 /// Maps one generation-route snapshot failure to its stable diagnostic code.
 ///
 /// Only the variant is emitted; any `String` payload is never logged.
@@ -386,12 +408,22 @@ enum GenerationCutoverInnerFailure {
 }
 
 impl ServiceFenceObservation {
-    fn emit(self) {
-        observe_generation("kernel.generation.service_fence_requested", "attempt");
+    /// Cutover-scoped fence observation: the same subordinate pair, correlated
+    /// to its cutover call by the validated operation identity (W7).
+    fn emit_for_cutover(self, cutover_id: &str) {
+        observe_generation_cutover(
+            "kernel.generation.service_fence_requested",
+            "attempt",
+            cutover_id,
+        );
         if self.succeeded {
-            observe_generation("kernel.generation.service_fenced", "success");
+            observe_generation_cutover("kernel.generation.service_fenced", "success", cutover_id);
         } else {
-            observe_generation("kernel.generation.service_fence_rejected", "rejected");
+            observe_generation_cutover(
+                "kernel.generation.service_fence_rejected",
+                "rejected",
+                cutover_id,
+            );
         }
     }
 }
@@ -408,7 +440,7 @@ fn fence_service_after_generation_failure(
     ServiceFenceObservation {
         succeeded: result.is_ok(),
     }
-    .emit();
+    .emit_for_cutover("cutover-op-903");
     result
 }
 
@@ -557,23 +589,38 @@ impl KernelComposition {
     ///
     /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): exactly one terminal is
     /// emitted per failed cutover; the cutover request versus the owner's
-    /// durable receipt stay distinct, and no decision, route, epoch, or
-    /// fence material is logged.
+    /// durable receipt stay distinct. Subordinate phase records of one call
+    /// carry only that call's validated operation identity (already echoed on
+    /// the authenticated outcome reply), so concurrent cutovers correlate
+    /// without a dedup cache, a new probe, or a lock-held emission; no route,
+    /// epoch, generation, or fence material is logged.
     pub fn apply_generation_cutover(
         &self,
         decision: &CutoverDecision,
     ) -> Result<(), KernelServiceError> {
-        observe_generation("kernel.generation.cutover_requested", "attempt");
+        observe_generation_cutover(
+            "kernel.generation.cutover_requested",
+            "attempt",
+            decision.cutover_id(),
+        );
         match self.apply_generation_cutover_inner(decision) {
             Ok(GenerationCutoverApplyDisposition::Applied) => {
-                observe_generation("kernel.generation.cutover_committed", "success");
+                observe_generation_cutover(
+                    "kernel.generation.cutover_committed",
+                    "success",
+                    decision.cutover_id(),
+                );
                 // Issue #1837: durable audit evidence for epoch transition.
                 self.audit_observe(AuditEventDraft::epoch_cutover_applied(decision));
                 Ok(())
             }
             Ok(GenerationCutoverApplyDisposition::Readback) => Ok(()),
             Err(error) => {
-                observe_generation("kernel.generation.cutover_failed", "rejected");
+                observe_generation_cutover(
+                    "kernel.generation.cutover_failed",
+                    "rejected",
+                    decision.cutover_id(),
+                );
                 super::kernel_diagnostics::observe_terminal_error(
                     generation_cutover_terminal_code(&error),
                 );
@@ -677,10 +724,10 @@ impl KernelComposition {
         };
         drop(poison);
         if let Some(observations) = persistence_observations {
-            observations.emit(result.is_ok());
+            observations.emit(result.is_ok(), decision.cutover_id());
         }
         if let Some(observation) = fence_observation {
-            observation.emit();
+            observation.emit_for_cutover(decision.cutover_id());
         }
         result
     }
