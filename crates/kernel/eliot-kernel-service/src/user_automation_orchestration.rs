@@ -41,7 +41,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::user_automation_execution::{
-    UserAutomationWakeHorizonPublication, UserAutomationWakePublication,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePublication,
 };
 
 /// Domain separator of one derived runtime-obligation identity.
@@ -72,6 +73,9 @@ pub enum UserAutomationRuntimeObligationKind {
     WakeHorizonPublication,
     /// Exact unadmitted pending wakes cancelled at a committed retirement.
     WakeCancellation,
+    /// Durable receipt recording the one-snapshot owner enumeration that
+    /// authorizes a later wake cancellation.
+    WakeTargetEnumerationReceipt,
 }
 
 impl UserAutomationRuntimeObligationKind {
@@ -81,6 +85,7 @@ impl UserAutomationRuntimeObligationKind {
         match self {
             Self::WakeHorizonPublication => "wake_horizon_publication",
             Self::WakeCancellation => "wake_cancellation",
+            Self::WakeTargetEnumerationReceipt => "wake_target_enumeration_receipt",
         }
     }
 
@@ -93,6 +98,9 @@ impl UserAutomationRuntimeObligationKind {
         match self {
             Self::WakeHorizonPublication => "eliot.user-automation.wake-horizon-publication",
             Self::WakeCancellation => "eliot.user-automation.wake-cancellation",
+            Self::WakeTargetEnumerationReceipt => {
+                "eliot.user-automation.wake-target-enumeration-receipt"
+            }
         }
     }
 }
@@ -120,6 +128,15 @@ pub enum UserAutomationRuntimeObligationAnswer {
     WakeCancellation {
         /// The owner's own cancelled wake identities, retained verbatim.
         cancelled_wake_ids: Vec<String>,
+        /// Exact owner enumeration receipt bound to the cancellation. Missing
+        /// values identify pre-W1 legacy answers and remain unqualified.
+        #[serde(default)]
+        enumeration_receipt: Option<Box<UserAutomationWakeEnumerationReceipt>>,
+    },
+    /// Complete one-snapshot Host owner receipt persisted before cancellation.
+    WakeTargetEnumerationReceipt {
+        /// Exact versioned owner evidence retained verbatim.
+        receipt: Box<UserAutomationWakeEnumerationReceipt>,
     },
 }
 
@@ -262,6 +279,10 @@ pub struct UserAutomationRuntimeObligation {
     /// unadmitted pending wakes are in scope. Both are immutable properties of
     /// the committed revision, so the set is identical on every later attempt.
     pub subject_ids: Vec<String>,
+    /// Exact pre-cancellation owner receipt for a qualified cancellation.
+    /// Missing values are accepted only for legacy/unqualified records.
+    #[serde(default)]
+    pub wake_enumeration_receipt: Option<Box<UserAutomationWakeEnumerationReceipt>>,
     /// Durable disposition of the retained record.
     pub disposition: UserAutomationRuntimeObligationDisposition,
 }
@@ -375,12 +396,13 @@ impl UserAutomationOrchestrationRecord {
                     },
                 );
             }
-            let request_digest = runtime_obligation_request_digest(
+            let request_digest = runtime_obligation_request_digest_for_receipt(
                 obligation.kind,
                 &self.automation_id,
                 &self.automation_revision,
                 &self.revision_digest,
                 &obligation.subject_ids,
+                obligation.wake_enumeration_receipt.as_deref(),
             )?;
             if request_digest != obligation.request_digest {
                 return Err(
@@ -388,6 +410,9 @@ impl UserAutomationOrchestrationRecord {
                         kind: obligation.kind.as_str(),
                     },
                 );
+            }
+            if let Some(receipt) = &obligation.wake_enumeration_receipt {
+                validate_enumeration_receipt_binding(self, obligation, receipt)?;
             }
             match &obligation.disposition {
                 UserAutomationRuntimeObligationDisposition::Retained => {}
@@ -442,7 +467,10 @@ fn validate_answer(
         ) => Err(UserAutomationOrchestrationError::MissingHorizonRequest),
         (
             UserAutomationRuntimeObligationKind::WakeCancellation,
-            UserAutomationRuntimeObligationAnswer::WakeCancellation { cancelled_wake_ids },
+            UserAutomationRuntimeObligationAnswer::WakeCancellation {
+                cancelled_wake_ids,
+                enumeration_receipt,
+            },
         ) => {
             if cancelled_wake_ids.is_empty() {
                 return Err(UserAutomationOrchestrationError::EmptyCancellationAnswer {
@@ -456,12 +484,57 @@ fn validate_answer(
                     return Err(UserAutomationOrchestrationError::DuplicateCancellationAnswer);
                 }
             }
+            let Some(receipt) = enumeration_receipt else {
+                return Err(UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch);
+            };
+            if obligation.wake_enumeration_receipt.as_deref() != Some(receipt.as_ref()) {
+                return Err(UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch);
+            }
+            validate_enumeration_receipt_binding(record, obligation, receipt)?;
+            let expected_targets = receipt
+                .cancellation_targets()
+                .map_err(|_| UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch)?
+                .into_iter()
+                .map(|target| target.wake_id)
+                .collect::<Vec<_>>();
+            if &expected_targets != cancelled_wake_ids {
+                return Err(UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch);
+            }
             Ok(())
         }
+        (
+            UserAutomationRuntimeObligationKind::WakeTargetEnumerationReceipt,
+            UserAutomationRuntimeObligationAnswer::WakeTargetEnumerationReceipt { receipt },
+        ) => validate_enumeration_receipt_binding(record, obligation, receipt),
         (kind, _) => Err(UserAutomationOrchestrationError::AnswerKindMismatch {
             kind: kind.as_str(),
         }),
     }
+}
+
+fn validate_enumeration_receipt_binding(
+    record: &UserAutomationOrchestrationRecord,
+    obligation: &UserAutomationRuntimeObligation,
+    receipt: &UserAutomationWakeEnumerationReceipt,
+) -> Result<(), UserAutomationOrchestrationError> {
+    receipt
+        .validate_integrity()
+        .map_err(|_| UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch)?;
+    let subject_ids = receipt
+        .denominator
+        .iter()
+        .map(|occurrence| occurrence.occurrence_id.clone())
+        .collect::<Vec<_>>();
+    if receipt.parent_operation_identity != record.parent
+        || receipt.automation_id != record.automation_id
+        || receipt.automation_revision != record.automation_revision
+        || receipt.revision_digest != record.revision_digest
+        || receipt.state_fence != record.state_fence
+        || subject_ids != obligation.subject_ids
+    {
+        return Err(UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch);
+    }
+    Ok(())
 }
 
 /// Derives the ORIGINAL owner operation identity of one runtime obligation.
@@ -535,6 +608,44 @@ pub fn runtime_obligation_request_digest(
     Ok(sha256_hex(&bytes))
 }
 
+fn runtime_obligation_request_digest_for_receipt(
+    kind: UserAutomationRuntimeObligationKind,
+    automation_id: &str,
+    automation_revision: &str,
+    revision_digest: &str,
+    subject_ids: &[String],
+    receipt: Option<&UserAutomationWakeEnumerationReceipt>,
+) -> Result<String, UserAutomationOrchestrationError> {
+    let base = runtime_obligation_request_digest(
+        kind,
+        automation_id,
+        automation_revision,
+        revision_digest,
+        subject_ids,
+    )?;
+    let Some(receipt) = receipt else {
+        return Ok(base);
+    };
+    if kind != UserAutomationRuntimeObligationKind::WakeCancellation {
+        return Err(UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch);
+    }
+    receipt
+        .validate_integrity()
+        .map_err(|_| UserAutomationOrchestrationError::WakeEnumerationReceiptMismatch)?;
+    let bytes = canonical_json_bytes(&(
+        OBLIGATION_IDENTITY_DOMAIN,
+        "request-with-wake-enumeration-receipt.v1",
+        base,
+        &receipt.canonical_digest,
+    ))
+    .map_err(
+        |error| UserAutomationOrchestrationError::CanonicalEncoding {
+            detail: error.to_string(),
+        },
+    )?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// Derives the digest over the exact subject identities alone, used as the
 /// durable payload digest of the retained record so the exact occurrence/wake
 /// set is bound independently of the automation binding.
@@ -572,8 +683,39 @@ pub fn retained_user_automation_obligation(
             subject_ids,
         )?,
         subject_ids: subject_ids.to_vec(),
+        wake_enumeration_receipt: None,
         disposition: UserAutomationRuntimeObligationDisposition::Retained,
     })
+}
+
+/// Builds a cancellation obligation bound to the exact Host enumeration
+/// receipt that supplies its target subset.
+pub fn retained_user_automation_cancellation_obligation(
+    parent: &OperationIdentity,
+    automation_id: &str,
+    automation_revision: &str,
+    revision_digest: &str,
+    subject_ids: &[String],
+    receipt: UserAutomationWakeEnumerationReceipt,
+) -> Result<UserAutomationRuntimeObligation, UserAutomationOrchestrationError> {
+    let mut obligation = retained_user_automation_obligation(
+        UserAutomationRuntimeObligationKind::WakeCancellation,
+        parent,
+        automation_id,
+        automation_revision,
+        revision_digest,
+        subject_ids,
+    )?;
+    obligation.wake_enumeration_receipt = Some(Box::new(receipt));
+    obligation.request_digest = runtime_obligation_request_digest_for_receipt(
+        obligation.kind,
+        automation_id,
+        automation_revision,
+        revision_digest,
+        subject_ids,
+        obligation.wake_enumeration_receipt.as_deref(),
+    )?;
+    Ok(obligation)
 }
 
 /// Rejects a subject set that is empty, blank, or contains a duplicate, because
@@ -700,6 +842,10 @@ pub enum UserAutomationOrchestrationError {
         /// Typed execution-contract validation failure.
         detail: String,
     },
+    /// The exact owner enumeration receipt does not bind to its durable
+    /// cancellation obligation or response.
+    #[error("post-commit wake enumeration receipt does not bind to its cancellation obligation")]
+    WakeEnumerationReceiptMismatch,
     /// A retained answer does not match the obligation kind it is filed under.
     #[error("a retained answer of another kind cannot answer this {kind} obligation")]
     AnswerKindMismatch {

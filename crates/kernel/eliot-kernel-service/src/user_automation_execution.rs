@@ -532,6 +532,11 @@ pub struct UserAutomationWakeCancellation {
     /// parsing a wake reason or deriving an identity.
     #[serde(default)]
     pub targets: Vec<UserAutomationWakeCancellationTarget>,
+    /// Exact complete owner receipt from which these targets were selected.
+    /// Missing values are legacy/unqualified cancellation requests and are not
+    /// accepted by the concrete Host cancellation owner.
+    #[serde(default)]
+    pub enumeration_receipt: Option<Box<UserAutomationWakeEnumerationReceipt>>,
 }
 
 impl UserAutomationWakeCancellation {
@@ -566,6 +571,23 @@ impl UserAutomationWakeCancellation {
                     "duplicate cancellation target",
                 ));
             }
+        }
+        let receipt = self.enumeration_receipt.as_deref().ok_or(
+            UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation requires a complete owner enumeration receipt",
+            ),
+        )?;
+        receipt.validate_integrity()?;
+        if receipt.automation_id != self.automation_id
+            || receipt.automation_revision != self.automation_revision
+            || receipt.parent_operation_identity != self.identity
+            || receipt.state_fence != self.state_fence
+            || receipt.authenticated_owner_identity != self.authenticated_principal
+            || receipt.cancellation_targets()? != self.targets
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation enumeration receipt binding",
+            ));
         }
         Ok(())
     }
@@ -682,6 +704,498 @@ pub struct UserAutomationWakeReadback {
     pub idempotency_key: String,
     /// Checksum of the exact retained Host journal record.
     pub record_checksum: String,
+}
+
+/// Request for one owner snapshot that accounts for the complete committed
+/// occurrence denominator of a retired immutable revision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeEnumerationRequest {
+    /// Authenticated operator request metadata and State Fence.
+    pub context: RequestMetadata,
+    /// Principal authenticated by Kernel/Host for the immutable revision owner.
+    pub authenticated_principal: String,
+    /// Exact parent remove operation identity.
+    pub identity: OperationIdentity,
+    /// Retired automation identity.
+    pub automation_id: String,
+    /// Retired immutable revision identity.
+    pub automation_revision: String,
+    /// Canonical digest of the committed immutable revision.
+    pub revision_digest: String,
+    /// Complete committed occurrence denominator in canonical owner order.
+    pub denominator: Vec<AutomationOccurrenceIdentity>,
+    /// Canonical digest of the complete denominator.
+    pub denominator_digest: String,
+}
+
+impl UserAutomationWakeEnumerationRequest {
+    /// Validates every identity and recomputes the complete denominator digest.
+    pub fn validate(&self) -> Result<(), UserAutomationExecutionError> {
+        self.context
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        self.identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        validate_text(
+            &self.authenticated_principal,
+            "wake_enumeration.authenticated_principal",
+        )?;
+        validate_text(&self.automation_id, "wake_enumeration.automation_id")?;
+        validate_text(
+            &self.automation_revision,
+            "wake_enumeration.automation_revision",
+        )?;
+        validate_digest(&self.revision_digest, "wake_enumeration.revision_digest")?;
+        validate_digest(
+            &self.denominator_digest,
+            "wake_enumeration.denominator_digest",
+        )?;
+        validate_wake_occurrence_denominator(
+            &self.automation_id,
+            &self.automation_revision,
+            &self.denominator,
+        )?;
+        let expected = wake_occurrence_denominator_digest(&self.denominator)?;
+        if self.denominator_digest != expected {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration denominator digest",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Version of the provider-neutral owner-issued wake enumeration receipt.
+pub const USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION: u16 = 1;
+
+/// Exact Host journal location used to prove one occurrence's disposition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeOwnerEvidence {
+    /// Occurrence identity this owner evidence answers.
+    pub occurrence_id: String,
+    /// Exact Host installation identity from the Host owner epoch.
+    pub host_owner_identity: String,
+    /// Canonical Host owner epoch digest; the receipt separately binds the
+    /// journal sequence and last checksum within that generation.
+    pub host_owner_generation: String,
+    /// Monotonic Host journal sequence of the one shared snapshot.
+    pub journal_sequence: u64,
+    /// Last durable journal checksum in that snapshot, absent only at genesis.
+    pub journal_last_checksum: Option<String>,
+    /// Canonical digest of the exact Host snapshot projection.
+    pub snapshot_digest: String,
+    /// Exact retained wake-record checksum, present when the snapshot has a
+    /// single matching record rather than a proven absence.
+    pub wake_record_checksum: Option<String>,
+    /// Exact lifecycle state of that matching record, when one is retained.
+    pub wake_state: Option<WakeIntentState>,
+}
+
+/// One denominator member's complete owner-issued disposition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum UserAutomationWakeOccurrenceDisposition {
+    /// The Host owner retains this exact unadmitted pending wake.
+    PendingTarget {
+        /// Exact journal-backed cancellation target.
+        target: UserAutomationWakeCancellationTarget,
+    },
+    /// The Host owner snapshot proves no unadmitted pending target is retained.
+    /// Evidence may cite a matching wake already claimed, started, or terminal.
+    NotRetained {
+        /// Exact per-occurrence reference into the shared owner snapshot.
+        evidence: UserAutomationWakeOwnerEvidence,
+    },
+    /// The owner snapshot could not classify this member safely.
+    Unresolved {
+        /// Exact per-occurrence reference into the shared owner snapshot.
+        evidence: UserAutomationWakeOwnerEvidence,
+        /// Closed reason this member prevents cancellation.
+        reason: String,
+    },
+}
+
+/// Counts proving that each committed denominator member appears exactly once.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeEnumerationCoverage {
+    /// Number of immutable committed occurrences.
+    pub denominator_count: u64,
+    /// Number of occurrences represented by exactly one disposition.
+    pub covered_count: u64,
+    /// Number represented as retained pending targets.
+    pub pending_target_count: u64,
+    /// Number represented as owner-proven not retained.
+    pub not_retained_count: u64,
+    /// Number represented explicitly as unresolved.
+    pub unresolved_count: u64,
+    /// Whether every denominator member has one disposition.
+    pub complete: bool,
+}
+
+/// Versioned provider-neutral projection of one durable Host owner snapshot.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeEnumerationReceipt {
+    /// Receipt schema version.
+    pub version: u16,
+    /// Automation bound by the committed revision.
+    pub automation_id: String,
+    /// Immutable revision identity.
+    pub automation_revision: String,
+    /// Canonical immutable revision digest.
+    pub revision_digest: String,
+    /// Exact remove operation identity that asked the Host owner.
+    pub parent_operation_identity: OperationIdentity,
+    /// Complete committed occurrence denominator, in canonical owner order.
+    pub denominator: Vec<AutomationOccurrenceIdentity>,
+    /// Canonical digest of the complete denominator.
+    pub denominator_digest: String,
+    /// Exact Host installation identity that owns the journal snapshot.
+    pub host_owner_identity: String,
+    /// Exact sequence-bound Host owner generation.
+    pub host_owner_generation: String,
+    /// Digest of the server-authored Host channel and peer-admission evidence.
+    pub authenticated_channel_binding_sha256: String,
+    /// Monotonic Host journal sequence of the shared snapshot.
+    pub journal_sequence: u64,
+    /// Last durable journal checksum in that snapshot, absent only at genesis.
+    pub journal_last_checksum: Option<String>,
+    /// Canonical digest of the exact Host snapshot projection.
+    pub snapshot_digest: String,
+    /// State Fence under which the authenticated retirement was requested.
+    pub state_fence: StateFence,
+    /// Authenticated immutable revision owner principal.
+    pub authenticated_owner_identity: String,
+    /// One disposition for every denominator member, in denominator order.
+    pub dispositions: Vec<UserAutomationWakeOccurrenceDisposition>,
+    /// Explicit denominator coverage counts and completeness bit.
+    pub coverage: UserAutomationWakeEnumerationCoverage,
+    /// Canonical digest over this receipt with this field empty.
+    pub canonical_digest: String,
+}
+
+impl UserAutomationWakeEnumerationReceipt {
+    /// Recomputes coverage and canonical digest and binds the receipt to the
+    /// exact committed revision and request that asked the owner.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationWakeEnumerationRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        request.validate()?;
+        if self.version != USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION
+            || self.automation_id != request.automation_id
+            || self.automation_revision != request.automation_revision
+            || self.revision_digest != request.revision_digest
+            || self.denominator != request.denominator
+            || self.denominator_digest != request.denominator_digest
+            || self.parent_operation_identity != request.identity
+            || self.state_fence != request.context.state_fence
+            || self.authenticated_owner_identity != request.authenticated_principal
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration receipt binding",
+            ));
+        }
+        validate_text(
+            &self.host_owner_identity,
+            "wake_enumeration.host_owner_identity",
+        )?;
+        validate_digest(
+            &self.host_owner_generation,
+            "wake_enumeration.host_owner_generation",
+        )?;
+        validate_digest(
+            &self.authenticated_channel_binding_sha256,
+            "wake_enumeration.authenticated_channel_binding_sha256",
+        )?;
+        validate_digest(&self.snapshot_digest, "wake_enumeration.snapshot_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        self.validate_integrity()?;
+        Ok(())
+    }
+
+    /// Validates the self-contained receipt without comparing it to a newer
+    /// caller State Fence. Used when reading a previously retained receipt.
+    pub fn validate_integrity(&self) -> Result<(), UserAutomationExecutionError> {
+        if self.version != USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration receipt version",
+            ));
+        }
+        self.parent_operation_identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        validate_text(&self.automation_id, "wake_enumeration.automation_id")?;
+        validate_text(
+            &self.automation_revision,
+            "wake_enumeration.automation_revision",
+        )?;
+        validate_digest(&self.revision_digest, "wake_enumeration.revision_digest")?;
+        validate_digest(
+            &self.denominator_digest,
+            "wake_enumeration.denominator_digest",
+        )?;
+        validate_wake_occurrence_denominator(
+            &self.automation_id,
+            &self.automation_revision,
+            &self.denominator,
+        )?;
+        if wake_occurrence_denominator_digest(&self.denominator)? != self.denominator_digest {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration receipt denominator digest",
+            ));
+        }
+        validate_text(
+            &self.host_owner_identity,
+            "wake_enumeration.host_owner_identity",
+        )?;
+        validate_digest(
+            &self.host_owner_generation,
+            "wake_enumeration.host_owner_generation",
+        )?;
+        validate_digest(
+            &self.authenticated_channel_binding_sha256,
+            "wake_enumeration.authenticated_channel_binding_sha256",
+        )?;
+        validate_digest(&self.snapshot_digest, "wake_enumeration.snapshot_digest")?;
+        validate_text(
+            &self.authenticated_owner_identity,
+            "wake_enumeration.authenticated_owner_identity",
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        if let Some(checksum) = &self.journal_last_checksum {
+            validate_digest(checksum, "wake_enumeration.journal_last_checksum")?;
+        }
+        self.validate_dispositions()?;
+        if self.canonical_digest != self.compute_digest()? {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration receipt digest",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the exact pending targets only when the complete receipt has no
+    /// unresolved member.
+    pub fn cancellation_targets(
+        &self,
+    ) -> Result<Vec<UserAutomationWakeCancellationTarget>, UserAutomationExecutionError> {
+        self.validate_dispositions()?;
+        if !self.coverage.complete || self.coverage.unresolved_count != 0 {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration contains unresolved denominator members",
+            ));
+        }
+        Ok(self
+            .dispositions
+            .iter()
+            .filter_map(|disposition| match disposition {
+                UserAutomationWakeOccurrenceDisposition::PendingTarget { target } => {
+                    Some(target.clone())
+                }
+                UserAutomationWakeOccurrenceDisposition::NotRetained { .. }
+                | UserAutomationWakeOccurrenceDisposition::Unresolved { .. } => None,
+            })
+            .collect())
+    }
+
+    /// Verifies that the owner bound its receipt to the exact authenticated
+    /// Host channel that carried the batch request.
+    pub fn validate_authenticated_channel(
+        &self,
+        expected_channel_binding_sha256: &str,
+    ) -> Result<(), UserAutomationExecutionError> {
+        validate_digest(
+            expected_channel_binding_sha256,
+            "wake_enumeration.expected_channel_binding_sha256",
+        )?;
+        if self.authenticated_channel_binding_sha256 != expected_channel_binding_sha256 {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration authenticated channel binding",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Recomputes the canonical receipt digest with the digest field cleared.
+    pub fn compute_digest(&self) -> Result<String, UserAutomationExecutionError> {
+        let mut unsigned = self.clone();
+        unsigned.canonical_digest.clear();
+        let bytes = canonical_json_bytes(&unsigned).map_err(|_| {
+            UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration receipt encoding",
+            )
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    fn validate_dispositions(&self) -> Result<(), UserAutomationExecutionError> {
+        if self.denominator.is_empty() || self.dispositions.len() != self.denominator.len() {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration receipt coverage",
+            ));
+        }
+        let mut pending = 0_u64;
+        let mut not_retained = 0_u64;
+        let mut unresolved = 0_u64;
+        for (occurrence, disposition) in self.denominator.iter().zip(&self.dispositions) {
+            match disposition {
+                UserAutomationWakeOccurrenceDisposition::PendingTarget { target } => {
+                    validate_text(&target.wake_id, "wake_enumeration.target.wake_id")?;
+                    validate_text(&target.operation_id, "wake_enumeration.target.operation_id")?;
+                    validate_text(
+                        &target.idempotency_key,
+                        "wake_enumeration.target.idempotency_key",
+                    )?;
+                    validate_digest(
+                        &target.record_checksum,
+                        "wake_enumeration.target.record_checksum",
+                    )?;
+                    target.state_fence.validate().map_err(|error| {
+                        UserAutomationExecutionError::Metadata(error.to_string())
+                    })?;
+                    if target.automation_id != self.automation_id
+                        || target.automation_revision != self.automation_revision
+                        || target.wake_id != occurrence.occurrence_id
+                        || target.state_fence != self.state_fence
+                    {
+                        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                            "wake enumeration target binding",
+                        ));
+                    }
+                    pending += 1;
+                }
+                UserAutomationWakeOccurrenceDisposition::NotRetained { evidence } => {
+                    validate_wake_owner_evidence(self, occurrence, evidence)?;
+                    if evidence.wake_state == Some(WakeIntentState::Pending) {
+                        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                            "pending wake cannot be classified as not retained",
+                        ));
+                    }
+                    not_retained += 1;
+                }
+                UserAutomationWakeOccurrenceDisposition::Unresolved { evidence, reason } => {
+                    validate_wake_owner_evidence(self, occurrence, evidence)?;
+                    validate_text(reason, "wake_enumeration.unresolved.reason")?;
+                    unresolved += 1;
+                }
+            }
+        }
+        let denominator_count = self.denominator.len() as u64;
+        let expected_coverage = UserAutomationWakeEnumerationCoverage {
+            denominator_count,
+            covered_count: denominator_count,
+            pending_target_count: pending,
+            not_retained_count: not_retained,
+            unresolved_count: unresolved,
+            complete: true,
+        };
+        if self.coverage != expected_coverage {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration coverage counts",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_wake_owner_evidence(
+    receipt: &UserAutomationWakeEnumerationReceipt,
+    occurrence: &AutomationOccurrenceIdentity,
+    evidence: &UserAutomationWakeOwnerEvidence,
+) -> Result<(), UserAutomationExecutionError> {
+    validate_text(
+        &evidence.occurrence_id,
+        "wake_enumeration.evidence.occurrence_id",
+    )?;
+    validate_text(
+        &evidence.host_owner_identity,
+        "wake_enumeration.evidence.host_owner_identity",
+    )?;
+    validate_digest(
+        &evidence.host_owner_generation,
+        "wake_enumeration.evidence.host_owner_generation",
+    )?;
+    validate_digest(
+        &evidence.snapshot_digest,
+        "wake_enumeration.evidence.snapshot_digest",
+    )?;
+    if let Some(checksum) = &evidence.journal_last_checksum {
+        validate_digest(checksum, "wake_enumeration.evidence.journal_last_checksum")?;
+    }
+    if let Some(checksum) = &evidence.wake_record_checksum {
+        validate_digest(checksum, "wake_enumeration.evidence.wake_record_checksum")?;
+    }
+    if evidence.wake_record_checksum.is_some() != evidence.wake_state.is_some() {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "wake enumeration retained-record evidence pair",
+        ));
+    }
+    if evidence.occurrence_id != occurrence.occurrence_id
+        || evidence.host_owner_identity != receipt.host_owner_identity
+        || evidence.host_owner_generation != receipt.host_owner_generation
+        || evidence.journal_sequence != receipt.journal_sequence
+        || evidence.journal_last_checksum != receipt.journal_last_checksum
+        || evidence.snapshot_digest != receipt.snapshot_digest
+    {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "wake enumeration owner evidence binding",
+        ));
+    }
+    Ok(())
+}
+
+/// Computes the canonical digest of one complete committed denominator.
+pub fn wake_occurrence_denominator_digest(
+    denominator: &[AutomationOccurrenceIdentity],
+) -> Result<String, UserAutomationExecutionError> {
+    let bytes = canonical_json_bytes(&denominator).map_err(|_| {
+        UserAutomationExecutionError::RuntimeResponseMismatch(
+            "wake enumeration denominator encoding",
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn validate_wake_occurrence_denominator(
+    automation_id: &str,
+    automation_revision: &str,
+    denominator: &[AutomationOccurrenceIdentity],
+) -> Result<(), UserAutomationExecutionError> {
+    if denominator.is_empty() {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "wake enumeration denominator is empty",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for occurrence in denominator {
+        if occurrence.automation_id != automation_id
+            || occurrence.revision != automation_revision
+            || occurrence.occurrence_id
+                != UserAutomationInvocation::occurrence_identity_for(
+                    &occurrence.automation_id,
+                    &occurrence.revision,
+                    &occurrence.trigger,
+                )
+                .map_err(UserAutomationExecutionError::Contract)?
+            || !seen.insert(occurrence.occurrence_id.as_str())
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake enumeration denominator identity",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl UserAutomationWakeReadback {
@@ -2059,6 +2573,30 @@ pub trait UserAutomationWakePort: Send + Sync {
         ))
     }
 
+    /// Returns one owner-issued receipt for the complete occurrence denominator
+    /// from one owner snapshot. An owner without this exact batch path fails
+    /// closed; repeated single-occurrence reads are not a substitute.
+    async fn enumerate_pending_wakes(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "UserAutomation complete wake enumeration is unavailable".to_owned(),
+        ))
+    }
+
+    /// Host-only form supplied after the server-authored execution session has
+    /// authenticated this exact channel. The default fails closed.
+    async fn enumerate_pending_wakes_authenticated(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
+        _authenticated_channel_binding_sha256: String,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "authenticated UserAutomation wake enumeration is unavailable".to_owned(),
+        ))
+    }
+
     /// Cancels only unadmitted wakes for a retired revision.
     async fn cancel_pending_wakes(
         &self,
@@ -2452,6 +2990,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         &self,
         request: UserAutomationServiceRequest,
         targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
         runtime: &R,
     ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
         let (automation_id, automation_revision) = match &request.intent.operation {
@@ -2501,6 +3040,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 "remove revision",
             ));
         }
+        enumeration_receipt.validate_integrity()?;
         let cancellation = UserAutomationWakeCancellation {
             context: request.context.clone(),
             authenticated_principal: request.authenticated_principal,
@@ -2510,6 +3050,7 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             state_fence: request.context.state_fence.clone(),
             only_unadmitted: true,
             targets,
+            enumeration_receipt: Some(Box::new(enumeration_receipt)),
         };
         cancellation.validate()?;
         let cancelled_wake_ids = runtime
@@ -2556,168 +3097,114 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 /// cancellation owner (issue #2808, I5.16).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserAutomationWakeTargetEnumeration {
-    /// The wake owner answered for every committed occurrence: it returned an
-    /// exact retained pending record for the ones it still holds, and a
-    /// definitive "retains no such record" for the rest.
+    /// The wake owner returned one validated receipt covering every committed
+    /// occurrence from one exact Host journal snapshot.
     Proven {
-        /// Exact owner-issued targets, one per retained pending wake. Empty only
-        /// when the owner proved there is no unadmitted wake to cancel.
-        targets: Vec<UserAutomationWakeCancellationTarget>,
+        /// Complete versioned receipt, including every positive and negative
+        /// disposition and the shared owner snapshot reference.
+        receipt: UserAutomationWakeEnumerationReceipt,
     },
     /// No complete exact target list is owner-proven, so no cancellation is
     /// issued and the wake handoff of this retirement stays unresolved.
     Unproven {
         /// Closed reason the enumeration is not owner-proven.
         reason: String,
+        /// Typed owner evidence when the Host answered but some member remains
+        /// explicitly unresolved. Absent only when no receipt was returned.
+        receipt: Option<UserAutomationWakeEnumerationReceipt>,
     },
 }
 
-/// Reads the exact owner-issued pending wake targets of one retired revision.
+/// Requests one versioned Host-owner receipt over a retired revision's complete
+/// committed occurrence denominator.
 ///
-/// The occurrence set asked about is the committed revision's own normalized
-/// occurrence denominator — the same bounded set the horizon publication owner
-/// compiles from that revision, not a page of execution history and not the
-/// Durable Job history this projection already references. Each member is read
-/// back from the existing wake owner, which resolves it against its own journal
-/// and returns the record it actually retains; only that returned record
-/// supplies the wake identity, journal operation identity, idempotency key,
-/// record checksum and State Fence a cancellation target carries.
+/// The request binds the immutable revision and canonical denominator digest.
+/// The Host producer takes one journal snapshot and returns one ordered
+/// disposition per occurrence: an exact pending cancellation target, exact
+/// owner evidence that no unadmitted pending target is retained, or an explicit
+/// unresolved result. The receipt also binds that snapshot's owner identity,
+/// generation, sequence, State Fence, authenticated principal and channel. A
+/// missing member, incomplete coverage or unresolved result prevents
+/// cancellation; there is no series of per-occurrence reads and no inference
+/// from omitted targets.
 ///
-/// Each read has exactly two honest answers, and the walk keeps them apart. A
-/// returned record is a target. A
-/// [`UserAutomationRuntimeError::NotRetained`] is the owner's complete negative
-/// answer for that occurrence — it read its own state and definitively retains
-/// no such record — so the walk continues with that occurrence accounted for and
-/// nothing to cancel there. Every other answer, including
-/// [`UserAutomationRuntimeError::Unavailable`] for an owner that could not be
-/// read, makes the whole walk `Unproven`: an unknown target set is never
-/// reported as a partial one, and "nothing needs cancelling" is never inferred
-/// from an owner that could not answer.
-///
-/// A committed revision that declares no occurrence identity is `Unproven` as
-/// well. The walk asked nobody, so it proved nothing; an empty denominator is
-/// not evidence of an empty wake set. A valid normalized schedule always
-/// declares at least one occurrence, so this is a fail-closed guard rather than
-/// a reachable product state.
+/// A committed revision that declares no occurrence identity is `Unproven`.
+/// The owner asked about no members, so the empty denominator is not evidence
+/// that the Host retains no wakes.
 pub async fn read_retirement_wake_targets<R>(
     revision: &UserAutomationRevision,
     context: &RequestMetadata,
+    authenticated_principal: &str,
     identity: &OperationIdentity,
     runtime: &R,
 ) -> Result<UserAutomationWakeTargetEnumeration, UserAutomationExecutionError>
 where
     R: UserAutomationWakePort + ?Sized,
 {
-    let identities = revision
-        .compile_occurrence_identities()
-        .map_err(UserAutomationExecutionError::Contract)?;
-    // The read is authenticated as the revision's own owner principal: a
-    // published calendar wake belongs to the revision owner, and the wake read
-    // refuses a request whose principal does not name the invocation it
-    // selects. The carrier identity is the caller's already-admitted remove
-    // identity, so this read mints no canonical operation of its own.
-    let mut targets: Vec<UserAutomationWakeCancellationTarget> = Vec::new();
-    for occurrence in &identities {
-        let request = retirement_wake_read_request(revision, occurrence, context, identity)?;
-        let read_request = request.clone();
-        match UserAutomationWakePort::read_pending_wake(runtime, request).await {
-            Ok(readback) => {
-                readback.validate_for(&read_request)?;
-                targets.push(UserAutomationWakeCancellationTarget {
-                    automation_id: revision.automation_id.clone(),
-                    automation_revision: revision.revision.clone(),
-                    wake_id: readback.intent.wake_id.clone(),
-                    operation_id: readback.operation_id.clone(),
-                    idempotency_key: readback.idempotency_key.clone(),
-                    record_checksum: readback.record_checksum.clone(),
-                    state_fence: readback.intent.state_fence.clone(),
-                });
-            }
-            // The owner is the sole writer of its wake journal and has just read
-            // it, so retaining no record for this exact occurrence is a complete
-            // negative answer: there is no unadmitted wake here to cancel. The
-            // walk continues, and the set stays provable.
-            Err(UserAutomationRuntimeError::NotRetained(_)) => {}
-            Err(error) => {
-                return Ok(UserAutomationWakeTargetEnumeration::Unproven {
-                    reason: format!(
-                        "the wake owner did not answer for occurrence {} of retired revision {}: \
-                         {error}; the exact unadmitted set is unknown, so no cancellation is \
-                         issued from a partial denominator",
-                        occurrence.occurrence_id, revision.revision
-                    ),
-                });
-            }
+    let request =
+        retirement_wake_enumeration_request(revision, context, authenticated_principal, identity)?;
+    let receipt = match UserAutomationWakePort::enumerate_pending_wakes(runtime, request.clone())
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return Ok(UserAutomationWakeTargetEnumeration::Unproven {
+                reason: format!(
+                    "the wake owner did not return one complete snapshot receipt for retired revision {}: {error}; no cancellation is issued",
+                    revision.revision
+                ),
+                receipt: None,
+            });
         }
-    }
-    if identities.is_empty() {
-        // The walk asked nobody, so it proved nothing. An empty denominator is
-        // not evidence of an empty wake set, and reporting it as a proven
-        // absence would be exactly the failure this function refuses elsewhere.
+    };
+    receipt.validate_for(&request)?;
+    if !receipt.coverage.complete || receipt.coverage.unresolved_count != 0 {
         return Ok(UserAutomationWakeTargetEnumeration::Unproven {
             reason: format!(
-                "retired revision {} of {} declares no committed occurrence identity, so no wake \
-                 owner was asked and the unadmitted wake set is unknown rather than proven empty",
-                revision.revision, revision.automation_id
+                "the Host owner receipt for retired revision {} represents the complete denominator but contains {} unresolved occurrence(s); no cancellation is issued",
+                revision.revision, receipt.coverage.unresolved_count
             ),
+            receipt: Some(receipt),
         });
     }
-    // Every committed occurrence was answered: a retained record became a target
-    // and a definitive `NotRetained` was accounted for. An empty set here is a
-    // proven absence, not a missing answer.
-    Ok(UserAutomationWakeTargetEnumeration::Proven { targets })
+    Ok(UserAutomationWakeTargetEnumeration::Proven { receipt })
 }
 
-/// Builds the exact wake-owner read request for one committed occurrence of a
-/// retired revision.
-///
-/// Every field is owner-issued. The automation, immutable revision and calendar
-/// trigger come from the committed revision's own occurrence compiler, and the
-/// principal, `WorkScope`, workdir and mode come from that same committed
-/// revision document. Nothing here consults an ambient identity, a clock, a
-/// reason string, or a row index, and the request names no wake: the wake
-/// identity, journal operation identity, idempotency key, record checksum and
-/// State Fence of a cancellation target are all returned by the wake owner.
-fn retirement_wake_read_request(
+/// Constructs the exact owner enumeration request from the immutable revision
+/// and already authenticated remove operation.
+pub fn retirement_wake_enumeration_request(
     revision: &UserAutomationRevision,
-    occurrence: &AutomationOccurrenceIdentity,
     context: &RequestMetadata,
+    authenticated_principal: &str,
     identity: &OperationIdentity,
-) -> Result<UserAutomationWakeReadRequest, UserAutomationExecutionError> {
-    if occurrence.automation_id != revision.automation_id
-        || occurrence.revision != revision.revision
-        || occurrence.occurrence_id
-            != UserAutomationInvocation::occurrence_identity_for(
-                &revision.automation_id,
-                &revision.revision,
-                &occurrence.trigger,
-            )
-            .map_err(UserAutomationExecutionError::Contract)?
-    {
+) -> Result<UserAutomationWakeEnumerationRequest, UserAutomationExecutionError> {
+    validate_text(
+        authenticated_principal,
+        "wake_enumeration.authenticated_principal",
+    )?;
+    if revision.owner_principal != authenticated_principal {
         return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
-            "retirement wake occurrence is not a member of the committed revision",
+            "authenticated principal does not own the committed automation revision",
         ));
     }
-    Ok(UserAutomationWakeReadRequest {
+    let denominator = revision
+        .compile_occurrence_identities()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    let revision_digest = revision
+        .digest()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    let request = UserAutomationWakeEnumerationRequest {
         context: context.clone(),
-        authenticated_principal: revision.owner_principal.clone(),
+        authenticated_principal: authenticated_principal.to_owned(),
         identity: identity.clone(),
-        invocation: UserAutomationInvocation {
-            automation_id: revision.automation_id.clone(),
-            automation_revision: revision.revision.clone(),
-            trigger: occurrence.trigger.clone(),
-            mode: revision.mode,
-            principal_ref: revision.owner_principal.clone(),
-            work_scope_ref: revision.work_scope.scope_id.clone(),
-            workdir_ref: revision.workdir_ref.clone(),
-            trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
-            // A published calendar occurrence of this revision is not an
-            // admitted child of another automation, so its own lineage depth is
-            // the root one.
-            child_depth: 0,
-            provenance: None,
-        },
-    })
+        automation_id: revision.automation_id.clone(),
+        automation_revision: revision.revision.clone(),
+        revision_digest,
+        denominator_digest: wake_occurrence_denominator_digest(&denominator)?,
+        denominator,
+    };
+    request.validate()?;
+    Ok(request)
 }
 
 /// Refuses a runtime boundary whose owner view is not a complete, fail-closed
@@ -3279,6 +3766,7 @@ mod tests {
             automation_revision: "revision-7".to_owned(),
             only_unadmitted: true,
             targets: Vec::new(),
+            enumeration_receipt: None,
         };
         let cancelled = active_composition
             .cancel_pending_wakes(cancellation)

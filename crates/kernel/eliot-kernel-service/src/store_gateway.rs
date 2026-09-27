@@ -50,14 +50,16 @@ use crate::store_write_reservation::{
 };
 use crate::user_automation_execution::{
     UserAutomationExecutionError, UserAutomationRemovalResult,
-    UserAutomationWakeCancellationTarget, UserAutomationWakePublication,
-    UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
+    UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
+    read_retirement_wake_targets, retirement_wake_enumeration_request,
 };
 use crate::user_automation_orchestration::{
     USER_AUTOMATION_RUNTIME_CHANNEL, UserAutomationOrchestrationRecord,
     UserAutomationRuntimeObligation, UserAutomationRuntimeObligationAnswer,
     UserAutomationRuntimeObligationDisposition, UserAutomationRuntimeObligationKind,
-    retained_user_automation_obligation, runtime_obligation_payload_digest,
+    retained_user_automation_cancellation_obligation, retained_user_automation_obligation,
+    runtime_obligation_payload_digest,
 };
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
@@ -1681,7 +1683,8 @@ impl KernelStoreGateway {
             contract_version: ORS_CONTRACT_VERSION,
             operation_id: user_automation_obligation_operation_id(obligation)?,
             kind: match obligation.kind {
-                UserAutomationRuntimeObligationKind::WakeHorizonPublication => {
+                UserAutomationRuntimeObligationKind::WakeHorizonPublication
+                | UserAutomationRuntimeObligationKind::WakeTargetEnumerationReceipt => {
                     HostRequestKind::Invocation
                 }
                 UserAutomationRuntimeObligationKind::WakeCancellation => {
@@ -1923,7 +1926,6 @@ impl KernelStoreGateway {
             .iter()
             .map(|identity| identity.occurrence_id.clone())
             .collect::<Vec<_>>();
-        let committed_occurrences = committed_occurrence_ids.len();
         let execution = not_applicable_execution();
         let Some(runtime) = runtime else {
             return Ok((
@@ -1933,77 +1935,346 @@ impl KernelStoreGateway {
                 execution,
             ));
         };
-        // The cancellation obligation is derived from the retired revision's own
-        // immutable occurrence denominator, so its durable key is known before
-        // any target is enumerated. Reading the retained record first is what
-        // makes a lost response resumable: once a cancellation is applied the
-        // owner no longer retains the cancelled wakes, so a replay that
-        // enumerated first would prove an empty target set and never reach the
-        // retained answer under this original owner operation identity.
-        let mut obligation = match Self::retirement_cancellation_obligation(
+        self.continue_retirement_wake_handoff(
             sealed,
             &revision,
             &committed_occurrence_ids,
-        ) {
-            Ok(obligation) => obligation,
-            Err(reason) => {
-                return Ok(unresolved_retirement_phases(reason, execution));
-            }
-        };
-        let retained = classify_retained_cancellation(
-            &obligation,
-            &revision.revision,
-            self.read_user_automation_obligation(&obligation),
-        );
-        if let Some(phases) = retained_cancellation_phases(retained, &mut obligation, &execution) {
-            obligations.push(obligation);
-            return Ok(phases);
-        }
-        let targets = match read_retirement_wake_targets(
-            &revision,
-            &sealed.context,
-            &sealed.identity,
             runtime,
+            obligations,
         )
         .await
-        {
-            Ok(UserAutomationWakeTargetEnumeration::Proven { targets }) => targets,
-            Ok(UserAutomationWakeTargetEnumeration::Unproven { reason }) => {
-                return Ok(unresolved_retirement_phases(reason, execution));
-            }
-            // A committed revision whose own occurrence denominator does not
-            // compile is a canonical identity defect, not an absent owner.
+    }
+
+    async fn continue_retirement_wake_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        committed_occurrence_ids: &[String],
+        runtime: &R,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let execution = not_applicable_execution();
+        let committed_occurrences = committed_occurrence_ids.len();
+        if let Err(reason) = self.ensure_legacy_cancellation_unqualified(
+            sealed,
+            revision,
+            committed_occurrence_ids,
+            obligations,
+        ) {
+            return Ok(unresolved_retirement_phases(reason, execution));
+        }
+        let enumeration_request = match retirement_wake_enumeration_request(
+            revision,
+            &sealed.context,
+            &sealed.authenticated_principal,
+            &sealed.identity,
+        ) {
+            Ok(request) => request,
             Err(error) => return Err(error.to_string()),
         };
+        let mut receipt_obligation = match Self::retirement_enumeration_obligation(
+            sealed,
+            revision,
+            committed_occurrence_ids,
+        ) {
+            Ok(obligation) => obligation,
+            Err(reason) => return Ok(unresolved_retirement_phases(reason, execution)),
+        };
+        let receipt = match self
+            .read_or_retain_retirement_enumeration_receipt(
+                sealed,
+                revision,
+                &enumeration_request,
+                &mut receipt_obligation,
+                runtime,
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                obligations.push(receipt_obligation);
+                return Ok(unresolved_retirement_phases(reason, execution));
+            }
+        };
+        let targets = match receipt.cancellation_targets() {
+            Ok(targets) => targets,
+            Err(error) => {
+                let reason = error.to_string();
+                obligations.push(receipt_obligation);
+                return Ok(unresolved_retirement_phases(reason, execution));
+            }
+        };
         if targets.is_empty() {
-            // The owner read its own journal for every committed occurrence and
-            // definitively retains no unadmitted wake for any of them. That is a
-            // complete negative answer, so the retirement is reported as resolved
-            // and no cancellation is requested: the concrete Host owner refuses
-            // an empty target list by design, and asking it to cancel nothing
-            // would be a request whose only possible answer is a refusal.
+            obligations.push(receipt_obligation);
             return Ok((
                 UserAutomationWakePhase::NotApplicable {
                     reason: format!(
-                        "the wake owner read its own journal for all {committed_occurrences} \
-                         committed occurrence identities of retired revision {} and definitively \
-                         retains no unadmitted pending wake for any of them, so there is nothing \
-                         to cancel",
+                        "the Host owner receipt accounts for all {committed_occurrences} committed occurrences of retired revision {} and proves there is no pending target to cancel",
                         revision.revision
                     ),
                 },
                 execution,
             ));
         }
+
+        let mut obligation = match Self::retirement_cancellation_obligation_with_receipt(
+            sealed,
+            revision,
+            committed_occurrence_ids,
+            receipt.clone(),
+        ) {
+            Ok(obligation) => obligation,
+            Err(reason) => {
+                obligations.push(receipt_obligation);
+                return Ok(unresolved_retirement_phases(reason, execution));
+            }
+        };
+        obligations.push(receipt_obligation);
         self.issue_retirement_cancellation(
             sealed,
-            &revision,
             &mut obligation,
-            targets,
+            (revision.clone(), targets, receipt),
             runtime,
             obligations,
         )
         .await
+    }
+
+    fn ensure_legacy_cancellation_unqualified(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        committed_occurrence_ids: &[String],
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    ) -> Result<(), String> {
+        let mut legacy_obligation =
+            Self::retirement_cancellation_obligation(sealed, revision, committed_occurrence_ids)?;
+        match self.read_user_automation_obligation(&legacy_obligation) {
+            RetainedObligationLookup::Absent => Ok(()),
+            RetainedObligationLookup::Held(_) => {
+                let reason = format!(
+                    "legacy cancellation record for revision {} has no bound one-snapshot enumeration receipt; it remains unqualified and requires reconciliation under its original identity",
+                    revision.revision
+                );
+                legacy_obligation.disposition =
+                    UserAutomationRuntimeObligationDisposition::Reconciling {
+                        reason: reason.clone(),
+                    };
+                obligations.push(legacy_obligation);
+                Err(reason)
+            }
+            RetainedObligationLookup::Unreadable { reason } => {
+                legacy_obligation.disposition =
+                    UserAutomationRuntimeObligationDisposition::Unavailable {
+                        reason: reason.clone(),
+                    };
+                obligations.push(legacy_obligation);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Reads or durably records the one Host enumeration receipt for a retired
+    /// revision. A retained answer is validated against the current exact
+    /// request, including State Fence; a replay under a different fence remains
+    /// reconciling instead of being silently rebound to the new era.
+    async fn read_or_retain_retirement_enumeration_receipt<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        request: &crate::user_automation_execution::UserAutomationWakeEnumerationRequest,
+        obligation: &mut UserAutomationRuntimeObligation,
+        runtime: &R,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        match self.read_user_automation_obligation(obligation) {
+            RetainedObligationLookup::Held(RetainedUserAutomationObligation::Answered {
+                result_response,
+            }) => {
+                let receipt = match decode_retained_wake_enumeration_receipt(
+                    result_response,
+                    request,
+                    &revision.revision,
+                    &obligation.owner_operation_id,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(reason) => {
+                        obligation.disposition =
+                            UserAutomationRuntimeObligationDisposition::Reconciling {
+                                reason: reason.clone(),
+                            };
+                        return Err(reason);
+                    }
+                };
+                self.classify_enumeration_receipt(obligation, request, receipt, false)
+            }
+            RetainedObligationLookup::Held(RetainedUserAutomationObligation::Reconciling {
+                reason,
+            }) => {
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                    reason: reason.clone(),
+                };
+                Err(reason)
+            }
+            RetainedObligationLookup::Unreadable { reason } => {
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Unavailable {
+                    reason: reason.clone(),
+                };
+                Err(reason)
+            }
+            RetainedObligationLookup::Absent
+            | RetainedObligationLookup::Held(RetainedUserAutomationObligation::Retained) => {
+                match self.retain_user_automation_obligation(sealed, obligation) {
+                    RetainedObligationLookup::Held(
+                        RetainedUserAutomationObligation::Answered { result_response },
+                    ) => {
+                        let receipt = match decode_retained_wake_enumeration_receipt(
+                            result_response,
+                            request,
+                            &revision.revision,
+                            &obligation.owner_operation_id,
+                        ) {
+                            Ok(receipt) => receipt,
+                            Err(reason) => {
+                                obligation.disposition =
+                                    UserAutomationRuntimeObligationDisposition::Reconciling {
+                                        reason: reason.clone(),
+                                    };
+                                return Err(reason);
+                            }
+                        };
+                        self.classify_enumeration_receipt(obligation, request, receipt, false)
+                    }
+                    RetainedObligationLookup::Held(RetainedUserAutomationObligation::Retained) => {
+                        self.enumerate_retirement_wakes_once(
+                            sealed, revision, request, obligation, runtime,
+                        )
+                        .await
+                    }
+                    RetainedObligationLookup::Held(
+                        RetainedUserAutomationObligation::Reconciling { reason },
+                    ) => {
+                        obligation.disposition =
+                            UserAutomationRuntimeObligationDisposition::Reconciling {
+                                reason: reason.clone(),
+                            };
+                        Err(reason)
+                    }
+                    RetainedObligationLookup::Unreadable { reason } => {
+                        obligation.disposition =
+                            UserAutomationRuntimeObligationDisposition::Unavailable {
+                                reason: reason.clone(),
+                            };
+                        Err(reason)
+                    }
+                    RetainedObligationLookup::Absent => {
+                        let reason = format!(
+                            "the durable Host enumeration receipt obligation for revision {} disappeared before the owner read",
+                            revision.revision
+                        );
+                        obligation.disposition =
+                            UserAutomationRuntimeObligationDisposition::Unavailable {
+                                reason: reason.clone(),
+                            };
+                        Err(reason)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn enumerate_retirement_wakes_once<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        request: &crate::user_automation_execution::UserAutomationWakeEnumerationRequest,
+        obligation: &mut UserAutomationRuntimeObligation,
+        runtime: &R,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        if let Err(reason) = self.mark_user_automation_obligation_admitted(obligation) {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.clone(),
+            };
+            return Err(reason);
+        }
+        match read_retirement_wake_targets(
+            revision,
+            &sealed.context,
+            &sealed.authenticated_principal,
+            &sealed.identity,
+            runtime,
+        )
+        .await
+        {
+            Ok(UserAutomationWakeTargetEnumeration::Proven { receipt }) => {
+                self.classify_enumeration_receipt(obligation, request, receipt, true)
+            }
+            Ok(UserAutomationWakeTargetEnumeration::Unproven {
+                reason,
+                receipt: Some(receipt),
+            }) => match self.classify_enumeration_receipt(obligation, request, receipt, true) {
+                Ok(_) => Err(reason),
+                Err(receipt_reason) => Err(receipt_reason),
+            },
+            Ok(UserAutomationWakeTargetEnumeration::Unproven {
+                reason,
+                receipt: None,
+            }) => {
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Retained;
+                Err(reason)
+            }
+            Err(error) => {
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Retained;
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn classify_enumeration_receipt(
+        &self,
+        obligation: &mut UserAutomationRuntimeObligation,
+        request: &crate::user_automation_execution::UserAutomationWakeEnumerationRequest,
+        receipt: UserAutomationWakeEnumerationReceipt,
+        persist: bool,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, String> {
+        if let Err(error) = receipt.validate_for(request) {
+            let reason = format!(
+                "the retained Host enumeration receipt does not match the exact revision, denominator, authenticated owner, or State Fence request: {error}"
+            );
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.clone(),
+            };
+            return Err(reason);
+        }
+        let answer = UserAutomationRuntimeObligationAnswer::WakeTargetEnumerationReceipt {
+            receipt: Box::new(receipt.clone()),
+        };
+        if persist
+            && let Err(reason) = self.retain_user_automation_obligation_answer(obligation, &answer)
+        {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.clone(),
+            };
+            return Err(reason);
+        }
+        obligation.disposition = UserAutomationRuntimeObligationDisposition::Answered {
+            answer: Box::new(answer),
+        };
+        if !receipt.coverage.complete || receipt.coverage.unresolved_count != 0 {
+            return Err(format!(
+                "the durable Host receipt for revision {} accounts for the denominator but leaves {} occurrence(s) unresolved; no cancellation is issued",
+                receipt.automation_revision, receipt.coverage.unresolved_count
+            ));
+        }
+        Ok(receipt)
     }
 
     /// Derives the durable wake-cancellation obligation of one committed
@@ -2024,6 +2295,44 @@ impl KernelStoreGateway {
         .map_err(|error| unretained_cancellation_reason(&revision.revision, error.to_string()))
     }
 
+    fn retirement_enumeration_obligation(
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        committed_occurrence_ids: &[String],
+    ) -> Result<UserAutomationRuntimeObligation, String> {
+        retained_user_automation_obligation(
+            UserAutomationRuntimeObligationKind::WakeTargetEnumerationReceipt,
+            &sealed.identity,
+            &revision.automation_id,
+            &revision.revision,
+            &revision.digest().map_err(|error| error.to_string())?,
+            committed_occurrence_ids,
+        )
+        .map_err(|error| {
+            format!(
+                "the exact Host enumeration receipt obligation for revision {} could not be derived: {error}",
+                revision.revision
+            )
+        })
+    }
+
+    fn retirement_cancellation_obligation_with_receipt(
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        committed_occurrence_ids: &[String],
+        receipt: UserAutomationWakeEnumerationReceipt,
+    ) -> Result<UserAutomationRuntimeObligation, String> {
+        retained_user_automation_cancellation_obligation(
+            &sealed.identity,
+            &revision.automation_id,
+            &revision.revision,
+            &revision.digest().map_err(|error| error.to_string())?,
+            committed_occurrence_ids,
+            receipt,
+        )
+        .map_err(|error| unretained_cancellation_reason(&revision.revision, error.to_string()))
+    }
+
     /// Retains, routes and issues the wake cancellation of one committed
     /// retirement under its durable owner operation identity, and returns the
     /// wake phase the owner produced.
@@ -2038,15 +2347,19 @@ impl KernelStoreGateway {
     async fn issue_retirement_cancellation<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
-        revision: &UserAutomationRevision,
         obligation: &mut UserAutomationRuntimeObligation,
-        targets: Vec<UserAutomationWakeCancellationTarget>,
+        retirement: (
+            UserAutomationRevision,
+            Vec<UserAutomationWakeCancellationTarget>,
+            UserAutomationWakeEnumerationReceipt,
+        ),
         runtime: &R,
         obligations: &mut Vec<UserAutomationRuntimeObligation>,
     ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
+        let (revision, targets, enumeration_receipt) = retirement;
         let execution = not_applicable_execution();
         let mut settled = obligation.clone();
         let retained = classify_retained_cancellation(
@@ -2069,7 +2382,10 @@ impl KernelStoreGateway {
             obligations.push(settled);
             return Ok(unresolved_retirement_phases(reason, execution));
         }
-        let removal = match self.cancel_retirement_wakes(sealed, targets, runtime).await {
+        let removal = match self
+            .cancel_retirement_wakes(sealed, targets, enumeration_receipt.clone(), runtime)
+            .await
+        {
             Ok(removal) => removal,
             // The retirement is committed and durable, so a refusal at this leg
             // is an unresolved handoff of a committed fact. It is reported as
@@ -2134,6 +2450,7 @@ impl KernelStoreGateway {
         let cancelled_wake_ids = removal.cancelled_wake_ids;
         let answer = UserAutomationRuntimeObligationAnswer::WakeCancellation {
             cancelled_wake_ids: cancelled_wake_ids.clone(),
+            enumeration_receipt: Some(Box::new(enumeration_receipt)),
         };
         settled.disposition = match self.retain_user_automation_obligation_answer(&settled, &answer)
         {
@@ -2171,6 +2488,7 @@ impl KernelStoreGateway {
         &self,
         sealed: &UserAutomationServiceRequest,
         targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
         runtime: &R,
     ) -> Result<UserAutomationRemovalResult, (UserAutomationExecutionError, bool)>
     where
@@ -2180,7 +2498,12 @@ impl KernelStoreGateway {
             UserAutomationService::new(&CanonicalUserAutomationStore::new(
                 BorrowedCanonicalStoreClient::new(self.store.as_ref()),
             ))
-            .remove_and_cancel_with_targets(sealed.clone(), targets, runtime),
+            .remove_and_cancel_with_targets(
+                sealed.clone(),
+                targets,
+                enumeration_receipt,
+                runtime,
+            ),
         )
         .await
         .map_err(|error| {
@@ -3529,6 +3852,8 @@ enum RetainedCancellation {
     Answered {
         /// Exact wake identities the owner reported as cancelled.
         cancelled_wake_ids: Vec<String>,
+        /// Exact pre-cancellation Host receipt bound to this answer.
+        enumeration_receipt: Box<UserAutomationWakeEnumerationReceipt>,
     },
     /// The wake handoff is unresolved under the retained owner operation
     /// identity and must be reconciled; repeating the effect is not safe.
@@ -3567,8 +3892,12 @@ fn classify_retained_cancellation(
             result_response,
             automation_revision,
             &obligation.owner_operation_id,
+            obligation.wake_enumeration_receipt.as_deref(),
         ) {
-            Ok(cancelled_wake_ids) => RetainedCancellation::Answered { cancelled_wake_ids },
+            Ok((cancelled_wake_ids, enumeration_receipt)) => RetainedCancellation::Answered {
+                cancelled_wake_ids,
+                enumeration_receipt: Box::new(enumeration_receipt),
+            },
             Err(reason) => RetainedCancellation::Unresolved { reason },
         },
     }
@@ -3583,10 +3912,14 @@ fn retained_cancellation_phases(
 ) -> Option<(UserAutomationWakePhase, UserAutomationExecutionPhase)> {
     match classification {
         RetainedCancellation::Issue => None,
-        RetainedCancellation::Answered { cancelled_wake_ids } => {
+        RetainedCancellation::Answered {
+            cancelled_wake_ids,
+            enumeration_receipt,
+        } => {
             obligation.disposition = UserAutomationRuntimeObligationDisposition::Answered {
                 answer: Box::new(UserAutomationRuntimeObligationAnswer::WakeCancellation {
                     cancelled_wake_ids: cancelled_wake_ids.clone(),
+                    enumeration_receipt: Some(enumeration_receipt),
                 }),
             };
             Some((
@@ -3770,22 +4103,62 @@ fn observed_retention_instant(context: &RequestMetadata) -> Option<i64> {
         .filter(|observed| *observed > 0)
 }
 
+/// Decodes and revalidates the exact typed Host enumeration receipt retained by
+/// the durable outbox.
+fn decode_retained_wake_enumeration_receipt(
+    result_response: serde_json::Value,
+    request: &crate::user_automation_execution::UserAutomationWakeEnumerationRequest,
+    automation_revision: &str,
+    owner_operation_id: &str,
+) -> Result<UserAutomationWakeEnumerationReceipt, String> {
+    let reason = || {
+        format!(
+            "the retained Host enumeration receipt for revision {automation_revision} under owner operation {owner_operation_id} is malformed or does not match its original request"
+        )
+    };
+    let Ok(UserAutomationRuntimeObligationAnswer::WakeTargetEnumerationReceipt { receipt }) =
+        serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response)
+    else {
+        return Err(reason());
+    };
+    receipt.validate_for(request).map_err(|_| reason())?;
+    Ok(*receipt)
+}
+
 /// Decodes the retained wake-cancellation answer of one durable obligation, or
 /// names why the retained body is not this operation's answer.
 fn decode_retained_cancellation_answer(
     result_response: serde_json::Value,
     automation_revision: &str,
     owner_operation_id: &str,
-) -> Result<Vec<String>, String> {
-    let Ok(UserAutomationRuntimeObligationAnswer::WakeCancellation { cancelled_wake_ids }) =
-        serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response)
+    expected_receipt: Option<&UserAutomationWakeEnumerationReceipt>,
+) -> Result<(Vec<String>, UserAutomationWakeEnumerationReceipt), String> {
+    let Ok(UserAutomationRuntimeObligationAnswer::WakeCancellation {
+        cancelled_wake_ids,
+        enumeration_receipt: Some(enumeration_receipt),
+    }) = serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response)
     else {
         return Err(unretained_cancellation_answer_reason(
             automation_revision,
             owner_operation_id,
         ));
     };
-    Ok(cancelled_wake_ids)
+    let Some(expected_receipt) = expected_receipt else {
+        return Err(unretained_cancellation_answer_reason(
+            automation_revision,
+            owner_operation_id,
+        ));
+    };
+    enumeration_receipt.validate_integrity().map_err(|_| {
+        unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
+    })?;
+    if enumeration_receipt.as_ref() != expected_receipt {
+        return Err(unretained_cancellation_answer_reason(
+            automation_revision,
+            owner_operation_id,
+        ));
+    }
+    Ok((cancelled_wake_ids, *enumeration_receipt))
 }
 
 /// Decodes and re-validates the retained schedule-owner acknowledgement of one

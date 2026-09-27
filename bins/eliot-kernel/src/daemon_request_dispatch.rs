@@ -25,9 +25,10 @@ use eliot_kernel_service::{
     UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
     UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeHorizonPublication, UserAutomationWakePort,
-    UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
-    advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
+    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -3575,6 +3576,14 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
         };
         if request_fence != &session.module_generation.state_fence {
             return Err(TransportError::SessionFenced);
@@ -3604,6 +3613,12 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_wake_read(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_enumeration(session, request)
                         .await,
                 )
             }
@@ -3660,6 +3675,12 @@ impl KernelComposition {
                         .await,
                 )
             }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
         };
         if let Some(answer) = owner_check {
             return Ok(answer);
@@ -3709,6 +3730,19 @@ impl KernelComposition {
                         "value": {
                             "outcome": "wake_readback",
                             "readback": readback,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                match Box::pin(client.enumerate_pending_wakes(request)).await {
+                    Ok(receipt) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "wake_enumeration",
+                            "receipt": receipt,
                         },
                         "recovery": null,
                     })),
@@ -5377,6 +5411,64 @@ impl KernelComposition {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         ensure_user_automation_store_receipt(&*gateway, &lookup.state_fence, &request.identity)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates a complete committed-revision enumeration request against
+    /// the authenticated owner and canonical parent operation receipt before Host.
+    async fn revalidate_user_automation_enumeration(
+        &self,
+        session: &Session,
+        request: &UserAutomationWakeEnumerationRequest,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal
+            || request.context.state_fence != session.module_generation.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.automation_id.clone(),
+            requested_revision: request.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        let owner_denominator = owner
+            .revision
+            .compile_occurrence_identities()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        if owner.automation_id != request.automation_id
+            || owner.revision.revision != request.automation_revision
+            || owner.revision.owner_principal != authenticated_principal
+            || owner
+                .revision
+                .digest()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+                != request.revision_digest
+            || owner_denominator != request.denominator
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_store_receipt(&gateway, &lookup.state_fence, &request.identity)
             .await
             .map(|_| ())
     }
