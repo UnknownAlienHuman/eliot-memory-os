@@ -820,6 +820,10 @@ pub struct AnchoredReviewItem {
     pub state_fence: StateFence,
     pub lifecycle: ReviewLifecycle,
     pub response_refs: Vec<PublicReference>,
+    #[serde(default)]
+    pub change_refs: Vec<PublicReference>,
+    #[serde(default)]
+    pub verifier_refs: Vec<PublicReference>,
     pub rejection_reason: Option<String>,
 }
 
@@ -844,6 +848,12 @@ impl AnchoredReviewItem {
             .validate()
             .map_err(|_| ContractError::StaleFence)?;
         for reference in &self.response_refs {
+            reference.validate()?;
+        }
+        for reference in &self.change_refs {
+            reference.validate()?;
+        }
+        for reference in &self.verifier_refs {
             reference.validate()?;
         }
         Ok(())
@@ -2228,6 +2238,8 @@ mod tests {
             state_fence: fence(),
             lifecycle: ReviewLifecycle::Draft,
             response_refs: Vec::new(),
+            change_refs: Vec::new(),
+            verifier_refs: Vec::new(),
             rejection_reason: None,
         };
         let resolution = AnchorResolution {
@@ -2264,6 +2276,8 @@ mod tests {
             state_fence: fence(),
             lifecycle: ReviewLifecycle::Draft,
             response_refs: Vec::new(),
+            change_refs: Vec::new(),
+            verifier_refs: Vec::new(),
             rejection_reason: None,
         };
         let resolution = AnchorResolution {
@@ -2384,6 +2398,8 @@ mod tests {
             state_fence: fence(),
             lifecycle: ReviewLifecycle::Answered,
             response_refs: Vec::new(),
+            change_refs: Vec::new(),
+            verifier_refs: Vec::new(),
             rejection_reason: None,
         };
         let mut item = item;

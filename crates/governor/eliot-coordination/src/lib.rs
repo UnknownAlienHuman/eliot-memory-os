@@ -647,6 +647,15 @@ impl CoordinationOwner {
         {
             return Err(CoordinationError::InvalidState);
         }
+        if snapshot.peer_reviews.values().any(|review| {
+            review.lifecycle == PeerReviewLifecycle::RejectedWithReason
+                && review
+                    .rejection_reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+        }) {
+            return Err(CoordinationError::InvalidState);
+        }
         snapshot.validate_active_bindings()?;
         snapshot.validate_issuance_snapshot()?;
         Ok(snapshot)
