@@ -2107,6 +2107,7 @@ operational_input!(AdmissionReservationActivation);
 operational_input!(AdmissionReservationRelease);
 operational_input!(GenerationTransition);
 operational_input!(GenerationCutoverRecord);
+operational_input!(DaemonCutoverRecord);
 operational_input!(ActiveSessionBinding);
 operational_input!(SessionDetach);
 operational_input!(UserBrokerRegistration);

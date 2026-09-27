@@ -25,7 +25,7 @@ use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{OrsError, sha256_hex, validate_digest, validate_text};
+use crate::model::{OperationIdentity, OrsError, sha256_hex, validate_digest, validate_text};
 
 /// Maximum retained in-flight dispositions on one cutover record.
 pub const MAX_CUTOVER_IN_FLIGHT: usize = 256;
@@ -572,6 +572,128 @@ impl GenerationCutoverOwnershipReceipt {
             unresolved_scopes: record.unresolved_scopes.clone(),
             state: record.state,
         })
+    }
+}
+
+/// The boundary after which an unstaged old-daemon proposal is stale
+/// (I14.15).
+///
+/// An unstaged proposal from the fenced prior daemon generation, carrying the
+/// fenced prior epoch, is rejected once a cutover with a newer epoch is
+/// committed; the old epoch is never revived.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OldDaemonProposalFence {
+    /// Fenced prior daemon generation.
+    pub generation: ResourceGeneration,
+    /// Fenced prior authority epoch of that generation.
+    pub epoch: AuthorityEpoch,
+}
+
+/// Durable Kernel-owned daemon-generation cutover record (I14.15).
+///
+/// The typed content committed at the ORS cutover linearization point and
+/// bound to the durable [`crate::DaemonCutoverRecord`] row. Kernel stays the
+/// authority boundary while `eliotd` is replaced: the record names the
+/// candidate that becomes authoritative, the proposal fence that makes unstaged
+/// old-daemon proposals stale, the staged-operation identities already owned by
+/// Kernel, the old in-flight disposition set, and the unresolved effect scopes.
+/// A tool/external effect launched by the old daemon follows the same I14.14
+/// in-flight rules as a module cutover.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonCutoverOwnership {
+    /// Cutover identity.
+    pub cutover_id: String,
+    /// Prior daemon generation being replaced, if any.
+    pub prior_daemon_generation: Option<ResourceGeneration>,
+    /// Candidate daemon generation becoming authoritative.
+    pub candidate_daemon_generation: ResourceGeneration,
+    /// New authority epoch issued by the cutover.
+    pub new_epoch: AuthorityEpoch,
+    /// Fence after which unstaged prior-daemon proposals are stale.
+    pub old_proposal_fence: OldDaemonProposalFence,
+    /// Exact staged-operation identities already owned by Kernel; they
+    /// continue by operation identity even if the proposing daemon exits.
+    pub staged_operation_ids: Vec<OperationIdentity>,
+    /// Old in-flight disposition set, reusing the I14.14 dispositions.
+    pub in_flight: Vec<InFlightDisposition>,
+    /// Unresolved effect scopes carried from the old daemon.
+    pub unresolved_scopes: Vec<String>,
+    /// ORS linearization identity, linking this record to the store receipt of
+    /// its [`crate::DaemonCutoverRecord`] row commit; `None` while staged.
+    pub linearization_record_id: Option<String>,
+}
+
+impl DaemonCutoverOwnership {
+    /// Validates the full daemon-cutover record.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.cutover_id, "daemon_cutover_id")?;
+        if self.prior_daemon_generation == Some(self.candidate_daemon_generation) {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_candidate_generation",
+                reason: "cutover must select a distinct daemon generation",
+            });
+        }
+        if self
+            .prior_daemon_generation
+            .is_some_and(|prior| prior != self.old_proposal_fence.generation)
+        {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_old_proposal_fence",
+                reason: "the proposal fence must name the prior daemon generation",
+            });
+        }
+        if self.new_epoch.value() <= self.old_proposal_fence.epoch.value() {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_new_epoch",
+                reason: "the new epoch must supersede the fenced old epoch",
+            });
+        }
+        let mut staged = BTreeSet::new();
+        for operation_id in &self.staged_operation_ids {
+            if !staged.insert(operation_id.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "daemon_cutover_staged_operation_ids",
+                    reason: "one staged operation identity is recorded once",
+                });
+            }
+        }
+        if self.in_flight.len() > MAX_CUTOVER_IN_FLIGHT {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_in_flight",
+                reason: "in-flight disposition set exceeds its bound",
+            });
+        }
+        let mut operations = BTreeSet::new();
+        for entry in &self.in_flight {
+            entry.validate()?;
+            if !operations.insert(entry.operation_id.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "daemon_cutover_in_flight",
+                    reason: "one operation must receive exactly one disposition",
+                });
+            }
+        }
+        if self.unresolved_scopes.len() > MAX_CUTOVER_UNRESOLVED_SCOPES {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_unresolved_scopes",
+                reason: "unresolved scope set exceeds its bound",
+            });
+        }
+        for scope in &self.unresolved_scopes {
+            validate_text(scope, "daemon_cutover_unresolved_scope")?;
+            if operations.contains(scope.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "daemon_cutover_unresolved_scopes",
+                    reason: "a classified operation must not also be unresolved",
+                });
+            }
+        }
+        if let Some(linearization) = &self.linearization_record_id {
+            validate_text(linearization, "daemon_cutover_linearization")?;
+        }
+        Ok(())
     }
 }
 
