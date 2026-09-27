@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     UserAutomationDurableJobPort, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakePort, UserAutomationWakeReadRequest,
     UserAutomationWakeReadback,
 };
 
@@ -156,6 +157,17 @@ impl UserAutomationHostChannelBinding {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         Ok(())
+    }
+
+    /// Returns the canonical digest of the server-authored channel binding.
+    /// The peer-admission receipt inside this binding ties the digest to the
+    /// authenticated Host session that carried the receipt request.
+    pub fn authenticated_evidence_digest(&self) -> Result<String, UserAutomationRuntimeError> {
+        self.validate()?;
+        let bytes =
+            canonical_json_bytes(&("eliot.user_automation.authenticated-host-channel.v1", self))
+                .map_err(|error| rejected(format!("Host channel evidence encoding: {error}")))?;
+        Ok(sha256_hex(&bytes))
     }
 }
 
@@ -330,6 +342,15 @@ impl UserAutomationHostExecutionSession {
         self.owner.validate_peer(&self.peer)
     }
 
+    /// Returns the channel digest only after revalidating the retained
+    /// server-authenticated peer and Host owner anchor.
+    pub fn authenticated_channel_binding_digest(
+        &self,
+    ) -> Result<String, UserAutomationRuntimeError> {
+        self.validate_authenticated_peer()?;
+        self.channel.authenticated_evidence_digest()
+    }
+
     /// Returns the retained server session identity for exact queue
     /// correlation. It is not a bearer token and is never trusted from a
     /// serialized request.
@@ -452,6 +473,11 @@ pub enum UserAutomationHostExecutionOperation {
         /// Original Human RunNow identity and owner-issued invocation.
         request: Box<UserAutomationWakeReadRequest>,
     },
+    /// Enumerate the complete committed denominator from one Host snapshot.
+    EnumeratePendingWakes {
+        /// Immutable revision, full occurrence denominator, and digest.
+        request: Box<UserAutomationWakeEnumerationRequest>,
+    },
 }
 
 /// Typed Kernel-to-Host request carrier for one UserAutomation execution
@@ -506,6 +532,19 @@ impl UserAutomationHostExecutionRequest {
         Self::new(
             channel,
             UserAutomationHostExecutionOperation::ReadPendingWake {
+                request: request.into(),
+            },
+        )
+    }
+
+    /// Builds and hashes one complete owner-snapshot enumeration carrier.
+    pub fn enumerate_pending_wakes(
+        channel: UserAutomationHostChannelBinding,
+        request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
+    ) -> Result<Self, UserAutomationRuntimeError> {
+        Self::new(
+            channel,
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes {
                 request: request.into(),
             },
         )
@@ -591,6 +630,14 @@ impl UserAutomationHostExecutionRequest {
                 if request.state_fence != self.channel.state_fence {
                     return Err(rejected("cancellation channel fence mismatch"));
                 }
+                let receipt = request
+                    .enumeration_receipt
+                    .as_deref()
+                    .ok_or(UserAutomationRuntimeError::IdentityConflict)?;
+                let expected_channel = self.channel.authenticated_evidence_digest()?;
+                receipt
+                    .validate_authenticated_channel(&expected_channel)
+                    .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
             }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 request
@@ -598,6 +645,14 @@ impl UserAutomationHostExecutionRequest {
                     .map_err(|error| rejected(format!("wake read: {error}")))?;
                 if request.context.state_fence != self.channel.state_fence {
                     return Err(rejected("wake read channel fence mismatch"));
+                }
+            }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                request
+                    .validate()
+                    .map_err(|error| rejected(format!("wake enumeration: {error}")))?;
+                if request.context.state_fence != self.channel.state_fence {
+                    return Err(rejected("wake enumeration channel fence mismatch"));
                 }
             }
         }
@@ -635,6 +690,15 @@ pub enum UserAutomationHostExecutionResponse {
         state_fence: StateFence,
         /// Persisted wake intent and record checksum.
         readback: UserAutomationWakeReadback,
+    },
+    /// Complete owner-issued receipt from one exact Host journal snapshot.
+    WakeEnumeration {
+        /// Digest of the exact request carrier answered.
+        request_sha256: String,
+        /// Fence observed by the Host owner.
+        state_fence: StateFence,
+        /// Versioned receipt covering every committed occurrence.
+        receipt: Box<UserAutomationWakeEnumerationReceipt>,
     },
     /// Closed Host-owner failure projection.
     Failed {
@@ -682,6 +746,11 @@ impl UserAutomationHostExecutionResponse {
                 request_sha256,
                 state_fence,
                 ..
+            }
+            | Self::WakeEnumeration {
+                request_sha256,
+                state_fence,
+                ..
             } => (request_sha256, state_fence),
             Self::Failed {
                 request_sha256,
@@ -695,6 +764,13 @@ impl UserAutomationHostExecutionResponse {
         if request_sha256 != &request.request_sha256 || state_fence != request.state_fence() {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
+        self.validate_operation_response(request)
+    }
+
+    fn validate_operation_response(
+        &self,
+        request: &UserAutomationHostExecutionRequest,
+    ) -> Result<(), UserAutomationRuntimeError> {
         match (&request.operation, self) {
             (
                 UserAutomationHostExecutionOperation::AdmitOccurrence { request },
@@ -729,6 +805,21 @@ impl UserAutomationHostExecutionResponse {
             ) => readback
                 .validate_for(request)
                 .map_err(|_| UserAutomationRuntimeError::IdentityConflict),
+            (
+                UserAutomationHostExecutionOperation::EnumeratePendingWakes {
+                    request: enumeration_request,
+                },
+                Self::WakeEnumeration { receipt, .. },
+            ) => {
+                receipt
+                    .validate_for(enumeration_request)
+                    .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                let expected_channel = request.channel.authenticated_evidence_digest()?;
+                receipt
+                    .validate_authenticated_channel(&expected_channel)
+                    .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
+                Ok(())
+            }
             (_, Self::Failed { .. }) => Ok(()),
             (
                 UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
@@ -753,6 +844,30 @@ impl UserAutomationHostExecutionResponse {
             | (
                 UserAutomationHostExecutionOperation::ReadPendingWake { .. },
                 Self::Cancelled { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::AdmitOccurrence { .. },
+                Self::WakeEnumeration { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
+                Self::WakeEnumeration { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::ReadPendingWake { .. },
+                Self::WakeEnumeration { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. },
+                Self::Admitted { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. },
+                Self::Cancelled { .. },
+            )
+            | (
+                UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. },
+                Self::WakeRead { .. },
             ) => Err(UserAutomationRuntimeError::IdentityConflict),
         }
     }
@@ -764,6 +879,7 @@ fn request_context(request: &UserAutomationHostExecutionRequest) -> &RequestMeta
         UserAutomationHostExecutionOperation::AdmitOccurrence { request } => &request.context,
         UserAutomationHostExecutionOperation::CancelPendingWakes { request } => &request.context,
         UserAutomationHostExecutionOperation::ReadPendingWake { request } => &request.context,
+        UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => &request.context,
     }
 }
 
@@ -1293,7 +1409,31 @@ where
         match self.execute(carrier).await? {
             UserAutomationHostExecutionResponse::WakeRead { readback, .. } => Ok(readback),
             UserAutomationHostExecutionResponse::Admitted { .. }
-            | UserAutomationHostExecutionResponse::Cancelled { .. } => {
+            | UserAutomationHostExecutionResponse::Cancelled { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
+            }
+            UserAutomationHostExecutionResponse::Failed { failure, .. } => {
+                Err(failure.into_runtime_error())
+            }
+        }
+    }
+
+    /// Enumerates every committed occurrence from one authenticated Host
+    /// snapshot and validates its receipt against this exact channel.
+    pub async fn enumerate_pending_wakes(
+        &self,
+        request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, UserAutomationRuntimeError> {
+        let carrier = UserAutomationHostExecutionRequest::enumerate_pending_wakes(
+            self.transport.channel_binding().clone(),
+            request,
+        )?;
+        match self.execute(carrier).await? {
+            UserAutomationHostExecutionResponse::WakeEnumeration { receipt, .. } => Ok(*receipt),
+            UserAutomationHostExecutionResponse::Admitted { .. }
+            | UserAutomationHostExecutionResponse::Cancelled { .. }
+            | UserAutomationHostExecutionResponse::WakeRead { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1318,7 +1458,8 @@ where
         match self.execute(carrier).await? {
             UserAutomationHostExecutionResponse::Admitted { execution, .. } => Ok(execution),
             UserAutomationHostExecutionResponse::Cancelled { .. }
-            | UserAutomationHostExecutionResponse::WakeRead { .. } => {
+            | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
@@ -1343,13 +1484,21 @@ where
         match self.execute(carrier).await? {
             UserAutomationHostExecutionResponse::Cancelled { wake_ids, .. } => Ok(wake_ids),
             UserAutomationHostExecutionResponse::Admitted { .. }
-            | UserAutomationHostExecutionResponse::WakeRead { .. } => {
+            | UserAutomationHostExecutionResponse::WakeRead { .. }
+            | UserAutomationHostExecutionResponse::WakeEnumeration { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionResponse::Failed { failure, .. } => {
                 Err(failure.into_runtime_error())
             }
         }
+    }
+
+    async fn enumerate_pending_wakes(
+        &self,
+        request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, UserAutomationRuntimeError> {
+        UserAutomationHostExecutionClient::enumerate_pending_wakes(self, request).await
     }
 }
 

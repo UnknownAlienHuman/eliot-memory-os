@@ -13,15 +13,18 @@
 //! are different facts and a caller that must decide whether a retirement has
 //! anything left to cancel cannot be given the same value for both.
 
-use eliot_contracts::sha256_hex;
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_host_state::{
-    AppendDisposition, BackendError, HostStateJournalService, HostStateRecord, IdempotencyIdentity,
-    JournalBackend, JournalError, WakeCancellationBatchEntry, WakeCancellationBatchRecord,
-    record_checksum,
+    AppendDisposition, BackendError, HostState, HostStateJournalService, HostStateRecord,
+    IdempotencyIdentity, JournalBackend, JournalError, WakeCancellationBatchEntry,
+    WakeCancellationBatchRecord, host_owner_epoch_digest, record_checksum,
 };
 use eliot_kernel_service::{
-    UserAutomationRuntimeError, UserAutomationWakeCancellation, UserAutomationWakePort,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION, UserAutomationRuntimeError,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationCoverage,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOwnerEvidence,
+    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::WakeIntentState;
@@ -98,80 +101,19 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
                 "concrete Host wake cancellation requires owner-issued targets",
             ));
         }
+        if request.enumeration_receipt.is_none() {
+            return Err(rejected(
+                "concrete Host wake cancellation requires the exact persisted enumeration receipt",
+            ));
+        }
 
         let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
-        let mut cancelled = Vec::with_capacity(request.targets.len());
-        let mut entries = Vec::with_capacity(request.targets.len());
-        for target in &request.targets {
-            target
-                .validate_for(&request)
-                .map_err(|error| rejected(format!("Wake cancellation target: {error}")))?;
-            let wake = snapshot
-                .wakes
-                .iter()
-                .find(|wake| wake.wake_id.as_str() == target.wake_id)
-                .ok_or_else(|| rejected("owner-issued wake target is absent from Host journal"))?;
-
-            if wake.operation.operation_id.as_str() != target.operation_id
-                || wake.operation.idempotency_key.as_str() != target.idempotency_key
-            {
-                return Err(UserAutomationRuntimeError::IdentityConflict);
-            }
-            if wake.intent.state_fence != request.state_fence
-                || wake.intent.state_fence != target.state_fence
-            {
-                return Err(UserAutomationRuntimeError::IdentityConflict);
-            }
-            let current_checksum =
-                record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
-            if current_checksum != target.record_checksum
-                && !matches!(wake.intent.state, WakeIntentState::Cancelled)
-            {
-                return Err(UserAutomationRuntimeError::IdentityConflict);
-            }
-
-            match wake.intent.state {
-                WakeIntentState::Pending => {
-                    let mut next = wake.clone();
-                    next.intent.state = WakeIntentState::Cancelled;
-                    let expected_record_checksum =
-                        PlatformHandle::new(target.record_checksum.clone()).map_err(|_| {
-                            rejected("wake cancellation checksum identity is invalid")
-                        })?;
-                    entries.push(WakeCancellationBatchEntry {
-                        expected_record_checksum,
-                        wake: next,
-                    });
-                    cancelled.push(target.wake_id.clone());
-                }
-                WakeIntentState::Cancelled => {
-                    // Keep the original operation and expected checksum in
-                    // the batch.  After a committed append whose reply was
-                    // lost, the current record is already Cancelled and its
-                    // checksum has changed; the journal must see the same
-                    // batch identity and return Replayed before applying a
-                    // second lifecycle transition.
-                    let expected_record_checksum =
-                        PlatformHandle::new(target.record_checksum.clone()).map_err(|_| {
-                            rejected("wake cancellation checksum identity is invalid")
-                        })?;
-                    entries.push(WakeCancellationBatchEntry {
-                        expected_record_checksum,
-                        wake: wake.clone(),
-                    });
-                    cancelled.push(target.wake_id.clone());
-                }
-                WakeIntentState::Claimed
-                | WakeIntentState::Started
-                | WakeIntentState::Satisfied
-                | WakeIntentState::Expired
-                | WakeIntentState::Failed => {
-                    return Err(rejected(
-                        "Host wake is no longer an unadmitted pending intent",
-                    ));
-                }
-            }
-        }
+        let receipt = request
+            .enumeration_receipt
+            .as_deref()
+            .ok_or_else(|| rejected("wake enumeration receipt is absent"))?;
+        validate_enumeration_snapshot(&snapshot, &request, receipt)?;
+        let (cancelled, entries) = build_cancellation_entries(&snapshot, &request)?;
         if entries.is_empty() {
             return Ok(cancelled);
         }
@@ -195,6 +137,310 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
         }
         Ok(cancelled)
     }
+
+    async fn enumerate_pending_wakes_authenticated(
+        &self,
+        request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
+        authenticated_channel_binding_sha256: String,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeEnumerationRequest> = request.into();
+        request
+            .validate()
+            .map_err(|error| rejected(format!("Wake enumeration request: {error}")))?;
+        validate_sha256(&authenticated_channel_binding_sha256)?;
+
+        let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
+        let snapshot_evidence = HostWakeSnapshotEvidence::new(&snapshot)?;
+        let dispositions = request
+            .denominator
+            .iter()
+            .map(|occurrence| {
+                enumerate_occurrence(
+                    &request,
+                    &snapshot,
+                    &snapshot_evidence,
+                    &occurrence.occurrence_id,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut receipt = UserAutomationWakeEnumerationReceipt {
+            version: USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION,
+            automation_id: request.automation_id.clone(),
+            automation_revision: request.automation_revision.clone(),
+            revision_digest: request.revision_digest.clone(),
+            parent_operation_identity: request.identity.clone(),
+            denominator: request.denominator.clone(),
+            denominator_digest: request.denominator_digest.clone(),
+            host_owner_identity: snapshot_evidence.host_owner_identity,
+            host_owner_generation: snapshot_evidence.host_owner_generation,
+            journal_sequence: snapshot.sequence,
+            journal_last_checksum: snapshot_evidence.journal_last_checksum,
+            authenticated_channel_binding_sha256,
+            snapshot_digest: snapshot_evidence.snapshot_digest,
+            state_fence: request.context.state_fence.clone(),
+            authenticated_owner_identity: request.authenticated_principal.clone(),
+            coverage: enumeration_coverage(&dispositions),
+            dispositions,
+            canonical_digest: String::new(),
+        };
+        receipt.canonical_digest = receipt
+            .compute_digest()
+            .map_err(|error| rejected(format!("Wake receipt digest: {error}")))?;
+        receipt
+            .validate_for(&request)
+            .map_err(|error| rejected(format!("Wake receipt validation: {error}")))?;
+        Ok(receipt)
+    }
+}
+
+struct HostWakeSnapshotEvidence {
+    host_owner_identity: String,
+    host_owner_generation: String,
+    journal_last_checksum: Option<String>,
+    snapshot_digest: String,
+}
+
+impl HostWakeSnapshotEvidence {
+    fn new(snapshot: &HostState) -> Result<Self, UserAutomationRuntimeError> {
+        let host_owner_identity = snapshot.host.installation.as_str().to_owned();
+        let host_owner_generation = host_owner_epoch_digest(&snapshot.host)
+            .map_err(map_journal_error)?
+            .as_str()
+            .to_owned();
+        let journal_last_checksum = snapshot
+            .last_checksum
+            .as_ref()
+            .map(|value| value.as_str().to_owned());
+        if let Some(checksum) = &journal_last_checksum {
+            validate_sha256(checksum)?;
+        }
+        let snapshot_digest = sha256_hex(
+            &canonical_json_bytes(&(
+                "eliot.user_automation.host-wake-snapshot.v1",
+                &host_owner_identity,
+                &host_owner_generation,
+                snapshot.sequence,
+                &journal_last_checksum,
+                &snapshot.wakes,
+            ))
+            .map_err(|error| rejected(format!("Wake snapshot encoding: {error}")))?,
+        );
+        Ok(Self {
+            host_owner_identity,
+            host_owner_generation,
+            journal_last_checksum,
+            snapshot_digest,
+        })
+    }
+}
+
+fn enumerate_occurrence(
+    request: &UserAutomationWakeEnumerationRequest,
+    snapshot: &HostState,
+    snapshot_evidence: &HostWakeSnapshotEvidence,
+    occurrence_id: &str,
+) -> Result<UserAutomationWakeOccurrenceDisposition, UserAutomationRuntimeError> {
+    let evidence = UserAutomationWakeOwnerEvidence {
+        occurrence_id: occurrence_id.to_owned(),
+        host_owner_identity: snapshot_evidence.host_owner_identity.clone(),
+        host_owner_generation: snapshot_evidence.host_owner_generation.clone(),
+        journal_sequence: snapshot.sequence,
+        journal_last_checksum: snapshot_evidence.journal_last_checksum.clone(),
+        snapshot_digest: snapshot_evidence.snapshot_digest.clone(),
+        wake_record_checksum: None,
+        wake_state: None,
+    };
+    let mut matches = snapshot
+        .wakes
+        .iter()
+        .filter(|wake| wake.wake_id.as_str() == occurrence_id);
+    let Some(wake) = matches.next() else {
+        return Ok(UserAutomationWakeOccurrenceDisposition::NotRetained { evidence });
+    };
+    if matches.next().is_some() {
+        return Ok(UserAutomationWakeOccurrenceDisposition::Unresolved {
+            evidence,
+            reason: "the one Host snapshot contains duplicate records for this occurrence"
+                .to_owned(),
+        });
+    }
+    let checksum =
+        record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
+    let mut evidence = evidence;
+    evidence.wake_record_checksum = Some(checksum.clone());
+    evidence.wake_state = Some(wake.intent.state);
+    if wake.intent.wake_id != occurrence_id {
+        return Ok(UserAutomationWakeOccurrenceDisposition::Unresolved {
+            evidence,
+            reason: "the retained Host record identity conflicts with the denominator member"
+                .to_owned(),
+        });
+    }
+    if wake.intent.state != WakeIntentState::Pending {
+        return Ok(UserAutomationWakeOccurrenceDisposition::NotRetained { evidence });
+    }
+    if wake.intent.state_fence != request.context.state_fence {
+        return Ok(UserAutomationWakeOccurrenceDisposition::Unresolved {
+            evidence,
+            reason: "the retained pending Host record belongs to a different State Fence"
+                .to_owned(),
+        });
+    }
+    Ok(UserAutomationWakeOccurrenceDisposition::PendingTarget {
+        target: eliot_kernel_service::UserAutomationWakeCancellationTarget {
+            automation_id: request.automation_id.clone(),
+            automation_revision: request.automation_revision.clone(),
+            wake_id: wake.wake_id.as_str().to_owned(),
+            operation_id: wake.operation.operation_id.as_str().to_owned(),
+            idempotency_key: wake.operation.idempotency_key.as_str().to_owned(),
+            record_checksum: checksum,
+            state_fence: wake.intent.state_fence.clone(),
+        },
+    })
+}
+
+fn validate_enumeration_snapshot(
+    snapshot: &HostState,
+    request: &UserAutomationWakeCancellation,
+    receipt: &UserAutomationWakeEnumerationReceipt,
+) -> Result<(), UserAutomationRuntimeError> {
+    let current_owner_generation = host_owner_epoch_digest(&snapshot.host)
+        .map_err(map_journal_error)?
+        .as_str()
+        .to_owned();
+    if receipt.host_owner_identity != snapshot.host.installation.as_str()
+        || receipt.host_owner_generation != current_owner_generation
+        || receipt.state_fence != request.state_fence
+        || receipt.authenticated_owner_identity != request.authenticated_principal
+    {
+        return Err(UserAutomationRuntimeError::IdentityConflict);
+    }
+    for (occurrence, disposition) in receipt.denominator.iter().zip(&receipt.dispositions) {
+        let mut current = snapshot
+            .wakes
+            .iter()
+            .filter(|wake| wake.wake_id.as_str() == occurrence.occurrence_id);
+        let Some(wake) = current.next() else {
+            continue;
+        };
+        if current.next().is_some()
+            || (matches!(
+                disposition,
+                UserAutomationWakeOccurrenceDisposition::NotRetained { .. }
+            ) && wake.intent.state == WakeIntentState::Pending)
+            || matches!(
+                disposition,
+                UserAutomationWakeOccurrenceDisposition::Unresolved { .. }
+            )
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+    }
+    Ok(())
+}
+
+fn build_cancellation_entries(
+    snapshot: &HostState,
+    request: &UserAutomationWakeCancellation,
+) -> Result<(Vec<String>, Vec<WakeCancellationBatchEntry>), UserAutomationRuntimeError> {
+    let mut cancelled = Vec::with_capacity(request.targets.len());
+    let mut entries = Vec::with_capacity(request.targets.len());
+    for target in &request.targets {
+        target
+            .validate_for(request)
+            .map_err(|error| rejected(format!("Wake cancellation target: {error}")))?;
+        let mut matching = snapshot
+            .wakes
+            .iter()
+            .filter(|wake| wake.wake_id.as_str() == target.wake_id);
+        let wake = matching
+            .next()
+            .ok_or_else(|| rejected("owner-issued wake target is absent from Host journal"))?;
+        if matching.next().is_some()
+            || wake.operation.operation_id.as_str() != target.operation_id
+            || wake.operation.idempotency_key.as_str() != target.idempotency_key
+            || wake.intent.state_fence != request.state_fence
+            || wake.intent.state_fence != target.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let checksum =
+            record_checksum(&HostStateRecord::Wake(wake.clone())).map_err(map_journal_error)?;
+        if checksum != target.record_checksum && wake.intent.state != WakeIntentState::Cancelled {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        match wake.intent.state {
+            WakeIntentState::Pending | WakeIntentState::Cancelled => {
+                let next = if wake.intent.state == WakeIntentState::Pending {
+                    let mut next = wake.clone();
+                    next.intent.state = WakeIntentState::Cancelled;
+                    next
+                } else {
+                    wake.clone()
+                };
+                let expected_record_checksum = PlatformHandle::new(target.record_checksum.clone())
+                    .map_err(|_| rejected("wake cancellation checksum identity is invalid"))?;
+                entries.push(WakeCancellationBatchEntry {
+                    expected_record_checksum,
+                    wake: next,
+                });
+                cancelled.push(target.wake_id.clone());
+            }
+            WakeIntentState::Claimed
+            | WakeIntentState::Started
+            | WakeIntentState::Satisfied
+            | WakeIntentState::Expired
+            | WakeIntentState::Failed => {
+                return Err(rejected(
+                    "Host wake is no longer an unadmitted pending intent",
+                ));
+            }
+        }
+    }
+    Ok((cancelled, entries))
+}
+
+fn enumeration_coverage(
+    dispositions: &[UserAutomationWakeOccurrenceDisposition],
+) -> UserAutomationWakeEnumerationCoverage {
+    let mut pending_target_count = 0_u64;
+    let mut not_retained_count = 0_u64;
+    let mut unresolved_count = 0_u64;
+    for disposition in dispositions {
+        match disposition {
+            UserAutomationWakeOccurrenceDisposition::PendingTarget { .. } => {
+                pending_target_count += 1;
+            }
+            UserAutomationWakeOccurrenceDisposition::NotRetained { .. } => {
+                not_retained_count += 1;
+            }
+            UserAutomationWakeOccurrenceDisposition::Unresolved { .. } => {
+                unresolved_count += 1;
+            }
+        }
+    }
+    let covered_count = dispositions.len() as u64;
+    UserAutomationWakeEnumerationCoverage {
+        denominator_count: covered_count,
+        covered_count,
+        pending_target_count,
+        not_retained_count,
+        unresolved_count,
+        complete: true,
+    }
+}
+
+fn validate_sha256(value: &str) -> Result<(), UserAutomationRuntimeError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(rejected(
+            "authenticated wake enumeration evidence digest is invalid",
+        ));
+    }
+    Ok(())
 }
 
 fn cancellation_batch_identity(
