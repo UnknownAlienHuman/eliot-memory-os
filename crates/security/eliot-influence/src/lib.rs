@@ -2507,6 +2507,12 @@ impl RuntimeSubject {
 
     /// Build a subject from live contract records so allowed influence stays
     /// bound to source assurance and the dependency closure.
+    ///
+    /// Refuses a closure from another lineage or fence before any receipt can
+    /// certify it: the closure root must name the provenance origin and both
+    /// state fences must agree, mirroring [`InfluenceRequest::validate`]. A
+    /// merged subject would otherwise bind one lineage's influence state to
+    /// another origin's allowed use for the whole staged path.
     pub fn from_contracts(
         subject_ref: String,
         provenance: &ProvenanceRecord,
@@ -2520,6 +2526,11 @@ impl RuntimeSubject {
         closure
             .validate()
             .map_err(|_| InfluenceRuntimeError::InvalidField("dependency_closure"))?;
+        if closure.root_ref != provenance.origin_ref
+            || closure.state_fence != provenance.state_fence
+        {
+            return Err(InfluenceRuntimeError::InvalidField("dependency_closure"));
+        }
         Self::new(
             subject_ref,
             provenance.origin_ref.clone(),
