@@ -7,7 +7,13 @@ Enforces that:
    compile-only merge check (workflow_dispatch, main-scoped pull_request and
    push). pull_request_target, schedules, releases, merge queue and every
    other automatic trigger are rejected on every workflow.
-2. Every third-party Action reference is pinned to a full 40-character commit SHA.
+2. Every third-party Action is verified by immutable identity (issue #1225 step
+   2): the reference must be a reviewed full 40-character commit SHA owned by an
+   approved action owner, the human-readable release stays comment-only metadata,
+   mutable tags/branches/short SHAs/expressions are rejected, the same action may
+   not carry two different pins across workflows, and every reference's
+   owner/repository/SHA identity is derived from the files and published in the
+   --json-out payload as the first step toward the run manifest.
 3. Top-level permissions remain minimal (contents: read); broad write-all is rejected.
 4. Python verification dependencies are fully version- and hash-locked with --hash=sha256.
 5. NuGet dependencies for Eliot.Operator and the Eliot.Operator.Tests harness
@@ -35,8 +41,25 @@ from typing import Any
 
 
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-ACTION_REF_RE = re.compile(r"^\s*-\s*uses:\s*([^\s#]+)")
+# Step-level `- uses:` and job-level reusable `uses:` (no dash). The capture
+# stops at the first whitespace or `#`, so a trailing `# v4.2.2` release
+# annotation is comment metadata and never becomes part of the ref.
+ACTION_REF_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)")
+# Action identity shape: owner/repo[/path...]@ref. A `${{ ... }}` ref fails the
+# full 40-hex ref test, and a reference without an owner segment fails the
+# owner-shape test, so neither can silently reach the pin decision.
+ACTION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9._-]+)+$")
 PERMISSION_WRITE_ALL_RE = re.compile(r"^\s*permissions:\s*(?:write-all|read-all)", re.MULTILINE)
+
+# Closed approved action owner set (issue #1225 step 2, Wave D "unapproved
+# owners"). Evidence-derived, not aspirational: `actions` is the only owner any
+# workflow in this repository references. A third-party `uses:` whose owner
+# segment is not listed here is rejected (GWF-002) even when it carries a
+# syntactically valid full 40-hex SHA, so a well-formed pin cannot smuggle in an
+# unreviewed publisher. Adding an owner is a reviewed change to this constant
+# together with the workflow reference that introduces it; never a discovery
+# result. There is deliberately no wildcard and no org-prefix matching.
+APPROVED_ACTION_OWNERS = ("actions",)
 
 # Closed per-workflow trigger policy (accepted issue #3004). Default: every
 # repository workflow is manual-only. ci.yml is the sole exception: the
@@ -194,7 +217,13 @@ def check_workflows(root: Path) -> list[Finding]:
                         )
                     )
 
-        # 2. Action pin check: third-party actions must use full 40-char SHA
+        # 2. Action identity check (issue #1225 step 2): every third-party `uses:`
+        # is a reviewed full 40-character commit SHA owned by an approved action
+        # owner. The capture below is used for the owner decision, not only for
+        # the error message, so a well-formed SHA from an unreviewed publisher
+        # still fails. ACTION_REF_RE covers both step-level `- uses:` and
+        # job-level reusable `uses:` (no dash), so a reusable workflow cannot
+        # escape the pin rule.
         for line_no, line in enumerate(lines, start=1):
             m = ACTION_REF_RE.match(line)
             if not m:
@@ -214,6 +243,31 @@ def check_workflows(root: Path) -> list[Finding]:
                 )
                 continue
             action_name, ref = action_ref.split("@", 1)
+            # Identity shape: a reference with no owner segment is not an
+            # identity this verifier can attest, so it fails on its own code
+            # rather than being attributed to the mutable-ref rule.
+            if not ACTION_NAME_RE.fullmatch(action_name):
+                findings.append(
+                    Finding(
+                        "GWF-010",
+                        rel_path,
+                        line_no,
+                        f"action reference '{action_ref}' is not an owner/repository identity; "
+                        f"expected owner/repo[/path]@<40-hex SHA> with owner in {list(APPROVED_ACTION_OWNERS)}",
+                    )
+                )
+                continue
+            if action_name.split("/")[0] not in APPROVED_ACTION_OWNERS:
+                findings.append(
+                    Finding(
+                        "GWF-002",
+                        rel_path,
+                        line_no,
+                        f"unapproved action owner '{action_name.split('/')[0]}' for '{action_name}'; "
+                        f"approved owners are {list(APPROVED_ACTION_OWNERS)}",
+                    )
+                )
+                continue
             if not FULL_SHA_RE.fullmatch(ref):
                 findings.append(
                     Finding(
@@ -377,6 +431,102 @@ def check_workflows(root: Path) -> list[Finding]:
     return findings
 
 
+def iter_workflow_files(root: Path) -> list[Path]:
+    """Every workflow file in the one closed directory, deterministically ordered."""
+    workflows_dir = root / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return []
+    return sorted([*workflows_dir.glob("*.yml"), *workflows_dir.glob("*.yaml")])
+
+
+def iter_action_references(root: Path):
+    """Yield (rel_path, line_no, action_ref) for every third-party `uses:` ref.
+
+    Derived from the files, never hand-written. Mirrors the ACTION_REF_RE handling
+    in check_workflows, including the `./` local-action exemption, so the
+    identity record and the enforcement decision can never disagree about which
+    references are in scope.
+    """
+    for wf_path in iter_workflow_files(root):
+        rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
+        try:
+            lines = wf_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line_no, line in enumerate(lines, start=1):
+            match = ACTION_REF_RE.match(line)
+            if not match:
+                continue
+            action_ref = match.group(1)
+            if action_ref.startswith("./"):
+                continue
+            yield rel_path, line_no, action_ref
+
+
+def collect_action_identities(root: Path) -> list[dict[str, str]]:
+    """Derived owner/repository/SHA identity for every third-party `uses:` ref.
+
+    This is the source of truth for the run manifest's action record: no workflow
+    hand-types its action list. The returned list is sorted by
+    (workflow, line, action, ref) so repeated runs over an unchanged tree produce
+    a byte-identical payload, and it is bounded by the number of `uses:` lines in
+    the repository. `ref` is empty when the reference carries no `@` pin, so an
+    unpinned reference is still recorded rather than silently dropped.
+    """
+    records: list[dict[str, str]] = []
+    for rel_path, line_no, action_ref in iter_action_references(root):
+        if "@" in action_ref:
+            action_name, ref = action_ref.split("@", 1)
+        else:
+            action_name, ref = action_ref, ""
+        records.append(
+            {
+                "workflow": rel_path,
+                "line": str(line_no),
+                "action": action_name,
+                "ref": ref,
+            }
+        )
+    records.sort(key=lambda r: (r["workflow"], int(r["line"]), r["action"], r["ref"]))
+    return records
+
+
+def check_action_pin_divergence(root: Path) -> list[Finding]:
+    """One action, one pin: reject the same action carried at two different SHAs.
+
+    Without this, a future workflow can silently introduce a different (possibly
+    compromised) commit for an action the repository already pins, and every
+    per-file check still passes because each reference is individually
+    well-formed. The first workflow in deterministic order is the reference
+    observation and is never itself a finding; each divergent reference is.
+    """
+    findings: list[Finding] = []
+    first_ref: dict[str, tuple[str, int, str]] = {}
+    for rel_path, line_no, action_ref in iter_action_references(root):
+        if "@" not in action_ref:
+            continue
+        action_name, ref = action_ref.split("@", 1)
+        if not ACTION_NAME_RE.fullmatch(action_name):
+            continue
+        observed = first_ref.get(action_name)
+        if observed is None:
+            first_ref[action_name] = (rel_path, line_no, ref)
+            continue
+        if ref == observed[2]:
+            continue
+        findings.append(
+            Finding(
+                "GWF-011",
+                rel_path,
+                line_no,
+                f"action '{action_name}' diverges from its repository pin: "
+                f"{ref} here but {observed[2]} at {observed[0]}:{observed[1]}; "
+                "one action carries one reviewed commit SHA across all workflows",
+            )
+        )
+    return findings
+
+
 def check_python_requirements(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     req_file = root / "scripts" / "requirements-verification.txt"
@@ -522,6 +672,7 @@ def check_pip_install_lock(root: Path) -> list[Finding]:
 def verify_all(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(check_workflows(root))
+    findings.extend(check_action_pin_divergence(root))
     findings.extend(check_python_requirements(root))
     findings.extend(check_nuget_lock(root))
     findings.extend(check_pip_install_lock(root))
@@ -539,6 +690,27 @@ def run_self_tests() -> int:
         "    types: [opened, synchronize, reopened, ready_for_review]\n  push:\n    branches: [main]\n"
     )
     ci_prefix = "name: Automatic PR Merge Compile Gate\n" + ci_triggers + "permissions:\n  contents: read\n"
+    # Action-identity fixtures (issue #1225 step 2). `gate_yaml` wraps a
+    # `uses:` body in an otherwise conforming manual-dispatch workflow so a
+    # rejection can only come from the action rule under test.
+    gate_yaml = (
+        "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      {body}\n"
+    )
+    # A second 40-hex SHA, so divergence cases are distinguishable from the
+    # reviewed actions/checkout pin by value and not only by position.
+    other_sha = "a" * 40
+
+    def step_uses(ref: str) -> str:
+        return gate_yaml.format(body=f"- uses: {ref}")
+
+    def job_uses(ref: str) -> str:
+        # Job-level reusable workflow: `uses:` at job scope carries no dash.
+        return (
+            "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\n"
+            "jobs:\n  t:\n    uses: " + ref + "\n"
+        )
+
     test_cases = [
         ("trigger_push", "test.yml", "on:\n  push:\n    branches: [main]\n", "GWF-001"),
         ("trigger_pr", "test.yml", "on:\n  pull_request:\n", "GWF-001"),
@@ -554,6 +726,29 @@ def run_self_tests() -> int:
         ("mergecompile_clean_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None, {"scripts/verify.ps1": "# stub profile owner\ndotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode\ndotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode\ndotnet build apps/Eliot.Operator/Eliot.Operator.csproj\ndotnet build tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n"}),
         ("mergecompile_elsewhere_rejected", "extra.yml", "name: Manual Extra Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n", "GWF-006"),
         ("policy_checker_exempt", "repository-policy.yml", "name: Manual Repository Policy Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"asserts -Profile MergeCompile wiring\"\n", None),
+        # --- Action identity (issue #1225 step 2) ---
+        # An unapproved owner fails even with a syntactically perfect 40-hex
+        # SHA: a valid pin is not on its own an approved identity.
+        ("unapproved_owner_rejected", "test.yml", step_uses(f"evilcorp/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"), "GWF-002"),
+        # Job-level reusable workflow `uses:` has no leading dash. This is the
+        # blind spot the dash-optional ACTION_REF_RE closes: a mutable ref here
+        # was previously not parsed at all.
+        ("reusable_workflow_mutable_ref_rejected", "test.yml", job_uses("actions/reusable/.github/workflows/x.yml@v1"), "GWF-002"),
+        ("reusable_workflow_expression_rejected", "test.yml", job_uses("actions/reusable/.github/workflows/x.yml@${{ inputs.ref }}"), "GWF-002"),
+        ("reusable_workflow_pinned_accepted", "test.yml", job_uses("actions/reusable/.github/workflows/x.yml@11bd71901bbe5b1630ceea73d27597364c9af683"), None),
+        ("expression_ref_rejected", "test.yml", step_uses("actions/checkout@${{ env.ACTION_SHA }}"), "GWF-002"),
+        ("short_sha_rejected", "test.yml", step_uses("actions/checkout@11bd7190"), "GWF-002"),
+        ("branch_ref_rejected", "test.yml", step_uses("actions/checkout@main"), "GWF-002"),
+        ("wildcard_ref_rejected", "test.yml", step_uses("actions/checkout@*"), "GWF-002"),
+        # No owner segment: the reference is not an owner/repository identity.
+        ("malformed_action_name_rejected", "test.yml", step_uses(f"checkout@11bd71901bbe5b1630ceea73d27597364c9af683"), "GWF-010"),
+        # The pre-existing no-`@` branch is reached first and is unchanged: a
+        # reference with neither an owner segment nor a pin is reported as an
+        # unpinned action, not reclassified as a malformed identity.
+        ("unpinned_action_rejected", "test.yml", step_uses("checkout"), "GWF-002"),
+        ("approved_owner_full_sha_accepted", "test.yml", step_uses("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2"), None),
+        # Divergence is a repository-level rule: it needs two workflow files, so
+        # it runs as a dedicated block below rather than in this single-file table.
     ]
 
     for case in test_cases:
@@ -578,6 +773,87 @@ def run_self_tests() -> int:
             elif expected_code not in codes:
                 print(f"SELF_TEST_FAILURE in {name}: expected finding {expected_code}, got {codes}", file=sys.stderr)
                 return 1
+
+    # Cross-workflow pin divergence (issue #1225 step 2): the same action at two
+    # different SHAs is a finding, and one SHA everywhere is clean. Each pair of
+    # workflows is individually well-formed, so only the repository-level check
+    # can reject the divergent pair.
+    divergence_cases = [
+        ("divergent_pin_rejected", step_uses(f"actions/checkout@{other_sha}"), True),
+        ("consistent_pin_accepted", step_uses("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"), False),
+    ]
+    for name, second_workflow, expect_finding in divergence_cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            wf_dir = tmp_root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "a.yml").write_text(
+                step_uses("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"),
+                encoding="utf-8",
+            )
+            (wf_dir / "b.yml").write_text(second_workflow, encoding="utf-8")
+            findings = check_action_pin_divergence(tmp_root)
+            if expect_finding and not any(f.code == "GWF-011" for f in findings):
+                print(
+                    f"SELF_TEST_FAILURE in {name}: expected GWF-011 for divergent action pin, got {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not expect_finding and findings:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: consistent pin produced unexpected findings: {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+
+    # The identity record is derived from the files and deterministic: the same
+    # tree yields the same sorted records, and every third-party ref is present
+    # including the job-level (no dash) form.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        wf_dir = tmp_root / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "b.yml").write_text(
+            step_uses("actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0"), encoding="utf-8"
+        )
+        (wf_dir / "a.yml").write_text(
+            step_uses("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2")
+            + job_uses(f"actions/reusable/.github/workflows/x.yml@{other_sha}"),
+            encoding="utf-8",
+        )
+        identities = collect_action_identities(tmp_root)
+        expected_identities = [
+            {
+                "workflow": ".github/workflows/a.yml",
+                "line": "10",
+                "action": "actions/checkout",
+                "ref": "11bd71901bbe5b1630ceea73d27597364c9af683",
+            },
+            {
+                "workflow": ".github/workflows/a.yml",
+                "line": "18",
+                "action": "actions/reusable/.github/workflows/x.yml",
+                "ref": other_sha,
+            },
+            {
+                "workflow": ".github/workflows/b.yml",
+                "line": "10",
+                "action": "actions/cache",
+                "ref": "1bd1e32a3bdc45362d1e726936510720a7c30a57",
+            },
+        ]
+        if identities != expected_identities:
+            print(
+                f"SELF_TEST_FAILURE in derived_action_identity: expected {expected_identities}, got {identities}",
+                file=sys.stderr,
+            )
+            return 1
+        if collect_action_identities(tmp_root) != identities:
+            print(
+                "SELF_TEST_FAILURE in derived_action_identity: record is not deterministic",
+                file=sys.stderr,
+            )
+            return 1
 
     # Test python requirements without hash
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -680,7 +956,10 @@ def run_self_tests() -> int:
             print(f"SELF_TEST_FAILURE: hash-locked pip install produced unexpected findings: {findings}", file=sys.stderr)
             return 1
 
-    print("GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS (21/21 cases verified)")
+    # 25 single-file workflow cases + 2 cross-workflow divergence cases
+    # + 1 derived-identity case + 7 rule-level cases below.
+    case_count = len(test_cases) + len(divergence_cases) + 1 + 7
+    print(f"GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS ({case_count}/{case_count} cases verified)")
     return 0
 
 
@@ -712,6 +991,11 @@ def main() -> int:
                 }
                 for f in findings
             ],
+            # Derived action identity (issue #1225 step 2). Additive key: every
+            # existing consumer reads `status`/`findings_count`/`findings`, which
+            # keep their meaning and ordering unchanged. Sorted and bounded, so
+            # an unchanged tree yields a byte-identical file.
+            "actions": collect_action_identities(root),
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
