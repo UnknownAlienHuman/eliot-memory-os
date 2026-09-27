@@ -1122,6 +1122,12 @@ impl DependencyResourceBudget {
 /// never because no stop was recorded. Inside one process generation the
 /// remaining budget is monotonic non-increasing, so an over-committed budget is
 /// refused rather than clamped.
+///
+/// All five bindings are consumed by
+/// [`ManagedDependencyRecord::canonical_store_write_readiness`], which joins them
+/// with the store-bridge semantic probes to derive canonical-store write
+/// readiness. That decision reads none of [`Self::state`]; its liveness comes
+/// only from the carried observation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedDependencyRecord {
@@ -1176,6 +1182,94 @@ impl ManagedDependencyRecord {
             PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => false,
         }
     }
+
+    /// Derives the canonical-store write-readiness decision for this record
+    /// from the five operational bindings it carries, joined with the
+    /// store-bridge semantic probes the caller already evaluated.
+    ///
+    /// `I1.9` gives the canonical store two independent sources: "process
+    /// liveness comes from this record and Host/Watchdog observations; semantic
+    /// readiness comes from store-bridge version/schema/transaction probes.
+    /// Neither observation can substitute for the other." This function is that
+    /// join, and it is deliberately one-directional: liveness never satisfies
+    /// `semantic_probes_ready`, and `semantic_probes_ready` never substitutes
+    /// for the liveness observation.
+    ///
+    /// Each refusal names exactly one binding that did not hold, in the order
+    /// [`CanonicalStoreWriteRefusal`] lists them. This method reads
+    /// [`Self::state`] nowhere: liveness comes only from the carried
+    /// [`Self::outcome`] observation, and the remaining restart allowance comes
+    /// only from [`Self::lifecycle_budget`]. It grants no authority, starts no
+    /// process, and performs no probe of its own; a caller that has not run the
+    /// store-bridge version/schema/transaction probes must pass `false` rather
+    /// than infer readiness from the live process.
+    pub fn canonical_store_write_readiness(
+        &self,
+        required_process_manifest: &ImmutableProcessManifest,
+        required_process_generation: &EpochTransition,
+        required_artifact_hash: &PlatformHandle,
+        required_config_hash: &PlatformHandle,
+        semantic_probes_ready: bool,
+    ) -> Result<(), CanonicalStoreWriteRefusal> {
+        if self.process_manifest != *required_process_manifest
+            || self.process_generation != *required_process_generation
+        {
+            return Err(CanonicalStoreWriteRefusal::LaunchLineageMismatch);
+        }
+        if self.approved_artifact_hash != *required_artifact_hash
+            || self.approved_config_hash != *required_config_hash
+        {
+            return Err(CanonicalStoreWriteRefusal::ProcessApprovalMismatch);
+        }
+        // `I1.4` keeps the canonical store in its own Host-owned Job Object, so
+        // a record without PID/Job lineage cannot be proven to be that process.
+        if self.pid_job_lineage_refs.is_empty() {
+            return Err(CanonicalStoreWriteRefusal::MissingPidJobLineage);
+        }
+        if !self.observed_liveness() {
+            return Err(CanonicalStoreWriteRefusal::NotObservedLive);
+        }
+        // `I1.4` "quarantine — after restart-budget exhaustion, disable the
+        // capability while Problem State remains open". The remaining restart
+        // count is the only place this record expresses that allowance, so an
+        // exhausted budget leaves canonical writes disabled.
+        if self.lifecycle_budget.restart_attempts_remaining == 0 {
+            return Err(CanonicalStoreWriteRefusal::RestartBudgetExhausted);
+        }
+        if !semantic_probes_ready {
+            return Err(CanonicalStoreWriteRefusal::SemanticallyNotReady);
+        }
+        Ok(())
+    }
+}
+
+/// Why the canonical-store write path stays closed for one managed dependency.
+///
+/// Every variant names the single binding that did not hold, so a refusal is
+/// attributable to a named operational fact rather than to a generic "not
+/// ready". This is a refusal classification, not a second readiness state: it
+/// has no ready variant, it is never serialized into the `HostStateJournal`
+/// frame, and no variant other than [`Self::NotObservedLive`] is cleared by a
+/// liveness observation. The semantic probes behind
+/// [`Self::SemanticallyNotReady`] stay owned by the store bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalStoreWriteRefusal {
+    /// The immutable process manifest or the process `EpochTransition` that
+    /// launched this process is not the one the write path requires.
+    LaunchLineageMismatch,
+    /// The approved artifact or config hash this record carries is not the one
+    /// the write path requires.
+    ProcessApprovalMismatch,
+    /// The record carries no Job Object/PID lineage, so it cannot be shown to
+    /// be the Host-owned canonical-store process.
+    MissingPidJobLineage,
+    /// The carried process observation does not report live liveness.
+    NotObservedLive,
+    /// This process generation has no remaining restart allowance.
+    RestartBudgetExhausted,
+    /// The store-bridge version/schema/transaction probes did not report
+    /// semantic readiness. A live process does not clear this.
+    SemanticallyNotReady,
 }
 
 /// Compatibility alias for the canonical [`ManagedDependencyRecord`]. Host code
@@ -2438,6 +2532,23 @@ impl HostState {
             applied_operations: Vec::new(),
             epoch_retirements: Vec::new(),
         }
+    }
+
+    /// Exact managed-dependency record for one dependency identity, or a typed
+    /// absence.
+    ///
+    /// The reducer keys [`Self::dependencies`] by [`ManagedDependencyRecord::dependency`]
+    /// and replaces the entry in place, so this projection holds at most one
+    /// record per identity and this lookup is the same key the append path used.
+    /// `HostState` is a rebuildable read model replayed from the journal bytes;
+    /// the returned record is operational evidence, never authority.
+    pub fn managed_dependency(
+        &self,
+        dependency: &PlatformHandle,
+    ) -> Option<&ManagedDependencyRecord> {
+        self.dependencies
+            .iter()
+            .find(|record| &record.dependency == dependency)
     }
 }
 
