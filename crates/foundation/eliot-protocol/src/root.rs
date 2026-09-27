@@ -64,3 +64,13 @@ pub use finish_attempt::{
     FINISH_ATTEMPT_WIRE_ID, FINISH_ATTEMPT_WIRE_VERSION, FINISH_INVOKE_PAYLOAD_SCHEMA_ID,
     FINISH_RESULT_BODY_WIRE_ID, FINISH_RESULT_BODY_WIRE_VERSION, FinishAttempt, FinishResultBody,
 };
+
+pub mod route_continuation;
+pub use route_continuation::{
+    ContinuityKind, HandoffCausalLink, HandoffCompleteness, InFlightEffectDisposition,
+    MAX_ROUTE_CONTINUATION_HANDLES, MAX_ROUTE_CONTINUATION_IN_FLIGHT_DISPOSITIONS,
+    MAX_ROUTE_CONTINUATION_OPAQUE_STATE_BYTES, MAX_ROUTE_CONTINUATION_TEXT_BYTES,
+    ROUTE_CONTINUATION_CONTRACT_NAME, ROUTE_CONTINUATION_CONTRACT_VERSION,
+    ROUTE_CONTINUATION_PAYLOAD_TYPE, RehydrationBundle, RouteContinuationDeletionReason,
+    RouteContinuationState, RouteFingerprint, route_continuation_contract_identity,
+};
