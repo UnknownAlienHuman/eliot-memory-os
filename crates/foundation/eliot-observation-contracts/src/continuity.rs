@@ -630,11 +630,20 @@ fn check_preservation_supported(
 
 /// Assesses one modality property: without a modality-competent evaluator
 /// the property stays unknown or degraded, never measured.
+///
+/// An unestablished source modality ([`SourceModality::Unknown`]) is absent
+/// modality evidence, so it assesses as [`ModalityPropertyStatus::Unknown`]
+/// whatever else is offered. This matches the ingestion refusal of any
+/// measurement claim on such a source in [`check_modality_status`]: the
+/// helper never advises a status the gate would then have to refuse.
 pub fn assess_modality_property(
     modality: SourceModality,
     evaluator_present: bool,
     partial_measurement: bool,
 ) -> ModalityPropertyStatus {
+    if matches!(modality, SourceModality::Unknown) {
+        return ModalityPropertyStatus::Unknown;
+    }
     if !modality.requires_modality_competent_evaluator() {
         return ModalityPropertyStatus::Measured;
     }
