@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use eliot_contracts::{
     ClockReading, ContractVersion, StateFence, canonical_json_bytes, sha256_hex,
@@ -3304,4 +3305,131 @@ pub trait ExchangeJobLedger {
     /// "resume by idempotency identity rather than duplicate transfer" (I21.11)
     /// is a property of the store, not only of the caller that reads it.
     fn store(&mut self, record: ExchangeJobLifecycleRecord) -> Result<(), Self::Error>;
+}
+
+/// One external-knowledge dependency failure, as the bridge itself classified it
+/// before any reduction.
+///
+/// # Why this is a closed value
+///
+/// `crates/research/AGENTS.md` (Hard Boundaries) requires: "Preserve raw
+/// output/exit/process evidence or immutable omission handles before reduction.
+/// Timeout, cancellation, crash, unavailable source and unknown provider
+/// outcome remain distinct." I21.13 then fixes the *scope* of that failure:
+/// "provider unavailable -> declared coverage narrows; dependent inquiry
+/// returns a typed gap", and I21.11 names the two outcomes the dependent
+/// inquiry may return, `RESEARCH_SOURCE_UNAVAILABLE` and
+/// `INCOMPLETE_COVERAGE`.
+///
+/// So an external-knowledge failure has to reach the exchange as the outcome the
+/// bridge already proved — not as a refusal of a state transition, and not as
+/// prose. This enum is that closed vocabulary: one variant per outcome the
+/// production bridge error distinguishes, carried over `Copy` and a
+/// `&'static str` reason the bridge itself owns. It holds no owned text, so it
+/// cannot become a place where a provider body or a free-form message is
+/// re-authored on the way through.
+///
+/// [`ExternalKnowledgeFailure::TimedOut`] and
+/// [`ExternalKnowledgeFailure::UnknownOutcome`] are the two outcomes whose
+/// bridge error retains evidence — a cancellation receipt and the immutable raw
+/// provider evidence respectively. They deliberately carry none here: that
+/// evidence stays with the bridge error that holds it, so a durable exchange
+/// record keeps no second copy of provider bytes and cannot drift from them,
+/// while the outcome itself still reaches the caller distinct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalKnowledgeFailure {
+    /// The Research-held source, or the admitted bridge that reaches it, could
+    /// not be reached. This is the exact condition I21.11 names
+    /// `RESEARCH_SOURCE_UNAVAILABLE` for the dependent inquiry.
+    SourceUnavailable,
+    /// The provider execution exceeded its admitted deadline. The cancellation
+    /// was attempted and the outcome is unconfirmed, so this is a deadline
+    /// overrun and never a clean stop.
+    TimedOut,
+    /// The provider execution itself failed after the executor was contacted.
+    ProviderFailed {
+        /// The bridge's own stable reason for the failure, passed through rather
+        /// than re-authored here. Provider bodies are never included.
+        reason: &'static str,
+    },
+    /// The provider operation was refused as not admitted: a binding, ownership
+    /// or authority refusal that proved no provider outcome.
+    NotAdmitted {
+        /// The bridge's own stable reason for the refusal.
+        reason: &'static str,
+    },
+    /// The provider answered over a wire that is not the admitted protocol, so
+    /// the generation behind the answer cannot be verified and the dependent
+    /// inquiry's coverage is incomplete rather than absent.
+    ProtocolViolation {
+        /// The bridge's own stable reason for the refusal; provider bodies are
+        /// never included.
+        reason: &'static str,
+    },
+    /// The provider materialized evidence that is incomplete.
+    EvidenceIncomplete {
+        /// The bridge's own stable reason for the incompleteness.
+        reason: &'static str,
+    },
+    /// The provider outcome could not be classified from what was retained. It
+    /// is an explicit unknown to be reconciled by operation identity, never a
+    /// failure and never a completion.
+    UnknownOutcome,
+    /// The shared governed process contour failed around the provider
+    /// execution. It is its own crash-class outcome and is not a provider
+    /// verdict.
+    ProcessFailed,
+}
+
+impl fmt::Display for ExternalKnowledgeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceUnavailable => f.write_str("research source unavailable"),
+            Self::TimedOut => f.write_str("provider deadline exceeded, cancellation unconfirmed"),
+            Self::ProviderFailed { reason } => write!(f, "provider execution failed: {reason}"),
+            Self::NotAdmitted { reason } => {
+                write!(f, "provider operation is not admitted: {reason}")
+            }
+            Self::ProtocolViolation { reason } => {
+                write!(f, "provider wire is not the admitted protocol: {reason}")
+            }
+            Self::EvidenceIncomplete { reason } => {
+                write!(f, "provider evidence is incomplete: {reason}")
+            }
+            Self::UnknownOutcome => {
+                f.write_str("provider outcome is unknown; reconcile by operation identity")
+            }
+            Self::ProcessFailed => f.write_str("shared process contour failed"),
+        }
+    }
+}
+
+/// The point at which the exchange contacted its external-knowledge dependency.
+///
+/// The stage is part of the reported failure rather than prose about it, because
+/// the same provider outcome means something different before a job identity
+/// exists and after the exchange has already recorded a cancellation it could
+/// not confirm. A caller that reconciles by job identity has to know which of
+/// the two it is looking at, and I21.11 requires a pending exchange to "remain
+/// durable exchange job[s] and resume by idempotency identity" — so the failed
+/// cancel leaves an identity to reconcile that the failed submit never minted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalKnowledgeStage {
+    /// Admitting one new query: the provider job identity is being minted, so
+    /// this idempotency identity owns no job yet and a retry may be admitted
+    /// afresh.
+    Submit,
+    /// Cancelling one admitted job: the issued cancellation is already a durable
+    /// fact and the bridge's confirmation is absent, so the job identity exists
+    /// and is the thing to reconcile.
+    Cancel,
+}
+
+impl fmt::Display for ExternalKnowledgeStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Submit => f.write_str("admitting the query"),
+            Self::Cancel => f.write_str("cancelling the admitted job"),
+        }
+    }
 }

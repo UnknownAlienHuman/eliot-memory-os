@@ -24,7 +24,8 @@ use eliot_contracts::StateFence;
 use eliot_process::ExitDisposition;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
 use eliot_research_exchange_api::{
-    CoverageGapKind, DisclosureClass, ResearchQueryRequest, ResearchSourceGapOutcome, SourceClass,
+    CoverageGapKind, DisclosureClass, ExternalKnowledgeFailure, ResearchQueryRequest,
+    ResearchSourceGapOutcome, SourceClass,
 };
 use eliot_researcher::{
     AcquisitionOutcome, CandidateEvidence, InquiryGovernance, InquiryHorizon, InquiryObservation,
@@ -288,6 +289,40 @@ impl ResearchBridge for GovernedResearchBridge {
 
     fn cancel(&mut self, _job_id: &str) -> Result<(), Self::Error> {
         Err(BridgeError::ProviderUnavailable)
+    }
+
+    fn classify(error: &Self::Error) -> ExternalKnowledgeFailure {
+        // Exhaustive by design: a timeout, a crash, an unavailable source and an
+        // unknown provider outcome must stay distinct on the way into the
+        // exchange, so every outcome this error type distinguishes keeps its own
+        // external-knowledge value and no catch-all arm may re-collapse them.
+        match error {
+            // An invalid bridge identity never reached a provider, and this crate
+            // already classifies it as the same source-unavailable gap an absent
+            // provider is, so it folds into that outcome rather than inventing an
+            // external-knowledge meaning it does not have, so the
+            // RESEARCH_SOURCE_UNAVAILABLE disposition is reachable for both.
+            BridgeError::InvalidBridgeIdentity { .. } | BridgeError::ProviderUnavailable => {
+                ExternalKnowledgeFailure::SourceUnavailable
+            }
+            // The retained cancellation receipt stays with this error; only the
+            // outcome is projected.
+            BridgeError::TimedOut { .. } => ExternalKnowledgeFailure::TimedOut,
+            BridgeError::ProviderFailed { reason } => {
+                ExternalKnowledgeFailure::ProviderFailed { reason }
+            }
+            BridgeError::NotAdmitted { reason } => ExternalKnowledgeFailure::NotAdmitted { reason },
+            BridgeError::ProtocolViolation { reason } => {
+                ExternalKnowledgeFailure::ProtocolViolation { reason }
+            }
+            BridgeError::EvidenceIncomplete { reason } => {
+                ExternalKnowledgeFailure::EvidenceIncomplete { reason }
+            }
+            // The retained raw provider evidence stays with this error so a
+            // reconcile reuses the same bytes; only the outcome is projected.
+            BridgeError::UnknownOutcome { .. } => ExternalKnowledgeFailure::UnknownOutcome,
+            BridgeError::Process(_) => ExternalKnowledgeFailure::ProcessFailed,
+        }
     }
 }
 
@@ -742,6 +777,43 @@ impl ResearchBridge for AdmittedResearchBridge {
         Err(BridgeError::NotAdmitted {
             reason: "nothing was attempted through the executor yet",
         })
+    }
+
+    fn classify(error: &Self::Error) -> ExternalKnowledgeFailure {
+        // Exhaustive by design: a timeout, a crash, an unavailable source and an
+        // unknown provider outcome must stay distinct on the way into the
+        // exchange, so every outcome this error type distinguishes keeps its own
+        // external-knowledge value and no catch-all arm may re-collapse them.
+        // Identical to `GovernedResearchBridge` because both bridges report the
+        // same `BridgeError`; it is repeated rather than shared so neither impl
+        // can be silently narrowed by the other.
+        match error {
+            // An invalid bridge identity never reached a provider, and this crate
+            // already classifies it as the same source-unavailable gap an absent
+            // provider is, so it folds into that outcome rather than inventing an
+            // external-knowledge meaning it does not have, so the
+            // RESEARCH_SOURCE_UNAVAILABLE disposition is reachable for both.
+            BridgeError::InvalidBridgeIdentity { .. } | BridgeError::ProviderUnavailable => {
+                ExternalKnowledgeFailure::SourceUnavailable
+            }
+            // The retained cancellation receipt stays with this error; only the
+            // outcome is projected.
+            BridgeError::TimedOut { .. } => ExternalKnowledgeFailure::TimedOut,
+            BridgeError::ProviderFailed { reason } => {
+                ExternalKnowledgeFailure::ProviderFailed { reason }
+            }
+            BridgeError::NotAdmitted { reason } => ExternalKnowledgeFailure::NotAdmitted { reason },
+            BridgeError::ProtocolViolation { reason } => {
+                ExternalKnowledgeFailure::ProtocolViolation { reason }
+            }
+            BridgeError::EvidenceIncomplete { reason } => {
+                ExternalKnowledgeFailure::EvidenceIncomplete { reason }
+            }
+            // The retained raw provider evidence stays with this error so a
+            // reconcile reuses the same bytes; only the outcome is projected.
+            BridgeError::UnknownOutcome { .. } => ExternalKnowledgeFailure::UnknownOutcome,
+            BridgeError::Process(_) => ExternalKnowledgeFailure::ProcessFailed,
+        }
     }
 }
 

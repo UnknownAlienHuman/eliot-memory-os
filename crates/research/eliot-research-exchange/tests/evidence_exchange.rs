@@ -22,8 +22,8 @@ use eliot_research_exchange::{
 };
 use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, CoverageGap, CoverageGapKind,
-    DisclosureClass, ExactCitation, ResearchClaim, ResearchEvidenceBundle, ResearchQueryRequest,
-    SourceClass, SourceSnapshot,
+    DisclosureClass, ExactCitation, ExternalKnowledgeFailure, ResearchClaim,
+    ResearchEvidenceBundle, ResearchQueryRequest, SourceClass, SourceSnapshot,
 };
 
 const GOLDEN: &str = include_str!("data/evidence_exchange.json");
@@ -170,6 +170,12 @@ impl ResearchBridge for TestBridge {
     fn cancel(&mut self, job_id: &str) -> Result<(), Self::Error> {
         self.cancelled.push(job_id.to_owned());
         Ok(())
+    }
+
+    fn classify(error: &Self::Error) -> ExternalKnowledgeFailure {
+        // `Infallible` is uninhabited: this provider edge has no failure to
+        // project, so the exhaustive classification is the empty match.
+        match *error {}
     }
 }
 
@@ -503,6 +509,21 @@ impl ResearchBridge for RejectResubmitBridge {
 
     fn cancel(&mut self, _job_id: &str) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    fn classify(error: &Self::Error) -> ExternalKnowledgeFailure {
+        match error {
+            // The only refusal this edge produces is a second provider job for an
+            // already-admitted idempotency identity, which is exactly a
+            // not-admitted operation.
+            ExchangeError::InvalidTransition => ExternalKnowledgeFailure::NotAdmitted {
+                reason: "this edge refuses to mint a second provider job",
+            },
+            // Every other error is not an outcome this edge's provider edge can
+            // produce, so it stays an explicit unclassified outcome rather than
+            // being read as one of the refusals above.
+            _ => ExternalKnowledgeFailure::UnknownOutcome,
+        }
     }
 }
 
