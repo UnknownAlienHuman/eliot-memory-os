@@ -465,7 +465,7 @@ fn validate_external_calls(calls: &[HotPathExternalCall]) -> Result<(), RuntimeC
     Ok(())
 }
 
-fn invalid(field: &'static str, reason: &'static str) -> RuntimeContractError {
+pub(crate) fn invalid(field: &'static str, reason: &'static str) -> RuntimeContractError {
     RuntimeContractError::InvalidField { field, reason }
 }
 
