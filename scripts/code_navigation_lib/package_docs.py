@@ -194,6 +194,23 @@ def _md_link(label: str, destination: str) -> str:
     return f"[{label}]({destination})"
 
 
+def target_cell(target: dict[str, Any]) -> str:
+    kind = target.get("kind", "target")
+    path = target.get("path", "")
+    features = str(target.get("required_features", "") or "").strip()
+    if features:
+        return f"`{kind}: {path}` `[requires: {features}]`"
+    return f"`{kind}: {path}`"
+
+
+def reverse_target_cell(package_root: str, target: dict[str, Any]) -> str:
+    path = target.get("path", "")
+    features = str(target.get("required_features", "") or "").strip()
+    if features:
+        return f"`{package_root}:{path}` `[requires: {features}]`"
+    return f"`{package_root}:{path}`"
+
+
 def render(registry: dict[str, Any], root: Path | None = None) -> str:
     resolved_root = (root or Path(".")).resolve()
     resolver = get_resolver(resolved_root)
@@ -278,7 +295,7 @@ def render(registry: dict[str, Any], root: Path | None = None) -> str:
         admission = "default" if package.get("default_member") else "workspace"
         raw_targets = package.get("targets", [])
         sorted_targets = sorted(raw_targets, key=lambda t: (t.get("kind", ""), t.get("name", ""), t.get("path", "")))
-        targets_str = "<br>".join(f"`{t.get('kind', 'target')}: {t.get('path', '')}`" for t in sorted_targets)
+        targets_str = "<br>".join(target_cell(t) for t in sorted_targets)
         blocks_str = "<br>".join(f"`{item}`" for item in package["logical_blocks"])
         package_handles = _handles(package, blocks)
         handle_links = []
@@ -316,7 +333,7 @@ def render(registry: dict[str, Any], root: Path | None = None) -> str:
                 admitted.append(_md_link(f"`{p_root}`", f"../../{p_manifest}"))
                 raw_targets = package.get("targets", [])
                 for t in sorted(raw_targets, key=lambda x: (x.get("kind", ""), x.get("name", ""), x.get("path", ""))):
-                    target_list.append(f"`{p_root}:{t.get('path', '')}`")
+                    target_list.append(reverse_target_cell(p_root, t))
         lines.append(
             f"| {handle_link} | {dest_link} | {'<br>'.join(admitted)} | {'<br>'.join(target_list)} |"
         )
