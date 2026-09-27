@@ -51,6 +51,45 @@
 //! the scheduler owner; the adapter preserves the ordered owner-supplied
 //! creation/expiry pair and rejects an inverted pair.
 //!
+//! ## Staged payload protection (fail-closed, `I5.2`)
+//!
+//! ORS is handed every staged payload as `RecoveryPayload::Encrypted { key,
+//! ciphertext }`, and `I5.2` states the obligation plainly: "The installation
+//! secret provider owns the key reference. `expires_at` is a cleanup horizon
+//! only after a terminal reconciliation/disposition; unresolved operations,
+//! unknown external effects and active checkpoints cannot expire
+//! automatically. Decryption failure, missing key or hash mismatch creates a
+//! Recovery Problem; plaintext fallback and silent deletion are forbidden."
+//! The envelope variant is therefore a claim, and the bytes under it must
+//! really be protected. This module does not weaken that claim:
+//!
+//! ```text
+//! plaintext transition bytes  -> refused before any ORS mutation
+//! caller-supplied seed bytes  -> the caller's claim; ORS re-binds its own
+//!                                digest/length and the Kernel adds no second
+//!                                encoding, cipher, or key
+//! ```
+//!
+//! The check is exact and keyless because it needs to be: the admitted
+//! transition's canonical JSON bytes and its protected encoding cannot
+//! coincide, so a payload that is byte-identical to the canonical bytes is a
+//! *provable* false `Encrypted` label, not a heuristic guess. Such a seed is
+//! refused in [`reserve_for_transition`] before `stage_and_reserve`, so any
+//! envelope, index entry, and recovery reference already retained for that
+//! reservation stay exactly as they are: nothing is deleted, downgraded to the
+//! root-transition-only `RecoveryPayload::CanonicalRequest` variant, or
+//! rewritten as plaintext, and the refusal names no payload byte.
+//!
+//! What this module deliberately does **not** do is resolve the key reference
+//! itself. No installation-owned secret provider is reachable from the
+//! composition here: `CompositionReservation::bind` carries the ORS handle and
+//! the writer epoch only, the `eliot-crypto` surface `I15.4` names as the
+//! ORS/blob/export encryption owner does not exist in the workspace, and the
+//! live `dpapi-user-v1` primitive is owned by the Blob/restore secret owners
+//! (`eliot_blob::DpapiUserAeadPort`, `eliot_backup::DestinationRestoreAdapter`)
+//! under a Blob lineage the Kernel does not own. Rather than invent a
+//! provider, a key id, or a cipher, [`gateway_seed`] refuses.
+//!
 //! ## Send ordering (no orphaned tokens)
 //!
 //! ```text
@@ -96,10 +135,20 @@ use eliot_store_api::{
 
 use crate::{EbpCanonicalStoreClient, EbpStoreTransport};
 
-/// Composition-owned key reference under which the Kernel stages reservation
-/// envelopes. Labels only; no secret bytes live here or cross this boundary.
+/// Requested key-provider label carried on reservation envelopes.
+///
+/// Labels only; no secret bytes live here or cross this boundary. This names
+/// the identity a caller *asks* the installation secret provider to resolve,
+/// not a provider this product owns: no secret provider with this identity
+/// exists, so a well-formed reference built from these labels is not proof of
+/// key availability, retrievability, or authenticated decoding. The staging
+/// boundary in [`reserve_for_transition`] therefore never treats the labels
+/// as evidence of protection.
 pub const RESERVATION_KEY_PROVIDER: &str = "kernel-reservation-key";
-/// Key name within [`RESERVATION_KEY_PROVIDER`] for store-write reservations.
+/// Requested key name under [`RESERVATION_KEY_PROVIDER`] for store-write
+/// reservations. Same caveat as the provider label: a key reference becomes
+/// evidence only when the installation secret provider resolves it, never from
+/// the string itself.
 pub const RESERVATION_KEY_NAME: &str = "store-write-reservation-v1";
 /// Visibility label preserved on every reservation envelope without
 /// interpretation by ORS.
@@ -269,8 +318,10 @@ impl ObservedHead {
 /// Identity and head evidence must be exactly compatible with the admitted
 /// transition and expected-head sets; [`reserve_for_transition`] checks every
 /// binding before any ORS mutation. The payload bytes are caller-owned opaque
-/// bytes (the canonical transition bytes in tests); ORS stores them with an
-/// integrity binding and never interprets them.
+/// bytes that the ORS stores under its `Encrypted` claim; ORS binds them with
+/// its own integrity digest and length and never interprets them. Supplying
+/// the admitted transition's plaintext canonical bytes is refused there, so a
+/// caller cannot stage plaintext under an encrypted label.
 #[derive(Clone, Debug)]
 pub struct ReservationSeed {
     /// ORS reservation identity label; unique per operation.
@@ -280,11 +331,14 @@ pub struct ReservationSeed {
     pub operation_id: String,
     /// Recovery owner identity preserved without granting authority.
     pub recovery_owner: String,
-    /// Caller-owned opaque bytes staged under the key reference below.
+    /// Caller-owned opaque bytes staged under the key reference below. They
+    /// are the installation secret owner's protected bytes: this module never
+    /// encrypts, mints key material, or derives a second encoding.
     pub payload_bytes: Vec<u8>,
-    /// Composition-owned key provider label (no secret bytes).
+    /// Key provider label the installation secret provider is asked to resolve
+    /// (no secret bytes, and no claim that such a provider exists).
     pub key_provider: String,
-    /// Composition-owned key name label (no secret bytes).
+    /// Key name label under that provider (no secret bytes).
     pub key_name: String,
     /// Visibility label preserved without interpretation.
     pub visibility: String,
@@ -488,6 +542,46 @@ fn check_epoch_against_fence(
     Ok(observed)
 }
 
+/// Refuses a seed whose `Encrypted` payload is the admitted transition's own
+/// plaintext canonical bytes.
+///
+/// ORS is told these bytes are ciphertext under an installation-owned key
+/// reference, so byte identity with the canonical transition JSON is a
+/// provable false label rather than a guess: no protected encoding of the same
+/// bytes can equal them. `I5.2` forbids exactly this ("plaintext fallback and
+/// silent deletion are forbidden"), so the refusal happens here, before any
+/// ORS mutation — an envelope, index entry, and recovery reference already
+/// retained for the reservation stay untouched, and the refusal carries the
+/// operation identity plus a fixed sentence, never a payload byte.
+///
+/// The complement of this check (proving the bytes really are the installation
+/// owner's protected encoding) needs the key and therefore the installation
+/// secret owner, which this composition does not carry; see the module
+/// "Staged payload protection" section.
+fn refuse_plaintext_payload(
+    seed: &ReservationSeed,
+    transition: &PreparedTransition,
+    operation_id: &str,
+) -> Result<(), ReservationWriteError> {
+    let plaintext = eliot_contracts::canonical_json_bytes(transition).map_err(|error| {
+        ReservationWriteError::Admission {
+            operation_id: operation_id.to_owned(),
+            detail: format!("admitted transition canonical bytes do not encode: {error}"),
+        }
+    })?;
+    if seed.payload_bytes == plaintext {
+        return Err(ReservationWriteError::Admission {
+            operation_id: operation_id.to_owned(),
+            detail:
+                "reservation seed payload is the admitted transition's plaintext canonical bytes; \
+                 a payload staged as encrypted must carry installation-secret-owner protected \
+                 bytes and the envelope is retained untouched"
+                    .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Atomically reserves every admitted scope through the actual ORS operation,
 /// or none.
 ///
@@ -497,6 +591,11 @@ fn check_epoch_against_fence(
 /// replay of an existing reservation id returns the durable token unchanged;
 /// changed content under the same id is rejected later at projection time, not
 /// silently rebound here.
+///
+/// The staged payload must be the installation secret owner's protected bytes:
+/// [`refuse_plaintext_payload`] rejects the admitted transition's plaintext
+/// before anything is staged, so `accepted_pending` is never backed by a
+/// payload ORS was told was encrypted and was not.
 pub fn reserve_for_transition(
     owner: &CompositionReservation,
     seed: &ReservationSeed,
@@ -513,6 +612,7 @@ pub fn reserve_for_transition(
         expected_ordering_heads,
     )?;
     seed.validate(&operation_id)?;
+    refuse_plaintext_payload(seed, transition, &operation_id)?;
     let observed_sequence = check_epoch_against_fence(&owner.writer_epoch, context, &operation_id)?;
     let mut observed: Vec<(&str, u64)> = seed
         .heads
@@ -1086,38 +1186,57 @@ pub fn recovery_page(
     Ok(owner.ors.recover_page(cursor)?)
 }
 
-/// Builds the per-operation seed the gateway supplies from composition-owned
-/// labels and caller-owned opaque bytes.
+/// Refuses to build a composition-owned reservation seed.
 ///
-/// The key reference and visibility are the fixed composition labels; the
-/// payload bytes are the canonical transition bytes staged opaquely.
+/// This used to serialize the admitted transition's canonical JSON straight
+/// into `ReservationSeed::payload_bytes` and stamp it with the fixed
+/// [`RESERVATION_KEY_PROVIDER`]/[`RESERVATION_KEY_NAME`] labels, which told
+/// ORS the payload was encrypted while it was readable plaintext. That
+/// contradicted `I5.2` ("plaintext fallback and silent deletion are forbidden")
+/// and the `RecoveryPayloadEnvelope` contract, and the staged envelope could
+/// never be decoded by the key reference it named.
+///
+/// Building an honest seed needs the installation secret owner's protected
+/// bytes and the key reference that same owner resolved. This composition
+/// carries neither: [`CompositionReservation::bind`] binds the ORS handle and
+/// the writer epoch only, the `eliot-crypto` surface `I15.4` names as the
+/// ORS/blob/export encryption owner does not exist in the workspace, and the
+/// live `dpapi-user-v1` primitive belongs to the Blob/restore secret owners
+/// under a Blob lineage the Kernel does not own. Inventing a provider id, a
+/// key, or a cipher here would be a second secret owner, so the seed is not
+/// built and the reserved write refuses instead.
+///
+/// Until that owner exists, a caller that already holds owner-protected bytes
+/// and a resolved key reference supplies a [`ReservationSeed`] directly;
+/// [`reserve_for_transition`] still refuses plaintext and still lets ORS bind
+/// its own digest and length.
+///
+/// The composition inputs are borrowed because a refusal consumes none of
+/// them: it names them and returns. The function has no caller in this
+/// repository, so this signature carries no other obligation.
 pub fn gateway_seed(
-    reservation_id: String,
+    reservation_id: &str,
     transition: &PreparedTransition,
-    recovery_owner: String,
+    recovery_owner: &str,
     created_at_ms: i64,
     known_at_ms: i64,
     expires_at_ms: i64,
-    heads: Vec<ObservedHead>,
+    heads: &[ObservedHead],
 ) -> Result<ReservationSeed, ReservationWriteError> {
-    let payload_bytes = eliot_contracts::canonical_json_bytes(transition).map_err(|error| {
-        ReservationWriteError::Admission {
-            operation_id: transition.identity.operation_id.as_str().to_owned(),
-            detail: format!("transition canonical bytes do not encode: {error}"),
-        }
-    })?;
-    Ok(ReservationSeed {
-        reservation_id,
+    // Every composition input is named in the refusal so an operator can see
+    // exactly which reservation was not staged. Only operational identity
+    // labels, times, and the reserved-scope count cross here: no payload byte,
+    // no key material, and no secret-bearing value.
+    Err(ReservationWriteError::Unsupported {
         operation_id: transition.identity.operation_id.as_str().to_owned(),
-        recovery_owner,
-        payload_bytes,
-        key_provider: RESERVATION_KEY_PROVIDER.to_owned(),
-        key_name: RESERVATION_KEY_NAME.to_owned(),
-        visibility: RESERVATION_VISIBILITY.to_owned(),
-        created_at_ms,
-        known_at_ms,
-        expires_at_ms,
-        heads,
+        detail: format!(
+            "reservation {reservation_id} for recovery owner {recovery_owner} (created \
+             {created_at_ms}, known {known_at_ms}, expires {expires_at_ms}, {} reserved scopes) \
+             was not staged: the composition binds no installation secret provider, so it cannot \
+             produce a protected ORS payload; supply owner-protected bytes and a resolved key \
+             reference in a ReservationSeed, and never plaintext",
+            heads.len()
+        ),
     })
 }
 
