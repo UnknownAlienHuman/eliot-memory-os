@@ -56,6 +56,7 @@ fn map_bounded_history_error(error: AuthorityError) -> RevocationHistoryError {
         | AuthorityError::UseBudgetExhausted
         | AuthorityError::UnauthorizedOperation
         | AuthorityError::UnauthorizedResource
+        | AuthorityError::UnauthorizedDataClass
         | AuthorityError::EffectCeilingExceeded
         | AuthorityError::IdentityConflict
         | AuthorityError::StaleTransitionEvidence(_)
@@ -214,7 +215,7 @@ pub(crate) const fn effect_rank(effect: EffectClass) -> u8 {
     }
 }
 
-fn source_effect_rank(ceiling: EffectCeiling) -> u8 {
+pub(crate) fn source_effect_rank(ceiling: EffectCeiling) -> u8 {
     match ceiling {
         EffectCeiling::ReadOnly => 0,
         EffectCeiling::CandidateOnly => 1,

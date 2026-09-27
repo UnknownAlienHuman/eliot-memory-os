@@ -206,6 +206,26 @@ pub enum KernelError {
     #[error("idempotency key conflict")]
     IdempotencyConflict,
 
+    /// A compiled authority projection no longer matches a RECORDED content
+    /// commitment, or the exact revision it names has already been fenced.
+    ///
+    /// Distinct from [`Self::IdempotencyConflict`]: an idempotency conflict says
+    /// the same identity was presented with different bytes, while this says
+    /// the admitted projection itself is stale, unverifiable, or superseded by a
+    /// newer revocation. Neither is ever downgraded to a fresh active snapshot.
+    #[error("stale or unverifiable authority projection: {0}")]
+    StaleActivationEvidence(String),
+
+    /// The compiled I6.10 mechanical subset refused one presented use site.
+    ///
+    /// The exact closed cause crosses unchanged, so a consumer is never told
+    /// "unauthorized" when the real decision was expiry, revocation, a
+    /// data-class ceiling, a stale epoch, or an approval that does not bind the
+    /// presented action. This is a wrapper over a typed cause, never a string
+    /// standing in for several distinguishable decisions.
+    #[error("mechanical authority refusal: {0}")]
+    MechanicalAdmission(#[from] eliot_authority::AuthorityError),
+
     /// A durable dependency is missing or unavailable.
     #[error("dependency unavailable: {0}")]
     DependencyUnavailable(String),

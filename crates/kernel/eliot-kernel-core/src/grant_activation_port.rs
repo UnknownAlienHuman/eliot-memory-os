@@ -78,6 +78,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use eliot_authority::{AuthorityUseSite, MechanicalAuthoritySubset};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
@@ -136,6 +137,8 @@ pub struct GrantActivationIntent {
     pub session_id: String,
     /// Scope the grant is activated for.
     pub scope_id: String,
+    /// Capability-token identity the compiled subset binds.
+    pub token_id: String,
     /// Authority binding pinning owner, epoch, fence, effect and ceiling.
     pub binding: AuthorityBinding,
     /// Requested effect ceiling. Must not exceed the binding ceiling.
@@ -148,6 +151,22 @@ pub struct GrantActivationIntent {
     pub expires_at_ms: Option<i64>,
     /// Receipt obligations the effect path must discharge.
     pub receipt_obligations: Vec<String>,
+    /// The compiled I6.10 mechanical subset this activation admits.
+    ///
+    /// It is the whole mechanically enforceable projection — named operations
+    /// and transition classes, exact scope/effect/proof/data-class ceilings,
+    /// policy/configuration/lease revisions, typed epoch and State Fence,
+    /// expiry and heartbeat conditions, required approval references and the
+    /// canonical source commitment — not a summary of it. The port verifies
+    /// it against its recorded content commitment before any mutation, so a
+    /// structurally valid payload nobody compared with the source authority
+    /// cannot become an active snapshot.
+    pub mechanical_subset: MechanicalAuthoritySubset,
+    /// The ORIGINAL content commitment recorded beside the subset.
+    ///
+    /// It is an independent recorded field, not a value recomputed at
+    /// admission: a tampered subset and an untampered intent must disagree.
+    pub mechanical_subset_commitment: String,
 }
 
 /// Live grant-revocation intent presented to the one P-07 port.
@@ -206,12 +225,15 @@ pub const ROOT_GRANT_HYDRATION_FIELDS: &[&str] = &[
     "intent.holder_principal",
     "intent.session_id",
     "intent.scope_id",
+    "intent.token_id",
     "intent.binding",
     "intent.allowed_effect",
     "intent.proof_ceiling",
     "intent.issued_at_ms",
     "intent.expires_at_ms",
     "intent.receipt_obligations",
+    "intent.mechanical_subset",
+    "intent.mechanical_subset_commitment",
     "durable_record",
     "observed_at_ms",
 ];
@@ -559,12 +581,15 @@ pub const GRANT_CLOSURE_ENUMERATION_FIELDS: &[&str] = &[
     "members[].intent.holder_principal",
     "members[].intent.session_id",
     "members[].intent.scope_id",
+    "members[].intent.token_id",
     "members[].intent.binding",
     "members[].intent.allowed_effect",
     "members[].intent.proof_ceiling",
     "members[].intent.issued_at_ms",
     "members[].intent.expires_at_ms",
     "members[].intent.receipt_obligations",
+    "members[].intent.mechanical_subset",
+    "members[].intent.mechanical_subset_commitment",
     "members[].durable_record",
     "members[].observed_at_ms",
     "preserved[].grant_id",
@@ -827,6 +852,11 @@ impl GrantActivationPort {
                 proof_ceiling: request.proof_ceiling,
                 expires_at_ms: request.expires_at_ms,
                 status: LiveStatus::Active,
+                mechanical_subset: Some(request.mechanical_subset.clone()),
+                activation_identity: Some(CommittedAuthorityActivation::new(
+                    receipt.clone(),
+                    request,
+                )),
             },
         );
         ledger.note_revision(&request.authority_root_ref, request.grant_graph_revision);
@@ -1646,6 +1676,30 @@ impl GrantActivationPort {
         operations.into_iter().collect()
     }
 
+    /// Returns the exact committed mechanical activation for one grant, or
+    /// `None` when the grant is not committed active authority.
+    ///
+    /// A canonical grant row without this committed activation — Kernel-issued
+    /// receipt, durable ORS record reference, and the ORIGINAL recorded content
+    /// commitment over the compiled mechanical subset — is not authority and
+    /// admits no effect. The receipt shape alone is not the answer; the caller
+    /// receives the whole activation commitment and may compare it.
+    #[must_use]
+    pub fn committed_activation(
+        &self,
+        grant_id: &str,
+    ) -> Option<(CommittedAuthorityActivation, MechanicalAuthoritySubset)> {
+        let ledger = self.lock_ledger();
+        let record = ledger.grants.get(grant_id)?;
+        if record.status != LiveStatus::Active {
+            return None;
+        }
+        Some((
+            record.activation_identity.clone()?,
+            record.mechanical_subset.clone()?,
+        ))
+    }
+
     /// Returns `true` only when the grant is recorded as revoked.
     ///
     /// An unknown grant is not assumed fenced; it stays reconciling until an
@@ -1803,6 +1857,11 @@ impl GrantActivationPort {
         candidate.introductions.clear();
         candidate.max_revision.clear();
         candidate.closure_targets.clear();
+        // The Kernel-first fence watermark is rebuilt from the durable closure
+        // commits this restart recovered, not from process memory: a fence that
+        // committed before the restart must keep denying matching new effects
+        // afterwards, and a delayed activation replay must not undo it.
+        candidate.revocation_revision.clear();
         let mut projections = Vec::new();
         for root in authority_roots {
             validate_id(root, "owner_rehydration.authority_root_ref")?;
@@ -1974,6 +2033,17 @@ impl GrantActivationPort {
                 recovered.push((commit, receipt));
             }
         }
+        // The Kernel-first fence watermark is rebuilt from the durable closure
+        // commits this restart recovered, not from process memory: a fence that
+        // committed before the restart must keep denying matching new effects
+        // afterwards, and a delayed activation replay presenting the same
+        // revision must not undo it.
+        for (commit, _) in &recovered {
+            candidate.note_revocation_revision(
+                &commit.declaration.authority_root_ref,
+                commit.declaration.grant_graph_revision,
+            );
+        }
         let mut hydrated_grant_ids = BTreeSet::new();
         let mut hydrated_introduction_ids = BTreeSet::new();
         let mut hydrated_operation_ids = BTreeSet::new();
@@ -2121,6 +2191,23 @@ impl GrantActivationPort {
                     ));
                 }
             };
+            let (mechanical_subset, activation_identity) = if status == LiveStatus::Active {
+                let receipt = runtime_activation_receipt(
+                    &hydration.intent,
+                    &hydration.intent.binding.authority_epoch,
+                )?;
+                (
+                    Some(hydration.intent.mechanical_subset.clone()),
+                    Some(CommittedAuthorityActivation::new(
+                        receipt,
+                        &hydration.intent,
+                    )),
+                )
+            } else {
+                // A rehydrated `Revoked` row is fenced by its durable closure
+                // receipt, not by an activation; it carries no live projection.
+                (None, None)
+            };
             candidate.grants.insert(
                 hydration.intent.grant_id.clone(),
                 LiveGrantRecord {
@@ -2130,6 +2217,8 @@ impl GrantActivationPort {
                     proof_ceiling: hydration.intent.proof_ceiling,
                     expires_at_ms: hydration.intent.expires_at_ms,
                     status,
+                    mechanical_subset,
+                    activation_identity,
                 },
             );
         }
@@ -2460,6 +2549,8 @@ impl GrantActivationPort {
                         proof_ceiling,
                         expires_at_ms,
                         status: LiveStatus::Revoked,
+                        mechanical_subset: None,
+                        activation_identity: None,
                     },
                 );
             }
@@ -2874,6 +2965,7 @@ impl GrantActivationPort {
             ));
         }
         for member in &request.enumeration.members {
+            let receipt = runtime_activation_receipt(&member.intent, active_epoch)?;
             ledger.grants.insert(
                 member.intent.grant_id.clone(),
                 LiveGrantRecord {
@@ -2883,6 +2975,11 @@ impl GrantActivationPort {
                     proof_ceiling: member.intent.proof_ceiling,
                     expires_at_ms: member.intent.expires_at_ms,
                     status: LiveStatus::Active,
+                    mechanical_subset: Some(member.intent.mechanical_subset.clone()),
+                    activation_identity: Some(CommittedAuthorityActivation::new(
+                        receipt,
+                        &member.intent,
+                    )),
                 },
             );
         }
@@ -3222,6 +3319,7 @@ impl GrantActivationPort {
             ));
         }
         for member in &request.enumeration.members {
+            let receipt = runtime_activation_receipt(&member.intent, active_epoch)?;
             ledger.grants.insert(
                 member.intent.grant_id.clone(),
                 LiveGrantRecord {
@@ -3231,6 +3329,11 @@ impl GrantActivationPort {
                     proof_ceiling: member.intent.proof_ceiling,
                     expires_at_ms: member.intent.expires_at_ms,
                     status: LiveStatus::Active,
+                    mechanical_subset: Some(member.intent.mechanical_subset.clone()),
+                    activation_identity: Some(CommittedAuthorityActivation::new(
+                        receipt,
+                        &member.intent,
+                    )),
                 },
             );
         }
@@ -3505,6 +3608,12 @@ impl GrantActivationPort {
         }
         let receipt = authority_receipt;
         ledger.note_revision(&request.authority_root_ref, request.grant_graph_revision);
+        // The Kernel-first fence watermark. From the moment this commits, any
+        // compiled subset at or below this revision is denied at the effect
+        // gate, and a delayed activation replay presenting that same revision
+        // cannot resurrect it. A replacement compiled at a newer revision is
+        // untouched: a revocation of an obsolete revision never reaches it.
+        ledger.note_revocation_revision(&request.authority_root_ref, request.grant_graph_revision);
         ledger.intents.insert(
             request.operation_id.clone(),
             PortIntentRecord {
@@ -3738,6 +3847,55 @@ struct LiveGrantRecord {
     proof_ceiling: ProofCeiling,
     expires_at_ms: Option<i64>,
     status: LiveStatus,
+    /// The immutable compiled mechanical subset this activation committed, and
+    /// the exact activation it committed under. The effect consumer reads the
+    /// subset instead of the summary fields above, because only it carries the
+    /// named operations and transition classes, the data-class ceiling, the
+    /// revision identities, the approval references, and the canonical source
+    /// commitment. `None` on a rehydrated `Revoked` row, where the durable
+    /// fence — not an activation — is the evidence.
+    mechanical_subset: Option<MechanicalAuthoritySubset>,
+    /// The activation identity and the ORIGINAL recorded content commitment
+    /// this live row was committed under.
+    activation_identity: Option<CommittedAuthorityActivation>,
+}
+
+/// The exact mechanical activation a live grant row was committed under.
+///
+/// A canonical grant row without this committed activation is not authority:
+/// the Kernel-issued receipt, the durable ORS record identity that holds it,
+/// and the ORIGINAL recorded content commitment over the compiled mechanical
+/// subset are one object, and an effect consumer requires all of them before it
+/// decides anything.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedAuthorityActivation {
+    /// The Kernel-issued activation receipt for this grant.
+    pub receipt: AuthorityActivationReceipt,
+    /// `record_id` of the ORS operational record holding this activation. It
+    /// is the activation's own operation identity, exactly as the committed
+    /// `CapabilityGrantActivation` was constructed.
+    pub ors_record_id: String,
+    /// `subject_id` of the same ORS record: the grant it activated.
+    pub ors_subject_id: String,
+    /// The ORIGINAL recorded digest over the compiled mechanical subset.
+    pub mechanical_subset_commitment: String,
+    /// Grant-graph revision the activation committed at.
+    pub grant_graph_revision: u64,
+}
+
+impl CommittedAuthorityActivation {
+    /// Binds one validated activation receipt to the exact ORS record identity
+    /// and recorded content commitment of its admitted intent.
+    #[must_use]
+    pub fn new(receipt: AuthorityActivationReceipt, intent: &GrantActivationIntent) -> Self {
+        Self {
+            receipt,
+            ors_record_id: intent.operation_id.clone(),
+            ors_subject_id: intent.grant_id.clone(),
+            mechanical_subset_commitment: intent.mechanical_subset_commitment.clone(),
+            grant_graph_revision: intent.grant_graph_revision,
+        }
+    }
 }
 
 /// Live enforcement state of one recorded introduction.
@@ -3774,6 +3932,13 @@ struct PortLedger {
     revoked_grants: BTreeSet<String>,
     introductions: BTreeMap<String, LiveIntroductionRecord>,
     max_revision: BTreeMap<String, u64>,
+    /// Greatest committed revocation revision per lineage root. A compiled
+    /// subset whose source revision is at or below the recorded revocation has
+    /// already been fenced, so a delayed activation replay cannot restore it
+    /// and a replacement compiled at a newer revision is unaffected. The
+    /// watermark is rebuilt from the durable closure commits during restart
+    /// rehydration, so a Kernel-first fence survives restart.
+    revocation_revision: BTreeMap<String, u64>,
     reconciling_effects: BTreeMap<String, String>,
     /// Closure target grant identity to closure operation identity, so a
     /// committed closure stays reachable by target after restart rehydration.
@@ -3802,6 +3967,30 @@ impl PortLedger {
             authority_root_ref.to_owned(),
             current.max(grant_graph_revision),
         );
+    }
+
+    /// Notes the revision at which a Kernel-first revocation took effect. The
+    /// watermark is durable state, not a derived view: it is what makes a
+    /// delayed activation replay unable to restore a fenced projection and
+    /// what keeps a revocation of an obsolete revision from reaching a
+    /// replacement compiled at a newer one.
+    fn note_revocation_revision(&mut self, authority_root_ref: &str, grant_graph_revision: u64) {
+        let current = self
+            .revocation_revision
+            .get(authority_root_ref)
+            .copied()
+            .unwrap_or(0);
+        self.revocation_revision.insert(
+            authority_root_ref.to_owned(),
+            current.max(grant_graph_revision),
+        );
+    }
+
+    fn revocation_revision(&self, authority_root_ref: &str) -> u64 {
+        self.revocation_revision
+            .get(authority_root_ref)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -4250,6 +4439,13 @@ fn validate_closure_activation_members(
     boundary: Option<&DurableRootGrantBoundary>,
     active_epoch: &EpochId,
 ) -> Result<(), KernelError> {
+    // Every member carries the complete compiled mechanical subset and is
+    // content-verified against its recorded commitment here, before any
+    // mutation, so a structurally valid projection nobody compared with the
+    // source authority can never be installed.
+    for member in &enumeration.members {
+        check_mechanical_subset(&member.intent, ledger)?;
+    }
     let mut working: BTreeMap<String, LiveGrantRecord> = ledger.grants.clone();
     // Member grant identities inside one enumeration, for external-parent
     // detection without re-walking the whole enumeration per member.
@@ -4311,6 +4507,11 @@ fn validate_closure_activation_members(
                 proof_ceiling: intent.proof_ceiling,
                 expires_at_ms: intent.expires_at_ms,
                 status: LiveStatus::Active,
+                mechanical_subset: Some(intent.mechanical_subset.clone()),
+                activation_identity: Some(CommittedAuthorityActivation::new(
+                    runtime_activation_receipt(intent, active_epoch)?,
+                    intent,
+                )),
             },
         );
     }
@@ -4684,7 +4885,99 @@ fn prove_survivor_membership(
         ));
     }
     check_opaque_record_binding(projection.record(), &request.binding, active_epoch)?;
+    prove_survivor_cover_by_compiled_subset(
+        ledger,
+        active_epoch,
+        request,
+        survivor,
+        &covering_hydration.intent.mechanical_subset,
+        survivor_hydration.observed_at_ms,
+    )?;
     Ok(())
+}
+
+/// Proves that the covering path's COMPILED mechanical subset actually admits
+/// the exact continuation use the owner declared as surviving.
+///
+/// This is the W5/W7 content verification at the point of use: the owner
+/// declares that one exact already-possible operation keeps working under an
+/// independent qualifying authority path, and the Kernel proves it against the
+/// compiled projection instead of accepting the declaration on its contour
+/// checks alone. The comparison is against the ORIGINAL recorded content
+/// commitment, and no semantic daemon is consulted.
+///
+/// Two dimensions the continuation permit does not carry are resolved
+/// fail-closed rather than defaulted: the covering subset must commit exactly
+/// one transition class and exactly one data class, because a permit naming
+/// neither may only cover a projection that admits no ambiguity. More than one
+/// refuses — that is not a wildcard.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the continuation proof binds ledger, epoch, request, permit, projection, and clock"
+)]
+fn prove_survivor_cover_by_compiled_subset(
+    ledger: &PortLedger,
+    active_epoch: &EpochId,
+    request: &GrantClosureRevocationIntent,
+    survivor: &GrantClosureSurvivor,
+    subset: &MechanicalAuthoritySubset,
+    now_ms: i64,
+) -> Result<(), KernelError> {
+    subset
+        .verify_recorded_commitment()
+        .map_err(|error| KernelError::StaleActivationEvidence(error.to_string()))?;
+    if subset.binding != request.binding
+        || !subset
+            .binding
+            .authority_epoch
+            .is_same_authority(active_epoch)
+    {
+        return Err(KernelError::FenceMismatch);
+    }
+    let (Some(transition_class), Some(data_class)) = (
+        single_value(&subset.transition_classes),
+        single_value(&subset.data_classes),
+    ) else {
+        return Err(KernelError::InvalidField {
+            field: "enumeration.preserved",
+            reason: "a continuation permit names no transition class or data class, so it \
+                     may only be covered by a projection committing exactly one of each",
+        });
+    };
+    let site = AuthorityUseSite {
+        holder_principal: survivor.holder_principal.clone(),
+        session_id: survivor.session_id.clone(),
+        scope_id: survivor.scope_id.clone(),
+        authority_epoch: active_epoch.clone(),
+        state_fence: request.binding.state_fence.clone(),
+        binding: request.binding.clone(),
+        operation_name: survivor.operation_name.clone(),
+        transition_class: transition_class.to_owned(),
+        resource_ref: survivor.resource_ref.clone(),
+        data_class: data_class.to_owned(),
+        effect: survivor.effect,
+        proof_ceiling: subset.proof_ceiling,
+        action_canonical_hash: survivor.canonical_request_hash.clone(),
+        now_ms,
+        heartbeat_age_ms: 0,
+        consumed_uses: 0,
+    };
+    subset
+        .admits(
+            &site,
+            ledger.revocation_revision(&request.authority_root_ref),
+        )
+        .map_err(map_mechanical_admission_error)?;
+    Ok(())
+}
+
+/// Returns the only committed value of a required named set, or `None` when
+/// the set is empty or ambiguous.
+fn single_value(values: &[String]) -> Option<&str> {
+    match values {
+        [only] => Some(only.as_str()),
+        _ => None,
+    }
 }
 
 /// Ledger-only fence derivation for the module's legacy unit fixture.
@@ -5045,6 +5338,84 @@ fn live_closure_introduction_ids(ledger: &PortLedger, affected: &[String]) -> Ve
         .collect()
 }
 
+/// Content-verifies one presented compiled mechanical subset against its
+/// ORIGINAL recorded commitment, the intent it was compiled into, and the
+/// current Kernel revocation watermark. This runs before any mutation, so a
+/// structurally valid payload nobody compared can never become an active
+/// snapshot.
+///
+/// Four independent checks, none of which substitutes a recomputed digest for
+/// a recorded one:
+///
+/// 1. the payload still hashes to the commitment recorded *on the payload*;
+/// 2. the independently recorded commitment beside it agrees, so a tampered
+///    subset cannot ride an untampered intent;
+/// 3. every identity, ceiling and lifetime field agrees with the intent it
+///    was compiled from;
+/// 4. the subset's source revision is strictly newer than the committed
+///    revocation watermark for its root, so a delayed activation replay cannot
+///    undo a newer revocation while a replacement compiled at a newer revision
+///    is unaffected.
+///
+/// # Errors
+///
+/// Returns [`KernelError::StaleActivationEvidence`] when the payload no longer
+/// matches a recorded commitment, [`KernelError::IdempotencyConflict`] when the
+/// two recorded commitments disagree, [`KernelError::InvalidField`] for a
+/// malformed identity, [`KernelError::FenceMismatch`] when the subset's fence
+/// or epoch disagrees with the intent, and
+/// [`KernelError::IdempotencyConflict`] when a newer revocation has already
+/// fenced this source revision.
+fn check_mechanical_subset(
+    request: &GrantActivationIntent,
+    ledger: &PortLedger,
+) -> Result<(), KernelError> {
+    let subset = &request.mechanical_subset;
+    subset
+        .verify_recorded_commitment()
+        .map_err(|error| KernelError::StaleActivationEvidence(error.to_string()))?;
+    if subset.content_commitment != request.mechanical_subset_commitment {
+        return Err(KernelError::IdempotencyConflict);
+    }
+    if validate_id(&request.token_id, "token_id").is_err() {
+        return Err(KernelError::InvalidField {
+            field: "token_id",
+            reason: "capability token identity is required by the compiled mechanical subset",
+        });
+    }
+    if subset.grant_id != request.grant_id
+        || subset.holder_principal != request.holder_principal
+        || subset.session_id != request.session_id
+        || subset.scope_id != request.scope_id
+        || subset.token_id != request.token_id
+        || subset.governor_snapshot_id != request.snapshot_id
+        || subset.authority_root_ref != request.authority_root_ref
+        || subset.effect_ceiling != request.allowed_effect
+        || subset.proof_ceiling != request.proof_ceiling
+        || subset.issued_at_ms != request.issued_at_ms
+        || subset.expires_at_ms != request.expires_at_ms
+    {
+        return Err(KernelError::InvalidField {
+            field: "mechanical_subset",
+            reason: "compiled mechanical subset disagrees with its admitted grant intent",
+        });
+    }
+    if subset.binding != request.binding {
+        return Err(KernelError::FenceMismatch);
+    }
+    if subset.source.source_graph_revision != request.grant_graph_revision {
+        return Err(KernelError::StaleActivationEvidence(
+            "compiled mechanical subset names a different canonical grant-graph revision"
+                .to_owned(),
+        ));
+    }
+    let revoked_at = ledger.revocation_revision(&request.authority_root_ref);
+    if revoked_at > 0 && request.grant_graph_revision <= revoked_at {
+        return Err(KernelError::IdempotencyConflict);
+    }
+    Ok(())
+}
+
 /// Validates one grant activation against the recorded lineage before any
 /// mutation.
 fn validate_grant_activation(
@@ -5077,6 +5448,7 @@ fn validate_grant_activation(
         &request.binding,
     )?;
     check_expiry(request.issued_at_ms, request.expires_at_ms, now_ms)?;
+    check_mechanical_subset(request, ledger)?;
     if ledger.grants.contains_key(&request.grant_id)
         || ledger.revoked_grants.contains(&request.grant_id)
     {
@@ -5416,12 +5788,18 @@ struct GrantActivationDigestView<'a> {
     holder_principal: &'a str,
     session_id: &'a str,
     scope_id: &'a str,
+    token_id: &'a str,
     binding: &'a AuthorityBinding,
     allowed_effect: EffectClass,
     proof_ceiling: ProofCeiling,
     issued_at_ms: i64,
     expires_at_ms: Option<i64>,
     receipt_obligations: BTreeSet<&'a str>,
+    /// The complete compiled mechanical subset, not a summary: an altered
+    /// operation, scope, ceiling, approval reference or source receipt changes
+    /// this digest, so it can never reuse a recorded operation identity.
+    mechanical_subset: &'a MechanicalAuthoritySubset,
+    mechanical_subset_commitment: &'a str,
 }
 
 /// The durable root replay identity includes the exact opaque ORS input in
@@ -5552,6 +5930,7 @@ impl GrantActivationIntent {
             holder_principal: &self.holder_principal,
             session_id: &self.session_id,
             scope_id: &self.scope_id,
+            token_id: &self.token_id,
             binding: &self.binding,
             allowed_effect: self.allowed_effect,
             proof_ceiling: self.proof_ceiling,
@@ -5562,6 +5941,8 @@ impl GrantActivationIntent {
                 .iter()
                 .map(String::as_str)
                 .collect(),
+            mechanical_subset: &self.mechanical_subset,
+            mechanical_subset_commitment: &self.mechanical_subset_commitment,
         }
     }
 
@@ -5887,6 +6268,8 @@ fn install_root_activation(
             proof_ceiling: intent.proof_ceiling,
             expires_at_ms: intent.expires_at_ms,
             status: LiveStatus::Active,
+            mechanical_subset: Some(intent.mechanical_subset.clone()),
+            activation_identity: Some(CommittedAuthorityActivation::new(receipt.clone(), intent)),
         },
     );
     ledger.note_revision(&intent.authority_root_ref, intent.grant_graph_revision);
@@ -6085,6 +6468,11 @@ fn map_ors_recovery_error(error: &eliot_ors::OrsError) -> KernelError {
         eliot_ors::OrsError::DuplicateConflict => KernelError::IdempotencyConflict,
         _ => KernelError::RecoveryUnavailable(error.to_string()),
     }
+}
+
+/// Projects one mechanical-subset refusal onto the typed Kernel failure.
+fn map_mechanical_admission_error(error: eliot_authority::AuthorityError) -> KernelError {
+    KernelError::MechanicalAdmission(error)
 }
 
 /// Maps an introduction-row ORS failure to the typed port refusal.
