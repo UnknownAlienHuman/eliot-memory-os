@@ -1247,6 +1247,16 @@ pub enum AnchorPrecision {
     Section,
     Paragraph,
     Line,
+    /// The finest named position inside a source: a named symbol such as a
+    /// function, type or field path.
+    ///
+    /// I21.7 names a `symbol` beside a `line` among the things a file-level or
+    /// document-level support does not automatically support, so the ladder has
+    /// to be able to say "this source supports the line, not the symbol". The
+    /// rung sits between [`Self::Line`] and [`Self::ByteRange`] and the
+    /// declaration order is load-bearing: [`Self::permits`] compares with
+    /// `>=`, so moving a variant would silently change which admissions hold.
+    Symbol,
     ByteRange,
 }
 
