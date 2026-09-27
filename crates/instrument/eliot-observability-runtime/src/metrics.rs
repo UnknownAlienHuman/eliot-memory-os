@@ -17,6 +17,22 @@ use std::fmt::Write as _;
 
 use crate::config::{MAX_METRIC_LABEL_CHARS, MAX_METRIC_LABELS, MAX_METRIC_SERIES};
 
+/// Revision of the metric label-key schema accepted by [`OpenMetrics::record`].
+///
+/// Bump this when the allowed label keys change. Values remain subject to the
+/// export bounds below; this revision does not claim that arbitrary values
+/// drawn from an allowed key have bounded cardinality.
+pub const METRIC_LABEL_SCHEMA_VERSION: u32 = 1;
+
+const METRIC_LABEL_KEYS: [&str; 6] = [
+    "binary",
+    "module",
+    "work_class",
+    "route_fingerprint_id",
+    "outcome",
+    "profile",
+];
+
 /// Aggregation semantics of one exported series (I16.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetricKind {
@@ -41,7 +57,8 @@ pub enum MetricError {
     /// More labels than `MAX_METRIC_LABELS` were supplied.
     #[error("metric label count exceeds the bounded limit")]
     TooManyLabels,
-    /// A label key or value is blank, oversized, or outside the charset.
+    /// A label key is not in the schema, is duplicated, or a label value is
+    /// blank, oversized, or outside the charset.
     #[error("metric label is not exportable")]
     InvalidLabel,
     /// The bounded series registry is full.
@@ -97,7 +114,10 @@ impl OpenMetrics {
         }
         let mut labels: Vec<(String, String)> = Vec::with_capacity(metric.labels.len());
         for (key, value) in metric.labels {
-            if !is_exportable_label(key) || !is_exportable_label(value) {
+            if !METRIC_LABEL_KEYS.contains(key)
+                || labels.iter().any(|(existing, _)| existing.as_str() == *key)
+                || !is_exportable_label(value)
+            {
                 return Err(MetricError::InvalidLabel);
             }
             labels.push(((*key).to_owned(), (*value).to_owned()));
@@ -121,7 +141,6 @@ impl OpenMetrics {
             self.rejected_series = self.rejected_series.saturating_add(1);
             return Err(MetricError::RegistryFull);
         }
-        self.rejected_series = self.rejected_series.saturating_add(1);
         self.series.insert(
             identity,
             Series {

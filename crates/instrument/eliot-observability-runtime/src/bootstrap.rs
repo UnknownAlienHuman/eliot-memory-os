@@ -16,7 +16,11 @@
 //! live handles, so a caller can report the real state instead of assuming
 //! success.
 
+use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -170,6 +174,16 @@ pub fn install(
         ));
     }
     config.validate()?;
+    // Bind before installing process-global logging so a configured exporter
+    // failure cannot be mistaken for a successful observability install.
+    let metrics_listener = config
+        .metrics_listen
+        .as_deref()
+        .map(TcpListener::bind)
+        .transpose()
+        .map_err(|_| {
+            ObservabilityConfigError::Inconsistent("OpenMetrics endpoint could not bind")
+        })?;
     let log = RollingLogHandle::start(&config.rolling_log).map_err(|_| {
         ObservabilityConfigError::Inconsistent("rolling log appender could not be opened")
     })?;
@@ -181,12 +195,200 @@ pub fn install(
         otlp: otlp_disposition(config.otlp_endpoint.as_deref()),
         profile: config.profile,
     };
+    if let Some(listener) = metrics_listener {
+        start_openmetrics_server(listener, Arc::clone(&install.metrics)).map_err(|_| {
+            ObservabilityConfigError::Inconsistent("OpenMetrics endpoint could not start")
+        })?;
+    }
     // The appender handle must outlive this function: dropping it sets the
     // shared shutdown flag, which would make every later `try_send` drop its
     // record. Keeping it here ties the writer thread to the process lifetime.
     let _ = APPENDER.set(log);
     let _ = INSTALL.set(install.clone());
     Ok(ObservabilityInstallOutcome::Installed(install))
+}
+
+/// Starts the optional scrape listener on a detached process-lifetime thread.
+///
+/// The configured address is the only source for the bind target. Each
+/// accepted connection serves one request and closes; the listener remains
+/// available for later scrapes.
+fn start_openmetrics_server(
+    listener: TcpListener,
+    metrics: Arc<MetricsRegistry>,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("eliot-openmetrics".to_owned())
+        .spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let _ = serve_openmetrics_request(stream, &metrics);
+            }
+        })
+        .map(|_| ())
+}
+
+/// Serves one bounded-registry scrape without accepting metric identity from
+/// the HTTP request.
+fn serve_openmetrics_request(mut stream: TcpStream, metrics: &MetricsRegistry) -> io::Result<()> {
+    let request_line = read_request_line(&mut stream)?;
+    let (status, body) = match request_line {
+        RequestLine::Invalid => ("400 Bad Request", "invalid HTTP request\n".to_owned()),
+        RequestLine::OtherMethod => ("405 Method Not Allowed", "method not allowed\n".to_owned()),
+        RequestLine::OtherTarget => ("404 Not Found", "not found\n".to_owned()),
+        RequestLine::GetMetrics if !read_request_headers(&mut stream)? => {
+            ("400 Bad Request", "invalid HTTP headers\n".to_owned())
+        }
+        RequestLine::GetMetrics => match openmetrics_body(metrics) {
+            Some(body) => ("200 OK", body),
+            None => (
+                "500 Internal Server Error",
+                "metric family metadata is inconsistent\n".to_owned(),
+            ),
+        },
+    };
+    let content_type = if status == "200 OK" {
+        "application/openmetrics-text; version=1.0.0; charset=utf-8"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body.as_bytes())
+}
+
+/// Produces one valid `OpenMetrics` document, rejecting inconsistent family
+/// metadata and removing the duplicate HELP/TYPE lines emitted per series.
+fn openmetrics_body(metrics: &MetricsRegistry) -> Option<String> {
+    let mut families: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    let mut body = String::new();
+
+    for line in metrics.expose().lines() {
+        let declaration = line
+            .strip_prefix("# HELP ")
+            .map(|rest| (true, rest))
+            .or_else(|| line.strip_prefix("# TYPE ").map(|rest| (false, rest)));
+        if let Some((is_help, rest)) = declaration {
+            let (name, value) = rest.split_once(' ')?;
+            let (help, kind) = families.entry(name.to_owned()).or_default();
+            let current = if is_help { help } else { kind };
+            match current {
+                Some(existing) if existing.as_str() == value => continue,
+                Some(_) => return None,
+                None => *current = Some(value.to_owned()),
+            }
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push_str("# EOF\n");
+    Some(body)
+}
+
+#[derive(Clone, Copy)]
+enum RequestLine {
+    Invalid,
+    OtherMethod,
+    OtherTarget,
+    GetMetrics,
+}
+
+/// Reads only the request-line facts needed by this endpoint. The parser uses
+/// fixed state and consumes arbitrarily long tokens without retaining them.
+fn read_request_line(stream: &mut TcpStream) -> io::Result<RequestLine> {
+    const METRICS_PATH: &[u8] = b"/metrics";
+    const HTTP_10: &[u8] = b"HTTP/1.0";
+    const HTTP_11: &[u8] = b"HTTP/1.1";
+
+    #[derive(Clone, Copy)]
+    enum Part {
+        Method,
+        Target,
+        Version,
+        LineFeed,
+    }
+
+    let mut part = Part::Method;
+    let mut byte = [0_u8; 1];
+    let (mut method_matches, mut method_len) = (true, 0_usize);
+    let (mut path_matches, mut path_len, mut query_started) = (true, 0_usize, false);
+    let mut version = [0_u8; HTTP_10.len()];
+    let mut version_len = 0_usize;
+
+    loop {
+        stream.read_exact(&mut byte)?;
+        let byte = byte[0];
+        match part {
+            Part::Method if byte == b' ' => part = Part::Target,
+            Part::Method if byte == b'\r' || byte == b'\n' => {
+                return Ok(RequestLine::Invalid);
+            }
+            Part::Method => {
+                method_matches &= b"GET".get(method_len) == Some(&byte);
+                method_len = method_len.saturating_add(1);
+            }
+            Part::Target if byte == b' ' => part = Part::Version,
+            Part::Target if byte == b'\r' || byte == b'\n' => {
+                return Ok(RequestLine::Invalid);
+            }
+            Part::Target => {
+                if byte == b'?' {
+                    query_started = true;
+                } else if !query_started {
+                    path_matches &= METRICS_PATH.get(path_len) == Some(&byte);
+                    path_len = path_len.saturating_add(1);
+                }
+            }
+            Part::Version if byte == b'\r' => part = Part::LineFeed,
+            Part::Version if byte == b'\n' => return Ok(RequestLine::Invalid),
+            Part::Version => {
+                if let Some(slot) = version.get_mut(version_len) {
+                    *slot = byte;
+                }
+                version_len = version_len.saturating_add(1);
+            }
+            Part::LineFeed if byte == b'\n' => {
+                if method_len == 0
+                    || path_len == 0
+                    || version_len != version.len()
+                    || (version.as_slice() != HTTP_10 && version.as_slice() != HTTP_11)
+                {
+                    return Ok(RequestLine::Invalid);
+                }
+                if !method_matches || method_len != b"GET".len() {
+                    return Ok(RequestLine::OtherMethod);
+                }
+                if !path_matches || path_len != METRICS_PATH.len() {
+                    return Ok(RequestLine::OtherTarget);
+                }
+                return Ok(RequestLine::GetMetrics);
+            }
+            Part::LineFeed => return Ok(RequestLine::Invalid),
+        }
+    }
+}
+
+/// Drains headers through the terminating blank line with constant memory.
+fn read_request_headers(stream: &mut TcpStream) -> io::Result<bool> {
+    let mut byte = [0_u8; 1];
+    let mut line_has_bytes = false;
+    let mut saw_carriage_return = false;
+    loop {
+        stream.read_exact(&mut byte)?;
+        match (saw_carriage_return, byte[0]) {
+            (true, b'\n') if !line_has_bytes => return Ok(true),
+            (true, b'\n') => {
+                line_has_bytes = false;
+                saw_carriage_return = false;
+            }
+            (true, _) | (false, b'\n') => return Ok(false),
+            (false, b'\r') => saw_carriage_return = true,
+            (false, _) => line_has_bytes = true,
+        }
+    }
 }
 
 /// Builds the I16.11 sink group for the configured profile.
