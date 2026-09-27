@@ -54,6 +54,7 @@ use eliot_security_contracts::{
     CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, IndependenceLevel,
     InstructionTaint, IntegrityStatus, PrivacyClass, QuarantineState, SourceAssurance,
 };
+use eliot_wasm_runtime::promotion_receipt::{ComponentPromotionReceipt, LifecycleVerdictBinding};
 use eliot_wasm_runtime::{
     AuthorityResolution, AuthorityResolutionPort, CapabilityId, ComponentManifest,
     DerivedExecutionEvidence, EngineBinding, EngineInvocation, EngineReport, GovernorResolution,
@@ -76,11 +77,6 @@ use crate::wasmtime_provider::{WIT_VERSION, WIT_WORLD, provider_configuration_di
 /// Closed-world `run` export the admitted generation and the isolated child
 /// engine both require. One literal, never a second spelling.
 const RUN_EXPORT: &str = "run";
-
-/// Lifecycle verdicts stay unevaluated until owner lifecycle evidence is
-/// threaded through the delivery set. Encoding them once keeps the
-/// promotion receipt digest bound to the verdicts actually returned.
-const UNEVALUATED_VERDICTS: (bool, bool, bool, bool) = (false, false, false, false);
 
 /// Live authority cell shared by the request loop's control thread and the
 /// local owner adapters executing inside the engine worker.
@@ -488,6 +484,10 @@ struct AdmittedOwnerPorts {
     authority_receipt: Sha256Digest,
     source_receipt: Sha256Digest,
     promotion_receipt: Sha256Digest,
+    /// The component promotion receipt whose evidence decided the four
+    /// lifecycle verdicts bound into `promotion_receipt`. Retained so every
+    /// returned verdict is read from the same evidence the digest binds.
+    component_promotion: ComponentPromotionReceipt,
 }
 
 impl AdmittedOwnerPorts {
@@ -524,12 +524,14 @@ impl AdmittedOwnerPorts {
             &allowed_effect_proposals,
         ))?;
         let source_receipt = digest_canonical(&assurance)?;
+        let lifecycle_verdicts =
+            LifecycleVerdictBinding::from_receipt(&records.component_promotion);
         let promotion_receipt = digest_canonical(&(
             &records.corpus_digest,
             &records.expected_result_digest,
             &records.expected_effect_digest,
             &records.expected_state_delta_digest,
-            UNEVALUATED_VERDICTS,
+            lifecycle_verdicts.as_tuple(),
         ))?;
         Ok(Self {
             live,
@@ -555,6 +557,7 @@ impl AdmittedOwnerPorts {
             authority_receipt,
             source_receipt,
             promotion_receipt,
+            component_promotion: records.component_promotion.clone(),
         })
     }
 
@@ -659,6 +662,10 @@ impl SourceVerificationPort for AdmittedOwnerPorts {
 }
 
 impl PromotionVerificationPort for AdmittedOwnerPorts {
+    /// Returns the retained corpus expectations for exactly the admitted
+    /// component, artifact, interface, state contract, and generation, bound
+    /// to the lifecycle verdicts the component promotion receipt's evidence
+    /// decides. Any other query fails closed.
     fn verify(&mut self, query: &PromotionQuery) -> Result<PromotionVerification, PortError> {
         self.check_live()?;
         if query.component_id != self.manifest.component_id
@@ -669,16 +676,24 @@ impl PromotionVerificationPort for AdmittedOwnerPorts {
         {
             return Err(PortError::Denied);
         }
+        let verdicts = LifecycleVerdictBinding::from_receipt(&self.component_promotion);
+        let verdict = |evaluated: bool| {
+            if evaluated {
+                VerificationVerdict::Verified
+            } else {
+                VerificationVerdict::Rejected
+            }
+        };
         Ok(PromotionVerification {
             corpus_digest: self.corpus_digest.clone(),
             expected_result_digest: self.expected_result_digest.clone(),
             expected_effect_digest: self.expected_effect_digest.clone(),
             expected_state_delta_digest: self.expected_state_delta_digest.clone(),
             verification_revision: self.verification_revision,
-            shadow: VerificationVerdict::Rejected,
-            canary: VerificationVerdict::Rejected,
-            rollback: VerificationVerdict::Rejected,
-            cutover: VerificationVerdict::Rejected,
+            shadow: verdict(verdicts.shadow),
+            canary: verdict(verdicts.canary),
+            rollback: verdict(verdicts.rollback),
+            cutover: verdict(verdicts.cutover),
             verification_receipt_digest: self.promotion_receipt.clone(),
         })
     }

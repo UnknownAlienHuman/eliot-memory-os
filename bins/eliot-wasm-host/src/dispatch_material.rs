@@ -26,6 +26,7 @@
 
 use eliot_contracts::{EpochId, StateFence, sha256_hex};
 use eliot_wasm_runtime::Sha256Digest;
+use eliot_wasm_runtime::promotion_receipt::ComponentPromotionReceipt;
 
 use crate::cli_contract::Profile;
 
@@ -761,7 +762,12 @@ pub struct ValidatedAssuranceRecord {
     pub quarantine: String,
 }
 
-/// Validated owner-authored promotion oracle record.
+/// Validated owner-authored promotion oracle record, carrying the component
+/// promotion receipt that production promotion consumes.
+///
+/// The receipt is the evidence reference I18.42 requires. A staged set whose
+/// receipt is absent or incomplete is a build-only promotion and is refused
+/// as `INCOMPLETE`, never admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedPromotionRecord {
     /// Corpus digest.
@@ -772,6 +778,9 @@ pub struct ValidatedPromotionRecord {
     pub expected_effect_digest: Sha256Digest,
     /// Oracle state-delta digest.
     pub expected_state_delta_digest: Sha256Digest,
+    /// The component promotion receipt whose evidence decides the four
+    /// lifecycle verdicts bound into the promotion receipt digest.
+    pub component_promotion: ComponentPromotionReceipt,
 }
 
 /// Validated owner-attested snapshot record. Fence/epoch agreement with
@@ -1039,7 +1048,8 @@ pub struct ValidatedAssuranceInput {
     pub quarantine: String,
 }
 
-/// Typed promotion oracle input (hex digests).
+/// Typed promotion oracle input (hex digests), carrying the component
+/// promotion receipt the owner published for this delivery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedPromotionInput {
     /// Corpus digest (hex).
@@ -1050,6 +1060,8 @@ pub struct ValidatedPromotionInput {
     pub expected_effect_digest: String,
     /// Oracle state-delta digest (hex).
     pub expected_state_delta_digest: String,
+    /// The owner-published component promotion receipt.
+    pub component_promotion: ComponentPromotionReceipt,
 }
 
 /// Typed snapshot input.
@@ -1850,6 +1862,7 @@ struct PromotionRecordMirror {
     expected_result_digest: String,
     expected_effect_digest: String,
     expected_state_delta_digest: String,
+    component_promotion: ComponentPromotionReceipt,
 }
 
 /// Wire mirror of the owner-attested snapshot record.
@@ -2430,6 +2443,7 @@ fn bind_promotion(
             &promotion.expected_state_delta_digest,
             "promotion-state-delta",
         )?,
+        component_promotion: promotion.component_promotion.clone(),
     })
 }
 

@@ -39,6 +39,10 @@ use eliot_observation_contracts::ObservationScope;
 use eliot_runtime_contracts::{ModuleGeneration, RuntimeLease};
 use eliot_security_contracts::SourceAssurance;
 use eliot_wasm_runtime::lifecycle::{DeterministicEchoCore, SemanticCore};
+use eliot_wasm_runtime::promotion_receipt::{
+    ComponentPromotionReceipt, LifecycleVerdictBinding, PromotionDisposition,
+    check_component_promotion,
+};
 use eliot_wasm_runtime::{
     AuthorityResolution, AuthorityResolutionPort, CapabilityId, ComponentManifest,
     DerivedExecutionEvidence, EffectProposal, EngineInvocation, EngineReport, GovernorResolution,
@@ -186,6 +190,10 @@ pub struct GovernorWasmAdmission {
     allowed_host_calls: BTreeSet<CapabilityId>,
     allowed_effect_proposals: BTreeSet<CapabilityId>,
     promotion: PromotionExpectations,
+    /// The component promotion receipt whose evidence decides the four
+    /// lifecycle verdicts. Required: an admission cannot bind a promotion
+    /// receipt digest without the evidence the verdicts come from.
+    component_promotion: ComponentPromotionReceipt,
 }
 
 impl GovernorWasmAdmission {
@@ -220,9 +228,18 @@ impl GovernorWasmAdmission {
         allowed_host_calls: BTreeSet<CapabilityId>,
         allowed_effect_proposals: BTreeSet<CapabilityId>,
         promotion: PromotionExpectations,
+        component_promotion: ComponentPromotionReceipt,
     ) -> Result<Self, PortError> {
         if generation.module_id.as_str() != manifest.component_id.as_str()
             || generation.artifact_id.as_str() != manifest.artifact_digest.as_str()
+        {
+            return Err(PortError::Denied);
+        }
+        // The promotion receipt must describe exactly this component at
+        // exactly this interface digest, or its evidence is not evidence for
+        // this admission.
+        if component_promotion.component_id != manifest.component_id.as_str()
+            || component_promotion.interface_digest != manifest.interface_digest
         {
             return Err(PortError::Denied);
         }
@@ -260,6 +277,7 @@ impl GovernorWasmAdmission {
             allowed_host_calls,
             allowed_effect_proposals,
             promotion,
+            component_promotion,
         })
     }
 
@@ -312,8 +330,16 @@ impl GovernorWasmAdmission {
         allowed_host_calls: BTreeSet<CapabilityId>,
         allowed_effect_proposals: BTreeSet<CapabilityId>,
         promotion: PromotionExpectations,
+        component_promotion: ComponentPromotionReceipt,
     ) -> Result<Self, PortError> {
         snapshot.validate().map_err(|_| PortError::Denied)?;
+        // Production promotion consumes a complete receipt. An incomplete one
+        // — including no receipt at all, which a build alone produces — is
+        // INCOMPLETE, never a pass, and fails closed here.
+        let disposition = check_component_promotion(Some(&component_promotion)).0;
+        if disposition != PromotionDisposition::Complete {
+            return Err(PortError::Denied);
+        }
         if contour.artifact_bytes.is_empty()
             || contour.wit_bytes.is_empty()
             || contour.configuration_bytes.is_empty()
@@ -352,6 +378,7 @@ impl GovernorWasmAdmission {
             allowed_host_calls,
             allowed_effect_proposals,
             promotion,
+            component_promotion,
         )
     }
 
@@ -386,19 +413,22 @@ impl GovernorWasmAdmission {
     }
 
     /// Recomputes the promotion verification receipt digest.
+    ///
+    /// The four lifecycle verdicts are read from the component promotion
+    /// receipt this admission carries. They are never a hardcoded constant:
+    /// a verdict is `true` only when the corresponding I18.42 evidence class
+    /// was actually produced and admitted, so a promotion cannot be gated on a
+    /// permanently un-evaluated quadruple.
     fn promotion_receipt(&self) -> Result<Sha256Digest, PortError> {
+        let verdicts = LifecycleVerdictBinding::from_receipt(&self.promotion_receipt);
         digest_canonical(&(
             &self.promotion.corpus_digest,
             &self.promotion.expected_result_digest,
             &self.promotion.expected_effect_digest,
             &self.promotion.expected_state_delta_digest,
-            Self::UNEVALUATED_VERDICTS,
+            verdicts.as_tuple(),
         ))
     }
-
-    /// Encodes lifecycle verdicts for receipt binding. All `false` until
-    /// lifecycle evidence is threaded (A13.3 promotion path).
-    const UNEVALUATED_VERDICTS: (bool, bool, bool, bool) = (false, false, false, false);
 }
 
 /// Canonical digest helper: deterministic JSON bytes hashed with SHA-256.
@@ -470,11 +500,10 @@ impl SourceVerificationPort for GovernorWasmAdmission {
 }
 
 impl PromotionVerificationPort for GovernorWasmAdmission {
-    /// Returns the oracle-computed corpus expectations for exactly the
-    /// admitted component, artifact, interface, state contract, and
-    /// generation. Any other query fails closed. Lifecycle verdicts stay
-    /// rejected until lifecycle evidence is threaded, so only the
-    /// Conformance contour (which ignores verdicts) admits.
+    /// Returns the corpus expectations for exactly the admitted component,
+    /// artifact, interface, state contract, and generation, bound to the
+    /// lifecycle verdicts the component promotion receipt's evidence decides.
+    /// Any other query fails closed.
     fn verify(&mut self, query: &PromotionQuery) -> Result<PromotionVerification, PortError> {
         if query.component_id != self.manifest.component_id
             || query.artifact_digest != self.manifest.artifact_digest
@@ -484,16 +513,24 @@ impl PromotionVerificationPort for GovernorWasmAdmission {
         {
             return Err(PortError::Denied);
         }
+        let verdicts = LifecycleVerdictBinding::from_receipt(&self.component_promotion);
+        let verdict = |evaluated: bool| {
+            if evaluated {
+                VerificationVerdict::Verified
+            } else {
+                VerificationVerdict::Rejected
+            }
+        };
         Ok(PromotionVerification {
             corpus_digest: self.promotion.corpus_digest.clone(),
             expected_result_digest: self.promotion.expected_result_digest.clone(),
             expected_effect_digest: self.promotion.expected_effect_digest.clone(),
             expected_state_delta_digest: self.promotion.expected_state_delta_digest.clone(),
             verification_revision: self.verification_revision,
-            shadow: VerificationVerdict::Rejected,
-            canary: VerificationVerdict::Rejected,
-            rollback: VerificationVerdict::Rejected,
-            cutover: VerificationVerdict::Rejected,
+            shadow: verdict(verdicts.shadow),
+            canary: verdict(verdicts.canary),
+            rollback: verdict(verdicts.rollback),
+            cutover: verdict(verdicts.cutover),
             verification_receipt_digest: self.promotion_receipt()?,
         })
     }
