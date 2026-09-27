@@ -286,8 +286,14 @@ impl P07AuthorityPort for KernelAuthorityClient {
             .kernel
             .request_blocking(ACTIVATE_ROOT_TRANSITION_OPERATION, payload)
             .map_err(|error| map_transport(error, &snapshot_id))?;
-        let value = kind_value(&value, ROOT_TRANSITION_RECEIPT_KIND)
-            .map_err(|_| P07PortError::InvalidBinding)?;
+        // A decided Kernel refusal crosses as its exact typed cause, never as
+        // one generic binding code: the refusal frame is decoded before the
+        // success receipt kind is compared, like the four lifecycle arms.
+        let value = p07_route_value(
+            &value,
+            ROOT_TRANSITION_RECEIPT_KIND,
+            ACTIVATE_ROOT_TRANSITION_OPERATION,
+        )?;
         let receipt: RootTransitionActivationReceipt =
             serde_json::from_value(value).map_err(|_| P07PortError::InvalidBinding)?;
         receipt
