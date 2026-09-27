@@ -512,7 +512,7 @@ pub const DIVERGENCE_REASON_CODE: &str = "COMPONENT_DIVERGENCE";
 /// guest is never executed twice) and the sealed reference carries no
 /// resource observations. Absent legs stay absent; they are never reported
 /// as matching.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DivergenceReport {
     /// The derived result digest equals the sealed expected result digest.
