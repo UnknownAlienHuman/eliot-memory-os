@@ -192,6 +192,9 @@ pub enum ProtocolError {
     /// A message type is not admitted by this protocol surface.
     #[error("unknown message type")]
     UnknownMessageType,
+    /// An event payload type is not in the closed known-payload registry.
+    #[error("unknown event payload type")]
+    UnknownEventPayloadType,
     /// The negotiated encoding has no implementation in this crate.
     #[error("unsupported encoding profile: {0}")]
     UnsupportedEncoding(String),
@@ -830,6 +833,42 @@ impl EventEnvelope {
     fn replay_key(&self) -> EventIdentityKey {
         EventIdentityKey::new(&self.stream_id, &self.event_id)
     }
+
+    /// Rejects envelopes whose payload type no known producer mints.
+    ///
+    /// The rejection preserves the presented event identity: nothing is
+    /// minted, staged, or cursor-advanced. Receivers call this after
+    /// [`Self::validate`].
+    pub fn require_known_payload_type(&self) -> Result<(), ProtocolError> {
+        if is_known_event_payload_type(&self.payload_type) {
+            Ok(())
+        } else {
+            Err(ProtocolError::UnknownEventPayloadType)
+        }
+    }
+}
+
+/// Bridge-event payload type minted by the `OpenCode` plugin route.
+///
+/// Paired with `eliot-agent-opencode/src/ingress.rs::HOST_EVENTS_PAYLOAD_TYPE`,
+/// which cannot depend on this crate back; both are the same stable wire
+/// string and must change together.
+pub const OPENCODE_HOST_EVENT_PAYLOAD_TYPE: &str = "eliot.opencode.host-event.v1";
+
+/// Returns whether an event payload type is produced by a known owner.
+///
+/// The closed registry names exactly the production [`EventEnvelope`]
+/// producers: the reactive-context route ([`REACTIVE_CONTEXT_PAYLOAD_TYPE`]),
+/// the backup route ([`BACKUP_PAYLOAD_TYPE`]), and the `OpenCode` bridge route
+/// ([`OPENCODE_HOST_EVENT_PAYLOAD_TYPE`]). Receivers reject anything else via
+/// [`EventEnvelope::require_known_payload_type`] without minting a new event
+/// identity.
+#[must_use]
+pub fn is_known_event_payload_type(payload_type: &str) -> bool {
+    matches!(
+        payload_type,
+        REACTIVE_CONTEXT_PAYLOAD_TYPE | BACKUP_PAYLOAD_TYPE | OPENCODE_HOST_EVENT_PAYLOAD_TYPE
+    )
 }
 
 /// Explicit acknowledgement phase for a durable event.

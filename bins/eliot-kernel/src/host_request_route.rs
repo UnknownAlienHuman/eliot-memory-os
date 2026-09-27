@@ -5236,9 +5236,10 @@ fn bridge_epoch_text(epoch: &eliot_contracts::EpochId) -> String {
 /// payload.
 ///
 /// The payload must carry the closed operation string plus the full typed
-/// envelope; the envelope shape, sequencing, and fence/authority coherence
-/// are re-validated here, so this is typed dispatch rather than generic JSON
-/// routing.
+/// envelope; the envelope shape, sequencing, fence/authority coherence, and
+/// closed payload-type registry are re-validated here, so this is typed
+/// dispatch rather than generic JSON routing. Unknown payload types are
+/// rejected without staging, minting, or cursor movement.
 pub(crate) fn bridge_event_envelope_from_payload(
     payload: &serde_json::Value,
 ) -> Result<EventEnvelope, TransportError> {
@@ -5250,6 +5251,9 @@ pub(crate) fn bridge_event_envelope_from_payload(
         serde_json::from_value(envelope_value).map_err(|_| TransportError::SessionFenced)?;
     envelope
         .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    envelope
+        .require_known_payload_type()
         .map_err(|_| TransportError::SessionFenced)?;
     Ok(envelope)
 }
