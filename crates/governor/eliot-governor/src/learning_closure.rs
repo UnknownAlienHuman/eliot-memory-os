@@ -40,7 +40,15 @@
 //! [`eliot_learning_delta::check_delivery_typed`] before it records whether
 //! the stored record may influence a subsequent attempt, and the typed
 //! [`DeliveryRefusal`] is what it records, so a stale or mismatched admission
-//! receipt is refused and stays distinguishable from an absent one.
+//! receipt is refused and stays distinguishable from an absent one. The same
+//! gate decides delivery in the *incoming* direction: the next materially
+//! related attempt of the campaign is closed by the next
+//! [`LearningClosureService::close_attempt`] call, and the prior record this
+//! campaign committed is the one proposed behavioural change that could reach
+//! it. [`prior_lineage_delivery`] runs that verdict before any retry relation
+//! is built, so a prior proposal the Governor has not admitted is not
+//! delivered to the subsequent attempt, while an honest close record — which
+//! proposes no behaviour — stays referable as retry lineage.
 //!
 //! Promotion boundary: the closure also evaluates the candidate-only promotion
 //! boundary through [`crate::learning_promotion`] on every committed record, so
@@ -310,6 +318,16 @@ pub struct LearningClosureReceipt {
     /// The typed gate refusal, retained so an absent, malformed, and mismatched
     /// receipt stay distinguishable.
     pub delivery_refusal: Option<DeliveryRefusal>,
+    /// Delivery verdict for the prior attempt's proposed next-behaviour
+    /// change, as the current attempt saw it.
+    ///
+    /// `Some(reason)` records that the prior attempt of this campaign proposed
+    /// a behavioural change the Governor has not admitted, so the record this
+    /// closure committed carries no retry relation to it: the proposal was not
+    /// delivered to this attempt. `None` means either that no prior record
+    /// exists, that it proposed no behavioural change, or that the Governor
+    /// admitted it.
+    pub prior_delivery: Option<DeliveryRefusal>,
     /// Compare-and-swap heads the daemon composes into the canonical envelope
     /// that carries this commit across process restarts.
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
@@ -431,6 +449,13 @@ impl LearningClosureService {
     /// gate refuses with [`DeliveryRefusal::MissingReceipt`], which is exactly
     /// the required "unadmitted means undelivered" outcome.
     ///
+    /// `admissions` are the admission receipts the owner holds for this
+    /// campaign's already-committed records. The prior record of the campaign
+    /// is read from the committed image and passed through
+    /// [`prior_lineage_delivery`] before any relation is built, so the
+    /// current attempt inherits the prior proposal only when the Governor
+    /// admitted it.
+    ///
     /// Promotion boundary: the owner-published candidate-only promotion boundary
     /// for this record and its attribution/experiment lineage. The verdict is
     /// produced on every committed record here. A caller that holds no boundary
@@ -449,9 +474,10 @@ impl LearningClosureService {
         activity_name: &str,
         observed: &[LifecycleActivity],
         close: AttemptCloseDisposition,
-        retry_relation: Option<StoredRetryRelation>,
+        declared_retry_reason: Option<RetryReason>,
         evidence_refs: Vec<ArtifactId>,
         receipt: Option<&AdmissionReceipt>,
+        admissions: &[AdmissionReceipt],
         promotion: PromotionBoundaryInput<'_>,
     ) -> Result<LearningClosureOutcome, LearningClosureError> {
         let boundaries = match derive_boundaries(activity_name, observed) {
@@ -468,6 +494,20 @@ impl LearningClosureService {
         // several boundaries keeps every one of them visible.
         let boundary = boundaries[0];
         let identity = identity_input.into_identity(boundary)?;
+        // The prior attempt of this campaign is read from the committed image,
+        // so the delivery gate judges the record the store actually holds
+        // rather than a caller-supplied copy of it.
+        let prior = self.store.prior_in_campaign(&identity.campaign_id)?;
+        let prior_delivery = prior_lineage_delivery(prior.as_ref(), admissions);
+        let retry_relation = if prior_delivery.is_some() {
+            None
+        } else {
+            retry_relation_from_prior(
+                prior.as_ref(),
+                &identity.strategy_fingerprint,
+                declared_retry_reason,
+            )
+        };
         let record = crate::learning_delta_integration::store_attempt_close(
             &identity,
             close,
@@ -484,6 +524,7 @@ impl LearningClosureService {
                 boundaries,
                 delivered: delivery_refusal.is_none(),
                 delivery_refusal,
+                prior_delivery,
                 // The heads a daemon canonical-write envelope binds to are the
                 // version this commit moved *from*, because that is the head
                 // the store image still carried when the record was derived.
@@ -677,6 +718,43 @@ pub fn retry_relation_from_prior(
     })
 }
 
+/// Delivery verdict for the prior attempt's proposal to the current attempt.
+///
+/// This is the W6/A4 decision on the one inheritance path the attempt
+/// lifecycle actually has: the next materially related attempt of the same
+/// campaign is closed by the next [`LearningClosureService::close_attempt`]
+/// call, and the prior record this campaign committed is the only proposed
+/// behavioural change that could reach it. The verdict is the existing
+/// [`delta_delivery_refusal`] verdict — the crate's own
+/// [`check_delivery_typed`](eliot_learning_delta::check_delivery_typed) gate —
+/// applied to the exact prior artifact identity and digest, so a stale,
+/// malformed or foreign receipt stays distinguishable from an absent one.
+///
+/// Only a record that carries a proposed next-behaviour change is gated
+/// ([`StoredLearningDelta::carries_behavioural_proposal`]). An honest close
+/// record (`NO_JUSTIFIED_CHANGE`, `INCONCLUSIVE`, `INVALID_EVIDENCE`) proposes
+/// no behaviour, so it stays referable as retry lineage without admission —
+/// the durable attempt record must not disappear just because no admission
+/// receipt exists for it. A gated record that is refused yields `Some(refusal)`
+/// and the current attempt then inherits no relation to it: an unadmitted
+/// proposed behavioural change is not delivered to the subsequent attempt.
+#[must_use]
+pub fn prior_lineage_delivery(
+    prior: Option<&StoredLearningDelta>,
+    admissions: &[AdmissionReceipt],
+) -> Option<DeliveryRefusal> {
+    let record = prior?;
+    if !record.carries_behavioural_proposal() {
+        return None;
+    }
+    // Only a receipt issued for this exact delta identity is presented to the
+    // gate; anything else is left for the gate to name as the refusal it is.
+    let presented = admissions
+        .iter()
+        .find(|receipt| receipt.delta_id == record.delta_artifact);
+    delta_delivery_refusal(presented, record)
+}
+
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Runs the non-blocking learning-closure edge for one consequential
     /// attempt at the live finish ceremony.
@@ -694,7 +772,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// presented for the stored record: no admission-receipt owner issues one at
     /// this seam, so the live caller presents `None` and the durable receipt
     /// records the gate refusal, which is exactly the required "unadmitted means
-    /// undelivered" outcome.
+    /// undelivered" outcome. `admissions` are the receipts the owner holds for
+    /// this campaign's already-committed records; the prior proposal is delivered
+    /// to this attempt only when one of them is admitted for it.
     ///
     /// `promotion` is the owner-published candidate-only promotion boundary for
     /// this attempt together with the attribution and experiment lineage whose
@@ -714,6 +794,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         activity_name: &str,
         declared_retry_reason: Option<RetryReason>,
         receipt: Option<&AdmissionReceipt>,
+        admissions: &[AdmissionReceipt],
         promotion: PromotionBoundaryInput<'_>,
     ) -> Result<LearningClosureOutcome, LearningClosureError> {
         let job = &evidence.job;
@@ -770,11 +851,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             state_fence: fence.clone(),
             evidence_refs: evidence_refs.clone(),
         };
-        let campaign =
-            CampaignId::from_artifact(artifact_id(&identity.task_id, "campaign task id")?);
-        let prior = service.store().prior_in_campaign(&campaign)?;
-        let retry_relation =
-            retry_relation_from_prior(prior.as_ref(), &fingerprint, declared_retry_reason);
         let observed = observed_activities(
             job.state,
             job.attempts,
@@ -793,9 +869,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             activity_name,
             &observed,
             close_disposition_for(Some(&fact), derived),
-            retry_relation,
+            declared_retry_reason,
             evidence_refs,
             receipt,
+            admissions,
             promotion,
         )
     }

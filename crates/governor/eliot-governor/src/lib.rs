@@ -128,7 +128,7 @@ pub use learning_closure::{
     CanonicalLearningDeltaStore, CanonicalLearningDeltaStoreError, ClosureIdentityInput,
     LEARNING_DELTA_ORDERING_SCOPE, LEARNING_DELTA_REVISION_KEY, LearningClosureError,
     LearningClosureOutcome, LearningClosureReceipt, LearningClosureService, close_disposition_for,
-    retry_relation_from_prior,
+    prior_lineage_delivery, retry_relation_from_prior,
 };
 pub use learning_delta_integration::{
     AttemptCloseError, StoredDeltaIdentity, admission_claim_for_delta, attempt_status_for_activity,
