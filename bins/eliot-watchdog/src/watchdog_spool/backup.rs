@@ -62,6 +62,7 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::sha256_hex;
 
+use crate::observation_coverage::IntervalCoverageReport;
 use crate::{GapRecoveryReason, SpoolError};
 
 use super::codec::{
@@ -414,6 +415,36 @@ pub struct WatchdogSpoolFence {
     entries: Vec<RedactedSpoolEntry>,
     /// Exact retained member and marker denominator.
     denominator: SpoolCoverageDenominator,
+    /// Independently published per-channel coverage of the interval this
+    /// owner closed **most recently** at the moment of the capture, or `None`
+    /// when no interval is available to carry: none has been closed yet, or a
+    /// supervision tick has one open.
+    ///
+    /// This is deliberately not "the interval this capture was taken in". The
+    /// capture covers the retained spool window, whose newest observation is
+    /// the capture anchor; the report covers one supervision tick, which is a
+    /// different and earlier window. One published interval is exactly one
+    /// tick, so the retained report is at most one tick older than the
+    /// capture, and it is retained as the owner's own last coverage
+    /// publication rather than as evidence about the captured window.
+    ///
+    /// It is always an interval that reached its own close. A window a tick
+    /// opened and did not finish is reported to the operator as a named
+    /// `INTERVAL_NOT_CLOSED` omission and is never stored as this owner's last
+    /// publication, so a capture can neither carry it nor read its absence as
+    /// anything but unknown coverage.
+    ///
+    /// It is a second, independent coverage dimension and never a replacement
+    /// for [`Self::denominator`]: the denominator is the exact retained-record
+    /// count and its marker subset, while this is what the I8.2 sensor map
+    /// says was actually observed per channel. The two are validated
+    /// independently, and **nothing in this crate conjoins them**: the
+    /// denominator is re-derived only against the entries this fence holds, and
+    /// `WatchdogComposition::readiness` gates
+    /// `WatchdogReadiness::coverage_claimed` on admitted authority and this
+    /// report alone, with no denominator term. `None` is unknown coverage, never
+    /// complete coverage.
+    channel_coverage: Option<IntervalCoverageReport>,
     /// Source installation the capture was taken from.
     pub source_installation: String,
     /// Watchdog generation bound at sensor construction.
@@ -479,6 +510,13 @@ impl WatchdogSpoolFence {
         &self.denominator
     }
 
+    /// Returns the independently published per-channel coverage this owner
+    /// last closed before the capture, when it had closed one.
+    #[must_use]
+    pub(crate) const fn channel_coverage(&self) -> Option<&IntervalCoverageReport> {
+        self.channel_coverage.as_ref()
+    }
+
     /// Re-validates this fence against the evidence it actually holds.
     ///
     /// Re-runs, over the entries in this fence rather than over any raw record:
@@ -499,7 +537,10 @@ impl WatchdogSpoolFence {
     ///   re-checked against the rules that redacted them;
     /// - the capture anchor (`captured_at_ms` is the newest observation held)
     ///   and the content digest (re-derived from these entries);
-    /// - the bound identity shapes, and the fence schema version.
+    /// - the bound identity shapes, and the fence schema version;
+    /// - when a channel-coverage report is held, its own dispositions, re-derived
+    ///   from its own samples and the current sensor map by
+    ///   [`IntervalCoverageReport::validate`].
     ///
     /// What it deliberately cannot re-check: the exact cross-owner fence
     /// protocol behind `canonical_ref` / `ors_ref`. The fence stores no
@@ -510,19 +551,26 @@ impl WatchdogSpoolFence {
     ///
     /// A changed member, a changed denominator, or a swapped digest is therefore
     /// [`SpoolError::Corrupt`] — incomplete/corrupt, never a known-empty or
-    /// full-coverage page.
+    /// full-coverage page. A channel-coverage report whose dispositions do not
+    /// re-derive from its own evidence is corrupt for the same reason; the
+    /// report is an in-process value, so that is a self-consistency check and
+    /// not a check against a persisted artifact.
     ///
     /// # Errors
     ///
     /// Returns [`SpoolError::Corrupt`] when any re-derived counter, window,
-    /// digest, or identity above disagrees with the fence, and
-    /// [`SpoolError::Serialization`] when an entry cannot be canonically
-    /// encoded.
+    /// digest, or identity above disagrees with the fence, when a held
+    /// channel-coverage report is not consistent with the sensor map and its own
+    /// observed classes, and [`SpoolError::Serialization`] when an entry cannot
+    /// be canonically encoded.
     pub fn validate(&self) -> Result<(), SpoolError> {
         self.check_header_shape()?;
         self.validate_entries()?;
         self.validate_windows()?;
         self.validate_content()?;
+        if let Some(report) = self.channel_coverage() {
+            report.validate()?;
+        }
         Ok(())
     }
 
@@ -1217,6 +1265,22 @@ fn check_capture_params(params: &CaptureFenceParams) -> Result<(), SpoolError> {
 /// operation identity, fence schema, fence-matched canonical/ORS references,
 /// and the content digest.
 ///
+/// `channel_coverage` is this owner's independently published per-channel I8.2
+/// coverage for the interval the owner most recently **closed**, or `None` when
+/// no interval has been closed yet. It is deliberately not "the interval this
+/// capture was taken in": the owner-bound port supplies the same last closed
+/// report it holds, which is at most one tick older than the capture. It is
+/// retained beside the denominator rather than folded into it: the denominator
+/// is the exact retained-record count and its marker subset, the channel
+/// coverage is what the sensor map says was observed, the two are validated
+/// independently, and nothing in this crate conjoins them. A supplied report is
+/// re-derived here by [`IntervalCoverageReport::validate`] and again from the
+/// copy this fence holds in [`read_page`], so a disposition that was not derived
+/// from the evidence it carries cannot reach a reader; that re-check runs over
+/// an in-process value, because the report has no serialization and is not
+/// stored anywhere. The channel coverage is deliberately **not** part of the
+/// content digest, which stays derived from the retained entries alone.
+///
 /// The content digest is derived from the redacted entries this fence stores —
 /// the same representation [`WatchdogSpoolFence::validate`] re-derives — so it
 /// is recomputable and cannot outlive the evidence it describes. This builder
@@ -1232,15 +1296,59 @@ fn check_capture_params(params: &CaptureFenceParams) -> Result<(), SpoolError> {
 /// when a caller binding is unusable or claims canonical/ORS coherence
 /// without exact fence equality. Returns [`SpoolError::Serialization`] when
 /// canonical encoding fails.
+///
+/// A capture with no channel-coverage report is a complete capture of the
+/// retained-record dimension alone. The four-argument signature is preserved
+/// for exactly that case; the owner that observes I8.2 channels calls
+/// `capture_fence_with_channel_coverage` in this module, which is crate-visible
+/// rather than re-exported because only this crate's own owner-bound port has a
+/// report to supply.
 pub fn capture_fence(
     header: &WatchdogSpoolHeader,
     entries: &[WatchdogSpoolEntry],
     high_water: u64,
     params: &CaptureFenceParams,
 ) -> Result<WatchdogSpoolFence, SpoolError> {
+    capture_fence_with_channel_coverage(header, entries, high_water, params, None)
+}
+
+/// Captures one bounded coherent fence together with this owner's published
+/// I8.2 channel coverage.
+///
+/// Identical to [`capture_fence`] in every retained-record respect. The
+/// supplied report is the second, independent coverage dimension and never a
+/// replacement for the denominator: the denominator is the exact retained-record
+/// count and its marker subset, the report is what the sensor map says was
+/// observed, and the two are validated independently. `None` is retained as
+/// unknown coverage, never as complete coverage.
+///
+/// The channel coverage is deliberately **not** part of the content digest,
+/// which stays derived from the retained entries alone. It is re-derived from
+/// its own samples by [`IntervalCoverageReport::validate`] here, and again from
+/// the copy this fence holds every time [`read_page`] calls
+/// [`WatchdogSpoolFence::validate`], so a disposition that disagrees with the
+/// evidence it carries cannot reach a reader. That re-check is over an
+/// in-process value: the report has no serialization and is not stored, so a
+/// differing revision can never arrive from a persisted artifact.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Corrupt`] under every condition [`capture_fence`]
+/// documents, plus [`SpoolError::Corrupt`] when the supplied channel-coverage
+/// report is not consistent with the sensor map and its own observed classes.
+pub fn capture_fence_with_channel_coverage(
+    header: &WatchdogSpoolHeader,
+    entries: &[WatchdogSpoolEntry],
+    high_water: u64,
+    params: &CaptureFenceParams,
+    channel_coverage: Option<&IntervalCoverageReport>,
+) -> Result<WatchdogSpoolFence, SpoolError> {
     validate_header(header, entries)?;
     validate_high_water(header, entries, high_water)?;
     check_capture_params(params)?;
+    if let Some(report) = channel_coverage {
+        report.validate()?;
+    }
     if entries.is_empty() {
         return Err(SpoolError::Corrupt(
             "watchdog spool backup capture covers no retained entries; a bare record vector is not a fence"
@@ -1305,6 +1413,7 @@ pub fn capture_fence(
             gap_members,
             complete: gap_members == 0,
         },
+        channel_coverage: channel_coverage.cloned(),
         source_installation: params.source_installation.clone(),
         watchdog_generation: params.watchdog_generation,
         requester_principal: params.requester_principal.clone(),
