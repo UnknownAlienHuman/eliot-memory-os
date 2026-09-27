@@ -161,10 +161,13 @@ impl HostIdentityMonitor {
         let target = self
             .expected_registration
             .as_ref()
-            .map_or("unavailable", |registration| {
-                registration.request.service_name()
+            .map_or("unavailable".to_owned(), |registration| {
+                registration.request.service_name().to_owned()
             });
-        let generation = self.observed_generation.as_deref().unwrap_or("unavailable");
+        let generation = self
+            .observed_generation
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_owned());
         if self.require_image_lease
             && self.expected_image_lease.is_none()
             && let Some(expected_image) = self.expected_image.as_deref()
@@ -181,8 +184,8 @@ impl HostIdentityMonitor {
             tracing::debug!(
                 event = "watchdog.host_observed",
                 observation = "unknown",
-                target = target,
-                generation = generation,
+                target = target.as_str(),
+                generation = generation.as_str(),
                 "host image lease unavailable; observation stays unknown"
             );
             crate::diagnostics::observe_host_observation(HostObservationState::Unknown, false);
@@ -200,8 +203,8 @@ impl HostIdentityMonitor {
             tracing::debug!(
                 event = "watchdog.host_observed",
                 observation = crate::diagnostics::host_observation_diagnostic(observation.state),
-                target = target,
-                generation = generation,
+                target = target.as_str(),
+                generation = generation.as_str(),
                 "host observation reconciled without lifecycle authority"
             );
             return observation;
@@ -209,8 +212,8 @@ impl HostIdentityMonitor {
         tracing::debug!(
             event = "watchdog.host_observed",
             observation = "unknown",
-            target = target,
-            generation = generation,
+            target = target.as_str(),
+            generation = generation.as_str(),
             "no registration readback required; observation stays unknown"
         );
         crate::diagnostics::observe_host_observation(HostObservationState::Unknown, false);
