@@ -24,7 +24,11 @@ use crate::config::{MAX_METRIC_LABEL_CHARS, MAX_METRIC_LABELS, MAX_METRIC_SERIES
 /// drawn from an allowed key have bounded cardinality.
 pub const METRIC_LABEL_SCHEMA_VERSION: u32 = 1;
 
-const METRIC_LABEL_KEYS: [&str; 6] = [
+/// The complete label key set this exporter accepts, in schema order.
+///
+/// A record helper builds its label pairs from this list, so a published
+/// catalogue and the samples written from it cannot name different dimensions.
+pub const METRIC_LABEL_KEYS: [&str; 6] = [
     "binary",
     "module",
     "work_class",
