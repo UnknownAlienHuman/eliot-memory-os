@@ -11,8 +11,8 @@ use std::{cmp::Ordering, future::Future};
 use eliot_contracts::EpochId;
 use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
-    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolError, ProtocolPayload,
-    ProtocolRange, ProtocolVersion, ServerHello, negotiate,
+    ClientHello, EncodingProfile, EventEnvelope, Frame, FrameKind, MessageType, ProtocolError,
+    ProtocolPayload, ProtocolRange, ProtocolVersion, ServerHello, negotiate,
 };
 use eliot_runtime_contracts::{HealthDimension, ModuleGeneration, ModuleGenerationState};
 use thiserror::Error;
@@ -390,6 +390,48 @@ pub fn check_inline_response_ceiling(
         }));
     }
     Ok(())
+}
+
+/// Dispatches one lifecycle `Event` frame to its validated [`EventEnvelope`].
+///
+/// This is the canonical first step of a lifecycle-event receiver: the frame
+/// is validated, then the envelope is extracted either from the typed
+/// [`ProtocolPayload::Event`] variant or from the JSON-encoded envelope the
+/// Host producer emits, mirroring the protocol frame validation so the two
+/// can never disagree on what a lifecycle `Event` carries. Anything else —
+/// a non-`Event` kind/message or a payload that is not an envelope — is
+/// rejected explicitly and never interpreted as a generic command.
+///
+/// The returned envelope is validated but not staged: persistence,
+/// duplicate suppression, acknowledgement phases, and cursor advancement
+/// remain owned by the receiver's durable owner.
+///
+/// # Errors
+///
+/// Returns a protocol error for invalid frames, for JSON that does not
+/// encode an `EventEnvelope`, and for frames that are not lifecycle `Event`
+/// frames carrying an envelope.
+pub fn lifecycle_event_envelope(frame: &Frame) -> Result<EventEnvelope, TransportError> {
+    frame.validate()?;
+    match (frame.kind, frame.message_type, &frame.payload) {
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Event(envelope)) => {
+            Ok((**envelope).clone())
+        }
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Json(value)) => {
+            let envelope: EventEnvelope = serde_json::from_value(value.clone()).map_err(|_| {
+                TransportError::Protocol(ProtocolError::InvalidField {
+                    field: "payload",
+                    reason: "lifecycle Event JSON must encode an EventEnvelope",
+                })
+            })?;
+            envelope.validate()?;
+            Ok(envelope)
+        }
+        _ => Err(TransportError::Protocol(ProtocolError::InvalidField {
+            field: "kind/message_type",
+            reason: "lifecycle Event dispatch requires an Event frame carrying an EventEnvelope",
+        })),
+    }
 }
 
 /// Transport failures are deliberately distinct from application outcomes.
