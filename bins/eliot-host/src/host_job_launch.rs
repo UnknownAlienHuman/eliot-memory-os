@@ -22,7 +22,8 @@ use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, UserOwnedRootLease,
+    SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
+    observe_loopback_tcp_listener_owner,
 };
 
 #[cfg(windows)]
@@ -170,6 +171,49 @@ fn approved_launch_paths(
     // WORK_UNIT_CASE: 978/1 — approved paths admitted, distinct from rejection.
     host_launch_observe("host.launch approved paths admitted");
     Ok(())
+}
+
+/// Extracts the planned loopback TCP endpoint from the canonical Store
+/// arguments (the `--bind` flag). Returns `None` when the approved arguments
+/// carry no exact bind endpoint.
+///
+/// Issue #1775: the planned endpoint is persisted in the approved launch
+/// descriptor; this helper reads it back without inventing a default.
+#[cfg(windows)]
+pub(super) fn planned_store_endpoint(
+    canonical_store_arguments: &[PlatformHandle],
+) -> Option<std::net::SocketAddr> {
+    for window in canonical_store_arguments.windows(2) {
+        if window[0].as_str() == "--bind" {
+            if let Ok(addr) = window[1].as_str().parse::<std::net::SocketAddr>() {
+                if addr.port() != 0 {
+                    return Some(addr);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Observes whether one exact loopback TCP endpoint currently has a listener
+/// owner. Returns `Ok(Some(pid))` when a process owns the endpoint,
+/// `Ok(None)` when no exact listener exists, and a typed error when the
+/// owner cannot be determined.
+///
+/// Issue #1775: this is a read-only observation. It never kills, adopts, or
+/// reuses the occupying process. Inability to read the owner is not absence
+/// of a collision; the caller must fail closed.
+#[cfg(windows)]
+pub(super) fn store_endpoint_foreign_occupant(
+    endpoint: std::net::SocketAddr,
+) -> Result<Option<u32>, HostError> {
+    match observe_loopback_tcp_listener_owner(endpoint) {
+        Ok(observation) => Ok(Some(observation.process_id())),
+        Err(TcpListenerOwnerError::Missing) => Ok(None),
+        Err(error) => Err(HostError::ProcessContour(format!(
+            "planned Store endpoint owner observation failed: {error}"
+        ))),
+    }
 }
 
 /// Builds the exact Kernel child argv by injecting the Host-approved
@@ -699,6 +743,35 @@ impl HostJobBranches {
             &launch.kernel_arguments,
             &launch.doctor_executable_path,
         )?;
+        // Issue #1775: resolve collision before credential use. A foreign
+        // compatible SurrealDB listener occupying the planned endpoint is an
+        // observation/import candidate, never an implicit installation member.
+        // Record the collision and return a Recovery Directive; never kill,
+        // adopt, reuse, or attach a credential to the unidentified listener.
+        if let Some(endpoint) = planned_store_endpoint(&launch.canonical_store_arguments) {
+            match store_endpoint_foreign_occupant(endpoint) {
+                Ok(Some(occupant_pid)) => {
+                    // WORK_UNIT_CASE: 978/3 — foreign occupant preserved, never adopted.
+                    host_launch_observe("host.launch store endpoint collision observed");
+                    return Err(HostError::RecoveryRequired(format!(
+                        "planned Store endpoint {endpoint} is occupied by an unrelated process \
+                         (pid {occupant_pid}); the occupant is an observation/import candidate \
+                         only — select an alternate endpoint or perform an explicit read-only \
+                         import; no kill, adoption, reuse, or credential attachment was performed"
+                    )));
+                }
+                Ok(None) => {
+                    // The endpoint is free; the Store launch may proceed.
+                    host_launch_observe("host.launch store endpoint free");
+                }
+                Err(error) => {
+                    // Inability to read the endpoint owner is not absence of a
+                    // collision; fail closed before any credential-bearing launch.
+                    host_launch_observe("host.launch store endpoint owner unknown");
+                    return Err(error);
+                }
+            }
+        }
         let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(

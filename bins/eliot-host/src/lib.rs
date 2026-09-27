@@ -4402,6 +4402,31 @@ impl HostJobBranches {
         )?;
         let (_, store_working_directory) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
+        // Issue #1775: resolve collision before reconnect. A foreign
+        // compatible SurrealDB listener occupying the planned endpoint is an
+        // observation/import candidate, never an implicit installation member.
+        // Record the collision and return a Recovery Directive; never kill,
+        // adopt, reuse, or attach a credential to the unidentified listener.
+        if let Some(endpoint) =
+            host_job_launch::planned_store_endpoint(&launch.canonical_store_arguments)
+        {
+            match host_job_launch::store_endpoint_foreign_occupant(endpoint) {
+                Ok(Some(occupant_pid)) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "planned Store endpoint {endpoint} is occupied by an unrelated process \
+                         (pid {occupant_pid}); the occupant is an observation/import candidate \
+                         only — select an alternate endpoint or perform an explicit read-only \
+                         import; no kill, adoption, reuse, or credential attachment was performed"
+                    )));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // Inability to read the endpoint owner is not absence of a
+                    // collision; fail closed before any credential-bearing relaunch.
+                    return Err(error);
+                }
+            }
+        }
         let child = Self::launch(
             &executable,
             executable_lease,
