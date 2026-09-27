@@ -1166,11 +1166,24 @@ impl KernelComposition {
             .map(serde_json::from_value::<eliot_contracts::HostCorrelationProjection>)
             .transpose()
             .map_err(|_| TransportError::SessionFenced)?;
-        let stored = self
+        let stored = match self
             .generation_gateway
             .ors
             .load_host_request_by_logical_key(&key)
-            .map_err(|_| TransportError::SessionFenced)?;
+        {
+            Ok(stored) => stored,
+            // A retired key carries a tombstone instead of a link: answer the
+            // typed recovery limitation (issue #2571), mirroring the submit
+            // entry. Every other load failure stays fail-closed and generic.
+            Err(OrsError::HostRequestLegacyCorrelationUnresolved) => {
+                return Ok(host_request_resolve_unresolved_response(
+                    "legacy_correlation_unresolved",
+                    Some(&key),
+                    None,
+                ));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
         let Some(record) = stored else {
             return Ok(host_request_resolve_unresolved_response(
                 "absent",
