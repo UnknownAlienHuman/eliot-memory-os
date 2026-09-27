@@ -161,6 +161,7 @@ pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_comma
 pub use owner_closure_feed::{
     OwnerPublishPort, publish_owner_feed, synchronize_owner_feed,
     synchronize_owner_feed_with_canonical_receipts,
+    synchronize_owner_feed_with_quarantine_evidence,
 };
 pub use owner_closure_provider::{
     AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,

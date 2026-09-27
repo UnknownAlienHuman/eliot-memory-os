@@ -11,6 +11,7 @@ mod break_glass;
 mod effects;
 mod grants;
 mod leases;
+mod quarantine_evidence;
 mod revocation_history;
 mod root_transition;
 
@@ -46,6 +47,11 @@ pub use grants::{
     SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
+pub use quarantine_evidence::{
+    CrossRootQuarantineEvidence, QUARANTINE_EVIDENCE_OPERATION_KIND, QUARANTINE_EVIDENCE_SCHEMA,
+    QUARANTINE_EVIDENCE_VERSION, QuarantineDisposition, QuarantineEnforcementRef,
+    QuarantineEvidenceStatus, UnresolvedEffectDisposition, VerifiedQuarantineBinding,
+};
 pub use revocation_history::{
     GrantRestoreOutcome, RevocationHistoryError, RevocationHistoryEvidence, SuppressedGrant,
     SuppressionCause, ValidatedRevocationClosure,
@@ -80,6 +86,11 @@ pub enum AuthorityError {
     /// disposition. The named field says which readback clause refused, so a
     /// stale crossing is distinguishable from a malformed one.
     StaleTransitionEvidence(&'static str),
+    /// Quarantine evidence no longer matches CURRENT owner state: revoked,
+    /// stale, unreadable, or missing its durable receipt readback. The named
+    /// field says which readback clause refused, so a stale quarantine is
+    /// distinguishable from a malformed one.
+    StaleQuarantineEvidence(&'static str),
     InvalidLifecycleTransition,
     ReceiptMismatch,
     P07Unavailable,
@@ -116,6 +127,9 @@ impl fmt::Display for AuthorityError {
                 formatter,
                 "stale or uncommitted root-transition evidence: {field}"
             ),
+            Self::StaleQuarantineEvidence(field) => {
+                write!(formatter, "stale or unproven quarantine evidence: {field}")
+            }
             Self::InvalidLifecycleTransition => formatter.write_str("invalid lifecycle transition"),
             Self::ReceiptMismatch => {
                 formatter.write_str("effect receipt does not match authorization")

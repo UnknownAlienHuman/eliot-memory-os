@@ -23,6 +23,7 @@ use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
     OwnerPublishPort, synchronize_owner_feed, synchronize_owner_feed_with_canonical_receipts,
+    synchronize_owner_feed_with_quarantine_evidence,
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::scan_disclosure_owner::InstallationScanDisclosureStore;
@@ -36,8 +37,8 @@ use crate::{
     QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
 };
 use eliot_authority::{
-    GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
-    IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
+    CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
+    GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
     IntroductionStatus, P07AuthorityPort, P07PortError, RootTransitionActivationReceipt,
     RootTransitionActivationRequest,
 };
@@ -6696,6 +6697,43 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             max_records,
             expected_revision,
             canonical_receipts,
+        )
+        .await
+    }
+
+    /// Synchronizes the Kernel P-07 owner with canonical second-phase links
+    /// plus owner quarantine evidence records read from the durable
+    /// boundary. Absent evidence leaves the affected omissions explicitly
+    /// unresolved; it is never reconstructed here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, and quarantine evidence explicit"
+    )]
+    pub async fn synchronize_kernel_owner_with_quarantine_evidence<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &self,
+        reads: &R,
+        kernel: &K,
+        origin_refs: &[String],
+        max_records: u32,
+        expected_revision: u64,
+        canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+        quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+    ) -> Result<u64, CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let state_fence = self.snapshot.state_fence();
+        synchronize_owner_feed_with_quarantine_evidence(
+            reads,
+            kernel,
+            snapshot,
+            &state_fence,
+            origin_refs,
+            max_records,
+            expected_revision,
+            canonical_receipts,
+            quarantine_evidence,
         )
         .await
     }
