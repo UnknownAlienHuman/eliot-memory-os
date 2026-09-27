@@ -747,7 +747,7 @@ pub struct ReservedWriteReconciliation {
 /// [`ReservedWriteReconciliation::validate`], so unknown fields are rejected
 /// and an inconsistent value fails closed with a typed [`StoreError`]. The
 /// serialized shape is unchanged.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ReconciliationWire {
     operation_id: OperationId,
