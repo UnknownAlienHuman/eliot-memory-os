@@ -337,6 +337,7 @@ fn result_body_for(envelope: &HostRequestEnvelope) -> TestResult<HostRequestResu
         // attempt rides this vehicle. Submissions always carry the current
         // attempt, enforced by the Kernel legs.
         attempt: None,
+        lineage: None,
     };
     body.validate()
         .map_err(|error| format!("result body must validate: {error}"))?;

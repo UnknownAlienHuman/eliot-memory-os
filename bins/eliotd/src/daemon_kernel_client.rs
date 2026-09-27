@@ -2317,6 +2317,7 @@ impl DaemonKernelClient {
             result_digest: body_digest.to_owned(),
             response: body_response,
             attempt: Some(attempt),
+            lineage: None,
         };
         body.validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;

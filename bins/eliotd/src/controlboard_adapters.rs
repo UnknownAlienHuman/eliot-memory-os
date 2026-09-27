@@ -461,6 +461,7 @@ pub fn controlboard_result_body(
         result_digest: sha256_hex(&bytes),
         response,
         attempt: Some(attempt.clone()),
+        lineage: None,
     };
     body.validate().map_err(|error| {
         ControlBoardError::Provider(format!("controlboard result body shape: {error}"))
@@ -526,6 +527,7 @@ fn controlboard_unbound_refusal_body(
         result_digest,
         response,
         attempt: Some(attempt.clone()),
+        lineage: None,
     };
     // The gate is run, not assumed; its verdict is the one already observed
     // above and is adjudicated by the submit leg, not by this arm.

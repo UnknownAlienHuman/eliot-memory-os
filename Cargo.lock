@@ -2873,6 +2873,7 @@ dependencies = [
  "eliot-instrument-api",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "schemars",
  "serde",
  "serde_json",

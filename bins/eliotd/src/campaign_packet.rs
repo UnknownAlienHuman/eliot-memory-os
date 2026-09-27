@@ -1464,6 +1464,7 @@ fn campaign_packet_result_body(
         result_digest: sha256_hex(&response_bytes),
         response,
         attempt: Some(attempt.clone()),
+        lineage: None,
     };
     body.validate()
         .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;

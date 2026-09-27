@@ -978,6 +978,7 @@ impl KernelComposition {
                 response: body.clone(),
                 // Coherence gate only: stored rows predate attempt ownership.
                 attempt: None,
+                lineage: None,
             }
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2212,6 +2213,13 @@ impl KernelComposition {
             && stored.result_response.as_ref() == Some(&body.response)
         {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
+        }
+        if capability == "eliot.query" {
+            body.validate_local_read_submission()
+                .map_err(|_| TransportError::SessionFenced)?;
+        } else {
+            body.validate_for_submission()
+                .map_err(|_| TransportError::SessionFenced)?;
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return Err(TransportError::Timeout);
@@ -5947,6 +5955,7 @@ pub(crate) fn local_read_replay_response(
         response: body.clone(),
         // Replay readback only: stored rows predate attempt ownership.
         attempt: None,
+        lineage: None,
     }
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;
