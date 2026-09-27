@@ -67,14 +67,17 @@
 #   redacts credential/query/source/data canaries and never emits secrets.
 #   A sink/redaction failure keeps the original terminal state and owner.
 # - Stop proves receipt ownership (requested requestKey/endpoint/schemaDigest
-#   plus observed pid/nonce/endpoint binding) before signalling anything,
-#   then performs a bounded graceful phase and, only if needed,
-#   exact-owned-tree termination of the verified tree; never by name, port,
-#   or unverified PID. A stale or foreign receipt is refused without
-#   signalling any process.
+#   plus observed pid/nonce/endpoint/image/start-time binding) before
+#   signalling anything, then performs a bounded graceful phase and, only
+#   if needed, exact-owned-tree termination of the verified tree; never by
+#   name, port, or unverified PID. A stale or foreign receipt is refused
+#   without signalling any process, and forced termination is refused when
+#   the observed descendant closure is explicitly incomplete.
 # - VerifyCleanup checks the owner marker, process descendants, port, locks,
 #   secrets, and roots; it is idempotent and never deletes foreign state.
-#   Unresolved launch/stop/cleanup reconciliation blocks a clean verdict.
+#   Unbound process/port observers default to real observation, an
+#   explicitly incomplete descendant closure blocks a clean verdict, and
+#   unresolved launch/stop/cleanup reconciliation blocks a clean verdict.
 # - Any launch/stop/cleanup with a lost response retains owner identity in a
 #   reconciliation record under the owned run root (plus an in-memory
 #   backstop); no replacement instance starts until the record resolves.
@@ -1815,7 +1818,13 @@ function Invoke-StoreStop {
     if ($null -eq $ProcessController) {
         throw [System.ArgumentException]::new('STORE-MISSING-CONTROLLER: a process-controller seam is required.')
     }
+    $hasImage = ($observed.ContainsKey('imagePath') -and -not [string]::IsNullOrWhiteSpace([string]$observed['imagePath']))
+    $hasStart = ($observed.ContainsKey('startTimeUtc') -and -not [string]::IsNullOrWhiteSpace([string]$observed['startTimeUtc']))
+    if (-not $hasImage -or -not $hasStart) {
+        throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: start receipt carries no live-verifiable process identity.')
+    }
     $ownedTree = @($ownedPid)
+    $treeComplete = $true
     if ($null -ne $ProcessObserver) {
         $live = (& $ProcessObserver @{ pid = $ownedPid; runId = $runId })
         if ($null -eq $live -or $live -isnot [hashtable]) {
@@ -1824,12 +1833,10 @@ function Invoke-StoreStop {
         if ($live.ContainsKey('pid') -and ([int]$live['pid'] -ne $ownedPid)) {
             throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: stop observer returned a foreign pid.')
         }
-        $hasImage = ($observed.ContainsKey('imagePath') -and -not [string]::IsNullOrWhiteSpace([string]$observed['imagePath']))
-        $hasStart = ($observed.ContainsKey('startTimeUtc') -and -not [string]::IsNullOrWhiteSpace([string]$observed['startTimeUtc']))
-        if (-not $hasImage -or -not $hasStart) {
-            throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: start receipt carries no live-verifiable process identity.')
-        }
         [void](Test-StoreProcessOwnership -Pid $ownedPid -ExpectedImagePath ([string]$observed['imagePath']) -ExpectedStartTimeUtc ([string]$observed['startTimeUtc']) -Observation $live)
+        if ($live.ContainsKey('treeComplete') -and $null -ne $live['treeComplete']) {
+            $treeComplete = [bool]$live['treeComplete']
+        }
         if ($live.ContainsKey('descendants') -and $null -ne $live['descendants']) {
             foreach ($child in @($live['descendants'])) {
                 $childPid = 0
@@ -1884,6 +1891,9 @@ function Invoke-StoreStop {
             stopState = 'OwnedResourcesStopped'
             forced    = $false
         }
+    }
+    if (-not $treeComplete) {
+        throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: forced termination refused because the owned descendant closure is incomplete.')
     }
     try {
         $forced = (& $ProcessController @{ phase = 'forced'; pid = $ownedPid; runId = $runId; ownedTree = @($ownedTree) })
@@ -2001,10 +2011,14 @@ function Invoke-StoreVerifyCleanup {
     if ($null -ne $StartReceipt['observed'] -and $StartReceipt['observed'] -is [hashtable] -and $StartReceipt['observed'].ContainsKey('pid')) {
         try { $ownedPid = [int]$StartReceipt['observed']['pid'] } catch { $ownedPid = 0 }
     }
-    if ($null -ne $ProcessObserver -and $ownedPid -gt 0) {
+    $verifyProcessObserver = $ProcessObserver
+    if ($null -eq $verifyProcessObserver) {
+        $verifyProcessObserver = New-StoreDefaultProcessObserver
+    }
+    if ($ownedPid -gt 0) {
         $process = $null
         try {
-            $process = (& $ProcessObserver @{ pid = $ownedPid; runId = $runId })
+            $process = (& $verifyProcessObserver @{ pid = $ownedPid; runId = $runId })
         } catch {
             if ($_.Exception.Message -match '(?i)lost-response|timeout|unknown') {
                 [void]$failures.Add('process-observer-unknown')
@@ -2025,26 +2039,31 @@ function Invoke-StoreVerifyCleanup {
                     [void]$failures.Add(('descendants-remaining:' + $descendants.Count))
                 }
             }
+            if ($process.ContainsKey('treeComplete') -and $null -ne $process['treeComplete'] -and -not [bool]$process['treeComplete']) {
+                [void]$failures.Add('descendant-closure-incomplete')
+            }
         }
     }
-    if ($null -ne $PortObserver) {
-        $port = $null
-        try {
-            $port = (& $PortObserver @{ endpoint = [string]$Allocation['endpoint']; runId = $runId })
-        } catch {
-            if ($_.Exception.Message -match '(?i)lost-response|timeout|unknown') {
-                [void]$failures.Add('port-observer-unknown')
-            } else {
-                [void]$failures.Add('port-observer-failed')
-            }
+    $verifyPortObserver = $PortObserver
+    if ($null -eq $verifyPortObserver) {
+        $verifyPortObserver = New-StoreDefaultPortObserver
+    }
+    $port = $null
+    try {
+        $port = (& $verifyPortObserver @{ endpoint = [string]$Allocation['endpoint']; runId = $runId })
+    } catch {
+        if ($_.Exception.Message -match '(?i)lost-response|timeout|unknown') {
+            [void]$failures.Add('port-observer-unknown')
+        } else {
+            [void]$failures.Add('port-observer-failed')
         }
-        if ($null -ne $port -and $port -is [hashtable]) {
-            if ($port.ContainsKey('endpoint') -and ([string]$port['endpoint'] -cne [string]$Allocation['endpoint'])) {
-                throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: cleanup port observer returned a foreign endpoint.')
-            }
-            if ($port.ContainsKey('open') -and [bool]$port['open']) {
-                [void]$failures.Add('port-still-open')
-            }
+    }
+    if ($null -ne $port -and $port -is [hashtable]) {
+        if ($port.ContainsKey('endpoint') -and ([string]$port['endpoint'] -cne [string]$Allocation['endpoint'])) {
+            throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: cleanup port observer returned a foreign endpoint.')
+        }
+        if ($port.ContainsKey('open') -and [bool]$port['open']) {
+            [void]$failures.Add('port-still-open')
         }
     }
     if ($null -ne $FileProbe) {
