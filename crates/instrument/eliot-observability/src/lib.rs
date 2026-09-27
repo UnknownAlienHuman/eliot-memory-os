@@ -14,10 +14,10 @@ pub mod influence;
 
 pub use cost_profile::{
     BlindInterval, CaptureMode, CompleteEvidenceCoverage, PartialCaptureEvidence,
-    QUALIFICATION_EXPIRY_MS, QualificationExpiry, SamplingRate, TelemetryBoundary,
-    TelemetryCostProfile, TelemetryCoverage, TelemetryImpactClass, TelemetryKillCondition,
-    cost_profile_for, cost_profile_inventory, cost_profiles_for, enforce_capture_mode,
-    validate_cost_profile_inventory,
+    QUALIFICATION_EXPIRY_MS, QualificationExpiry, RouteTelemetryConfiguration, SamplingRate,
+    TelemetryBoundary, TelemetryCostProfile, TelemetryCoverage, TelemetryImpactClass,
+    TelemetryKillCondition, cost_profile_for, cost_profile_inventory, cost_profiles_for,
+    enforce_capture_mode, validate_cost_profile_inventory,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -915,6 +915,9 @@ impl ObservabilitySnapshot {
 #[derive(Clone, Debug)]
 pub struct ObservabilityBuffer {
     limits: BufferLimits,
+    /// The capture configuration resolved for the route this facade collects
+    /// for; `None` only for a facade built without a route.
+    telemetry: Option<RouteTelemetryConfiguration>,
     events: BTreeMap<String, (String, OperationalEvent)>,
     metrics: BTreeMap<String, (String, MetricSample)>,
     gaps: BTreeMap<String, ObservabilityGap>,
@@ -926,27 +929,42 @@ impl ObservabilityBuffer {
         limits.validate()?;
         Ok(Self {
             limits,
+            telemetry: None,
             events: BTreeMap::new(),
             metrics: BTreeMap::new(),
             gaps: BTreeMap::new(),
         })
     }
 
-    /// Creates a bounded projection only after the published telemetry cost
-    /// profiles are re-justified for the route about to run.
+    /// Creates a bounded projection for `route_ref` only after the published
+    /// telemetry cost profiles are re-justified for that route.
     ///
-    /// A route that cannot justify its capture configuration gets a typed
-    /// rejection instead of a facade that silently collects past its
-    /// qualification.
+    /// The route's resolved capture configuration is retained, so the facade
+    /// reports the capture mode in force at every governed boundary instead of
+    /// only admitting that one was checked. A route that cannot justify its
+    /// collection gets a typed rejection instead of a facade that silently
+    /// collects past its qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RouteTelemetryConfiguration::new_for_route`] refusal, or
+    /// [`ObservabilityError::InvalidField`] for non-positive bounded capacities.
     pub fn new_for_route(
         limits: BufferLimits,
+        route_ref: impl Into<String>,
         observed_at_ms: i64,
     ) -> Result<Self, ObservabilityError> {
-        validate_cost_profile_inventory()?;
-        for boundary in TelemetryBoundary::all() {
-            cost_profile::enforce_capture_mode(boundary, observed_at_ms)?;
-        }
-        Self::new(limits)
+        let telemetry = RouteTelemetryConfiguration::new_for_route(route_ref, observed_at_ms)?;
+        let mut buffer = Self::new(limits)?;
+        buffer.telemetry = Some(telemetry);
+        Ok(buffer)
+    }
+
+    /// The capture configuration resolved for this facade's route, when it was
+    /// created for one.
+    #[must_use]
+    pub fn telemetry_configuration(&self) -> Option<&RouteTelemetryConfiguration> {
+        self.telemetry.as_ref()
     }
 
     /// Appends an event with idempotent replay and protected-capacity fencing.

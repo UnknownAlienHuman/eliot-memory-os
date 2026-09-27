@@ -19,7 +19,12 @@
 //!   [`CompleteEvidenceCoverage::new`] refuses every non-full mode.
 //!   [`TelemetryCoverage::reports_complete_coverage`] additionally requires the
 //!   declared mode to be [`CaptureMode::Full`], so a partial record cannot
-//!   report complete coverage even if its fields are forged.
+//!   report complete coverage even if its fields are forged;
+//! * [`RouteTelemetryConfiguration::new_for_route`] resolves both properties for
+//!   one active route, so inspecting a route's configuration shows full capture
+//!   for every full-evidence boundary and an explicit profile for every
+//!   optional diagnostic family, and refuses a route whose collection is no
+//!   longer justified.
 //!
 //! I16.11 stays visible: every rejection here is a typed
 //! [`ObservabilityError`] for the emitting route to record, never a silent
@@ -1300,4 +1305,142 @@ pub fn enforce_capture_mode(
         });
     }
     Ok(profile)
+}
+
+/// The resolved telemetry capture configuration in force for one route.
+///
+/// This is the object a route inspects to obtain the I16.9 fact and its limit at
+/// once: the profiles captured in full across the nine full-evidence
+/// boundaries, and the explicit profile of every optional diagnostic family,
+/// whose coverage states its sampling denominator or its blind interval and
+/// never reports complete coverage. Nothing here is a parallel ledger; the
+/// configuration resolves the published
+/// [`cost_profile_inventory`](cost_profile_inventory) through
+/// [`enforce_capture_mode`], so every guarantee it exposes is the guarantee the
+/// declared profile already carries.
+///
+/// I16.11 keeps the resolution visible: a route that cannot justify its
+/// collection is refused with a typed [`ObservabilityError`] instead of
+/// receiving a configuration that quietly drops a boundary. The configuration
+/// therefore exists only for a still-justified collection, which is what keeps
+/// the [`QualificationExpiry`] kill condition reachable from the route rather
+/// than from a declaration nobody consults.
+///
+/// It is resolved rather than configured: the constructor is the only way to
+/// obtain one, so the value is serializable for inspection but not
+/// deserializable, and no unchecked path can assert a coverage claim this type
+/// would have refused.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct RouteTelemetryConfiguration {
+    /// The route whose collection this configuration governs.
+    route_ref: String,
+    /// The full-evidence boundaries captured in full, in
+    /// [`TelemetryBoundary::all`] order.
+    full_evidence: Vec<TelemetryCostProfile>,
+    /// The optional diagnostic families, in [`TelemetryBoundary::all`] order.
+    optional_diagnostic: Vec<TelemetryCostProfile>,
+}
+
+impl RouteTelemetryConfiguration {
+    /// Resolves the capture configuration in force for `route_ref` at
+    /// `observed_at_ms`.
+    ///
+    /// The inventory is validated as a whole and then every governed boundary
+    /// is admitted through [`enforce_capture_mode`], which refuses a
+    /// full-evidence boundary that is not captured in full and a family past
+    /// its qualification expiry. On top of that this resolution refuses a
+    /// full-evidence boundary whose coverage record does not state complete
+    /// evidence, an optional family that reports complete coverage, and an
+    /// optional family that states neither its sampling denominator nor its
+    /// blind interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservabilityError::InvalidField`] for a blank route
+    /// reference, the inventory's own typed error when a published profile
+    /// disagrees with its declaration,
+    /// [`ObservabilityError::IncompleteCriticalEvidence`] when a full-evidence
+    /// boundary would not retain complete evidence,
+    /// [`ObservabilityError::QualificationExpired`] when a family is past its
+    /// qualification expiry, [`ObservabilityError::CoverageOverstated`] when an
+    /// optional family reports complete coverage, and
+    /// [`ObservabilityError::InvalidField`] when an optional family states
+    /// neither a sampling denominator nor a blind interval.
+    pub fn new_for_route(
+        route_ref: impl Into<String>,
+        observed_at_ms: i64,
+    ) -> Result<Self, ObservabilityError> {
+        let route_ref = route_ref.into();
+        text(&route_ref, "route_telemetry_configuration.route_ref")?;
+        validate_cost_profile_inventory()?;
+        let mut configuration = Self {
+            route_ref,
+            full_evidence: Vec::new(),
+            optional_diagnostic: Vec::new(),
+        };
+        for boundary in TelemetryBoundary::all() {
+            let profile = enforce_capture_mode(boundary, observed_at_ms)?;
+            if boundary.requires_full_evidence() {
+                if !profile.reports_complete_coverage() {
+                    return Err(ObservabilityError::IncompleteCriticalEvidence {
+                        family: profile.family,
+                    });
+                }
+                configuration.full_evidence.push(profile);
+                continue;
+            }
+            if profile.reports_complete_coverage() {
+                return Err(ObservabilityError::CoverageOverstated);
+            }
+            if !profile.states_bounded_coverage() {
+                return Err(ObservabilityError::InvalidField {
+                    field: "route_telemetry_configuration.optional_coverage",
+                    reason: "an optional family must state its sampling denominator or blind interval",
+                });
+            }
+            configuration.optional_diagnostic.push(profile);
+        }
+        Ok(configuration)
+    }
+
+    /// The route whose collection this configuration governs.
+    #[must_use]
+    pub fn route_ref(&self) -> &str {
+        &self.route_ref
+    }
+
+    /// The profiles captured in full across the full-evidence boundaries, in
+    /// [`TelemetryBoundary::all`] order.
+    #[must_use]
+    pub fn full_evidence_profiles(&self) -> &[TelemetryCostProfile] {
+        &self.full_evidence
+    }
+
+    /// The explicit profile of every optional diagnostic family, in
+    /// [`TelemetryBoundary::all`] order.
+    #[must_use]
+    pub fn optional_diagnostic_profiles(&self) -> &[TelemetryCostProfile] {
+        &self.optional_diagnostic
+    }
+
+    /// The profile governing `boundary` in this route, when the boundary is on
+    /// the path.
+    #[must_use]
+    pub fn profile_for(&self, boundary: TelemetryBoundary) -> Option<&TelemetryCostProfile> {
+        self.full_evidence
+            .iter()
+            .chain(&self.optional_diagnostic)
+            .find(|profile| profile.boundary == boundary)
+    }
+
+    /// Whether this route's collection is past the qualification expiry at
+    /// `observed_at_ms`, at which point each profile's declared
+    /// [`TelemetryKillCondition`] applies.
+    #[must_use]
+    pub fn is_expired(&self, observed_at_ms: i64) -> bool {
+        self.full_evidence
+            .iter()
+            .chain(&self.optional_diagnostic)
+            .any(|profile| profile.is_expired(observed_at_ms))
+    }
 }
