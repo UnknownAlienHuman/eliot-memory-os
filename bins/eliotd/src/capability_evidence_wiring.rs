@@ -5,16 +5,12 @@
 //! daemon composition root's handle on that view. The single
 //! [`GovernorCapabilityAdmission`] is constructed empty at
 //! [`DaemonComposition::start`](super::DaemonComposition::start) and is
-//! mutated in production at exactly two sites, both non-test:
-//!
-//! 1. [`GovernorCapabilityAdmission::hydrate_from_evidence_response`], reached
-//!    from the daemon's live Skill-intake commit step
-//!    ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)), which
-//!    applies the canonical `GetCapabilityEvidenceState` response that same
-//!    intake already read;
-//! 2. [`GovernorCapabilityAdmission::apply_scope_change`], reached from
-//!    [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//!    with the route scope the caller observed.
+//! mutated in production at exactly ONE site:
+//! [`GovernorCapabilityAdmission::hydrate_from_evidence_response`], reached
+//! from the daemon's live Skill-intake commit step
+//! ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)), which
+//! applies the canonical `GetCapabilityEvidenceState` response that same
+//! intake already read.
 //!
 //! No semantic rule lives here; every admission decision is the Governor
 //! registry's.
@@ -31,21 +27,16 @@
 //! constructed in production by `daemon_runtime::attach_dreamer_model`
 //! through [`DaemonComposition::dreamer_model`](super::DaemonComposition::dreamer_model).
 //!
-//! The daemon route gate
-//! ([`AgentFabric::require_model_route`](super::agent_fabric::AgentFabric::require_model_route))
-//! is a second, distinct consumer of the same predicate, reached through
-//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//! from [`DaemonComposition::drive_verified_agent_fabric`](super::DaemonComposition::drive_verified_agent_fabric).
-//! Its refusal is the typed [`FabricError::NoRoute`](super::agent_fabric::FabricError::NoRoute)
-//! residual; it never falls back to a local route.
-//!
-//! Residual STITCH, measured and not papered over:
-//! `drive_verified_agent_fabric` itself has no in-crate caller, and the
-//! production B-MOD model-registry port (`ProductionModelRegistryPort`) reports
-//! `PortBindingState::Missing`, so a production route resolution cannot succeed
-//! in this crate at all. The gate is therefore reachable only once its
-//! per-operation executor binds that driver; the driver seam lives outside
-//! `bins/eliotd`, and no composition method here invents a caller for it.
+//! [`AgentFabric::require_model_route`](super::agent_fabric::AgentFabric::require_model_route)
+//! is NOT that gate and this module does not claim it is. It has no in-crate
+//! production caller on this base: its only would-be caller,
+//! [`DaemonComposition::drive_verified_agent_fabric`](super::DaemonComposition::drive_verified_agent_fabric),
+//! itself has none, and the production B-MOD model-registry port
+//! (`ProductionModelRegistryPort`) reports `PortBindingState::Missing`, so a
+//! production route resolution cannot succeed in this crate at all. The gate
+//! is therefore reachable only once its per-operation executor binds that
+//! driver; the driver seam lives outside `bins/eliotd`, and no composition
+//! method here invents a caller for it.
 //!
 //! Evidence bridge: `GetCapabilityEvidenceState` is the existing canonical
 //! read for capability evidence (selected by exact `skill_id` +
@@ -79,17 +70,26 @@
 //! production route; it is never treated as a pass, and never as "nothing to
 //! check".
 //!
-//! Staleness is derived, never persisted, and it is applied on the observed
-//! route. A changed runtime hash, adapter hash, provider/model/auth route,
-//! serializer, or feature-flag scope stops admitting on two independent
-//! grounds: [`admit_production_route`](Self::admit_production_route) compares
-//! the observed scope against each record's fingerprint by exact value, so a
-//! record that no longer matches cannot authorize the changed route; and
-//! [`apply_scope_change`](Self::apply_scope_change), called by
-//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
-//! with the caller-observed scope, moves every record that differs from that
-//! observation into the registry's invalidation set. Either way the exact route
-//! must be re-probed before it authorizes production work again.
+//! Staleness is DERIVED, never persisted, and this module applies no
+//! invalidation pass of its own. A changed runtime hash, adapter hash,
+//! provider/model/auth route, serializer, or feature-flag scope stops
+//! admitting through exact-fingerprint comparison alone:
+//! [`admit_production_route`](Self::admit_production_route) requires a retained
+//! record whose `scope_fingerprint` equals the observed scope by exact value,
+//! so a record taken against a different adapter hash or serializer can no
+//! longer authorize the changed route, and the exact route must be re-probed
+//! first. No production site in `bins/eliotd` observes a dependency change to
+//! report, so none invents one.
+//!
+//! [`apply_scope_change`](Self::apply_scope_change) remains the registry's own
+//! facility for a caller that can attribute a change to a narrowed
+//! [`ScopeDependencySelector`], and it is not invoked from any production site
+//! in this crate. It is deliberately not used as a general "narrow to the
+//! current route" operation: the registry inserts every record whose fingerprint
+//! differs from the supplied scope into a growing `invalidated_scopes` set that
+//! a later matching record does not revive, so passing an observed route scope
+//! as the "current" scope would permanently invalidate still-valid evidence for
+//! every other account and route.
 
 use std::collections::BTreeMap;
 
