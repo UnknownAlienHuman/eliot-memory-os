@@ -16,40 +16,19 @@
 //!
 //! State: fallback is signed Watchdog-envelope verification only and owns no
 //! canonical state or repair authority. The one-shot ledger durability and
-//! compare-and-swap lives in `lib.rs`; this module owns only declaration
-//! parsing, validation, and digest helpers.
+//! compare-and-swap lives in `lib.rs`; this module owns protected declaration
+//! loading and digest helpers. Parsing and validation use eliot-notify-core.
 
-use std::path::Path;
-
-use ed25519_dalek::VerifyingKey;
-use eliot_platform::{PlatformHandle, PortError, ProviderError, ProviderErrorCode};
+pub(crate) use eliot_notify_core::{
+    FallbackVerificationDeclaration, decode_fallback_key_hex as decode_hex,
+    validate_fallback_declaration,
+};
+use eliot_platform::{PortError, ProviderError, ProviderErrorCode};
 use eliot_platform_windows::{ProtectedPathLease, protected_program_data_path};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::NotifyBuildError;
 use crate::{FALLBACK_BYTES_LIMIT, FALLBACK_VERIFIER_RELATIVE};
-use crate::{WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN};
-
-/// Installer-pinned public material for the separately registered X-01 route.
-/// The private signing key is never persisted here or accepted from the user
-/// process. The protected declaration binds the public key to one installation,
-/// audience, authority epoch, algorithm, key id and signature domain.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FallbackVerificationDeclaration {
-    pub(crate) installation_identity: PlatformHandle,
-    pub(crate) audience: PlatformHandle,
-    pub(crate) authority_epoch: u64,
-    pub(crate) algorithm: String,
-    pub(crate) key_id: PlatformHandle,
-    pub(crate) domain: String,
-    pub(crate) public_key: String,
-    pub(crate) notify_executable: String,
-    pub(crate) notify_artifact_sha256: String,
-    pub(crate) interactive_user_sid: String,
-    pub(crate) interactive_session_id: u32,
-}
 
 pub(crate) struct FallbackMaterial {
     pub(crate) declaration: FallbackVerificationDeclaration,
@@ -96,73 +75,6 @@ pub(crate) fn fallback_provider_error(code: ProviderErrorCode) -> PortError {
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-pub(crate) fn decode_hex(value: &str, expected_bytes: usize) -> Option<Vec<u8>> {
-    if value.len() != expected_bytes.checked_mul(2)?
-        || value
-            .bytes()
-            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
-    {
-        return None;
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = u8::try_from((pair[0] as char).to_digit(16)?).ok()?;
-            let low = u8::try_from((pair[1] as char).to_digit(16)?).ok()?;
-            Some((high << 4) | low)
-        })
-        .collect()
-}
-
-pub(crate) fn validate_fallback_declaration(
-    declaration: &FallbackVerificationDeclaration,
-) -> Result<(), String> {
-    if declaration.authority_epoch == 0
-        || declaration.installation_identity.as_str().trim().is_empty()
-        || declaration.audience.as_str().trim().is_empty()
-        || declaration.key_id.as_str().trim().is_empty()
-        || declaration.algorithm != WATCHDOG_SIGNATURE_ALGORITHM
-        || declaration.domain != WATCHDOG_SIGNATURE_DOMAIN
-        || declaration.public_key.len() != 64
-        || !declaration
-            .public_key
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || !Path::new(&declaration.notify_executable).is_absolute()
-        || !valid_sha256(&declaration.notify_artifact_sha256)
-        || !valid_sid(&declaration.interactive_user_sid)
-        || declaration.interactive_session_id == 0
-    {
-        return Err("watchdog verification declaration is invalid".to_owned());
-    }
-    let bytes = decode_hex(&declaration.public_key, 32)
-        .ok_or_else(|| "watchdog public key is not valid hex".to_owned())?;
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| "watchdog public key has the wrong length".to_owned())?;
-    VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|error| format!("watchdog public key is invalid: {error}"))?;
-    Ok(())
-}
-
-pub(crate) fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-pub(crate) fn valid_sid(value: &str) -> bool {
-    value.strip_prefix("S-1-").is_some_and(|tail| {
-        !tail.is_empty()
-            && tail.len() <= 180
-            && tail
-                .chars()
-                .all(|character| character.is_ascii_digit() || character == '-')
-    })
 }
 
 pub(crate) fn load_fallback_material() -> Result<FallbackMaterial, NotifyBuildError> {

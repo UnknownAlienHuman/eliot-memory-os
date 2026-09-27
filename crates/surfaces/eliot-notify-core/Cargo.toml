@@ -7,6 +7,7 @@ license.workspace = true
 description = "A-10 role-filtered one-shot notification delivery core"
 
 [dependencies]
+ed25519-dalek.workspace = true
 eliot-config.workspace = true
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
