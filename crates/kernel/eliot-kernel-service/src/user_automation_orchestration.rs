@@ -40,7 +40,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::user_automation_execution::UserAutomationWakePublication;
+use super::user_automation_execution::{
+    UserAutomationWakeHorizonPublication, UserAutomationWakePublication,
+};
 
 /// Domain separator of one derived runtime-obligation identity.
 const OBLIGATION_IDENTITY_DOMAIN: &str = "eliot.user_automation.runtime-obligation.v1";
@@ -106,6 +108,11 @@ pub enum UserAutomationRuntimeObligationAnswer {
     /// Exact acknowledgement the schedule owner returned for the bounded
     /// horizon publication of one immutable revision.
     WakeHorizonPublication {
+        /// Exact request retained with the owner acknowledgement. Missing
+        /// values are accepted only while decoding legacy records, then rejected
+        /// by validation because they cannot bind the answer to its request.
+        #[serde(default)]
+        publication_request: Option<Box<UserAutomationWakeHorizonPublication>>,
         /// The owner's own acknowledgement, retained verbatim.
         acknowledgement: Box<UserAutomationWakePublication>,
     },
@@ -114,6 +121,74 @@ pub enum UserAutomationRuntimeObligationAnswer {
         /// The owner's own cancelled wake identities, retained verbatim.
         cancelled_wake_ids: Vec<String>,
     },
+}
+
+impl UserAutomationRuntimeObligationAnswer {
+    /// Validates a retained horizon answer against the exact request expected
+    /// by the caller. The request's original clock observation is retained but
+    /// may differ from a replay's fresh observation; every other request field
+    /// that binds identity, authority, revision, slice, or effects must match.
+    pub fn validate_horizon_for(
+        &self,
+        expected: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), UserAutomationOrchestrationError> {
+        let (retained, acknowledgement) = match self {
+            Self::WakeHorizonPublication {
+                publication_request: Some(retained),
+                acknowledgement,
+            } => (retained, acknowledgement),
+            Self::WakeHorizonPublication {
+                publication_request: None,
+                ..
+            } => return Err(UserAutomationOrchestrationError::MissingHorizonRequest),
+            _ => {
+                return Err(UserAutomationOrchestrationError::AnswerKindMismatch {
+                    kind: UserAutomationRuntimeObligationKind::WakeHorizonPublication.as_str(),
+                });
+            }
+        };
+
+        expected.validate().map_err(|error| {
+            UserAutomationOrchestrationError::InvalidHorizonRequest {
+                detail: error.to_string(),
+            }
+        })?;
+        if !same_horizon_request(retained, expected) {
+            return Err(UserAutomationOrchestrationError::HorizonRequestMismatch);
+        }
+        acknowledgement.validate_for(retained).map_err(|error| {
+            UserAutomationOrchestrationError::InvalidHorizonAnswer {
+                detail: error.to_string(),
+            }
+        })
+    }
+}
+
+/// Compares the immutable request content while allowing a replay to carry a
+/// fresh observation in `RequestMetadata::clock`.
+fn same_horizon_request(
+    retained: &UserAutomationWakeHorizonPublication,
+    expected: &UserAutomationWakeHorizonPublication,
+) -> bool {
+    let retained_context = &retained.context;
+    let expected_context = &expected.context;
+    retained_context.request_id == expected_context.request_id
+        && retained_context.session_id == expected_context.session_id
+        && retained_context.task_id == expected_context.task_id
+        && retained_context.product_id == expected_context.product_id
+        && retained_context.source_id == expected_context.source_id
+        && retained_context.state_fence == expected_context.state_fence
+        && retained.authenticated_principal == expected.authenticated_principal
+        && retained.identity == expected.identity
+        && retained.automation_id == expected.automation_id
+        && retained.automation_revision == expected.automation_revision
+        && retained.revision_digest == expected.revision_digest
+        && retained.state_fence == expected.state_fence
+        && retained.trigger == expected.trigger
+        && retained.denominator_occurrence_ids == expected.denominator_occurrence_ids
+        && retained.entries == expected.entries
+        && retained.only_unadmitted_future == expected.only_unadmitted_future
+        && retained.consumed_occurrence_id == expected.consumed_occurrence_id
 }
 
 /// Durable disposition of one retained runtime obligation.
@@ -321,7 +396,7 @@ impl UserAutomationOrchestrationRecord {
                     validate_text(reason, "orchestration.obligation.reason")?;
                 }
                 UserAutomationRuntimeObligationDisposition::Answered { answer } => {
-                    validate_answer(obligation.kind, answer, &obligation.subject_ids)?;
+                    validate_answer(self, obligation, answer)?;
                 }
             }
         }
@@ -332,42 +407,46 @@ impl UserAutomationOrchestrationRecord {
 /// Retained owner answer of one runtime obligation, bound to the obligation kind
 /// and to the exact subject identities it was issued for.
 fn validate_answer(
-    kind: UserAutomationRuntimeObligationKind,
+    record: &UserAutomationOrchestrationRecord,
+    obligation: &UserAutomationRuntimeObligation,
     answer: &UserAutomationRuntimeObligationAnswer,
-    subject_ids: &[String],
 ) -> Result<(), UserAutomationOrchestrationError> {
-    match (kind, answer) {
+    match (obligation.kind, answer) {
         (
             UserAutomationRuntimeObligationKind::WakeHorizonPublication,
-            UserAutomationRuntimeObligationAnswer::WakeHorizonPublication { acknowledgement },
+            UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+                publication_request: Some(publication_request),
+                ..
+            },
         ) => {
-            let accounted = acknowledgement
-                .acknowledged_occurrence_ids
-                .iter()
-                .chain(acknowledgement.remaining_occurrence_ids.iter())
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>();
-            // The retained answer may account for a strict subset of the exact
-            // requested slice, but it may never account for an occurrence this
-            // obligation never requested: that would be a different obligation's
-            // answer served under this identity.
-            if subject_ids
-                .iter()
-                .any(|subject| !accounted.contains(subject.as_str()))
+            answer.validate_horizon_for(publication_request)?;
+            let requested_occurrence_ids = publication_request.requested_occurrence_ids();
+            if publication_request.identity != record.parent
+                || publication_request.automation_id != record.automation_id
+                || publication_request.automation_revision != record.automation_revision
+                || publication_request.revision_digest != record.revision_digest
+                || publication_request.state_fence != record.state_fence
+                || publication_request.context.state_fence != record.state_fence
+                || requested_occurrence_ids.as_slice() != obligation.subject_ids.as_slice()
             {
-                return Err(UserAutomationOrchestrationError::AnswerOutsideObligation {
-                    kind: kind.as_str(),
-                });
+                return Err(UserAutomationOrchestrationError::HorizonRequestMismatch);
             }
             Ok(())
         }
+        (
+            UserAutomationRuntimeObligationKind::WakeHorizonPublication,
+            UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+                publication_request: None,
+                ..
+            },
+        ) => Err(UserAutomationOrchestrationError::MissingHorizonRequest),
         (
             UserAutomationRuntimeObligationKind::WakeCancellation,
             UserAutomationRuntimeObligationAnswer::WakeCancellation { cancelled_wake_ids },
         ) => {
             if cancelled_wake_ids.is_empty() {
                 return Err(UserAutomationOrchestrationError::EmptyCancellationAnswer {
-                    kind: kind.as_str(),
+                    kind: obligation.kind.as_str(),
                 });
             }
             let mut unique = BTreeSet::new();
@@ -603,12 +682,23 @@ pub enum UserAutomationOrchestrationError {
     /// A retained cancellation answer counts one wake identity twice.
     #[error("a retained cancellation answer must not count one wake identity twice")]
     DuplicateCancellationAnswer,
-    /// A retained answer accounts for an occurrence this obligation never
-    /// requested, so it belongs to a different obligation.
-    #[error("a retained {kind} answer accounts for an occurrence outside this obligation")]
-    AnswerOutsideObligation {
-        /// The offending obligation kind.
-        kind: &'static str,
+    /// A legacy retained horizon answer has no request to validate against.
+    #[error("a retained wake-horizon answer has no retained publication request")]
+    MissingHorizonRequest,
+    /// Retained request bindings differ from the current or outer durable request.
+    #[error("a retained wake-horizon request differs from its expected immutable bindings")]
+    HorizonRequestMismatch,
+    /// The current wake-horizon request did not satisfy its execution contract.
+    #[error("the expected wake-horizon publication request is invalid: {detail}")]
+    InvalidHorizonRequest {
+        /// Typed execution-contract validation failure.
+        detail: String,
+    },
+    /// The retained acknowledgement failed the schedule owner's request validator.
+    #[error("the retained wake-horizon acknowledgement is invalid: {detail}")]
+    InvalidHorizonAnswer {
+        /// Typed execution-contract validation failure.
+        detail: String,
     },
     /// A retained answer does not match the obligation kind it is filed under.
     #[error("a retained answer of another kind cannot answer this {kind} obligation")]
