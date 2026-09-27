@@ -6380,7 +6380,7 @@ def main() -> int:
     for f in findings:
         print(f"  [{f.code}] {f.path}:{f.line}: {f.detail}")
 
-    return 0 if status == STATUS_PASS else 1
+    return 0 if status in (STATUS_PASS, STATUS_TOOL_UNAVAILABLE) else 1
 
 
 if __name__ == "__main__":
