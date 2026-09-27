@@ -21,8 +21,8 @@ use eliot_kernel_service::semantic_store_config_hash_from_json;
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild, SuspendedLaunchSpec,
-    UserOwnedRootLease,
+    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
+    SuspendedLaunchSpec, UserOwnedRootLease,
 };
 
 #[cfg(windows)]
@@ -351,7 +351,30 @@ impl HostJobBranches {
             host_launch_observe("host.launch typed rejection");
             HostError::ProcessContour(error.to_string())
         })?;
-        let child = SuspendedJobChild::spawn_named(spec, identity.clone()).map_err(|error| {
+        // Issue #1888: this branch starts in its own Host-owned outer Job Object.
+        // The platform layer resolves the kill domain owner identity from that
+        // one Job Object name, so the record cannot disagree with the name and
+        // neither the Kernel nor the Watchdog launcher can present the other's
+        // outer Job Object; `CreateJobObjectW` additionally refuses an already
+        // open outer name, so two branches cannot share one kill domain. The
+        // child is created only after this build's launch probe has observed
+        // assignment, permitted nesting, and outer kill-on-close.
+        // `JobObjectLimits::default()` installs no CPU, memory, or process
+        // ceiling: this branch root carries no admitted manifest limit, and the
+        // launch must not invent one.
+        if !identity.is_host_outer_kill_domain_name() {
+            // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+            host_launch_observe("host.launch typed rejection");
+            return Err(HostError::ProcessContour(
+                "branch Job Object is not a Host-owned outer kill domain".to_owned(),
+            ));
+        }
+        let child = SuspendedJobChild::spawn_named_host_outer_kill_domain(
+            spec,
+            identity.clone(),
+            JobObjectLimits::default(),
+        )
+        .map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
             host_launch_observe("host.launch typed rejection");
             HostError::ProcessContour(error.to_string())
