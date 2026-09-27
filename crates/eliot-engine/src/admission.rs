@@ -1,10 +1,11 @@
 use crate::{CompletionGate, EngineError};
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_types::{
-    ClaimCardInput, CompletionStatus, EpistemicStatus, EvidenceAtomInput, FailureFingerprintInput,
-    IdempotencyOptions, LifecycleWriteOptions, MemoryWriteEnvelope, OperationId, RelationInput,
-    RelationType, SemanticCommand, SourceSnapshotInput, TaskContractInput, TaskContractStatus,
-    ToolObservationInput, UlArtifact, VerificationResult, VerificationRunInput, WriteRejectReason,
-    normalize_bindings,
+    ClaimCardInput, CommandContext, CompletionStatus, EpistemicStatus, EvidenceAtomInput,
+    FailureFingerprintInput, FailureRecordCommand, IdempotencyOptions, LifecycleWriteOptions,
+    MemoryWriteEnvelope, OperationId, RelationInput, RelationType, SemanticCommand,
+    SourceSnapshotInput, TaskContractInput, TaskContractStatus, ToolObservationInput, UlArtifact,
+    VerificationResult, VerificationRunInput, WriteRejectReason, normalize_bindings,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -638,4 +639,169 @@ where
 
 fn reject<T>(reason: &str) -> Result<T, EngineError> {
     Err(EngineError::WriteRejected(reason.to_owned()))
+}
+
+/// Canonical-import outcome for one published candidate-only bootstrap draft
+/// (issue #1854 W2).
+///
+/// The immutable draft stays `CANDIDATE_ONLY`; this value binds the exact
+/// draft content digest to the admitted canonical envelope. A governed import
+/// trigger turns the envelope identifiers into an explicit import receipt; a
+/// rejection never reaches this path because it performs no canonical write.
+#[derive(Clone, Debug)]
+pub struct BootstrapDraftImport {
+    /// Content digest of the reconciled immutable candidate draft.
+    pub draft_digest: String,
+    /// Canonical envelope admitted for the draft finding.
+    pub envelope: MemoryWriteEnvelope,
+}
+
+impl WriteAdmissionService {
+    /// Admits one published candidate-only bootstrap draft into canonical memory.
+    ///
+    /// `draft` is the published draft JSON value. The adapter fails closed
+    /// unless the draft carries a `CANDIDATE_ONLY` disposition and a content
+    /// digest that recomputes over its own bytes; the admitted `FailureRecord`
+    /// fingerprints that exact digest and preserves the finding fields
+    /// (source/runtime identity, owning functional cell, observed behavior,
+    /// discriminator, affected path, claim status) in its payload.
+    /// `context` is supplied by the governed importing owner and is never
+    /// invented here.
+    pub fn admit_bootstrap_draft(
+        &self,
+        draft: &Value,
+        context: CommandContext,
+    ) -> Result<BootstrapDraftImport, EngineError> {
+        let material = bootstrap_draft_import_material(draft)?;
+        let envelope = self.admit(&SemanticCommand::FailureRecord(FailureRecordCommand {
+            context,
+            fingerprint: material.fingerprint,
+            summary: material.summary,
+            payload: material.payload,
+        }))?;
+        Ok(BootstrapDraftImport {
+            draft_digest: material.draft_digest,
+            envelope,
+        })
+    }
+}
+
+struct BootstrapDraftImportMaterial {
+    draft_digest: String,
+    fingerprint: String,
+    summary: String,
+    payload: Value,
+}
+
+fn bootstrap_draft_import_material(
+    draft: &Value,
+) -> Result<BootstrapDraftImportMaterial, EngineError> {
+    let object = draft.as_object().ok_or_else(|| {
+        EngineError::WriteRejected("bootstrap draft must be a JSON object".to_owned())
+    })?;
+    let disposition = object
+        .get("import_disposition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            EngineError::WriteRejected(
+                "bootstrap draft import_disposition must be a string".to_owned(),
+            )
+        })?;
+    if disposition != "CANDIDATE_ONLY" {
+        return reject("bootstrap draft import requires a CANDIDATE_ONLY disposition");
+    }
+    let draft_digest = object
+        .get("canonical_digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            EngineError::WriteRejected(
+                "bootstrap draft canonical_digest must be a string".to_owned(),
+            )
+        })?;
+    reject_unless_hex_digest(draft_digest, "bootstrap draft canonical_digest")?;
+    let mut unsigned = draft.clone();
+    let unsigned_object = unsigned.as_object_mut().ok_or_else(|| {
+        EngineError::WriteRejected("bootstrap draft must be a JSON object".to_owned())
+    })?;
+    unsigned_object.insert("canonical_digest".to_owned(), Value::String(String::new()));
+    let bytes = canonical_json_bytes(&unsigned)?;
+    if sha256_hex(&bytes) != draft_digest {
+        return reject("bootstrap draft content digest does not match canonical_digest");
+    }
+    let finding = object
+        .get("finding")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            EngineError::WriteRejected("bootstrap draft finding must be an object".to_owned())
+        })?;
+    let cell = draft_member_text(finding, "owning_functional_cell")?;
+    let behavior = draft_member_text(finding, "observed_behavior")?;
+    let discriminator = draft_member_text(finding, "discriminator")?;
+    let affected_path = draft_member_text(finding, "affected_path")?;
+    let claim_status = draft_member_text(finding, "claim_status")?;
+    let runtime = finding
+        .get("runtime_identity")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            EngineError::WriteRejected(
+                "bootstrap draft runtime_identity must be an object".to_owned(),
+            )
+        })?;
+    let runtime_key = draft_member_text(runtime, "key")?;
+    let runtime_value = draft_member_text(runtime, "value")?;
+    let runtime_ref = draft_member_text(runtime, "evidence_ref")?;
+    let runtime_evaluation = draft_member_text(runtime, "evaluation")?;
+    let source_identity = draft_member_text(object, "source_identity")?;
+    let work_unit_id = draft_member_text(object, "work_unit_id")?;
+    Ok(BootstrapDraftImportMaterial {
+        draft_digest: draft_digest.to_owned(),
+        fingerprint: draft_digest.to_owned(),
+        summary: format!("bootstrap draft {draft_digest} [{cell}] {behavior}"),
+        payload: json!({
+            "bootstrap_draft": draft_digest,
+            "source_identity": source_identity,
+            "work_unit_id": work_unit_id,
+            "finding": {
+                "owning_functional_cell": cell,
+                "observed_behavior": behavior,
+                "discriminator": discriminator,
+                "affected_path": affected_path,
+                "claim_status": claim_status,
+                "runtime_identity": {
+                    "key": runtime_key,
+                    "value": runtime_value,
+                    "evidence_ref": runtime_ref,
+                    "evaluation": runtime_evaluation,
+                },
+            },
+        }),
+    })
+}
+
+fn draft_member_text(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<String, EngineError> {
+    let value = object.get(field).and_then(Value::as_str).ok_or_else(|| {
+        EngineError::WriteRejected(format!("bootstrap draft member {field} must be a string"))
+    })?;
+    if value.trim().is_empty() {
+        return Err(EngineError::WriteRejected(format!(
+            "bootstrap draft member {field} must be non-blank"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn reject_unless_hex_digest(value: &str, field: &str) -> Result<(), EngineError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(EngineError::WriteRejected(format!(
+            "{field} must be a lowercase 64-character hex digest"
+        )));
+    }
+    Ok(())
 }

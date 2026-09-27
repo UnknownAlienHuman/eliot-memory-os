@@ -1671,6 +1671,150 @@ macro_rules! draft_impl {
 draft_impl!(BootstrapFailureDraft);
 draft_impl!(BootstrapImprovementDraft);
 
+/// Explicit import/rejection receipt reconciling one immutable candidate-only
+/// bootstrap draft with its canonical outcome (Implementation I17.2).
+///
+/// A published draft stays `CANDIDATE_ONLY` forever: draft construction and
+/// validation refuse any other disposition, and publication is create-new with
+/// byte-exact readback. This separate artifact records that a governed owner
+/// imported the draft into canonical memory (`Imported`, bound to the exact
+/// canonical write) or explicitly rejected it (`Rejected`, with a reason).
+/// Filename presence never promotes a draft; only this receipt reconciles it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapDraftImportReceipt {
+    /// Content digest of the reconciled immutable candidate draft.
+    pub draft_digest: String,
+    /// Reconciliation outcome: `Imported` or `Rejected`, never `CandidateOnly`.
+    pub disposition: DraftImportDisposition,
+    /// Canonical input hash of the admitting write; present only on import.
+    pub canonical_input_hash: Option<String>,
+    /// Canonical write identity of the admitting write; present only on import.
+    pub canonical_write_id: Option<String>,
+    /// Explicit rejection reason; present only on rejection.
+    pub rejection_reason: Option<String>,
+    /// Content digest of this receipt with `receipt_digest` cleared.
+    pub receipt_digest: String,
+}
+
+impl BootstrapDraftImportReceipt {
+    /// Records the canonical import of one validated candidate-only draft.
+    ///
+    /// The caller is the governed importing owner: it must have validated the
+    /// draft as candidate-only with a matching content digest before calling.
+    /// This constructor records the supplied outcome; it does not perform the
+    /// import and grants no canonical authority by itself.
+    pub fn imported(
+        draft_digest: &str,
+        canonical_input_hash: &str,
+        canonical_write_id: &str,
+    ) -> Result<Self, BootstrapCompileError> {
+        let source = "bootstrap-draft-import-receipt".to_owned();
+        digest(draft_digest, source.clone(), "draft_digest")?;
+        digest(canonical_input_hash, source.clone(), "canonical_input_hash")?;
+        text(canonical_write_id, source, "canonical_write_id")?;
+        let mut receipt = Self {
+            draft_digest: draft_digest.to_owned(),
+            disposition: DraftImportDisposition::Imported,
+            canonical_input_hash: Some(canonical_input_hash.to_owned()),
+            canonical_write_id: Some(canonical_write_id.to_owned()),
+            rejection_reason: None,
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt_digest(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Records the explicit rejection of one validated candidate-only draft.
+    ///
+    /// The caller is the governed importing owner: it must have validated the
+    /// draft as candidate-only with a matching content digest before calling.
+    /// Rejection performs no canonical write, so no canonical reference is
+    /// accepted here.
+    pub fn rejected(draft_digest: &str, reason: &str) -> Result<Self, BootstrapCompileError> {
+        let source = "bootstrap-draft-import-receipt".to_owned();
+        digest(draft_digest, source.clone(), "draft_digest")?;
+        text(reason, source, "rejection_reason")?;
+        let mut receipt = Self {
+            draft_digest: draft_digest.to_owned(),
+            disposition: DraftImportDisposition::Rejected,
+            canonical_input_hash: None,
+            canonical_write_id: None,
+            rejection_reason: Some(reason.to_owned()),
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt_digest(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Validates field invariants and the receipt content digest.
+    pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+        let source = "bootstrap-draft-import-receipt".to_owned();
+        digest(&self.draft_digest, source.clone(), "draft_digest")?;
+        match self.disposition {
+            DraftImportDisposition::Imported => {
+                let input_hash = self.canonical_input_hash.as_deref().ok_or(
+                    BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "an imported receipt must bind the canonical input hash".to_owned(),
+                    },
+                )?;
+                digest(input_hash, source.clone(), "canonical_input_hash")?;
+                let write_id = self.canonical_write_id.as_deref().ok_or(
+                    BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "an imported receipt must bind the canonical write identity"
+                            .to_owned(),
+                    },
+                )?;
+                text(write_id, source.clone(), "canonical_write_id")?;
+                if self.rejection_reason.is_some() {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "an imported receipt must not carry a rejection reason".to_owned(),
+                    });
+                }
+            }
+            DraftImportDisposition::Rejected => {
+                let reason = self.rejection_reason.as_deref().ok_or(
+                    BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "a rejected receipt must carry an explicit reason".to_owned(),
+                    },
+                )?;
+                text(reason, source.clone(), "rejection_reason")?;
+                if self.canonical_input_hash.is_some() || self.canonical_write_id.is_some() {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "a rejected receipt must not bind a canonical write".to_owned(),
+                    });
+                }
+            }
+            DraftImportDisposition::CandidateOnly => {
+                return Err(BootstrapCompileError::ProviderValidation {
+                    provider: "bootstrap-draft-import-receipt",
+                    detail:
+                        "an import receipt must record Imported or Rejected, never CandidateOnly"
+                            .to_owned(),
+                });
+            }
+        }
+        digest(&self.receipt_digest, source, "receipt_digest")?;
+        if receipt_digest(self)? != self.receipt_digest {
+            return Err(BootstrapCompileError::DigestMismatch {
+                artifact: "bootstrap-draft-import-receipt",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn receipt_digest(value: &BootstrapDraftImportReceipt) -> Result<String, BootstrapCompileError> {
+    let mut unsigned = value.clone();
+    unsigned.receipt_digest.clear();
+    canonical_digest(&unsigned, "bootstrap-draft-import-receipt")
+}
+
 fn canonical_digest<T: Serialize>(
     value: &T,
     artifact: &'static str,
