@@ -22,8 +22,9 @@ use std::collections::BTreeMap;
 use eliot_contracts::{ContractVersion, StateFence};
 use eliot_research_exchange_api::{
     CancellationState, CompletionDisposition, ExchangeJobLedger, ExchangeJobLifecycleRecord,
-    GapContinuation, IdempotentResume, ResearchContractError, ResearchEvidenceBundle,
-    ResearchExportBundle, ResearchHeldSourceGap, ResearchQueryRequest,
+    ExternalKnowledgeFailure, ExternalKnowledgeStage, GapContinuation, IdempotentResume,
+    ResearchContractError, ResearchEvidenceBundle, ResearchExportBundle, ResearchHeldSourceGap,
+    ResearchQueryRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -146,12 +147,63 @@ pub enum ExchangeError {
     StaleFence,
     #[error("export is not permitted for this exchange")]
     ExportDenied,
+    /// The external-knowledge dependency failed at the stage this exchange
+    /// contacted it.
+    ///
+    /// I21.13: "provider unavailable -> declared coverage narrows; dependent
+    /// inquiry returns a typed gap", and I21.11 says Research "failure degrades
+    /// external knowledge only". So a bridge failure is reported as the outcome
+    /// the bridge proved, at the stage it happened, and never as a refusal of a
+    /// state transition: the transition was not what failed, and telling the
+    /// caller otherwise is how an unavailable source used to arrive as an
+    /// untyped execution failure.
+    ///
+    /// The failure is a closed value rather than a boxed source error, so this
+    /// variant still compares exactly and the retained cancellation receipt and
+    /// raw provider evidence behind a timeout or an unknown outcome stay with the
+    /// bridge error that holds them.
+    #[error("external knowledge dependency failed while {stage}: {failure}")]
+    ExternalKnowledge {
+        /// The stage at which the bridge was contacted.
+        stage: ExternalKnowledgeStage,
+        /// The outcome the bridge itself classified.
+        failure: ExternalKnowledgeFailure,
+    },
+    /// The provider answered with something that cannot be a job identity.
+    ///
+    /// The job id is this exchange's only key on a provider job, so an answer
+    /// that is blank or whitespace is a malformed provider answer, not a
+    /// transition this job refuses. Reporting it as a refusal stated something
+    /// about the state machine that the provider had in fact decided, and the
+    /// answer itself is deliberately not retained here.
+    #[error("provider answer is not a job identity")]
+    ProviderAnswerNotJobIdentity,
 }
 
+/// The replaceable external-knowledge dependency this exchange drives.
+///
+/// I21.11: "Research failure degrades external knowledge only." A bridge failure
+/// is therefore projected, never discarded: [`ResearchBridge::classify`] is a
+/// required method, so every implementor states which external-knowledge outcome
+/// each of its own errors proved and the exchange reports that outcome together
+/// with the stage it happened at. A default classification would be exactly the
+/// collapse this contract removes — it would let a timeout, an unavailable
+/// source, a crash and an unknown provider outcome reach the dependent inquiry
+/// as one undifferentiated value.
 pub trait ResearchBridge {
     type Error: std::error::Error + Send + Sync + 'static;
     fn submit(&mut self, request: &ResearchQueryRequest) -> Result<String, Self::Error>;
     fn cancel(&mut self, job_id: &str) -> Result<(), Self::Error>;
+
+    /// Projects this implementor's own error into the external-knowledge outcome
+    /// it proved.
+    ///
+    /// The implementation is expected to be a total, exhaustive match over
+    /// `Self::Error`, because a bridge whose error type distinguishes provider
+    /// outcomes must say which outcome each one is. A catch-all arm would
+    /// re-introduce the collapse, and an implementor that cannot tell its
+    /// outcomes apart should not expose an error type that pretends to.
+    fn classify(error: &Self::Error) -> ExternalKnowledgeFailure;
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -294,7 +346,11 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// A resumed key never re-contacts the bridge, so at most one provider job
     /// exists per identity. A resumed job is served only from a durable record
     /// that still validates, so a restored snapshot can never decode a drifted
-    /// record as a live job.
+    /// record as a live job. A genuinely new identity that reaches the bridge
+    /// and fails there is reported as
+    /// [`ExchangeError::ExternalKnowledge`] at
+    /// [`ExternalKnowledgeStage::Submit`], which owns no job identity, so a retry
+    /// of that key is admitted afresh rather than resumed.
     pub fn admit(
         &mut self,
         request: ResearchQueryRequest,
@@ -312,12 +368,18 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             existing.lifecycle.validate()?;
             return Ok(ExchangeAdmission::Resumed(existing.clone()));
         }
-        let job_id = self
-            .bridge
-            .submit(&request)
-            .map_err(|_| ExchangeError::InvalidTransition)?;
+        // A bridge failure is the external-knowledge dependency degrading, not
+        // this state machine refusing a transition, so the bridge's own
+        // classification and the stage it failed at are reported instead.
+        let job_id =
+            self.bridge
+                .submit(&request)
+                .map_err(|error| ExchangeError::ExternalKnowledge {
+                    stage: ExternalKnowledgeStage::Submit,
+                    failure: B::classify(&error),
+                })?;
         if job_id.trim().is_empty() {
-            return Err(ExchangeError::InvalidTransition);
+            return Err(ExchangeError::ProviderAnswerNotJobIdentity);
         }
         let job = ExchangeJob {
             exchange_id: request.exchange_id.clone(),
@@ -464,6 +526,23 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         Ok(job.clone())
     }
 
+    /// Requests cancellation of one job and records whether the bridge
+    /// confirmed it.
+    ///
+    /// The issued cancellation is recorded durably before the bridge is
+    /// contacted: an interruption in between leaves the job
+    /// cancellation-unconfirmed instead of decoding as a clean stop.
+    ///
+    /// # What a bridge failure leaves behind
+    ///
+    /// The durable record is already advanced when the bridge is contacted, so a
+    /// failure leaves exactly that: cancellation requested, confirmation absent.
+    /// The record is neither rolled back — the issued cancellation did happen —
+    /// nor advanced to a confirmed cancellation that never arrived. The failure
+    /// is reported as the external-knowledge outcome the bridge proved, at the
+    /// cancel stage, so a caller reconciles by the job identity it already owns
+    /// instead of reading a failed cancellation as either a refused transition
+    /// or a clean stop.
     pub fn cancel(
         &mut self,
         job_id: &str,
@@ -491,7 +570,10 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         job.status = ExchangeStatus::CancelRequested;
         self.bridge
             .cancel(job_id)
-            .map_err(|_| ExchangeError::InvalidTransition)?;
+            .map_err(|error| ExchangeError::ExternalKnowledge {
+                stage: ExternalKnowledgeStage::Cancel,
+                failure: B::classify(&error),
+            })?;
         let job = self
             .snapshot
             .jobs
