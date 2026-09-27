@@ -25,17 +25,25 @@
 //!   ([`DeclaredWorkItem::project`]). The emitted argv is a plain
 //!   `Vec<String>` and nothing is executed;
 //! * **one producer per (target root, fingerprint)** — the first real consumer
-//!   of the existing `SingleFlightBuildRegistry`. Waiters receive the
-//!   producer's raw evidence on success and on failure
-//!   ([`TargetRootBuildCoordinator`], [`ProducerOutcome`]);
+//!   of the existing `SingleFlightBuildRegistry`, held **once per target
+//!   root**, so the slot a flight occupies and the root it builds in are the
+//!   same identity by construction rather than by coincidence. Waiters receive
+//!   the producer's own raw evidence on success and on failure
+//!   ([`TargetRootBuildCoordinator`], [`ProducerOutcome`],
+//!   [`TargetRootBuildCoordinator::terminal_outcome`]);
 //! * **the refusal of an agent-originated `--workspace`/`--all`** (line 3),
 //!   with no override, because the projected route is the only admitted one
+//!   and the projected route is admitted only by presenting the real
+//!   [`ProjectedBuild`] it was emitted from
 //!   ([`restrict_agent_argv`], [`CargoOrigin`]);
 //! * **lineage separation and rebuild-on-unknown-identity**, both *derived*:
-//!   the target root and the single-flight key are
-//!   [`BuildFingerprint::digest`], so a different toolchain, feature set,
-//!   environment class, or candidate is already a different lineage, and
-//!   unknown cache identity is the existing `CacheLookup::Miss`
+//!   the last segment of the target root is
+//!   [`BuildFingerprint::digest`], and the single-flight key is that same
+//!   digest held in the registry of its own target root, so a different
+//!   toolchain, feature set, environment class, or candidate — or a different
+//!   worktree or build mode, which I2.22 places in the root path itself — is
+//!   already a different lineage with a different producer slot, and unknown
+//!   cache identity is the existing `CacheLookup::Miss`
 //!   ([`BuildCacheDecision`]). No second fingerprint, digest, or cache exists
 //!   here;
 //! * **cancellation evidence and quarantine** (line 36), plus a lineage- and
@@ -56,8 +64,17 @@
 //! 31 admits a second producer only when "exact tool evidence proves safe
 //! concurrency", and no such evidence type exists anywhere in the codebase, so
 //! one producer per target root is the rule with no escape hatch.
+//!
+//! Line 32 is what makes the per-root key load-bearing rather than redundant:
+//! target roots "follow I2.22", and I2.22 places the worktree id and the build
+//! mode *in the root path* while the fingerprint digest is its last segment.
+//! A [`BuildFingerprint`] carries no worktree id, so a digest alone cannot
+//! separate two work items that agree on every build input but sit in
+//! different worktrees. The coordinator therefore keys on the root, not on the
+//! digest alone; see [`TargetRootBuildCoordinator`].
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use eliot_build_test_graph::{
@@ -257,6 +274,11 @@ impl DeclaredWorkItem {
     /// toolchain, feature set, environment class, or candidate is already a
     /// different lineage (I18.26 lines 21-22).
     ///
+    /// The worktree id and the build mode are path segments of the root, not
+    /// members of the fingerprint, so this value is strictly more specific
+    /// than [`BuildFingerprint::digest`] and is the identity the coordinator
+    /// keys its producer slot on.
+    ///
     /// # Errors
     ///
     /// Returns [`BuildProjectionError::Lane`] when the lane cannot derive its
@@ -305,7 +327,8 @@ impl DeclaredWorkItem {
     ///
     /// This function executes nothing: the returned [`ProjectedBuild::argv`]
     /// is plain data, and the only route that admits it is
-    /// [`restrict_agent_argv`] with [`CargoOrigin::Projected`].
+    /// [`restrict_agent_argv`] presented with this very [`ProjectedBuild`] as
+    /// [`CargoOrigin::Projected`].
     ///
     /// # Errors
     ///
@@ -454,17 +477,23 @@ impl BuildCacheDecision {
 
 /// One claimed producer slot for a target root.
 ///
-/// A waiter learns which producer to await; it never learns a verdict.
+/// A waiter learns which producer to await; it never learns a verdict. The
+/// claim is the waiter's handle onto the flight: `target_root` and `lineage`
+/// together resolve the producer's own terminal outcome through
+/// [`TargetRootBuildCoordinator::terminal_outcome`], and they are the same
+/// identity the single-flight slot was keyed on, so `flight` can never name a
+/// producer that builds in a different root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProducerClaim {
-    /// Normalized [`BuildFingerprint::digest`]: the lineage that both the
-    /// target root and the single-flight key are derived from.
+    /// Normalized [`BuildFingerprint::digest`]: the lineage inside this claim's
+    /// target root, and the identity the recorded outcome is checked against.
     pub lineage: String,
     /// The work item that owns the producer slot.
     pub producer: String,
     /// Whether this claim is the producer itself or a waiter.
     pub flight: BuildFlight,
-    /// The governed target root the flight may build in.
+    /// The governed target root the flight may build in, and the root the
+    /// single-flight slot was taken from.
     pub target_root: PathBuf,
 }
 
@@ -572,8 +601,13 @@ pub enum ProducerOutcome {
 }
 
 impl ProducerOutcome {
-    /// The exact evidence every waiter of this flight receives, on both the
-    /// success and the failure path.
+    /// The exact evidence of this flight, on both the success and the failure
+    /// path.
+    ///
+    /// The same value is what a waiter resolves through
+    /// [`TargetRootBuildCoordinator::terminal_outcome`]; the producer reads it
+    /// here off the outcome it just closed, and a waiter reads it off the copy
+    /// the coordinator recorded for the flight.
     #[must_use]
     pub const fn evidence(&self) -> &RawEvidence {
         match self {
@@ -589,8 +623,8 @@ pub struct ProducerCompletion {
     pub lineage: String,
     /// Whether this call held the producer slot and released it.
     pub released: bool,
-    /// The producer's terminal state, including the raw evidence the waiters
-    /// receive.
+    /// The producer's terminal state. The same value is now recorded for the
+    /// flight and is what its waiters receive.
     pub outcome: ProducerOutcome,
 }
 
@@ -763,33 +797,89 @@ impl BuildCleanupPass {
     }
 }
 
+/// One closed producer flight, retained so the flight's waiters can resolve it.
+///
+/// The lineage is stored beside the outcome and re-checked on every read, so a
+/// resolution can never hand a claim evidence recorded for a different lineage
+/// that happens to share a target root.
+struct ClosedFlight {
+    lineage: String,
+    outcome: ProducerOutcome,
+}
+
 /// The one InstrumentRunner-controlled build projection.
 ///
 /// The coordinator owns two things and nothing else: the single-producer claim
 /// per (target root, fingerprint), and the refusal of unrestricted agent Cargo
 /// invocations. It creates no scheduler, no job, no queue, no budget, and no
 /// pre-emption engine; I18.26 line 63 keeps those elsewhere.
+///
+/// # Why the slot is keyed on the target root
+///
+/// `SingleFlightBuildRegistry` keys its own map on
+/// [`BuildFingerprint::digest`] and nothing else, and
+/// [`BuildFingerprint`] has no worktree-id member. But I2.22, which I18.26
+/// line 32 makes binding for target roots, puts the worktree id *and* the build
+/// mode in the root path:
+/// `%LOCALAPPDATA%\Eliot\build\<workspace-id>\<worktree-id>\<build-mode>\<fingerprint>`.
+/// A digest alone therefore cannot separate `wi-A` in `wt-1` from `wi-B` in
+/// `wt-2` when they agree on every build input, yet those two work items build
+/// in different directories and I10.8.4 requires one build-coordination owner
+/// per target root.
+///
+/// The coordinator consequently holds **one registry per target root**. Inside a
+/// root the registry still keys on the digest, which is the root's own last
+/// path segment, so the slot and the root are the same lineage identity by
+/// construction: a claim's `flight` can no longer name a producer that builds
+/// somewhere other than the claim's `target_root`. The registry type itself is
+/// untouched — it is reused exactly as [`SingleFlightBuildRegistry::claim`] and
+/// [`SingleFlightBuildRegistry::release`] already define it, and no second
+/// fingerprint, digest, or coordination primitive is introduced.
+///
+/// A registry exists only while its root has a live producer: releasing a
+/// flight drops the entry, because the next claim for that root must be free to
+/// become the producer. That is what bounds this map to *live* roots.
+///
+/// # Single-owner coordination
+///
+/// The state is behind a [`RefCell`], so a coordinator is single-owner and not
+/// `Sync`. That is the intended shape, not a limitation to work around: I10.8.4
+/// gives a target root exactly one build-coordination owner, and a second
+/// coordinator instance would be a second owner. Sharing a registry across roots
+/// was precisely the B-1 defect.
+#[derive(Default)]
 pub struct TargetRootBuildCoordinator {
-    registry: SingleFlightBuildRegistry,
+    /// One live producer slot per target root.
+    live: RefCell<BTreeMap<PathBuf, SingleFlightBuildRegistry>>,
+    /// The terminal outcome of the most recently closed flight per target root.
+    closed: RefCell<BTreeMap<PathBuf, ClosedFlight>>,
 }
 
 impl TargetRootBuildCoordinator {
-    /// Creates a coordinator over the existing single-flight registry.
+    /// Creates a coordinator with no live producer slots and no closed flights.
     #[must_use]
-    pub const fn new(registry: SingleFlightBuildRegistry) -> Self {
-        Self { registry }
+    pub const fn new() -> Self {
+        Self {
+            live: RefCell::new(BTreeMap::new()),
+            closed: RefCell::new(BTreeMap::new()),
+        }
     }
 
     /// Claims the producer slot for one work item, or returns the waiter's view
-    /// of the existing producer.
+    /// of the existing producer of that item's target root.
     ///
-    /// The claim is the existing `SingleFlightBuildRegistry`, keyed by
-    /// [`BuildFingerprint::digest`]. Because I2.22 already places that digest in
-    /// the target-root path, the single-flight key and the target root are the
-    /// same lineage identity: two work items that differ in toolchain, feature
-    /// set, environment class, or candidate are different lineages with
-    /// different producer slots (I18.26 lines 15-16 and 21-22), while identical
-    /// fingerprints share one producer and many waiters (line 15).
+    /// The slot is the existing `SingleFlightBuildRegistry`, held per target
+    /// root, so the key and the root are one identity (see the type docs). Two
+    /// work items that share a target root share one producer and the rest
+    /// become waiters (I18.26 line 15); two work items whose toolchain, feature
+    /// set, environment class, candidate, **worktree, or build mode** differ
+    /// resolve to different roots and are different lineages with independent
+    /// producer slots (lines 21-22, and I2.22).
+    ///
+    /// A claim granted [`BuildFlight::Producer`] also supersedes whatever this
+    /// root recorded before: the root has no live producer, so the previous
+    /// flight's artifacts are no longer what the root holds, and its recorded
+    /// outcome is dropped rather than served to a later reader.
     ///
     /// # Errors
     ///
@@ -806,9 +896,15 @@ impl TargetRootBuildCoordinator {
                 source,
             }
         })?;
-        let flight = self
-            .registry
-            .claim(&item.envelope.fingerprint, item.work_item_id.clone())?;
+        let flight = {
+            let mut live = self.live.borrow_mut();
+            let registry = live.entry(target_root.clone()).or_default();
+            let flight = registry.claim(&item.envelope.fingerprint, item.work_item_id.clone())?;
+            if matches!(flight, BuildFlight::Producer) {
+                self.closed.borrow_mut().remove(&target_root);
+            }
+            flight
+        };
         Ok(ProducerClaim {
             lineage,
             producer: item.work_item_id.clone(),
@@ -817,45 +913,91 @@ impl TargetRootBuildCoordinator {
         })
     }
 
-    /// Closes one producer flight and hands the waiters the producer's own
-    /// evidence.
+    /// Closes one producer flight, releases its slot, and records its outcome so
+    /// the flight's waiters can resolve the producer's own evidence.
     ///
     /// This is I18.26 line 34: a failed producer wakes waiters with the same
     /// evidence. Both arms of [`ProducerOutcome`] deliver the identical
-    /// `RawEvidence`, and nothing is retried here — line 35 rules out a silent
-    /// retry storm, so the decision to re-run stays with the owning work item.
+    /// `RawEvidence`, the same value the waiters read back through
+    /// [`TargetRootBuildCoordinator::terminal_outcome`]. Nothing is retried
+    /// here — line 35 rules out a silent retry storm, so the decision to re-run
+    /// stays with the owning work item.
     ///
     /// # Errors
     ///
     /// Returns [`BuildProjectionError::NotTheProducer`] when `item` does not
-    /// hold the flight, and the same declaration failures as
-    /// [`TargetRootBuildCoordinator::claim`] for a malformed lane.
+    /// hold a live flight of its target root, and the same declaration failures
+    /// as [`TargetRootBuildCoordinator::claim`] for a malformed lane.
     pub fn completion_wakeup(
         &self,
         item: &DeclaredWorkItem,
         outcome: ProducerOutcome,
     ) -> Result<ProducerCompletion, BuildProjectionError> {
         item.validate()?;
+        let target_root = item.target_root()?;
         let lineage = item.envelope.fingerprint.digest().map_err(|source| {
             BuildProjectionError::InvalidDigest {
                 field: "build_fingerprint",
                 source,
             }
         })?;
-        let released = self
-            .registry
-            .release(&item.envelope.fingerprint, &item.work_item_id)
-            .map_err(BuildProjectionError::SingleFlight)?;
+        let released = {
+            let mut live = self.live.borrow_mut();
+            let Some(registry) = live.get(&target_root) else {
+                return Err(BuildProjectionError::NotTheProducer {
+                    work_item_id: item.work_item_id.clone(),
+                });
+            };
+            let released = registry
+                .release(&item.envelope.fingerprint, &item.work_item_id)
+                .map_err(BuildProjectionError::SingleFlight)?;
+            if released {
+                live.remove(&target_root);
+            }
+            released
+        };
         if !released {
             return Err(BuildProjectionError::NotTheProducer {
                 work_item_id: item.work_item_id.clone(),
             });
         }
+        self.closed.borrow_mut().insert(
+            target_root,
+            ClosedFlight {
+                lineage: lineage.clone(),
+                outcome: outcome.clone(),
+            },
+        );
         Ok(ProducerCompletion {
             lineage,
             released,
             outcome,
         })
+    }
+
+    /// The terminal outcome a claim's flight reached, or `None` while the
+    /// producer is still running.
+    ///
+    /// This is the waiter's side of I18.26 line 34. A waiter holds no handle
+    /// of its own, so it resolves through the claim it already owns: the claim
+    /// names the target root and the lineage, and the coordinator returns the
+    /// producer's own recorded [`ProducerOutcome`] only when both match. The
+    /// waiter therefore receives the *same* execution axis and the *same*
+    /// immutable [`RawEvidence`] the producer closed with, on the success and
+    /// the failure path alike, and the value is not a copy of anything the
+    /// waiter supplied.
+    ///
+    /// `None` means the flight has not closed, or that a newer producer has
+    /// already superseded this root's recorded outcome. It is never a signal to
+    /// re-run: line 35 forbids a silent retry storm, so the decision stays with
+    /// the owning work item.
+    #[must_use]
+    pub fn terminal_outcome(&self, claim: &ProducerClaim) -> Option<ProducerOutcome> {
+        self.closed
+            .borrow()
+            .get(&claim.target_root)
+            .filter(|closed| closed.lineage == claim.lineage)
+            .map(|closed| closed.outcome.clone())
     }
 }
 
@@ -863,9 +1005,10 @@ impl TargetRootBuildCoordinator {
 ///
 /// I18.26 line 3 withdraws `--workspace` from a parallel agent, and line 31 is
 /// equally unconditional about the number of producers per target root.
-/// Neither has an escape hatch here: the projected route is the only admitted
-/// one, and there is no "exact tool evidence" type anywhere in the codebase
-/// that could justify a second producer.
+/// Neither has an escape hatch here: there is no "exact tool evidence" type
+/// anywhere in the codebase that could justify a second producer, and
+/// [`restrict_agent_argv`] applies this refusal to every origin including the
+/// projected one, so admitting the projected route is not a way around it.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CargoScopeRefusal {
     /// `cargo --workspace` selects every workspace member.
@@ -886,10 +1029,18 @@ pub enum CargoScopeRefusal {
 /// package-selected by construction. An [`CargoOrigin::Agent`] argv is
 /// inspected by [`restrict_agent_argv`] and refused when it names an
 /// unrestricted workspace selection or is not a Cargo command at all.
+///
+/// [`CargoOrigin::Projected`] is not a free-typed label: it carries the
+/// [`ProjectedBuild`] the argv is claimed to come from, so the claim is checked
+/// against a real projection rather than asserted. There is no way to name the
+/// projected origin without presenting one, which is what stops the label from
+/// becoming a bypass of the only refusal. The enum borrows because the
+/// projection it names outlives the inspection and is never copied or
+/// reconstructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CargoOrigin {
-    /// Emitted by [`DeclaredWorkItem::project`].
-    Projected,
+pub enum CargoOrigin<'a> {
+    /// Emitted by [`DeclaredWorkItem::project`], carrying that projection.
+    Projected(&'a ProjectedBuild),
     /// Supplied by a parallel agent or an operator shell.
     Agent,
 }
@@ -926,9 +1077,17 @@ pub enum BuildProjectionError {
     #[error(transparent)]
     CargoScope(#[from] CargoScopeRefusal),
     /// An agent-originated argv runs no Cargo command at all, so it is not a
-    /// governed build and is refused.
+    /// governed build and is refused. This check applies to every origin,
+    /// projected included.
     #[error("agent-originated cargo invocation does not name the cargo tool")]
     NotCargo,
+    /// An argv claimed to be projected is not the argv of the
+    /// [`ProjectedBuild`] it was presented with, so the projected route was
+    /// not the route that produced it.
+    #[error(
+        "argv claimed as projected is not the argv emitted by the projection it was presented with"
+    )]
+    ProjectedArgvMismatch,
     /// A cancellation was recorded without retained raw evidence. I18.26 line
     /// 36 makes retention a condition of the cancellation.
     #[error("cancellation would not preserve raw evidence")]
@@ -966,23 +1125,40 @@ pub enum BuildProjectionError {
 /// I18.26 line 3: a parallel agent "does not independently launch unrestricted
 /// `cargo --workspace` commands". The check is argv text, not semantics: it
 /// never parses, executes, or reorders anything, and it never grants an
-/// override. The projected route — an argv emitted by
-/// [`DeclaredWorkItem::project`], which can only contain `-p` package
-/// selections — is the only admitted route, and it is admitted by declaring
-/// [`CargoOrigin::Projected`].
+/// override.
+///
+/// The projected route is the only admitted one, and it is admitted by
+/// *presenting the projection*, not by declaring it. There are three refusals,
+/// and none of them can be stepped over by claiming the projected origin:
+///
+/// 1. the argv must name the cargo tool. This runs for **every** origin,
+///    because a non-Cargo argv is not a governed build in the first place and
+///    the projected route has no exemption from it;
+/// 2. the argv must not request `--workspace` or `--all`. This also runs for
+///    every origin, so even a hand-built [`ProjectedBuild`] cannot smuggle an
+///    unrestricted selection through the projected arm;
+/// 3. a [`CargoOrigin::Projected`] argv must equal, element for element, the
+///    `argv` of the [`ProjectedBuild`] it was presented with. The projected
+///    route is admitted only by [`DeclaredWorkItem::project`]'s own output, so
+///    the origin label carries no authority of its own and cannot be asserted
+///    into an admission.
+///
+/// Together these mean there is no argv that both reaches `Ok` and selects more
+/// than the projected package set: to pass (2) the argv cannot name
+/// `--workspace`/`--all`, and to pass (3) it cannot differ from a projection,
+/// whose every selection is a `-p`.
 ///
 /// # Errors
 ///
-/// Returns [`BuildProjectionError::NotCargo`] when an agent-originated argv
-/// does not name the cargo tool, and [`BuildProjectionError::CargoScope`]
-/// naming the exact flag when it requests `--workspace` or `--all`.
+/// Returns [`BuildProjectionError::NotCargo`] when the argv does not name the
+/// cargo tool, [`BuildProjectionError::CargoScope`] naming the exact flag when
+/// it requests `--workspace` or `--all`, and
+/// [`BuildProjectionError::ProjectedArgvMismatch`] when a projected argv is not
+/// the argv of the projection it was presented with.
 pub fn restrict_agent_argv(
     argv: &[String],
-    origin: CargoOrigin,
+    origin: CargoOrigin<'_>,
 ) -> Result<Vec<String>, BuildProjectionError> {
-    if origin == CargoOrigin::Projected {
-        return Ok(argv.to_vec());
-    }
     if argv.first().is_none_or(|first| first != "cargo") {
         return Err(BuildProjectionError::NotCargo);
     }
@@ -992,6 +1168,11 @@ pub fn restrict_agent_argv(
             "--all" => return Err(CargoScopeRefusal::All.into()),
             _ => {}
         }
+    }
+    if let CargoOrigin::Projected(projected) = origin
+        && argv != projected.argv.as_slice()
+    {
+        return Err(BuildProjectionError::ProjectedArgvMismatch);
     }
     Ok(argv.to_vec())
 }
