@@ -4,6 +4,7 @@ use crate::{
 };
 use eliot_instrument_api::InstrumentKind;
 use eliot_instrument_runner::profile::{AdmittedProfile, InstrumentRegistry, ProfileCompiler};
+use eliot_instrument_runner::{BuildProjectionError, CargoOrigin, restrict_agent_argv};
 use eliot_store::BlobStore;
 use eliot_types::{
     ActionLease, ActionScope, CodeCortexReport, CommandContext, CompletionGateDecision,
@@ -518,9 +519,31 @@ impl<'a> VerifierHarness<'a> {
                 started_at,
             ));
         };
+        let admitted = match admitted_agent_cargo_argv(&command) {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
+                // I18.26 line 3: an unrestricted agent Cargo selection is
+                // refused here, before any process exists. The verifier run
+                // records the exact typed refusal and is never `Passed`, so a
+                // refused build cannot admit the patch either.
+                return Ok(verifier_run(
+                    project_id,
+                    task_id,
+                    agent_id,
+                    requirement,
+                    VerifierStatus::NotAllowed,
+                    None,
+                    0,
+                    None,
+                    None,
+                    format!("{QUARANTINED_LEGACY_LANE} {refusal}"),
+                    started_at,
+                ));
+            }
+        };
         let output = run_bounded_command(
-            command.program,
-            &command.args,
+            &admitted[0],
+            &admitted[1..],
             &self.repo_root,
             self.timeout_seconds,
             self.blob_store,
@@ -810,6 +833,31 @@ fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {
         VerifierCommandKind::DomainVerifier | VerifierCommandKind::ManualReview => return None,
     };
     Some(command)
+}
+
+/// Admits the real agent Cargo argv of one verifier requirement through the one
+/// InstrumentRunner-controlled build projection (issue #1902).
+///
+/// I18.26 line 3 reads: "Parallel agents use Cargo package selection and one
+/// InstrumentRunner-controlled build projection. They do not independently
+/// launch unrestricted `cargo --workspace` commands." This function is the
+/// agent verifier lane's only Cargo admission point, and the argv it returns is
+/// the only argv [`VerifierHarness::run_requirement`] launches, so the
+/// projection cannot be stepped over by calling the launcher directly. A
+/// [`CargoScopeRefusal`](eliot_instrument_runner::CargoScopeRefusal) is
+/// returned instead of an argv, and the caller launches nothing on that path.
+///
+/// The argv is presented as [`CargoOrigin::Agent`] because it is
+/// agent-originated. The projected origin additionally requires the argv to
+/// equal the argv of a live [`ProjectedBuild`](eliot_instrument_runner::ProjectedBuild),
+/// and this composition root has no admitted work-item declaration to present
+/// one, so claiming that origin here would be an unbacked assertion rather
+/// than an admission.
+fn admitted_agent_cargo_argv(command: &FixedCommand) -> Result<Vec<String>, BuildProjectionError> {
+    let mut argv = Vec::with_capacity(command.args.len() + 1);
+    argv.push(command.program.to_owned());
+    argv.extend(command.args.iter().map(|arg| (*arg).to_owned()));
+    restrict_agent_argv(&argv, CargoOrigin::Agent)
 }
 
 #[allow(clippy::too_many_arguments)]
