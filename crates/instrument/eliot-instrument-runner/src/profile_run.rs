@@ -53,12 +53,33 @@ pub enum ProfileRunError {
         /// Offending stage identity.
         stage: String,
     },
+    /// A candidate identity is not a lowercase SHA-256 digest.
+    #[error("{field} must be a lowercase SHA-256 digest")]
+    InvalidDigest {
+        /// Field that failed validation.
+        field: &'static str,
+    },
+    /// A candidate identity was already bound to a different value.
+    #[error("candidate identity is already bound to this stage plan")]
+    CandidateIdentityAlreadyBound,
 }
 
 /// Validates one required text value.
 fn validate_text(value: &str, field: &'static str) -> Result<(), ProfileRunError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(ProfileRunError::InvalidText { field });
+    }
+    Ok(())
+}
+
+/// Validates a lowercase SHA-256 digest without computing or normalizing it.
+fn validate_digest(value: &str, field: &'static str) -> Result<(), ProfileRunError> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(ProfileRunError::InvalidDigest { field });
     }
     Ok(())
 }
@@ -204,8 +225,42 @@ pub struct StagePlan {
     pub profile_digest: String,
     /// Stage DAG digest.
     pub dag_digest: String,
+    /// Optional complete candidate/configuration identity.
+    ///
+    /// Generic profile plans leave this absent. Candidate-bound callers set
+    /// the identity returned by their existing candidate authority.
+    pub candidate_identity: Option<String>,
     /// Planned stages in deterministic topological order.
     pub stages: Vec<PlannedStage>,
+}
+
+impl StagePlan {
+    /// Binds one existing candidate identity to this plan.
+    ///
+    /// This validates only the identity's SHA-256 text shape; it does not
+    /// compute a second candidate fingerprint. Repeating the same binding is
+    /// harmless, while attempting to replace an existing identity fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileRunError::InvalidDigest`] for malformed identity text
+    /// or [`ProfileRunError::CandidateIdentityAlreadyBound`] when a different
+    /// identity is already present.
+    pub fn bind_candidate_identity(
+        &mut self,
+        candidate_identity: impl Into<String>,
+    ) -> Result<(), ProfileRunError> {
+        let candidate_identity = candidate_identity.into();
+        validate_digest(&candidate_identity, "candidate_identity")?;
+        if let Some(bound) = &self.candidate_identity {
+            if bound == &candidate_identity {
+                return Ok(());
+            }
+            return Err(ProfileRunError::CandidateIdentityAlreadyBound);
+        }
+        self.candidate_identity = Some(candidate_identity);
+        Ok(())
+    }
 }
 
 /// Per-stage launch provisions supplied by the composition root.
@@ -289,6 +344,9 @@ pub struct InstrumentRun {
     /// carries no grant. It travels into the aggregate digest so a changed
     /// executable/argument combination can never reuse an earlier receipt.
     pub grant_digest: Option<String>,
+    /// Candidate/configuration identity inherited from the stage plan, when
+    /// this run belongs to a candidate-bound plan.
+    pub candidate_identity: Option<String>,
 }
 
 impl InstrumentRun {
@@ -316,6 +374,7 @@ impl InstrumentRun {
             },
             executable_digest: None,
             grant_digest: Some(grant.grant_digest.clone()),
+            candidate_identity: None,
         }
     }
 
@@ -331,6 +390,7 @@ impl InstrumentRun {
             },
             executable_digest: None,
             grant_digest: None,
+            candidate_identity: None,
         }
     }
 
@@ -380,6 +440,8 @@ pub struct ProfileAggregate {
     pub profile_digest: String,
     /// Stage DAG digest.
     pub dag_digest: String,
+    /// Candidate/configuration identity inherited from the plan, when bound.
+    pub candidate_identity: Option<String>,
     /// Aggregate digest over definition plus ordered runs.
     pub aggregate_digest: String,
     /// Per-stage runs in plan order.
@@ -400,6 +462,9 @@ impl ProfileAggregate {
     pub fn assemble(plan: &StagePlan, runs: Vec<InstrumentRun>) -> Self {
         let mut observed = BTreeMap::new();
         for run in runs {
+            if run.candidate_identity != plan.candidate_identity {
+                continue;
+            }
             observed
                 .entry((
                     run.stage.profile.clone(),
@@ -415,12 +480,15 @@ impl ProfileAggregate {
                 plan.revision,
                 planned.route.stage().stage_id.clone(),
             );
-            match observed.remove(&key) {
-                Some(run) => ordered.push(run),
-                None => ordered.push(InstrumentRun::missing(
-                    &planned.route,
-                    "stage has no observed run",
-                )),
+            if let Some(run) = observed.remove(&key) {
+                ordered.push(run);
+            } else {
+                let mut missing =
+                    InstrumentRun::missing(&planned.route, "stage has no observed run");
+                missing
+                    .candidate_identity
+                    .clone_from(&plan.candidate_identity);
+                ordered.push(missing);
             }
         }
         let status = aggregate_status(plan, &ordered);
@@ -428,6 +496,10 @@ impl ProfileAggregate {
             "{}\0{}\0{}\0{}\0",
             plan.profile, plan.revision, plan.profile_digest, plan.dag_digest,
         );
+        if let Some(candidate_identity) = &plan.candidate_identity {
+            material.push_str(candidate_identity);
+            material.push('\0');
+        }
         for run in &ordered {
             material.push_str(&run.stage.digest());
             material.push('\0');
@@ -454,6 +526,7 @@ impl ProfileAggregate {
             revision: plan.revision,
             profile_digest: plan.profile_digest.clone(),
             dag_digest: plan.dag_digest.clone(),
+            candidate_identity: plan.candidate_identity.clone(),
             aggregate_digest: sha256_hex(material.as_bytes()),
             runs: ordered,
             status,
@@ -556,6 +629,7 @@ impl StageOrchestrator {
             revision: admitted.revision,
             profile_digest: admitted.profile_digest.clone(),
             dag_digest: admitted.dag_digest.clone(),
+            candidate_identity: None,
             stages,
         }
     }
@@ -582,14 +656,17 @@ impl StageOrchestrator {
                 .iter()
                 .find(|dependency| unlaunched.contains(*dependency));
             if let Some(dependency) = blocked_by {
-                runs.push(InstrumentRun::missing(
+                let mut run = InstrumentRun::missing(
                     route,
                     format!("blocked by unlaunched dependency '{dependency}'"),
-                ));
+                );
+                run.candidate_identity.clone_from(&plan.candidate_identity);
+                runs.push(run);
                 unlaunched.insert(route.stage().stage_id.clone());
                 continue;
             }
-            let run = Self::launch_one(runner, planned, launcher).await;
+            let mut run = Self::launch_one(runner, planned, launcher).await;
+            run.candidate_identity.clone_from(&plan.candidate_identity);
             if run.evidence.is_missing() {
                 unlaunched.insert(route.stage().stage_id.clone());
             }

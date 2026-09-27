@@ -369,8 +369,9 @@ pub const fn inline_ceiling_for_kind(kind: FrameKind, max_frame_bytes: usize) ->
 ///
 /// Violations surface as `OversizeFrame` with the applicable maximum through
 /// the existing transport error vocabulary; saturation remains `Backpressure`.
-/// Used by `encode_frame` before inline emission and by `decode_frame` on the
-/// receive path. On receipt the primary enforcement is the tier-capped decode
+/// Used by `encode_frame` before inline emission, by `decode_frame` on the
+/// receive path, and by [`AdmissionQueue::admit_frame`] before capacity is
+/// reserved. On receipt the primary enforcement is the tier-capped decode
 /// in `decode_frame`, which rejects from the length prefix before the body is
 /// decoded; this check remains as the post-decode invariant.
 ///
@@ -610,7 +611,8 @@ fn map_platform_error(error: eliot_platform_windows::WindowsAdapterError) -> Tra
         WindowsAdapterError::NotFound
         | WindowsAdapterError::AlreadyExists
         | WindowsAdapterError::PermissionDenied
-        | WindowsAdapterError::Failed => TransportError::Io(error.to_string()),
+        | WindowsAdapterError::Failed
+        | WindowsAdapterError::RevertToSelf { .. } => TransportError::Io(error.to_string()),
     }
 }
 
@@ -1581,6 +1583,11 @@ impl AdmissionQueue {
     /// the per-connection admission bound the agent-bridge transport uses so a
     /// saturated data plane can still recover or stop work.
     ///
+    /// Bodies above their applicable inline tier (64 KiB control-recovery
+    /// default, 256 KiB structured hard ceiling, `max_frame_bytes`
+    /// otherwise) are rejected with `OversizeFrame` before any capacity is
+    /// reserved, so an over-tier frame never occupies in-flight budget.
+    ///
     /// # Errors
     ///
     /// Returns a protocol error for invalid frames, `ZeroLengthFrame` /
@@ -1592,6 +1599,12 @@ impl AdmissionQueue {
         encoded_bytes: usize,
     ) -> Result<QueueReservation, TransportError> {
         frame.validate()?;
+        // Tier ceilings apply to the body: the I7.2 wire image is a 4-byte
+        // length prefix plus the body, so an over-tier body surfaces as
+        // `OversizeFrame` with the applicable ceiling before any in-flight
+        // capacity is reserved, matching `encode_frame`/`decode_frame`.
+        let body_len = encoded_bytes.saturating_sub(frame_codec::FRAME_PREFIX_LEN);
+        check_inline_response_ceiling(frame, body_len, self.limits.max_frame_bytes)?;
         self.admit(encoded_bytes, is_control_capacity_frame(frame))
     }
 

@@ -38,7 +38,7 @@ split_trigger = "a second causal responsibility, mutable owner, independent proo
 
 [[donor]]
 path = "crates/meta/eliot-improvement/src/lib.rs"
-disposition = "retain and harden advisory boundary; integration owner wires the new module"
+disposition = "retain and harden advisory boundary; shared export integration landed under #973 as a package-root `pub use promotion_input::{…}` re-export of the promotion-input records, gate types, errors, preparation and evidence digest"
 
 [[donor]]
 path = "ELIOT_IMPLEMENTATION I12.24 and ELIOT_ARCHITECTURE A14.5"
@@ -60,3 +60,4 @@ workspace_admission = "forbidden until implementation, package proof, affected E
 shared_integration_surface = "crates/meta/eliot-improvement/src/lib.rs"
 shared_integration_owner = "cognitive-wave-integrator"
 integration_rule = "The integration owner alone wires module exports after both existing-crate cells return non-overlapping implementations."
+evidence_status_and_review_owner = "Implementation and package-proof are complete on current main (crates/meta/eliot-improvement/src/promotion_input.rs, 44 public items) and the package-root `pub use promotion_input::{…}` re-export of the promotion-input records, gate types, errors, preparation and evidence digest was already present before #973; #973 confirmed the exact symbol list and left it unchanged, and the four package-root identity names MODULE_ID, SOURCE_LAYER, RUNTIME_LAYER and CAUSAL_PROPERTY stay bound to this cell. No production consumer of prepare_promotion_input exists outside this package's own dedicated test - `git grep -n prepare_promotion_input origin/main -- crates bins` returns the definition and that test only - so the recorded consumer reference is the declared Governor or Human promotion owner and it is NOT yet realised in code; this is a wiring fact, not a runtime observation. Review owner: the #973 integration owner named by this router."

@@ -15,7 +15,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,8 +90,9 @@ use watchdog_publication_readback::{
 };
 pub use watchdog_spool::export_driver::{
     WatchdogEntryView, WatchdogExportSink, WatchdogIntentAcknowledgement,
-    WatchdogIntentReconciliation, WatchdogIntentSink, export_once, reconcile_watchdog_intents,
-    watchdog_entry_views, watchog_entry_views,
+    WatchdogIntentExportBatch, WatchdogIntentReconciliation, WatchdogIntentSink,
+    WatchdogIntentWindowBlock, export_once, reconcile_watchdog_intents, watchdog_entry_views,
+    watchog_entry_views,
 };
 pub(crate) use watchdog_spool::intent::{
     GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
@@ -354,9 +357,62 @@ pub struct IndependentKernelSensor {
     /// later fenced-Kernel reconciliation can name the exact lease the Kernel
     /// holds. `None` until a lease has been verified at least once.
     supervision_lease_id: Mutex<Option<String>>,
+    /// Ordinal half of this owner's own monotonic admission observation
+    /// sequence, re-seeded at construction from the durable episode row.
+    ///
+    /// This is the ordinal the Watchdog owner issues to itself for **every**
+    /// admission event — an observed Governor-unavailability proof and a live
+    /// Governor admission alike — and it issues the value *before* it opens the
+    /// spool write transaction that will accept the event. That is the whole
+    /// point: the episode's position is then ordered by the owner's own event
+    /// order rather than by the order two redb write transactions happened to
+    /// commit in, and two events in the same millisecond are still separable.
+    ///
+    /// The generation half is [`Self::watchdog_generation`], the owner identity
+    /// this sensor already binds and the rule already trusts, reused rather than
+    /// invented. The ordinal is a plain per-generation counter, not a nonce, a
+    /// random identifier, a payload hash, or a clock reading, and it survives a
+    /// restart because the owner re-seeds it above the position its own durable
+    /// episode row already records: see [`Self::next_admission_ordinal`].
+    admission_ordinal: AtomicU64,
 }
 
 impl IndependentKernelSensor {
+    /// Issues the next ordinal of this owner's admission observation sequence.
+    ///
+    /// Every admission event goes through here exactly once, before its spool
+    /// transaction opens, so the sequence states the owner's own event order and
+    /// the rule can refuse a recovery that raced a newer outage even when the
+    /// two carry the same millisecond. `Relaxed` is the right ordering: the
+    /// counter is a name for "which of this owner's events am I", not a
+    /// synchronisation channel — the total order of the events themselves is
+    /// established by this single counter and by the spool's single writer, and
+    /// no other memory is published through it.
+    fn next_admission_ordinal(&self) -> u64 {
+        self.admission_ordinal.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Returns the admission ordinal this owner must continue above, seeded from
+    /// its own durable episode row.
+    ///
+    /// A row this owner generation cannot order against contributes nothing: a
+    /// strictly newer generation is admitted by the generation comparison alone,
+    /// and a row that records no producer generation at all has no owner identity
+    /// to continue. Everything else hands back the exact ordinal this owner
+    /// generation last issued, so a restarted owner continues above its own
+    /// recorded position instead of replaying it and being refused forever.
+    fn admission_ordinal_seed(spool: &WatchdogSpool, watchdog_generation: u64) -> u64 {
+        // A row this owner cannot read is not this seed's problem to report: the
+        // rule refuses to advance at all on the very next write transaction, so
+        // an unreadable row fails closed there rather than being papered over
+        // here with a position.
+        spool
+            .read_intent_rule_state()
+            .ok()
+            .filter(|state| state.episode_producer_generation == Some(watchdog_generation))
+            .map_or(0, |state| state.episode_admission_sequence)
+    }
+
     /// Opens a sensor from an approved binding and retains its root leases.
     ///
     /// # Errors
@@ -400,6 +456,7 @@ impl IndependentKernelSensor {
             Epoch(watchdog_epoch),
         )
         .map_err(|_| SpoolError::InvalidLease("watchdog epoch is invalid".to_owned()))?;
+        let admission_ordinal = Self::admission_ordinal_seed(&spool, watchdog_generation);
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
@@ -410,6 +467,7 @@ impl IndependentKernelSensor {
             epoch_lineage,
             approved_authority_epoch,
             supervision_lease_id: Mutex::new(None),
+            admission_ordinal: AtomicU64::new(admission_ordinal),
         })
     }
 
@@ -451,6 +509,7 @@ impl IndependentKernelSensor {
             .authority_epoch
             .sequence
             .get();
+        let admission_ordinal = Self::admission_ordinal_seed(&spool, watchdog_generation);
         Ok(Self {
             watchdog: Mutex::new(None),
             spool,
@@ -461,6 +520,7 @@ impl IndependentKernelSensor {
             epoch_lineage,
             approved_authority_epoch,
             supervision_lease_id: Mutex::new(None),
+            admission_ordinal: AtomicU64::new(admission_ordinal),
         })
     }
 
@@ -679,6 +739,7 @@ impl IndependentKernelSensor {
             eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
                 .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
         let backup_port = owner_backup_port(&spool, installation_id, watchdog_generation)?;
+        let admission_ordinal = Self::admission_ordinal_seed(&spool, watchdog_generation);
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
@@ -693,6 +754,7 @@ impl IndependentKernelSensor {
             // closed check both production contours keep.
             approved_authority_epoch: watchdog_epoch,
             supervision_lease_id: Mutex::new(None),
+            admission_ordinal: AtomicU64::new(admission_ordinal),
         })
     }
 
@@ -770,17 +832,24 @@ impl IndependentKernelSensor {
     /// A live admission is the only recovery signal the rule accepts. The
     /// presenting Watchdog generation travels with it so a late success from a
     /// superseded admission generation is refused instead of closing an episode
-    /// a newer generation is still advancing. Spooled intents are untouched
-    /// here: they stay retained, and unacknowledged, until the fenced Kernel
-    /// route acknowledges them. Closing claims no canonical resolution.
+    /// a newer generation is still advancing, and the ordinal of this owner's own
+    /// admission sequence travels with it so the rule can tell a recovery that
+    /// really happened after the latest accepted outage from one that raced it
+    /// in the same millisecond. The ordinal is issued here, before the write
+    /// transaction opens, so it states this owner's own event order. Spooled
+    /// intents are untouched here: they stay retained, and unacknowledged, until
+    /// the fenced Kernel route acknowledges them. Closing claims no canonical
+    /// resolution.
     pub fn observe_governor_recovered(&self) {
         let Ok(observed_at_ms) = current_unix_ms().map(|value| value.max(1)) else {
             return;
         };
-        match self
-            .spool
-            .observe_governor_recovery(self.watchdog_generation, observed_at_ms)
-        {
+        let admission_ordinal = self.next_admission_ordinal();
+        match self.spool.observe_governor_recovery(
+            self.watchdog_generation,
+            admission_ordinal,
+            observed_at_ms,
+        ) {
             Ok(true) => tracing::debug!(
                 event = "watchdog.intent_episode_closed",
                 observation = "reconciled",
@@ -853,6 +922,10 @@ impl IndependentKernelSensor {
         let Ok(observed_at_ms) = current_unix_ms().map(|value| value.max(1)) else {
             return;
         };
+        // Issued here, before the spool transaction opens, so the rule orders
+        // this observation by the owner's own event order and a later recovery
+        // can be told apart from one that raced it.
+        let admission_ordinal = self.next_admission_ordinal();
         let reason = proof.reason();
         let digest = governor_unavailable_observation_digest(
             &self.installation_id,
@@ -903,6 +976,7 @@ impl IndependentKernelSensor {
             proof,
             digest.as_str(),
             lineage,
+            admission_ordinal,
             observed_at_ms,
         ) {
             Ok(outcome) => outcome,

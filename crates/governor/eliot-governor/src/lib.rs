@@ -128,7 +128,7 @@ pub use learning_closure::{
     CanonicalLearningDeltaStore, CanonicalLearningDeltaStoreError, ClosureIdentityInput,
     LEARNING_DELTA_ORDERING_SCOPE, LEARNING_DELTA_REVISION_KEY, LearningClosureError,
     LearningClosureOutcome, LearningClosureReceipt, LearningClosureService, close_disposition_for,
-    retry_relation_from_prior,
+    prior_lineage_delivery, retry_relation_from_prior,
 };
 pub use learning_delta_integration::{
     AttemptCloseError, StoredDeltaIdentity, admission_claim_for_delta, attempt_status_for_activity,
@@ -173,10 +173,11 @@ pub use reactive_admission::{
     assess_reactive_risk, bind_atom_risk,
 };
 pub use route_registry::{
-    ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute, RouteAdmission,
-    RouteAdmissionDecision, RouteBehaviorFingerprint, RouteEvidenceSummary, RouteIdentityLayer,
-    RouteInstallationIdentity, RouteRefusalReason, RouteRegistryError, RuntimeRoute,
-    diverging_scope_layers,
+    ActualRouteReceipt, CapabilityRouteRegistry, EFFECTIVE_ROUTE_KEY_DOMAIN, ExecutionIdentity,
+    ObservedRoute, RouteAdmission, RouteAdmissionDecision, RouteBehaviorFingerprint,
+    RouteEvidenceSummary, RouteIdentityLayer, RouteInstallationIdentity, RouteOutcomeCounts,
+    RouteOutcomeProfile, RouteOutcomeProfileIndex, RouteRefusalReason, RouteRegistryError,
+    RuntimeRoute, diverging_scope_layers, effective_route_key,
 };
 pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{

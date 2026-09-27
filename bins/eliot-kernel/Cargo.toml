@@ -23,6 +23,7 @@ blake3.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-installation.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
@@ -32,6 +33,19 @@ eliot-ipc.workspace = true
 # bins/eliotd declares it. No version upgrade: versions match the member
 # manifest.
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
+# Workspace edge (issue #1841, I16.2/I16.5): the bounded-label OpenMetrics
+# registry, exporter and execution-path recorders live in
+# eliot-observability-runtime, which HAS a [workspace.dependencies] entry, so
+# this is a plain workspace edge. scripts/audit-architecture-boundaries.py
+# permits it: the crate is in no forbidden_exact/forbidden_prefix set of the
+# eliot-kernel runtime root (issue #15), and its closure (eliot-contracts,
+# eliot-platform-windows, serde, serde_json, thiserror, tracing,
+# tracing-subscriber) adds no forbidden reach.
+#
+# Issue #1836 (W1): the same edge, and the reason this composition root
+# installs the shared observability runtime from `main` before any live work
+# starts.
+eliot-observability-runtime.workspace = true
 eliot-ors.workspace = true
 eliot-process-executor.workspace = true
 eliot-protocol.workspace = true

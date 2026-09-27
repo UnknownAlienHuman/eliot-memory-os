@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod bridge_event_capacity;
+mod bridge_event_recovery;
 mod capability_cell_registry;
 mod cell_effective_manifest;
 mod epoch_identity;
@@ -23,6 +24,7 @@ mod module_catalog;
 mod peer_blackboard;
 
 pub use bridge_event_capacity::*;
+pub use bridge_event_recovery::*;
 pub use capability_cell_registry::*;
 pub use cell_effective_manifest::*;
 pub use epoch_identity::*;
@@ -163,6 +165,125 @@ impl HostCorrelationProjection {
             }
         }
     }
+}
+
+/// Canonical namespace of every current-version logical host-request key (issue #2571).
+///
+/// The namespace names the Kernel-admitted application-continuity domain: keys
+/// derive only from Kernel-issued session continuity plus the stable client
+/// occurrence projection, never from bare text, a principal alone, or a
+/// connection/deadline. This constant is the single executable owner of the
+/// key domain; the Bridge and ORS consume it through
+/// [`host_request_logical_key`] instead of restating the literal.
+pub const HOST_REQUEST_LOGICAL_KEY_NAMESPACE: &str = "eliot.host-request.logical.v2";
+/// Current version of the canonical logical host-request key encoding (issue #2571).
+///
+/// A new version mints a new namespace constant; historical namespaces are
+/// never reinterpreted under the current one. The retired v1 recipe
+/// (`eliot.host-request.logical.v1`) survives only inside the ORS owner for
+/// recompute/validation of pre-existing unmarked rows and never stages new
+/// keys.
+pub const HOST_REQUEST_LOGICAL_KEY_VERSION: u32 = 2;
+/// Canonical namespace of every legacy-presence key (issue #2571).
+///
+/// Presence keys mark pre-index historical occurrences without carrying an
+/// operation identity. The Bridge probes and the ORS adoption/lookup consume
+/// this constant through [`host_request_legacy_presence_key`] instead of
+/// restating the literal.
+pub const HOST_REQUEST_LEGACY_PRESENCE_NAMESPACE: &str = "eliot.host-request.legacy-presence.v1";
+
+/// Closed logical-key family for host-request replay/cancellation identity (issue #2571).
+///
+/// The marker spelling is load-bearing key material: [`Self::parse`] accepts
+/// only the canonical uppercase markers and rejects every historical
+/// spelling, so a retired version can never be silently reinterpreted under
+/// the current namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostRequestLogicalKind {
+    /// A request invocation occurrence.
+    Invocation,
+    /// A cancellation-intent occurrence.
+    Cancellation,
+}
+
+impl HostRequestLogicalKind {
+    /// Returns the canonical marker spelling carried in every key preimage.
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Invocation => "INVOCATION",
+            Self::Cancellation => "CANCELLATION",
+        }
+    }
+
+    /// Parses a presented kind marker, rejecting every non-canonical spelling.
+    ///
+    /// Historical spellings (notably the retired lowercase markers) yield
+    /// `None` instead of a key, so old bytes fail closed instead of
+    /// addressing the current index.
+    #[must_use]
+    pub fn parse(marker: &str) -> Option<Self> {
+        match marker {
+            "INVOCATION" => Some(Self::Invocation),
+            "CANCELLATION" => Some(Self::Cancellation),
+            _ => None,
+        }
+    }
+}
+
+/// Derives the canonical logical key for one session-bound host-request occurrence (issue #2571).
+///
+/// This function is the single executable owner of the logical-key recipe:
+/// canonical namespace ([`HOST_REQUEST_LOGICAL_KEY_NAMESPACE`]), kind marker,
+/// component order, `\x1f` framing, projection encoding, and SHA-256 digest.
+/// The Bridge (resolve queries) and ORS (staging, lookup, validation) both
+/// consume it, so one changed spelling can never split the presenter from
+/// the owner.
+///
+/// The projection encodes with plain struct field order, pinned to the staged
+/// bytes: canonicalization would reorder fields and change the digest, so it
+/// must not be substituted here. Callers pass an already-validated session
+/// and projection (Kernel-issued session continuity;
+/// [`HostCorrelationProjection::validate`]); validated text carries no
+/// control character, so the `\x1f` framing stays unambiguous.
+///
+/// # Errors
+///
+/// Returns [`serde_json::Error`] when the projection cannot be encoded.
+pub fn host_request_logical_key(
+    kind: HostRequestLogicalKind,
+    session: &str,
+    projection: &HostCorrelationProjection,
+) -> Result<String, serde_json::Error> {
+    let projection = serde_json::to_string(projection)?;
+    Ok(sha256_hex(
+        format!(
+            "{HOST_REQUEST_LOGICAL_KEY_NAMESPACE}\x1fkind={kind}\x1fsession={session}\x1fprojection={projection}",
+            kind = kind.marker()
+        )
+        .as_bytes(),
+    ))
+}
+
+/// Derives the canonical legacy-presence key for one historical occurrence (issue #2571).
+///
+/// Single executable owner of the presence recipe, consumed by both the
+/// Bridge probes and the ORS adoption/lookup. Callers pass already-validated
+/// session and occurrence text; see [`host_request_logical_key`] for the
+/// framing precondition.
+#[must_use]
+pub fn host_request_legacy_presence_key(
+    kind: HostRequestLogicalKind,
+    session: &str,
+    occurrence: &str,
+) -> String {
+    sha256_hex(
+        format!(
+            "{HOST_REQUEST_LEGACY_PRESENCE_NAMESPACE}\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}",
+            kind = kind.marker()
+        )
+        .as_bytes(),
+    )
 }
 
 /// A validation failure for a contract primitive.

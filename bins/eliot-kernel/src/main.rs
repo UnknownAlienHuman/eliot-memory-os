@@ -34,20 +34,117 @@
 //!   boundary, and process ownership follows I01-02.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use eliot_kernel::kernel_diagnostics::{
-    EntrypointStage, install_kernel_diagnostics, observe_entrypoint, observe_terminal_error,
+    EntrypointStage, install_kernel_diagnostics, observe_entrypoint,
+    observe_entrypoint_with_detail, observe_terminal_error,
 };
 use eliot_kernel::{
-    EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
-    KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
-    compose_production_native_worker_front_door, compose_production_testd_front_door,
+    AuditAnchorBinding, EliotdReceiptRootBinding, KernelBuildError, KernelComposition,
+    KernelConfig, KernelDoctorRecoveryLedger, compose_dispatch_contour,
+    compose_production_doctor_front_door, compose_production_native_worker_front_door,
+    compose_production_testd_front_door,
+};
+use eliot_observability_runtime::{
+    ObservabilityConfig, RollingLogPolicy, RuntimeProfile, SpoolPolicy,
 };
 
 #[cfg(windows)]
 mod front_door_driver;
 mod startup_binding;
+
+/// Stable operational-log stem for this process. The generation name carries
+/// the exit code, so a fresh process start is distinguishable from a rolling
+/// rotation without any second naming scheme.
+const OPERATIONAL_LOG_STEM: &str = "eliot-kernel";
+
+/// Bounded operational-log generation size, in bytes.
+///
+/// I16.2/I16.9 make the operational log a rolling, non-authoritative surface,
+/// and the crate's own declared ceiling for one generation is
+/// `MAX_ROLLING_BYTES` (`eliot-observability-runtime::config`). The Kernel is
+/// the busiest shipped surface, so it runs at the declared ceiling rather than
+/// a smaller private number.
+const OPERATIONAL_LOG_GENERATION_BYTES: u64 =
+    eliot_observability_runtime::config::MAX_ROLLING_BYTES;
+
+/// Bounded operational-log generation count, at the same declared ceiling.
+const OPERATIONAL_LOG_GENERATIONS: u32 =
+    eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS;
+
+/// Bounded writer-queue depth, in records, before admission starts dropping and
+/// the visible dropped-records gauge advances (I16.11 forbids hidden loss), at
+/// the crate's own declared ceiling.
+const OPERATIONAL_LOG_QUEUED_RECORDS: usize =
+    eliot_observability_runtime::config::MAX_ROLLING_QUEUED_RECORDS;
+
+/// Bounded protected spool generation count, at the same declared ceiling.
+const OPERATIONAL_SPOOL_GENERATIONS: u32 =
+    eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS;
+
+/// Largest accepted single spooled critical record, in bytes, at the crate's
+/// declared ceiling (`MAX_SPOOL_RECORD_BYTES`).
+const OPERATIONAL_SPOOL_RECORD_BYTES: u64 =
+    eliot_observability_runtime::config::MAX_SPOOL_RECORD_BYTES;
+
+/// Derives the process observability configuration from the two roots the
+/// Host already injected into this exact process.
+///
+/// `receipt_root` and `kernel_ors_root` come from
+/// `startup_binding::KernelStartupBinding::from_environment`
+/// (`ELIOT_KERNEL_RECEIPT_ROOT`, `ELIOT_KERNEL_ORS_ROOT`) and are the same
+/// validated values the Kernel opens with `ProtectedRootLease` in
+/// `eliot-kernel/src/lib.rs`. The profile contour is the same one the Kernel
+/// already resolves for its own authority descriptor:
+/// `startup_binding::authority_contour` maps an authority descriptor inside
+/// the work root to the portable current-user contour and anything else to
+/// `ProgramData`, so the last-resort sink is the surface this process actually
+/// runs on rather than an assumed installation profile.
+///
+/// `metrics_listen` and `otlp_endpoint` stay at the crate's own
+/// `None`: no canonical `OpenMetrics` bind address and no approved OTLP
+/// collector endpoint exist in the tree, and I16.2 requires the OTLP bridge to
+/// stay disabled by default.
+fn observability_config(
+    receipt_root: &Path,
+    ors_root: &Path,
+    contour: &eliot_kernel::AuthorityDescriptorContour,
+) -> ObservabilityConfig {
+    let profile = match contour {
+        eliot_kernel::AuthorityDescriptorContour::PortableCurrentUser { .. } => {
+            RuntimeProfile::Portable
+        }
+        eliot_kernel::AuthorityDescriptorContour::ProgramData => RuntimeProfile::SystemService,
+    };
+    // `SystemService` uses the Windows Event Log as its last resort
+    // (`bootstrap::sinks_for`); the portable contour needs the protected
+    // event spool, so the spool sits beside the ORS root the Kernel owns.
+    let spool = match profile {
+        RuntimeProfile::SystemService => None,
+        RuntimeProfile::UserMode | RuntimeProfile::Portable => Some(SpoolPolicy {
+            directory: ors_root.join("spool"),
+            file_stem: "critical-events".to_owned(),
+            max_generations: OPERATIONAL_SPOOL_GENERATIONS,
+            max_record_bytes: OPERATIONAL_SPOOL_RECORD_BYTES,
+        }),
+    };
+    ObservabilityConfig {
+        profile,
+        rolling_log: RollingLogPolicy {
+            directory: receipt_root.join("logs"),
+            file_stem: OPERATIONAL_LOG_STEM.to_owned(),
+            max_bytes_per_generation: OPERATIONAL_LOG_GENERATION_BYTES,
+            max_generations: OPERATIONAL_LOG_GENERATIONS,
+            max_buffered_records: OPERATIONAL_LOG_QUEUED_RECORDS,
+            exit_code: 0,
+        },
+        spool,
+        metrics_listen: None,
+        otlp_endpoint: None,
+    }
+}
 
 /// Keeps startup, authenticated listener rotation, and fenced shutdown in one
 /// ordered authority path.
@@ -72,6 +169,18 @@ async fn main() {
     };
     #[cfg(windows)]
     observe_entrypoint(EntrypointStage::HostStartupBinding);
+    // Issue #1836 (W1): install the shared observability runtime from the
+    // roots the Host injected, before the store bootstrap, the launch
+    // contract, the composition, and the front-door loop start. Best-effort
+    // by the same contract as the subscriber above: a refused configuration
+    // leaves the launch funnel untouched and is never turned into a startup
+    // failure.
+    #[cfg(windows)]
+    let _observability = eliot_observability_runtime::install(&observability_config(
+        &startup_binding.receipt_root,
+        &startup_binding.kernel_ors_root,
+        &startup_binding::authority_contour(&options.work_root, &options.authority_descriptor),
+    ));
     let prepared_store = match startup_binding::prepare_store_bootstrap(&options) {
         Ok(prepared) => prepared,
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
@@ -104,6 +213,19 @@ async fn main() {
         )
         .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
         kernel_config = kernel_config.with_eliotd_receipt_binding(receipt_binding);
+        // I16.10 (issue #1837): bind the periodic digest-anchor sink to the
+        // Watchdog failure domain. The bound directory is the
+        // installer-owned `watchdog_state_root` the Host injected with this
+        // same launch contour, under the same `runtime_state_roots_digest`
+        // that covers it — never a path this binary derives from its own work
+        // root. `AuditAnchorBinding::new` requires an absolute, already
+        // existing directory (the Kernel never creates the foreign one), and
+        // `set_anchor_sink` refuses a sink inside the work root, so the
+        // periodic `export_anchor` now lands where a rollback or loss of the
+        // Kernel work root cannot take it (A13.8).
+        let anchor_binding = AuditAnchorBinding::new(startup_binding.watchdog_state_root.clone())
+            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error.to_string()));
+        kernel_config = kernel_config.with_audit_anchor_binding(anchor_binding);
     }
     if let Some(prepared) = &prepared_store {
         kernel_config = kernel_config.with_store_bootstrap(prepared.requirement.clone());
@@ -156,6 +278,22 @@ async fn main() {
     kernel_config = kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
+    // I16.2/I16.5 (issue #1841): install the bounded-label OpenMetrics stack
+    // and publish the local scrape surface. Best-effort by contract (A13.10):
+    // a refused configuration is reported and the launch funnel continues, so
+    // telemetry can never become a reason the Kernel refuses to run. The
+    // install is placed after the authority contour is known, because the
+    // installation profile is that admitted contour and not an inference.
+    match eliot_kernel::execution_metrics::install_kernel_execution_metrics(
+        &kernel_config,
+        &authority_contour,
+    ) {
+        Ok(observability) => {
+            observability.publish_runtime_counters();
+            observe_entrypoint_with_detail(EntrypointStage::Composition, observability.describe());
+        }
+        Err(error) => observe_terminal_error(&error.to_string()),
+    }
     let kernel = Arc::new(
         match KernelComposition::new_with_authority_descriptor(
             kernel_config,

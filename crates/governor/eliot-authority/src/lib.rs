@@ -31,10 +31,10 @@ pub use break_glass::{
     BreakGlassAuthorization, BreakGlassAuthorizationId, BreakGlassPermit, BreakGlassState,
 };
 pub use effects::{
-    ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord, ContestedEffectAnnotation,
-    DependentEffectState, EFFECT_AUTHORIZER_RECOVERY_SCHEMA, EFFECT_AUTHORIZER_RECOVERY_VERSION,
-    EffectAuthorizer, EffectAuthorizerRecoverySnapshot, EffectOutcome, EffectReceipt,
-    ProposedEffect,
+    ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord, CompiledEffect,
+    ContestedEffectAnnotation, DependentEffectState, EFFECT_AUTHORIZER_RECOVERY_SCHEMA,
+    EFFECT_AUTHORIZER_RECOVERY_VERSION, EffectAuthorizer, EffectAuthorizerRecoverySnapshot,
+    EffectOutcome, EffectReceipt, ImpactClass, ProposedEffect,
 };
 pub use grants::{
     AuthoritySet, AuthorizedCrossRootMember, CapabilityGrant, CapabilityIntroduction,
@@ -53,8 +53,8 @@ pub use quarantine_evidence::{
     QuarantineEvidenceStatus, UnresolvedEffectDisposition, VerifiedQuarantineBinding,
 };
 pub use revocation_history::{
-    GrantRestoreOutcome, RevocationHistoryError, RevocationHistoryEvidence, SuppressedGrant,
-    SuppressionCause, ValidatedRevocationClosure,
+    GrantRestoreOutcome, REVOCATION_HISTORY_EVIDENCE_VERSION, RevocationHistoryError,
+    RevocationHistoryEvidence, SuppressedGrant, SuppressionCause, ValidatedRevocationClosure,
 };
 
 use std::{error::Error, fmt};

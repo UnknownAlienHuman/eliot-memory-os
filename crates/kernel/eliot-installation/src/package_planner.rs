@@ -13,13 +13,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, InstallationEpoch, InstallationError,
-    InstallationProfile, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
-    InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID, ManagedEnvironmentAction,
-    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
-    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
-    StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
-    SupervisionAuthorityProvisionPlan, candidate_manifest_digest as candidate_digest_fn, handle,
-    phase_b_static_template_for_candidate, supervision_key_slot_for_scope_id,
+    InstallationProfile, InstallationRoots, InstallationTransaction, InstallerAclPrincipal,
+    InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID,
+    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
+    PackageArtifactDigest, PlannedChange, ProfileRootAnchors, ResourceGeneration,
+    RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
+    StoreCredentialProvisionPlan, StoreCredentialScope, SupervisionAuthorityProvisionPlan,
+    candidate_manifest_digest as candidate_digest_fn, handle,
+    phase_b_static_template_for_candidate, select_profile_roots, supervision_key_slot_for_scope_id,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 
@@ -1043,6 +1044,26 @@ pub struct GenerationPackagePlanInput {
     pub agent_bridge_source: Option<Box<AgentBridgeSourceMaterializationPlan>>,
 }
 
+/// Explicit I3.1 root-selection inputs for the profile-governed planner entry.
+///
+/// Every value is supplied by the caller. The OS-proved anchors come from the
+/// Windows adapter, never from process environment variables or the current
+/// directory; a required anchor that was not proved is a typed refusal from
+/// the selector, never a guess.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileRootSelectionInput {
+    /// OS-proved profile anchors for one explicitly selected profile.
+    pub anchors: ProfileRootAnchors,
+    /// Component name for the versioned immutable root of the Windows profiles.
+    pub component: String,
+    /// Component version for the versioned immutable root of the Windows profiles.
+    pub version: String,
+    /// Immutable-root generation for `portable_dev`, which versions its
+    /// immutable root by generation rather than by release version. Required
+    /// when the profile is `PortableDev`, ignored otherwise.
+    pub generation: Option<String>,
+}
+
 /// The sole production package/transaction composition seam.
 pub struct GenerationPackagePlanner;
 
@@ -1098,6 +1119,87 @@ impl GenerationPackagePlanner {
         Self::plan_with_binding(input, &publication_binding, true)
     }
 
+    /// Plan through the I3.1 profile-governed root selector before effects.
+    ///
+    /// The selector resolves the exact root row for the explicitly selected
+    /// profile from the caller-supplied OS-proved anchors, and the complete
+    /// versioned four-root binding — immutable, durable, user configuration
+    /// and user cache separately — is validated against the digest-bound
+    /// runtime topology this planner derives. Planned source and staging
+    /// destinations that would write mutable data beside immutable versioned
+    /// binaries are refused here, before any effect is derived. Planning stays
+    /// read-only: nothing is created, reserved or mutated.
+    ///
+    /// The returned binding is the versioned layout the runtime consumers and
+    /// restart recovery rehydrate and revalidate; persisting it onto the
+    /// transaction wire and threading it through the out-of-crate launch
+    /// owners is stitching work owned by those consumers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::ProfileViolation`] for an invalid profile,
+    /// a missing or ambiguous anchor, a conflicting binding, or a planned
+    /// write into the versioned immutable binaries root.
+    pub fn plan_with_profile_governed_roots(
+        input: GenerationPackagePlanInput,
+        selection: &ProfileRootSelectionInput,
+        source_identity: FileIdentity,
+        files: Vec<PackageArtifactDigest>,
+        evidence_digest: PlatformHandle,
+    ) -> Result<(InstallationTransaction, InstallationRoots), InstallationError> {
+        let governed = select_profile_roots(
+            input.profile,
+            selection.component.as_str(),
+            selection.version.as_str(),
+            selection.generation.as_deref(),
+            &selection.anchors,
+        )?;
+        governed.admits_write_target(input.source_root.as_str())?;
+        governed.admits_write_target(input.staging_root.as_str())?;
+        let roots = Self::planner_runtime_roots(&input)?;
+        let binding = governed.into_installation_roots(roots)?;
+        let transaction = Self::plan_with_source_publication_binding(
+            input,
+            source_identity,
+            files,
+            evidence_digest,
+        )?;
+        Ok((transaction, binding))
+    }
+
+    /// Derives the digest-bound runtime topology for one planner input.
+    ///
+    /// This is the single derivation shared by the governed and ungoverned
+    /// planner entries, so both entries bind the same retained root
+    /// identities for one input.
+    fn planner_runtime_roots(
+        input: &GenerationPackagePlanInput,
+    ) -> Result<RuntimeStateRoots, InstallationError> {
+        match input.profile {
+            InstallationProfile::PortableDev => {
+                if input.installation_key.is_some() {
+                    return Err(InstallationError::ProfileViolation(
+                        "portable_dev does not accept a profiled installation key".to_owned(),
+                    ));
+                }
+                RuntimeStateRoots::derive_portable(input.profile_anchor_root.clone())
+            }
+            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                let key = input.installation_key.as_ref().ok_or_else(|| {
+                    InstallationError::InvalidField {
+                        field: "generation.installation_key".to_owned(),
+                        reason: "profiled installations require an explicit key".to_owned(),
+                    }
+                })?;
+                RuntimeStateRoots::derive_profiled(
+                    input.profile,
+                    input.profile_anchor_root.clone(),
+                    key.as_str(),
+                )
+            }
+        }
+    }
+
     /// Derive the complete candidate/package/effect graph and create one
     /// immutable `PLANNED` transaction.
     ///
@@ -1137,29 +1239,7 @@ impl GenerationPackagePlanner {
             return Err(InstallationError::IdentityConflict);
         }
 
-        let roots = match input.profile {
-            InstallationProfile::PortableDev => {
-                if input.installation_key.is_some() {
-                    return Err(InstallationError::ProfileViolation(
-                        "portable_dev does not accept a profiled installation key".to_owned(),
-                    ));
-                }
-                RuntimeStateRoots::derive_portable(input.profile_anchor_root.clone())?
-            }
-            InstallationProfile::SystemService | InstallationProfile::UserMode => {
-                let key = input.installation_key.as_ref().ok_or_else(|| {
-                    InstallationError::InvalidField {
-                        field: "generation.installation_key".to_owned(),
-                        reason: "profiled installations require an explicit key".to_owned(),
-                    }
-                })?;
-                RuntimeStateRoots::derive_profiled(
-                    input.profile,
-                    input.profile_anchor_root.clone(),
-                    key.as_str(),
-                )?
-            }
-        };
+        let roots = Self::planner_runtime_roots(&input)?;
         if let Some(expected_staging_root) = roots.expected_staging_root()?
             && !crate::same_windows_root(
                 input.staging_root.as_str(),

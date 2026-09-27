@@ -26,14 +26,22 @@
 //!   presents. There is no mutable "stale" flag: changing the adapter hash or
 //!   the serializer fingerprint moves the derived scope, the exact-fingerprint
 //!   match fails, and admission is refused until the route is requalified.
+//! - **Complete effective key (issue #1958).** Routing evidence, capability
+//!   lookup, and outcome-profile lookup all key on the complete behaviour
+//!   fingerprint through [`effective_route_key`] and
+//!   [`RouteScopeFingerprint`], never on provider/model labels. Two attempts
+//!   that differ only by serializer or by tool-call ID / role ordering
+//!   therefore resolve to different keys and cannot reuse each other's
+//!   capability or outcome evidence.
 //!
 //! The registry holds no durable state and performs no effect: it is the
 //! read/decision half of the I1.9 evidence view.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use eliot_contracts::{LowercaseSha256, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -42,6 +50,15 @@ use crate::capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
     RouteScopeFingerprint,
 };
+
+/// Digest domain of the complete effective route key (issue #1958).
+///
+/// The key is versioned material, not a bare hash of a value: a change to the
+/// material shape moves the domain instead of silently reinterpreting an
+/// already-published key. This mirrors the shared epoch-identity recipe in
+/// `eliot-contracts` (`canonical_json_bytes` over a struct carrying a
+/// `domain_separator`, then `sha256_hex`).
+pub const EFFECTIVE_ROUTE_KEY_DOMAIN: &str = "eliot.governor.effective-route-key.v1";
 
 /// Execution identity a route is configured for (I3.4 `RuntimeRoute`).
 #[derive(
@@ -330,30 +347,78 @@ impl RouteBehaviorFingerprint {
     }
 }
 
+/// Versioned canonical material the effective route key is computed over.
+///
+/// It carries the whole [`RouteBehaviorFingerprint`] value, never a subset of
+/// it, so the key cannot collapse two behaviour-different routes onto one.
+#[derive(Serialize)]
+struct EffectiveRouteKeyMaterial<'a> {
+    domain_separator: &'static str,
+    fingerprint: &'a RouteBehaviorFingerprint,
+}
+
+/// Computes the complete effective route key of one route fingerprint.
+///
+/// This is the single keying function for routing evidence, capability lookup,
+/// and outcome-profile lookup: it hashes the canonical bytes of the complete
+/// behaviour fingerprint, so any behaviour-affecting difference - serializer or
+/// chat template, tool-call ID / role ordering, reasoning
+/// continuation/compaction, feature-flag or tool/context profile hashes, or
+/// any identity layer - yields a different key, and no evidence recorded under
+/// one can be found under the other.
+///
+/// # Errors
+///
+/// Returns [`RouteRegistryError::DigestComputation`] when the canonical
+/// material cannot be serialized or the resulting hex is not a canonical
+/// lowercase SHA-256 digest.
+pub fn effective_route_key(
+    fingerprint: &RouteBehaviorFingerprint,
+) -> Result<LowercaseSha256, RouteRegistryError> {
+    let material = EffectiveRouteKeyMaterial {
+        domain_separator: EFFECTIVE_ROUTE_KEY_DOMAIN,
+        fingerprint,
+    };
+    let bytes =
+        canonical_json_bytes(&material).map_err(|_| RouteRegistryError::DigestComputation)?;
+    // `LowercaseSha256` exposes no public constructor: its own deserializer is
+    // the validating boundary, and `sha256_hex` output always satisfies it, so
+    // this cannot fail in practice. The failure is still propagated rather
+    // than unwrapped or replaced by a sentinel digest.
+    serde_json::from_value::<LowercaseSha256>(serde_json::Value::String(sha256_hex(&bytes)))
+        .map_err(|_| RouteRegistryError::DigestComputation)
+}
+
 /// Returns the identity layers on which two evidence scopes differ.
 ///
 /// This is the comparison I3.4 requires for staleness: it is evaluated against
-/// the scope the current route presents, so a runtime, adapter, provider or
-/// serializer change names itself here instead of being recorded as a flag
-/// somebody may forget to set.
+/// the scope the current route presents, so a runtime, adapter, provider,
+/// serializer, tool-call-ordering, or reasoning/compaction change names itself
+/// here instead of being recorded as a flag somebody may forget to set.
 ///
-/// The layers reported are the dimensions an I3.4 `scope_fingerprint` carries,
-/// which is exactly the set I3.4 makes stale: runtime, adapter, architecture,
-/// auth profile, provider/model route and serializer. The remaining
-/// behaviour-changing dimensions of [`RouteBehaviorFingerprint`] (host family,
-/// protocol/transport, tool-call ordering, reasoning continuation) are part of
-/// the route identity the receipt reports, not of the evidence scope shape.
+/// Every behaviour-changing dimension of [`RouteBehaviorFingerprint`] is a
+/// dimension of [`RouteScopeFingerprint`], so no behaviour-changing layer can
+/// move outside this report: an evidence scope that is field-complete equal on
+/// the current route is the only shape that keeps admitting (issue #1958).
 #[must_use]
 pub fn diverging_scope_layers(
     stored: &RouteScopeFingerprint,
     current: &RouteScopeFingerprint,
 ) -> Vec<RouteIdentityLayer> {
     let mut layers = Vec::new();
+    if stored.host_family != current.host_family {
+        layers.push(RouteIdentityLayer::HostFamily);
+    }
+    // Adapter identity and adapter implementation hash are one identity layer:
+    // a change to either names the same layer once.
+    if stored.adapter_id != current.adapter_id || stored.adapter_hash != current.adapter_hash {
+        layers.push(RouteIdentityLayer::Adapter);
+    }
+    if stored.protocol_transport != current.protocol_transport {
+        layers.push(RouteIdentityLayer::ProtocolTransport);
+    }
     if stored.runtime_hash != current.runtime_hash {
         layers.push(RouteIdentityLayer::RuntimeInstance);
-    }
-    if stored.adapter_hash != current.adapter_hash {
-        layers.push(RouteIdentityLayer::Adapter);
     }
     if stored.os_architecture != current.os_architecture {
         layers.push(RouteIdentityLayer::OsArchitecture);
@@ -364,6 +429,13 @@ pub fn diverging_scope_layers(
     if stored.provider_model_route != current.provider_model_route {
         layers.push(RouteIdentityLayer::ProviderModelRoute);
     }
+    if stored.tool_call_id_and_role_ordering != current.tool_call_id_and_role_ordering {
+        layers.push(RouteIdentityLayer::ToolCallOrdering);
+    }
+    if stored.reasoning_continuation_and_compaction != current.reasoning_continuation_and_compaction
+    {
+        layers.push(RouteIdentityLayer::ReasoningContinuation);
+    }
     if stored.feature_flags_and_serializer != current.feature_flags_and_serializer {
         layers.push(RouteIdentityLayer::Serializer);
     }
@@ -372,10 +444,13 @@ pub fn diverging_scope_layers(
 
 /// Route facts the runtime actually exposed for one attempt.
 ///
-/// A `None` field is `unknown`, never inferred. I3.4 is explicit that the
-/// observed route must not be reconstructed from the UI selection, the prompt
-/// text, or the requested intent, so this type offers no constructor that
-/// fills one field from another route's values.
+/// `None` is the explicit `unknown` state, and it is explicit in the type: an
+/// unexposed fact is an absent value, never an empty string, a sentinel id, or
+/// a default that reads as a value. I3.4 is explicit that the observed route
+/// must not be reconstructed from the UI selection, the prompt text, or the
+/// requested intent, so this type offers no constructor that fills one field
+/// from another route's values, and no accessor that substitutes a requested
+/// value for an unexposed one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedRoute {
@@ -454,12 +529,18 @@ impl ObservedRoute {
 /// exposed. Because the observed fields are stored independently, a runtime
 /// that reports nothing leaves the receipt explicitly `unknown` instead of
 /// carrying the request forward as if it were an observation.
+///
+/// `requested` is populated from planning/configuration and `observed` only
+/// from an evidence-bearing observation, and
+/// [`CapabilityRouteRegistry::record_receipt`] refuses a receipt whose
+/// `evidence_refs` name none: there is no constructor path that fills an
+/// observed field from the requested route, a UI selection, or prompt text.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActualRouteReceipt {
     /// Route identity this receipt belongs to.
     pub route_id: String,
-    /// The requested route intent.
+    /// The requested route intent, from planning/configuration.
     pub requested: RuntimeRoute,
     /// The observed route, with `unknown` preserved as `None`.
     pub observed: ObservedRoute,
@@ -469,7 +550,9 @@ pub struct ActualRouteReceipt {
     pub installation: RouteInstallationIdentity,
     /// Observation time of the observed route.
     pub observed_at: u64,
-    /// Evidence references supporting the observed route facts.
+    /// Evidence-bearing observation references (runtime handshake, transport
+    /// metadata, or equivalent) supporting the observed route facts. At
+    /// least one is required before the receipt is retained.
     pub evidence_refs: Vec<String>,
 }
 
@@ -498,6 +581,14 @@ impl ActualRouteReceipt {
 
     /// Returns the evidence scope the current route actually presents.
     ///
+    /// The scope is the *complete effective* route identity, not a
+    /// provider/model label: it carries every behaviour-changing group of
+    /// [`RouteBehaviorFingerprint`], so capability evidence recorded under one
+    /// serializer or one tool-call/role ordering cannot admit the other
+    /// (issue #1958). Installation-side groups come from
+    /// [`RouteInstallationIdentity`], which is the Governor's own discovered
+    /// build/runtime artifact, not a value the route may assume.
+    ///
     /// The scope exists only when the runtime exposed every route-side
     /// dimension admission compares. When any of them is `unknown` the scope
     /// is `None`: a scope assembled from the request instead would be exactly
@@ -514,14 +605,32 @@ impl ActualRouteReceipt {
                 // `_billing`: the evidence `scope_fingerprint` has no billing
                 // field, because I3.4's mandatory stale set is
                 // runtime/adapter/provider/serializer. Billing still takes part
-                // in the requested-vs-observed comparison below; it is not part
-                // of the evidence scope and must not silently become one.
+                // in the requested-vs-observed comparison below and in the
+                // complete effective route key; it is not part of the evidence
+                // scope and must not silently become one.
                 |(((auth, provider), _billing), serializer)| RouteScopeFingerprint {
+                    host_family: Some(self.requested_fingerprint.host_family.clone()),
+                    adapter_id: Some(self.requested_fingerprint.adapter_id.clone()),
+                    protocol_transport: Some(format!(
+                        "{}|{}",
+                        self.requested_fingerprint.protocol_kind,
+                        self.requested_fingerprint.transport_kind
+                    )),
                     runtime_hash: Some(self.requested_fingerprint.runtime_hash.clone()),
                     adapter_hash: Some(self.requested_fingerprint.adapter_hash.clone()),
                     os_architecture: Some(self.installation.os_architecture.clone()),
                     auth_profile_class: Some(auth),
                     provider_model_route: Some(provider),
+                    tool_call_id_and_role_ordering: Some(
+                        self.requested_fingerprint
+                            .tool_call_id_and_role_ordering
+                            .clone(),
+                    ),
+                    reasoning_continuation_and_compaction: Some(
+                        self.requested_fingerprint
+                            .reasoning_continuation_and_compaction
+                            .clone(),
+                    ),
                     feature_flags_and_serializer: Some(format!(
                         "{serializer}|{}",
                         self.requested_fingerprint
@@ -544,6 +653,18 @@ pub enum RouteRegistryError {
     /// The receipt's route identity contradicts its requested route.
     #[error("receipt route identity does not match the requested route")]
     ReceiptRouteMismatch,
+    /// The canonical material of the complete effective route key could not be
+    /// built. The failure is reported, never replaced by a sentinel key.
+    #[error("effective route key digest could not be computed")]
+    DigestComputation,
+    /// The observed route carries no evidence-bearing observation reference.
+    ///
+    /// I3.4 admits only a runtime handshake, transport metadata, or an
+    /// equivalent evidence-bearing observation as the source of an observed
+    /// route, so a receipt naming none is refused whole rather than retained
+    /// as an unsupported observation.
+    #[error("observed route requires at least one evidence-bearing observation reference")]
+    ObservationEvidenceUnproven,
 }
 
 /// Evidence status, source and expiry shown with a route admission decision.
@@ -634,8 +755,136 @@ pub struct RouteAdmission {
     pub route_id: String,
     /// Behaviour fingerprint of the requested route on the current installation.
     pub requested_fingerprint: RouteBehaviorFingerprint,
+    /// Complete effective route key this decision was made on. Routing
+    /// evidence and downstream lookups join on this value, so a decision can
+    /// only be attributed to the exact behaviour stack that produced it.
+    pub effective_route_key: LowercaseSha256,
     /// The derived decision, with the evidence that produced it.
     pub decision: RouteAdmissionDecision,
+}
+
+/// Sample counts of one route's derived empirical outcome profile (I3.4).
+///
+/// `unknown` is a real count, not an absence: a sample whose outcome was never
+/// reconciled must stay visible so aggregated success cannot hide it.
+#[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteOutcomeCounts {
+    /// Samples whose output was verified complete.
+    pub verified_complete: u32,
+    /// Samples that finished with a partial result.
+    pub partial: u32,
+    /// Samples that failed.
+    pub failed: u32,
+    /// Samples whose outcome was never established.
+    pub unknown: u32,
+}
+
+/// One route's derived empirical outcome profile (I3.4
+/// `RouteOutcomeProfile`).
+///
+/// This is a profile, never a capability or proof by itself. It is stored and
+/// looked up under the complete effective route key
+/// ([`RouteOutcomeProfileIndex`]), so a profile measured on one serializer or
+/// one tool-call/role ordering is never returned for another. Every composite
+/// measure is carried as named, evidence-linked text because this type owns no
+/// measurement taxonomy: a number without its measure name, unit and source
+/// would be an invented value.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteOutcomeProfile {
+    /// Task class and recipe the samples were taken for.
+    pub task_class_and_recipe: String,
+    /// Governance and environment profile the samples were taken under.
+    pub governance_and_environment_profile: String,
+    /// Sample window and the observed distribution over it.
+    pub sample_window_and_distribution: String,
+    /// Verified/complete, partial, failed and unknown sample counts.
+    pub outcome_counts: RouteOutcomeCounts,
+    /// Verifier coverage and quality measures, named and sourced.
+    pub verifier_coverage_and_quality_measures: String,
+    /// Latency, cost, quota and cleanup measures, named and sourced.
+    pub latency_cost_quota_and_cleanup_measures: String,
+    /// Continuation, context and route-mismatch failures observed.
+    pub continuation_context_and_route_mismatch_failures: String,
+    /// Independence and common-lineage notes for the sampled work.
+    pub independence_and_common_lineage_notes: String,
+    /// Confidence, coverage and known biases of the profile.
+    pub confidence_coverage_and_known_biases: String,
+    /// Evidence references backing the profile.
+    pub evidence_refs: Vec<String>,
+    /// Validity bound and the dependencies that make the profile stale.
+    pub valid_until_and_stale_dependencies: String,
+}
+
+/// Governor-owned outcome profiles keyed by the complete effective route
+/// fingerprint (I3.4, issue #1958).
+///
+/// The key is [`effective_route_key`] over the complete
+/// [`RouteBehaviorFingerprint`], not a provider/model label, so two routes that
+/// differ only in serializer or in tool-call ID / role ordering hold separate
+/// profiles and a lookup never returns another route's samples.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RouteOutcomeProfileIndex {
+    profiles: HashMap<LowercaseSha256, RouteOutcomeProfile>,
+}
+
+impl RouteOutcomeProfileIndex {
+    /// Creates an empty index.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            profiles: HashMap::new(),
+        }
+    }
+
+    /// Records one route's profile under its complete effective route key.
+    ///
+    /// A later record for the same key replaces the retained profile: the key
+    /// is the whole identity, so there is no sibling to reconcile against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouteRegistryError::DigestComputation`] when the effective
+    /// route key cannot be built; the profile is then not stored at all rather
+    /// than stored under a placeholder key.
+    pub fn record(
+        &mut self,
+        fingerprint: &RouteBehaviorFingerprint,
+        profile: RouteOutcomeProfile,
+    ) -> Result<(), RouteRegistryError> {
+        self.profiles
+            .insert(effective_route_key(fingerprint)?, profile);
+        Ok(())
+    }
+
+    /// Returns the profile recorded for the exact complete effective route.
+    ///
+    /// `None` means no profile was recorded for this fingerprint, even when a
+    /// provider/model-identical sibling exists under a different key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouteRegistryError::DigestComputation`] when the effective
+    /// route key cannot be built.
+    pub fn lookup(
+        &self,
+        fingerprint: &RouteBehaviorFingerprint,
+    ) -> Result<Option<&RouteOutcomeProfile>, RouteRegistryError> {
+        Ok(self.profiles.get(&effective_route_key(fingerprint)?))
+    }
+
+    /// Returns the number of distinct effective route keys retained.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    /// Returns true when no profile is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.profiles.is_empty()
+    }
 }
 
 /// Governor-owned registry of route intent, observed routes, and the evidence
@@ -698,8 +947,9 @@ impl CapabilityRouteRegistry {
     /// # Errors
     ///
     /// Returns [`RouteRegistryError`] when the receipt's route identity
-    /// contradicts its own requested route, or when either identity is
-    /// malformed. The receipt is rejected whole; a partial receipt is never
+    /// contradicts its own requested route, when either identity is malformed,
+    /// or when the observed route names no evidence-bearing observation
+    /// reference. The receipt is rejected whole; a partial receipt is never
     /// stored.
     pub fn record_receipt(
         &mut self,
@@ -713,6 +963,18 @@ impl CapabilityRouteRegistry {
         }
         if !receipt.installation.is_well_formed() {
             return Err(RouteRegistryError::InstallationNotWellFormed);
+        }
+        // An observed route exists only where a runtime handshake, transport
+        // metadata, or an equivalent evidence-bearing observation produced it.
+        // A receipt that names none is refused instead of being retained with
+        // an unsupported observation.
+        if receipt.evidence_refs.is_empty()
+            || !receipt
+                .evidence_refs
+                .iter()
+                .all(|reference| is_identity_text(reference))
+        {
+            return Err(RouteRegistryError::ObservationEvidenceUnproven);
         }
         self.define_route(receipt.requested.clone())?;
         self.receipts.insert(receipt.route_id.clone(), receipt);
@@ -738,7 +1000,8 @@ impl CapabilityRouteRegistry {
     /// # Errors
     ///
     /// Returns [`RouteRegistryError`] when the receipt is not a consistent,
-    /// well-formed route observation.
+    /// well-formed route observation, or when the complete effective route key
+    /// of the current fingerprint cannot be built.
     pub fn admit_route(
         &mut self,
         evidence: &CapabilityRegistry,
@@ -755,25 +1018,27 @@ impl CapabilityRouteRegistry {
         let Some(retained) = self.receipts.get(&route_id) else {
             return Err(RouteRegistryError::ReceiptRouteMismatch);
         };
-        Ok(Self::derive_admission(
-            evidence,
-            retained,
-            prior.as_ref(),
-            capability,
-            now,
-        ))
+        Self::derive_admission(evidence, retained, prior.as_ref(), capability, now)
     }
 
     /// Derives admission for one already recorded route receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouteRegistryError::DigestComputation`] when the complete
+    /// effective route key of the current fingerprint cannot be built; the
+    /// decision is then not produced at all, rather than reported under a
+    /// placeholder key.
     fn derive_admission(
         evidence: &CapabilityRegistry,
         receipt: &ActualRouteReceipt,
         prior_fingerprint: Option<&RouteBehaviorFingerprint>,
         capability: &str,
         now: u64,
-    ) -> RouteAdmission {
+    ) -> Result<RouteAdmission, RouteRegistryError> {
         let requested_fingerprint =
             RouteBehaviorFingerprint::of(&receipt.requested, &receipt.installation);
+        let key = effective_route_key(&requested_fingerprint)?;
         let route_layers_changed = prior_fingerprint
             .map(|prior| prior.diverging_layers(&requested_fingerprint))
             .unwrap_or_default();
@@ -787,9 +1052,10 @@ impl CapabilityRouteRegistry {
         let observed_diverging_layers = receipt.observed.diverging_layers(&receipt.requested);
         let unknown_layers = receipt.observed.unknown_layers();
         let Some(current) = receipt.current_scope() else {
-            return RouteAdmission {
+            return Ok(RouteAdmission {
                 route_id: receipt.route_id.clone(),
                 requested_fingerprint,
+                effective_route_key: key,
                 decision: RouteAdmissionDecision::Refused {
                     reason: RouteRefusalReason::ObservedRouteUnknown,
                     diverging_layers: Vec::new(),
@@ -798,7 +1064,7 @@ impl CapabilityRouteRegistry {
                     route_layers_changed,
                     evidence: summaries,
                 },
-            };
+            });
         };
         let on_current: Vec<&CapabilityEvidenceRecord> = retained
             .iter()
@@ -814,13 +1080,14 @@ impl CapabilityRouteRegistry {
                 && evidence.admit_production_route(capability, &current, now)
         });
         if let Some(record) = admitting {
-            return RouteAdmission {
+            return Ok(RouteAdmission {
                 route_id: receipt.route_id.clone(),
                 requested_fingerprint,
+                effective_route_key: key,
                 decision: RouteAdmissionDecision::Admitted {
                     evidence: (*record).into(),
                 },
-            };
+            });
         }
         let restrictive = on_current.iter().any(|record| {
             matches!(
@@ -841,9 +1108,10 @@ impl CapabilityRouteRegistry {
         } else {
             RouteRefusalReason::EvidenceStale
         };
-        RouteAdmission {
+        Ok(RouteAdmission {
             route_id: receipt.route_id.clone(),
             requested_fingerprint,
+            effective_route_key: key,
             decision: RouteAdmissionDecision::Refused {
                 reason,
                 diverging_layers,
@@ -852,6 +1120,6 @@ impl CapabilityRouteRegistry {
                 route_layers_changed,
                 evidence: summaries,
             },
-        }
+        })
     }
 }

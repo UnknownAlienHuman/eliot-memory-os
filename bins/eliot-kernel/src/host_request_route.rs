@@ -54,13 +54,13 @@
 
 use super::kernel_audit::AuditEventDraft;
 use super::{
-    Frame, FrameKind, GovernanceProfile, KernelComposition, KernelFrameAction, MessageType,
-    ProtocolPayload, Session, TransportError, activation_deadline_expired, sha256_json,
-    status_frame, unix_ms,
+    Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
+    TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
-use eliot_contracts::RequestId;
+use eliot_contracts::{BridgeRecoverySelector, RequestId};
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
+use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel,
@@ -77,6 +77,7 @@ use eliot_protocol::{
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, ScopeId};
+use std::collections::BTreeMap;
 
 mod daemon_claim_queue;
 
@@ -99,6 +100,35 @@ const HOST_REQUEST_REQUEST_BINDING_PREFIX: &str = "hostreq-request-id:";
 const HOST_REQUEST_CANCELLATION_BINDING_PREFIX: &str = "hostreq-cancellation-id:";
 const HOST_REQUEST_IDENTITY_BINDING_LABEL: &str =
     "eliot.kernel.host-request.operation-identity-binding.v1";
+
+/// Publishes the local-read queue depth and live-claim count (I16.5, #1841).
+///
+/// `queued` is the depth the admission gate has just compared against
+/// `MAX_QUEUED_LOCAL_READS`, and the claim count is the number of queued pairs
+/// whose attempt is live - the same `LocalReadAttemptState::is_live` predicate
+/// the claim path uses, so the gauge cannot disagree with the claim gate. Both
+/// counts convert with a saturating `try_from`: an unreachable count saturates
+/// rather than wrapping into a plausible smaller number.
+fn observe_local_read_queue_gauges(
+    index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
+    queued: usize,
+) {
+    let Some(metrics) = crate::execution_metrics::kernel_metrics() else {
+        return;
+    };
+    let live_claims = index
+        .values()
+        .flatten()
+        .filter(|candidate| candidate.local_read_attempt.is_live())
+        .count();
+    metrics.record(metrics.record_queue_and_claims(
+        ModuleIdentity::LocalHttpAdapter,
+        WorkClass::Interactive,
+        "kernel.local_read_queue",
+        u32::try_from(queued).unwrap_or(u32::MAX),
+        u32::try_from(live_claims).unwrap_or(u32::MAX),
+    ));
+}
 
 /// Typed frame operations carrying one [`HostRequestEnvelope`] through the
 /// closed frame gateway.
@@ -531,11 +561,8 @@ impl KernelComposition {
             .as_ref()
             .is_none_or(|record| !record.state.is_terminal());
         if !expired && needs_material_authority {
-            self.admit_material_authority_for_fence(
-                GovernanceProfile::full(),
-                &envelope.state_fence,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+            self.admit_material_authority_for_governor_issued_fence(&envelope.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
         }
 
         let admission_receipt = {
@@ -1139,11 +1166,24 @@ impl KernelComposition {
             .map(serde_json::from_value::<eliot_contracts::HostCorrelationProjection>)
             .transpose()
             .map_err(|_| TransportError::SessionFenced)?;
-        let stored = self
+        let stored = match self
             .generation_gateway
             .ors
             .load_host_request_by_logical_key(&key)
-            .map_err(|_| TransportError::SessionFenced)?;
+        {
+            Ok(stored) => stored,
+            // A retired key carries a tombstone instead of a link: answer the
+            // typed recovery limitation (issue #2571), mirroring the submit
+            // entry. Every other load failure stays fail-closed and generic.
+            Err(OrsError::HostRequestLegacyCorrelationUnresolved) => {
+                return Ok(host_request_resolve_unresolved_response(
+                    "legacy_correlation_unresolved",
+                    Some(&key),
+                    None,
+                ));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
         let Some(record) = stored else {
             return Ok(host_request_resolve_unresolved_response(
                 "absent",
@@ -1872,6 +1912,10 @@ impl KernelComposition {
         }
         // Issue #1837: durable audit evidence for queue admission.
         self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
+        // I16.5 (issue #1841): the queue gauges are read from the owner's own
+        // live index at admission, so a sample measures the current contour
+        // rather than a total carried forward.
+        observe_local_read_queue_gauges(&index, queued);
         Ok(())
     }
 
@@ -2376,13 +2420,36 @@ impl KernelComposition {
         // submission. The submission leg causally precedes the Kernel
         // binding, so its record is fsync-sealed before the ORS completion
         // below: a crash after completion can never lose it.
-        self.audit_observe(AuditEventDraft::result_daemon_submitted(
+        let submitted_draft = AuditEventDraft::result_daemon_submitted(
             session,
             body,
             &stored,
             queued_envelope.as_ref(),
             lane,
-        ));
+        );
+        // Issue #1837 (I16.11 spool cascade): the binding record below can
+        // only append after the ORS completion it evidences, so a crash or
+        // a failed append in between would leave a completed result without
+        // its binding evidence. Spool both result-leg drafts durably BEFORE
+        // the persist: reconcile replays a surviving entry against the
+        // validated ORS record, and the chain stays complete. The spooled
+        // binding lineage equals the post-persist draft (persist only sets
+        // state/result/commit fields, none of which feed `fill_stored`);
+        // only `durable_state` refreshes from the ORS original at reconcile.
+        self.spool_pending_result_binding(
+            &submitted_draft,
+            &AuditEventDraft::result_kernel_bound(
+                session,
+                body,
+                &stored,
+                queued_envelope.as_ref(),
+                lane,
+            ),
+            &body.operation_id,
+            &body.request_sha256,
+            &body.result_digest,
+        );
+        let submitted_ok = self.audit_observe(submitted_draft).is_some();
         let persisted = self
             .generation_gateway
             .ors
@@ -2401,13 +2468,23 @@ impl KernelComposition {
         // record evidences the persisted completion above, so it must follow
         // it; a failed persist leaves submission evidence without binding,
         // which is the accurate history.
-        self.audit_observe(AuditEventDraft::result_kernel_bound(
-            session,
-            body,
-            &persisted,
-            queued_envelope.as_ref(),
-            lane,
-        ));
+        let bound_ok = self
+            .audit_observe(AuditEventDraft::result_kernel_bound(
+                session,
+                body,
+                &persisted,
+                queued_envelope.as_ref(),
+                lane,
+            ))
+            .is_some();
+        // Both legs sealed in the chain retire the pre-persist spool. Any
+        // missing leg keeps it for reconcile (a later `audit_chain_records`
+        // completes the chain from it); a failed persist likewise leaves the
+        // spool in place, and reconcile drops it once the ORS record proves
+        // no completion, so the chain never carries an unproven binding.
+        if submitted_ok && bound_ok {
+            self.clear_pending_result_binding(&body.operation_id);
+        }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
@@ -4061,7 +4138,20 @@ impl KernelComposition {
         // disclosure disposition over these exact bytes, and the stage entry
         // re-verifies the presented decision before any durable write. The
         // decision object travels into the durable stage below.
-        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(&envelope_bytes);
+        //
+        // Issue #1934: the ORS owner no longer DECIDES. Disclosure is resolved
+        // by the privacy owner over the `WorkScope` / source / recipient /
+        // provider policy and arrives bound to these exact source bytes, the
+        // scope, and the policy revision it was decided at. A caller that
+        // cannot present such a verdict gets the redacted path, never an
+        // inferred `allowed`: the ORS deny scan stays a conservative detector
+        // that can only deny.
+        let privacy_authorization =
+            Self::bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
+        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
+            &envelope_bytes,
+            Some(&privacy_authorization),
+        );
         let now = unix_ms();
         let expired = activation_deadline_expired(now, deadline_unix_ms);
         // `Ready` admits delivery; `Degraded` keeps only recovery (gap and
@@ -4106,6 +4196,89 @@ impl KernelComposition {
         }
     }
 
+    /// Resolves the privacy owner's disclosure verdict for one bridge event's
+    /// exact source bytes (issue #1934, I7.23).
+    ///
+    /// The verdict is bound to three things the bytes alone cannot supply: the
+    /// exact source digest, the `WorkScope` scope the owner evaluated the
+    /// bytes under, and the privacy policy revision it decided at. The scope
+    /// is the owner namespace the ORS stage entry is about to bind for this
+    /// stream, so the authorization is checked against the very namespace that
+    /// will be persisted — a verdict reached for one stream cannot authorize
+    /// another.
+    ///
+    /// The retained `Session` is the authority for the scope identity (issue
+    /// #2729): the principal, authority lineage, connection, launch nonce and
+    /// session epoch are the same owner legs the stage entry persists, so the
+    /// verdict and the row it authorizes are attributable to the same owner
+    /// read. The policy revision is the session's own binding generation, so a
+    /// verdict made under an older binding cannot authorize bytes under a
+    /// newer one; a replay under a different revision is a different verdict,
+    /// not a duplicate.
+    ///
+    /// Failure is closed by construction: a session that cannot be resolved
+    /// into a scope yields a rejected verdict, never an absent one, so no
+    /// caller can reach the verbatim path without a bound owner decision.
+    fn bridge_event_privacy_authorization(
+        session: &Session,
+        frame_fence: &eliot_contracts::StateFence,
+        event: &EventEnvelope,
+        envelope_bytes: &[u8],
+    ) -> Result<serde_json::Value, TransportError> {
+        let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
+        // The scope is the very owner namespace the ORS stage entry binds for
+        // this stream, derived through the owner's own namespace digest so the
+        // verdict and the row it authorizes cannot drift.
+        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let scope = RedbRecoveryStore::bridge_event_privacy_scope(
+            &evidence.authority_lineage,
+            &evidence.principal,
+            &event.producer_id,
+            &event.stream_id,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        // The retained session's own generation is the policy revision the
+        // verdict was reached under; zero is never an admissible revision.
+        let policy_revision = frame_fence.resource_generation.value();
+        Ok(serde_json::json!({
+            "verdict": "admitted",
+            "source_sha256": source_sha256,
+            "scope": scope,
+            "policy_revision": policy_revision,
+        }))
+    }
+
+    /// Projects the three disclosure legs the ORS stage entry re-verifies out
+    /// of a resolved privacy decision object (issue #1934).
+    ///
+    /// The owner authorization travels alongside them so the stage entry can
+    /// compare the verdict against the exact bytes and scope it is about to
+    /// bind; a decision that carries no authorization is projected as a null
+    /// authorization, which the store refuses rather than infers.
+    fn bridge_event_privacy_legs(
+        privacy: &serde_json::Value,
+    ) -> Result<BridgeEventPrivacyLegs<'_>, TransportError> {
+        let disposition = privacy
+            .get("privacy_disposition")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let classes = privacy
+            .get("redacted_classes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let authorization = privacy
+            .get("privacy_authorization")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let reason = privacy["redaction_reason"].as_str().unwrap_or("");
+        Ok(BridgeEventPrivacyLegs {
+            disposition,
+            classes,
+            authorization,
+            reason,
+        })
+    }
+
     /// Stages one durable/control event with its pre-persistence privacy
     /// decision and records the Governor-intake handoff (Implements #2561,
     /// I7.23 + I5(i)).
@@ -4133,15 +4306,7 @@ impl KernelComposition {
         privacy: &serde_json::Value,
         expired: bool,
     ) -> Result<serde_json::Value, TransportError> {
-        let privacy_disposition = privacy
-            .get("privacy_disposition")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(TransportError::SessionFenced)?;
-        let redacted_classes = privacy
-            .get("redacted_classes")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let redaction_reason = privacy["redaction_reason"].as_str().unwrap_or("");
+        let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
         let staged = serde_json::json!({
             "stream_id": event.stream_id,
             "event_id": event.event_id,
@@ -4153,9 +4318,15 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
             "envelope_sha256": envelope_sha,
             "staging_connection": session.connection_id,
-            "privacy_disposition": privacy_disposition,
-            "redacted_classes": redacted_classes,
-            "redaction_reason": redaction_reason,
+            "privacy_disposition": privacy_legs.disposition,
+            "redacted_classes": privacy_legs.classes,
+            "redaction_reason": privacy_legs.reason,
+            // Issue #1934: the owner authorization travels with the decision so
+            // the ORS stage entry can re-verify that the verdict was reached
+            // over exactly these bytes, inside the scope it is about to bind,
+            // at the policy revision it names. Without it persistence is
+            // refused, never inferred.
+            "privacy_authorization": privacy_legs.authorization,
             "owner_principal": evidence.principal,
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_connection": evidence.connection,
@@ -4575,9 +4746,14 @@ impl KernelComposition {
         reconciliation["connection_id"] = serde_json::Value::String(session.connection_id.clone());
         reconciliation["live_generation"] = serde_json::Value::from(live_generation);
         reconciliation["reconcile_key_version"] = serde_json::Value::from(1_u64);
+        // The selector echoes back as the ONE shared contract type's own
+        // serialization, not as the caller's raw bytes: the preimage binds
+        // what ORS actually selected, so a caller that spelled a legacy or
+        // partial shape cannot hash its way into a matching key.
         reconciliation["requested_recovery_scope"] = scope
             .recovery_scope
-            .clone()
+            .as_ref()
+            .and_then(|selector| serde_json::to_value(selector).ok())
             .unwrap_or(serde_json::Value::Null);
         let key_bytes = eliot_contracts::canonical_json_bytes(&reconciliation)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -5175,6 +5351,20 @@ struct BridgeOwnerEvidence {
     session_epoch: u64,
 }
 
+/// The disclosure legs of one resolved privacy decision, as the ORS stage
+/// entry re-verifies them (issue #1934).
+///
+/// `authorization` is the privacy owner's verdict bound to the exact source
+/// bytes, the scope, and the policy revision. It travels with the disposition
+/// so the store can compare the verdict against what it is about to persist
+/// instead of accepting a disposition on its own shape.
+struct BridgeEventPrivacyLegs<'a> {
+    disposition: &'a str,
+    classes: serde_json::Value,
+    authorization: serde_json::Value,
+    reason: &'a str,
+}
+
 /// Derives the owner evidence for one bridge-event operation from the
 /// retained Session and the presenting fence (issue #2729, item 2). The
 /// fence already proved compatibility with the retained Session at
@@ -5380,156 +5570,21 @@ pub(crate) fn bridge_gap_from_payload(
 /// recovery selector asks for one bounded continuation page and is read-only.
 pub(crate) struct BridgeReconcileScope {
     pub(crate) consumed: Vec<(String, u64)>,
-    pub(crate) recovery_scope: Option<serde_json::Value>,
+    pub(crate) recovery_scope: Option<BridgeRecoverySelector>,
 }
 
-const MAX_BRIDGE_RECOVERY_STREAMS: u64 = 4;
-const MAX_BRIDGE_RECOVERY_EVENTS: u64 = 128;
-const MAX_BRIDGE_RECOVERY_GAPS: u64 = 256;
+// The recovery selector's stream/event/gap page bounds now live on the one
+// shared contract type (`eliot_contracts::BridgeRecoverySelector`), so this
+// route no longer carries a second copy that could drift from it.
 const MAX_BRIDGE_RECONCILE_TEXT_BYTES: usize = 1024;
 
-/// Requires a closed field set for one versioned recovery selector. In
-/// particular, a future field cannot silently weaken this route's bounds.
-fn bridge_recovery_scope_fields(
-    object: &serde_json::Map<String, serde_json::Value>,
-    expected: &[&str],
-) -> Result<(), TransportError> {
-    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
-        return Err(TransportError::SessionFenced);
-    }
-    Ok(())
-}
-
-fn bridge_recovery_scope_text<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<&'a str, TransportError> {
-    object
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .filter(|text| {
-            !text.trim().is_empty()
-                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
-                && !text.chars().any(char::is_control)
-        })
-        .ok_or(TransportError::SessionFenced)
-}
-
-fn bridge_recovery_scope_u64(
-    object: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<u64, TransportError> {
-    object
-        .get(field)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(TransportError::SessionFenced)
-}
-
-/// Validates one bounded, versioned owner continuation selector. The raw
-/// object is forwarded unchanged to ORS only after this closed typed parse.
-fn validate_bridge_recovery_scope(value: &serde_json::Value) -> Result<(), TransportError> {
-    let object = value.as_object().ok_or(TransportError::SessionFenced)?;
-    if bridge_recovery_scope_u64(object, "version")? != 1 {
-        return Err(TransportError::SessionFenced);
-    }
-    let kind = bridge_recovery_scope_text(object, "kind")?;
-    let window_key = bridge_recovery_scope_text(object, "window_key")?;
-    if window_key.len() != 64
-        || !window_key
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(TransportError::SessionFenced);
-    }
-
-    match kind {
-        "streams" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_stream",
-                    "stream_limit",
-                ],
-            )?;
-            bridge_recovery_scope_text(object, "after_stream")?;
-            let limit = bridge_recovery_scope_u64(object, "stream_limit")?;
-            if limit == 0 || limit > MAX_BRIDGE_RECOVERY_STREAMS {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        "stream" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "stream_id",
-                    "after_sequence",
-                    "upper_sequence",
-                    "expected_revision",
-                    "retention_floor",
-                    "event_limit",
-                    "gap_offset",
-                    "gap_limit",
-                ],
-            )?;
-            let stream_id = bridge_recovery_scope_text(object, "stream_id")?;
-            if stream_id.contains("::") {
-                return Err(TransportError::SessionFenced);
-            }
-            let after_sequence = bridge_recovery_scope_u64(object, "after_sequence")?;
-            let upper_sequence = bridge_recovery_scope_u64(object, "upper_sequence")?;
-            let expected_revision = bridge_recovery_scope_u64(object, "expected_revision")?;
-            let retention_floor = bridge_recovery_scope_u64(object, "retention_floor")?;
-            let event_limit = bridge_recovery_scope_u64(object, "event_limit")?;
-            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
-            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
-            if expected_revision == 0
-                || after_sequence > upper_sequence
-                || retention_floor > upper_sequence
-                || event_limit == 0
-                || event_limit > MAX_BRIDGE_RECOVERY_EVENTS
-                || gap_limit == 0
-                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
-                || gap_offset.checked_add(gap_limit).is_none()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        "unscoped_gaps" => {
-            bridge_recovery_scope_fields(
-                object,
-                &[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_gap_scope",
-                    "gap_offset",
-                    "gap_limit",
-                ],
-            )?;
-            bridge_recovery_scope_text(object, "after_gap_scope")?;
-            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
-            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
-            if gap_limit == 0
-                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
-                || gap_offset.checked_add(gap_limit).is_none()
-            {
-                return Err(TransportError::SessionFenced);
-            }
-        }
-        _ => return Err(TransportError::SessionFenced),
-    }
-    Ok(())
-}
-
 /// Decodes the bounded consumed-frontier list and optional exact recovery
-/// selector. Initial/open reads omit the selector. Continuation selectors
-/// are closed version-1 objects and cannot be combined with acknowledgements.
+/// selector. Initial/open reads omit the selector. The selector is the one
+/// shared cross-owner contract type: it is decoded and fully validated here
+/// mechanically, then the SAME decoded value travels into ORS, so no second
+/// parser can disagree with this one about what a continuation means.
+/// Continuation selectors are read-only and cannot be combined with
+/// acknowledgements.
 pub(crate) fn bridge_reconcile_scope_from_payload(
     payload: &serde_json::Value,
 ) -> Result<BridgeReconcileScope, TransportError> {
@@ -5563,8 +5618,7 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
     }
     let recovery_scope = match payload.get("recovery_scope") {
         Some(value) => {
-            validate_bridge_recovery_scope(value)?;
-            Some(value.clone())
+            Some(BridgeRecoverySelector::decode(value).map_err(|_| TransportError::SessionFenced)?)
         }
         None => None,
     };

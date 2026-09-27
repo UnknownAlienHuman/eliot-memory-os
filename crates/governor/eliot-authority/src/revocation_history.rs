@@ -58,7 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_influence::RevocationBounds;
 use eliot_security_contracts::{InfluenceDependencyClosure, InfluenceState, RevocationReason};
 use schemars::JsonSchema;
@@ -66,6 +66,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::grants::RevocationDenominator;
 use crate::{AuthorityError, CapabilityGrant, GrantGraph, GrantId, validate_text};
+
+/// Closed evidence version of the authority revocation-history closure
+/// record (issue #2966, step 2).
+///
+/// Every [`ValidatedRevocationClosure`] is stamped with this version by
+/// [`RevocationHistoryEvidence::require_current`](RevocationHistoryEvidence::require_current)
+/// and every [`AdmittedRevocationClosure`] carries it through admission,
+/// which refuses any other version: a closure validated under an older (or
+/// newer) evidence version is never silently reinterpreted as the current
+/// stronger form. The wire-carried owner namespace and the durable owner
+/// receipt stay with the durable history owner and are never minted here.
+pub const REVOCATION_HISTORY_EVIDENCE_VERSION: u16 = 1;
 
 /// Explicit CURRENT revocation-history evidence observed at one durable
 /// source revision.
@@ -128,15 +140,18 @@ impl RevocationHistoryEvidence {
             if let Some(previous) = previous
                 && previous.closure_id.as_str() >= closure.closure_id.as_str()
             {
-                if previous.closure_id == closure.closure_id
-                    && let Some(field) = conflicted_closure_field(previous, closure)
-                {
-                    return Err(RevocationHistoryError::IdentityConflict(
-                        ClosureIdentityConflict {
-                            closure_id: closure.closure_id.clone(),
-                            field,
-                        },
-                    ));
+                if previous.closure_id == closure.closure_id {
+                    let previous_digest = closure_canonical_digest(previous)?;
+                    let digest = closure_canonical_digest(closure)?;
+                    if previous_digest != digest {
+                        return Err(RevocationHistoryError::IdentityConflict(
+                            ClosureIdentityConflict {
+                                closure_id: closure.closure_id.clone(),
+                                field: conflicted_closure_field(previous, closure)
+                                    .unwrap_or("closure.canonical_content"),
+                            },
+                        ));
+                    }
                 }
                 return Err(RevocationHistoryError::UnknownHistory);
             }
@@ -188,6 +203,46 @@ fn conflicted_closure_field(
     None
 }
 
+/// Canonical preimage of one exact revocation-closure presentation.
+/// Private on purpose: it is the digest input, not a wire contract.
+///
+/// Dependent order is spelling, not content (see
+/// [`conflicted_closure_field`]), so the preimage carries the sorted
+/// membership; the committed affected set is exactly this origin plus
+/// these dependents. Every other presented field is committed content.
+#[derive(Serialize)]
+struct RevocationClosureCanonicalPreimage<'a> {
+    closure_id: &'a str,
+    root_ref: &'a str,
+    dependent_refs: Vec<&'a str>,
+    invalidation_reason: Option<RevocationReason>,
+    current_influence: InfluenceState,
+    state_fence: &'a StateFence,
+    revision: u64,
+}
+
+/// Canonical request digest of one exact revocation-closure presentation:
+/// the identity, origin, sorted dependents, reason, state, fence, and
+/// revision the wire record presented. An unserializable presentation is
+/// unknown evidence, never a defaulted hash.
+fn closure_canonical_digest(
+    closure: &InfluenceDependencyClosure,
+) -> Result<String, RevocationHistoryError> {
+    let mut dependent_refs: Vec<&str> = closure.dependent_refs.iter().map(String::as_str).collect();
+    dependent_refs.sort_unstable();
+    let bytes = canonical_json_bytes(&RevocationClosureCanonicalPreimage {
+        closure_id: closure.closure_id.as_str(),
+        root_ref: closure.root_ref.as_str(),
+        dependent_refs,
+        invalidation_reason: closure.invalidation_reason,
+        current_influence: closure.current_influence,
+        state_fence: &closure.state_fence,
+        revision: closure.revision,
+    })
+    .map_err(|_| RevocationHistoryError::UnknownHistory)?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// One CURRENT revocation closure with its exact declared reference set.
 ///
 /// The affected set is what the durable record CLAIMS: the origin reference
@@ -210,6 +265,20 @@ pub struct ValidatedRevocationClosure {
     pub affected: BTreeSet<String>,
     /// Why the origin was invalidated.
     pub reason: RevocationReason,
+    /// The closure's own committed revision: nonzero and never newer than
+    /// the durable source revision it was observed at.
+    pub revision: u64,
+    /// Durable revocation-history revision the closure was observed at: the
+    /// recovery reference this validation is bound to.
+    pub source_revision: u64,
+    /// Canonical request digest of the exact presented bytes: identity,
+    /// origin, sorted dependents, reason, state, fence, and revision.
+    pub canonical_request_digest: String,
+    /// Evidence version this validation was proven under. Admission
+    /// requires [`REVOCATION_HISTORY_EVIDENCE_VERSION`], so a value
+    /// reaching admission by any path other than `require_current` under
+    /// the current version is refused rather than reinterpreted.
+    pub evidence_version: u16,
 }
 
 impl ValidatedRevocationClosure {
@@ -238,6 +307,7 @@ impl ValidatedRevocationClosure {
             validate_text(dependent, "dependent_ref")
                 .map_err(|_| RevocationHistoryError::UnknownHistory)?;
         }
+        let canonical_request_digest = closure_canonical_digest(closure)?;
         let mut affected = BTreeSet::new();
         affected.insert(closure.root_ref.clone());
         affected.extend(closure.dependent_refs.iter().cloned());
@@ -246,6 +316,10 @@ impl ValidatedRevocationClosure {
             root_ref: closure.root_ref.clone(),
             affected,
             reason,
+            revision: closure.revision,
+            source_revision: evidence.source_revision,
+            canonical_request_digest,
+            evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION,
         })
     }
 }
@@ -390,7 +464,21 @@ impl fmt::Display for ClosureIdentityConflict {
 /// comparison has succeeded. There is no way to build this value from raw
 /// `dependent_refs` membership, so suppression derivation cannot consume an
 /// unvalidated record and a record-supplied member can never become a second
-/// implicit origin.
+/// implicit origin. The admission binds evidence version, closure identity,
+/// typed origin, reason, the expected denominator (members, verified
+/// crossings, quarantined frontier, completeness, revision, and fence), the
+/// unfiltered committed membership, the declared traversal bounds, the
+/// durable source revision, the closure revision, and the canonical request
+/// digest of the exact presented bytes, so the admitted value identifies its
+/// own evidence version and its own evidence.
+///
+/// Two coordinates stay with the durable history owner and are never minted
+/// here: a wire-carried owner namespace (this crate binds the namespace only
+/// by resolving the declared origin against the bound graph) and a canonical
+/// durable receipt (minting one here would be a second canonical owner).
+/// Both need the durable-history-owner version bump and pre-partition across
+/// the evidence constructors; until then a foreign or unscoped reference
+/// refuses rather than being reinterpreted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmittedRevocationClosure {
     /// Stable closure identity carried by the evidence.
@@ -410,26 +498,51 @@ pub struct AdmittedRevocationClosure {
     /// without them: a denominator proven whole under wider bounds is a
     /// different proof.
     pub bounds: RevocationBounds,
+    /// Durable revocation-history revision the closure was observed at.
+    pub source_revision: u64,
+    /// The closure's own committed revision at that source revision.
+    pub closure_revision: u64,
+    /// Canonical request digest of the exact presented bytes this admission
+    /// was proven from: identity, origin, sorted dependents, reason,
+    /// state, fence, and revision.
+    pub canonical_request_digest: String,
+    /// Evidence version the admission was proven under, carried from the
+    /// validated closure so the admitted value identifies the evidence
+    /// version its proof ran under.
+    pub evidence_version: u16,
 }
 
 impl AdmittedRevocationClosure {
     /// The single construction site, callable only by the graph owner once
     /// the committed membership has been proven to lie inside
     /// `denominator`.
+    ///
+    /// The validated closure must carry the current
+    /// [`REVOCATION_HISTORY_EVIDENCE_VERSION`]: a value built by any path
+    /// other than current-form validation (a stale durable restore, a
+    /// hand-built record) is unknown evidence, never silently admitted as
+    /// the current stronger form.
     pub(crate) fn admit(
         closure: &ValidatedRevocationClosure,
         origin: RevocationOrigin,
         denominator: RevocationDenominator,
         bounds: RevocationBounds,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RevocationHistoryError> {
+        if closure.evidence_version != REVOCATION_HISTORY_EVIDENCE_VERSION {
+            return Err(RevocationHistoryError::UnknownHistory);
+        }
+        Ok(Self {
             closure_id: closure.closure_id.clone(),
             origin,
             reason: closure.reason,
             denominator,
             committed_members: closure.affected.clone(),
             bounds,
-        }
+            source_revision: closure.source_revision,
+            closure_revision: closure.revision,
+            canonical_request_digest: closure.canonical_request_digest.clone(),
+            evidence_version: closure.evidence_version,
+        })
     }
 }
 
@@ -490,8 +603,9 @@ pub enum RevocationHistoryError {
     StaleHistory,
     /// A closure is invalid, unordered, or not terminal revocation evidence;
     /// its declared origin resolves to no entity of the bound graph, or to
-    /// two; or a dependent reference it names resolves to nothing in this
-    /// graph. A lookup miss proves nothing about another graph: an
+    /// two; a dependent reference it names resolves to nothing in this
+    /// graph; or it carries an evidence version this crate did not
+    /// validate. A lookup miss proves nothing about another graph: an
     /// unresolvable reference in this graph's committed closure is unknown
     /// evidence, never a no-op.
     UnknownHistory,

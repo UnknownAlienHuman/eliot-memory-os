@@ -56,6 +56,11 @@ mod control_plane;
 /// and the captured operational log windows. It emits references, gaps, and
 /// one next step, never rolling log content and never an assigned cause.
 pub mod diagnostic_brief;
+/// Execution-path `OpenMetrics` wiring (issue #1841, I16.1/I16.2/I16.5): the
+/// bounded schema, labels, registry and exporter stay owned by
+/// `eliot-observability-runtime`; this module only installs that stack and maps
+/// observations the Kernel's own owners already hold onto its catalogue.
+pub mod execution_metrics;
 /// Kernel-owned durable audit evidence (issue #1837; I16): the single
 /// BLAKE3-chained audit chain plus the single Watchdog-domain anchor sink.
 /// Every authority/lifecycle boundary appends through the composition's
@@ -134,6 +139,29 @@ pub(crate) use shutdown_drain::{
     ShutdownPhase, ShutdownTerminal, coordinator_for, reverse_quiescence_order,
 };
 /// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
+/// Records that a supervision lease expired, at the exact decision that refuses
+/// the renewal.
+///
+/// I16.5 lists lease expiry among the metrics an operator needs, and
+/// `decide_daemon_supervision_progress_renewal` is the only place the Kernel
+/// decides it: the renewal is refused because the lease aged out, so a gauge
+/// raised anywhere else would be a second opinion about an authority that
+/// decision owns. The route label is the renewal path itself, not a daemon or
+/// session name, so the label cardinality stays bounded by the number of renewal
+/// paths.
+#[cfg(windows)]
+fn observe_supervision_lease_expiry() {
+    use eliot_observability_runtime::{ModuleIdentity, WorkClass};
+    let Some(metrics) = execution_metrics::kernel_metrics() else {
+        return;
+    };
+    metrics.record(metrics.record_lease_expiry(
+        ModuleIdentity::InternalRust,
+        WorkClass::Control,
+        "kernel.daemon_supervision_renewal",
+    ));
+}
+
 mod idle_lease_census;
 pub(crate) use idle_lease_census::KernelIdleLeaseCensus;
 pub(crate) use startup_coordinator::StartupCoordinator;
@@ -550,6 +578,12 @@ pub struct KernelComposition {
     /// of re-arming a fresh join. Pruned by grant expiry on every use;
     /// process-local only, never a restart/durable record.
     wasm_join_table: Mutex<eliot_kernel_service::WasmJoinTable>,
+    /// Pre-stage contract-rejection identity cache (issue #1796, I6.8). Holds
+    /// the exact canonical-hash → rejection mapping so an exact same-hash
+    /// retry replays the same rejection and changed bytes under one idempotency
+    /// key yield `IDENTITY_CONFLICT` — all before any ORS/store mutation,
+    /// ordering-sequence allocation, or `write_intent_id` mint.
+    pre_stage_identity_cache: Mutex<eliot_kernel_service::PreStageIdentityCache>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
     #[cfg(windows)]
@@ -2826,7 +2860,7 @@ impl KernelComposition {
     pub(crate) fn admit_material_process_start(
         &self,
         admission: &eliot_process::ProcessExecutionAdmissionRequest,
-    ) -> Result<(), KernelServiceError> {
+    ) -> Result<eliot_kernel_service::HostKernelCandidateBinding, KernelServiceError> {
         let target_generation =
             eliot_contracts::ResourceGeneration::new(admission.state_fence().generation().get())
                 .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
@@ -2834,7 +2868,20 @@ impl KernelComposition {
             admission.state_fence().authority_epoch().clone(),
             target_generation,
         );
-        self.admit_material_authority_for_fence(GovernanceProfile::full(), &target_fence)
+        let candidate = self.validate_material_target_fence(&target_fence)?;
+        // Issue #1935 AUD1: Material/Critical authority admits only under the live
+        // Governor-derived coverage profile (revision-bound, revokes on loss),
+        // never under a hard-coded GovernanceProfile::full().
+        self.admit_material_authority_for_governor_issued_fence(&target_fence)?;
+        self.verify_watchdog_supervision_branch(&candidate, &target_fence)
+            .map_err(|reason| {
+                KernelServiceError::Platform(format!(
+                    "{}: {reason}; Material/Critical work is paused under runtime-degraded-v3 and requires the explicit Human-risk path",
+                    eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
+                ))
+            })?;
+        self.validate_candidate_process_binding(&candidate)?;
+        Ok(candidate)
     }
 
     /// Records one real owner-produced I1.11 evidence item. Out-of-order
@@ -3371,6 +3418,7 @@ impl KernelComposition {
             )
         })?;
         if progress.stale_renewal_expired(policy, now_ms) {
+            observe_supervision_lease_expiry();
             return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
         }
         if request.observation.validate().is_ok() {
@@ -3382,6 +3430,7 @@ impl KernelComposition {
             Err(error) => {
                 progress.note_missed_renewal();
                 if progress.stale_renewal_expired(policy, now_ms) {
+                    observe_supervision_lease_expiry();
                     return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
                 }
                 return Err(error.into());

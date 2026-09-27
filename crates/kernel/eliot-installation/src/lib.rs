@@ -129,6 +129,7 @@ mod redb_state;
 mod registry_wire;
 mod runtime_root_contract;
 mod scm_approval;
+mod setup_binding;
 mod signed_activation;
 mod transaction;
 
@@ -211,14 +212,16 @@ use package::{
 };
 #[cfg(test)]
 use package::{package_absent_with_snapshot, package_manifest_matches, package_staging_reference};
-pub use package_planner::{GenerationPackagePlanInput, GenerationPackagePlanner};
+pub use package_planner::{
+    GenerationPackagePlanInput, GenerationPackagePlanner, ProfileRootSelectionInput,
+};
 pub use plan::{
     InstallerAclPrincipal, InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole,
     PackageArtifactDigest, PlannedChange, SupervisionAuthorityProvisionPlan,
 };
 use plan::{validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings};
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
-pub use profile_roots::InstallationRoots;
+pub use profile_roots::{INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots};
 pub use redb_state::{
     RedbInstallationTransactionStore, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
     SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
@@ -231,6 +234,11 @@ pub use runtime_root_contract::{
     ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
 };
 pub use scm_approval::{InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval};
+pub use setup_binding::{
+    SETUP_BINDING_WIRE_VERSION, SetupAdmissionError, SetupAdvanceInput, SetupBinding,
+    SetupEffectObservation, SetupKeyReference, SetupMilestone, SetupStatus, VerifiedSetupBinding,
+    validate_setup_binding_json, verify_setup_binding,
+};
 #[cfg(test)]
 use transaction::decode_installation_transaction_json;
 use transaction::decode_installation_transaction_json_from_store;
@@ -6870,7 +6878,10 @@ fn secret_port_error(error: eliot_platform_windows::WindowsAdapterError) -> Port
             eliot_platform_windows::WindowsAdapterError::IdentityMismatch
             | eliot_platform_windows::WindowsAdapterError::AclMismatch
             | eliot_platform_windows::WindowsAdapterError::AlreadyExists
-            | eliot_platform_windows::WindowsAdapterError::Failed => ProviderErrorCode::Failed,
+            | eliot_platform_windows::WindowsAdapterError::Failed
+            | eliot_platform_windows::WindowsAdapterError::RevertToSelf { .. } => {
+                ProviderErrorCode::Failed
+            }
             eliot_platform_windows::WindowsAdapterError::NotFound
             | eliot_platform_windows::WindowsAdapterError::Unavailable => {
                 ProviderErrorCode::Unavailable

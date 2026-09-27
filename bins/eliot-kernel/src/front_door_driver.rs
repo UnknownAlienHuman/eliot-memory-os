@@ -18,9 +18,13 @@ use eliot_ipc::{
 #[cfg(windows)]
 use eliot_kernel::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 use eliot_kernel::{KernelComposition, KernelFrameAction};
+#[cfg(windows)]
+use eliot_kernel_service::ProcessExecutionResponse;
 use eliot_kernel_service::{
     KernelControlCommand, control_response_frame, decode_control_request_frame,
 };
+#[cfg(windows)]
+use eliot_observability_runtime::{LocalPortOutcome, ModuleIdentity, WorkClass};
 use eliot_platform_windows::{
     NamedPipePeerKind, NamedPipePeerSelection, current_process_named_pipe_expectation,
 };
@@ -33,9 +37,26 @@ use crate::{exit_build_error, exit_error, write_error};
 #[cfg(windows)]
 const MAX_SESSIONS: usize = 32;
 
+/// Classifies one local-port response into the bounded port outcome I16.5 names.
+///
+/// The mapping is a property of the response shape, not a judgement about the
+/// work: a started child, a status projection, a cancellation receipt, a
+/// reconciliation and a bounded rejection are all port outcomes, and only a
+/// genuine rejection is reported as one. Collapsing them would make a refused
+/// admission indistinguishable from a failed execution in the scrape.
+#[cfg(windows)]
+fn local_port_outcome(response: &ProcessExecutionResponse) -> LocalPortOutcome {
+    match response {
+        ProcessExecutionResponse::Started(_)
+        | ProcessExecutionResponse::Status(_)
+        | ProcessExecutionResponse::Cancelled(_)
+        | ProcessExecutionResponse::Reconciled(_) => LocalPortOutcome::Succeeded,
+        ProcessExecutionResponse::Rejected(_) => LocalPortOutcome::Rejected,
+    }
+}
+
 /// Runs the authenticated front-door accept/rotation/session loop to drain.
 ///
-/// Keeps startup, authenticated listener rotation, and fenced shutdown in one
 /// ordered authority path. Returns after `ctrl_c` or a fenced front-door
 /// failure, once every spawned session has drained; the caller owns terminal
 /// shutdown projection.
@@ -311,11 +332,27 @@ async fn serve_connection(
                 session_binding,
             } => {
                 use eliot_kernel::process_execution_client;
-                use eliot_kernel_service::{ProcessExecutionClient, ProcessExecutionResponse};
+                use eliot_kernel_service::ProcessExecutionClient;
+                // I16.6 (issue #1841): the port execution is timed from the
+                // moment the local port was handed the admitted action, and the
+                // outcome is the one the port actually produced - a rejection
+                // from admission is `Rejected`, not a failed execution. Nothing
+                // here measures the transport write, so a slow peer cannot be
+                // reported as a slow port.
+                let port_started = std::time::Instant::now();
                 let response = match process_execution_client(&kernel, &session, &session_binding) {
                     Ok(client) => client.execute(request).await,
                     Err(rejection) => ProcessExecutionResponse::Rejected(rejection),
                 };
+                if let Some(metrics) = eliot_kernel::execution_metrics::kernel_metrics() {
+                    metrics.record(metrics.record_local_port(
+                        ModuleIdentity::LocalHttpAdapter,
+                        WorkClass::Interactive,
+                        "kernel.local_port",
+                        local_port_outcome(&response),
+                        port_started.elapsed(),
+                    ));
+                }
                 let reply = kernel.process_response_frame(&session, request_id, &response)?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();

@@ -1246,6 +1246,44 @@ impl NormalizedHostEventEnvelope {
     }
 }
 
+/// Binds one legacy quarantine wire to the closed normalized observation it
+/// carries, and returns that observation (issue #228 A6).
+///
+/// [`crate::HostEventEnvelope`] stays the quarantine wire for old producers,
+/// but a quarantine record may drive policy, authority, reactive-injection, or
+/// terminal-reduction logic only when it carries a closed typed observation
+/// and that observation validates. This is the single place the binding is
+/// decided; the closed owner validates its own schema version, identities,
+/// adapter binding, causal predecessors, payload kind, raw-source
+/// handle/digest, normalization receipt (including the recomputed output
+/// digest), loss/privacy/ceiling invariants, clock, and lineage. The wire's
+/// `event_id`, `cursor`, and `sequence` must then equal the normalized
+/// observation's by value, so the legacy wire's own identifier can never name
+/// a different observation than the one it carries.
+///
+/// The bridge host-hook intake holds no #361 `ProviderExecutionBinding` and no
+/// #369 `AdmittedRouteReceipt`, so the only admission the closed owner can
+/// perform here is [`NormalizedHostEventEnvelope::validate_as_session_observation`]:
+/// session-lifecycle and typed-quarantine observations. An execution-unit
+/// observation fails closed instead of being admitted on the wire's own
+/// framing, so arbitrary host JSON never becomes an attributable event.
+///
+/// Returns the validated observation so the consumer reads typed fields from
+/// the owner rather than from the legacy wire's generic JSON.
+pub fn validate_legacy_carry(
+    wire: &crate::HostEventEnvelope,
+) -> Result<&NormalizedHostEventEnvelope, ContractError> {
+    let normalized = &wire.normalized;
+    normalized.validate_as_session_observation()?;
+    if wire.event_id != normalized.event_id
+        || wire.cursor != normalized.cursor
+        || wire.sequence != normalized.sequence
+    {
+        return Err(ContractError::BindingMismatch);
+    }
+    Ok(normalized)
+}
+
 /// Durable-to-intake conversion view for one committed journal record (issues
 /// #371 W7/A27).
 ///

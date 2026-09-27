@@ -293,12 +293,53 @@ impl SkillHarnessActivationReceipt {
     }
 }
 
+/// Whether usefulness is established for one attempt, and by what evidence.
+///
+/// I7.25 keeps `installed != delivered != executed != useful` and states that
+/// a `SkillExecutionEvidence` "cannot prove that the Skill alone caused the
+/// result", while I12.24 makes usefulness depend on an owner-backed
+/// utility/outcome relation rather than on a presented reference. A plain
+/// `bool` cannot express that gap, so the claim is a vocabulary: only an
+/// owner-resolved relation to a recorded verifier-run/outcome record may
+/// produce [`OwnerBacked`](Self::OwnerBacked); every other state — including
+/// a presented-but-unresolved outcome reference — stays
+/// [`Unknown`](Self::Unknown) or [`NotEstablished`](Self::NotEstablished).
+/// Absence of a resolved owner relation is never a negative fact about the
+/// Skill and never a positive one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillUsefulness {
+    /// The observed activation, followed adherence and the presented outcome
+    /// references resolved to owner-recorded verifier-run/outcome records
+    /// bound to this exact attempt, Skill revision and fence.
+    OwnerBacked,
+    /// Activation or adherence was not observed, so no usefulness relation
+    /// could be evaluated. Never a negative finding.
+    #[default]
+    Unknown,
+    /// The owner record was resolved and it does not attribute utility to this
+    /// attempt; the run is observed but unattributed.
+    NotEstablished,
+}
+
+impl SkillUsefulness {
+    /// Whether this variant is a positive usefulness claim. Only the
+    /// owner-backed relation qualifies, so no plain boolean can stand in for
+    /// it.
+    #[must_use]
+    pub const fn is_useful(self) -> bool {
+        matches!(self, Self::OwnerBacked)
+    }
+}
+
 /// Derived per-attempt lifecycle summary. `delivered`, `retrieved`,
 /// `activated`, `adhered` and `useful` are distinct claims; a Skill included
 /// in a packet but never retrieved or activated is never marked successful.
 ///
 /// The four flags are independent lifecycle stages, not a ladder, so the
-/// struct keeps them as plain booleans by design.
+/// struct keeps them as plain booleans by design. Usefulness is NOT a
+/// boolean: it is a [`SkillUsefulness`] because only an owner-resolved
+/// utility/outcome relation can establish it (I7.25, I12.24).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -307,13 +348,20 @@ pub struct AttemptLifecycleSummary {
     pub retrieved: bool,
     pub activated: bool,
     pub adhered: SkillAdherenceStatus,
-    pub useful: bool,
+    pub useful: SkillUsefulness,
 }
 
-/// Derives the attempt summary from the exact receipt. Usefulness requires
-/// observed activation, followed adherence and verifier-backed outcome
-/// evidence; it is never inferred from installation, retrieval, repetition
-/// or model agreement.
+/// Derives the attempt summary from the exact receipt, WITHOUT any usefulness
+/// claim.
+///
+/// Usefulness is deliberately absent from this derivation: a presented
+/// `verified_outcome_refs` list is an unverified wire string set, and
+/// recognising that the list is non-empty proves nothing about the Skill.
+/// This function therefore always reports [`SkillUsefulness::Unknown`]; the
+/// owner-backed verdict comes only from
+/// [`qualify_useful_outcomes`](crate::qualify_useful_outcomes), which
+/// compares each reference against a real owner record. This keeps
+/// [`AttemptLifecycleSummary::useful`] unassignable by shape alone.
 #[must_use]
 pub fn derive_attempt_summary(receipt: &SkillHarnessActivationReceipt) -> AttemptLifecycleSummary {
     let delivered = matches!(
@@ -326,15 +374,201 @@ pub fn derive_attempt_summary(receipt: &SkillHarnessActivationReceipt) -> Attemp
     );
     let activated = receipt.activation == SkillActivationStatus::Observed;
     let adhered = receipt.adherence.combined();
-    let useful = activated
-        && adhered == SkillAdherenceStatus::Followed
-        && !receipt.verified_outcome_refs.is_empty();
     AttemptLifecycleSummary {
         delivered,
         retrieved,
         activated,
         adhered,
-        useful,
+        useful: SkillUsefulness::Unknown,
+    }
+}
+
+/// One presented outcome reference resolved to a canonical owner record, with
+/// the owner revision the read reported.
+///
+/// `record` is the ORIGINAL recorded value, re-validated against itself by
+/// [`qualify_useful_outcomes`] before it may support a claim — never a freshly
+/// recomputed substitute — and `reference` is the exact string the receipt
+/// presented. The pair exists only because a bounded named owner read returned
+/// the record under a selector that names this attempt; a caller that cannot
+/// produce this pair cannot produce a usefulness claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedOutcome {
+    /// Exact presented outcome reference this record was resolved for.
+    pub reference: String,
+    /// Owner revision (commit order) the canonical read reported, when that
+    /// owner reports one. `None` is the honest state for a keyed immutable
+    /// row owner (issue #1868 learning records) whose identity IS its
+    /// `record_digest` and which publishes no per-row commit order: a revision
+    /// is never synthesized to fill the field.
+    pub source_revision: Option<u64>,
+    /// The original recorded outcome, carried verbatim.
+    pub record: SkillExecutionEvidence,
+}
+
+/// Resolves the usefulness relation for one observed attempt against real
+/// owner-recorded outcomes, and returns the owner-backed summary.
+///
+/// `resolved` pairs are the owner records the caller's bounded named read
+/// returned for this receipt's `verified_outcome_refs`; each record is the
+/// ORIGINAL recorded value and is re-validated through
+/// [`SkillExecutionEvidence::validate`] before it may support a claim. The
+/// gate is conjunctive and evidence-typed:
+///
+/// * the attempt must show observed activation, and
+/// * adherence must combine to [`SkillAdherenceStatus::Followed`], and
+/// * at least one of the receipt's presented `verified_outcome_refs` must
+///   resolve to an owner record that itself validates.
+///
+/// Anything short of that reports [`SkillUsefulness::Unknown`] — never
+/// `OwnerBacked`, and never a negative fact about the Skill. A foreign or
+/// substituted outcome reference cannot produce a positive claim: a reference
+/// the receipt never presented is ignored outright, and one that resolves to
+/// a record failing its own validation is discarded.
+///
+/// Causal credit is never consumed here. Usefulness never converts
+/// [`CausalCredit::NoCausalCredit`] or a distributed/uncertain credit into a
+/// sole-cause claim: it records only that a verifier-run/outcome owner record
+/// exists for this attempt.
+#[must_use]
+pub fn qualify_useful_outcomes(
+    receipt: &SkillHarnessActivationReceipt,
+    resolved: &[ResolvedOutcome],
+) -> AttemptLifecycleSummary {
+    let mut summary = derive_attempt_summary(receipt);
+    if receipt.activation != SkillActivationStatus::Observed
+        || summary.adhered != SkillAdherenceStatus::Followed
+    {
+        return summary;
+    }
+    let matched = resolved.iter().any(|candidate| {
+        // The reference must be one this receipt actually presented, and the
+        // record must be the one that reference resolved to, validated as
+        // recorded.
+        receipt.verified_outcome_refs.contains(&candidate.reference)
+            && candidate.record.execution_ref == candidate.reference
+            && candidate.record.validate().is_ok()
+    });
+    summary.useful = if matched {
+        SkillUsefulness::OwnerBacked
+    } else {
+        SkillUsefulness::Unknown
+    };
+    summary
+}
+
+/// How completely one owner-qualified claim was backed by the reads that
+/// actually ran.
+///
+/// Coverage is recorded, never assumed: a claim whose source read was absent,
+/// refused, or truncated reports the corresponding state instead of silently
+/// degrading to a positive or negative finding (I7.25, I12.24).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceCoverage {
+    /// Every load-bearing source read ran, was current, and was complete.
+    Complete,
+    /// A source read was unavailable or refused; the claim is unqualified.
+    #[default]
+    Partial,
+    /// A source read was truncated, so currency could not be proved.
+    Truncated,
+    /// A load-bearing source read was absent, so the claim is unqualified.
+    Blocked,
+}
+
+impl EvidenceCoverage {
+    /// Whether the backing reads fully settled this candidate. Only
+    /// [`Complete`](Self::Complete) may publish a settled claim; every other
+    /// state reports the unresolved coverage instead, so a missing read is
+    /// never read as a finding.
+    #[must_use]
+    pub const fn is_settled(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// One load-bearing owner revision a qualification decision depended on.
+///
+/// The revision is whatever the canonical read actually reported for that
+/// source. It is never synthesized: an entry exists only because a bounded
+/// named read returned a current value for the exact selector that named this
+/// attempt, and `revision` is `None` for a keyed immutable row owner whose own
+/// digest IS its revision identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRevision {
+    /// Closed source this revision came from (e.g. the lifecycle row, the
+    /// attempt record, the outcome record).
+    pub source: String,
+    /// Owner revision the canonical read reported, when it reports one.
+    pub revision: Option<u64>,
+}
+
+impl SourceRevision {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        text(&self.source, "source_revision.source")?;
+        Ok(())
+    }
+}
+
+/// An ingest candidate bound to the owner revisions and evidence that
+/// qualified it, together with the coverage those reads actually achieved.
+///
+/// This is a candidate, not a finding. It is the ingest-side counterpart of
+/// `LifecycleCounters`: it records WHAT was read, AT WHICH revision, and HOW
+/// COMPLETELY — and a claim that could not be fully backed stays
+/// `unknown`/unqualified rather than becoming a negative fact about the Skill
+/// or a positive summary. Every load-bearing owner revision is carried
+/// explicitly, so a later publisher can re-check them under a fresh borrow
+/// rather than trusting a stale observation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerQualifiedCandidate {
+    /// Skill identity the candidate observes.
+    pub skill_id: String,
+    /// Skill revision observed.
+    pub skill_revision: String,
+    /// Package digest observed.
+    pub package_digest: String,
+    /// Attempt identity the evidence is bound to — the HISTORICAL agent
+    /// attempt being observed, never the authenticated ingest request.
+    pub subject_attempt_ref: String,
+    /// Load-bearing owner revisions the qualification depended on.
+    pub source_revisions: Vec<SourceRevision>,
+    /// Owner records that resolved this receipt's presented outcome refs.
+    pub resolved_outcomes: Vec<ResolvedOutcome>,
+    /// How completely the backing reads were served.
+    pub coverage: EvidenceCoverage,
+    /// Usefulness established from the resolved owner records, or unknown.
+    pub useful: SkillUsefulness,
+}
+
+impl OwnerQualifiedCandidate {
+    /// Whether every load-bearing read was complete and current. A partial,
+    /// truncated or blocked candidate is never publishable as a settled claim.
+    #[must_use]
+    pub fn is_fully_qualified(&self) -> bool {
+        self.coverage == EvidenceCoverage::Complete
+    }
+
+    pub fn validate(&self) -> Result<(), SkillError> {
+        text(&self.skill_id, "candidate.skill_id")?;
+        text(&self.skill_revision, "candidate.skill_revision")?;
+        digest(&self.package_digest, "candidate.package_digest")?;
+        text(&self.subject_attempt_ref, "candidate.subject_attempt_ref")?;
+        for revision in &self.source_revisions {
+            revision.validate()?;
+        }
+        for outcome in &self.resolved_outcomes {
+            text(&outcome.reference, "candidate.resolved_outcome.reference")?;
+            outcome
+                .record
+                .validate()
+                .map_err(|error| SkillError::Surface(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -679,7 +913,7 @@ fn fold_attempt_evidence(
         if receipt.retrieval == SkillRetrievalStatus::Expanded {
             fold.expanded = fold.expanded.saturating_add(1);
         }
-        if summary.useful {
+        if summary.useful.is_useful() {
             fold.useful = fold.useful.saturating_add(1);
         }
         if summary.retrieved
@@ -710,22 +944,25 @@ pub struct ExecutionFold {
 /// Production verdict of the unknown-effects reconciliation gate (issue
 /// #1191).
 ///
-/// Counts the exact presented step/artifact/verifier evidence by outcome and
+/// Counts distinct presented executions by latest presented outcome and
 /// names every execution still [`ExecutionOutcome::Uncertain`]. Retry is
 /// permitted only when nothing is uncertain: an uncertain execution has
 /// unknown effects, and an unknown effect must be reconciled — superseded by
 /// exact observed or failed evidence for the same execution — before the next
-/// attempt. Absence of an execution record is absence of evidence, never an
-/// observed claim: only presented records fold, so uninstrumented executions
-/// stay unknown instead of proving success.
+/// attempt. Repeated records for one execution fold idempotently through
+/// their latest outcome instead of double-counting. Absence of an execution
+/// record is absence of evidence, never an observed claim: only presented
+/// records fold, so uninstrumented executions stay unknown instead of
+/// proving success.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnknownEffectsVerdict {
-    /// Presented executions with a fully observed outcome.
+    /// Distinct presented executions whose latest outcome is fully observed.
     pub observed: u64,
-    /// Presented executions with a known failed outcome.
+    /// Distinct presented executions whose latest outcome is known failed.
     pub failed: u64,
-    /// `execution_ref`s whose effects are still unknown.
+    /// `execution_ref`s whose latest presented outcome is still unknown, in
+    /// first-presented order.
     pub uncertain_pending_refs: Vec<String>,
 }
 
@@ -753,23 +990,50 @@ impl UnknownEffectsVerdict {
 
 /// Reconciles unknown execution effects before retry (issue #1191).
 ///
-/// Validates every presented [`SkillExecutionEvidence`] and folds the exact
-/// outcome counts through [`fold_execution_evidence`]: observed executions
-/// require exact step refs, non-default causal credit requires exact step
-/// refs and never claims sole cause, and missing
-/// instrumentation never becomes an observed claim — unreported executions
-/// simply do not fold. The returned verdict names the still-uncertain
-/// execution refs; the caller refuses retry while [`UnknownEffectsVerdict::retry_permitted`]
-/// is false.
+/// Validates every presented [`SkillExecutionEvidence`] and folds one
+/// outcome per distinct execution: the latest presented outcome wins, so an
+/// exact observed or failed record supersedes an earlier uncertain one for
+/// the same execution, a later uncertain record re-opens it, and repeated
+/// records fold idempotently. Observed executions require exact step refs,
+/// non-default causal credit requires exact step refs and never claims sole
+/// cause, and missing instrumentation never becomes an observed claim —
+/// unreported executions simply do not fold. The returned verdict names the
+/// still-uncertain execution refs; the caller refuses retry while
+/// [`UnknownEffectsVerdict::retry_permitted`] is false.
 pub fn reconcile_unknown_effects(
     executions: &[SkillExecutionEvidence],
 ) -> Result<UnknownEffectsVerdict, SkillError> {
+    // Latest presented outcome wins per execution. Windows are
+    // payload-bounded, so the linear scan stays small.
+    let mut latest: Vec<(String, ExecutionOutcome)> = Vec::new();
+    for execution in executions {
+        execution.validate()?;
+        match latest
+            .iter_mut()
+            .find(|(reference, _)| *reference == execution.execution_ref)
+        {
+            Some(slot) => slot.1 = execution.outcome,
+            None => latest.push((execution.execution_ref.clone(), execution.outcome)),
+        }
+    }
+    // Independent re-derivation over the raw records: every folded outcome
+    // must match its latest presented record, so a verdict that clears a
+    // still-uncertain execution — or miscounts a superseded one — never
+    // publishes.
+    for (reference, outcome) in &latest {
+        let confirmed = executions
+            .iter()
+            .rfind(|execution| &execution.execution_ref == reference)
+            .is_some_and(|record| record.outcome == *outcome);
+        if !confirmed {
+            return Err(SkillError::IdentityMismatch);
+        }
+    }
     let mut observed = 0_u64;
     let mut failed = 0_u64;
     let mut uncertain_pending_refs = Vec::new();
-    for execution in executions {
-        execution.validate()?;
-        match execution.outcome {
+    for (reference, outcome) in &latest {
+        match outcome {
             ExecutionOutcome::Observed => {
                 observed = observed.saturating_add(1);
             }
@@ -777,20 +1041,9 @@ pub fn reconcile_unknown_effects(
                 failed = failed.saturating_add(1);
             }
             ExecutionOutcome::Uncertain => {
-                if !uncertain_pending_refs.contains(&execution.execution_ref) {
-                    uncertain_pending_refs.push(execution.execution_ref.clone());
-                }
+                uncertain_pending_refs.push(reference.clone());
             }
         }
-    }
-    // The shared fold is the single counter implementation: the verdict must
-    // agree with it exactly, so a divergence fails closed here instead of
-    // publishing two truths.
-    let fold = fold_execution_evidence(executions)?;
-    let uncertain_matches = usize::try_from(fold.uncertain)
-        .is_ok_and(|narrowed| narrowed == uncertain_pending_refs.len());
-    if fold.executed != observed || fold.failed != failed || !uncertain_matches {
-        return Err(SkillError::IdentityMismatch);
     }
     let verdict = UnknownEffectsVerdict {
         observed,
@@ -801,14 +1054,15 @@ pub fn reconcile_unknown_effects(
     Ok(verdict)
 }
 
-/// Counts execution evidence by outcome; observed executions with verifier
-/// refs count as verified. Causal credit is never a sole-cause claim:
+/// Counts presented execution records by outcome; observed executions with
+/// verifier refs count as verified. Causal credit is never a sole-cause claim:
 /// evidence validation accepts only the distributed, uncertain or associated
-/// representations, each bound to exact step refs. This is the single production
-/// outcome fold — [`reconcile_unknown_effects`] and
-/// [`derive_lifecycle_view`] both count through it, so the daemon execution
-/// ingest and the lifecycle derivation can never publish divergent counters
-/// for the same evidence window.
+/// representations, each bound to exact step refs. This is the record-count
+/// fold behind [`derive_lifecycle_view`]: unlike
+/// [`reconcile_unknown_effects`], which folds one latest outcome per distinct
+/// execution for the retry gate, it counts every presented record, so the two
+/// agree exactly on duplicate-free windows and intentionally differ when one
+/// execution carries repeated records.
 pub fn fold_execution_evidence(
     executions: &[SkillExecutionEvidence],
 ) -> Result<ExecutionFold, SkillError> {

@@ -1380,7 +1380,8 @@ fn validate_committed_canonical_transition(
 /// projection publications are not whole: every publication the transaction
 /// wrote must be named by the very receipt this commit produced, must pin that
 /// receipt's commit as its atomic data/provenance commit, must sit at the
-/// receipt's own fence, and must name exactly the scope-revision heads this
+/// receipt's own fence, must name the currently declared definition digest for
+/// its projection kind, and must name exactly the scope-revision heads this
 /// transaction committed as its source heads — read back through the same
 /// [`eliot_store_api::FencedProjectionPublication::check_record_current`]
 /// predicate the reader-side publication gate uses, so the write-side and
@@ -1410,10 +1411,18 @@ fn validate_committed_projection_publications(
         {
             return Err(AdapterError::Store(StoreError::InvalidProjection));
         }
+        // The definition digest is compared against the store's CURRENT
+        // declaration for this kind, resolved through the same one function the
+        // planner wrote it from, so a commit can never publish a record that
+        // names a stale or undeclared projection definition.
+        let declared_definition_digest =
+            eliot_store_api::declared_projection_definition_digest(&record.projection_kind)
+                .map_err(AdapterError::Store)?;
         eliot_store_api::FencedProjectionPublication::check_record_current(
             record,
             &plan.next_revision_heads,
             record.source_generation,
+            &declared_definition_digest,
         )
         .map_err(AdapterError::Store)?;
     }
@@ -1434,8 +1443,9 @@ fn validate_committed_projection_publications(
 /// exact subject/scope. All `SurrealQL` stays in `apply`/`schema` modules;
 /// this boundary carries store-api types only (plus the local intent/outcome
 /// model in `atomic_write`, since the neutral purge port is defined in a
-/// parallel subtask and is not yet on this base; the adapter never imports
-/// `eliot-erasure`).
+/// parallel subtask and is not yet on this base; the canonical erasure path
+/// lives in `eliot-store-api` `erasure_admission` and `ErasureIntentRecord`,
+/// not in a separate crate).
 ///
 /// `record_surreal_erasure_intent` validates and freezes the intent: in the
 /// live path the returned intent is the durable row the atomic transaction

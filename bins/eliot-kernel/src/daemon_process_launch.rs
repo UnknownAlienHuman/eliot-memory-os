@@ -241,6 +241,53 @@ impl KernelComposition {
         .map_err(|error| {
             KernelBuildError::Service(format!("eliotd intent session binding failed: {error}"))
         })?;
+        let (candidate, activation) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+            if service.generation_fenced()
+                || !matches!(
+                    service.state(),
+                    super::KernelServiceState::Activating | super::KernelServiceState::Ready
+                )
+            {
+                return Err(KernelBuildError::Service(
+                    "eliotd launch has no current authenticated activation".to_owned(),
+                ));
+            }
+            let candidate = service.candidate_binding().cloned().ok_or_else(|| {
+                KernelBuildError::Service(
+                    "eliotd launch has no current Host Kernel candidate binding".to_owned(),
+                )
+            })?;
+            let activation = service.activation_receipt().cloned().ok_or_else(|| {
+                KernelBuildError::Service(
+                    "eliotd launch has no authenticated activation receipt".to_owned(),
+                )
+            })?;
+            (candidate, activation)
+        };
+        candidate
+            .validate()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        if activation.candidate_binding_digest != candidate_digest
+            || activation.authority_epoch != launch.authority_epoch
+            || activation.generation != launch.generation
+            || candidate.kernel_epoch != launch.authority_epoch
+            || admission.state_fence().authority_epoch() != &activation.authority_epoch
+            || admission.state_fence().generation().get() != activation.generation.value()
+        {
+            return Err(KernelBuildError::Service(
+                "eliotd launch candidate differs from its authenticated activation".to_owned(),
+            ));
+        }
+        self.validate_candidate_process_binding(&candidate)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let outer_binding = candidate;
         {
             let mut state = self.daemon_runtime.lock().map_err(|_| {
                 KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
@@ -254,7 +301,7 @@ impl KernelComposition {
             state.supervision = None;
             state.live_ready = None;
         }
-        let receipt = match gateway.start(&owner, admission, proof).await {
+        let receipt = match gateway.start(&owner, admission, proof, outer_binding).await {
             Ok(receipt) => receipt,
             Err(error) => {
                 let reason = format!("eliotd process start failed: {error}");

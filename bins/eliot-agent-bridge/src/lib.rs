@@ -40,9 +40,11 @@ pub use eliot_agent_bridge_core::{
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
 use eliot_contracts::{
+    BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
     BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
-    BridgeTransportBackpressure, ClockReading, ProductId, RequestId, RequestMetadata, SourceId,
-    StateFence, canonical_json_bytes, sha256_hex,
+    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
+    BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
+    RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -894,13 +896,15 @@ fn decode_recovery_stream(
         decode_stream_snapshot(stream, live_generation)?;
     let producer_id = recovery_text(stream, "producer_id")?;
     let owner_incarnation = recovery_sequence(stream, "owner_incarnation")?;
-    recovery_sequence(stream, "owner_revision")?;
+    let owner_revision = recovery_sequence(stream, "owner_revision")?;
     let events = decode_page_events(&stream_id, &producer_id, page, live_generation, budget)?;
     let gaps = decode_stream_gaps(stream, &stream_id, budget)?;
     let cut = RecoveryStreamCut::checked(
         recovery_cursor(stream, "upper_sequence")?,
         recovery_sequence(stream, "expected_revision")?,
         recovery_cursor(stream, "retention_floor")?,
+        owner_incarnation,
+        owner_revision,
     )
     .map_err(|_| event_shape_failure("reconciliation refused: invalid owner recovery cut"))?;
     let gap_continuation = match stream.get("gap_continuation") {
@@ -1146,6 +1150,43 @@ fn decode_page_continuation(
 /// required stream scope must still be present and its continuation must
 /// still advance past the requested predecessor; otherwise the page is a
 /// foreign or stale continuation and refuses.
+/// Checks that an answer belongs to the presenting attach: the owner must report
+/// the live generation this attach was activated at and — when a continuation
+/// was requested — keep the SAME window identity. A changed window key means the
+/// owner redefined the walk, which is refused rather than adopted.
+fn check_reconciliation_identity(
+    binding: &AttachBinding,
+    reconciliation: &serde_json::Value,
+    expected: Option<&RecoveryReadRequest>,
+) -> Result<u64, ProviderFailure> {
+    let live_generation = recovery_cursor(reconciliation, "live_generation")?;
+    if live_generation == 0 {
+        return Err(event_shape_failure(
+            "reconciliation refused: live generation must be nonzero",
+        ));
+    }
+    if live_generation != binding.activation_generation().get() {
+        return Err(event_shape_failure(
+            "reconciliation refused: live generation does not match the presenting attach",
+        ));
+    }
+    if let Some(request) = expected {
+        let window_key = recovery_digest(reconciliation, "window_key")?;
+        if request.window_key() != window_key.as_str() {
+            return Err(event_shape_failure(
+                "recovery continuation refused: owner window identity changed",
+            ));
+        }
+    }
+    Ok(live_generation)
+}
+
+/// Decodes the owner's reconciliation answer into a port outcome, refusing any
+/// answer that does not belong to the presenting attach. The continuation
+/// checks live in [`check_expected_continuation`]: a required stream scope must
+/// still be present and its continuation must still advance past the requested
+/// predecessor; otherwise the page is a foreign or stale continuation and
+/// refuses.
 fn decode_reconciliation_outcome(
     binding: &AttachBinding,
     facts: &BridgeEventTransportFacts,
@@ -1170,23 +1211,8 @@ fn decode_reconciliation_outcome(
             "reconciliation refused: owner answer does not echo the presenting connection",
         ));
     }
-    let live_generation = recovery_cursor(reconciliation, "live_generation")?;
-    if live_generation == 0 {
-        return Err(event_shape_failure(
-            "reconciliation refused: live generation must be nonzero",
-        ));
-    }
-    if live_generation != binding.activation_generation().get() {
-        return Err(event_shape_failure(
-            "reconciliation refused: live generation does not match the presenting attach",
-        ));
-    }
+    let live_generation = check_reconciliation_identity(binding, reconciliation, expected)?;
     let window_key = recovery_digest(reconciliation, "window_key")?;
-    if expected.is_some_and(|request| request.window_key() != window_key.as_str()) {
-        return Err(event_shape_failure(
-            "recovery continuation refused: owner window identity changed",
-        ));
-    }
     let window_status = match reconciliation
         .get("window_status")
         .and_then(serde_json::Value::as_str)
@@ -1201,6 +1227,31 @@ fn decode_reconciliation_outcome(
         }
     };
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
+    // The typed disposition, the explicit unresolved frontier, and the page
+    // commitment are all resolved BEFORE any fact below is decoded, let alone
+    // applied: a page whose commitment cannot be recomputed from the answer's
+    // own legs is refused whole, so no known fact and no unresolved frontier
+    // is ever applied half-verified.
+    let disposition = decode_recovery_window_disposition(reconciliation)?;
+    // The typed disposition and the legacy status leg must agree, so an
+    // answer cannot present a refresh-required walk as an active one (or the
+    // reverse) and be read through whichever leg the consumer happens to use.
+    let expected_status = match disposition {
+        BridgeRecoveryWindowDisposition::Active => "active",
+        BridgeRecoveryWindowDisposition::Moved => "moved",
+        BridgeRecoveryWindowDisposition::Expired => "expired",
+    };
+    if reconciliation
+        .get("window_status")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_status)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: window status disagrees with its typed disposition",
+        ));
+    }
+    let unresolved = decode_recovery_unresolved_frontier(reconciliation)?;
+    verify_recovery_page_commitment(reconciliation, &window_key, disposition, &unresolved)?;
     let stream_facts = decode_reconciliation_streams(reconciliation, live_generation, &mut budget)?;
     let unscoped_gaps = decode_unscoped_gaps(reconciliation, &mut budget)?;
     let coverage = decode_recovery_reply_coverage(reconciliation)?;
@@ -1351,37 +1402,154 @@ fn decode_unscoped_gaps(
     Ok(unscoped_gaps)
 }
 
-/// Requires the requested continuation scope to still be present in the
-/// answer with a continuation that still advances past the requested
-/// predecessor; otherwise the page is foreign or stale and refuses.
+/// The exact selector this request is, expressed as the ONE shared
+/// cross-owner contract type (issue #2798).
+///
+/// There is no bridge-local shape for this any more: the same type the Kernel
+/// validated and ORS resolved produces these bytes, so a mismatch anywhere
+/// downstream is a real disagreement rather than two parsers spelling the
+/// same request differently.
 fn recovery_scope_value(
     request: &RecoveryReadRequest,
-) -> Result<serde_json::Value, ProviderFailure> {
+) -> Result<BridgeRecoverySelector, ProviderFailure> {
     if let Some((stream_id, after_sequence, cut, event_limit, gap_offset, gap_limit)) =
         request.stream_scope()
     {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "stream", "window_key": request.window_key(),
-            "stream_id": stream_id, "after_sequence": after_sequence,
-            "upper_sequence": cut.upper_sequence(), "expected_revision": cut.expected_revision(),
-            "retention_floor": cut.retention_floor(), "event_limit": event_limit,
-            "gap_offset": gap_offset, "gap_limit": gap_limit,
-        }))
+        Ok(BridgeRecoverySelector::Stream {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: request.window_key().to_owned(),
+            stream_id: stream_id.to_owned(),
+            owner_incarnation: cut.owner_incarnation(),
+            owner_revision: cut.owner_revision(),
+            expected_revision: cut.expected_revision(),
+            after_sequence,
+            upper_sequence: cut.upper_sequence(),
+            retention_floor: cut.retention_floor(),
+            event_limit,
+            gap_offset,
+            gap_limit,
+        })
     } else if let Some((after_stream, stream_limit)) = request.stream_list_scope() {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "streams", "window_key": request.window_key(),
-            "after_stream": after_stream, "stream_limit": stream_limit,
-        }))
+        Ok(BridgeRecoverySelector::Streams {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: request.window_key().to_owned(),
+            after_stream: after_stream.to_owned(),
+            stream_limit,
+        })
     } else if let Some((after_gap_scope, gap_offset, gap_limit)) = request.unscoped_gap_scope() {
-        Ok(serde_json::json!({
-            "version": 1, "kind": "unscoped_gaps", "window_key": request.window_key(),
-            "after_gap_scope": after_gap_scope, "gap_offset": gap_offset, "gap_limit": gap_limit,
-        }))
+        Ok(BridgeRecoverySelector::UnscopedGaps {
+            version: BRIDGE_RECOVERY_SELECTOR_VERSION,
+            window_key: request.window_key().to_owned(),
+            after_gap_scope: after_gap_scope.to_owned(),
+            gap_offset,
+            gap_limit,
+        })
     } else {
         Err(event_shape_failure(
             "recovery continuation has no bounded selector",
         ))
     }
+}
+
+/// Verifies the owner's canonical page commitment BEFORE any live-state swap.
+///
+/// The commitment is recomputed from the answer's own legs with the same
+/// shared contract type the owner used, so this is a genuine content
+/// comparison against the recorded value — not an existence or shape check.
+/// A page that cannot be recomputed exactly is refused whole: no known fact is
+/// applied, and the explicit unresolved frontier that travelled with the
+/// commitment names what the owner could not resolve.
+fn verify_recovery_page_commitment(
+    reconciliation: &serde_json::Value,
+    window_key: &str,
+    disposition: BridgeRecoveryWindowDisposition,
+    unresolved: &BridgeRecoveryUnresolvedFrontier,
+) -> Result<String, ProviderFailure> {
+    if reconciliation
+        .get("page_commitment_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION)
+    {
+        return Err(event_shape_failure(
+            "recovery page refused: unsupported commitment version",
+        ));
+    }
+    let recorded = recovery_digest(reconciliation, "page_commitment")?;
+    // The owner hashes the page body BEFORE attaching the commitment legs, so
+    // they are stripped here and nothing else.
+    let mut preimage = reconciliation.clone();
+    let object = preimage.as_object_mut().ok_or_else(|| {
+        event_shape_failure("recovery page refused: owner answer is not an object")
+    })?;
+    object.remove("page_commitment");
+    object.remove("page_commitment_version");
+    let selector = match object.get("selected_scope") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => Some(BridgeRecoverySelector::decode(value).map_err(|_| {
+            event_shape_failure(
+                "recovery page refused: selected scope is not the shared selector type",
+            )
+        })?),
+    };
+    let computed = BridgeRecoveryPageCommitment::compute(
+        selector.as_ref(),
+        window_key,
+        disposition,
+        unresolved,
+        &preimage,
+    )
+    .map_err(|_| event_shape_failure("recovery page refused: commitment is not computable"))?;
+    if computed.digest() != recorded {
+        return Err(event_shape_failure(
+            "recovery page refused: commitment does not bind these facts; \
+             nothing applied, safe to retry",
+        ));
+    }
+    Ok(recorded)
+}
+
+/// Decodes the explicit unresolved frontier the owner recorded beside its
+/// disposition, and refuses an answer that omits it.
+///
+/// A walk that cannot be completed must stay visibly incomplete: without this
+/// leg a short page could be read as a whole one.
+fn decode_recovery_unresolved_frontier(
+    reconciliation: &serde_json::Value,
+) -> Result<BridgeRecoveryUnresolvedFrontier, ProviderFailure> {
+    let value = reconciliation
+        .get("unresolved_frontier")
+        .ok_or_else(|| event_shape_failure("recovery page refused: unresolved frontier absent"))?;
+    serde_json::from_value(value.clone()).map_err(|_| {
+        event_shape_failure("recovery page refused: unresolved frontier is not the typed frontier")
+    })
+}
+
+/// Decodes the owner's typed disposition, rejecting a bare status string the
+/// contract does not define.
+fn decode_recovery_window_disposition(
+    reconciliation: &serde_json::Value,
+) -> Result<BridgeRecoveryWindowDisposition, ProviderFailure> {
+    let disposition: BridgeRecoveryWindowDisposition = reconciliation
+        .get("window_disposition")
+        .cloned()
+        .ok_or_else(|| event_shape_failure("recovery page refused: typed disposition absent"))
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|_| {
+                event_shape_failure("recovery page refused: disposition is not a known variant")
+            })
+        })?;
+    // The reason leg must be the reason vocabulary member for that variant,
+    // so a moved window can never be relabelled as a plain truncation.
+    if reconciliation
+        .get("window_disposition_reason")
+        .and_then(serde_json::Value::as_str)
+        != Some(disposition.reason())
+    {
+        return Err(event_shape_failure(
+            "recovery page refused: disposition reason does not match its variant",
+        ));
+    }
+    Ok(disposition)
 }
 
 /// A complete finite event page must account for its declared upper bound.
@@ -1493,6 +1661,30 @@ fn check_recovery_page_ordinals(
     Ok(())
 }
 
+/// Checks an answer that carried NO continuation request: any selector in the
+/// answer is unsolicited and refused, and every returned page is instead
+/// checked against the current acknowledged cursor.
+fn check_unsolicited_continuation(
+    reconciliation: &serde_json::Value,
+    stream_facts: &[RecoveredStreamFacts],
+) -> Result<(), ProviderFailure> {
+    if !reconciliation
+        .get("requested_recovery_scope")
+        .is_some_and(serde_json::Value::is_null)
+        || !reconciliation
+            .get("selected_scope")
+            .is_some_and(serde_json::Value::is_null)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: unsolicited continuation selector",
+        ));
+    }
+    for page in stream_facts {
+        check_finite_page_end(page, page.acked_cursor())?;
+    }
+    Ok(())
+}
+
 fn check_expected_continuation(
     reconciliation: &serde_json::Value,
     stream_facts: &[RecoveredStreamFacts],
@@ -1502,22 +1694,13 @@ fn check_expected_continuation(
         .get("requested_recovery_scope")
         .ok_or_else(|| event_shape_failure("reconciliation refused: requested selector absent"))?;
     let Some(request) = expected else {
-        if !requested.is_null()
-            || !reconciliation
-                .get("selected_scope")
-                .is_some_and(serde_json::Value::is_null)
-        {
-            return Err(event_shape_failure(
-                "reconciliation refused: unsolicited continuation selector",
-            ));
-        }
-        for page in stream_facts {
-            check_finite_page_end(page, page.acked_cursor())?;
-        }
-        return Ok(());
+        return check_unsolicited_continuation(reconciliation, stream_facts);
     };
     let exact = recovery_scope_value(request)?;
-    if requested != &exact || reconciliation.get("selected_scope") != Some(&exact) {
+    let exact_value = serde_json::to_value(&exact).map_err(|_| {
+        event_shape_failure("reconciliation refused: requested selector is not encodable")
+    })?;
+    if requested != &exact_value || reconciliation.get("selected_scope") != Some(&exact_value) {
         return Err(event_shape_failure(
             "recovery continuation refused: owner selected a foreign scope",
         ));
@@ -1634,7 +1817,7 @@ fn check_expected_continuation(
 ///
 /// | method | provider normalizer | Governor ingest | result readback |
 /// |---|---|---|---|
-/// | `forward_hook` | envelope already normalized bridge-side (`HostEventEnvelope::validate`) | none (transport observation) | RECEIVED echo bound to the hook digest |
+/// | `forward_hook` | closed typed observation required and validated by its owner (`HostEventEnvelope::validate` -> `HostEventEnvelope::normalized`); the wire's generic `normalized_payload` is never interpreted (issue #228 A6) | none (transport observation) | RECEIVED echo bound to the hook digest |
 /// | `forward_event` | `normalize_acp_event` for raw producer bytes (ACP owner); forwarded `EventEnvelope` linkage re-validated Kernel-side | coordinator `observe_committed_intake` over `CommittedHostEventIntake` (ACP/commit path) | owner phase/disposition/cursors from the ORS row |
 /// | `forward_gap` | gap identity/interval validation (no normalization) | none (coverage accounting) | gap acceptance bound to the gap identity |
 /// | `reconcile_external` | none (read path) | none (read path) | ownership/cursor/page facts plus the bound reconciliation key |
@@ -1664,6 +1847,19 @@ fn check_expected_continuation(
 /// resubmitted as a host request.
 struct KernelMcpForwardingPort {
     shared: SharedTransport,
+}
+
+/// Typed refusal for a contested reconciliation-import commit (issue #2799):
+/// the retained transport owner is already borrowed, so nothing was
+/// committed on either half of the import and the caller retries the same
+/// import. Silent success after a skipped ack-cache update is forbidden on
+/// this path.
+fn reconciliation_import_borrow_refusal() -> ProviderFailure {
+    ProviderFailure::new(
+        "eliot-kernel-front-door",
+        "reconciliation import refused: retained transport owner is mutably borrowed; core \
+         recovery state, owner ack bases, and held receipts are unchanged; retry the import",
+    )
 }
 
 impl KernelMcpForwardingPort {
@@ -1804,35 +2000,6 @@ impl KernelMcpForwardingPort {
             return;
         }
         held.insert(sequence);
-    }
-
-    /// Records the owner-confirmed acked base only after core import accepted
-    /// the verified reconcile reply, then prunes the held sequences it confirms.
-    ///
-    /// Owner confirmation is a receipt, not local inference: only sequences
-    /// at or below the confirmed base leave the held set, and the
-    /// contiguous frontier always resumes above it.
-    fn note_owner_acked(&mut self, stream_id: &str, acked: u64) {
-        let Ok(mut owner) = self.shared.try_borrow_mut() else {
-            return;
-        };
-        let known = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
-        if acked > known {
-            owner.owner_acked.insert(stream_id.to_owned(), acked);
-        }
-        let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
-        let empty = if let Some(held) = owner.delivered_sequences.get_mut(stream_id) {
-            let confirmed: Vec<u64> = held.range(..=base).copied().collect();
-            for sequence in confirmed {
-                held.remove(&sequence);
-            }
-            held.is_empty()
-        } else {
-            false
-        };
-        if empty {
-            owner.delivered_sequences.remove(stream_id);
-        }
     }
 
     /// Builds the exact contiguous consumed frontier justified by the
@@ -2120,22 +2287,85 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         decode_reconciliation_outcome(binding, &facts, &value, Vec::new(), Some(request))
     }
 
+    /// Jointly commits the transport half of one validated reconciliation
+    /// import (issue #2799): the exact proposed owner ack bases plus
+    /// held-sequence pruning restricted to those confirmed bases.
+    ///
+    /// The core calls this after its candidate recovery window applied off
+    /// to the side and before the candidate publishes. Preparation runs on
+    /// one short immutable snapshot: owner confirmation is a receipt, not
+    /// local inference, so bases only rise and only sequences at or below
+    /// the confirmed base leave the held set; a lower cursor prunes only
+    /// its proven prefix and never rolls state backward. All allocation
+    /// happens before the mutable borrow is acquired; the commit itself
+    /// swaps two prepared maps, which cannot fail.
+    ///
+    /// A borrow conflict or stale continuity commits nothing and returns a
+    /// typed refusal naming the preserved state and the retry/recovery
+    /// directive. Ack bases stay keyed by stream text here (BLOCKED-BY
+    /// #2798: owner/window/revision/incarnation namespacing must land
+    /// before a same-named replacement stream stops inheriting the
+    /// predecessor cursor), and no outstanding-offer state exists to retire
+    /// (BLOCKED-BY #2800: prepared/outstanding/confirmed consumed
+    /// frontiers must land before this commit can retire them jointly).
     fn reconciliation_imported(
         &mut self,
         binding: &AttachBinding,
         result: &ReconciliationPortResult,
-    ) {
-        // Core calls this only after its staged recovery window was accepted.
-        // Keep an additional live transport check so an adapter cannot apply
-        // a cache receipt after its connection has been replaced.
-        if self.check_continuity(binding).is_err() {
-            return;
-        }
-        if let Some(window) = result.window() {
-            for stream in window.stream_facts() {
-                self.note_owner_acked(stream.stream_id(), stream.acked_cursor());
+    ) -> Result<(), ProviderFailure> {
+        let Some(window) = result.window() else {
+            return Ok(());
+        };
+        // Typed continuity precheck before any snapshot work.
+        self.check_continuity(binding)?;
+        let (mut owner_acked, mut delivered_sequences) = {
+            let owner = self
+                .shared
+                .try_borrow()
+                .map_err(|_| reconciliation_import_borrow_refusal())?;
+            (owner.owner_acked.clone(), owner.delivered_sequences.clone())
+        };
+        // Pure projection from the immutable snapshot: every allocation on
+        // this path happens here, before the owner is acquired for commit.
+        for stream in window.stream_facts() {
+            let known = owner_acked.get(stream.stream_id()).copied().unwrap_or(0);
+            let base = known.max(stream.acked_cursor());
+            if base != known {
+                owner_acked.insert(stream.stream_id().to_owned(), base);
+            }
+            if let Some(held) = delivered_sequences.get_mut(stream.stream_id()) {
+                let confirmed: Vec<u64> = held.range(..=base).copied().collect();
+                for sequence in confirmed {
+                    held.remove(&sequence);
+                }
+                if held.is_empty() {
+                    delivered_sequences.remove(stream.stream_id());
+                }
             }
         }
+        let mut owner = self
+            .shared
+            .try_borrow_mut()
+            .map_err(|_| reconciliation_import_borrow_refusal())?;
+        // Recheck continuity against live state under the held borrow: the
+        // shared precheck above cannot run here because it would observe
+        // this commit's own mutable borrow as contention. A mismatch
+        // commits nothing.
+        let live = owner.activated_session.as_deref().unwrap_or("");
+        if live.is_empty() || live != binding.session_id().as_str() {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "reconciliation import refused: presented attach session is not the retained \
+                 kernel-issued session (foreign, stale, or pre-activation binding); core \
+                 recovery state, owner ack bases, and held receipts are unchanged; reconnect \
+                 must present the validated continuity binding",
+            ));
+        }
+        // One infallible bounded swap; no parsing, allocation, owner call,
+        // validation, or other fallible work follows on this path.
+        owner.owner_acked = owner_acked;
+        owner.delivered_sequences = delivered_sequences;
+        Ok(())
     }
 }
 
@@ -3922,9 +4152,16 @@ mod tests {
         };
         use super::test_epoch;
         use eliot_agent_bridge_core::{
-            ActivationPortOutcome, ActivationPortResult, CoverageGap, EventEnvelope,
-            EventPortOutcome, FencingToken, Generation, PrincipalId, ReconciliationPortOutcome,
-            SessionId, TaskId, WorkUnitId,
+            ActivationPortOutcome, ActivationPortResult, ClockReading, CoverageGap, EventCursor,
+            EventEnvelope, EventId, EventPortOutcome, FencingToken, Generation,
+            HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+            HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, NativeSession,
+            NativeSessionLocator, NormalizationCoverage, NormalizedHostEventEnvelope,
+            NormalizedHostEventPayload, PrincipalId, ProviderObservationLineage,
+            QualifiedSourceDigest, RawSourceRecord, ReconciliationPortOutcome,
+            RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation,
+            SessionLifecycleTransition, SessionObservation, TaskId, UnsupportedDisposition,
+            WorkUnitId,
         };
 
         const REACTIVE_DIGEST: &str =
@@ -3981,7 +4218,8 @@ mod tests {
                 &mut self,
                 _binding: &AttachBinding,
                 _result: &eliot_agent_bridge_core::ReconciliationPortResult,
-            ) {
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
             }
         }
 
@@ -4049,8 +4287,77 @@ mod tests {
             }
         }
 
+        /// #228 A6 fixture seam: the legacy quarantine wire is admissible only
+        /// while it carries a closed, versioned, bounded normalized
+        /// observation bound to the wire's own identity, cursor, and sequence.
+        fn normalized_observation(
+            hook_id: &str,
+            sequence: u64,
+        ) -> Result<NormalizedHostEventEnvelope, String> {
+            fn digest(bytes: &[u8]) -> Result<LowercaseSha256, String> {
+                serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(bytes)))
+                    .map_err(|error| error.to_string())
+            }
+            let source_bytes = format!("bridge-reactive-source-{hook_id}").into_bytes();
+            let raw_source = RawSourceRecord {
+                handle: RestrictedRawSourceHandle::new(format!("restricted:{hook_id}"))
+                    .map_err(|error| error.to_string())?,
+                digest: QualifiedSourceDigest {
+                    algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+                    digest: digest(&source_bytes)?,
+                },
+            };
+            let mut envelope = NormalizedHostEventEnvelope {
+                schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+                event_id: EventId::new(hook_id).map_err(|error| error.to_string())?,
+                cursor: EventCursor::new("cursor-reactive-1").map_err(|error| error.to_string())?,
+                lineage: ProviderObservationLineage::SessionObservation(SessionObservation {
+                    session_id: None,
+                    native: NativeSession::Native(
+                        NativeSessionLocator::new(format!("thread-{hook_id}"))
+                            .map_err(|error| error.to_string())?,
+                    ),
+                }),
+                producer_adapter_identity: "bridge-fixture".to_owned(),
+                adapter_contract_version: "bridge-fixture/v1".to_owned(),
+                sequence,
+                causal_predecessors: Vec::new(),
+                payload: NormalizedHostEventPayload::SessionLifecycle(
+                    SessionLifecycleObservation {
+                        transition: SessionLifecycleTransition::Started,
+                        detail_ref: None,
+                    },
+                ),
+                admitted_route_digest: None,
+                raw_source: raw_source.clone(),
+                normalization: HostEventNormalizationReceipt {
+                    normalizer_identity: "bridge-fixture".to_owned(),
+                    normalizer_version: "bridge-fixture/v1".to_owned(),
+                    input_handle: raw_source.handle.clone(),
+                    input_digest: raw_source.digest.clone(),
+                    output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+                    output_digest: digest(b"bridge-reactive-seal-placeholder")?,
+                    omitted_fields: Vec::new(),
+                    warnings: Vec::new(),
+                    unsupported_disposition: UnsupportedDisposition::None,
+                    privacy_class: HostEventPrivacyClass::RedactedSummary,
+                    coverage: NormalizationCoverage::Complete,
+                    proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+                },
+                observed_at: ClockReading {
+                    valid_time_ms: Some(1_700_000_000_000),
+                    known_time_ms: Some(1_700_000_000_000),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1_000),
+                },
+                delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            };
+            envelope.seal().map_err(|error| error.to_string())?;
+            Ok(envelope)
+        }
+
         fn hook_event(hook_id: &str, sequence: u64) -> HostEventEnvelope {
-            serde_json::from_value(serde_json::json!({
+            let mut wire = serde_json::json!({
                 "event_id": hook_id,
                 "attempt_id": "attempt-reactive-1",
                 "sequence": sequence,
@@ -4075,8 +4382,12 @@ mod tests {
                 "normalized_payload": {},
                 "parent_event_id": null,
                 "observed_at": "2026-09-21T00:00:00Z"
-            }))
-            .expect("valid hook fixture")
+            });
+            wire["normalized"] = serde_json::to_value(
+                normalized_observation(hook_id, sequence).expect("valid normalized observation"),
+            )
+            .expect("normalized observation serializes");
+            serde_json::from_value(wire).expect("valid hook fixture")
         }
 
         fn attention_ids(runner: &BridgeRunner) -> Vec<String> {
@@ -4387,7 +4698,8 @@ mod tests {
                 &mut self,
                 _binding: &AttachBinding,
                 _result: &eliot_agent_bridge_core::ReconciliationPortResult,
-            ) {
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
             }
         }
 

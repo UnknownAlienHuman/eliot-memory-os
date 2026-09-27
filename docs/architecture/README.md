@@ -29,7 +29,7 @@ A route alone is navigation, not reading evidence. The local
 - [Dependency policy](../DEPENDENCY_POLICY.md)
 - [Pre-sharding navigation snapshots](navigation-history/)
 
-Normative pair: `sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea`.
+Normative pair: `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`.
 
 `ELIOT_ARCHITECTURE.md` and `ELIOT_IMPLEMENTATION.md` remain only to preserve
 incoming file and heading links. Their canonical content has moved to fragments.

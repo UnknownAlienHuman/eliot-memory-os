@@ -38,7 +38,7 @@ split_trigger = "a second causal responsibility, mutable owner, independent proo
 
 [[donor]]
 path = "crates/meta/eliot-improvement/src/lib.rs"
-disposition = "retain advisory candidate boundary; integration owner wires the new module"
+disposition = "retain advisory candidate boundary; shared export integration landed under #973 as a package-root `pub use learning_closure::{…}` re-export of the closure records, dispositions, errors and assembly functions"
 
 [[donor]]
 path = "ELIOT_IMPLEMENTATION I12.24 CampaignLearningClosure"
@@ -60,3 +60,4 @@ workspace_admission = "forbidden until implementation, package proof, affected E
 shared_integration_surface = "crates/meta/eliot-improvement/src/lib.rs"
 shared_integration_owner = "cognitive-wave-integrator"
 integration_rule = "The integration owner alone wires module exports after both existing-crate cells return non-overlapping implementations."
+evidence_status_and_review_owner = "Implementation and package-proof are complete on current main (crates/meta/eliot-improvement/src/learning_closure.rs, 49 public items) and the reserved shared export integration landed under #973 as a package-root `pub use learning_closure::{…}` re-export of the closure records, dispositions, errors and assembly functions; the seven closure names deliberately left reachable only at learning_closure:: are named with their reason in the comment on that block. No production consumer of the closure assembly functions exists outside this package's own dedicated test - `git grep -n assemble_campaign_learning_closure origin/main -- crates bins` returns the definition and that test only - so the recorded consumer reference is the declared advisory Governor or Memory OS disposition and it is NOT yet realised in code; this is a wiring fact, not a runtime observation. Review owner: the #973 integration owner named by this router."

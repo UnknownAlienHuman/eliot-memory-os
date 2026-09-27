@@ -316,6 +316,17 @@ pub enum WindowsAdapterError {
     Failed,
     IdentityMismatch,
     AclMismatch,
+    /// `RevertToSelf` failed with the exact raw Win32 code of that call.
+    ///
+    /// Issue #860 test-matrix case 8 requires the exact Windows error of a
+    /// failed impersonation revert to survive the explicit restoration
+    /// attempt (I2.6 "An error preserves: ... raw evidence handle"). The
+    /// coarse variants above cannot distinguish two different revert
+    /// failures, so the named-pipe peer-authentication path carries the
+    /// unmapped code here instead of collapsing it onto `Failed`.
+    RevertToSelf {
+        win32_error: u32,
+    },
 }
 
 impl std::fmt::Display for WindowsAdapterError {

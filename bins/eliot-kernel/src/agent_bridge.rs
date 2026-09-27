@@ -1694,12 +1694,6 @@ impl KernelComposition {
             accepted.client_hello().module_generation.clone(),
             session_nonce.clone(),
         )?;
-        self.record_application_session_binding(
-            &binding.session_id,
-            &session.connection_id,
-            &session.authority_epoch,
-            session.session_epoch,
-        )?;
         let authenticated = AgentBridgeAuthenticatedBinding {
             principal_id: binding.principal_id.clone(),
             session_id: binding.session_id.clone(),
@@ -1757,6 +1751,15 @@ impl KernelComposition {
         if state.activation_completed || state.session.is_some() {
             return Err(TransportError::IdentityConflict);
         }
+        // Complete every fallible response projection and connection check
+        // before mutating the retained application session. Publication below
+        // this point is infallible.
+        self.record_application_session_binding(
+            &binding.session_id,
+            &session.connection_id,
+            &session.authority_epoch,
+            session.session_epoch,
+        )?;
         state.session = Some(session);
         state.activation_completed = true;
         Ok(reply)
@@ -2319,27 +2322,32 @@ impl KernelComposition {
             .agent_application_sessions
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        let result = if let Some(session) = sessions.get_mut(session_id) {
-            session.record_transport_binding(
-                connection_id,
-                TransportKind::Pipe,
-                session_epoch,
-                observed_at_unix_ms,
-            )
+        if let Some(session) = sessions.get_mut(session_id) {
+            session
+                .record_transport_binding(
+                    connection_id,
+                    TransportKind::Pipe,
+                    session_epoch,
+                    observed_at_unix_ms,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
         } else {
             let mut session = ApplicationSession::new(session_id, authority_epoch.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
             session
                 .attach()
                 .map_err(|_| TransportError::SessionFenced)?;
-            session.record_transport_binding(
-                connection_id,
-                TransportKind::Pipe,
-                session_epoch,
-                observed_at_unix_ms,
-            )
-        };
-        result.map_err(|_| TransportError::SessionFenced)
+            session
+                .record_transport_binding(
+                    connection_id,
+                    TransportKind::Pipe,
+                    session_epoch,
+                    observed_at_unix_ms,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+            sessions.insert(session_id.to_owned(), session);
+        }
+        Ok(())
     }
 
     /// Explicitly revokes the application-owned ELIOT session for

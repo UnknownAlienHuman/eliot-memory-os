@@ -4,7 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{HostCorrelationProjection, HostJsonRpcCorrelationId, canonical_json_bytes};
+use eliot_contracts::{
+    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
+    BridgeRecoveryWindowDisposition, HostCorrelationProjection, HostJsonRpcCorrelationId,
+    HostRequestLogicalKind, canonical_json_bytes, host_request_legacy_presence_key,
+    host_request_logical_key,
+};
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
@@ -271,23 +276,38 @@ const RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM: u64 = 512;
 /// durable relation, so staging always persists `DURABLE`; `RECEIVED` is the
 /// pre-stage transport fact answered without a row.
 const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
-/// Privacy disposition persisted on a staged bridge event (issue #2561, I7.23:
+/// Privacy disposition persisted on a staged bridge event (issue #1934, I7.23:
 /// secret values, provider-forbidden hidden reasoning, and data outside the
 /// `WorkScope` privacy boundary are never persisted merely to preserve
 /// "rawness" — the ingest path stores the exact transport hash plus either
 /// the allowed raw bytes or a deterministic redacted representation with a
-/// redaction receipt). The decision is computed over the canonical envelope
-/// bytes before any durable write and re-verified by the stage entry, so a
-/// denied payload is redacted with its receipt, never persisted raw.
+/// redaction receipt). Admission is RESOLVED BY THE OWNER before this owner
+/// persists anything: only an owner authorization bound to the exact source
+/// bytes, the scope, and the policy revision reaches this disposition, so a
+/// payload is verbatim only when the owner admitted it AND the deny scan is
+/// clean.
 const BRIDGE_EVENT_PRIVACY_ALLOWED: &str = "allowed";
-/// Privacy disposition stored when the canonical envelope bytes carry denied
-/// content: only the deterministic redacted projection plus the redaction
-/// receipt facts are staged.
+/// Privacy disposition stored when the source bytes were not admitted as
+/// verbatim by the privacy owner: only the deterministic redacted projection
+/// plus the redaction receipt facts are staged.
 const BRIDGE_EVENT_PRIVACY_REDACTED: &str = "redacted";
-/// Redaction reason stored when denied content forces the redacted path. Uses
-/// the closed wire reason vocabulary shared with the protocol redaction
-/// receipt (`FORBIDDEN_CONTENT_DETECTED` / `DECLARED_OUT_OF_SCOPE`); this
-/// owner only ever mints the detected reason.
+/// Owner authorization verdict meaning "these exact bytes may persist
+/// verbatim inside this scope at this policy revision". This is the only
+/// verdict that can select the verbatim path, and it is presented by the
+/// privacy owner, never derived from the bytes by this owner.
+const BRIDGE_EVENT_PRIVACY_ADMISSION: &str = "admitted";
+/// Owner authorization verdict meaning "these exact bytes may not persist
+/// verbatim inside this scope at this policy revision". Uses the closed wire
+/// reason vocabulary shared with the protocol redaction receipt
+/// (`FORBIDDEN_CONTENT_DETECTED` / `DECLARED_OUT_OF_SCOPE`).
+const BRIDGE_EVENT_PRIVACY_REJECTION: &str = "rejected";
+/// Redaction reason stored when the owner withheld the original bytes as
+/// declared outside its privacy scope. Uses the closed wire reason
+/// vocabulary shared with the protocol redaction receipt.
+const BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE: &str = "DECLARED_OUT_OF_SCOPE";
+/// Redaction reason stored when the conservative deny scan additionally
+/// forced the redacted path over owner-admitted bytes. Uses the closed wire
+/// reason vocabulary shared with the protocol redaction receipt.
 const BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN: &str = "FORBIDDEN_CONTENT_DETECTED";
 /// Marker prefix of every deterministic redacted projection minted by this
 /// owner. Distinct from the ACP journal marker: each minting owner names its
@@ -296,9 +316,14 @@ const BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN: &str = "FORBIDDEN_CONTENT_DETECTE
 const BRIDGE_EVENT_REDACTED_PROJECTION_MARKER: &str = "redacted/bridge-event-v1";
 /// Byte patterns that must never persist as admissible staged bytes. Matched
 /// case-insensitively against the lossy UTF-8 decoding of the canonical
-/// envelope bytes: the operationalization, for this byte-only persistence
-/// owner, of the I7.23 denied classes (secret values, provider-forbidden
-/// hidden reasoning, data outside the `WorkScope` privacy boundary). The same
+/// envelope bytes.
+///
+/// This scan is an ADDITIONAL CONSERVATIVE DETECTOR, not the authorization
+/// (issue #1934, I7.23): a hit forces the redacted path over owner-admitted
+/// bytes, and the absence of a hit grants nothing. Verbatim persistence
+/// requires a positive owner authorization bound to the exact source bytes,
+/// the scope, and the policy revision, so content outside its real privacy
+/// scope with no matching token can no longer be persisted verbatim. The same
 /// denied vocabulary is enforced by the ACP durable journal on its own path;
 /// each owner scans the bytes it persists, so neither trusts the other.
 const BRIDGE_EVENT_DENIED_CONTENT_TOKENS: &[&str] = &[
@@ -322,12 +347,21 @@ const MAX_BRIDGE_EVENT_HANDOFFS: usize = 2048;
 const BRIDGE_EVENT_HANDOFF_HANDED_OFF: &str = "handed_off";
 /// Handoff state once the event reconcile entry binds the row to a
 /// reconciliation key at or past its sequence.
+///
+/// Issue #1934 names this state for what it proves. The transition is
+/// driven by the PRESENTING producer's own consumed frontier, so it records
+/// that this store has accepted the producer's custody receipt for the
+/// delivery — a local handoff fact. It does NOT join a receiving Governor
+/// normalization or application receipt, and it is NOT the host/native
+/// cursor whose advance requires the full I7.23 durable relation. Downstream
+/// normalization, application, and the host/native cursor stay owned by the
+/// receiver; nothing here may be read as completed downstream consumption.
 const BRIDGE_EVENT_HANDOFF_RECONCILED: &str = "reconciled";
 /// Durable bridge-stream owner bindings (issue #2729): one authenticated
 /// owner binding per admitted stream namespace plus one per unscoped-gap
 /// reporter occurrence. Keyed by the versioned namespace digest; the row
-/// carries the full binding (installation/authority lineage, principal,
-/// producer, creating session occurrence, stream incarnation) and its
+/// carries the retained authority lineage, principal, producer, creating
+/// session occurrence, stream incarnation, and its
 /// revision. The last-staging connection stays observation metadata on the
 /// cursor/event rows only — never scope material here.
 const BRIDGE_STREAM_OWNERS: TableDefinition<&str, &str> =
@@ -358,14 +392,13 @@ const BRIDGE_EVENT_RECOVERY_REVISIONS: TableDefinition<&str, &str> =
 /// carries its own current identity while the recovered stream keeps its
 /// original one (mirrors the #2571 logical-key rule).
 const BRIDGE_STREAM_OWNER_NAMESPACE: &str = "eliot.bridge-event.stream-owner.v1";
-/// Owner-namespace domain for connection-level (unscoped) coverage gaps
-/// (issue #2729). Binds this literal, the authority lineage, and the
-/// Kernel-observed principal, with the producer and stream slots fixed to
-/// the explicit unbound marker: the gap has its own admitted
-/// producer/session occurrence even when no stream is known, namespaced
-/// through that owner's explicit continuity rather than a bare global gap
-/// ID or a fabricated task.
-const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v1";
+/// Owner-namespace domain for newly admitted connection-level (unscoped)
+/// coverage-gap occurrences (issue #2729). V2 adds the Kernel-observed
+/// connection, launch nonce, and session epoch to lineage/principal; producer
+/// and stream remain explicit unbound markers. Existing v1 owner rows are
+/// preserved under their original keys; this change does not migrate them or
+/// establish reconnect rights.
+const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v2";
 /// Version of the bridge-stream owner binding carried by every owner row.
 const BRIDGE_STREAM_OWNER_VERSION: u16 = 1;
 /// Incarnation assigned at the first admitted bind of a stream namespace.
@@ -454,11 +487,16 @@ const BRIDGE_EVENT_DISPOSITION_RETIRED: &str = "retired";
 /// Privacy (I7.23) is decided before persistence: `transport_hash` is the
 /// immutable hash of the original canonical envelope bytes; admissible rows
 /// store those bytes verbatim (`redacted == false`), while rows whose bytes
-/// carried denied content store only the deterministic redacted projection
-/// (`redacted == true`) plus the redaction receipt facts. Rows written before
-/// the privacy fields existed carry empty privacy facts and validate as
-/// legacy admissible rows; every row written by the current stage entry
-/// carries the full decision.
+/// were not admitted verbatim store only the deterministic redacted
+/// projection (`redacted == true`) plus the redaction receipt facts.
+///
+/// The admission itself is the OWNER's (issue #1934): `admitted_source` and
+/// `admitted_scope` bind the exact source digest and the scope the owner
+/// evaluated, and `admitted_policy_revision` names the privacy policy
+/// revision the verdict was made under. A row whose verdict was reached
+/// without those three bindings is not verbatim-admissible, so legacy rows
+/// that predate the privacy fields keep validating while every row written by
+/// the current stage entry carries the bound authorization.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventRow {
@@ -493,6 +531,21 @@ struct BridgeEventRow {
     redaction_marker: String,
     #[serde(default)]
     redaction_version: u16,
+    /// Exact digest of the source bytes the privacy owner evaluated
+    /// (issue #1934). Empty only on rows written before owner authorization
+    /// existed; a verbatim-admissible row written by the current stage entry
+    /// always carries the transport hash here.
+    #[serde(default)]
+    admitted_source: String,
+    /// Scope the privacy owner evaluated these bytes under (issue #1934):
+    /// the admitted owner namespace. Empty on legacy rows only.
+    #[serde(default)]
+    admitted_scope: String,
+    /// Privacy policy revision the owner verdict was made under (issue
+    /// #1934). Zero on legacy rows only; a changed revision under the same
+    /// event identity is a policy change, never a duplicate.
+    #[serde(default)]
+    admitted_policy_revision: u64,
 }
 
 impl BridgeEventRow {
@@ -547,7 +600,17 @@ impl BridgeEventRow {
     /// reporting redacted facts over foreign bytes. Rows predating the
     /// privacy fields (empty transport hash on an admissible row) validate as
     /// legacy rows against the envelope identity digest.
+    ///
+    /// Issue #1934 binds the OWNER authorization itself: a verbatim-admissible
+    /// row written by the current stage entry must name the source the owner
+    /// evaluated, the scope it evaluated it under, and the policy revision it
+    /// decided at, with the source equal to the row's own transport hash. A
+    /// row that claims verbatim admissibility with any of those unbound is
+    /// rejected instead of read as owner-authorized. The binding is kept on
+    /// redacted rows too, so a later owner decision is always attributable to
+    /// the bytes, scope, and policy revision it was made about.
     fn validate_privacy(&self) -> Result<(), OrsError> {
+        self.validate_privacy_authorization()?;
         if !self.redacted {
             if !self.redaction_reason.is_empty()
                 || !self.redacted_classes.is_empty()
@@ -560,8 +623,10 @@ impl BridgeEventRow {
                 });
             }
             if self.transport_hash.is_empty() {
-                // Legacy row predating the privacy decision: the stored bytes
-                // are the verbatim envelope bound by the identity digest.
+                // Legacy row predating owner authorization: the stored bytes
+                // are the verbatim envelope bound by the identity digest. The
+                // authorization check above already refused a row that mixes
+                // legacy bytes with a partial authorization binding.
                 if crate::model::sha256_hex(&self.envelope_bytes) != self.envelope_sha256 {
                     return Err(OrsError::PayloadIntegrityMismatch);
                 }
@@ -583,10 +648,12 @@ impl BridgeEventRow {
                 reason: "redacted bridge events bind the original transport hash",
             });
         }
-        if self.redaction_reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN {
+        if self.redaction_reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN
+            && self.redaction_reason != BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE
+        {
             return Err(OrsError::InvalidField {
                 field: "redaction_reason",
-                reason: "bridge event redaction carries the detected-content reason",
+                reason: "bridge event redaction carries a known wire reason",
             });
         }
         if self.redacted_classes.is_empty()
@@ -614,6 +681,31 @@ impl BridgeEventRow {
             &self.redacted_classes,
         );
         if self.envelope_bytes != expected {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validates the owner authorization binding every current stage entry
+    /// must persist (issue #1934). Either the row predates owner
+    /// authorization and carries none of the three fields, or it carries all
+    /// three with the source equal to its own transport hash — never a
+    /// partial binding, which would be a verdict attributed to bytes, a
+    /// scope, or a policy revision it was not made about.
+    fn validate_privacy_authorization(&self) -> Result<(), OrsError> {
+        let bound = [self.admitted_source.as_str(), self.admitted_scope.as_str()];
+        if bound.iter().all(|field| field.is_empty()) && self.admitted_policy_revision == 0 {
+            return Ok(());
+        }
+        if bound.iter().any(|field| field.is_empty()) || self.admitted_policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "admitted_source",
+                reason: "bridge event owner authorization binds source, scope, and policy revision together",
+            });
+        }
+        crate::model::validate_digest(&self.admitted_source, "admitted_source")?;
+        crate::model::validate_digest(&self.admitted_scope, "admitted_scope")?;
+        if self.admitted_source != self.transport_hash {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
         Ok(())
@@ -799,6 +891,16 @@ impl persistence_codec::PersistedValue for BridgeEventGapRow {
 /// carrying no receiver evidence: they keep validating and keep serving
 /// reads, but they never become retirement-eligible on their old state
 /// string alone. Legacy ownerless rows never carry evidence at all.
+///
+/// Issue #1934 fixes the scope of the whole relation, because the reconcile
+/// transition is driven by the PRESENTING producer's own `consumed`
+/// frontier and joins no receiving Governor normalization or application
+/// receipt. What this row therefore records is a PERMITTED STAGING CURSOR:
+/// the store accepted the producer's custody receipt for the delivery. It is
+/// not the host/native cursor, whose advance requires the full I7.23 durable
+/// relation held by the receiving consumer. Nothing in this row may be
+/// consumed, replayed, or reported as evidence of downstream normalization
+/// or application.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventHandoffRow {
@@ -1147,6 +1249,13 @@ fn bridge_owner_component(value: &str, field: &'static str) -> Result<(), OrsErr
 }
 
 /// Persisted recovery-window authority and finite owner-list cutoff.
+///
+/// The two denominators the earlier row lacked are now part of the window's
+/// immutable identity (issue #2798): `stream_list_total` is the outer stream
+/// enumeration denominator and `unscoped_gap_total` the unscoped-gap
+/// denominator. Neither is ever inferred from a returned length, so a
+/// truncated page can be reported as a fraction of a declared whole instead
+/// of looking complete because it happened to be shorter than a limit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventRecoveryWindowRow {
@@ -1156,6 +1265,8 @@ struct BridgeEventRecoveryWindowRow {
     principal: String,
     owner_scope_digest: String,
     owner_cutoff: u64,
+    stream_list_total: u64,
+    unscoped_gap_total: u64,
     created_at_ms: u64,
     expires_at_ms: u64,
     stream_list_complete: bool,
@@ -1178,6 +1289,21 @@ impl BridgeEventRecoveryWindowRow {
             return Err(OrsError::InvalidField {
                 field: "recovery_window.expiry",
                 reason: "recovery window expiry must follow its creation time",
+            });
+        }
+        // A denominator is a count of owner rows inside the window's finite
+        // cutoff, so it can never exceed that cutoff.
+        if self.stream_list_total > self.owner_cutoff || self.unscoped_gap_total > self.owner_cutoff
+        {
+            return Err(OrsError::InvalidField {
+                field: "recovery_window.denominator",
+                reason: "window denominators must fit the finite owner cutoff",
+            });
+        }
+        if self.stream_list_complete && self.stream_list_continuation.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "recovery_window.stream_list_complete",
+                reason: "a complete stream list cannot still carry a continuation",
             });
         }
         Ok(())
@@ -1302,32 +1428,34 @@ impl persistence_codec::PersistedValue for BridgeEventRecoveryRevisionRow {
     }
 }
 
+/// The window/page meaning of one owner continuation, resolved from the ONE
+/// shared cross-owner selector type (issue #2798). ORS is the sole owner of
+/// what a selector means; it no longer parses the selector itself.
 enum BridgeRecoveryScopeSelector {
     Open,
     Streams {
         window_key: String,
         after_stream: u64,
         stream_limit: usize,
-        selected_scope: serde_json::Value,
     },
     Stream {
         window_key: String,
         stream_id: String,
+        owner_incarnation: u64,
+        owner_revision: u64,
+        expected_revision: u64,
         after_sequence: u64,
         upper_sequence: u64,
-        expected_revision: u64,
         retention_floor: u64,
         event_limit: usize,
         gap_offset: usize,
         gap_limit: usize,
-        selected_scope: serde_json::Value,
     },
     UnscopedGaps {
         window_key: String,
         after_gap_scope: String,
         gap_offset: usize,
         gap_limit: usize,
-        selected_scope: serde_json::Value,
     },
 }
 
@@ -1550,20 +1678,53 @@ struct BridgeCheckedGap {
     session_epoch: u64,
 }
 
+/// The privacy owner's authorization for one event's exact source bytes
+/// (issue #1934, I7.23).
+///
+/// This is the resolution the previous deny-token heuristic could not
+/// produce: a verdict reached by the actual privacy owner over the `WorkScope`
+/// / source / recipient / provider policy, bound to the exact source digest,
+/// the scope it was decided in, and the policy revision it was decided at.
+/// `declared_class` is the owner's own out-of-scope label, present only on a
+/// rejection; it names the withheld scope and is never a claim about content
+/// this owner scanned for.
+struct BridgeEventPrivacyAuthorization {
+    verdict: String,
+    scope: String,
+    policy_revision: u64,
+    declared_class: Option<String>,
+}
+
 /// Resolved I7.23 disclosure staging for canonical envelope bytes.
 ///
-/// Carries the enforced privacy decision (denied or admissible with its
-/// classes), the immutable transport hash of the original bytes, and the
-/// bytes to stage (verbatim originals or the deterministic redacted
-/// projection). Built only by the stage entry through the privacy resolver.
+/// Carries the enforced disclosure decision (verbatim admitted, or redacted
+/// with its reason/classes), the immutable transport hash of the original
+/// bytes, the owner authorization binding the decision was made under, and
+/// the bytes to stage (verbatim originals or the deterministic redacted
+/// projection). Built only by the stage entry from the owner's presented
+/// authorization plus the conservative deny scan over the same bytes.
 struct BridgeEventPrivacyStaging {
     denied: bool,
+    /// Closed wire redaction reason when `denied`; empty otherwise.
+    reason: String,
     classes: Vec<String>,
     transport_hash: String,
+    /// Scope the privacy owner evaluated the source bytes under (issue
+    /// #1934): the admitted owner namespace, persisted with the row so the
+    /// decision stays attributable.
+    scope: String,
+    /// Privacy policy revision the owner's verdict was made under (issue
+    /// #1934).
+    policy_revision: u64,
     stored_bytes: Vec<u8>,
 }
 
 /// Builds the stage/lookup outcome object for one bridge-event row.
+///
+/// The owner authorization rides the answer (issue #1934) so a consumer can
+/// see which exact source bytes, in which scope, and at which privacy policy
+/// revision were authorized — the decision is never an unattributed "the
+/// scan found nothing".
 fn bridge_event_outcome(
     row: &BridgeEventRow,
     disposition: &str,
@@ -1588,6 +1749,20 @@ fn bridge_event_outcome(
     } else {
         serde_json::Value::Null
     };
+    let privacy_authorization = if row.admitted_source.is_empty() {
+        serde_json::Value::Null
+    } else {
+        json!({
+            "verdict": if row.redacted {
+                BRIDGE_EVENT_PRIVACY_REJECTION
+            } else {
+                BRIDGE_EVENT_PRIVACY_ADMISSION
+            },
+            "source_sha256": row.admitted_source,
+            "scope": row.admitted_scope,
+            "policy_revision": row.admitted_policy_revision,
+        })
+    };
     json!({
         "stream_id": row.stream_id,
         "event_id": row.event_id,
@@ -1605,6 +1780,7 @@ fn bridge_event_outcome(
         "privacy_disposition": privacy_disposition,
         "transport_hash": row.transport_hash,
         "redaction": redaction,
+        "privacy_authorization": privacy_authorization,
         "handoff": handoff,
     })
 }
@@ -1709,23 +1885,45 @@ fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u
 /// (session continuity, client occurrence, parent/task/scope binding,
 /// capability, payload commitment) tuple — to the exact winning operation
 /// (`operation_id`, `request_digest`). Written atomically in the same `RedDB`
-/// write transaction as the winning operation row, never updated, never
-/// deleted: an expired or terminal operation keeps its key bound forever, so
-/// an old key can never be reused as a new effect. Historical unmarked rows
-/// are represented only by a separately versioned presence marker; this
-/// primary link never infers or returns their operation identity.
+/// write transaction as the winning operation row. The index denominator is
+/// one entry per staged operation: a link lives exactly as long as its
+/// winner row stays unretired, and retirement swaps the link for a tombstone
+/// under exact terminal evidence (see
+/// [`RedbRecoveryStore::retire_host_request_logical_key`]) instead of
+/// deleting it, so a retired key can never be reused as a new effect and a
+/// retired lookup answers the typed recovery limitation instead of absence.
+/// Tombstones are never deleted. Historical unmarked rows are represented
+/// only by a separately versioned presence marker; this primary link never
+/// infers or returns their operation identity. Record/byte ceilings and a
+/// numeric replay horizon are not declared by the current contract: growth is
+/// bounded only by staged operations, and fresh stages beyond legitimate
+/// history fail closed through the typed errors below rather than through a
+/// capacity counter.
 const HOST_REQUEST_LOGICAL_KEYS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_logical_keys_v1");
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY: &str = "host_request_legacy_presence_schema";
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1: &str = "eliot.ors.host-request-legacy-presence.v1";
-/// Authenticated owner namespace for every logical host-request key
-/// (issue #2571).
+/// Format marker carried by every logical host-request tombstone (issue #2571).
 ///
-/// The namespace names the Kernel-admitted application-continuity domain:
-/// keys are only ever derived from Kernel-issued session continuity plus the
-/// client occurrence and commitment, never from bare text, a principal
-/// alone, or a connection/deadline. The Bridge carries the identical literal
-/// as its key-domain contract; the two must change together.
+/// Versioned so a future retirement contour can be told apart from this one
+/// without reinterpreting stored bytes; unknown markers fail closed at
+/// validation instead of decoding as a link.
+const HOST_REQUEST_LOGICAL_TOMBSTONE_V1: &str = "eliot.ors.host-request-logical-tombstone.v1";
+/// Retired owner namespace of the historical (v1) logical host-request key
+/// encoding (issue #2571).
+///
+/// The v1 recipe bound the same session/occurrence/commitment components
+/// without a typed projection. It survives only inside this owner for
+/// recompute/validation of pre-existing unmarked rows
+/// ([`RedbRecoveryStore::host_request_logical_key_v1_retired`]) and never
+/// stages new keys: unmarked invocations/cancellations are refused at every
+/// staging entry, and the resolve entry answers them as
+/// `legacy_correlation_unresolved`, never as an operation. The current key
+/// domain lives in the shared canonical contract
+/// (`eliot_contracts::HOST_REQUEST_LOGICAL_KEY_NAMESPACE`, version
+/// `eliot_contracts::HOST_REQUEST_LOGICAL_KEY_VERSION`) consumed through
+/// `eliot_contracts::host_request_logical_key` by both the Bridge and this
+/// owner; this literal is not shared and must not be reactivated.
 const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
 /// Explicit admitted-unbound marker for parent/task/scope key components.
 ///
@@ -2438,17 +2636,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// the returned `(operation_id, request_digest)` with its candidate: an
     /// equal identity staged (or exactly replays) this candidate and may
     /// advance it; a different identity is another transport's winner and
-    /// must be returned without dispatch. Storage failure is `Err` and never
-    /// absence.
+    /// must be returned without dispatch. A retired key fails with the typed
+    /// recovery limitation instead of staging again. Storage failure is `Err`
+    /// and never absence.
     fn resolve_or_stage_host_request(
         &self,
         record: &crate::HostRequestRecord,
     ) -> Result<crate::HostRequestRecord, OrsError>;
     /// Loads one host-request operation by logical key (issue #2571).
     ///
-    /// `Ok(None)` means no operation was ever staged under this key in this
-    /// store — including pre-index legacy rows, which are never inferred and
-    /// stay reachable only by exact operation/request identity. Any storage
+    /// `Ok(None)` means no operation was ever staged under this exact marked
+    /// key in this store — including pre-index legacy rows, which are never
+    /// inferred and stay reachable only by exact operation/request identity,
+    /// and excluding staging permission, which every staging entry decides
+    /// separately against the legacy-presence index. A retired key is `Err`
+    /// with the typed recovery limitation, never absence. Any storage
     /// or integrity failure is `Err` and can never become absence or
     /// authorize a fresh operation.
     fn load_host_request_by_logical_key(
@@ -2991,6 +3193,42 @@ impl persistence_codec::PersistedValue for HostRequestLogicalLink {
     const RECORD_TYPE: &'static str = "host_request_logical_link";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
+        crate::model::validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
+        crate::model::validate_digest(&self.request_digest, "host_request_request_digest")?;
+        Ok(())
+    }
+}
+
+/// Durable retirement marker for one logical host-request key (issue #2571).
+///
+/// A tombstone replaces the winning-operation link under the same key when
+/// the winner reaches the exact terminal state (see
+/// [`RedbRecoveryStore::retire_host_request_logical_key`]). It carries the
+/// retired operation identity so the limitation stays bound to this
+/// operation: later lookups answer
+/// [`OrsError::HostRequestLegacyCorrelationUnresolved`] — the typed recovery
+/// limitation the kernel translates instead of absence — and a retired key
+/// is never reusable. Tombstones are never deleted; the operation row is
+/// kept beside them until a result-acknowledgement contract admits row
+/// compaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostRequestLogicalTombstone {
+    tombstone: String,
+    operation_id: OperationIdentity,
+    request_digest: String,
+}
+
+impl persistence_codec::PersistedValue for HostRequestLogicalTombstone {
+    const RECORD_TYPE: &'static str = "host_request_logical_tombstone";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        if self.tombstone != HOST_REQUEST_LOGICAL_TOMBSTONE_V1 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "logical tombstone carries an unsupported format marker".to_owned(),
+            });
+        }
         crate::model::validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
         crate::model::validate_digest(&self.request_digest, "host_request_request_digest")?;
         Ok(())
@@ -4661,22 +4899,38 @@ impl RedbRecoveryStore {
         }
     }
 
+    /// Derives the canonical legacy-presence key for one historical
+    /// occurrence (issue #2571).
+    ///
+    /// The recipe is owned by the shared canonical contract
+    /// (`eliot_contracts::host_request_legacy_presence_key`); this wrapper
+    /// only maps the owner-local kind into the shared closed family so the
+    /// kernel resolve entry keeps its existing signature. Non-eligible
+    /// kinds keep the historical miss-guarantee preimage byte-for-byte: such
+    /// a key is never adopted or staged, so it always misses.
     pub fn host_request_legacy_presence_key(
         kind: crate::HostRequestKind,
         session: &str,
         occurrence: &str,
     ) -> String {
-        let kind = match kind {
-            crate::HostRequestKind::Invocation => "INVOCATION",
-            crate::HostRequestKind::Cancellation => "CANCELLATION",
-            _ => "INVALID",
-        };
-        crate::model::sha256_hex(
-            format!(
-                "eliot.host-request.legacy-presence.v1\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}"
-            )
-            .as_bytes(),
-        )
+        match kind {
+            crate::HostRequestKind::Invocation => host_request_legacy_presence_key(
+                HostRequestLogicalKind::Invocation,
+                session,
+                occurrence,
+            ),
+            crate::HostRequestKind::Cancellation => host_request_legacy_presence_key(
+                HostRequestLogicalKind::Cancellation,
+                session,
+                occurrence,
+            ),
+            _ => crate::model::sha256_hex(
+                format!(
+                    "eliot.host-request.legacy-presence.v1\x1fkind=INVALID\x1fsession={session}\x1foccurrence={occurrence}"
+                )
+                .as_bytes(),
+            ),
+        }
     }
 
     /// Refuses a typed request when a prior unmarked row could have used any
@@ -4792,9 +5046,11 @@ impl RedbRecoveryStore {
     /// without a Kernel-issued session, yields `Ok(None)` and fails closed
     /// at the resolve entry instead of staging anonymously.
     ///
-    /// The Bridge derives the identical key from its envelope fields; the
-    /// canonical component order, separator, markers, and digest are part of
-    /// the shared recovery contract and must change on both sides together.
+    /// The current key bytes come from the shared canonical contract
+    /// (`eliot_contracts::host_request_logical_key`), consumed identically
+    /// by the Bridge resolve queries and by this owner: there is one
+    /// executable recipe, so presenter and owner cannot drift. Unmarked rows
+    /// keep the retired v1 encoding below for recompute/validation only.
     pub fn host_request_logical_key_for_record(
         record: &crate::HostRequestRecord,
     ) -> Result<Option<String>, OrsError> {
@@ -4809,7 +5065,7 @@ impl RedbRecoveryStore {
         };
         record.validate()?;
         match &record.correlation_projection {
-            None => Ok(Some(Self::host_request_logical_key(
+            None => Ok(Some(Self::host_request_logical_key_v1_retired(
                 record.kind,
                 session.as_str(),
                 record.request_id.as_str(),
@@ -4821,21 +5077,139 @@ impl RedbRecoveryStore {
             )?)),
             Some(projection) => {
                 let kind = match record.kind {
-                    crate::HostRequestKind::Invocation => "INVOCATION",
-                    crate::HostRequestKind::Cancellation => "CANCELLATION",
+                    crate::HostRequestKind::Invocation => HostRequestLogicalKind::Invocation,
+                    crate::HostRequestKind::Cancellation => HostRequestLogicalKind::Cancellation,
                     _ => return Ok(None),
                 };
-                let projection = serde_json::to_string(projection)
-                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
-                Ok(Some(crate::model::sha256_hex(
-                    format!(
-                        "eliot.host-request.logical.v2\x1fkind={kind}\x1fsession={}\x1fprojection={projection}",
-                        session.as_str()
-                    )
-                    .as_bytes(),
-                )))
+                Ok(Some(
+                    host_request_logical_key(kind, session.as_str(), projection)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                ))
             }
         }
+    }
+
+    /// Decodes one logical-index value stored under a claimed key (issue #2571).
+    ///
+    /// A live link decodes to its winning-operation pointer. A tombstone is
+    /// not a link and never becomes absence: it answers the typed recovery
+    /// limitation, so a retired key can neither resolve nor stage again. The
+    /// limitation rides the existing
+    /// [`OrsError::HostRequestLegacyCorrelationUnresolved`] class — the
+    /// kernel translates exactly this class into the explicit
+    /// `legacy_correlation_unresolved` limitation at submit and resolve
+    /// instead of absence or a fresh stage — because the exhaustive
+    /// ORS-refusal classifier outside this crate cannot name a new class
+    /// without its own owner change. Both causes share one contract meaning:
+    /// this correlation cannot be resolved to a live operation, so do not
+    /// stage under it. A malformed value fails closed as an integrity
+    /// problem through the shared codec.
+    fn decode_host_request_logical_link(value: &str) -> Result<HostRequestLogicalLink, OrsError> {
+        let is_tombstone = serde_json::from_str::<serde_json::Value>(value)
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "host_request_logical_index_value",
+                reason: error.to_string(),
+            })?
+            .as_object()
+            .is_some_and(|object| object.contains_key("tombstone"));
+        if !is_tombstone {
+            return decode(value);
+        }
+        let _marker: HostRequestLogicalTombstone = decode(value)?;
+        Err(OrsError::HostRequestLegacyCorrelationUnresolved)
+    }
+
+    /// Retires one logical host-request key under exact terminal evidence
+    /// (issue #2571).
+    ///
+    /// In one owner write transaction the winner row is loaded and proven:
+    /// the link must decode to the row's exact operation identity, the row
+    /// must recompute to the presented key, and the row state must be
+    /// exactly `Terminal` — the absorbing state in which no effect or result
+    /// can still be unresolved. Any other state, a missing row, or a
+    /// divergent binding refuses the retirement instead of retiring it. The
+    /// link value is then replaced by a tombstone under the same key: the
+    /// key stays non-reusable and later lookups answer the typed recovery
+    /// limitation instead of absence. The operation row is kept; retiring
+    /// the row itself awaits a result-acknowledgement contract. Retiring an
+    /// already-retired key succeeds idempotently.
+    pub fn retire_host_request_logical_key(&self, logical_key: &str) -> Result<(), OrsError> {
+        crate::model::validate_digest(logical_key, "host_request_logical_key")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut links = write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            let link = {
+                let Some(guard) = links.get(logical_key).map_err(storage)? else {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_logical_key",
+                        reason: "no logical link is staged under this key",
+                    });
+                };
+                match Self::decode_host_request_logical_link(guard.value()) {
+                    Ok(link) => link,
+                    // The limitation class is returned only for tombstones by
+                    // the decoder above, so an already-retired key succeeds
+                    // idempotently here.
+                    Err(OrsError::HostRequestLegacyCorrelationUnresolved) => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+            let winner: crate::HostRequestRecord = operations
+                .get(row_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link points at a missing host-request row".to_owned(),
+                })?;
+            winner.validate()?;
+            if winner.operation_id != link.operation_id
+                || winner.request_digest != link.request_digest
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link diverges from its host-request row".to_owned(),
+                });
+            }
+            let recomputed =
+                Self::host_request_logical_key_for_record(&winner)?.ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_link",
+                        reason: "linked host-request row carries no logical key".to_owned(),
+                    }
+                })?;
+            if recomputed != logical_key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link diverges from its host-request row".to_owned(),
+                });
+            }
+            if winner.state != crate::HostRequestState::Terminal {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_state",
+                    reason: "logical-key retirement requires the exact terminal state",
+                });
+            }
+            let marker = HostRequestLogicalTombstone {
+                tombstone: HOST_REQUEST_LOGICAL_TOMBSTONE_V1.to_owned(),
+                operation_id: winner.operation_id.clone(),
+                request_digest: winner.request_digest.clone(),
+            };
+            persistence_codec::PersistedValue::validate_persisted(&marker)?;
+            let payload = encode(&marker)?;
+            links
+                .insert(logical_key, payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(())
     }
 
     /// Atomically claims one logical host-request key or returns its durable
@@ -4881,7 +5255,7 @@ impl RedbRecoveryStore {
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
                 .map_err(storage)?;
             if let Some(link_value) = links.get(logical_key.as_str()).map_err(storage)? {
-                let link: HostRequestLogicalLink = decode(link_value.value())?;
+                let link = Self::decode_host_request_logical_link(link_value.value())?;
                 let winner = {
                     let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
                     let row_key =
@@ -5185,7 +5559,7 @@ impl RedbRecoveryStore {
             links
                 .get(logical_key)
                 .map_err(storage)?
-                .map(|value| decode::<HostRequestLogicalLink>(value.value()))
+                .map(|value| Self::decode_host_request_logical_link(value.value()))
                 .transpose()?
         };
         let Some(link) = link else {
@@ -5338,12 +5712,15 @@ impl RedbRecoveryStore {
 
     /// Loads one host-request operation by logical key (issue #2571).
     ///
-    /// `Ok(None)` is authoritatively absent: no operation was ever staged
-    /// under this key in this store. Pre-index legacy rows are never
-    /// inferred and stay reachable only by exact operation/request identity.
-    /// A dangling or divergent link fails closed as an integrity problem;
-    /// storage failure fails closed as storage — neither can become absence
-    /// or authorize a fresh operation.
+    /// `Ok(None)` is absent for this exact marked key only: no operation
+    /// was ever staged under it in this store. Absence is not a license to
+    /// stage — pre-index legacy rows are never inferred and stay reachable
+    /// only by exact operation/request identity, so every staging entry
+    /// additionally refuses when a legacy presence marker covers the
+    /// presented occurrence. A retired key answers the typed recovery
+    /// limitation, never absence. A dangling or divergent link fails closed
+    /// as an integrity problem; storage failure fails closed as storage —
+    /// neither can become absence or authorize a fresh operation.
     pub fn load_host_request_by_logical_key(
         &self,
         logical_key: &str,
@@ -5357,7 +5734,7 @@ impl RedbRecoveryStore {
             links
                 .get(logical_key)
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| Self::decode_host_request_logical_link(value.value()))
                 .transpose()?
         };
         let Some(link) = link else {
@@ -5390,7 +5767,11 @@ impl RedbRecoveryStore {
         Ok(Some(record))
     }
 
-    /// Returns the closed kind marker carried in every logical key.
+    /// Returns the historical kind marker carried in retired v1 logical keys.
+    ///
+    /// Used only by [`Self::host_request_logical_key_v1_retired`]; the
+    /// current recipe's markers live in the shared canonical contract
+    /// (`eliot_contracts::HostRequestLogicalKind`).
     const fn host_request_kind_marker(kind: crate::HostRequestKind) -> &'static str {
         match kind {
             crate::HostRequestKind::Activation => "activation",
@@ -5401,7 +5782,16 @@ impl RedbRecoveryStore {
         }
     }
 
-    /// Encodes one canonical logical key and returns its SHA-256.
+    /// Recomputes the retired v1 logical key for one pre-existing unmarked
+    /// row (issue #2571).
+    ///
+    /// Historical encoding only: the v1 recipe bound the session,
+    /// occurrence, parent, task, scope, capability, and payload commitment
+    /// without a typed projection. It runs solely to recompute/validate keys
+    /// of rows staged before the typed-projection index; no staging entry
+    /// accepts unmarked invocations/cancellations, so it can never mint a
+    /// new key. The current recipe is owned by the shared canonical
+    /// contract (`eliot_contracts::host_request_logical_key`).
     ///
     /// Components are joined with a control separator that validated text
     /// can never contain, then digested to a fixed-size key: no separator
@@ -5410,9 +5800,9 @@ impl RedbRecoveryStore {
     /// collide with the explicit unbound marker.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the logical key binds every commitment component explicitly so no binding is implicit at the call site"
+        reason = "the retired v1 key binds every historical commitment component explicitly so no binding is implicit at the call site"
     )]
-    fn host_request_logical_key(
+    fn host_request_logical_key_v1_retired(
         kind: crate::HostRequestKind,
         session: &str,
         occurrence: &str,
@@ -5481,14 +5871,23 @@ impl RedbRecoveryStore {
     /// Validates every logical link against its operation row (issue #2571).
     ///
     /// Every primary link must decode, point at an existing validated row,
-    /// and recompute to its own key. Presence entries are separately checked
-    /// against source rows by the versioned adoption routine below; neither
-    /// index is repaired by selecting an operation winner.
+    /// and recompute to its own key. Tombstones must decode to the retired
+    /// operation identity; when the retired row is still present it must be
+    /// exactly terminal and recompute to the tombstone key, otherwise the
+    /// retirement is rejected — a tombstone whose row is legitimately
+    /// compacted validates by shape alone. Presence entries are separately
+    /// checked against source rows by the versioned adoption routine below;
+    /// no index is repaired by selecting an operation winner.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "logical-index validation keeps link, tombstone, and presence coherence against the operation row together"
+    )]
     fn validate_host_request_logical_index(write: &redb::WriteTransaction) -> Result<(), OrsError> {
         let links = write
             .open_table(HOST_REQUEST_LOGICAL_KEYS)
             .map_err(storage)?;
         let mut pending = Vec::new();
+        let mut retired = Vec::new();
         for entry in links.iter().map_err(storage)? {
             let (key, value) = entry.map_err(storage)?;
             let parsed: serde_json::Value =
@@ -5515,6 +5914,15 @@ impl RedbRecoveryStore {
                         reason: "presence index key diverges from its stored facts".to_owned(),
                     });
                 }
+                continue;
+            }
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("tombstone")
+                    && object.contains_key("operation_id")
+                    && object.contains_key("request_digest")
+            }) {
+                let marker: HostRequestLogicalTombstone = decode(value.value())?;
+                retired.push((key.value().to_owned(), marker));
                 continue;
             }
             let link: HostRequestLogicalLink = decode(value.value())?;
@@ -5545,6 +5953,45 @@ impl RedbRecoveryStore {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "host_request_logical_link",
                     reason: "logical link diverges from its host-request row".to_owned(),
+                });
+            }
+        }
+        for (key, marker) in retired {
+            let row_key = format!(
+                "{}::{}",
+                marker.operation_id.as_str(),
+                marker.request_digest
+            );
+            let Some(stored) = operations.get(row_key.as_str()).map_err(storage)? else {
+                continue;
+            };
+            let record: crate::HostRequestRecord = decode(stored.value())?;
+            record.validate()?;
+            if record.operation_id != marker.operation_id
+                || record.request_digest != marker.request_digest
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_tombstone",
+                    reason: "logical tombstone diverges from its host-request row".to_owned(),
+                });
+            }
+            if record.state != crate::HostRequestState::Terminal {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_tombstone",
+                    reason: "logical tombstone retires a non-terminal host-request row".to_owned(),
+                });
+            }
+            let recomputed =
+                Self::host_request_logical_key_for_record(&record)?.ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_tombstone",
+                        reason: "retired host-request row carries no logical key".to_owned(),
+                    }
+                })?;
+            if recomputed != key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_tombstone",
+                    reason: "logical tombstone diverges from its host-request row".to_owned(),
                 });
             }
         }
@@ -7261,23 +7708,94 @@ impl RedbRecoveryStore {
         Ok(Some(next))
     }
 
-    // Bridge-event privacy gate (I7.23 decision before persistence) and
-    // handoff reader used by the stage entry below.
-    /// Decides the I7.23 disclosure/retention disposition for one bridge
-    /// event over its canonical envelope bytes, before any durable write.
+    // Bridge-event disclosure gate (I7.23 owner authorization before
+    // persistence) and handoff reader used by the stage entry below.
+    /// Derives the privacy owner's scope for one bridge event: the owner
+    /// namespace this store binds for the event's stream, which is the scope
+    /// a disclosure verdict is authorized within (issue #1934, I7.23).
     ///
-    /// This is the production privacy gate the Kernel route owner calls
-    /// before staging: it returns the exact decision object the stage entry
-    /// requires (`privacy_disposition` plus `redacted_classes` and
-    /// `redaction_reason`), computed from the same bytes the stage entry
-    /// re-verifies, so the decision provably precedes persistence. Denied
-    /// content (secret values, provider-forbidden hidden reasoning, data
-    /// outside the `WorkScope` privacy boundary, operationalized as the denied
-    /// token scan) selects the redacted path with the matched classes;
-    /// anything else stages verbatim. The boundary exchanges validated JSON
-    /// only, like every other bridge-event entry on this owner.
-    pub fn bridge_event_privacy_decision(envelope_bytes: &[u8]) -> serde_json::Value {
-        let (redacted, classes) = Self::privacy_decision_for(envelope_bytes);
+    /// The Kernel resolves the verdict before it can stage anything, so it
+    /// needs the same namespace the stage entry will persist — otherwise the
+    /// verdict's scope and the row's scope could drift. This exposes the
+    /// EXISTING digest rather than introducing a second namespace scheme, so
+    /// the comparison the stage entry performs
+    /// ([`Self::bridge_event_privacy_staging`]) is against the identical value
+    /// it records as `admitted_scope`.
+    pub fn bridge_event_privacy_scope(
+        authority_lineage: &str,
+        principal: &str,
+        producer_id: &str,
+        stream_id: &str,
+    ) -> Result<String, OrsError> {
+        Self::bridge_stream_owner_digest(authority_lineage, principal, producer_id, stream_id)
+    }
+
+    /// Reads the privacy owner's disclosure verdict over exactly these
+    /// source bytes, and refuses to speak when the owner did not (issue
+    /// #1934, I7.23).
+    ///
+    /// This entry no longer DECIDES anything. The previous implementation
+    /// inspected the canonical bytes for a seven-token deny list and returned
+    /// `allowed` whenever no token matched, so it granted verbatim
+    /// persistence on the absence of a heuristic hit: content carrying no
+    /// matching token but still outside its real privacy scope was persisted
+    /// verbatim, and the `WorkScope` boundary, source/recipient class, and
+    /// provider restriction never entered the decision. Repeating that scan
+    /// before staging proved agreement with the heuristic, not authorization.
+    ///
+    /// Disclosure is now resolved by the actual privacy owner and arrives as
+    /// the decision object the stage entry re-verifies
+    /// (`privacy_disposition` plus `redacted_classes` and `redaction_reason`)
+    /// together with the owner authorization this owner binds to the exact
+    /// source bytes, the scope, and the policy revision
+    /// (`privacy_authorization`: `verdict`, `source_sha256`, `scope`,
+    /// `policy_revision`). A caller that cannot present an owner verdict for
+    /// these exact bytes gets a rejected disposition, never an inferred
+    /// `allowed`. The conservative deny scan still runs inside the stage entry
+    /// and can only push an admitted payload to the redacted path.
+    pub fn bridge_event_privacy_decision(
+        envelope_bytes: &[u8],
+        authorization: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        let source = crate::model::sha256_hex(envelope_bytes);
+        let grant = Self::presented_privacy_authorization(authorization, &source)
+            .ok()
+            .flatten();
+        let (scan_hit, scan_classes) = Self::privacy_deny_scan(envelope_bytes);
+        let (redacted, classes, reason) = match grant {
+            Some(grant) if grant.verdict == BRIDGE_EVENT_PRIVACY_ADMISSION => {
+                if scan_hit {
+                    // The conservative detector found denied content in
+                    // bytes the owner admitted: redaction wins, on the
+                    // detected-content reason.
+                    (
+                        true,
+                        scan_classes,
+                        BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
+                    )
+                } else {
+                    (false, Vec::new(), String::new())
+                }
+            }
+            // An owner rejection withholds the original bytes as outside its
+            // privacy scope. With no matching token the class names the
+            // withheld scope, never a claim about matched content.
+            Some(grant) => (
+                true,
+                vec![
+                    grant
+                        .declared_class
+                        .unwrap_or_else(|| "declared_out_of_scope".to_owned()),
+                ],
+                BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE.to_owned(),
+            ),
+            // No usable owner verdict for these exact bytes is not permission.
+            None => (
+                true,
+                vec!["privacy_authorization_absent".to_owned()],
+                BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE.to_owned(),
+            ),
+        };
         json!({
             "privacy_disposition": if redacted {
                 BRIDGE_EVENT_PRIVACY_REDACTED
@@ -7285,11 +7803,8 @@ impl RedbRecoveryStore {
                 BRIDGE_EVENT_PRIVACY_ALLOWED
             },
             "redacted_classes": classes,
-            "redaction_reason": if redacted {
-                BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN
-            } else {
-                ""
-            },
+            "redaction_reason": reason,
+            "privacy_authorization": authorization.cloned().unwrap_or(serde_json::Value::Null),
         })
     }
 
@@ -7310,11 +7825,15 @@ impl RedbRecoveryStore {
         .into_bytes()
     }
 
-    /// Computes the raw disclosure decision over canonical envelope bytes:
-    /// whether denied content is present and, when so, the sorted matched
-    /// classes. Matched case-insensitively over the lossy UTF-8 decoding, so
-    /// binary frames decoding to denied tokens are caught the same way.
-    fn privacy_decision_for(envelope_bytes: &[u8]) -> (bool, Vec<String>) {
+    /// Runs the conservative deny detector over the canonical envelope bytes
+    /// and returns the sorted matched classes (issue #1934). Matched
+    /// case-insensitively over the lossy UTF-8 decoding, so binary frames
+    /// decoding to denied tokens are caught the same way.
+    ///
+    /// This is an ADDITIONAL conservative detector only: it can deny, and it
+    /// can never grant. An empty result is not permission — verbatim
+    /// persistence additionally requires the privacy owner's authorization.
+    fn privacy_deny_scan(envelope_bytes: &[u8]) -> (bool, Vec<String>) {
         let decoded = String::from_utf8_lossy(envelope_bytes).to_lowercase();
         let mut classes: Vec<String> = BRIDGE_EVENT_DENIED_CONTENT_TOKENS
             .iter()
@@ -7329,7 +7848,7 @@ impl RedbRecoveryStore {
 
     /// Parses the presented pre-persistence privacy decision from a staged
     /// object: the disposition plus, on the redacted path, the bounded class
-    /// list and the detected-content reason.
+    /// list and the wire redaction reason.
     fn presented_privacy_decision(
         staged: &serde_json::Value,
     ) -> Result<(bool, Vec<String>, String), OrsError> {
@@ -7374,6 +7893,14 @@ impl RedbRecoveryStore {
             .to_owned();
         if !reason.is_empty() {
             crate::model::validate_text(&reason, "redaction_reason")?;
+            if reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN
+                && reason != BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE
+            {
+                return Err(OrsError::InvalidField {
+                    field: "redaction_reason",
+                    reason: "bridge event redaction reason must be a known wire reason",
+                });
+            }
         }
         Ok((redacted, classes, reason))
     }
@@ -7386,41 +7913,163 @@ impl RedbRecoveryStore {
         )
     }
 
-    /// Resolves the I7.23 disclosure staging for one stage call: the
-    /// presented pre-persistence decision must equal the decision this owner
-    /// recomputes over the canonical envelope bytes, and denied bytes resolve
-    /// to the deterministic redacted projection plus its receipt facts —
-    /// never to verbatim raw. A decision mismatch fails closed instead of
-    /// persisting a disputed form.
+    /// Resolves the I7.23 disclosure staging for one stage call (issue
+    /// #1934).
+    ///
+    /// The verdict is the OWNER's: the presented privacy authorization must
+    /// carry a verdict over exactly the canonical envelope bytes about to be
+    /// persisted, name the scope and the policy revision it was decided
+    /// under, and — where this owner is about to bind an owner namespace —
+    /// equal that namespace. Only an admitted verdict over a clean deny scan
+    /// stages the original bytes verbatim. An owner rejection, an absent or
+    /// unbound authorization, and a conservative scan hit all resolve to the
+    /// deterministic redacted projection plus its redaction receipt — the
+    /// scan can deny, and its silence can never allow. A mismatch fails
+    /// closed instead of persisting a disputed form.
+    ///
+    /// `enforced_scope` is the namespace this owner is binding; the legacy
+    /// ownerless entry passes `None` and accepts the owner's own scope
+    /// verbatim (it binds no namespace of its own to compare against), so
+    /// the owner's binding is still persisted on the row either way.
     fn bridge_event_privacy_staging(
         staged: &serde_json::Value,
         envelope_bytes: &[u8],
+        enforced_scope: Option<&str>,
     ) -> Result<BridgeEventPrivacyStaging, OrsError> {
         let (presented_redacted, presented_classes, presented_reason) =
             Self::presented_privacy_decision(staged)?;
-        let (denied, decided_classes) = Self::privacy_decision_for(envelope_bytes);
+        let transport_hash = crate::model::sha256_hex(envelope_bytes);
+        let grant = Self::presented_privacy_authorization(
+            staged.get("privacy_authorization"),
+            &transport_hash,
+        )?
+        .ok_or(OrsError::InvalidField {
+            field: "privacy_authorization",
+            reason: "bridge event persistence requires a privacy owner verdict bound to these bytes",
+        })?;
+        if enforced_scope.is_some_and(|scope| grant.scope != scope) {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization",
+                reason: "bridge event privacy owner verdict must bind the admitted scope",
+            });
+        }
+        let (scan_hit, scan_classes) = Self::privacy_deny_scan(envelope_bytes);
+        let admitted = grant.verdict == BRIDGE_EVENT_PRIVACY_ADMISSION;
+        let denied = !admitted || scan_hit;
+        let (classes, reason) = if denied && !scan_classes.is_empty() {
+            // The conservative detector found denied content in the bytes:
+            // redact on the detected-content reason regardless of whether the
+            // owner also withheld them.
+            (
+                scan_classes,
+                BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
+            )
+        } else if denied {
+            // The owner withheld the original bytes as outside its privacy
+            // scope. The class names the withheld scope; it is a scope label,
+            // never a claim about matched content.
+            (
+                vec![
+                    grant
+                        .declared_class
+                        .clone()
+                        .unwrap_or_else(|| "declared_out_of_scope".to_owned()),
+                ],
+                BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE.to_owned(),
+            )
+        } else {
+            (Vec::new(), String::new())
+        };
         if denied != presented_redacted
-            || (denied && decided_classes != presented_classes)
-            || (denied && presented_reason != BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN)
+            || (denied && (classes != presented_classes || presented_reason != reason))
             || (!denied && (!presented_classes.is_empty() || !presented_reason.is_empty()))
         {
             return Err(OrsError::InvalidField {
                 field: "privacy_disposition",
-                reason: "bridge event privacy decision does not match the staged bytes",
+                reason: "bridge event privacy decision does not match the owner verdict for the staged bytes",
             });
         }
-        let transport_hash = crate::model::sha256_hex(envelope_bytes);
         let stored_bytes = if denied {
-            Self::bridge_event_redacted_projection_bytes(&transport_hash, &decided_classes)
+            Self::bridge_event_redacted_projection_bytes(&transport_hash, &classes)
         } else {
             envelope_bytes.to_vec()
         };
         Ok(BridgeEventPrivacyStaging {
             denied,
-            classes: decided_classes,
+            reason,
+            classes,
             transport_hash,
+            scope: grant.scope,
+            policy_revision: grant.policy_revision,
             stored_bytes,
         })
+    }
+
+    /// Parses the privacy owner's presented authorization for one event
+    /// (issue #1934) and checks that it is bound to these exact source bytes.
+    ///
+    /// `Ok(None)` means the owner presented no authorization at all, which the
+    /// stage entry treats as "not permitted" — never as an implicit
+    /// admission. A presented authorization naming a different source digest
+    /// is an `Err`: a verdict reached about other bytes cannot authorize
+    /// these.
+    fn presented_privacy_authorization(
+        authorization: Option<&serde_json::Value>,
+        transport_hash: &str,
+    ) -> Result<Option<BridgeEventPrivacyAuthorization>, OrsError> {
+        let Some(value) = authorization.filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let verdict = bridge_text(value, "verdict")?;
+        if verdict != BRIDGE_EVENT_PRIVACY_ADMISSION && verdict != BRIDGE_EVENT_PRIVACY_REJECTION {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization.verdict",
+                reason: "privacy owner verdict must be admitted or rejected",
+            });
+        }
+        let source = bridge_text(value, "source_sha256")?;
+        crate::model::validate_digest(&source, "privacy_authorization.source_sha256")?;
+        if source != transport_hash {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        let scope = bridge_text(value, "scope")?;
+        crate::model::validate_digest(&scope, "privacy_authorization.scope")?;
+        let policy_revision = value
+            .get("policy_revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field: "privacy_authorization.policy_revision",
+                reason: "privacy owner verdict must name the policy revision it was decided at",
+            })?;
+        if policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization.policy_revision",
+                reason: "privacy owner policy revision must be nonzero",
+            });
+        }
+        let declared_class = match value.get("declared_class") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(class) => {
+                let class = class.as_str().ok_or(OrsError::InvalidField {
+                    field: "privacy_authorization.declared_class",
+                    reason: "declared out-of-scope class must be text",
+                })?;
+                crate::model::validate_text(class, "privacy_authorization.declared_class")?;
+                Some(class.to_owned())
+            }
+        };
+        if declared_class.is_some() && verdict != BRIDGE_EVENT_PRIVACY_REJECTION {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization.declared_class",
+                reason: "only a rejected verdict may declare an out-of-scope class",
+            });
+        }
+        Ok(Some(BridgeEventPrivacyAuthorization {
+            verdict,
+            scope,
+            policy_revision,
+            declared_class,
+        }))
     }
 
     /// Loads one staged bridge-event row inside a write transaction without
@@ -7554,7 +8203,7 @@ impl RedbRecoveryStore {
         if crate::model::sha256_hex(&envelope_bytes) != presented_sha {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
-        let staging = Self::bridge_event_privacy_staging(staged, &envelope_bytes)?;
+        let staging = Self::bridge_event_privacy_staging(staged, &envelope_bytes, None)?;
         let key = format!("{stream_id}::{event_id}");
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
@@ -7569,6 +8218,8 @@ impl RedbRecoveryStore {
                     || row.authority_epoch != authority_epoch
                     || row.redacted != staging.denied
                     || row.transport_hash != staging.transport_hash
+                    || row.admitted_scope != staging.scope
+                    || row.admitted_policy_revision != staging.policy_revision
                     || !row.owner_namespace.is_empty()
                 {
                     return Err(OrsError::DuplicateConflict);
@@ -7595,13 +8246,9 @@ impl RedbRecoveryStore {
                     // `stage_bridge_event_checked`, which binds the admitted
                     // namespace here instead of leaving it empty.
                     owner_namespace: String::new(),
-                    transport_hash: staging.transport_hash,
+                    transport_hash: staging.transport_hash.clone(),
                     redacted: staging.denied,
-                    redaction_reason: if staging.denied {
-                        BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned()
-                    } else {
-                        String::new()
-                    },
+                    redaction_reason: staging.reason.clone(),
                     redacted_classes: staging.classes,
                     redaction_marker: if staging.denied {
                         BRIDGE_EVENT_REDACTED_PROJECTION_MARKER.to_owned()
@@ -7613,6 +8260,13 @@ impl RedbRecoveryStore {
                     } else {
                         0
                     },
+                    // The owner's authorization binding travels with the
+                    // decision even on this ownerless entry, so the persisted
+                    // verdict stays attributable to the exact bytes, the
+                    // scope, and the policy revision it was made about.
+                    admitted_source: staging.transport_hash,
+                    admitted_scope: staging.scope,
+                    admitted_policy_revision: staging.policy_revision,
                 };
                 row.validate()?;
                 {
@@ -8444,18 +9098,30 @@ impl RedbRecoveryStore {
         Ok(crate::model::sha256_hex(text.as_bytes()))
     }
 
-    /// Computes the versioned owner-namespace digest for one
-    /// connection-level gap reporter occurrence (issue #2729). The producer
-    /// and stream slots are fixed to the explicit unbound marker by
-    /// construction — never taken from caller input — so the namespace
-    /// names the reporter's admitted occurrence without fabricating a
-    /// producer or a task.
-    fn bridge_gap_owner_digest(lineage: &str, principal: &str) -> Result<String, OrsError> {
+    /// Computes the v2 owner-namespace digest for one connection-level gap
+    /// reporter occurrence (issue #2729). The occurrence fields are derived by
+    /// Kernel and validated here; producer and stream stay fixed to the
+    /// explicit unbound marker, so this creates neither a producer nor a task.
+    fn bridge_gap_owner_digest(
+        lineage: &str,
+        principal: &str,
+        connection: &str,
+        launch_nonce: &str,
+        session_epoch: u64,
+    ) -> Result<String, OrsError> {
         bridge_owner_component(lineage, "owner_authority_lineage")?;
         bridge_owner_component(principal, "owner_principal")?;
+        bridge_owner_component(connection, "owner_connection")?;
+        bridge_owner_component(launch_nonce, "owner_launch_nonce")?;
+        if session_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "owner_session_epoch",
+                reason: "unscoped-gap owner occurrence binds a nonzero session epoch",
+            });
+        }
         let unbound = HOST_REQUEST_UNBOUND_MARKER;
         let text = format!(
-            "{BRIDGE_GAP_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fproducer={unbound}\x1fstream={unbound}"
+            "{BRIDGE_GAP_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fconnection={connection}\x1flaunch_nonce={launch_nonce}\x1fsession_epoch={session_epoch}\x1fproducer={unbound}\x1fstream={unbound}"
         );
         Ok(crate::model::sha256_hex(text.as_bytes()))
     }
@@ -8506,6 +9172,61 @@ impl RedbRecoveryStore {
                 record_type: "bridge_owner_list_sequence",
                 reason: "owner-list sequence is not an unsigned integer".to_owned(),
             })
+    }
+
+    /// Counts the two enumeration denominators the window declares at open
+    /// time: how many stream owners and how many unscoped-gap owners the
+    /// window's finite cutoff covers under its exact owner scope.
+    ///
+    /// They are counted here, from the index the same walk pages, rather than
+    /// inferred from any returned page. Overflow of the bounded owner set
+    /// fails closed instead of yielding a denominator that is a guess.
+    fn bridge_recovery_window_denominators_in(
+        write: &redb::WriteTransaction,
+        scope: &str,
+        owner_cutoff: u64,
+    ) -> Result<(u64, u64), OrsError> {
+        let mut stream_list_total = 0_u64;
+        let mut unscoped_gap_total = 0_u64;
+        for (kind, counter) in [
+            (BRIDGE_STREAM_OWNER_KIND_STREAM, &mut stream_list_total),
+            (
+                BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
+                &mut unscoped_gap_total,
+            ),
+        ] {
+            let prefix = Self::bridge_owner_list_index_prefix(scope, kind);
+            let end = Self::bridge_owner_list_index_key(scope, kind, owner_cutoff);
+            let index = write
+                .open_table(BRIDGE_STREAM_OWNER_LIST_INDEX)
+                .map_err(storage)?;
+            for entry in index
+                .range(prefix.as_str()..=end.as_str())
+                .map_err(storage)?
+                .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
+            {
+                let (key, _) = entry.map_err(storage)?;
+                let sequence = key
+                    .value()
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|suffix| suffix.parse::<u64>().ok())
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_stream_owner_list_index",
+                        reason: "owner-list key carries a malformed sequence".to_owned(),
+                    })?;
+                if sequence == 0 || sequence > owner_cutoff {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_stream_owner_list_index",
+                        reason: "owner-list key escaped the finite window cutoff".to_owned(),
+                    });
+                }
+                *counter = counter.saturating_add(1);
+            }
+            if *counter > MAX_BRIDGE_STREAM_OWNERS as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+        }
+        Ok((stream_list_total, unscoped_gap_total))
     }
 
     #[allow(
@@ -8612,6 +9333,13 @@ impl RedbRecoveryStore {
             "eliot.bridge-event.recovery-window.v1\x1f{lineage}\x1f{principal}\x1f{now_ms}\x1f{sequence}"
         );
         let window_key = crate::model::sha256_hex(key_material.as_bytes());
+        // The denominators are part of the window's identity, so the window
+        // key itself commits to them: a continuation cannot be replayed
+        // against a window whose declared whole has silently changed.
+        let (stream_list_total, unscoped_gap_total) =
+            Self::bridge_recovery_window_denominators_in(write, &scope, cutoff)?;
+        let key_material = format!("{window_key}\x1f{stream_list_total}\x1f{unscoped_gap_total}");
+        let window_key = crate::model::sha256_hex(key_material.as_bytes());
         let row = BridgeEventRecoveryWindowRow {
             version: 1,
             window_key: window_key.clone(),
@@ -8619,6 +9347,8 @@ impl RedbRecoveryStore {
             principal: principal.to_owned(),
             owner_scope_digest: scope,
             owner_cutoff: cutoff,
+            stream_list_total,
+            unscoped_gap_total,
             created_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(BRIDGE_RECOVERY_WINDOW_TTL_MS),
             stream_list_complete: false,
@@ -8760,187 +9490,86 @@ impl RedbRecoveryStore {
         Ok(Some(row))
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "closed validation covers all tagged recovery selectors before any store access"
-    )]
-    fn parse_bridge_recovery_scope(
-        scope: Option<&serde_json::Value>,
+    /// Resolves the shared [`BridgeRecoverySelector`] into ORS's own
+    /// window/page meaning. There is no second parser: the wire shape and
+    /// every mechanical bound were already decided by the one shared type,
+    /// so this only narrows its already-validated fields to store-sized
+    /// cursors. A legacy raw shape carrying fields the shared type does not
+    /// know is refused by that type, never partially honoured here.
+    fn resolve_bridge_recovery_scope(
+        selector: Option<&BridgeRecoverySelector>,
     ) -> Result<BridgeRecoveryScopeSelector, OrsError> {
-        let Some(scope) = scope else {
+        let Some(selector) = selector else {
             return Ok(BridgeRecoveryScopeSelector::Open);
         };
-        if scope.is_null() {
-            return Ok(BridgeRecoveryScopeSelector::Open);
-        }
-        let object = scope.as_object().ok_or(OrsError::InvalidField {
+        selector.validate().map_err(|_| OrsError::InvalidField {
             field: "recovery_scope",
-            reason: "recovery scope must be an object",
+            reason: "recovery scope failed the shared selector contract",
         })?;
-        if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-            return Err(OrsError::InvalidField {
-                field: "recovery_scope.version",
-                reason: "recovery scope version 1 is required",
-            });
-        }
-        let kind = object
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(OrsError::InvalidField {
-                field: "recovery_scope.kind",
-                reason: "recovery scope requires a tagged kind",
-            })?;
-        let reject_unknown = |allowed: &[&str]| -> Result<(), OrsError> {
-            if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-                return Err(OrsError::InvalidField {
-                    field: "recovery_scope",
-                    reason: "recovery scope carries an unsupported field",
-                });
-            }
-            Ok(())
-        };
-        let number = |name: &'static str, default: Option<u64>| -> Result<u64, OrsError> {
-            match object.get(name) {
-                Some(value) => value.as_u64().ok_or(OrsError::InvalidField {
-                    field: name,
-                    reason: "recovery scope field must be an unsigned integer",
-                }),
-                None => default.ok_or(OrsError::InvalidField {
-                    field: name,
-                    reason: "recovery scope field is required",
-                }),
-            }
-        };
-        let text = |name: &'static str| -> Result<String, OrsError> {
-            let value = object.get(name).and_then(serde_json::Value::as_str).ok_or(
-                OrsError::InvalidField {
-                    field: name,
-                    reason: "recovery scope field must be text",
-                },
-            )?;
-            crate::model::validate_text(value, name)?;
-            Ok(value.to_owned())
-        };
-        let checked_limit = |name: &'static str, default: u64, maximum: usize| {
-            let value = number(name, Some(default))?;
+        let page_bound = |value: u64, maximum: usize| -> Result<usize, OrsError> {
             let limit = usize::try_from(value).map_err(|_| OrsError::InvalidCursorLimit)?;
             if limit == 0 || limit > maximum {
                 return Err(OrsError::InvalidCursorLimit);
             }
             Ok(limit)
         };
-        match kind {
-            "open" => {
-                reject_unknown(&["version", "kind"])?;
-                Ok(BridgeRecoveryScopeSelector::Open)
-            }
-            "streams" => {
-                reject_unknown(&[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_stream",
-                    "stream_limit",
-                ])?;
-                let window_key = text("window_key")?;
-                crate::model::validate_digest(&window_key, "window_key")?;
-                let after_stream =
-                    text("after_stream")?
-                        .parse::<u64>()
-                        .map_err(|_| OrsError::InvalidField {
-                            field: "after_stream",
-                            reason: "stream-list continuation must be a decimal owner cursor",
-                        })?;
-                let stream_limit = checked_limit(
-                    "stream_limit",
-                    MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE as u64,
-                    MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE,
-                )?;
-                Ok(BridgeRecoveryScopeSelector::Streams {
-                    window_key,
-                    after_stream,
-                    stream_limit,
-                    selected_scope: scope.clone(),
-                })
-            }
-            "stream" => {
-                reject_unknown(&[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "stream_id",
-                    "after_sequence",
-                    "upper_sequence",
-                    "expected_revision",
-                    "retention_floor",
-                    "event_limit",
-                    "gap_offset",
-                    "gap_limit",
-                ])?;
-                let window_key = text("window_key")?;
-                crate::model::validate_digest(&window_key, "window_key")?;
-                let stream_id = text("stream_id")?;
-                bridge_identity_text(&stream_id, "stream_id")?;
-                let after_sequence = number("after_sequence", None)?;
-                let upper_sequence = number("upper_sequence", None)?;
-                let expected_revision = number("expected_revision", None)?;
-                let retention_floor = number("retention_floor", None)?;
-                let event_limit = checked_limit(
-                    "event_limit",
-                    MAX_BRIDGE_EVENT_PAGE as u64,
-                    MAX_BRIDGE_EVENT_PAGE,
-                )?;
-                let gap_offset = usize::try_from(number("gap_offset", Some(0))?)
-                    .map_err(|_| OrsError::InvalidCursorLimit)?;
-                let gap_limit = checked_limit(
-                    "gap_limit",
-                    MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64,
-                    MAX_BRIDGE_EVENT_GAPS_PER_STREAM,
-                )?;
-                Ok(BridgeRecoveryScopeSelector::Stream {
-                    window_key,
-                    stream_id,
-                    after_sequence,
-                    upper_sequence,
-                    expected_revision,
-                    retention_floor,
-                    event_limit,
-                    gap_offset,
-                    gap_limit,
-                    selected_scope: scope.clone(),
-                })
-            }
-            "unscoped_gaps" => {
-                reject_unknown(&[
-                    "version",
-                    "kind",
-                    "window_key",
-                    "after_gap_scope",
-                    "gap_offset",
-                    "gap_limit",
-                ])?;
-                let window_key = text("window_key")?;
-                crate::model::validate_digest(&window_key, "window_key")?;
-                let after_gap_scope = text("after_gap_scope")?;
-                crate::model::validate_digest(&after_gap_scope, "after_gap_scope")?;
-                let gap_offset = usize::try_from(number("gap_offset", Some(0))?)
-                    .map_err(|_| OrsError::InvalidCursorLimit)?;
-                let gap_limit = checked_limit(
-                    "gap_limit",
-                    MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64,
-                    MAX_BRIDGE_EVENT_GAPS_PER_STREAM,
-                )?;
-                Ok(BridgeRecoveryScopeSelector::UnscopedGaps {
-                    window_key,
-                    after_gap_scope,
-                    gap_offset,
-                    gap_limit,
-                    selected_scope: scope.clone(),
-                })
-            }
-            _ => Err(OrsError::InvalidField {
-                field: "recovery_scope.kind",
-                reason: "recovery scope kind is unsupported",
+        match selector {
+            BridgeRecoverySelector::Streams {
+                window_key,
+                after_stream,
+                stream_limit,
+                version: _,
+            } => Ok(BridgeRecoveryScopeSelector::Streams {
+                window_key: window_key.clone(),
+                // The outer cursor is a decimal owner list position, not an
+                // opaque label: a non-decimal cursor cannot name a position.
+                after_stream: after_stream
+                    .parse::<u64>()
+                    .map_err(|_| OrsError::InvalidField {
+                        field: "after_stream",
+                        reason: "stream-list continuation must be a decimal owner cursor",
+                    })?,
+                stream_limit: page_bound(*stream_limit, MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE)?,
+            }),
+            BridgeRecoverySelector::Stream {
+                window_key,
+                stream_id,
+                owner_incarnation,
+                owner_revision,
+                expected_revision,
+                after_sequence,
+                upper_sequence,
+                retention_floor,
+                event_limit,
+                gap_offset,
+                gap_limit,
+                version: _,
+            } => Ok(BridgeRecoveryScopeSelector::Stream {
+                window_key: window_key.clone(),
+                stream_id: stream_id.clone(),
+                owner_incarnation: *owner_incarnation,
+                owner_revision: *owner_revision,
+                expected_revision: *expected_revision,
+                after_sequence: *after_sequence,
+                upper_sequence: *upper_sequence,
+                retention_floor: *retention_floor,
+                event_limit: page_bound(*event_limit, MAX_BRIDGE_EVENT_PAGE)?,
+                gap_offset: usize::try_from(*gap_offset)
+                    .map_err(|_| OrsError::InvalidCursorLimit)?,
+                gap_limit: page_bound(*gap_limit, MAX_BRIDGE_EVENT_GAPS_PER_STREAM)?,
+            }),
+            BridgeRecoverySelector::UnscopedGaps {
+                window_key,
+                after_gap_scope,
+                gap_offset,
+                gap_limit,
+                version: _,
+            } => Ok(BridgeRecoveryScopeSelector::UnscopedGaps {
+                window_key: window_key.clone(),
+                after_gap_scope: after_gap_scope.clone(),
+                gap_offset: usize::try_from(*gap_offset)
+                    .map_err(|_| OrsError::InvalidCursorLimit)?,
+                gap_limit: page_bound(*gap_limit, MAX_BRIDGE_EVENT_GAPS_PER_STREAM)?,
             }),
         }
     }
@@ -9575,23 +10204,93 @@ impl RedbRecoveryStore {
         }
     }
 
-    fn bridge_recovery_empty_reply(
+    /// One non-page recovery answer carrying a typed disposition instead of a
+    /// bare status string (issue #2798).
+    ///
+    /// The disposition reuses the bridge's existing reason vocabulary, and the
+    /// answer still reports every dimension's explicit completeness so an
+    /// expired or moved window cannot be mistaken for a completed walk.
+    fn bridge_recovery_typed_reply(
         window: &BridgeEventRecoveryWindowRow,
-        status: &str,
+        disposition: BridgeRecoveryWindowDisposition,
         selected_scope: &serde_json::Value,
+        unproven_scope_present: Option<bool>,
     ) -> serde_json::Value {
+        let unproven_scope_present = unproven_scope_present.unwrap_or(true);
+        let unresolved = BridgeRecoveryUnresolvedFrontier {
+            // An unusable window completes nothing: all four dimensions stay
+            // explicitly pending rather than silently reading as finished.
+            stream_list_pending: true,
+            unscoped_gaps_pending: true,
+            stream_pages_pending: true,
+            unproven_scope_present,
+        };
         json!({
             "window_key": window.window_key,
-            "window_status": status,
+            "window_status": match disposition {
+                BridgeRecoveryWindowDisposition::Active => "active",
+                BridgeRecoveryWindowDisposition::Moved => "moved",
+                BridgeRecoveryWindowDisposition::Expired => "expired",
+            },
+            "window_disposition": disposition,
+            "window_disposition_reason": disposition.reason(),
             "selected_scope": selected_scope,
             "stream_list_complete": false,
             "stream_list_continuation": window.stream_list_continuation,
+            "stream_list_total": window.stream_list_total,
             "unscoped_gaps_complete": false,
             "unscoped_gaps_continuation": serde_json::Value::Null,
+            "unscoped_gap_total": window.unscoped_gap_total,
+            "unresolved_frontier": unresolved,
             "streams": [],
             "unscoped_gaps": [],
-            "unproven_scope_present": true,
+            "unproven_scope_present": unproven_scope_present,
         })
+    }
+
+    /// Seals a finished page with its canonical commitment and enforces the
+    /// reply bound (issue #2798).
+    ///
+    /// The commitment is computed over the response body exactly as the
+    /// consumer will see it, together with the window, the exact selector,
+    /// the disposition, and the explicit unresolved frontier. A consumer can
+    /// therefore recompute and check the whole page from the answer alone,
+    /// before it swaps any live state — and the preserved known facts travel
+    /// beside the frontier that names what could not be resolved.
+    fn bridge_recovery_seal_reply(
+        mut response: serde_json::Value,
+        recovery_scope: Option<&BridgeRecoverySelector>,
+        window_key: &str,
+        disposition: BridgeRecoveryWindowDisposition,
+        unresolved: &BridgeRecoveryUnresolvedFrontier,
+    ) -> Result<serde_json::Value, OrsError> {
+        let commitment = BridgeRecoveryPageCommitment::compute(
+            recovery_scope,
+            window_key,
+            disposition,
+            unresolved,
+            &response,
+        )
+        .map_err(|_| OrsError::ProjectionLimitExceeded)?;
+        let object = response
+            .as_object_mut()
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        object.insert(
+            "page_commitment_version".to_owned(),
+            serde_json::Value::from(commitment.version()),
+        );
+        object.insert(
+            "page_commitment".to_owned(),
+            serde_json::Value::String(commitment.digest().to_owned()),
+        );
+        if serde_json::to_vec(&response)
+            .map_err(|_| OrsError::ProjectionLimitExceeded)?
+            .len()
+            > MAX_BRIDGE_RECOVERY_REPLY_BYTES
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Ok(response)
     }
 
     fn bump_bridge_recovery_revision_in(
@@ -9936,7 +10635,8 @@ impl RedbRecoveryStore {
     /// #2729): the first admitted bind durably retains the binding with
     /// its store-assigned incarnation and revision, while a later bind
     /// under the same namespace must present the identical binding —
-    /// changed lineage, principal, producer, or local scope fails with
+    /// changed lineage, principal, producer, local scope, or creating
+    /// connection/launch-nonce/session-epoch occurrence fails with
     /// [`OrsError::DuplicateConflict`] and never overwrites the retained
     /// owner. Enforces the owner-table bound for fresh namespaces.
     fn bind_bridge_stream_owner_in(
@@ -9965,6 +10665,9 @@ impl RedbRecoveryStore {
                 || row.principal != evidence.principal
                 || row.producer != evidence.producer
                 || row.local_stream != evidence.local
+                || row.creating_connection != evidence.connection
+                || row.creating_launch_nonce != evidence.launch_nonce
+                || row.creating_session_epoch != evidence.session_epoch
             {
                 return Err(OrsError::DuplicateConflict);
             }
@@ -11006,13 +11709,17 @@ impl RedbRecoveryStore {
         if crate::model::sha256_hex(&envelope_bytes) != presented_sha {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
-        let staging = Self::bridge_event_privacy_staging(staged, &envelope_bytes)?;
         let namespace = Self::bridge_stream_owner_digest(
             &evidence.lineage,
             &evidence.principal,
             &evidence.producer,
             &evidence.local,
         )?;
+        // The privacy owner's verdict is enforced against the namespace this
+        // entry is about to bind, so the owner can only have authorized these
+        // bytes inside the scope this store will actually record.
+        let staging =
+            Self::bridge_event_privacy_staging(staged, &envelope_bytes, Some(&namespace))?;
         let key = format!("{namespace}::{event_id}");
         let stage = BridgeCheckedStage {
             evidence,
@@ -11038,6 +11745,13 @@ impl RedbRecoveryStore {
     /// marker, and version join the comparison, so a redaction-policy
     /// change under the same identity conflicts instead of answering a
     /// stale representation as a duplicate.
+    ///
+    /// Issue #1934 binds the owner authorization: the scope the privacy owner
+    /// evaluated the source in and the policy revision it decided at join the
+    /// comparison, so a verdict reached under a different scope or a newer
+    /// privacy policy conflicts rather than answering a stale permission as a
+    /// duplicate. The exact source digest is already covered by
+    /// `transport_hash`.
     fn replay_bridge_event_outcome_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -11066,6 +11780,8 @@ impl RedbRecoveryStore {
                 } else {
                     0
                 }
+            || row.admitted_scope != staging.scope
+            || row.admitted_policy_revision != staging.policy_revision
         {
             return Err(OrsError::DuplicateConflict);
         }
@@ -11177,11 +11893,7 @@ impl RedbRecoveryStore {
             owner_namespace: stage.namespace.clone(),
             transport_hash: staging.transport_hash.clone(),
             redacted: staging.denied,
-            redaction_reason: if staging.denied {
-                BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned()
-            } else {
-                String::new()
-            },
+            redaction_reason: staging.reason.clone(),
             redacted_classes: staging.classes.clone(),
             redaction_marker: if staging.denied {
                 BRIDGE_EVENT_REDACTED_PROJECTION_MARKER.to_owned()
@@ -11193,6 +11905,14 @@ impl RedbRecoveryStore {
             } else {
                 0
             },
+            // The owner authorization travels with the decision: the exact
+            // source bytes, the scope the owner evaluated them in, and the
+            // privacy policy revision it decided at. A later replay under a
+            // different scope or revision is a different verdict, not a
+            // duplicate (see [`Self::replay_bridge_event_outcome_checked`]).
+            admitted_source: staging.transport_hash.clone(),
+            admitted_scope: staging.scope.clone(),
+            admitted_policy_revision: staging.policy_revision,
         };
         row.validate()?;
         {
@@ -12276,7 +12996,13 @@ impl RedbRecoveryStore {
         now_ms: u64,
     ) -> Result<(String, String), OrsError> {
         if parsed.stream_id.is_empty() {
-            let namespace = Self::bridge_gap_owner_digest(&parsed.lineage, &parsed.principal)?;
+            let namespace = Self::bridge_gap_owner_digest(
+                &parsed.lineage,
+                &parsed.principal,
+                &parsed.connection,
+                &parsed.launch_nonce,
+                parsed.session_epoch,
+            )?;
             let evidence = BridgeOwnerEvidence {
                 lineage: parsed.lineage.clone(),
                 principal: parsed.principal.clone(),
@@ -13056,7 +13782,7 @@ impl RedbRecoveryStore {
         &self,
         presenter: &serde_json::Value,
         live_generation: u64,
-        recovery_scope: Option<&serde_json::Value>,
+        recovery_scope: Option<&BridgeRecoverySelector>,
     ) -> Result<serde_json::Value, OrsError> {
         let (lineage, principal) = Self::bridge_owner_presenter_from(presenter)?;
         if live_generation == 0 {
@@ -13065,15 +13791,10 @@ impl RedbRecoveryStore {
                 reason: "live producer generation must be nonzero",
             });
         }
-        let selector = Self::parse_bridge_recovery_scope(recovery_scope)?;
-        let selected_scope = match &selector {
-            BridgeRecoveryScopeSelector::Open => serde_json::Value::Null,
-            BridgeRecoveryScopeSelector::Streams { selected_scope, .. }
-            | BridgeRecoveryScopeSelector::Stream { selected_scope, .. }
-            | BridgeRecoveryScopeSelector::UnscopedGaps { selected_scope, .. } => {
-                selected_scope.clone()
-            }
-        };
+        let selector = Self::resolve_bridge_recovery_scope(recovery_scope)?;
+        let selected_scope = recovery_scope
+            .and_then(|selector| serde_json::to_value(selector).ok())
+            .unwrap_or(serde_json::Value::Null);
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
         let (mut window, opening) = match &selector {
@@ -13091,10 +13812,11 @@ impl RedbRecoveryStore {
         };
         if window.expires_at_ms <= now_ms {
             drop(write);
-            return Ok(Self::bridge_recovery_empty_reply(
+            return Ok(Self::bridge_recovery_typed_reply(
                 &window,
-                "expired",
+                BridgeRecoveryWindowDisposition::Expired,
                 &selected_scope,
+                None,
             ));
         }
 
@@ -13132,6 +13854,8 @@ impl RedbRecoveryStore {
             }
             BridgeRecoveryScopeSelector::Stream {
                 stream_id,
+                owner_incarnation,
+                owner_revision,
                 after_sequence,
                 upper_sequence,
                 expected_revision,
@@ -13149,9 +13873,19 @@ impl RedbRecoveryStore {
                     &owner.namespace,
                 )?
                 .ok_or(OrsError::RecoveryOwnerMismatch)?;
+                // The continuation must bind the SAME walk: the same finite
+                // upper bound, retention floor, view revision, AND the exact
+                // stream incarnation and owner binding revision. Comparing
+                // the incarnation and revision is what rejects a successor
+                // stream published under the same name inside the same
+                // window, which a bound-only check would happily continue.
                 if cut.upper_sequence != *upper_sequence
                     || cut.expected_revision != *expected_revision
                     || cut.retention_floor != *retention_floor
+                    || cut.owner_incarnation != *owner_incarnation
+                    || cut.owner_revision != *owner_revision
+                    || owner.incarnation != *owner_incarnation
+                    || owner.revision != *owner_revision
                 {
                     return Err(OrsError::RecoveryOwnerMismatch);
                 }
@@ -13245,10 +13979,11 @@ impl RedbRecoveryStore {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
         if read_window.expires_at_ms <= current_unix_ms_u64()? {
-            return Ok(Self::bridge_recovery_empty_reply(
+            return Ok(Self::bridge_recovery_typed_reply(
                 &read_window,
-                "expired",
+                BridgeRecoveryWindowDisposition::Expired,
                 &selected_scope,
+                None,
             ));
         }
         let mut moved = false;
@@ -13396,39 +14131,62 @@ impl RedbRecoveryStore {
         let unproven_scope_present =
             Self::bridge_recovery_unproven_scope_present(&read, &read_window)?;
         if moved {
-            let mut response =
-                Self::bridge_recovery_empty_reply(&read_window, "moved", &selected_scope);
-            response["stream_list_complete"] =
-                serde_json::Value::Bool(read_window.stream_list_complete);
-            response["stream_list_continuation"] = read_window
-                .stream_list_continuation
-                .clone()
-                .map_or(serde_json::Value::Null, serde_json::Value::String);
-            return Ok(response);
+            // A moved window never returns half a stitched page: the typed
+            // Moved disposition is the whole answer, and its commitment still
+            // binds the window and the selector the caller asked for.
+            return Ok(Self::bridge_recovery_typed_reply(
+                &read_window,
+                BridgeRecoveryWindowDisposition::Moved,
+                &selected_scope,
+                Some(unproven_scope_present),
+            ));
         }
         let gap_continuation = unscoped_gap_cursor.map(|(after_gap_scope, gap_offset)| {
             json!({ "after_gap_scope": after_gap_scope, "gap_offset": gap_offset })
         });
+        // Every independently bounded dimension reports its own explicit
+        // continuation and its own declared denominator. A page shorter than
+        // its limit is NOT complete: completeness is only ever the absence
+        // of that dimension's continuation, and the denominator says how much
+        // of the whole this page represents.
+        let stream_pages_pending = stream_pages.iter().any(|page| {
+            page.get("pending_first_page")
+                .and_then(|first| first.get("continuation"))
+                .is_some_and(|next| !next.is_null())
+                || page
+                    .get("gap_continuation")
+                    .is_some_and(|next| !next.is_null())
+        });
+        let unresolved = BridgeRecoveryUnresolvedFrontier {
+            stream_list_pending: !read_window.stream_list_complete,
+            unscoped_gaps_pending: !unscoped_gaps_complete,
+            stream_pages_pending,
+            unproven_scope_present,
+        };
         let response = json!({
             "window_key": read_window.window_key,
             "window_status": "active",
+            "window_disposition": BridgeRecoveryWindowDisposition::Active,
+            "window_disposition_reason": BridgeRecoveryWindowDisposition::Active.reason(),
             "selected_scope": selected_scope,
             "stream_list_complete": read_window.stream_list_complete,
             "stream_list_continuation": read_window.stream_list_continuation,
+            "stream_list_total": read_window.stream_list_total,
             "unscoped_gaps_complete": unscoped_gaps_complete,
             "unscoped_gaps_continuation": gap_continuation,
+            "unscoped_gap_total": read_window.unscoped_gap_total,
+            "unresolved_frontier": unresolved,
             "streams": stream_pages,
             "unscoped_gaps": unscoped_gaps,
             "unproven_scope_present": unproven_scope_present,
         });
-        if serde_json::to_vec(&response)
-            .map_err(|_| OrsError::ProjectionLimitExceeded)?
-            .len()
-            > MAX_BRIDGE_RECOVERY_REPLY_BYTES
-        {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-        Ok(response)
+        Self::bridge_recovery_seal_reply(
+            response,
+            recovery_scope,
+            &read_window.window_key,
+            BridgeRecoveryWindowDisposition::Active,
+            &unresolved,
+        )
     }
 
     /// Counts one namespace's #2730 ordered position rows with their total

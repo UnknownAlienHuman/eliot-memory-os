@@ -1695,14 +1695,20 @@ use eliot_platform_windows::{
     WindowsAdapterError, observe_named_pipe_peer_process,
 };
 
+// I16.10 (issue #1837): the last entry carries the installer-owned Watchdog
+// state root, the Watchdog failure domain the periodic digest anchor is copied
+// into. It is injected with the same launch contour and under the same
+// `ELIOT_RUNTIME_STATE_ROOTS_DIGEST` as the receipt and ORS roots, so the
+// Kernel cannot receive a digest that does not cover the anchor sink.
 #[cfg(windows)]
-const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 7] = [
+const KERNEL_BOOTSTRAP_ENVIRONMENT: [&str; 8] = [
     "ELIOT_KERNEL_CONTROL_PIPE",
     "ELIOT_HOST_PROCESS_ID",
     "ELIOT_HOST_PROCESS_START",
     "ELIOT_HOST_PROCESS_IMAGE",
     "ELIOT_KERNEL_RECEIPT_ROOT",
     "ELIOT_KERNEL_ORS_ROOT",
+    "ELIOT_KERNEL_WATCHDOG_STATE_ROOT",
     "ELIOT_RUNTIME_STATE_ROOTS_DIGEST",
 ];
 
@@ -2500,7 +2506,7 @@ impl HostJobBranches {
         config_path: &Path,
         job_identity: &JobObjectIdentity,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
-        receipt_binding: Option<(&Path, &Path, &PlatformHandle)>,
+        receipt_binding: Option<(&Path, &Path, &Path, &PlatformHandle)>,
     ) -> Vec<(OsString, OsString)>
     where
         I: IntoIterator<Item = (OsString, OsString)>,
@@ -2573,7 +2579,9 @@ impl HostJobBranches {
                     OsString::from(&binding.host_process.image_path),
                 ),
             ]);
-            if let Some((receipt_root, ors_root, roots_digest)) = receipt_binding {
+            if let Some((receipt_root, ors_root, watchdog_state_root, roots_digest)) =
+                receipt_binding
+            {
                 environment.extend([
                     (
                         OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[4]),
@@ -2585,6 +2593,10 @@ impl HostJobBranches {
                     ),
                     (
                         OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[6]),
+                        watchdog_state_root.as_os_str().to_owned(),
+                    ),
+                    (
+                        OsString::from(KERNEL_BOOTSTRAP_ENVIRONMENT[7]),
                         OsString::from(roots_digest.as_str()),
                     ),
                 ]);
@@ -2605,7 +2617,7 @@ impl HostJobBranches {
         config_path: &Path,
         job_identity: &JobObjectIdentity,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
-        receipt_binding: Option<(&Path, &Path, &PlatformHandle)>,
+        receipt_binding: Option<(&Path, &Path, &Path, &PlatformHandle)>,
     ) -> Vec<(OsString, OsString)> {
         Self::environment_from(
             std::env::vars_os(),
@@ -4282,6 +4294,11 @@ impl HostJobBranches {
         )?;
         let (kernel_working_directory, _) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
+        // I16.10 (issue #1837): the relaunched Kernel must reach the same
+        // Watchdog failure-domain anchor sink as the first launch, so the
+        // binding is rebuilt from the same installer-owned root rather than
+        // left to a same-directory default.
+        let watchdog_anchor_root = Self::watchdog_anchor_root(launch)?;
         // T6-D2 front-door anchor (issue #461): the stored 22-value contour
         // gains the sealed digest-bound Doctor path so the relaunched Kernel
         // receives the exact 24-value launch options. Missing anchors fail
@@ -4309,6 +4326,7 @@ impl HostJobBranches {
             Some((
                 Path::new(launch.runtime_state_roots.host_state_root.as_str()),
                 Path::new(launch.runtime_state_roots.kernel_ors_root.as_str()),
+                watchdog_anchor_root,
                 &launch.runtime_state_roots.roots_digest,
             )),
         )?;

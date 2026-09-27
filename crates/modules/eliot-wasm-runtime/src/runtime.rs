@@ -129,7 +129,8 @@ impl WasmRuntime {
         self.generation_coordinator.switch(request)
     }
 
-    /// Arms an explicit rollback as its own operation on the coordinator.
+    /// Returns a typed refusal until rollback is authorized by a Kernel/ORS
+    /// cutover to a newer epoch.
     pub fn arm_replacement_rollback(
         &self,
         request: &RollbackRequest,
@@ -137,7 +138,8 @@ impl WasmRuntime {
         self.generation_coordinator.arm_rollback(request)
     }
 
-    /// Completes an armed rollback with drain and atomic restore.
+    /// Returns a typed refusal until Kernel/ORS commits rollback as a newer-epoch
+    /// cutover; the local coordinator cannot restore a retained old epoch.
     pub fn complete_replacement_rollback(
         &self,
         operation_id: &str,

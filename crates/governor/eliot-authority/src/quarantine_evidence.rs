@@ -26,23 +26,31 @@
 //!    It is not authority and it is not an input to closure verdicts.
 //! 2. [`VerifiedQuarantineBinding`] — the admitted form. Every field is
 //!    private, it derives neither `Deserialize` nor `Serialize`, and its
-//!    only constructors re-verify the retained semantic decision receipt,
-//!    the applicable mechanical enforcement receipt, and CURRENT owner
-//!    state (the structural relation re-read from the live graph or the
-//!    admitted snapshot, parent/child commitments recomputed from CURRENT
-//!    grants, the current graph revision, and the current State Fence)
-//!    before the omission can satisfy a closure. A public deserializer
-//!    therefore cannot produce the type that
-//!    [`GrantGraph`](crate::GrantGraph) executes, and a caller-authored
-//!    structural record authorizes no omission.
+//!    only constructors prove the presented evidence against the retained
+//!    semantic decision (operation kind/identity, idempotency key,
+//!    canonical request digest, relation and grant commitments, roots,
+//!    policy/snapshot/revision, disposition, authority binding, and
+//!    receipt, each compared within its own domain), resolve the claimed
+//!    ORS reference against the exact retained enforcement result, and
+//!    re-verify the retained semantic decision receipt, the applicable
+//!    mechanical enforcement receipt, and CURRENT owner state (the
+//!    structural relation re-read from the live graph or the admitted
+//!    snapshot, parent/child commitments recomputed from CURRENT grants,
+//!    the current graph revision, and the current State Fence) before the
+//!    omission can satisfy a closure. A public deserializer therefore
+//!    cannot produce the type that [`GrantGraph`](crate::GrantGraph)
+//!    executes, and a caller-authored structural record authorizes no
+//!    omission, even with an authentic receipt identity borrowed from
+//!    another decision.
 //!
 //! # Purity boundary: this crate reads no Store, mints no canonical receipt,
 //! authenticates no session, and cannot verify a Kernel/ORS durable record.
 //! What this crate guarantees is that a verified binding replays stably
 //! under one operation identity, conflicts under changed same-identity
 //! content, and stays unreadable as completeness evidence until the owner
-//! chain has presented the exact semantic and mechanical receipts through
-//! the durable readback maps it already serves.
+//! chain has presented the exact retained semantic decision, the exact
+//! retained enforcement result, and the exact semantic and mechanical
+//! receipts through the durable readback maps it already serves.
 
 use std::collections::BTreeMap;
 
@@ -111,9 +119,11 @@ pub enum UnresolvedEffectDisposition {
 /// Mechanical enforcement reference: the exact Kernel/ORS revocation/fence
 /// result plus the unresolved-effect disposition (issue #2976, step 3).
 ///
-/// This reuses the canonical/ORS receipt and readback mechanisms: the
-/// enforcement operation identity must resolve through the durable receipt
-/// map to exactly this receipt. No new generic signature is introduced.
+/// This reuses the canonical/ORS receipt and readback mechanisms: the ORS
+/// reference must resolve through the retained enforcement results to
+/// exactly this record, and the enforcement operation identity must
+/// resolve through the durable receipt map to exactly this receipt. No
+/// new generic signature is introduced.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuarantineEnforcementRef {
@@ -125,6 +135,28 @@ pub struct QuarantineEnforcementRef {
     pub ors_record_ref: String,
     /// Explicit disposition of unknown in-flight effects.
     pub unresolved_effects: UnresolvedEffectDisposition,
+}
+
+impl QuarantineEnforcementRef {
+    /// Validates the closed structural shape of one mechanical
+    /// enforcement reference only. Resolution against the retained
+    /// enforcement result and receipt readback happen at admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError::InvalidField`] for a blank identity or
+    /// a malformed receipt.
+    pub fn validate_shape(&self) -> Result<(), AuthorityError> {
+        validate_text(
+            &self.operation_id,
+            "quarantine_evidence.enforcement.operation_id",
+        )?;
+        validate_text(
+            &self.ors_record_ref,
+            "quarantine_evidence.enforcement.ors_record_ref",
+        )?;
+        validate_receipt_identity(&self.receipt, "quarantine_evidence.enforcement.receipt")
+    }
 }
 
 /// Structural quarantine evidence record: the decoded wire form of ONE
@@ -272,18 +304,7 @@ impl CrossRootQuarantineEvidence {
             ));
         }
         if let Some(enforcement) = &self.enforcement {
-            validate_text(
-                &enforcement.operation_id,
-                "quarantine_evidence.enforcement.operation_id",
-            )?;
-            validate_text(
-                &enforcement.ors_record_ref,
-                "quarantine_evidence.enforcement.ors_record_ref",
-            )?;
-            validate_receipt_identity(
-                &enforcement.receipt,
-                "quarantine_evidence.enforcement.receipt",
-            )?;
+            enforcement.validate_shape()?;
         }
         validate_receipt_identity(&self.owner_receipt, "quarantine_evidence.owner_receipt")?;
         Ok(())
@@ -350,6 +371,27 @@ pub(crate) fn grant_record_commitment(
     Ok(sha256_hex(&bytes))
 }
 
+/// Resolves one claimed mechanical enforcement reference against the
+/// exact enforcement result the owner retained: the ORS reference must
+/// resolve, and the resolved operation identity, receipt, and
+/// unresolved-effect disposition must equal the claim. The receipt
+/// readback at the call site then proves the resolved operation
+/// completed to exactly that receipt.
+fn resolve_retained_enforcement(
+    enforcement: &QuarantineEnforcementRef,
+    retained_enforcements: &BTreeMap<String, QuarantineEnforcementRef>,
+) -> Result<(), AuthorityError> {
+    let resolved = retained_enforcements
+        .get(&enforcement.ors_record_ref)
+        .ok_or(AuthorityError::StaleQuarantineEvidence(
+            "quarantine_evidence.enforcement_unresolved",
+        ))?;
+    if resolved != enforcement {
+        return Err(AuthorityError::IdentityConflict);
+    }
+    Ok(())
+}
+
 /// Verified quarantine binding: the ONLY quarantine input executable
 /// closure verdicts accept.
 ///
@@ -382,9 +424,15 @@ impl VerifiedQuarantineBinding {
     ///
     /// The readback is deliberately against arguments the caller cannot
     /// satisfy by repeating its own request: `graph` is the CURRENT
-    /// restored graph, `current_fence` is the CURRENT owner fence, and
-    /// `canonical_receipts` is the CURRENT durable receipt map. A stale
-    /// record therefore fails closed instead of satisfying an omission.
+    /// restored graph, `current_fence` is the CURRENT owner fence,
+    /// `canonical_receipts` is the CURRENT durable receipt map,
+    /// `retained_decisions` holds the typed semantic decisions the owner
+    /// retained keyed by decision reference, and `retained_enforcements`
+    /// holds the exact enforcement results the owner retained keyed by
+    /// ORS record reference. A stale record therefore fails closed
+    /// instead of satisfying an omission, and a substituted decision
+    /// reference, policy, or request digest fails before first admission
+    /// even with the authentic receipt map.
     ///
     /// # Errors
     ///
@@ -396,12 +444,15 @@ impl VerifiedQuarantineBinding {
     /// child's fence/epoch, and
     /// [`AuthorityError::StaleQuarantineEvidence`] when the record is
     /// revoked, names no CURRENT relation, disagrees with CURRENT revision
-    /// or fence, or lacks its durable receipt readback.
+    /// or fence, resolves no retained semantic decision or enforcement
+    /// result, or lacks its durable receipt readback.
     pub fn admit(
         evidence: &CrossRootQuarantineEvidence,
         graph: &GrantGraph,
         current_fence: &StateFence,
         canonical_receipts: &BTreeMap<String, ReceiptIdentity>,
+        retained_decisions: &BTreeMap<String, CrossRootQuarantineEvidence>,
+        retained_enforcements: &BTreeMap<String, QuarantineEnforcementRef>,
     ) -> Result<Self, AuthorityError> {
         evidence.validate_shape()?;
         let relation = graph.quarantine_by_relation(&evidence.relation_id).ok_or(
@@ -422,6 +473,8 @@ impl VerifiedQuarantineBinding {
             graph.revision(),
             current_fence,
             canonical_receipts,
+            retained_decisions,
+            retained_enforcements,
         )
     }
 
@@ -432,8 +485,10 @@ impl VerifiedQuarantineBinding {
     /// `relation` is the necessary structural row from the admitted
     /// snapshot; `parent_record` and `child_record` are its CURRENT durable
     /// grant rows. Snapshot membership stays necessary but is never
-    /// sufficient proof: commitments are recomputed from these rows and the
-    /// receipts are re-read from the durable map.
+    /// sufficient proof: commitments are recomputed from these rows, the
+    /// evidence is proven against the retained semantic decision and the
+    /// exact retained enforcement result, and the receipts are re-read
+    /// from the durable map.
     ///
     /// # Errors
     ///
@@ -452,6 +507,8 @@ impl VerifiedQuarantineBinding {
         current_revision: u64,
         current_fence: &StateFence,
         canonical_receipts: &BTreeMap<String, ReceiptIdentity>,
+        retained_decisions: &BTreeMap<String, CrossRootQuarantineEvidence>,
+        retained_enforcements: &BTreeMap<String, QuarantineEnforcementRef>,
     ) -> Result<Self, AuthorityError> {
         evidence.validate_shape()?;
         Self::admit_resolved(
@@ -466,6 +523,8 @@ impl VerifiedQuarantineBinding {
             current_revision,
             current_fence,
             canonical_receipts,
+            retained_decisions,
+            retained_enforcements,
         )
     }
 
@@ -546,11 +605,12 @@ impl VerifiedQuarantineBinding {
         self.disposition
     }
 
-    /// Shared admission body: structural shape, exact edge/root
-    /// correspondence, relation and grant commitments recomputed from
-    /// CURRENT records, fence/epoch readback, revision currency, semantic
-    /// receipt readback, disposition-gated mechanical readback, and
-    /// non-revoked status.
+    /// Shared admission body: structural shape, content readback against
+    /// the retained semantic decision, exact edge/root correspondence,
+    /// relation and grant commitments recomputed from CURRENT records,
+    /// fence/epoch readback, revision currency, semantic receipt readback,
+    /// ORS-resolved disposition-gated mechanical readback, and non-revoked
+    /// status.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -568,11 +628,37 @@ impl VerifiedQuarantineBinding {
         current_revision: u64,
         current_fence: &StateFence,
         canonical_receipts: &BTreeMap<String, ReceiptIdentity>,
+        retained_decisions: &BTreeMap<String, CrossRootQuarantineEvidence>,
+        retained_enforcements: &BTreeMap<String, QuarantineEnforcementRef>,
     ) -> Result<Self, AuthorityError> {
         if evidence.status != QuarantineEvidenceStatus::Current {
             return Err(AuthorityError::StaleQuarantineEvidence(
                 "quarantine_evidence.status",
             ));
+        }
+        // Content readback against the retained owner decision, not the
+        // presenter's claim: the semantic decision reference must resolve
+        // to the exact decision the owner retained, and every committed
+        // field — operation kind/identity, idempotency key, canonical
+        // request digest, relation and grant commitments, roots,
+        // policy/snapshot/revision, disposition, authority binding,
+        // enforcement, and receipt — must agree within its own domain. A
+        // substituted reference, policy, or digest fails here, before
+        // first admission, even with the authentic graph, fence,
+        // operation, and receipt map: a real receipt for another decision
+        // cannot certify this one merely because its identity exists.
+        let retained = retained_decisions
+            .get(&evidence.semantic_decision_ref)
+            .ok_or(AuthorityError::StaleQuarantineEvidence(
+                "quarantine_evidence.semantic_decision_unretained",
+            ))?;
+        if retained.status != QuarantineEvidenceStatus::Current {
+            return Err(AuthorityError::StaleQuarantineEvidence(
+                "quarantine_evidence.semantic_decision_revoked",
+            ));
+        }
+        if retained != evidence {
+            return Err(AuthorityError::IdentityConflict);
         }
         if evidence.relation_id != relation_id
             || evidence.parent_grant_id != parent_record.grant_id
@@ -644,7 +730,9 @@ impl VerifiedQuarantineBinding {
                     ));
                 }
                 // Owner evidence that no activation became effective: the
-                // child never entered the admitted map.
+                // retained semantic decision attests NeverAdmitted at
+                // decision time, and the child is still absent from the
+                // admitted map now.
                 if child_admitted {
                     return Err(AuthorityError::StaleQuarantineEvidence(
                         "quarantine_evidence.never_admitted_active",
@@ -657,9 +745,11 @@ impl VerifiedQuarantineBinding {
                         "quarantine_evidence.enforcement",
                     ));
                 };
-                // Mechanical readback: the exact Kernel/ORS fence operation
-                // must have completed canonical reconciliation to exactly
-                // this receipt. Semantic quarantine alone is insufficient.
+                resolve_retained_enforcement(enforcement, retained_enforcements)?;
+                // Mechanical readback: the resolved exact Kernel/ORS fence
+                // operation must have completed canonical reconciliation to
+                // exactly this receipt, fencing this decision's child.
+                // Semantic quarantine alone is insufficient.
                 if canonical_receipts.get(&enforcement.operation_id) != Some(&enforcement.receipt) {
                     return Err(AuthorityError::StaleQuarantineEvidence(
                         "quarantine_evidence.mechanical_readback",
@@ -675,14 +765,17 @@ impl VerifiedQuarantineBinding {
                 // Validated owner evidence with an unknown enforcement
                 // outcome: the binding constructs so the unknown stays
                 // explicit, but it never satisfies an omission. A carried
-                // enforcement reference must still read back exactly.
-                if let Some(enforcement) = &evidence.enforcement
-                    && canonical_receipts.get(&enforcement.operation_id)
+                // enforcement reference must still resolve and read back
+                // exactly.
+                if let Some(enforcement) = &evidence.enforcement {
+                    resolve_retained_enforcement(enforcement, retained_enforcements)?;
+                    if canonical_receipts.get(&enforcement.operation_id)
                         != Some(&enforcement.receipt)
-                {
-                    return Err(AuthorityError::StaleQuarantineEvidence(
-                        "quarantine_evidence.mechanical_readback",
-                    ));
+                    {
+                        return Err(AuthorityError::StaleQuarantineEvidence(
+                            "quarantine_evidence.mechanical_readback",
+                        ));
+                    }
                 }
             }
             QuarantineDisposition::LegacyUnverified => {

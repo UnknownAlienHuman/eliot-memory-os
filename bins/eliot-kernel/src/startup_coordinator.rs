@@ -240,6 +240,61 @@ impl GovernanceProfile {
     }
 }
 
+/// Governor-issued authority projection (I7.16, #1935 AUD1).
+///
+/// Projection of the Governor-owned revisioned `GovernanceProfile`
+/// (`eliot-integration-coverage::GovernorCoverageDerivation`) across the
+/// authenticated boundary: the exact owner revision and exact active
+/// fingerprint plus the authorization axes in this crate's existing
+/// three-axis (A7.7) vocabulary. No third vocabulary is introduced:
+/// `revision`/`fingerprint` name the owner binding exactly as the owner
+/// names it, and `profile` is the existing [`GovernanceProfile`] vector.
+///
+/// A recorded projection is the only profile the Material/Critical gates
+/// admit under. Authority issued under one revision is rejected once a new
+/// revision is recorded, so coverage loss revokes dependent authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernorIssuedAuthority {
+    /// Exact owner derivation revision this projection was issued under.
+    revision: u64,
+    /// Exact active host/adapter fingerprint the owner derived for.
+    fingerprint: String,
+    /// Authorization axes in the existing three-axis vocabulary.
+    profile: GovernanceProfile,
+}
+
+impl GovernorIssuedAuthority {
+    /// Exact owner revision this projection was issued under.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Exact active fingerprint the owner derived for.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Authorization axes in the existing three-axis vocabulary.
+    #[must_use]
+    pub const fn profile(&self) -> GovernanceProfile {
+        self.profile
+    }
+}
+
+/// Rejection-shape validation for a Governor-issued fingerprint, mirroring
+/// the owner's text rule: the binding must name the exact active
+/// fingerprint, never blank or control-carrying text.
+fn validate_governor_fingerprint(fingerprint: &str) -> Result<(), String> {
+    if fingerprint.trim().is_empty() || fingerprint.chars().any(char::is_control) {
+        return Err(
+            "governor authority fingerprint must name the exact active fingerprint".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Rejection for a normal canonical write or Material/Critical authority
 /// request while a mandatory startup prerequisite is incomplete.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -382,6 +437,12 @@ pub struct StartupCoordinator {
     /// revocation leaves it alone: the number of physical observations is a
     /// property of this Kernel, not of one activation contour.
     supervision_progress_frontier: u64,
+    /// Current Governor-issued authority projection (I7.16, #1935 AUD1).
+    /// `None` until the Governor derivation is first recorded across the
+    /// authenticated boundary; while `None` every Material/Critical gate
+    /// refuses. A newer recorded revision supersedes (revokes) the older
+    /// one: admission binds to the exact current revision and fingerprint.
+    governor_authority: Option<GovernorIssuedAuthority>,
     blob_degraded: bool,
     capability_degraded: bool,
 }
@@ -406,6 +467,7 @@ impl StartupCoordinator {
             current_supervision_observation: None,
             superseded_supervision_observation: None,
             supervision_progress_frontier: 0,
+            governor_authority: None,
             blob_degraded: false,
             capability_degraded: false,
         }
@@ -555,6 +617,116 @@ impl StartupCoordinator {
                 ),
             })
         }
+    }
+
+    /// Records the live Governor-owned derivation projection (I7.16, #1935
+    /// AUD1).
+    ///
+    /// Designated producer: the Governor coverage feed binding the owner
+    /// bundle revision across the authenticated boundary (STITCH: the
+    /// host-side feed transport lives outside this issue's file scope; until
+    /// it records, every Material/Critical gate refuses). The revision must
+    /// start at one and strictly advance: replaying the current or an older
+    /// revision is rejected, so revoked authority can never be resurrected
+    /// by re-presenting superseded bytes. Recording a degraded profile
+    /// under a new revision revokes everything issued under the old one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed-shape reason when the revision is zero or not
+    /// strictly newer than the recorded one, or when the fingerprint does
+    /// not name the exact active fingerprint.
+    pub(crate) fn record_governor_derived_authority(
+        &mut self,
+        revision: u64,
+        fingerprint: String,
+        profile: GovernanceProfile,
+    ) -> Result<(), String> {
+        if revision == 0 {
+            return Err("governor authority revision must start at one".to_owned());
+        }
+        validate_governor_fingerprint(&fingerprint)?;
+        if let Some(current) = self.governor_authority.as_ref()
+            && revision <= current.revision
+        {
+            return Err(format!(
+                "governor authority revision {revision} does not advance the recorded revision {}",
+                current.revision,
+            ));
+        }
+        self.governor_authority = Some(GovernorIssuedAuthority {
+            revision,
+            fingerprint,
+            profile,
+        });
+        Ok(())
+    }
+
+    /// Records Governor-observed coverage loss (I7.16 blind interval / route
+    /// mismatch, #1935 AUD1).
+    ///
+    /// Mirrors the owner's mismatch derivation: the new revision authorizes
+    /// nothing ([`GovernanceProfile::minimal`]), so admissions issued under
+    /// any older revision are stale and every new Material/Critical request
+    /// fails the profile ceiling until the Governor derives again. Same
+    /// designated producer and same revision/fingerprint validation as
+    /// [`Self::record_governor_derived_authority`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed-shape reason when the revision is zero or not
+    /// strictly newer than the recorded one, or when the fingerprint does
+    /// not name the exact active fingerprint.
+    pub(crate) fn report_governor_coverage_loss(
+        &mut self,
+        revision: u64,
+        fingerprint: String,
+    ) -> Result<(), String> {
+        self.record_governor_derived_authority(revision, fingerprint, GovernanceProfile::minimal())
+    }
+
+    /// Current Governor-issued authority projection, if the Governor
+    /// derivation has been recorded. `None` fails every Material/Critical
+    /// gate closed; it is never defaulted to a strong profile.
+    #[must_use]
+    pub(crate) fn current_governor_issued_authority(&self) -> Option<GovernorIssuedAuthority> {
+        self.governor_authority.clone()
+    }
+
+    /// Binds presented Governor-issued authority to the current revision
+    /// (I7.16, #1935 AUD1).
+    ///
+    /// Fails when nothing has been derived, when the presented
+    /// revision/fingerprint is not exactly the current one (superseded by a
+    /// newer derivation, degraded or not), and returns the currently
+    /// authorized profile otherwise. A degraded re-derivation therefore
+    /// rejects every capability issued under the lost revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] when no derivation is
+    /// current, or a revision-binding rejection when the presented
+    /// authority is stale.
+    pub(crate) fn admit_governor_issued_authority(
+        &self,
+        issued: &GovernorIssuedAuthority,
+    ) -> Result<GovernanceProfile, StartupRejection> {
+        let Some(current) = self.governor_authority.as_ref() else {
+            return Err(StartupRejection {
+                prerequisite: StartupPrerequisite::SupervisionEvidence,
+                message: "material authority rejected: no Governor-derived coverage profile is current; Material/Critical work is paused until the Governor derivation is recorded".to_owned(),
+            });
+        };
+        if issued.revision != current.revision || issued.fingerprint != current.fingerprint {
+            return Err(StartupRejection {
+                prerequisite: StartupPrerequisite::SupervisionEvidence,
+                message: format!(
+                    "material authority rejected: issued governor authority (revision {}, fingerprint '{}') is not the current revision {} for fingerprint '{}'",
+                    issued.revision, issued.fingerprint, current.revision, current.fingerprint,
+                ),
+            });
+        }
+        Ok(current.profile())
     }
 
     /// Records blob large-payload degradation (I1.11 step 4). A failed blob
@@ -804,6 +976,21 @@ impl StartupCoordinator {
         if let Some(previous) = self.current_supervision_observation.take() {
             self.superseded_supervision_observation = Some(previous);
         }
+        // I7.16 (#1935 AUD1): admitting a new contour supersedes the recorded
+        // Governor derivation with it. The old revision's fingerprint binding
+        // no longer describes the live contour, so record coverage loss under
+        // the next revision (authorizing nothing) until the Governor derives
+        // again. On the unreachable validation failure the record is dropped
+        // instead, which fails Material/Critical closed either way.
+        if let Some(recorded) = self.current_governor_issued_authority() {
+            let next = recorded.revision().saturating_add(1).max(1);
+            if self
+                .report_governor_coverage_loss(next, recorded.fingerprint().to_owned())
+                .is_err()
+            {
+                self.governor_authority = None;
+            }
+        }
     }
 
     /// Completes every mandatory gate in I1.11 order (1-11). Test and
@@ -818,6 +1005,73 @@ impl StartupCoordinator {
     pub(crate) fn complete_all_mandatory(&mut self) -> Result<(), String> {
         for step in STARTUP_FIRST_STEP..=STARTUP_FINAL_STEP {
             self.complete_step(step)?;
+        }
+        Ok(())
+    }
+}
+
+/// Material/Critical authority admission under the live Governor-owned
+/// derivation (I7.16, #1935 AUD1).
+///
+/// This is the single production gate behind every Material/Critical
+/// effect: it reads the current owner-issued revision/fingerprint/profile
+/// readback, binds the presented authority to that exact revision, runs
+/// the unchanged fence, ceiling and Watchdog-supervision decision, then
+/// re-checks revision currency before admitting. A Governor re-derivation
+/// (degraded or route-mismatched) that lands mid-admission fails the
+/// request closed instead of admitting under a superseded profile, and any
+/// authority issued under an older revision is rejected as stale. No
+/// hard-coded [`GovernanceProfile::full`] reaches an effect through here.
+impl super::KernelComposition {
+    /// Admits one Material/Critical effect for one exact target fence under
+    /// the current Governor-issued authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when no Governor derivation is recorded,
+    /// when the recorded derivation was superseded mid-admission, or when
+    /// the underlying fence, ceiling, or Watchdog-supervision decision
+    /// refuses.
+    pub(crate) fn admit_material_authority_for_governor_issued_fence(
+        &self,
+        target: &eliot_contracts::StateFence,
+    ) -> Result<(), eliot_kernel_service::KernelServiceError> {
+        let lock_poisoned = || {
+            eliot_kernel_service::KernelServiceError::Platform(
+                "startup gate lock poisoned".to_owned(),
+            )
+        };
+        let issued = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| lock_poisoned())?
+            .current_governor_issued_authority()
+            .ok_or_else(|| {
+                eliot_kernel_service::KernelServiceError::Platform(
+                    "material authority refused: no Governor-derived coverage profile is current for this Kernel"
+                        .to_owned(),
+                )
+            })?;
+        let bound = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| lock_poisoned())?
+            .admit_governor_issued_authority(&issued)
+            .map_err(|rejection| {
+                eliot_kernel_service::KernelServiceError::Platform(rejection.to_string())
+            })?;
+        self.admit_material_authority_for_fence(bound, target)?;
+        let current = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| lock_poisoned())?
+            .current_governor_issued_authority();
+        if current.as_ref().is_none_or(|fresh| {
+            fresh.revision() != issued.revision() || fresh.fingerprint() != issued.fingerprint()
+        }) {
+            return Err(eliot_kernel_service::KernelServiceError::Platform(
+                "material authority refused: the Governor derivation advanced during admission; re-present under the current revision".to_owned(),
+            ));
         }
         Ok(())
     }

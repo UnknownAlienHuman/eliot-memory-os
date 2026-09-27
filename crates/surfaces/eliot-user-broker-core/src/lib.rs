@@ -17,8 +17,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
-use eliot_contracts::EpochId;
+use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_process::{
     CancellationReceipt, EnvironmentInheritance, EnvironmentProjection, Generation, ImageId, JobId,
     OperationId, ProcessExecutionView, ProcessLifecycle, ProcessStartReceipt, ProcessTreeId,
@@ -433,6 +434,31 @@ pub struct RegistrationReceipt {
     pub fence_id: String,
     pub expires_at: u64,
     pub status: RegistrationStatus,
+}
+
+impl RegistrationReceipt {
+    /// Validates the shape of a sealed registration receipt on its own terms.
+    ///
+    /// This is a *shape* check, not an authority check: it proves the receipt
+    /// names a real identity tuple, a real broker-local epoch, a real lineage
+    /// authority and a non-empty fence.  It deliberately grants nothing and
+    /// proves no grant signature — that remains the `seal_registration` job.
+    /// It exists so a cutover candidate can be refused for being malformed
+    /// before any comparison against the recorded registration is attempted.
+    fn validate_shape(&self) -> Result<(), BrokerError> {
+        text(&self.registration_digest, "registration_digest")?;
+        hex_digest(&self.registration_digest, "registration_digest")?;
+        text(&self.installation_id, "installation_id")?;
+        text(&self.windows_sid, "windows_sid")?;
+        text(&self.interactive_session_id, "interactive_session_id")?;
+        text(&self.boot_session_id, "boot_session_id")?;
+        text(&self.broker_process_id, "broker_process_id")?;
+        text(&self.fence_id, "fence_id")?;
+        if self.user_broker_epoch == 0 || self.expires_at == 0 {
+            return Err(BrokerError::InvalidField("registration_receipt"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1065,6 +1091,38 @@ pub struct BrokerSnapshot {
     /// licence to reuse an id.
     #[serde(default)]
     pub retired_operations: Vec<RetiredOperationIdentity>,
+    /// The registration this broker's current generation superseded.
+    ///
+    /// I14.17 keeps every pre-cutover child runtime "pinned to the
+    /// broker/epoch that launched it" and never silently adopts it, so the
+    /// superseded generation's own identity has to outlive the transition that
+    /// retired it. Without this row a restart could name the retired
+    /// operation ids but not the generation they belonged to, and a
+    /// registration/cutover receipt would have to take the old generation and
+    /// epoch from caller-supplied text — which would let a receipt describe a
+    /// transition this broker never performed.
+    ///
+    /// Only the immediately superseded registration is retained; a deeper
+    /// predecessor is not chained, because the receipt of the earlier
+    /// transition already recorded it. `#[serde(default)]` is the versioned
+    /// additive migration — a snapshot written before generations were
+    /// chained has no predecessor, which is read as "this file has recorded no
+    /// superseded registration", never as a licence to invent one.
+    #[serde(default)]
+    pub predecessor_registration: Option<RegistrationReceipt>,
+    /// The registration/cutover receipt this broker last published, or
+    /// `None` when it has published none.
+    ///
+    /// The receipt is a durable record, not a completion signal: its
+    /// [`OldJobObjectTermination`] field is the only state this owner can
+    /// produce, so a reader can never conclude from its presence that a new
+    /// generation took over. Persisting it is what makes the recorded Session
+    /// binding transfer and the pre-cutover operation dispositions survive a
+    /// restart instead of living only until the process died.
+    /// `#[serde(default)]` is the versioned additive migration — absence is
+    /// read as "no cutover was published into this file".
+    #[serde(default)]
+    pub cutover_receipt: Option<CutoverReceipt>,
 }
 
 /// One operation identity fenced by a newer broker generation.
@@ -1181,6 +1239,230 @@ impl OperationCursor {
     }
 }
 
+/// The explicitly recorded broker-independent part of one broker Session
+/// identity (I14.17:11).
+///
+/// A Session binding is recorded in two parts, and only this part is
+/// broker-independent: the installation, Windows SID, interactive logon
+/// Session and boot Session name the user's Session, not the broker process
+/// that serves it. The broker-dependent part — the broker process id, its
+/// immutable artifact digest and its launch nonce — is deliberately absent
+/// from this type, so a cutover has no field to copy it into and
+/// "leave broker-dependent bindings untransferred" is a property of the shape
+/// rather than of a code path somebody has to remember to follow.
+///
+/// A transferred binding grants nothing. It records which user Session a
+/// generation served, so a later generation can be shown to have continued the
+/// same Session; it is never an admission, and every launch still runs against
+/// the live registration's own binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerIndependentSessionBinding {
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub boot_session_id: String,
+}
+
+impl BrokerIndependentSessionBinding {
+    /// Projects the broker-independent part out of one registration.
+    fn of(registration: &RegistrationReceipt) -> Self {
+        Self {
+            installation_id: registration.installation_id.clone(),
+            windows_sid: registration.windows_sid.clone(),
+            interactive_session_id: registration.interactive_session_id.clone(),
+            boot_session_id: registration.boot_session_id.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.installation_id, "session_binding.installation_id")?;
+        text(&self.windows_sid, "session_binding.windows_sid")?;
+        text(
+            &self.interactive_session_id,
+            "session_binding.interactive_session_id",
+        )?;
+        text(&self.boot_session_id, "session_binding.boot_session_id")
+    }
+}
+
+/// The binding transfer one published cutover applied (I14.17:11).
+///
+/// The transfer moves the broker-independent content and nothing else: both
+/// halves are the same Session identity, field for field. A cutover that
+/// widened, narrowed or re-pointed the binding is refused rather than
+/// published, so the receipt cannot describe a cutover that changed which
+/// Session the broker serves.
+///
+/// The broker-dependent half of the transition — which broker process, which
+/// immutable artifact and which nonce — is not represented here at all. It
+/// lives in [`CutoverReceipt::old_registration`] and
+/// [`CutoverReceipt::new_registration`], and the new generation's copy is
+/// always its own: the candidate's process id, artifact digest and launch
+/// nonce come from its own protected launch declaration, and no cutover copies
+/// the superseded generation's.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionBindingTransfer {
+    /// The binding the superseded generation recorded.
+    pub old_binding: BrokerIndependentSessionBinding,
+    /// The binding this generation recorded.
+    pub new_binding: BrokerIndependentSessionBinding,
+}
+
+impl SessionBindingTransfer {
+    fn validate(&self) -> Result<(), BrokerError> {
+        self.old_binding.validate()?;
+        self.new_binding.validate()?;
+        if self.old_binding != self.new_binding {
+            return Err(BrokerError::SessionBindingNotTransferred);
+        }
+        Ok(())
+    }
+}
+
+/// What this owner could prove about the superseded generation's Job Object
+/// when the cutover stopped (I14.17:12, I14.17:16).
+///
+/// There is exactly one state to record here, and the type says so.
+///
+/// The broker cannot reach its own Job Object: [`ApprovedLaunch::job_id`] is a
+/// Kernel/N4-supplied contour identity this broker never infers from a path,
+/// process id or caller text, and the P-04 executor mints the per-attempt job
+/// name internally and never returns it. No termination-proof producer exists
+/// anywhere in this workspace.
+///
+/// A proved state is therefore deliberately *not* declared. Declaring one
+/// without a producer would be a receipt able to *claim* a proof nothing can
+/// produce — the "termination was assumed" shortcut that
+/// [`UserBroker::release_owned_operations`] already refuses to make when a
+/// child does not close. I14.17 requires the opposite: inability to prove old
+/// Job Object termination stops the cutover and leaves it for reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OldJobObjectTermination {
+    /// Termination of the superseded generation's Job Object is not proven by
+    /// this owner, so the cutover stopped: the candidate is not marked active
+    /// and the transition requires reconciliation. `reason` names the exact
+    /// proof that is missing.
+    Unproven { reason: String },
+}
+
+impl OldJobObjectTermination {
+    /// The only state this owner can record, with the exact proof it lacks.
+    fn unproven() -> Self {
+        Self::Unproven {
+            reason: "the superseded generation's Job Object identity is a Kernel/N4 contour the \
+                     broker never infers and the P-04 executor never returns, so termination of \
+                     that Job Object is not observable from this owner"
+                .to_owned(),
+        }
+    }
+
+    /// The exact proof this owner lacks, and why the cutover stopped.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Unproven { reason } => reason,
+        }
+    }
+}
+
+/// One pre-cutover operation and the state the cutover recorded for it
+/// (I14.17:12, I14.17:16).
+///
+/// The pin tuple is the whole point of this row. An operation stays attributed
+/// to the registration and broker generation that launched it, so a new broker
+/// cannot silently adopt it and a reader of the receipt can tell which
+/// generation each pre-cutover child runtime is still pinned to.
+///
+/// `state` is this broker's own [`OperationState`]. I14.14:45-63 fixes the
+/// in-flight disposition vocabulary in one owner (Kernel/ORS,
+/// `eliot_ors::InFlightDispositionKind`), and A-09 does not own that
+/// vocabulary: this crate carries no ORS dependency, and re-spelling those five
+/// dispositions here would be a second owner of them. Recording the state the
+/// broker actually holds, and leaving the mapping onto I14.14's dispositions to
+/// the ORS owner, is the honest split — which ORS vocabulary is authoritative
+/// for a broker-generation cutover is an open decision (reported as
+/// BLOCKED-BY decision on issue #1954).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoverOperationDisposition {
+    /// The operation identity. It stays the superseded generation's: a
+    /// pre-cutover operation is never adopted by a new broker.
+    pub operation_id: OperationId,
+    /// Canonical digest of the exact request the superseded generation
+    /// admitted, so a reader can tell which request this row is about.
+    pub request_digest: String,
+    /// Registration digest of the generation the operation is pinned to.
+    pub registration_digest: String,
+    /// Broker-local generation the operation is pinned to.
+    pub user_broker_epoch: u64,
+    /// The state the retired record held when its generation was fenced.
+    pub state: OperationState,
+}
+
+/// The published registration/cutover receipt for one broker-generation
+/// transition (I14.17:13).
+///
+/// Every field is a fact this broker holds. `old_job_object_termination` is
+/// the field that decides what a reader may conclude: because
+/// [`OldJobObjectTermination`] has exactly one inhabitant, this receipt can
+/// never be read as a completed cutover, so treating publication as
+/// completion is wrong by construction rather than by convention.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoverReceipt {
+    /// The generation and epoch this transition superseded, exactly as this
+    /// broker's own record held it.
+    pub old_registration: RegistrationReceipt,
+    /// The candidate generation and epoch. Publication grants it nothing: the
+    /// candidate is not marked active, and the live launch path continues to
+    /// admit only through this registration's own binding.
+    pub new_registration: RegistrationReceipt,
+    /// Exactly which broker-independent Session binding transferred.
+    pub session_binding_transfer: SessionBindingTransfer,
+    /// One row per pre-cutover operation of *this* transition, each still
+    /// pinned to the superseded generation.
+    pub operation_dispositions: Vec<CutoverOperationDisposition>,
+    /// What this owner could prove about the superseded generation's Job
+    /// Object.
+    pub old_job_object_termination: OldJobObjectTermination,
+}
+
+impl CutoverReceipt {
+    /// Checks a receipt read back from durable state.
+    ///
+    /// A receipt is only accepted if it is internally consistent with itself:
+    /// the transfer really moved the same binding, the replacement really
+    /// moved strictly forward inside one user Session, and every disposition
+    /// really belongs to the generation the receipt claims to supersede. A
+    /// corrupt file is rejected before it can report a binding as transferred
+    /// or a foreign operation as pinned here.
+    fn validate(&self) -> Result<(), BrokerError> {
+        self.session_binding_transfer.validate()?;
+        if self.old_registration.user_broker_epoch >= self.new_registration.user_broker_epoch
+            || self.old_registration.windows_sid != self.new_registration.windows_sid
+            || self.old_registration.interactive_session_id
+                != self.new_registration.interactive_session_id
+            || self.old_registration.boot_session_id != self.new_registration.boot_session_id
+            || self.old_registration.installation_id != self.new_registration.installation_id
+        {
+            return Err(BrokerError::CutoverPrecondition("receipt_lineage"));
+        }
+        if self
+            .operation_dispositions
+            .iter()
+            .any(|row| row.registration_digest != self.old_registration.registration_digest)
+        {
+            return Err(BrokerError::CutoverPrecondition(
+                "receipt_operation_disposition_lineage",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub trait AuthorityPort: Send {
     fn register(&mut self, request: &RegistrationRequest) -> Result<RegistrationGrant, PortError>;
     fn heartbeat(
@@ -1275,11 +1557,29 @@ pub struct UserBroker {
     retired_operations: BTreeMap<String, RetiredOperationIdentity>,
     issued_operations: BTreeMap<String, IssuedOperationIdentity>,
     lost_operation: Option<LostOperation>,
+    /// The registration this broker's current generation superseded, retained
+    /// so a pre-cutover child runtime's broker/epoch lineage outlives the
+    /// transition that retired it (I14.17) and a receipt can name that
+    /// generation from this broker's own record. `None` until this broker's
+    /// lineage has actually superseded a registration.
+    predecessor_registration: Option<RegistrationReceipt>,
+    /// The last published registration/cutover receipt, restored from durable
+    /// state on recovery and rewritten by the next publication.
+    cutover_receipt: Option<CutoverReceipt>,
     /// The live one-shot Operator handoff authority, bound to the registration
     /// revision and installation-approved artifact it was built for. `None`
     /// until the first admission, and reset on every recovery so a restarted
     /// broker can never redeem an endpoint a previous process issued.
     operator_handoff: Option<(OperatorHandoffBinding, OperatorHandoffAuthority)>,
+    /// The Kernel-coordinated registry and cutover machine (issue #1954).
+    ///
+    /// A fresh machine holds no candidate, so [`Self::admit_new_launch`] does
+    /// not gate the ordinary single-registration path; only a completed
+    /// cutover installs a candidate, and from that point the machine is the
+    /// authority on which registration may admit a launch.  A restart drops the
+    /// machine: the durable cutover receipt, not process memory, is what
+    /// re-establishes it.
+    cutover: BrokerCutover,
 }
 
 impl UserBroker {
@@ -1301,7 +1601,10 @@ impl UserBroker {
             retired_operations: BTreeMap::new(),
             issued_operations: BTreeMap::new(),
             lost_operation: None,
+            predecessor_registration: None,
+            cutover_receipt: None,
             operator_handoff: None,
+            cutover: BrokerCutover::new(),
         }
     }
 
@@ -1376,6 +1679,13 @@ impl UserBroker {
         // endpoint. Recovery therefore starts with no handoff authority, and
         // an endpoint from the previous process is refused as an unknown nonce.
         self.operator_handoff = None;
+        // A cutover machine lives in process memory only, so a restart must
+        // not inherit one: the previous process's in-flight transition is not
+        // resumable evidence, and a surviving machine would gate launches
+        // against a candidate this process never authenticated.  The durable
+        // cutover receipt is what re-establishes a cutover, and that happens
+        // through `stage_candidate` again after this recovery.
+        self.cutover = BrokerCutover::new();
         let snapshot = self
             .durable
             .as_mut()
@@ -1398,6 +1708,14 @@ impl UserBroker {
         }
         self.issued_operations = issued_operations;
         self.retired_operations = retired_index(snapshot.retired_operations)?;
+        // A receipt is adopted only after it is checked against itself: a
+        // corrupt file must not be able to report a binding as transferred, a
+        // generation as replaced, or a foreign operation as pinned here.
+        if let Some(receipt) = &snapshot.cutover_receipt {
+            receipt.validate()?;
+        }
+        self.cutover_receipt = snapshot.cutover_receipt;
+        self.predecessor_registration = snapshot.predecessor_registration;
         let Some(registration) = self.registration.as_ref() else {
             if snapshot.operation_cursors.is_empty() {
                 self.operations.clear();
@@ -1621,6 +1939,12 @@ impl UserBroker {
                 .insert(retired.operation_id.as_str().to_owned(), retired);
         }
         self.operations.clear();
+        // The superseded registration is retained, not dropped. It is the only
+        // in-hand proof of which generation this one replaced, so a cutover
+        // receipt can record the old generation and epoch from this broker's
+        // own record instead of from anything a caller supplies, and the
+        // retirements above can be shown to belong to that generation.
+        self.predecessor_registration = self.registration.clone();
         self.registration = Some(sealed.clone());
         self.registration_reconciled = true;
         self.persist()?;
@@ -1694,6 +2018,168 @@ impl UserBroker {
         Ok(heartbeat_receipt(&refreshed))
     }
 
+    /// Admits one new launch against the live cutover state.
+    ///
+    /// This is the production admission path named by the acceptance criterion:
+    /// "After broker cutover, a new launch is accepted only through the
+    /// candidate's broker registration and epoch."  When no cutover has
+    /// installed a candidate, the ordinary live-registration gate in
+    /// [`Self::launch`] decides, exactly as before.  Once a cutover *has*
+    /// reached `Active`, this consults the machine instead and refuses any
+    /// registration that is not the candidate's own, compared through
+    /// [`BrokerAdmissionIdentity::admits`] and the exact registration digest,
+    /// authority epoch, and fence — never a name match.
+    fn admit_new_launch(
+        &self,
+        current: &RegistrationReceipt,
+        observed_at: u64,
+    ) -> Result<(), BrokerError> {
+        if self.cutover.active_registration().is_none() {
+            // No completed cutover: the live registration is the only route.
+            return self.require_admitted_registration(current);
+        }
+        let admission = self
+            .admission
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?;
+        let epoch = UserBrokerEpoch::new(
+            current.authority_epoch.lineage_id.clone(),
+            NonZeroU64::new(current.user_broker_epoch)
+                .ok_or(BrokerError::InvalidField("user_broker_epoch"))?,
+        )?;
+        self.cutover.admits_new_launch(admission, current, &epoch)?;
+        // A candidate that is active still owes a live lease: the cutover
+        // proves *which* registration may launch, not that its lease covers
+        // this instant.  Re-check the window so an expired candidate
+        // registration is refused here rather than at the provider.
+        if observed_at >= current.expires_at || current.status != RegistrationStatus::Active {
+            return Err(BrokerError::LeaseExpired);
+        }
+        Ok(())
+    }
+
+    /// Runs one complete I14.17 cutover from a staged candidate to a
+    /// published receipt.
+    ///
+    /// The steps are exactly the document's, in order, and each one can only
+    /// be reached from the state before it.  The candidate is *not* active at
+    /// any point in this call except the final `Active`, which requires a
+    /// verified [`OldJobObjectTerminationProof`].  If that proof is refused or
+    /// absent, the machine ends in `ReconciliationRequired` and this returns
+    /// [`BrokerError::CutoverTerminationUnproven`] — the candidate is
+    /// definitively not active and the cutover is left for reconciliation.
+    ///
+    /// `stage` supplies the pre-authentication evidence the machine cannot
+    /// observe itself (old generation registration/artifact/contour, session
+    /// bindings, and the per-operation dispositions); everything after that is
+    /// decided here.
+    pub fn cutover_to_candidate(
+        &mut self,
+        stage: BrokerCutoverStage,
+        termination_proof: Option<&OldJobObjectTerminationProof>,
+    ) -> Result<BrokerCutoverReceipt, BrokerError> {
+        let BrokerCutoverStage {
+            old,
+            candidate,
+            session_bindings,
+            operation_dispositions,
+        } = stage;
+        // Only the registration this broker is actually serving can be fenced,
+        // so a stage naming a different generation is refused before the
+        // machine records anything.
+        if let Some(old) = old.as_ref() {
+            let live = self
+                .registration
+                .as_ref()
+                .ok_or(BrokerError::RegistrationNotAdmitted)?;
+            if old.registration.registration_digest != live.registration_digest {
+                return Err(BrokerError::StaleRegistrationIdentity);
+            }
+        }
+        let admission = self
+            .admission
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?
+            .clone();
+        self.cutover.stage_candidate(old.as_ref(), &candidate)?;
+        self.cutover.authenticate_candidate(&admission)?;
+        self.cutover.fence_old_registration()?;
+        self.cutover.transfer_session_bindings(&session_bindings)?;
+        // The disposition set is validated against this broker's *own* live
+        // operation ids, not against anything the caller asserts, so an
+        // operation the broker never owned cannot be dispositioned and an owned
+        // one cannot be silently dropped.
+        let own_operation_ids: BTreeSet<OperationId> = self
+            .operations
+            .values()
+            .map(|record| record.cursor.operation_id.clone())
+            .collect();
+        self.cutover
+            .commit_operation_dispositions(&operation_dispositions, &own_operation_ids)?;
+        self.cutover.request_old_termination()?;
+        // The old registration is fenced from new launches at the generation
+        // transition, so the authoritative fence is projected before activation
+        // is even attempted.  Until termination is proven this leaves the old
+        // registration draining, which still refuses every new launch.
+        if old.is_some()
+            && self
+                .registration
+                .as_ref()
+                .is_some_and(|live| live.status == RegistrationStatus::Active)
+        {
+            self.close(RegistrationStatus::Draining)?;
+        }
+        // `complete` publishes a receipt whether or not termination was proven:
+        // an unproven cutover publishes a `ReconciliationRequired` receipt with
+        // no termination proof, and returns the typed error naming which
+        // guarantee failed.  The receipt is captured before the error
+        // propagates so the failed cutover stays inspectable through
+        // [`Self::broker_cutover_receipt`] instead of being merely refused.
+        // The returned receipt borrows `self.cutover`, so the verdict is
+        // reduced to a plain `bool` here and the receipt is re-read below
+        // once every borrow has ended.
+        let cutover_complete = self
+            .cutover
+            .complete(termination_proof, &own_operation_ids)
+            .is_ok();
+        if cutover_complete {
+            // Only a proven cutover installs the candidate as this broker's
+            // live registration and epoch.  An unproven cutover never reaches
+            // here, so the draining old registration keeps refusing launches.
+            let candidate_registration = self.cutover.active_registration().cloned();
+            if let Some(candidate_registration) = candidate_registration {
+                self.registration = Some(candidate_registration);
+                self.registration_reconciled = true;
+                self.broker_epoch = candidate.user_broker_epoch.sequence.get();
+                self.operations.clear();
+                self.persist()?;
+            }
+        }
+        let published = self
+            .cutover
+            .receipt()
+            .cloned()
+            .ok_or(BrokerError::CutoverTerminationUnproven)?;
+        if !cutover_complete {
+            // The failed cutover stays inspectable through
+            // [`Self::broker_cutover_receipt`] instead of being merely refused.
+            return Err(BrokerError::CutoverTerminationUnproven);
+        }
+        Ok(published)
+    }
+
+    /// Returns the published cutover receipt, if a cutover has completed.
+    #[must_use]
+    pub fn broker_cutover_receipt(&self) -> Option<&BrokerCutoverReceipt> {
+        self.cutover.receipt()
+    }
+
+    /// Returns the current cutover state.
+    #[must_use]
+    pub fn broker_cutover_state(&self) -> BrokerCutoverState {
+        self.cutover.state()
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     #[allow(clippy::too_many_lines)]
     pub fn launch(&mut self, request: LaunchRequest) -> Result<LaunchReceipt, BrokerError> {
@@ -1703,8 +2189,9 @@ impl UserBroker {
         // registration must be the one *this* admitted process tuple holds.
         // A durable registration left by another SID/Session/installation
         // fails here, before any grant, process preparation, or credential
-        // introduction.
-        self.require_admitted_registration(&current)?;
+        // introduction.  After a completed cutover this also proves the
+        // registration is the candidate's own, carrying the candidate's epoch.
+        self.admit_new_launch(&current, request.observed_at)?;
         let request_digest = digest(&request)?;
         if let Some(record) = self.operations.get(&request.approved.idempotency_key) {
             if record.cursor.request_digest != request_digest {
@@ -2036,6 +2523,123 @@ impl UserBroker {
         }
         self.persist()?;
         Ok(())
+    }
+
+    /// Returns the registration/cutover receipt this broker last published, or
+    /// `None` when it has published none.
+    ///
+    /// The receipt is a durable record of a transition that did *not* complete.
+    /// Its presence never means the candidate generation became active; see
+    /// [`Self::publish_cutover_receipt`].
+    #[must_use]
+    pub fn cutover_receipt(&self) -> Option<&CutoverReceipt> {
+        self.cutover_receipt.as_ref()
+    }
+
+    /// Publishes the durable registration/cutover receipt for the broker
+    /// generation transition this lineage performed (I14.17:13).
+    ///
+    /// Both sides of the receipt are read from this broker's own record. The
+    /// superseded side is the registration [`Self::register`] replaced and
+    /// retired its operations against; the candidate side is the registration
+    /// this process now holds. No caller input names a generation, an epoch, a
+    /// fence or a job identity, so a receipt cannot be built around a
+    /// transition this broker did not perform.
+    ///
+    /// **The cutover stops rather than completes.** Termination of the
+    /// superseded generation's Job Object has no proof producer anywhere in
+    /// this workspace, so the receipt records
+    /// [`OldJobObjectTermination::Unproven`] and this call returns
+    /// [`BrokerError::CutoverRequiresReconciliation`]: the candidate is not
+    /// marked active, no new-generation effect authority follows from the
+    /// publication, and the transition is left for reconciliation (I14.17:16).
+    /// The `Ok` arm exists for the day a termination proof can actually be
+    /// produced; until then it is unreachable by construction, because
+    /// [`OldJobObjectTermination`] has exactly one inhabitant.
+    ///
+    /// The receipt is written durably *before* the refusal returns, so the
+    /// refusal names a durable record a reader can inspect rather than an
+    /// assertion they have to take on trust.
+    ///
+    /// Logout stops the publication outright. With no live lease over the
+    /// admitted logon Session there is no Session to move a binding within, so
+    /// [`Self::active_registration`] fails closed and no receipt is published.
+    /// A replacement that did not move strictly forward inside one user
+    /// Session is likewise refused, because a receipt about a lineage change
+    /// this broker cannot prove it made would be a fiction.
+    ///
+    /// Pre-cutover operations are not adopted. Each one this transition
+    /// retired is still named against the superseded registration, keeping the
+    /// pin tuple that attributes it to the broker and epoch that launched it.
+    pub fn publish_cutover_receipt(
+        &mut self,
+        observed_at: u64,
+    ) -> Result<CutoverReceipt, BrokerError> {
+        let current = self.active_registration(observed_at)?.clone();
+        self.require_admitted_registration(&current)?;
+        let old = self
+            .predecessor_registration
+            .as_ref()
+            .ok_or(BrokerError::CutoverPrecondition(
+                "no_superseded_registration",
+            ))?
+            .clone();
+        if old.user_broker_epoch >= current.user_broker_epoch
+            || old.installation_id != current.installation_id
+            || old.windows_sid != current.windows_sid
+            || old.interactive_session_id != current.interactive_session_id
+            || old.boot_session_id != current.boot_session_id
+        {
+            return Err(BrokerError::CutoverPrecondition("predecessor_lineage"));
+        }
+        let session_binding_transfer = SessionBindingTransfer {
+            old_binding: BrokerIndependentSessionBinding::of(&old),
+            new_binding: BrokerIndependentSessionBinding::of(&current),
+        };
+        session_binding_transfer.validate()?;
+        let receipt = CutoverReceipt {
+            old_registration: old,
+            new_registration: current,
+            session_binding_transfer,
+            operation_dispositions: self.cutover_operation_dispositions(),
+            old_job_object_termination: OldJobObjectTermination::unproven(),
+        };
+        receipt.validate()?;
+        // Durable before the refusal: a restart reconstructs the recorded
+        // Session binding transfer and the pre-cutover dispositions from here
+        // instead of losing them with the process.
+        self.cutover_receipt = Some(receipt.clone());
+        self.persist()?;
+        Err(BrokerError::CutoverRequiresReconciliation(
+            receipt.old_job_object_termination.reason().to_owned(),
+        ))
+    }
+
+    /// The pre-cutover operations of the generation this one superseded, each
+    /// with the pin tuple that keeps it attributed to the broker and epoch that
+    /// launched it.
+    ///
+    /// Only operations whose tombstone still names the superseded
+    /// registration are in flight for this transition. A tombstone left by an
+    /// earlier transition already describes history this broker inherited, and
+    /// an operation the superseded generation had already reconciled is
+    /// reported with its final state rather than as in flight. The index is
+    /// keyed by operation id, so the order is deterministic.
+    fn cutover_operation_dispositions(&self) -> Vec<CutoverOperationDisposition> {
+        let Some(old) = &self.predecessor_registration else {
+            return Vec::new();
+        };
+        self.retired_operations
+            .values()
+            .filter(|row| row.registration_digest == old.registration_digest)
+            .map(|row| CutoverOperationDisposition {
+                operation_id: row.operation_id.clone(),
+                request_digest: row.request_digest.clone(),
+                registration_digest: row.registration_digest.clone(),
+                user_broker_epoch: row.user_broker_epoch,
+                state: row.state,
+            })
+            .collect()
     }
 
     pub fn logoff(&mut self) -> Result<(), BrokerError> {
@@ -2370,6 +2974,8 @@ impl UserBroker {
                 .collect(),
             operation_identities: self.projected_operation_identities(),
             retired_operations: self.retired_operations.values().cloned().collect(),
+            predecessor_registration: self.predecessor_registration.clone(),
+            cutover_receipt: self.cutover_receipt.clone(),
         }
     }
 
@@ -2716,6 +3322,25 @@ pub enum BrokerError {
     StaleEpoch,
     #[error("registration or launch grant binding mismatch")]
     GrantBindingMismatch,
+    /// A cutover cannot be published because a precondition this broker holds
+    /// no fact for is unmet. The reason names which one, so the refusal is
+    /// never the generic recovery catch-all: a cutover with no live logon
+    /// Session, no superseded registration of this lineage, or a predecessor
+    /// that did not move strictly forward inside one user Session is a
+    /// different condition from a malformed field and has to stay
+    /// distinguishable.
+    #[error("user broker cutover precondition unmet: {0}")]
+    CutoverPrecondition(&'static str),
+    /// The cutover stopped because termination of the superseded generation's
+    /// Job Object is not proven, so the candidate is not marked active and the
+    /// transition requires reconciliation (I14.17:16).
+    #[error("user broker cutover requires reconciliation: {0}")]
+    CutoverRequiresReconciliation(String),
+    /// A cutover would have changed the recorded broker-independent Session
+    /// binding instead of transferring it, so the transfer is refused rather
+    /// than published as a cutover that changed which Session the broker serves.
+    #[error("user broker cutover would have altered the recorded session binding")]
+    SessionBindingNotTransferred,
     #[error("broker admission identity is not composed")]
     RegistrationNotAdmitted,
     #[error("registration identity is not this broker's own tuple")]
@@ -2754,6 +3379,10 @@ pub enum BrokerError {
     ReplayConflict,
     #[error("operation not found or already reconciled")]
     OperationNotFound,
+    #[error("old Job Object termination is not proven; cutover requires reconciliation")]
+    CutoverTerminationUnproven,
+    #[error("logout stopped the broker cutover; it requires reconciliation")]
+    CutoverStoppedByLogout,
     #[error("provider contract failure: {0}")]
     Provider(String),
 }
@@ -3451,6 +4080,792 @@ impl OpenCodeBootstrapAuthority {
     }
 }
 
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Issue #1954 — I14.17 immutable per-generation User Broker cutover.
+//
+// I14.17 requires a User Broker binary to be immutable per generation and
+// never replaced in place in a logged-on session: a candidate starts with no
+// launch/effect authority, authenticates its SID/session/artifact and EBP
+// contract, receives a higher/new-lineage `UserBrokerEpoch`, fences the old
+// registration from new launches, transfers only explicit broker-independent
+// Session bindings, drains/reconciles the old exact operations, terminates the
+// old Job Object, and only then publishes the registration/cutover receipt.
+//
+// Every guarantee below is a *comparison* against recorded state, never a
+// recorded fact alone: activation requires a positive termination proof, and
+// a new launch is admitted only through the candidate's own registration
+// receipt, compared against the recorded one by the existing
+// [`BrokerAdmissionIdentity::admits`].
+// ---------------------------------------------------------------------------
+
+/// The typed User Broker epoch identity (I14.17 "higher/new-lineage
+/// `UserBrokerEpoch`").
+///
+/// The broker-local epoch used to be a bare `u64` scalar, which cannot express
+/// "strictly higher" together with "or globally distinct when a shared maximum
+/// cannot be demonstrated" (A13.7). This is the lineage-aware replacement: two
+/// epochs are comparable only within one lineage, and a cutover epoch must be
+/// a strictly higher sequence of the recorded epoch or a *different* lineage.
+/// Equal sequences from different lineages are unrelated, never ordered, so a
+/// new lineage is a genuinely new identity rather than a reset counter.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserBrokerEpoch {
+    pub lineage_id: EpochLineageId,
+    pub sequence: NonZeroU64,
+}
+
+impl UserBrokerEpoch {
+    /// Constructs a typed epoch without exposing scalar coercion.
+    pub fn new(lineage_id: EpochLineageId, sequence: NonZeroU64) -> Result<Self, BrokerError> {
+        Ok(Self {
+            lineage_id,
+            sequence,
+        })
+    }
+
+    /// Returns whether this epoch supersedes `prior` for a cutover.
+    ///
+    /// Two disjoint lineages are globally distinct, so any sequence in a new
+    /// lineage is a valid successor (A13.7: "The new Authority Epoch lineage
+    /// must be strictly newer than every observed value, or globally distinct
+    /// when a shared maximum cannot be demonstrated"). Within one lineage the
+    /// successor must be strictly higher, so the identical epoch, an older
+    /// one, and a re-mint of the same sequence are all rejected.
+    #[must_use]
+    pub fn supersedes(&self, prior: &Self) -> bool {
+        if self.lineage_id != prior.lineage_id {
+            return true;
+        }
+        self.sequence > prior.sequence
+    }
+
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(self.lineage_id.as_str(), "user_broker_epoch.lineage_id")?;
+        Ok(())
+    }
+}
+
+/// One immutable candidate registration (I14.17 "immutable broker artifact
+/// identity, generation, authenticated SID/session identity, EBP contract
+/// version, Job Object identity, and `UserBrokerEpoch`").
+///
+/// Every field is a comparison target, not a label.  A candidate is
+/// authenticated by comparing each of them against what the old registration
+/// recorded, so a candidate claiming a different principal, a different
+/// session, a replaced binary, or a different contract cannot be activated.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerCandidateRegistration {
+    /// The candidate's own sealed registration receipt.  After cutover this is
+    /// the only thing that may admit a new launch.
+    pub registration: RegistrationReceipt,
+    /// Immutable broker artifact identity of the candidate binary.  I14.17
+    /// forbids replacing a broker in place, so this must differ from the
+    /// artifact the old generation registered with.
+    pub broker_artifact_digest: String,
+    /// The candidate's broker generation: registry state over an immutable
+    /// artifact (I14.14 "Running artifacts are immutable. Active generation is
+    /// registry state.").  It must be strictly higher than the old generation.
+    pub broker_generation: Generation,
+    /// The typed epoch minted for the candidate at the generation transition.
+    pub user_broker_epoch: UserBrokerEpoch,
+    /// The EBP contract version the candidate was verified against.
+    pub ebp_contract_version: ProtocolVersion,
+    /// The Kernel/N4-owned Job contour identity the candidate's children run
+    /// under.  It is the *new* contour; the old one is what must be proven
+    /// terminated.
+    pub job_id: JobId,
+}
+
+impl BrokerCandidateRegistration {
+    fn validate(&self) -> Result<(), BrokerError> {
+        self.registration.validate_shape()?;
+        hex_digest(
+            &self.broker_artifact_digest,
+            "candidate.broker_artifact_digest",
+        )?;
+        if self.broker_generation.get() == 0 {
+            return Err(BrokerError::InvalidField("candidate.broker_generation"));
+        }
+        self.user_broker_epoch.validate()?;
+        self.ebp_contract_version
+            .validate()
+            .map_err(|error| BrokerError::Provider(error.to_string()))?;
+        text(self.job_id.as_str(), "candidate.job_id")?;
+        Ok(())
+    }
+}
+
+/// One session binding, classified for cutover (I14.17 "transfer only explicit
+/// broker-independent Session bindings").
+///
+/// The classification is explicit and recorded.  A broker-*dependent* binding —
+/// one whose continued validity depends on the old broker's own authority,
+/// its introduced resources, or its Job contour — is never transferred; it is
+/// carried in [`BrokerCutoverReceipt::untransferred_bindings`] so a reader sees
+/// it was deliberately left behind rather than silently dropped.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionBindingRecord {
+    /// Stable identity of the session binding being classified.
+    pub binding_id: String,
+    /// The interactive logon Session this binding belongs to.
+    pub interactive_session_id: String,
+    /// Whether this binding survives the cutover on its own.
+    pub broker_independent: bool,
+}
+
+/// The exact in-flight disposition an old-generation operation receives at
+/// cutover (I14.14 "In-flight disposition").
+///
+/// Every accepted request records its generation, operation identity, effect
+/// set and State Fence, and at cutover it receives *exactly one* disposition.
+/// The variant names and meanings below are I14.14's, unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InFlightDisposition {
+    /// read/stream may finish while its input fence remains valid.
+    DrainRead,
+    /// only the already admitted operation may finish under a committed
+    /// `OperationContinuationPermit`; this is not general old-generation
+    /// authority.
+    FinishExactAuthorizedOperation,
+    /// candidate resumes from a compatible checkpoint under a new
+    /// attempt/generation receipt.
+    CheckpointTransfer,
+    /// cancellation is accepted only when no external/canonical effect is
+    /// proven.
+    CancelProvenNoEffect,
+    /// outcome is unresolved; conflicting new effects in the affected scope
+    /// remain blocked until receipt/probe/reconciliation resolves it.
+    BlockScopeUnknownOutcome,
+}
+
+impl InFlightDisposition {
+    /// Returns whether this disposition leaves the old operation *inside* the
+    /// old Job contour, and therefore blocks activation.
+    ///
+    /// `drain_read` may still finish, and
+    /// `block_scope_unknown_outcome` is unresolved by definition; both keep
+    /// the old contour alive.  Only the three dispositions that resolve the
+    /// operation's outcome release it.  This is a property of the disposition
+    /// alone — a machine that records a resolving disposition for an operation
+    /// that is actually still `Unknown` is refused by
+    /// [`OldJobObjectTerminationProof::proves_termination`].
+    #[must_use]
+    pub const fn blocks_old_termination(self) -> bool {
+        matches!(self, Self::DrainRead | Self::BlockScopeUnknownOutcome)
+    }
+}
+
+/// One old-generation operation with its committed disposition and the state
+/// observed for it at cutover commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InFlightOperation {
+    pub operation_id: OperationId,
+    pub disposition: InFlightDisposition,
+    /// Terminal state observed for this operation at the cutover commit.
+    pub state: OperationState,
+}
+
+/// The proof that the old generation's Job Object is really gone.
+///
+/// This is deliberately not "a termination was requested".  It is the
+/// conjunction of three independently checked facts: the old Job contour is the
+/// exact one the old registration recorded (ownership, not a matching name),
+/// the operation set it names is exactly the broker's own lineage for that
+/// registration (coverage, not a subset), and every one of those operations
+/// reached a state that cannot still produce an effect.  A refused, empty, or
+/// mismatched proof leaves the candidate inactive.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OldJobObjectTerminationProof {
+    /// The old Job contour identity this proof claims to have terminated.  It
+    /// must equal the `job_id` the old registration recorded.
+    pub job_id: JobId,
+    /// The old registration digest whose children were terminated.
+    pub old_registration_digest: String,
+    /// Every old-generation operation observed in the Job contour, with its
+    /// committed disposition and observed state.
+    pub operations: Vec<InFlightOperation>,
+}
+
+impl OldJobObjectTerminationProof {
+    /// Verifies that this proof actually proves termination of the old Job
+    /// Object.
+    ///
+    /// 1. **Ownership** — `job_id` and `old_registration_digest` must be the
+    ///    exact contour and registration the recorded old registration owned.
+    ///    A proof for any other contour is not a proof about this one, however
+    ///    similar its name.
+    /// 2. **Coverage** — the proof lists exactly the operation identities the
+    ///    broker's own lineage holds for that registration: no omission (an
+    ///    unlisted child may still be running) and no extra identity (an
+    ///    operation the broker never owned proves nothing about this contour).
+    /// 3. **Terminality** — every listed operation's disposition releases the
+    ///    old contour *and* its observed state is not `Unknown`.  An
+    ///    unproven outcome is exactly the case I14.17 says must stop cutover.
+    fn proves_termination(
+        &self,
+        old_registration: &RegisteredGeneration,
+        old_operation_ids: &BTreeSet<OperationId>,
+    ) -> Result<(), BrokerError> {
+        if self.old_registration_digest != old_registration.registration.registration_digest
+            || self.job_id != old_registration.job_id
+        {
+            return Err(BrokerError::CutoverTerminationUnproven);
+        }
+        let mut claimed = BTreeSet::new();
+        for operation in &self.operations {
+            if operation.state == OperationState::Unknown
+                || operation.disposition.blocks_old_termination()
+            {
+                return Err(BrokerError::CutoverTerminationUnproven);
+            }
+            if !claimed.insert(operation.operation_id.clone()) {
+                return Err(BrokerError::Duplicate("cutover.operation_id"));
+            }
+        }
+        let expected = old_operation_ids;
+        if expected.len() != claimed.len() || !expected.iter().all(|id| claimed.contains(id)) {
+            return Err(BrokerError::CutoverTerminationUnproven);
+        }
+        Ok(())
+    }
+}
+
+/// The state of one candidate's cutover (I14.17 cutover states).
+///
+/// The order encodes the contract: a candidate reaches `Active` only by
+/// passing through authentication, fencing, binding transfer, and a *proven*
+/// old Job Object termination.  `ReconciliationRequired` is the rest state for
+/// a cutover that cannot prove termination or that observed a logout, and the
+/// candidate is never active there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BrokerCutoverState {
+    /// Candidate artifact and authorization policy are staged.  The candidate
+    /// holds no launch/effect authority.
+    CandidateStaged,
+    /// SID/session/artifact and EBP contract are verified and a
+    /// strictly higher/new-lineage epoch has been issued.  Still no launch
+    /// authority.
+    CandidateAuthenticated,
+    /// The old registration is fenced from new launches.
+    OldRegistrationFenced,
+    /// Explicit broker-independent session bindings have been transferred.
+    BindingsTransferred,
+    /// A termination was requested for the old Job Object but has not been
+    /// *proven*.  The candidate is still not active.
+    TerminationRequested,
+    /// Termination is proven and the candidate is marked active.
+    Active,
+    /// Logout, or an unprovable old Job Object termination, stopped the
+    /// cutover.  Reconciliation is required and the candidate is not active.
+    ReconciliationRequired,
+}
+
+/// The durable receipt a committed cutover publishes (I14.17 "publish
+/// registration/cutover receipt"; I14.14 `GenerationCutoverReceipt`).
+///
+/// It records the old and new generation and epoch, which session bindings
+/// transferred and which did not, the disposition of every old in-flight
+/// operation, and the proof that the old Job Object was terminated.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerCutoverReceipt {
+    /// Terminal state of the cutover this receipt closes.
+    pub state: BrokerCutoverState,
+    /// The fenced old registration digest.
+    pub old_registration_digest: String,
+    /// The old broker generation that stopped admitting new launches.
+    pub old_broker_generation: Generation,
+    /// The old broker-local epoch, kept as the exact value it had.
+    pub old_user_broker_epoch: u64,
+    /// The candidate registration digest that owns new launches.
+    pub new_registration_digest: String,
+    /// The candidate broker generation.
+    pub new_broker_generation: Generation,
+    /// The typed epoch issued to the candidate.
+    pub new_user_broker_epoch: UserBrokerEpoch,
+    /// Bindings deliberately moved to the candidate.
+    pub transferred_bindings: Vec<SessionBindingRecord>,
+    /// Broker-dependent bindings that stayed with the old generation.  They
+    /// are recorded as untransferred rather than dropped.
+    pub untransferred_bindings: Vec<SessionBindingRecord>,
+    /// Every old-generation in-flight operation with its exact disposition.
+    pub operation_dispositions: Vec<InFlightOperation>,
+    /// Proof that the old Job Object was terminated.  `None` only when the
+    /// state is `ReconciliationRequired`, and then the candidate is not active.
+    pub old_job_object_termination: Option<OldJobObjectTerminationProof>,
+}
+
+/// One registered broker generation: its sealed registration plus the two
+/// identities that a generation transition must compare against — the
+/// immutable artifact it is running and the Job contour its children run in.
+///
+/// A [`RegistrationReceipt`] deliberately does not carry the Job contour, and
+/// the admission tuple does not carry the broker generation, so the registry
+/// holds this pair rather than inventing a second admission rule.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredGeneration {
+    pub registration: RegistrationReceipt,
+    pub broker_artifact_digest: String,
+    pub broker_generation: Generation,
+    /// The EBP contract version this generation registered with.  The
+    /// registration receipt does not carry it, so the registry holds it
+    /// explicitly as the value a candidate's contract is compared against.
+    pub ebp_contract_version: ProtocolVersion,
+    pub job_id: JobId,
+}
+
+impl RegisteredGeneration {
+    fn validate(&self) -> Result<(), BrokerError> {
+        self.registration.validate_shape()?;
+        hex_digest(
+            &self.broker_artifact_digest,
+            "registered_generation.broker_artifact_digest",
+        )?;
+        if self.broker_generation.get() == 0 {
+            return Err(BrokerError::InvalidField(
+                "registered_generation.broker_generation",
+            ));
+        }
+        self.ebp_contract_version
+            .validate()
+            .map_err(|error| BrokerError::Provider(error.to_string()))?;
+        text(self.job_id.as_str(), "registered_generation.job_id")?;
+        Ok(())
+    }
+}
+
+/// The evidence a caller supplies to stage one cutover.
+///
+/// The old generation's registration/artifact/contour, the classified session
+/// bindings, and the per-operation dispositions are observed facts about the
+/// broker being replaced; the machine re-validates all of them against what it
+/// recorded and against the broker's own operation lineage, so this struct is
+/// input to a check, never a substitute for one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerCutoverStage {
+    /// The generation being replaced, or `None` for a first registration.
+    pub old: Option<RegisteredGeneration>,
+    /// The candidate to promote.
+    pub candidate: BrokerCandidateRegistration,
+    /// Session bindings, each explicitly classified broker-independent or not.
+    pub session_bindings: Vec<SessionBindingRecord>,
+    /// The exact I14.14 disposition of every old in-flight operation.
+    pub operation_dispositions: Vec<InFlightOperation>,
+}
+
+/// The Kernel-coordinated User Broker registry and cutover machine
+/// (I14.17, I14.14).
+///
+/// This type owns the cutover decision and its durable record.  The broker
+/// core owns the live operation lineage; this machine is handed that lineage
+/// for the proof, so it never has to guess what was still running.  The
+/// production caller is [`UserBroker::admit_new_launch`], which is the
+/// admission path every launch goes through.
+pub struct BrokerCutover {
+    state: BrokerCutoverState,
+    old: Option<RegisteredGeneration>,
+    candidate: Option<BrokerCandidateRegistration>,
+    session_bindings: Vec<SessionBindingRecord>,
+    operation_dispositions: Vec<InFlightOperation>,
+    termination_proof: Option<OldJobObjectTerminationProof>,
+    receipt: Option<BrokerCutoverReceipt>,
+    logout_observed: bool,
+}
+
+impl Default for BrokerCutover {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrokerCutover {
+    /// Creates a machine that has admitted no candidate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: BrokerCutoverState::CandidateStaged,
+            old: None,
+            candidate: None,
+            session_bindings: Vec::new(),
+            operation_dispositions: Vec::new(),
+            termination_proof: None,
+            receipt: None,
+            logout_observed: false,
+        }
+    }
+
+    /// Returns the current cutover state.
+    #[must_use]
+    pub fn state(&self) -> BrokerCutoverState {
+        self.state
+    }
+
+    /// Returns the published cutover receipt, once one has been committed.
+    #[must_use]
+    pub fn receipt(&self) -> Option<&BrokerCutoverReceipt> {
+        self.receipt.as_ref()
+    }
+
+    /// Returns the active candidate registration, once the cutover completed.
+    #[must_use]
+    pub fn active_registration(&self) -> Option<&RegistrationReceipt> {
+        if self.state == BrokerCutoverState::Active {
+            self.candidate.as_ref().map(|c| &c.registration)
+        } else {
+            None
+        }
+    }
+
+    /// Stages the candidate that will replace the recorded generation.
+    ///
+    /// The candidate starts with no launch/effect authority by construction:
+    /// this only records it, and [`Self::authenticate_candidate`] is what
+    /// checks SID, session, artifact, and EBP contract.  Re-staging is refused
+    /// until a new candidate is presented, so a cutover cannot be restarted
+    /// from a half-completed state.
+    pub fn stage_candidate(
+        &mut self,
+        old: Option<&RegisteredGeneration>,
+        candidate: &BrokerCandidateRegistration,
+    ) -> Result<(), BrokerError> {
+        if self.state != BrokerCutoverState::CandidateStaged || self.candidate.is_some() {
+            return Err(BrokerError::StaleEpoch);
+        }
+        if let Some(old) = old {
+            old.validate()?;
+            if old.registration.status != RegistrationStatus::Active {
+                // A registration that is already Closed/Draining admits no
+                // successor transition: there is no live old generation to
+                // fence, and admitting one would resurrect a fenced lease.
+                return Err(BrokerError::LeaseExpired);
+            }
+        }
+        candidate.validate()?;
+        if old.is_some_and(|old| {
+            candidate.registration.registration_digest == old.registration.registration_digest
+        }) {
+            return Err(BrokerError::DuplicateRegistration);
+        }
+        self.old = old.cloned();
+        self.candidate = Some(candidate.clone());
+        Ok(())
+    }
+
+    /// Authenticates the staged candidate against the recorded old generation.
+    ///
+    /// Every check is a comparison against what was recorded, never a
+    /// self-assertion:
+    ///
+    /// * the candidate registration must be this process's own tuple, decided
+    ///   by the existing [`BrokerAdmissionIdentity::admits`];
+    /// * its artifact digest must differ from the old generation's, because
+    ///   I14.17 forbids replacing a broker binary in place;
+    /// * its broker generation must be strictly higher;
+    /// * its epoch must be strictly higher *or* a new lineage
+    ///   ([`UserBrokerEpoch::supersedes`]);
+    /// * its EBP contract version must equal the one the old generation
+    ///   registered with.
+    ///
+    /// A first registration has no predecessor, so there is nothing to fence
+    /// or compare and the candidate is authenticated on shape alone.
+    pub fn authenticate_candidate(
+        &mut self,
+        admission: &BrokerAdmissionIdentity,
+    ) -> Result<(), BrokerError> {
+        if self.state != BrokerCutoverState::CandidateStaged {
+            return Err(BrokerError::StaleEpoch);
+        }
+        let candidate = self
+            .candidate
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?;
+        if !admission.admits(&candidate.registration) {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        let Some(old) = self.old.as_ref() else {
+            self.state = BrokerCutoverState::CandidateAuthenticated;
+            return Ok(());
+        };
+        if candidate.broker_artifact_digest == old.broker_artifact_digest {
+            return Err(BrokerError::GrantBindingMismatch);
+        }
+        if candidate.broker_generation <= old.broker_generation {
+            return Err(BrokerError::StaleEpoch);
+        }
+        let recorded_epoch = UserBrokerEpoch::new(
+            candidate.registration.authority_epoch.lineage_id.clone(),
+            NonZeroU64::new(old.registration.user_broker_epoch)
+                .ok_or(BrokerError::InvalidField("cutover.old_user_broker_epoch"))?,
+        )?;
+        if !candidate.user_broker_epoch.supersedes(&recorded_epoch) {
+            return Err(BrokerError::StaleEpoch);
+        }
+        if candidate.ebp_contract_version != old.ebp_contract_version {
+            return Err(BrokerError::GrantBindingMismatch);
+        }
+        if candidate.job_id == old.job_id {
+            // Two generations sharing one Job contour could never prove the
+            // old one terminated, so the cutover would be unprovable by
+            // construction.  Refuse it here rather than at completion.
+            return Err(BrokerError::GrantBindingMismatch);
+        }
+        self.state = BrokerCutoverState::CandidateAuthenticated;
+        Ok(())
+    }
+
+    /// Fences the old registration from new launches at the generation
+    /// transition.
+    ///
+    /// Fencing is what makes the acceptance criterion hold: from here the only
+    /// registration that can admit a launch is the candidate's own, compared
+    /// against the recorded one in [`Self::admits_new_launch`].  Whether the
+    /// candidate may *become* active is decided later by [`Self::complete`],
+    /// and a cutover that never proves termination simply never leaves this
+    /// state.
+    pub fn fence_old_registration(&mut self) -> Result<(), BrokerError> {
+        if self.state != BrokerCutoverState::CandidateAuthenticated {
+            return Err(BrokerError::StaleEpoch);
+        }
+        self.state = BrokerCutoverState::OldRegistrationFenced;
+        Ok(())
+    }
+
+    /// Records the session bindings and transfers only the broker-independent
+    /// ones.
+    ///
+    /// Each binding is classified explicitly by the caller and validated for
+    /// shape and uniqueness.  A binding for any logon Session other than the
+    /// one the old generation owned is refused outright rather than quietly
+    /// carried across.  Broker-*dependent* bindings are accepted and retained
+    /// here precisely so the receipt can record them as untransferred.
+    pub fn transfer_session_bindings(
+        &mut self,
+        bindings: &[SessionBindingRecord],
+    ) -> Result<(), BrokerError> {
+        if self.state != BrokerCutoverState::OldRegistrationFenced {
+            return Err(BrokerError::StaleEpoch);
+        }
+        let mut seen = BTreeSet::new();
+        for binding in bindings {
+            text(&binding.binding_id, "session_binding.binding_id")?;
+            text(
+                &binding.interactive_session_id,
+                "session_binding.interactive_session_id",
+            )?;
+            if !seen.insert(binding.binding_id.clone()) {
+                return Err(BrokerError::Duplicate("session_binding.binding_id"));
+            }
+            if self.old.as_ref().is_some_and(|old| {
+                binding.interactive_session_id != old.registration.interactive_session_id
+            }) {
+                return Err(BrokerError::StaleRegistrationIdentity);
+            }
+        }
+        self.session_bindings = bindings.to_vec();
+        self.state = BrokerCutoverState::BindingsTransferred;
+        Ok(())
+    }
+
+    /// Commits the exact disposition of every old in-flight operation.
+    ///
+    /// Each operation receives exactly one I14.14 disposition, and `old_operations`
+    /// is the broker's own live lineage for the old registration.  The
+    /// disposition set must be exactly that lineage: an operation the broker
+    /// does not own cannot be dispositioned here, and an owned operation that
+    /// is omitted is a stale request, not a finished one.
+    pub fn commit_operation_dispositions(
+        &mut self,
+        dispositions: &[InFlightOperation],
+        old_operation_ids: &BTreeSet<OperationId>,
+    ) -> Result<(), BrokerError> {
+        if self.state != BrokerCutoverState::BindingsTransferred {
+            return Err(BrokerError::StaleEpoch);
+        }
+        if self.old.is_none() {
+            // A first registration has no old generation to disposition.
+            if !dispositions.is_empty() {
+                return Err(BrokerError::OperationNotFound);
+            }
+            self.operation_dispositions.clear();
+            return Ok(());
+        }
+        let expected = old_operation_ids;
+        let mut seen = BTreeSet::new();
+        for disposition in dispositions {
+            if !seen.insert(disposition.operation_id.clone()) {
+                return Err(BrokerError::Duplicate("cutover.operation_id"));
+            }
+            if !expected.contains(&disposition.operation_id) {
+                return Err(BrokerError::OperationNotFound);
+            }
+        }
+        if seen.len() != expected.len() {
+            return Err(BrokerError::OperationNotFound);
+        }
+        self.operation_dispositions = dispositions.to_vec();
+        Ok(())
+    }
+
+    /// Records that a termination was requested for the old Job Object.
+    ///
+    /// This moves the machine to `TerminationRequested`, which is explicitly
+    /// *not* active: a request is not a proof.  Only [`Self::complete`] can
+    /// promote the candidate, and only on a proof that passes
+    /// [`OldJobObjectTerminationProof::proves_termination`].
+    pub fn request_old_termination(&mut self) -> Result<(), BrokerError> {
+        if self.state != BrokerCutoverState::BindingsTransferred {
+            return Err(BrokerError::StaleEpoch);
+        }
+        self.state = BrokerCutoverState::TerminationRequested;
+        Ok(())
+    }
+
+    /// Records that a logout was observed while the cutover was in flight.
+    ///
+    /// I14.17: "Logout or inability to prove old Job Object termination stops
+    /// cutover and requires reconciliation."  A logout is terminal — the
+    /// machine can no longer reach `Active`.
+    pub fn observe_logout(&mut self) {
+        self.logout_observed = true;
+    }
+
+    /// Attempts to promote the candidate to `Active`.
+    ///
+    /// This is the only transition that marks a candidate active.  When an old
+    /// generation exists it happens only when a termination proof is supplied
+    /// *and* verified against the recorded old registration and the broker's
+    /// own operation lineage.  On refusal the machine moves to
+    /// `ReconciliationRequired` and publishes a receipt with no termination
+    /// proof, so the outcome is inspectable and the candidate is definitively
+    /// not active.
+    pub fn complete(
+        &mut self,
+        proof: Option<&OldJobObjectTerminationProof>,
+        old_operation_ids: &BTreeSet<OperationId>,
+    ) -> Result<&BrokerCutoverReceipt, BrokerError> {
+        if self.state != BrokerCutoverState::TerminationRequested {
+            return Err(BrokerError::StaleEpoch);
+        }
+        if self.logout_observed {
+            self.state = BrokerCutoverState::ReconciliationRequired;
+            self.publish();
+            return Err(BrokerError::CutoverStoppedByLogout);
+        }
+        if let Some(old) = self.old.as_ref() {
+            let Some(proof) = proof else {
+                // A generation transition without a proof never activates.
+                self.state = BrokerCutoverState::ReconciliationRequired;
+                self.publish();
+                return Err(BrokerError::CutoverTerminationUnproven);
+            };
+            if let Err(error) = proof.proves_termination(old, old_operation_ids) {
+                self.state = BrokerCutoverState::ReconciliationRequired;
+                self.publish();
+                return Err(error);
+            }
+            self.termination_proof = Some(proof.clone());
+        }
+        self.state = BrokerCutoverState::Active;
+        self.publish();
+        self.receipt
+            .as_ref()
+            .ok_or(BrokerError::CutoverTerminationUnproven)
+    }
+
+    /// Returns the exact admission decision for a new launch.
+    ///
+    /// This is the production path the acceptance criterion names: after a
+    /// broker cutover, a new launch is accepted only through the candidate's
+    /// own registration and epoch, compared against the recorded one.  It
+    /// never matches on a name: the presented registration must be the
+    /// candidate's own sealed registration, admitted by this process's
+    /// identity tuple, carrying the candidate's authority epoch and fence, and
+    /// the presented epoch must be the candidate's strictly-higher/new-lineage
+    /// epoch.
+    pub fn admits_new_launch(
+        &self,
+        admission: &BrokerAdmissionIdentity,
+        presented: &RegistrationReceipt,
+        presented_epoch: &UserBrokerEpoch,
+    ) -> Result<(), BrokerError> {
+        let candidate = self
+            .candidate
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?;
+        if self.state != BrokerCutoverState::Active {
+            return Err(BrokerError::RegistrationNotAdmitted);
+        }
+        if !admission.admits(presented)
+            || !admission.admits(&candidate.registration)
+            || presented.registration_digest != candidate.registration.registration_digest
+            || !presented
+                .authority_epoch
+                .is_same_authority(&candidate.registration.authority_epoch)
+            || presented.fence_id != candidate.registration.fence_id
+        {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        if presented_epoch != &candidate.user_broker_epoch {
+            return Err(BrokerError::StaleEpoch);
+        }
+        if let Some(old) = self.old.as_ref() {
+            let recorded = UserBrokerEpoch::new(
+                presented.authority_epoch.lineage_id.clone(),
+                NonZeroU64::new(old.registration.user_broker_epoch)
+                    .ok_or(BrokerError::InvalidField("cutover.old_user_broker_epoch"))?,
+            )?;
+            if !presented_epoch.supersedes(&recorded) {
+                return Err(BrokerError::StaleEpoch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Projects the published receipt, splitting the session bindings into
+    /// transferred and explicitly untransferred sets.
+    fn publish(&mut self) {
+        let Some(candidate) = self.candidate.as_ref() else {
+            return;
+        };
+        let (transferred, untransferred): (Vec<_>, Vec<_>) = self
+            .session_bindings
+            .iter()
+            .cloned()
+            .partition(|binding| binding.broker_independent);
+        self.receipt = Some(BrokerCutoverReceipt {
+            state: self.state,
+            old_registration_digest: self.old.as_ref().map_or_else(String::new, |old| {
+                old.registration.registration_digest.clone()
+            }),
+            old_broker_generation: self
+                .old
+                .as_ref()
+                .map_or_else(Generation::default, |old| old.broker_generation),
+            old_user_broker_epoch: self
+                .old
+                .as_ref()
+                .map_or(0, |old| old.registration.user_broker_epoch),
+            new_registration_digest: candidate.registration.registration_digest.clone(),
+            new_broker_generation: candidate.broker_generation,
+            new_user_broker_epoch: candidate.user_broker_epoch.clone(),
+            transferred_bindings: transferred,
+            untransferred_bindings: untransferred,
+            operation_dispositions: self.operation_dispositions.clone(),
+            old_job_object_termination: self.termination_proof.clone(),
+        });
+    }
+}
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -4317,6 +5732,8 @@ mod tests {
             operation_cursors: Vec::new(),
             operation_identities: Vec::new(),
             retired_operations: Vec::new(),
+            predecessor_registration: None,
+            cutover_receipt: None,
         };
         let registration_digest = snapshot
             .registration
@@ -4509,6 +5926,8 @@ mod tests {
                 operation_cursors: Vec::new(),
                 operation_identities: Vec::new(),
                 retired_operations: Vec::new(),
+                predecessor_registration: None,
+                cutover_receipt: None,
             })
             .expect("seed");
         let mut restarted = UserBroker::new(
@@ -4671,6 +6090,8 @@ mod tests {
                 .collect(),
             operation_identities: broker.projected_operation_identities(),
             retired_operations: broker.retired_operations.values().cloned().collect(),
+            predecessor_registration: broker.predecessor_registration.clone(),
+            cutover_receipt: broker.cutover_receipt.clone(),
         };
         let expected_cursor = snapshot.operation_cursors.first().expect("cursor").clone();
         assert_eq!(expected_cursor.operation_id, receipt.operation_id);

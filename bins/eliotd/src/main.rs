@@ -7,6 +7,7 @@
 //! `ProcessExecutor`, or authority source.
 
 mod daemon_runtime;
+mod observability;
 
 use eliotd::{PROTOCOL_VERSION, SERVICE_NAME};
 
@@ -15,6 +16,12 @@ fn main() {
     // stdout bytes and framing stay unchanged; init failure keeps the first
     // owner's subscriber and never alters exit/control behavior.
     let _diagnostics = eliotd::diagnostics::init_daemon_diagnostics();
+    // Issue #1836 (W1): install the shared observability runtime from the
+    // canonical roots this binary already resolves, before the daemon run
+    // loop starts. Best-effort by the same contract as the subscriber above:
+    // a refused configuration leaves the daemon running on its existing
+    // diagnostics and is never turned into a startup failure.
+    let _observability = eliot_observability_runtime::install(&observability::daemon_config());
     let _startup = eliotd::diagnostics::emit_startup();
     if let Err(error) = daemon_runtime::run() {
         let message = daemon_runtime::ReadyMessage::Error {

@@ -56,7 +56,6 @@ admission-to-runtime claim; integration via cognitive-wave-integrator.
 
 | Path | Package | Owner | Active reference |
 |---|---|---|---|
-| `crates/security/eliot-erasure` | eliot-erasure | security.erasure (component owner TBD); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |
 | `crates/security/eliot-influence` | eliot-influence | security.influence (component owner TBD); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |
 | `crates/smart/eliot-context` | eliot-context | smart.context (component owner TBD, ref #248); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |
 | `crates/smart/eliot-cues` | eliot-cues | smart.cues (component owner TBD); coordinated by bins/eliotd (#1860) | ACTIVE_REFERENCE |

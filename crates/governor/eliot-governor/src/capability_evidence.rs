@@ -24,6 +24,28 @@
 //! fingerprint is absent from the registry invalidation set. Time therefore
 //! flows into every admission decision through the explicit `now` parameter,
 //! so positive evidence can go stale in a running daemon.
+//!
+//! Scope keying (issue #1958): [`RouteScopeFingerprint`] is the *complete
+//! effective* route identity, not a provider/model label. It carries every
+//! behaviour-changing group of the I3.4 `RouteFingerprint` - host family,
+//! adapter identity, protocol/transport, runtime and adapter hashes, OS
+//! architecture, auth profile, provider/model route, tool-call ID and role
+//! ordering, reasoning continuation/compaction, and the serializer plus
+//! behaviour-affecting feature-flag and tool/context profile hashes - so two
+//! attempts differing only by serializer or by tool-call/role ordering resolve
+//! to different keys and cannot reuse each other's capability evidence. A
+//! dimension the source does not expose stays `None` (unknown) and matches
+//! only `None`; it is never back-filled from the requested route.
+//!
+//! Supersession is decided by the evidence retained for a key, not by arrival
+//! order: the registry holds one record per `(skill_id, scope_fingerprint)`,
+//! and an insertion replaces it only when its own `observed_at` is strictly
+//! newer. A delayed replay is refused whole, so it displaces no record and
+//! clears no invalidation; and an invalidation is cleared only by a fresh
+//! requalification of the same key, so a known restriction or an applied
+//! scope change is not erased by an unrelated record. The retained bound
+//! therefore never lets stale evidence look current, and an empty registry
+//! still refuses rather than admits.
 
 #![forbid(unsafe_code)]
 
@@ -87,16 +109,38 @@ impl CapabilitySource {
 
 /// Complete route-scope fingerprint for one capability claim.
 ///
-/// Fields the source cannot provide stay `None` (unknown, never inferred).
-/// `None` matches only `None` during exact-fingerprint comparison.
+/// This is the *complete effective* route identity issue #1958 requires, not a
+/// provider/model label: every behaviour-changing group I3.4 lists in
+/// `RouteFingerprint` is present, so a route that differs only in host family,
+/// adapter identity, protocol/transport, tool-call ID and role ordering, or
+/// reasoning continuation/compaction moves the key and its dependent evidence
+/// stops matching instead of being reused. It is the same value the
+/// [`RouteBehaviorFingerprint`](crate::RouteBehaviorFingerprint) owner
+/// projects, so capability lookup cannot drift from route identity.
+///
+/// Fields the source cannot provide stay `None` (unknown, never inferred from
+/// the requested route, a UI selection, or prompt text). `None` matches only
+/// `None` during exact-fingerprint comparison.
 #[derive(Clone, Debug, Default, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteScopeFingerprint {
+    pub host_family: Option<String>,
+    pub adapter_id: Option<String>,
+    /// Protocol kind and transport kind of the runtime connection.
+    pub protocol_transport: Option<String>,
     pub runtime_hash: Option<String>,
     pub adapter_hash: Option<String>,
     pub os_architecture: Option<String>,
     pub auth_profile_class: Option<String>,
+    /// Requested provider and model route label, exposed by the runtime.
     pub provider_model_route: Option<String>,
+    /// Tool-call ID and role ordering semantics of the adapter.
+    pub tool_call_id_and_role_ordering: Option<String>,
+    /// Reasoning continuation and compaction behavior of the runtime.
+    pub reasoning_continuation_and_compaction: Option<String>,
+    /// Composite of the runtime-exposed message serializer/chat-template
+    /// fingerprint and the behaviour-affecting feature-flag and tool/context
+    /// profile hashes of the installation.
     pub feature_flags_and_serializer: Option<String>,
 }
 
@@ -115,20 +159,25 @@ impl RouteScopeFingerprint {
 /// and accounts whose selected fields still match the current fingerprint
 /// stay admitted. [`ScopeDependencySelector::all`] reproduces the coarse
 /// whole-fingerprint invalidation for callers that cannot attribute the
-/// change more narrowly. Six independent dependency dimensions stay six
+/// change more narrowly. Eleven independent dependency dimensions stay eleven
 /// explicit flags (not a bitmask) so each contract dimension reads by name.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "six named I03-04 dependency dimensions"
+    reason = "eleven named I03-04 dependency dimensions"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeDependencySelector {
+    pub host_family: bool,
+    pub adapter_id: bool,
+    pub protocol_transport: bool,
     pub runtime_hash: bool,
     pub adapter_hash: bool,
     pub os_architecture: bool,
     pub auth_profile_class: bool,
     pub provider_model_route: bool,
+    pub tool_call_id_and_role_ordering: bool,
+    pub reasoning_continuation_and_compaction: bool,
     pub feature_flags_and_serializer: bool,
 }
 
@@ -137,11 +186,16 @@ impl ScopeDependencySelector {
     #[must_use]
     pub const fn all() -> Self {
         Self {
+            host_family: true,
+            adapter_id: true,
+            protocol_transport: true,
             runtime_hash: true,
             adapter_hash: true,
             os_architecture: true,
             auth_profile_class: true,
             provider_model_route: true,
+            tool_call_id_and_role_ordering: true,
+            reasoning_continuation_and_compaction: true,
             feature_flags_and_serializer: true,
         }
     }
@@ -150,11 +204,16 @@ impl ScopeDependencySelector {
     #[must_use]
     pub const fn none() -> Self {
         Self {
+            host_family: false,
+            adapter_id: false,
+            protocol_transport: false,
             runtime_hash: false,
             adapter_hash: false,
             os_architecture: false,
             auth_profile_class: false,
             provider_model_route: false,
+            tool_call_id_and_role_ordering: false,
+            reasoning_continuation_and_compaction: false,
             feature_flags_and_serializer: false,
         }
     }
@@ -167,12 +226,20 @@ impl ScopeDependencySelector {
         record: &RouteScopeFingerprint,
         current: &RouteScopeFingerprint,
     ) -> bool {
-        (self.runtime_hash && record.runtime_hash != current.runtime_hash)
+        (self.host_family && record.host_family != current.host_family)
+            || (self.adapter_id && record.adapter_id != current.adapter_id)
+            || (self.protocol_transport && record.protocol_transport != current.protocol_transport)
+            || (self.runtime_hash && record.runtime_hash != current.runtime_hash)
             || (self.adapter_hash && record.adapter_hash != current.adapter_hash)
             || (self.os_architecture && record.os_architecture != current.os_architecture)
             || (self.auth_profile_class && record.auth_profile_class != current.auth_profile_class)
             || (self.provider_model_route
                 && record.provider_model_route != current.provider_model_route)
+            || (self.tool_call_id_and_role_ordering
+                && record.tool_call_id_and_role_ordering != current.tool_call_id_and_role_ordering)
+            || (self.reasoning_continuation_and_compaction
+                && record.reasoning_continuation_and_compaction
+                    != current.reasoning_continuation_and_compaction)
             || (self.feature_flags_and_serializer
                 && record.feature_flags_and_serializer != current.feature_flags_and_serializer)
     }
@@ -312,6 +379,22 @@ impl CapabilityEvidenceRecord {
         self.observed_at <= now && self.expires_at.is_none_or(|expires| now < expires)
     }
 
+    /// Returns true when this record's own status and source could admit
+    /// production work on any scope: `probe_passed` or `observed` from an
+    /// admissible evidence source.
+    ///
+    /// This is the single definition of qualifying evidence, shared by
+    /// [`is_fresh_positive_for`](Self::is_fresh_positive_for) and by
+    /// [`CapabilityRegistry::insert`], so the status/source rule that admits
+    /// a route and the status/source rule that requalifies a stale scope
+    /// cannot drift apart.
+    fn is_qualifying_evidence(&self) -> bool {
+        matches!(
+            self.status,
+            CapabilityStatus::ProbePassed | CapabilityStatus::Observed
+        ) && self.source.is_admissible_evidence()
+    }
+
     /// Returns true when this record is a fresh exact-fingerprint positive
     /// that may admit production work: `probe_passed` or `observed` from an
     /// admissible evidence source, time-fresh at `now`, on a scope the
@@ -328,11 +411,7 @@ impl CapabilityEvidenceRecord {
             && self.scope_fingerprint.exact_match(scope)
             && !invalidated.contains(&self.scope_fingerprint)
             && self.is_time_fresh(now)
-            && matches!(
-                self.status,
-                CapabilityStatus::ProbePassed | CapabilityStatus::Observed
-            )
-            && self.source.is_admissible_evidence()
+            && self.is_qualifying_evidence()
     }
 
     /// Returns true when this record restricts production work on an exact
@@ -368,11 +447,21 @@ impl From<&ImportedLegacyEvidence> for CapabilityEvidenceRecord {
             status: CapabilityStatus::Declared,
             source: CapabilitySource::ImportedLegacyDeclaration,
             scope_fingerprint: RouteScopeFingerprint {
+                // A legacy declaration carries none of the complete effective
+                // route identity beyond the six dimensions the import shape
+                // declares; every further behaviour-changing group stays
+                // `None` (unknown), never back-filled from the route the
+                // declaration names.
+                host_family: None,
+                adapter_id: None,
+                protocol_transport: None,
                 runtime_hash: imported.scope.runtime_hash.clone(),
                 adapter_hash: imported.scope.adapter_hash.clone(),
                 os_architecture: imported.scope.os_architecture.clone(),
                 auth_profile_class: imported.scope.auth_profile_class.clone(),
                 provider_model_route: imported.scope.provider_model_route.clone(),
+                tool_call_id_and_role_ordering: None,
+                reasoning_continuation_and_compaction: None,
                 feature_flags_and_serializer: imported.scope.feature_flags_and_serializer.clone(),
             },
             limitations_and_negative_evidence: Vec::new(),
@@ -410,7 +499,8 @@ pub struct CapabilityRegistry {
     /// Derived staleness: scope fingerprints invalidated by an applied
     /// scope change. Records are never mutated in place; freshness is
     /// derived from this set plus `observed_at`/`expires_at` at admission
-    /// time.
+    /// time. Only [`insert`](Self::insert) removes an entry, and only for a
+    /// fresh requalification of the same key.
     invalidated_scopes: HashSet<RouteScopeFingerprint>,
 }
 
@@ -424,21 +514,50 @@ impl CapabilityRegistry {
         }
     }
 
-    /// Inserts one evidence record, superseding any earlier record for the
-    /// same skill and scope fingerprint.
+    /// Inserts one evidence record for its `(skill_id, scope_fingerprint)`
+    /// key, superseding the record already retained for that key.
     ///
-    /// Re-probing the same skill/scope replaces the earlier record instead
-    /// of appending: a later `broken` supersedes the earlier `probe_passed`
-    /// (and a later passing re-probe supersedes the `broken`, re-qualifying
-    /// the scope). Insertion beyond [`MAX_CAPABILITY_EVIDENCE_RECORDS`]
-    /// evicts the oldest record first. A fresh record for an invalidated
-    /// scope re-qualifies that scope.
+    /// Supersession is decided by the evidence retained for the key, never by
+    /// arrival order. A record whose `observed_at` is not newer than the
+    /// retained record for the same key is a delayed replay and is refused
+    /// whole: it displaces nothing and clears no invalidation, so a delayed
+    /// old `probe_passed` can neither replace a newer `broken` record nor
+    /// revive the scope that record restricted. Re-probing the same
+    /// skill/scope with strictly newer evidence therefore supersedes: a later
+    /// `broken` supersedes the earlier `probe_passed`, and a later passing
+    /// re-probe supersedes the `broken`.
+    ///
+    /// A scope-wide invalidation is cleared only by a fresh requalification of
+    /// the same key — newer evidence that could itself admit that exact scope
+    /// (see [`CapabilityEvidenceRecord::is_fresh_positive_for`]). An insertion
+    /// that opens a new key never revives a scope another capability's
+    /// evidence invalidated, so a scope-wide invalidation is not cleared by an
+    /// unrelated capability insertion on the same fingerprint. A retained
+    /// restriction or an applied scope change therefore stays stale until the
+    /// evidence it staled is requalified, not until any record arrives.
+    ///
+    /// Insertion beyond [`MAX_CAPABILITY_EVIDENCE_RECORDS`] evicts the oldest
+    /// record first.
     pub fn insert(&mut self, record: CapabilityEvidenceRecord) {
-        self.records.retain(|existing| {
-            existing.skill_id != record.skill_id
-                || existing.scope_fingerprint != record.scope_fingerprint
-        });
-        self.invalidated_scopes.remove(&record.scope_fingerprint);
+        if let Some(retained) = self.records.iter().position(|existing| {
+            existing.skill_id == record.skill_id
+                && existing.scope_fingerprint == record.scope_fingerprint
+        }) {
+            // `observed_at` is the evidence source's own observation instant
+            // for this exact scope, so comparing two records of one key orders
+            // those two pieces of evidence. It is not a freshness decision:
+            // freshness still runs at admission time against the caller's `now`
+            // through `is_time_fresh`, which refuses a future-dated record. A
+            // backdated replay only makes a record look older, so it can never
+            // win this comparison.
+            if record.observed_at <= self.records[retained].observed_at {
+                return;
+            }
+            self.records.remove(retained);
+            if record.is_qualifying_evidence() {
+                self.invalidated_scopes.remove(&record.scope_fingerprint);
+            }
+        }
         self.records.push(record);
         while self.records.len() > MAX_CAPABILITY_EVIDENCE_RECORDS {
             self.records.remove(0);
@@ -580,11 +699,16 @@ mod tests {
 
     fn scope() -> RouteScopeFingerprint {
         RouteScopeFingerprint {
+            host_family: Some("host-family-1".into()),
+            adapter_id: Some("adapter-id-1".into()),
+            protocol_transport: Some("app-server|stdio".into()),
             runtime_hash: Some("runtime-hash-1".into()),
             adapter_hash: Some("adapter-hash-1".into()),
             os_architecture: Some("x86_64-windows".into()),
             auth_profile_class: Some("user-broker".into()),
             provider_model_route: Some("provider/model/auth".into()),
+            tool_call_id_and_role_ordering: Some("tool-call-id-1".into()),
+            reasoning_continuation_and_compaction: Some("reasoning-compaction-1".into()),
             feature_flags_and_serializer: Some("serializer-v1".into()),
         }
     }

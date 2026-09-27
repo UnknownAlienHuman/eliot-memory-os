@@ -3,8 +3,8 @@
 
 The adopted `Architecture` byte stream is split into 123 bounded Markdown fragments.
 
-- Original SHA-256: `c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a`
-- Original bytes: `149403`
+- Original SHA-256: `a3c5b2028d9df89a53cd565f8ff493484be74078e4efd7b534c0f1c3169577c7`
+- Original bytes: `150260`
 - Manifest: [`manifest.json`](manifest.json)
 - Stable compatibility path: [`../ELIOT_ARCHITECTURE.md`](../ELIOT_ARCHITECTURE.md)
 - Do not read this entire index as task context. Resolve a route first.
@@ -113,7 +113,7 @@ Use [`../READING_PROTOCOL.md`](../READING_PROTOCOL.md), [`../ROUTES.md`](../ROUT
 - [A9.3. Dreamer and Concilium](../A09-03-dreamer-and-concilium.md#a93-dreamer-and-concilium) — `A9.3` (480 bytes)
 - [A9.4. Launching Agents and Swarms](../A09-04-launching-agents-and-swarms.md#a94-launching-agents-and-swarms) — `A9.4` (594 bytes)
 - [A9.5. Interfaces and Outputs](../A09-05-interfaces-and-outputs.md#a95-interfaces-and-outputs) — `A9.5` (674 bytes)
-- [A9.6. Remote Dreamer](../A09-06-remote-dreamer.md#a96-remote-dreamer) — `A9.6` (469 bytes)
+- [A9.6. Remote Dreamer](../A09-06-remote-dreamer.md#a96-remote-dreamer) — `A9.6` (1326 bytes)
 
 ## A10
 

@@ -100,6 +100,34 @@ impl KernelComposition {
     pub fn watchdog_backup_owner_client() -> Result<WatchdogBackupOwnerClient, OwnerClientError> {
         WatchdogBackupOwnerClient::production()
     }
+
+    /// Enforces I3.2 setup completion at the Kernel authority entrypoint.
+    ///
+    /// Ordinary agent authority — process execution, daemon/worker dispatch,
+    /// and restart — is admitted only after the caller presents the verified
+    /// current setup binding produced by the installation owner. The sealed
+    /// [`VerifiedSetupBinding`] can only be produced by the installation
+    /// owner's trust-anchor verification, so a missing, corrupt, foreign,
+    /// stale, or partially published record cannot unlock ordinary agents. A
+    /// defaults object or cold-composition state cannot substitute for it.
+    ///
+    /// Returns the verified setup revision for the caller to record.
+    ///
+    /// # Errors
+    /// Returns [`KernelBuildError::Service`] when the verified binding belongs
+    /// to a foreign installation.
+    pub fn require_setup_admission(
+        &self,
+        verified: &eliot_installation::VerifiedSetupBinding,
+        expected_installation_id: &str,
+    ) -> Result<u64, KernelBuildError> {
+        if verified.installation_id() != expected_installation_id {
+            return Err(KernelBuildError::Service(
+                "verified setup binding belongs to a foreign installation".to_owned(),
+            ));
+        }
+        Ok(verified.setup_revision())
+    }
 }
 
 /// Maps one build failure to its stable owner-typed diagnostic code.
@@ -1428,8 +1456,13 @@ impl KernelComposition {
         let mut kernel_audit = KernelAuditChain::open(&work_root)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         if let Some(binding) = config.audit_anchor_binding.as_ref() {
+            // I16.10 (issue #1837): production binds the installer-owned
+            // Watchdog failure-domain root in `main`; the same-domain default
+            // stays a legitimate configuration only while that injection is
+            // absent. `set_anchor_sink` proves the bound directory is
+            // physically outside the work root before accepting it.
             kernel_audit
-                .set_anchor_sink(binding)
+                .set_anchor_sink(binding, &work_root)
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         }
         let prior_head_seq = kernel_audit.head_seq();
@@ -1478,6 +1511,9 @@ impl KernelComposition {
             wasm_host_executable_path,
             wasm_host_artifact_sha256,
             wasm_join_table: Mutex::new(eliot_kernel_service::WasmJoinTable::default()),
+            pre_stage_identity_cache: Mutex::new(
+                eliot_kernel_service::PreStageIdentityCache::default(),
+            ),
             daemon_runtime: Mutex::new(DaemonRuntimeState {
                 status: DaemonRuntimeStatus::NotLaunched,
                 receipt: None,

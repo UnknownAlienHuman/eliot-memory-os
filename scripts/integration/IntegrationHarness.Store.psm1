@@ -1818,35 +1818,6 @@ function Invoke-StoreStop {
     if ($null -eq $ProcessController) {
         throw [System.ArgumentException]::new('STORE-MISSING-CONTROLLER: a process-controller seam is required.')
     }
-    $hasImage = ($observed.ContainsKey('imagePath') -and -not [string]::IsNullOrWhiteSpace([string]$observed['imagePath']))
-    $hasStart = ($observed.ContainsKey('startTimeUtc') -and -not [string]::IsNullOrWhiteSpace([string]$observed['startTimeUtc']))
-    if (-not $hasImage -or -not $hasStart) {
-        throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: start receipt carries no live-verifiable process identity.')
-    }
-    $ownedTree = @($ownedPid)
-    $treeComplete = $true
-    if ($null -ne $ProcessObserver) {
-        $live = (& $ProcessObserver @{ pid = $ownedPid; runId = $runId })
-        if ($null -eq $live -or $live -isnot [hashtable]) {
-            throw [System.InvalidOperationException]::new('STORE-OBSERVER-FAILED: stop observer must return a hashtable.')
-        }
-        if ($live.ContainsKey('pid') -and ([int]$live['pid'] -ne $ownedPid)) {
-            throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: stop observer returned a foreign pid.')
-        }
-        [void](Test-StoreProcessOwnership -Pid $ownedPid -ExpectedImagePath ([string]$observed['imagePath']) -ExpectedStartTimeUtc ([string]$observed['startTimeUtc']) -Observation $live)
-        if ($live.ContainsKey('treeComplete') -and $null -ne $live['treeComplete']) {
-            $treeComplete = [bool]$live['treeComplete']
-        }
-        if ($live.ContainsKey('descendants') -and $null -ne $live['descendants']) {
-            foreach ($child in @($live['descendants'])) {
-                $childPid = 0
-                try { $childPid = [int]$child } catch { $childPid = 0 }
-                if ($childPid -gt 0 -and $childPid -ne $ownedPid -and $ownedTree -notcontains $childPid) {
-                    $ownedTree += $childPid
-                }
-            }
-        }
-    }
     $stopFs = $FileSystem
     if ($null -eq $stopFs) {
         $stopFs = New-StoreDefaultFileSystem
@@ -1855,35 +1826,224 @@ function Invoke-StoreStop {
     if ($StartReceipt.ContainsKey('runRoot') -and -not [string]::IsNullOrWhiteSpace([string]$StartReceipt['runRoot'])) {
         $stopRunRoot = [string]$StartReceipt['runRoot']
     }
+    $hasImage = ($observed.ContainsKey('imagePath') -and -not [string]::IsNullOrWhiteSpace([string]$observed['imagePath']))
+    $hasStart = ($observed.ContainsKey('startTimeUtc') -and -not [string]::IsNullOrWhiteSpace([string]$observed['startTimeUtc']))
+    if (-not $hasImage -or -not $hasStart) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+            -Detail 'STORE-PROCESS-IDENTITY-UNPROVEN: start receipt carries no live-verifiable process identity.'
+    }
+    $rootIdentity = @{
+        pid          = $ownedPid
+        imagePath    = [string]$observed['imagePath']
+        startTimeUtc = [string]$observed['startTimeUtc']
+    }
+    $ownedTree = @($rootIdentity)
+    $treeComplete = $false
+    $stopObserver = $ProcessObserver
+    if ($null -eq $stopObserver) {
+        $stopObserver = New-StoreDefaultProcessObserver
+    }
+    $live = $null
     try {
-        $graceful = (& $ProcessController @{ phase = 'graceful'; pid = $ownedPid; runId = $runId })
+        $live = (& $stopObserver @{ pid = $ownedPid; runId = $runId })
     } catch {
-        $gracefulMessage = $_.Exception.Message
-        if ($gracefulMessage -match '(?i)lost-response|timeout|unknown') {
-            $gracefulReconciliation = Write-StoreLostResponseRecord -FileSystem $stopFs -RunRoot $stopRunRoot -RunId $runId -Operation 'stop' -RequestKey ([string]$requested['requestKey']) -Endpoint ([string]$requested['endpoint']) -Owner ([string]$Binding['owner']) -Generation ([int]$Binding['generation']) -Detail $gracefulMessage
-            return @{
-                runId                   = $runId
-                stopPhase               = 'unknown'
-                stopState               = 'ReconciliationRequired'
-                ownedPid                = $ownedPid
-                forced                  = $false
-                retryPermitted          = $false
-                reconciliationOwner     = $runId
-                reconciliationPath      = [string]$gracefulReconciliation['path']
-                reconciliationPersisted = [bool]$gracefulReconciliation['persisted']
-                failure                 = ('lost-response-owned:' + $gracefulMessage)
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail $_.Exception.Message
+    }
+    if ($null -eq $live -or $live -isnot [hashtable]) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-OBSERVER-FAILED: stop observer must return a hashtable.'
+    }
+    $livePid = 0
+    if ($live.ContainsKey('pid')) {
+        try { $livePid = [int]$live['pid'] } catch { $livePid = 0 }
+    }
+    if (-not $live.ContainsKey('alive') -or $live['alive'] -isnot [bool] -or
+        ($live.ContainsKey('pid') -and $livePid -ne $ownedPid)) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-OBSERVER-FAILED: stop observer did not establish the owned root state.'
+    }
+    $rootLiveBeforeGrace = [bool]$live['alive']
+    if ($rootLiveBeforeGrace) {
+        try {
+            [void](Test-StoreProcessOwnership -Pid $ownedPid -ExpectedImagePath ([string]$rootIdentity['imagePath']) `
+                -ExpectedStartTimeUtc ([string]$rootIdentity['startTimeUtc']) -Observation $live)
+        } catch {
+            return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+                -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail $_.Exception.Message
+        }
+    }
+    if ($rootLiveBeforeGrace -and $live.ContainsKey('treeComplete') -and $live['treeComplete'] -is [bool]) {
+        $treeComplete = [bool]$live['treeComplete']
+    }
+    if ($rootLiveBeforeGrace -and $live.ContainsKey('descendants') -and $null -ne $live['descendants']) {
+        foreach ($child in @($live['descendants'])) {
+            if ($null -eq $child -or $child -isnot [hashtable] -or
+                -not $child.ContainsKey('pid') -or -not $child.ContainsKey('imagePath') -or -not $child.ContainsKey('startTimeUtc')) {
+                $treeComplete = $false
+                continue
+            }
+            $childPid = 0
+            try { $childPid = [int]$child['pid'] } catch { $childPid = 0 }
+            if ($childPid -le 0 -or $childPid -eq $ownedPid -or
+                [string]::IsNullOrWhiteSpace([string]$child['imagePath']) -or
+                [string]::IsNullOrWhiteSpace([string]$child['startTimeUtc'])) {
+                $treeComplete = $false
+                continue
+            }
+            $existing = @($ownedTree | Where-Object { [int]$_['pid'] -eq $childPid })
+            if ($existing.Count -gt 0) {
+                if ([string]$existing[0]['imagePath'] -ine [string]$child['imagePath'] -or
+                    [string]$existing[0]['startTimeUtc'] -cne [string]$child['startTimeUtc']) {
+                    $treeComplete = $false
+                }
+                continue
+            }
+            $ownedTree += @{
+                pid          = $childPid
+                imagePath    = [string]$child['imagePath']
+                startTimeUtc = [string]$child['startTimeUtc']
             }
         }
-        if ($gracefulMessage -match '^STORE-[A-Z0-9-]+:') { throw }
-        throw [System.InvalidOperationException]::new("STORE-CONTROLLER-FAILED: graceful phase failed: $gracefulMessage")
+    }
+    $preGraceTreeComplete = [bool]$treeComplete
+    $preGraceOwnedTree = @($ownedTree)
+    try {
+        $graceful = (& $ProcessController @{ phase = 'graceful'; pid = $ownedPid; runId = $runId; ownedTree = @($ownedTree) })
+    } catch {
+        $gracefulMessage = $_.Exception.Message
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail $gracefulMessage
     }
     if ($null -eq $graceful -or $graceful -isnot [hashtable] -or -not $graceful.ContainsKey('exited')) {
-        throw [System.InvalidOperationException]::new('STORE-CONTROLLER-FAILED: graceful phase must return an exited mapping.')
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-CONTROLLER-FAILED: graceful phase must return an exited mapping.'
     }
-    if ($graceful.ContainsKey('pid') -and ([int]$graceful['pid'] -ne $ownedPid)) {
-        throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: controller touched a foreign pid.')
+    if ($graceful['exited'] -isnot [bool]) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-CONTROLLER-FAILED: graceful phase returned an invalid exited value.'
     }
-    if ([bool]$graceful['exited']) {
+    $gracefulExited = [bool]$graceful['exited']
+    $gracefulPid = 0
+    if ($graceful.ContainsKey('pid')) {
+        try { $gracefulPid = [int]$graceful['pid'] } catch { $gracefulPid = 0 }
+    }
+    if ($graceful.ContainsKey('pid') -and $gracefulPid -ne $ownedPid) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-FOREIGN-PROCESS: controller touched a foreign pid.'
+    }
+    $afterGrace = $null
+    try {
+        $afterGrace = (& $stopObserver @{ pid = $ownedPid; runId = $runId })
+    } catch {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid `
+            -Forced (-not $gracefulExited) -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+            -Detail ('STORE-DESCENDANT-CLOSURE-INCOMPLETE: post-grace observation failed: ' + $_.Exception.Message)
+    }
+    $afterGracePid = 0
+    if ($null -ne $afterGrace -and $afterGrace -is [hashtable] -and $afterGrace.ContainsKey('pid')) {
+        try { $afterGracePid = [int]$afterGrace['pid'] } catch { $afterGracePid = 0 }
+    }
+    if ($null -eq $afterGrace -or $afterGrace -isnot [hashtable] -or
+        -not $afterGrace.ContainsKey('pid') -or $afterGracePid -ne $ownedPid -or
+        -not $afterGrace.ContainsKey('alive') -or $afterGrace['alive'] -isnot [bool]) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid `
+            -Forced (-not $gracefulExited) -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+            -Detail 'STORE-DESCENDANT-CLOSURE-INCOMPLETE: post-grace observation does not establish the owned root state.'
+    }
+    $rootStillLive = [bool]$afterGrace['alive']
+    if ($rootStillLive) {
+        try {
+            [void](Test-StoreProcessOwnership -Pid $ownedPid -ExpectedImagePath ([string]$rootIdentity['imagePath']) `
+                -ExpectedStartTimeUtc ([string]$rootIdentity['startTimeUtc']) -Observation $afterGrace)
+        } catch {
+            return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid `
+                -Forced (-not $gracefulExited) -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail $_.Exception.Message
+        }
+        if ($gracefulExited) {
+            return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $false `
+                -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+                -Detail 'STORE-PROCESS-IDENTITY-UNPROVEN: graceful controller reported exit but the owned root remains live.'
+        }
+    }
+    $afterTreeComplete = ($afterGrace.ContainsKey('treeComplete') -and $afterGrace['treeComplete'] -is [bool] -and [bool]$afterGrace['treeComplete'] -and
+        $afterGrace.ContainsKey('descendants') -and $null -ne $afterGrace['descendants'])
+    if ($afterTreeComplete) {
+        foreach ($child in @($afterGrace['descendants'])) {
+            if ($null -eq $child -or $child -isnot [hashtable] -or
+                -not $child.ContainsKey('pid') -or -not $child.ContainsKey('imagePath') -or -not $child.ContainsKey('startTimeUtc')) {
+                $afterTreeComplete = $false
+                continue
+            }
+            $childPid = 0
+            try { $childPid = [int]$child['pid'] } catch { $childPid = 0 }
+            if ($childPid -le 0 -or $childPid -eq $ownedPid -or
+                [string]::IsNullOrWhiteSpace([string]$child['imagePath']) -or
+                [string]::IsNullOrWhiteSpace([string]$child['startTimeUtc'])) {
+                $afterTreeComplete = $false
+                continue
+            }
+            $existing = @($ownedTree | Where-Object { [int]$_['pid'] -eq $childPid })
+            if ($existing.Count -gt 0) {
+                if ([string]$existing[0]['imagePath'] -ine [string]$child['imagePath'] -or
+                    [string]$existing[0]['startTimeUtc'] -cne [string]$child['startTimeUtc']) {
+                    $afterTreeComplete = $false
+                }
+                continue
+            }
+            $ownedTree += @{
+                pid          = $childPid
+                imagePath    = [string]$child['imagePath']
+                startTimeUtc = [string]$child['startTimeUtc']
+            }
+        }
+    }
+    $treeComplete = $afterTreeComplete
+    if (-not $treeComplete) {
+        $closureDetail = 'STORE-DESCENDANT-CLOSURE-INCOMPLETE: post-grace owned descendant closure could not be proven.'
+        $reconciliationForced = (-not $gracefulExited)
+        if (-not $rootStillLive) {
+            $jobName = ''
+            if ($StartReceipt['observed'].ContainsKey('jobName')) {
+                $jobName = [string]$StartReceipt['observed']['jobName']
+            }
+            if (-not [string]::IsNullOrWhiteSpace($jobName) -and $jobName -cne 'inherited' -and
+                $Script:StoreJobHandles.ContainsKey($jobName)) {
+                $jobClosed = $null
+                try { $jobClosed = Close-StoreJobBinding -JobName $jobName } catch { $jobClosed = @{ closed = $false } }
+                if ($null -ne $jobClosed -and [bool]$jobClosed['closed']) {
+                    return @{
+                        runId     = $runId
+                        stopPhase = 'forced'
+                        ownedPid  = $ownedPid
+                        stopState = 'OwnedResourcesStopped'
+                        forced    = $true
+                    }
+                }
+            }
+            if ($preGraceTreeComplete) {
+                $reconciliationForced = $true
+                $closureDetail += ' A bounded best-effort forced attempt used the complete pre-grace identity tree; its response is not proof of cleanup.'
+                try {
+                    [void](& $ProcessController @{
+                        phase           = 'forced'
+                        pid             = $ownedPid
+                        runId           = $runId
+                        ownedTree       = @($preGraceOwnedTree)
+                        treeComplete    = $true
+                        rootObservedLive = $false
+                    })
+                } catch {
+                    $closureDetail += ' The best-effort forced response was uncertain: ' + $_.Exception.Message
+                }
+            }
+        }
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid `
+            -Forced $reconciliationForced -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+            -Detail $closureDetail
+    }
+    if (-not $rootStillLive -and $ownedTree.Count -eq 1) {
         return @{
             runId     = $runId
             stopPhase = 'graceful'
@@ -1892,40 +2052,74 @@ function Invoke-StoreStop {
             forced    = $false
         }
     }
-    if (-not $treeComplete) {
-        throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: forced termination refused because the owned descendant closure is incomplete.')
-    }
     try {
-        $forced = (& $ProcessController @{ phase = 'forced'; pid = $ownedPid; runId = $runId; ownedTree = @($ownedTree) })
+        $forced = (& $ProcessController @{ phase = 'forced'; pid = $ownedPid; runId = $runId; ownedTree = @($ownedTree); treeComplete = $treeComplete; rootObservedLive = $rootStillLive })
     } catch {
         $forcedMessage = $_.Exception.Message
-        if ($forcedMessage -match '(?i)lost-response|timeout|unknown') {
-            $forcedReconciliation = Write-StoreLostResponseRecord -FileSystem $stopFs -RunRoot $stopRunRoot -RunId $runId -Operation 'stop' -RequestKey ([string]$requested['requestKey']) -Endpoint ([string]$requested['endpoint']) -Owner ([string]$Binding['owner']) -Generation ([int]$Binding['generation']) -Detail $forcedMessage
-            return @{
-                runId                   = $runId
-                stopPhase               = 'unknown'
-                stopState               = 'ReconciliationRequired'
-                ownedPid                = $ownedPid
-                forced                  = $true
-                retryPermitted          = $false
-                reconciliationOwner     = $runId
-                reconciliationPath      = [string]$forcedReconciliation['path']
-                reconciliationPersisted = [bool]$forcedReconciliation['persisted']
-                failure                 = ('lost-response-owned:' + $forcedMessage)
-            }
-        }
-        if ($forcedMessage -match '^STORE-[A-Z0-9-]+:') { throw }
-        throw [System.InvalidOperationException]::new("STORE-CONTROLLER-FAILED: forced phase failed: $forcedMessage")
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail $forcedMessage
     }
     if ($null -eq $forced -or $forced -isnot [hashtable] -or -not $forced.ContainsKey('exited')) {
-        throw [System.InvalidOperationException]::new('STORE-CONTROLLER-FAILED: forced phase must return an exited mapping.')
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-CONTROLLER-FAILED: forced phase must return an exited mapping.'
+    }
+    if ($forced['exited'] -isnot [bool]) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-CONTROLLER-FAILED: forced phase returned an invalid exited value.'
     }
     if ($forced.ContainsKey('pid') -and ([int]$forced['pid'] -ne $ownedPid)) {
-        throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: controller touched a foreign pid.')
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-FOREIGN-PROCESS: controller touched a foreign pid.'
+    }
+    if (-not [bool]$forced['exited']) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId -Detail 'STORE-FORCED-STOP-INCOMPLETE: owned processes remain after the forced phase.'
     }
     $terminated = @($ownedPid)
     if ($forced.ContainsKey('terminatedPids') -and $null -ne $forced['terminatedPids']) {
         $terminated = @($forced['terminatedPids'])
+    }
+    $forcedCleanupProven = $false
+    $jobName = ''
+    if ($StartReceipt['observed'].ContainsKey('jobName')) {
+        $jobName = [string]$StartReceipt['observed']['jobName']
+    }
+    if (-not [string]::IsNullOrWhiteSpace($jobName) -and $jobName -cne 'inherited' -and
+        $Script:StoreJobHandles.ContainsKey($jobName)) {
+        $jobClosed = $null
+        try { $jobClosed = Close-StoreJobBinding -JobName $jobName } catch { $jobClosed = @{ closed = $false } }
+        if ($null -eq $jobClosed -or -not [bool]$jobClosed['closed']) {
+            return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+                -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+                -Detail 'STORE-JOB-CLOSE-UNCONFIRMED: forced target handles exited but owned job close was not confirmed.'
+        }
+        $forcedCleanupProven = $true
+    } else {
+        $postForced = $null
+        try {
+            $postForced = (& $stopObserver @{ pid = $ownedPid; runId = $runId })
+        } catch {
+            return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+                -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+                -Detail ('STORE-DESCENDANT-CLOSURE-INCOMPLETE: post-force closure observation failed: ' + $_.Exception.Message)
+        }
+        $postForcedPid = 0
+        if ($null -ne $postForced -and $postForced -is [hashtable] -and $postForced.ContainsKey('pid')) {
+            try { $postForcedPid = [int]$postForced['pid'] } catch { $postForcedPid = 0 }
+        }
+        if ($null -ne $postForced -and $postForced -is [hashtable] -and
+            $postForced.ContainsKey('pid') -and $postForcedPid -eq $ownedPid -and
+            $postForced.ContainsKey('alive') -and $postForced['alive'] -is [bool] -and -not [bool]$postForced['alive'] -and
+            $postForced.ContainsKey('treeComplete') -and $postForced['treeComplete'] -is [bool] -and [bool]$postForced['treeComplete'] -and
+            $postForced.ContainsKey('descendants') -and $null -ne $postForced['descendants'] -and
+            @($postForced['descendants']).Count -eq 0) {
+            $forcedCleanupProven = $true
+        }
+    }
+    if (-not $forcedCleanupProven) {
+        return New-StoreStopReconciliationResult -Binding $Binding -Requested $requested -OwnedPid $ownedPid -Forced $true `
+            -RunRoot $stopRunRoot -FileSystem $stopFs -RunId $runId `
+            -Detail 'STORE-DESCENDANT-CLOSURE-INCOMPLETE: forced target snapshot stopped but post-exit cleanup closure is unproven.'
     }
     return @{
         runId         = $runId
@@ -1936,6 +2130,46 @@ function Invoke-StoreStop {
         exited        = [bool]$forced['exited']
         ownedTree     = @($ownedTree)
         terminatedPids = @($terminated)
+    }
+}
+
+function New-StoreStopReconciliationResult {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Binding,
+        [Parameter(Mandatory)]
+        [hashtable]$Requested,
+        [Parameter(Mandatory)]
+        [int]$OwnedPid,
+        [Parameter(Mandatory)]
+        [bool]$Forced,
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$RunRoot,
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [scriptblock]$FileSystem,
+        [Parameter(Mandatory)]
+        [string]$RunId,
+        [Parameter(Mandatory)]
+        [string]$Detail
+    )
+    $reconciliation = Write-StoreLostResponseRecord -FileSystem $FileSystem -RunRoot $RunRoot -RunId $RunId `
+        -Operation 'stop' -RequestKey ([string]$Requested['requestKey']) -Endpoint ([string]$Requested['endpoint']) `
+        -Owner ([string]$Binding['owner']) -Generation ([int]$Binding['generation']) -Detail $Detail
+    return @{
+        runId                   = $RunId
+        stopPhase               = 'unknown'
+        stopState               = 'ReconciliationRequired'
+        ownedPid                = $OwnedPid
+        forced                  = $Forced
+        retryPermitted          = $false
+        reconciliationOwner     = $RunId
+        reconciliationPath      = [string]$reconciliation['path']
+        reconciliationPersisted = [bool]$reconciliation['persisted']
+        failure                 = ('stop-ownership-unproven:' + $Detail)
     }
 }
 
@@ -2364,6 +2598,151 @@ function Resolve-StoreReconciliationRecord {
     return $result
 }
 
+function Get-StoreProcessIdentity {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Diagnostics.Process]$Process
+    )
+    $pid = [int]$Process.Id
+    try {
+        if ($Process.HasExited) {
+            throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: process exited before its identity was captured.')
+        }
+    } catch {
+        if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
+        throw [System.InvalidOperationException]::new("STORE-PROCESS-IDENTITY-UNPROVEN: process liveness could not be read: $($_.Exception.Message)")
+    }
+    $imagePath = ''
+    try { $imagePath = [string]$Process.MainModule.FileName } catch { $imagePath = '' }
+    $startTimeUtc = ''
+    try { $startTimeUtc = $Process.StartTime.ToUniversalTime().ToString('o') } catch { $startTimeUtc = '' }
+    if ([string]::IsNullOrWhiteSpace($imagePath) -or [string]::IsNullOrWhiteSpace($startTimeUtc)) {
+        throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: process image path or start time could not be read.')
+    }
+    return @{
+        pid          = $pid
+        imagePath    = [System.IO.Path]::GetFullPath($imagePath)
+        startTimeUtc = $startTimeUtc
+    }
+}
+
+function Get-StoreNativeProcessApi {
+    [CmdletBinding()]
+    [OutputType([type])]
+    param()
+    $api = [System.Type]::GetType('EliotStoreNativeProcessApi')
+    if ($null -eq $api) {
+        $nativeSource = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class EliotStoreNativeProcessApi {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILETIME { public uint Low; public uint High; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessTimes(IntPtr process, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder imagePath, ref int size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
+    public static bool TryGetProcessIdentity(IntPtr process, out string imagePath, out long creationFileTime) {
+        imagePath = String.Empty;
+        creationFileTime = 0;
+        FILETIME creation, exit, kernel, user;
+        if (!GetProcessTimes(process, out creation, out exit, out kernel, out user)) return false;
+        int size = 32768;
+        StringBuilder path = new StringBuilder(size);
+        if (!QueryFullProcessImageName(process, 0, path, ref size) || size <= 0) return false;
+        try { imagePath = Path.GetFullPath(path.ToString()); }
+        catch { imagePath = String.Empty; return false; }
+        creationFileTime = ((long)creation.High << 32) | creation.Low;
+        return !String.IsNullOrWhiteSpace(imagePath) && creationFileTime > 0;
+    }
+}
+'@
+        try {
+            Add-Type -TypeDefinition $nativeSource -ErrorAction Stop | Out-Null
+            $api = [System.Type]::GetType('EliotStoreNativeProcessApi')
+        } catch {
+            throw [System.InvalidOperationException]::new("STORE-PROCESS-IDENTITY-UNPROVEN: native process handle API is unavailable: $($_.Exception.Message)")
+        }
+    }
+    if ($null -eq $api) {
+        throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: native process handle API is unavailable.')
+    }
+    return $api
+}
+
+function Invoke-StoreNativeTerminateByIdentity {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [int]$Pid,
+        [Parameter(Mandatory)]
+        [string]$ExpectedImagePath,
+        [Parameter(Mandatory)]
+        [string]$ExpectedStartTimeUtc
+    )
+    if ($Pid -le 0 -or [string]::IsNullOrWhiteSpace($ExpectedImagePath) -or
+        [string]::IsNullOrWhiteSpace($ExpectedStartTimeUtc)) {
+        throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: native termination identity is incomplete.')
+    }
+    $api = Get-StoreNativeProcessApi
+    $handle = $api::OpenProcess(0x00101001, $false, $Pid)
+    if ($handle -eq [System.IntPtr]::Zero) {
+        $openError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($openError -eq 87) {
+            return @{ pid = $Pid; exited = $true; signalled = $false; handle = [System.IntPtr]::Zero }
+        }
+        throw [System.InvalidOperationException]::new("STORE-PROCESS-IDENTITY-UNPROVEN: process handle could not be opened for pid '$Pid' (win32 $openError).")
+    }
+    $keepHandle = $false
+    try {
+        $imagePath = ''
+        $creationFileTime = [long]0
+        if (-not $api::TryGetProcessIdentity($handle, [ref]$imagePath, [ref]$creationFileTime)) {
+            throw [System.InvalidOperationException]::new("STORE-PROCESS-IDENTITY-UNPROVEN: pinned identity could not be read for pid '$Pid'.")
+        }
+        $expectedPath = [System.IO.Path]::GetFullPath($ExpectedImagePath)
+        if (-not [string]::Equals($imagePath, $expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw [System.InvalidOperationException]::new("STORE-FOREIGN-PROCESS: pinned image path for pid '$Pid' does not match the owned process.")
+        }
+        $pinnedStart = [System.DateTime]::FromFileTimeUtc($creationFileTime).ToString('o')
+        if ($pinnedStart -cne $ExpectedStartTimeUtc) {
+            throw [System.InvalidOperationException]::new("STORE-FOREIGN-PROCESS: pinned start identity for pid '$Pid' does not match the owned process.")
+        }
+        $waitState = $api::WaitForSingleObject($handle, [uint32]0)
+        if ($waitState -eq 0) {
+            return @{ pid = $Pid; exited = $true; signalled = $false; handle = [System.IntPtr]::Zero }
+        }
+        if ($waitState -ne 258) {
+            throw [System.InvalidOperationException]::new("STORE-PROCESS-IDENTITY-UNPROVEN: pinned liveness could not be established for pid '$Pid'.")
+        }
+        if (-not $api::TerminateProcess($handle, [uint32]1)) {
+            $terminateError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $waitState = $api::WaitForSingleObject($handle, [uint32]0)
+            if ($waitState -eq 0) {
+                return @{ pid = $Pid; exited = $true; signalled = $false; handle = [System.IntPtr]::Zero }
+            }
+            throw [System.InvalidOperationException]::new("lost-response: pinned termination of pid '$Pid' was not confirmed (win32 $terminateError).")
+        }
+        $keepHandle = $true
+        return @{ pid = $Pid; exited = $false; signalled = $true; handle = $handle }
+    } finally {
+        if (-not $keepHandle) { [void]$api::CloseHandle($handle) }
+    }
+}
+
 function Test-StoreProcessOwnership {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -2382,6 +2761,9 @@ function Test-StoreProcessOwnership {
     if ($Pid -le 0) {
         throw [System.ArgumentException]::new('STORE-INVALID-PID: owned pid is not positive.')
     }
+    if ($Observation.ContainsKey('pid') -and ([int]$Observation['pid'] -ne $Pid)) {
+        throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: observed process id does not match the owned pid.')
+    }
     if ([string]::IsNullOrWhiteSpace($ExpectedImagePath) -or [string]::IsNullOrWhiteSpace($ExpectedStartTimeUtc)) {
         throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: expected process identity is incomplete.')
     }
@@ -2399,18 +2781,7 @@ function Test-StoreProcessOwnership {
     $expectedStart = [string]$ExpectedStartTimeUtc
     $observedStart = [string]$Observation['startTimeUtc']
     if ($observedStart -cne $expectedStart) {
-        $parsedExpected = [System.DateTimeOffset]::MinValue
-        $parsedObserved = [System.DateTimeOffset]::MinValue
-        try {
-            $parsedExpected = [System.DateTimeOffset]::Parse($expectedStart)
-            $parsedObserved = [System.DateTimeOffset]::Parse($observedStart)
-        } catch {
-            throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: live process start time does not match the owned start identity.')
-        }
-        $drift = [System.Math]::Abs(($parsedObserved - $parsedExpected).TotalSeconds)
-        if ($drift -gt 2) {
-            throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: live process start time does not match the owned start identity.')
-        }
+        throw [System.InvalidOperationException]::new('STORE-FOREIGN-PROCESS: live process start time does not match the owned start identity.')
     }
     return $true
 }
@@ -2421,26 +2792,80 @@ function Get-StoreOwnedDescendants {
     param(
         [Parameter(Mandatory)]
         [int]$Pid,
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$RootIdentity,
         [ValidateRange(1, 16)]
         [int]$MaxDepth = 8,
         [ValidateRange(1, 1024)]
         [int]$MaxCount = 256
     )
-    $found = New-Object Collections.Generic.List[int]
+    $found = New-Object Collections.Generic.List[hashtable]
     $complete = $true
     try {
-        $frontier = @($Pid)
+        $rootExpected = $RootIdentity
+        if ($null -eq $rootExpected) {
+            $rootProcess = $null
+            try { $rootProcess = Get-Process -Id $Pid -ErrorAction SilentlyContinue } catch { $rootProcess = $null }
+            if ($null -eq $rootProcess) {
+                throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: owned root disappeared before descendant capture.')
+            }
+            $rootExpected = Get-StoreProcessIdentity -Process $rootProcess
+        }
+        $frontier = @(@{ pid = $Pid; identity = $rootExpected })
         $depth = 0
         while ($frontier.Count -gt 0 -and $depth -lt $MaxDepth -and $found.Count -lt $MaxCount) {
             $next = @()
-            foreach ($parent in $frontier) {
+            foreach ($parentRecord in $frontier) {
+                $parent = 0
+                try { $parent = [int]$parentRecord['pid'] } catch { $parent = 0 }
+                if ($parent -le 0 -or $null -eq $parentRecord['identity'] -or $parentRecord['identity'] -isnot [hashtable]) {
+                    throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: traversal parent identity is missing.')
+                }
+                $parentExpected = $parentRecord['identity']
+                $parentBefore = $null
+                try { $parentBefore = Get-Process -Id $parent -ErrorAction SilentlyContinue } catch { $parentBefore = $null }
+                if ($null -eq $parentBefore) {
+                    throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: traversal parent exited before its child scan.')
+                }
+                $parentBeforeIdentity = Get-StoreProcessIdentity -Process $parentBefore
+                [void](Test-StoreProcessOwnership -Pid $parent -ExpectedImagePath ([string]$parentExpected['imagePath']) `
+                    -ExpectedStartTimeUtc ([string]$parentExpected['startTimeUtc']) -Observation $parentBeforeIdentity)
                 $children = @(Get-CimInstance -ClassName 'Win32_Process' -Filter ("ParentProcessId = {0}" -f $parent) -ErrorAction Stop | ForEach-Object { [int]$_.ProcessId })
                 foreach ($child in $children) {
-                    if ($child -le 0 -or $child -eq $Pid -or $found.Contains($child)) { continue }
+                    $alreadyFound = @($found | Where-Object { [int]$_['pid'] -eq $child })
+                    if ($child -le 0 -or $child -eq $Pid -or $alreadyFound.Count -gt 0) { continue }
                     if ($found.Count -ge $MaxCount) { break }
-                    [void]$found.Add($child)
-                    $next += $child
+                    $childProcess = $null
+                    try { $childProcess = Get-Process -Id $child -ErrorAction SilentlyContinue } catch { $childProcess = $null }
+                    if ($null -eq $childProcess) {
+                        throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: a descendant exited during identity capture.')
+                    }
+                    $childIdentity = Get-StoreProcessIdentity -Process $childProcess
+                    $relationship = @(Get-CimInstance -ClassName 'Win32_Process' -Filter ("ProcessId = {0}" -f $child) -ErrorAction Stop)
+                    if ($relationship.Count -ne 1 -or [int]$relationship[0].ParentProcessId -ne $parent) {
+                        throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: descendant parent changed during identity capture.')
+                    }
+                    $childAgain = $null
+                    try { $childAgain = Get-Process -Id $child -ErrorAction SilentlyContinue } catch { $childAgain = $null }
+                    if ($null -eq $childAgain) {
+                        throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: a descendant exited during identity capture.')
+                    }
+                    $childLiveIdentity = Get-StoreProcessIdentity -Process $childAgain
+                    [void](Test-StoreProcessOwnership -Pid $child -ExpectedImagePath ([string]$childIdentity['imagePath']) `
+                        -ExpectedStartTimeUtc ([string]$childIdentity['startTimeUtc']) -Observation $childLiveIdentity)
+                    $childIdentity['parentPid'] = $parent
+                    [void]$found.Add($childIdentity)
+                    $next += @{ pid = $child; identity = $childIdentity }
                 }
+                $parentAfter = $null
+                try { $parentAfter = Get-Process -Id $parent -ErrorAction SilentlyContinue } catch { $parentAfter = $null }
+                if ($null -eq $parentAfter) {
+                    throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: traversal parent exited during its child scan.')
+                }
+                $parentAfterIdentity = Get-StoreProcessIdentity -Process $parentAfter
+                [void](Test-StoreProcessOwnership -Pid $parent -ExpectedImagePath ([string]$parentExpected['imagePath']) `
+                    -ExpectedStartTimeUtc ([string]$parentExpected['startTimeUtc']) -Observation $parentAfterIdentity)
             }
             $frontier = $next
             $depth++
@@ -2449,7 +2874,7 @@ function Get-StoreOwnedDescendants {
     } catch {
         $complete = $false
     }
-    return @{ pids = @($found); complete = $complete }
+    return @{ pids = @($found | ForEach-Object { [int]$_['pid'] }); processes = @($found.ToArray()); complete = $complete }
 }
 
 function Protect-StoreRootAcl {
@@ -2624,13 +3049,16 @@ function Close-StoreJobBinding {
         return @{ jobName = $JobName; closed = $false }
     }
     $job = $Script:StoreJobHandles[$JobName]
-    [void]$Script:StoreJobHandles.Remove($JobName)
     try {
         $api = [System.Type]::GetType('EliotStoreJobApi')
         if ($null -ne $api -and $job -is [System.IntPtr] -and $job -ne [System.IntPtr]::Zero) {
-            [void]$api::CloseHandle($job)
+            if (-not $api::CloseHandle($job)) {
+                return @{ jobName = $JobName; closed = $false }
+            }
+            [void]$Script:StoreJobHandles.Remove($JobName)
+            return @{ jobName = $JobName; closed = $true }
         }
-        return @{ jobName = $JobName; closed = $true }
+        return @{ jobName = $JobName; closed = $false }
     } catch {
         return @{ jobName = $JobName; closed = $false }
     }
@@ -3216,17 +3644,14 @@ function New-StoreDefaultProcessObserver {
         } catch {
             return @{ alive = $false; pid = $pid }
         }
-        $imagePath = ''
-        try { $imagePath = [string]$proc.MainModule.FileName } catch { $imagePath = '' }
-        $startTimeUtc = ''
-        try { $startTimeUtc = $proc.StartTime.ToUniversalTime().ToString('o') } catch { $startTimeUtc = '' }
-        $tree = Get-StoreOwnedDescendants -Pid $pid
+        $identity = Get-StoreProcessIdentity -Process $proc
+        $tree = Get-StoreOwnedDescendants -Pid $pid -RootIdentity $identity
         return @{
             alive        = $true
             pid          = $pid
-            imagePath    = $imagePath
-            startTimeUtc = $startTimeUtc
-            descendants  = @($tree['pids'])
+            imagePath    = [string]$identity['imagePath']
+            startTimeUtc = [string]$identity['startTimeUtc']
+            descendants  = @($tree['processes'])
             treeComplete = [bool]$tree['complete']
         }
     }
@@ -3433,7 +3858,8 @@ function New-StoreDefaultStoreClient {
 }
 
 # Real process controller: bounded graceful phase, then exact-owned-tree
-# forced termination by verified PID only. In: {phase,pid,runId,ownedTree?}.
+# forced termination after immediate image/start-identity revalidation.
+# In: {phase,pid,runId,ownedTree}.
 function New-StoreDefaultProcessController {
     [CmdletBinding()]
     [OutputType([scriptblock])]
@@ -3464,29 +3890,41 @@ function New-StoreDefaultProcessController {
         if ($phase -cne 'graceful' -and $phase -cne 'forced') {
             throw [System.ArgumentException]::new("STORE-CONTROLLER-FAILED: unknown controller phase '$phase'.")
         }
-        $targets = @($pid)
-        if ($phase -ceq 'forced') {
-            if ($Context.ContainsKey('ownedTree') -and $null -ne $Context['ownedTree']) {
-                $listed = @()
-                foreach ($candidate in @($Context['ownedTree'])) {
-                    $candidatePid = 0
-                    try { $candidatePid = [int]$candidate } catch { $candidatePid = 0 }
-                    if ($candidatePid -gt 0 -and $listed -notcontains $candidatePid) {
-                        $listed += $candidatePid
-                    }
-                }
-                if ($listed.Count -gt 0) { $targets = $listed }
-            } else {
-                $tree = Get-StoreOwnedDescendants -Pid $pid
-                $targets = @($pid) + @($tree['pids'])
+        if (-not $Context.ContainsKey('ownedTree') -or $null -eq $Context['ownedTree']) {
+            throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: controller received no identity-bearing owned tree.')
+        }
+        $targets = @()
+        foreach ($candidate in @($Context['ownedTree'])) {
+            if ($null -eq $candidate -or $candidate -isnot [hashtable] -or
+                -not $candidate.ContainsKey('pid') -or -not $candidate.ContainsKey('imagePath') -or -not $candidate.ContainsKey('startTimeUtc')) {
+                throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: every controller target needs an image and start identity.')
+            }
+            $candidatePid = 0
+            try { $candidatePid = [int]$candidate['pid'] } catch { $candidatePid = 0 }
+            if ($candidatePid -le 0 -or [string]::IsNullOrWhiteSpace([string]$candidate['imagePath']) -or
+                [string]::IsNullOrWhiteSpace([string]$candidate['startTimeUtc'])) {
+                throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: controller target identity is incomplete.')
+            }
+            $targets += @{
+                pid          = $candidatePid
+                imagePath    = [string]$candidate['imagePath']
+                startTimeUtc = [string]$candidate['startTimeUtc']
             }
         }
+        $rootIdentity = @($targets | Where-Object { [int]$_['pid'] -eq $pid } | Select-Object -First 1)
+        if ($rootIdentity.Count -eq 0) {
+            throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: controller tree does not carry the owned root identity.')
+        }
+        $rootIdentity = $rootIdentity[0]
         if ($phase -ceq 'graceful') {
             $proc = $null
             try { $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue } catch { $proc = $null }
             if ($null -eq $proc) {
                 return @{ exited = $true; pid = $pid }
             }
+            $currentIdentity = Get-StoreProcessIdentity -Process $proc
+            [void](Test-StoreProcessOwnership -Pid $pid -ExpectedImagePath ([string]$rootIdentity['imagePath']) `
+                -ExpectedStartTimeUtc ([string]$rootIdentity['startTimeUtc']) -Observation $currentIdentity)
             try { [void]$proc.CloseMainWindow() } catch { }
             $deadline = [System.DateTime]::UtcNow.AddMilliseconds($gracefulMs)
             while ([System.DateTime]::UtcNow -lt $deadline) {
@@ -3495,12 +3933,13 @@ function New-StoreDefaultProcessController {
                 if ($null -eq $live) {
                     return @{ exited = $true; pid = $pid }
                 }
+                $liveIdentity = Get-StoreProcessIdentity -Process $live
+                [void](Test-StoreProcessOwnership -Pid $pid -ExpectedImagePath ([string]$rootIdentity['imagePath']) `
+                    -ExpectedStartTimeUtc ([string]$rootIdentity['startTimeUtc']) -Observation $liveIdentity)
                 try {
-                    if ($live.HasExited) {
-                        return @{ exited = $true; pid = $pid }
-                    }
+                    if ($live.HasExited) { return @{ exited = $true; pid = $pid } }
                 } catch {
-                    return @{ exited = $true; pid = $pid }
+                    throw [System.InvalidOperationException]::new('STORE-PROCESS-IDENTITY-UNPROVEN: root liveness could not be read during graceful stop.')
                 }
                 Start-Sleep -Milliseconds 100
             }
@@ -3509,57 +3948,55 @@ function New-StoreDefaultProcessController {
             if ($null -eq $still) {
                 return @{ exited = $true; pid = $pid }
             }
+            $stillIdentity = Get-StoreProcessIdentity -Process $still
+            [void](Test-StoreProcessOwnership -Pid $pid -ExpectedImagePath ([string]$rootIdentity['imagePath']) `
+                -ExpectedStartTimeUtc ([string]$rootIdentity['startTimeUtc']) -Observation $stillIdentity)
             return @{ exited = $false; pid = $pid }
         }
-        $signalled = New-Object Collections.Generic.List[int]
-        foreach ($target in $targets) {
-            $victim = $null
-            try { $victim = Get-Process -Id $target -ErrorAction SilentlyContinue } catch { $victim = $null }
-            if ($null -eq $victim) { continue }
-            try {
-                $exitedAlready = $false
-                try { $exitedAlready = [bool]$victim.HasExited } catch { $exitedAlready = $true }
-                if ($exitedAlready) { continue }
-                Stop-Process -Id $target -Force -ErrorAction Stop
-                [void]$signalled.Add($target)
-            } catch {
-                $gone = $null
-                try { $gone = Get-Process -Id $target -ErrorAction SilentlyContinue } catch { $gone = $null }
-                if ($null -eq $gone) { continue }
-                throw [System.InvalidOperationException]::new("lost-response: forced termination of pid '$target' has an unknown outcome: $($_.Exception.Message)")
-            }
+        if (-not $Context.ContainsKey('treeComplete') -or -not [bool]$Context['treeComplete']) {
+            throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: forced termination refused because the owned descendant closure is incomplete.')
         }
+        if (-not $Context.ContainsKey('rootObservedLive') -or $Context['rootObservedLive'] -isnot [bool]) {
+            throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: forced termination has no post-grace root liveness proof.')
+        }
+        $rootObservedLive = [bool]$Context['rootObservedLive']
+        $signalled = New-Object Collections.Generic.List[int]
+        $pendingHandles = New-Object Collections.Generic.List[hashtable]
+        $nativeApi = Get-StoreNativeProcessApi
         $forcedDeadline = [System.DateTime]::UtcNow.AddMilliseconds($forcedMs)
-        while ([System.DateTime]::UtcNow -lt $forcedDeadline) {
-            $remaining = 0
-            foreach ($target in $targets) {
-                $live = $null
-                try { $live = Get-Process -Id $target -ErrorAction SilentlyContinue } catch { $live = $null }
-                if ($null -ne $live) {
-                    try {
-                        if (-not [bool]$live.HasExited) { $remaining++ }
-                    } catch { }
+        $orderedTargets = @($targets | Where-Object { [int]$_['pid'] -ne $pid })
+        $orderedTargets += @($targets | Where-Object { [int]$_['pid'] -eq $pid } | Select-Object -First 1)
+        try {
+            foreach ($targetIdentity in $orderedTargets) {
+                if ([System.DateTime]::UtcNow -ge $forcedDeadline) {
+                    throw [System.InvalidOperationException]::new('lost-response: forced termination deadline elapsed before all owned targets were handled.')
+                }
+                $target = [int]$targetIdentity['pid']
+                $pinned = Invoke-StoreNativeTerminateByIdentity -Pid $target `
+                    -ExpectedImagePath ([string]$targetIdentity['imagePath']) `
+                    -ExpectedStartTimeUtc ([string]$targetIdentity['startTimeUtc'])
+                if ($target -eq $pid -and $rootObservedLive -and [bool]$pinned['exited']) {
+                    throw [System.InvalidOperationException]::new('STORE-DESCENDANT-CLOSURE-INCOMPLETE: owned root exited after the post-grace descendant snapshot.')
+                }
+                if (-not [bool]$pinned['exited']) {
+                    [void]$signalled.Add($target)
+                    [void]$pendingHandles.Add($pinned)
                 }
             }
-            if ($remaining -eq 0) {
-                return @{ exited = $true; pid = $pid; terminatedPids = @($signalled) }
+            foreach ($pending in $pendingHandles) {
+                $remainingMs = [int][System.Math]::Ceiling(($forcedDeadline - [System.DateTime]::UtcNow).TotalMilliseconds)
+                if ($remainingMs -lt 0) { $remainingMs = 0 }
+                $waitState = $nativeApi::WaitForSingleObject([System.IntPtr]$pending['handle'], [uint32]$remainingMs)
+                if ($waitState -ne 0) {
+                    throw [System.InvalidOperationException]::new("lost-response: termination of owned pid '$([int]$pending['pid'])' was not confirmed by its pinned process handle.")
+                }
             }
-            Start-Sleep -Milliseconds 100
-        }
-        $left = New-Object Collections.Generic.List[int]
-        foreach ($target in $targets) {
-            $live = $null
-            try { $live = Get-Process -Id $target -ErrorAction SilentlyContinue } catch { $live = $null }
-            if ($null -ne $live) {
-                try {
-                    if (-not [bool]$live.HasExited) { [void]$left.Add($target) }
-                } catch { }
+            return @{ exited = $true; pid = $pid; terminatedPids = @($signalled) }
+        } finally {
+            foreach ($pending in $pendingHandles) {
+                [void]$nativeApi::CloseHandle([System.IntPtr]$pending['handle'])
             }
         }
-        if ($left.Count -gt 0) {
-            throw [System.InvalidOperationException]::new('lost-response: forced termination timed out with owned processes still observable.')
-        }
-        return @{ exited = $true; pid = $pid; terminatedPids = @($signalled) }
     }
     return $control.GetNewClosure()
 }
@@ -3777,9 +4214,20 @@ function New-StoreProviderOperationTable {
             if ([string]$result['stopState'] -ceq 'OwnedResourcesStopped') {
                 $receipt = $args['startReceipt']
                 if ($null -ne $receipt['observed'] -and $receipt['observed'] -is [hashtable] -and $receipt['observed'].ContainsKey('jobName')) {
-                    try {
-                        [void](Close-StoreJobBinding -JobName ([string]$receipt['observed']['jobName']))
-                    } catch { }
+                    $jobName = [string]$receipt['observed']['jobName']
+                    if (-not [string]::IsNullOrWhiteSpace($jobName) -and $jobName -cne 'inherited' -and
+                        $Script:StoreJobHandles.ContainsKey($jobName)) {
+                        $closed = $null
+                        try { $closed = Close-StoreJobBinding -JobName $jobName } catch { $closed = @{ closed = $false; failure = $_.Exception.Message } }
+                        if ($null -eq $closed -or -not [bool]$closed['closed']) {
+                            $requested = $receipt['requested']
+                            $detail = 'STORE-JOB-CLOSE-UNCONFIRMED: owned process job handle did not close.'
+                            if ($null -ne $closed -and $closed.ContainsKey('failure')) { $detail += ' ' + [string]$closed['failure'] }
+                            $result = New-StoreStopReconciliationResult -Binding $binding -Requested $requested `
+                                -OwnedPid ([int]$receipt['observed']['pid']) -Forced ([bool]$result['forced']) `
+                                -RunRoot ([string]$receipt['runRoot']) -FileSystem $tableFs -RunId ([string]$binding['runId']) -Detail $detail
+                        }
+                    }
                 }
             }
             return $result

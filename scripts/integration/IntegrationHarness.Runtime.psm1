@@ -397,7 +397,7 @@ function Get-RuntimeRedactedText {
         $redacted = [regex]::Replace($redacted, '(?i)(password|passwd|secret|token|api[_-]?key|connectionstring|governorconfig)\s*[:=]\s*\S+', '$1=[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)ELIOT_GOVERNOR_CONFIG\s*=\s*\S+', 'ELIOT_GOVERNOR_CONFIG=[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)runtime_[a-z_]*(pass|secret|token|key)[a-z_]*\s*=\s*\S+', '[redacted-runtime-secret]')
-        $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environ)\s*\{[^}]{0,4096}\}', '$1 [redacted-runtime-secret]')
+        $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environ|protocol|source|model|user)\s*\{[^}]{0,4096}\}', '$1 [redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environ|protocol|source|model|user|trace|commit|branch|tag|repo|repository)\s*[:=]\s*\S+', '$1=[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)([A-Za-z]:\\(?:[^\\/:*?"<>|\s]+\\)*private(?:\\[^\\/:*?"<>|\s]*)*|/(?:[^\\/:*?"<>|\s]+/)*private(?:/[^\\/:*?"<>|\s]*)*)', '[redacted-private-path]')
         $redacted = [regex]::Replace($redacted, '(?i)[A-Za-z]:\\Users\\[^\\/:*?"<>|]+', '[redacted-user-path]')

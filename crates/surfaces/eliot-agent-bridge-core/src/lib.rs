@@ -13,9 +13,22 @@ use std::future::Future;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::pin::Pin;
 
+// The closed host-event owner (issue #228 A6). `HostEventEnvelope` is the
+// legacy quarantine wire and is admissible only because it carries one of
+// these closed, versioned, bounded observations; every consumer of the wire
+// reads its typed fields from here, never from the wire's generic JSON.
+// Re-exported as a path so downstream bridge fixtures and adapters keep one
+// import root without a second owner.
+pub use eliot_agent_api::host_event;
 pub use eliot_agent_api::{
-    AttemptId, AttemptState, EventCursor, EventId, HostEventEnvelope, HostEventKind,
-    RouteFingerprint, SessionId, TaskId, WorkUnitId,
+    AttemptId, AttemptState, ClockReading, EventCursor, EventId, HOST_EVENT_CONTRACT_VERSION,
+    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventEnvelope, HostEventKind,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventReplayDisposition,
+    LowercaseSha256, NativeSession, NativeSessionLocator, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, ProviderObservationLineage,
+    QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle, RouteFingerprint, SessionId,
+    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
+    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, WorkUnitId,
 };
 use eliot_contracts::{BridgeEventCapacityPressure, BridgeTransportBackpressure, RequestMetadata};
 pub use eliot_observation_contracts::{
@@ -796,18 +809,30 @@ pub trait McpForwardingPort {
         binding: &AttachBinding,
     ) -> Result<ReconciliationPortOutcome, ProviderFailure>;
 
-    /// Confirms process-local cursor-cache effects only after the core has
-    /// accepted the complete owner response into its recovery view.
+    /// Jointly commits the process-local cursor-cache half of one validated
+    /// reconciliation import (issue #2799).
+    ///
+    /// The core calls this after the complete owner response decoded and the
+    /// candidate recovery window applied off to the side, but before the
+    /// candidate publishes: the port prepares its ack-cache replacement from
+    /// an immutable snapshot, acquires its mutable owner once, rechecks the
+    /// attach continuity captured by the prepared import, and swaps the
+    /// replacement infallibly. No fallible work may remain after the first
+    /// live swap on either side, so the core publish that follows a success
+    /// cannot strand one half committed.
     ///
     /// Every implementation must state how it commits those effects. The
-    /// production Kernel forwarding port applies owner ack bases and only
-    /// owner-confirmed offered consumed frontiers after import; fixtures with
+    /// production Kernel forwarding port swaps the exact proposed owner ack
+    /// bases and only owner-confirmed held-sequence pruning; fixtures with
     /// no process-local cursor cache implement this as an explicit no-op.
+    /// A borrow conflict or stale continuity commits nothing and returns a
+    /// typed retry/recovery refusal; silent success after a skipped update
+    /// is forbidden on this path.
     fn reconciliation_imported(
         &mut self,
         binding: &AttachBinding,
         result: &ReconciliationPortResult,
-    );
+    ) -> Result<(), ProviderFailure>;
 
     /// Reads one bounded recovery page inside the declared window.
     ///
@@ -2142,25 +2167,40 @@ pub struct RecoveryStreamCut {
     upper_sequence: u64,
     expected_revision: u64,
     retention_floor: u64,
+    owner_incarnation: u64,
+    owner_revision: u64,
 }
 
 impl RecoveryStreamCut {
+    /// Checks one owner-issued finite cut. The stream incarnation and owner
+    /// binding revision are part of the cut (issue #2798): a continuation has
+    /// to name the exact incarnation and revision it belongs to, so a
+    /// successor stream published under the same name inside the same window
+    /// cannot be mistaken for the walk already in progress.
     #[allow(clippy::result_large_err)]
     pub fn checked(
         upper_sequence: u64,
         expected_revision: u64,
         retention_floor: u64,
+        owner_incarnation: u64,
+        owner_revision: u64,
     ) -> Result<Self, BridgeError> {
-        if expected_revision == 0 || retention_floor > upper_sequence {
+        if expected_revision == 0
+            || retention_floor > upper_sequence
+            || owner_incarnation == 0
+            || owner_revision == 0
+        {
             return Err(BridgeError::InvalidContract {
                 field: "recovery_stream.cut",
-                reason: "owner revision must be nonzero and retention floor within the finite bound",
+                reason: "owner revision, incarnation and retention floor must be nonzero and the floor within the finite bound",
             });
         }
         Ok(Self {
             upper_sequence,
             expected_revision,
             retention_floor,
+            owner_incarnation,
+            owner_revision,
         })
     }
 
@@ -2174,6 +2214,16 @@ impl RecoveryStreamCut {
 
     pub const fn retention_floor(self) -> u64 {
         self.retention_floor
+    }
+
+    /// The stream incarnation this cut was taken at.
+    pub const fn owner_incarnation(self) -> u64 {
+        self.owner_incarnation
+    }
+
+    /// The owner binding revision this cut was taken at.
+    pub const fn owner_revision(self) -> u64 {
+        self.owner_revision
     }
 }
 
@@ -3425,8 +3475,13 @@ impl AgentBridgeCore {
             }
         };
         let permit = ReconciliationPermit::seal(result.clone())?;
+        // Prepare the complete import off to the side: authority checks and
+        // the isolated candidate window. A malformed or contradictory later
+        // stream/gap cannot leave earlier facts from this same page applied
+        // to the live window, and no live state moves before the joint
+        // commit below.
         {
-            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+            let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
             if active.binding != binding {
                 return Err(BridgeError::StaleAuthority);
             }
@@ -3439,23 +3494,32 @@ impl AgentBridgeCore {
                 return Err(BridgeError::StaleAuthority);
             }
             validate_text(permit.receipt_ref.as_str(), "reconciliation_receipt_ref")?;
-            if let Some(window) = permit.window.as_deref() {
-                // Validate and merge into an isolated candidate. A malformed
-                // or contradictory later stream/gap cannot leave earlier
-                // facts from this same page applied to the live window.
-                let mut candidate = active.recovery.clone();
-                let disposition =
-                    Self::apply_recovery_window(&active.binding, &mut candidate, window)?;
-                active.recovery = candidate;
-                if reconciliation_required && disposition == RecoveryDisposition::Complete {
-                    active.reconciliation_required = false;
-                }
-            }
         }
-        // The production adapter commits its process-local ack/frontier cache
-        // only after the checked window is now the live core state.
-        if result.window().is_some() {
-            self.forwarder()?.reconciliation_imported(&binding, &result);
+        let prepared = if let Some(window) = permit.window.as_deref() {
+            let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
+            let mut candidate = active.recovery.clone();
+            let disposition = Self::apply_recovery_window(&active.binding, &mut candidate, window)?;
+            Some((candidate, disposition))
+        } else {
+            None
+        };
+        // Joint commit (issue #2799): the production adapter swaps its
+        // process-local ack-cache replacement first; only then does the core
+        // window publish below through infallible field moves. A borrow
+        // conflict or stale continuity fails here with both halves
+        // untouched. Reversing this order would strand a published core
+        // window next to an uncommitted transport cache.
+        if prepared.is_some() {
+            self.forwarder()?
+                .reconciliation_imported(&binding, &result)
+                .map_err(BridgeError::from_forwarding_failure)?;
+        }
+        if let Some((candidate, disposition)) = prepared {
+            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+            active.recovery = candidate;
+            if reconciliation_required && disposition == RecoveryDisposition::Complete {
+                active.reconciliation_required = false;
+            }
         }
         self.attach_view().ok_or(BridgeError::NotAttached)
     }
@@ -3502,8 +3566,11 @@ impl AgentBridgeCore {
             }
         };
         let permit = ReconciliationPermit::seal(result.clone())?;
-        {
-            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+        // See the initial page path above: stage the entire continuation
+        // off to the side before publishing any fact or committing its
+        // ack-cache half. No live state moves in this block.
+        let prepared = {
+            let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
             if active.binding != binding {
                 return Err(BridgeError::StaleAuthority);
             }
@@ -3522,16 +3589,23 @@ impl AgentBridgeCore {
                 .ok_or(BridgeError::InvalidTransition(
                     "bounded recovery continuation requires a windowed owner answer",
                 ))?;
-            // See the initial page path above: stage the entire continuation
-            // before publishing any fact or acknowledging its consumed offer.
             let mut candidate = active.recovery.clone();
             let disposition = Self::apply_recovery_window(&active.binding, &mut candidate, window)?;
-            active.recovery = candidate;
-            if disposition == RecoveryDisposition::Complete {
+            (candidate, disposition)
+        };
+        // Joint commit (issue #2799): the transport half swaps first; the
+        // core half below publishes through infallible field moves, so a
+        // failure here leaves both halves untouched.
+        self.forwarder()?
+            .reconciliation_imported(&binding, &result)
+            .map_err(BridgeError::from_forwarding_failure)?;
+        {
+            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+            active.recovery = prepared.0;
+            if prepared.1 == RecoveryDisposition::Complete {
                 active.reconciliation_required = false;
             }
         }
-        self.forwarder()?.reconciliation_imported(&binding, &result);
         self.recovery_view().ok_or(BridgeError::NotAttached)
     }
 
@@ -3892,7 +3966,23 @@ impl AgentBridgeCore {
     /// forwarding failure still leaves immutable diagnostic history. Error
     /// events are additionally cited in `error_event_refs` without
     /// affecting any other field.
+    ///
+    /// #228 A6: the citation is taken from the closed, versioned, bounded
+    /// normalized observation the wire carries, validated by its owner
+    /// (`HostEventEnvelope::normalized`) and never from the host-chosen
+    /// `HostEventKind` or the wire's generic `normalized_payload`. The core
+    /// holds no #361 provider-execution binding and no #369 admitted-route
+    /// receipt, so the only admissible lineage is a session observation: a
+    /// wire carrying an execution-unit payload fails closed here instead of
+    /// driving a terminal-reduction input on its own framing. The only
+    /// error-class typed observation such a wire can carry is a provider
+    /// event the owner quarantined instead of normalizing
+    /// ([`NormalizedHostEventPayload::UnsupportedQuarantined`]), so that is
+    /// the only citation this path can make.
     fn observe_host_event(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
+        let normalized = event
+            .normalized()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         if let Some(previous) = self.host_journal.last()
             && event.sequence <= previous.sequence
         {
@@ -3904,9 +3994,12 @@ impl AgentBridgeCore {
             self.host_journal.remove(0);
             self.terminal_coverage = self.terminal_coverage.mark_incomplete_coverage();
         }
-        if event.kind == HostEventKind::Error {
+        if matches!(
+            normalized.payload,
+            NormalizedHostEventPayload::UnsupportedQuarantined(_)
+        ) {
             self.error_event_refs
-                .push(event.event_id.as_str().to_owned());
+                .push(normalized.event_id.as_str().to_owned());
         }
         self.host_journal.push(event.clone());
         Ok(())

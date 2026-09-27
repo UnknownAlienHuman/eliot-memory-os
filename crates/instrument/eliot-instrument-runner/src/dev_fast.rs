@@ -29,7 +29,9 @@ pub const DEV_FAST_PROFILE: &str = "dev-fast";
 pub const DEV_FAST_PROFILE_REVISION: u64 = 1;
 /// First-slice completeness label: partial until every retained I18.6
 /// obligation (live discovery dispatch, frozen selection execution,
-/// admitted evidence persistence) is present.
+/// admitted evidence persistence) is present. Final disposition already
+/// binds the complete candidate/configuration identity, so this label
+/// records the remaining assembly obligations, not an unbound identity.
 pub const DEV_FAST_SLICE_PARTIAL: &str = "partial:first-slice";
 /// Discovery stage: source-bound nextest inventory (I18.6 step 3).
 pub const DEV_FAST_STAGE_LIST: &str = "nextest-list";
@@ -46,7 +48,7 @@ pub const DEV_FAST_STAGE_RUSTFMT: &str = "rustfmt-check";
 pub const DEV_FAST_FIRST_PACKAGE: &str = "eliot-test-selection";
 /// Version of the persisted `VerificationProfileRun` semantics (I18.6 step
 /// 9).
-pub const VERIFICATION_PROFILE_RUN_VERSION: &str = "eliot-verification-profile-run-v1";
+pub const VERIFICATION_PROFILE_RUN_VERSION: &str = "eliot-verification-profile-run-v2";
 
 /// Failures raised while binding, freezing, or aggregating `dev-fast`.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -70,11 +72,14 @@ pub enum DevFastError {
         field: &'static str,
     },
     /// The candidate identity drifted after the selection froze.
-    #[error("candidate drift: selection is frozen for '{expected}', not '{observed}'")]
+    #[error("candidate drift: {coordinate} is frozen as '{expected}', not '{observed}'")]
     CandidateDrift {
-        /// Frozen candidate.
+        /// Coordinate that drifted (`candidate` revision or
+        /// `candidate_identity` complete build configuration).
+        coordinate: &'static str,
+        /// Frozen value of that coordinate.
         expected: String,
-        /// Observed candidate.
+        /// Observed value of that coordinate.
         observed: String,
     },
     /// An expected-nonzero selection executed zero tests.
@@ -232,6 +237,11 @@ impl DevFastCandidate {
     }
 
     /// Deterministic identity over every bound field.
+    ///
+    /// This is the single complete candidate/configuration identity: it is
+    /// the value frozen in [`FrozenSelection`], quoted by
+    /// [`TestSelectionReceipt`], and compared against the observed identity
+    /// at final disposition. It is not a second fingerprint scheme.
     pub fn digest(&self) -> String {
         let material = format!(
             "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
@@ -671,9 +681,14 @@ pub fn check_zero_execution(expected: u64, executed: u64) -> Result<(), DevFastE
 /// `Ready` or exact `Empty` (never `WidenedTier` or `Incomplete`), the
 /// receipt's selected and omitted rows match that frozen selection, its
 /// coverage is complete, its expected and observed execution counts match,
-/// and the observed candidate equals the frozen candidate. A substituted
-/// executable, changed candidate, missing mandatory stage, unmatched
-/// output, or incomplete cleanup never returns Pass.
+/// the observed candidate revision equals the frozen revision, and the
+/// observed complete candidate/configuration identity
+/// ([`DevFastCandidate::digest`]) equals the identity frozen in the
+/// selection, quoted by the receipt, and bound to the execution aggregate.
+/// The same source commit verified under a different target triple, feature
+/// set, or configuration is a different verification result and is refused
+/// here. A substituted executable, changed candidate, missing mandatory
+/// stage, unmatched output, or incomplete cleanup never returns Pass.
 pub fn dev_fast_disposition(
     aggregate: &ProfileAggregate,
     receipt: &TestSelectionReceipt,
@@ -746,8 +761,31 @@ pub fn dev_fast_disposition(
     }
     if candidate.candidate != frozen.candidate || candidate.candidate != receipt.candidate {
         return Err(DevFastError::CandidateDrift {
+            coordinate: "candidate",
             expected: frozen.candidate.clone(),
             observed: candidate.candidate.clone(),
+        });
+    }
+    // The bare revision is not the verification identity: the same source
+    // commit built for another target triple, feature set, or configuration
+    // is a different result. Bind the observed complete identity to the one
+    // frozen in the selection, quoted by the receipt, and bound to the
+    // aggregate that retains the stage executions.
+    let observed_identity = candidate.digest();
+    if aggregate.candidate_identity.as_deref() != Some(observed_identity.as_str()) {
+        return Err(DevFastError::CandidateDrift {
+            coordinate: "candidate_identity",
+            expected: aggregate.candidate_identity.clone().unwrap_or_default(),
+            observed: observed_identity,
+        });
+    }
+    if observed_identity != frozen.candidate_identity
+        || observed_identity != receipt.candidate_identity
+    {
+        return Err(DevFastError::CandidateDrift {
+            coordinate: "candidate_identity",
+            expected: frozen.candidate_identity.clone(),
+            observed: observed_identity,
         });
     }
     check_zero_execution(receipt.expected_count, receipt.executed_count)?;
@@ -784,14 +822,21 @@ pub fn dev_fast_registry(
 /// expands its deterministic stage plan (issue #1802 step 7).
 ///
 /// Every caller — local verify, agent verifier requests, wrappers, CI,
-/// `FinishService` — reaches the same revision, digests, and stage sequence
-/// through this one function; there is no second admission path. The
-/// executing composition root supplies the [`StageLauncher`](crate::profile_run::StageLauncher)
-/// that turns the plan into launches.
-pub fn dev_fast_caller_plan(registry: &InstrumentRegistry) -> Result<StagePlan, DevFastError> {
+/// `FinishService` — reaches the same revision, candidate identity, digests,
+/// and stage sequence through this one function; there is no second
+/// admission path. The executing composition root supplies the
+/// [`StageLauncher`](crate::profile_run::StageLauncher) that turns the plan
+/// into launches.
+pub fn dev_fast_caller_plan(
+    registry: &InstrumentRegistry,
+    candidate: &DevFastCandidate,
+) -> Result<StagePlan, DevFastError> {
     let compiler = ProfileCompiler::new(registry);
     let admitted = compiler.compile(DEV_FAST_PROFILE).admitted()?.clone();
-    Ok(StageOrchestrator::plan(&admitted))
+    let mut plan = StageOrchestrator::plan(&admitted);
+    plan.bind_candidate_identity(candidate.digest())
+        .map_err(|error| DevFastError::Admission(error.to_string()))?;
+    Ok(plan)
 }
 
 /// One persisted dev-fast profile run bound to its aggregate, receipt,
@@ -806,11 +851,14 @@ pub fn dev_fast_caller_plan(registry: &InstrumentRegistry) -> Result<StagePlan, 
 pub struct VerificationProfileRun {
     /// Record semantics version.
     pub version: String,
-    /// Deterministic run identity over candidate, profile revision,
-    /// aggregate digest, and receipt digest.
+    /// Deterministic run identity over candidate/configuration identity,
+    /// profile revision, aggregate digest, and receipt digest.
     pub run_id: String,
     /// Candidate the run is bound to.
     pub candidate: String,
+    /// Complete candidate/configuration identity from the validated
+    /// [`TestSelectionReceipt`], produced by [`DevFastCandidate::digest`].
+    pub candidate_identity: String,
     /// Admitted profile name.
     pub profile: String,
     /// Exact admitted profile revision.
@@ -830,19 +878,22 @@ pub struct VerificationProfileRun {
 }
 
 impl VerificationProfileRun {
-    /// Assembles one profile run over an aggregate and its receipt.
+    /// Assembles one profile run over a candidate, aggregate, and receipt.
     ///
-    /// The aggregate must be the admitted dev-fast revision and the receipt
-    /// must bind the aggregate digests and the candidate; persistence never
-    /// upgrades a failed aggregate into a pass.
+    /// The aggregate must be the admitted dev-fast revision and retain the
+    /// complete identity computed by [`DevFastCandidate::digest`]. The
+    /// validated receipt must bind its profile digests, candidate revision,
+    /// and that same identity; a receipt or aggregate for another
+    /// configuration at the same source revision is refused. Persistence
+    /// never upgrades a failed aggregate into a pass.
     pub fn assemble(
-        candidate: &str,
+        candidate: &DevFastCandidate,
         aggregate: &ProfileAggregate,
         receipt: &TestSelectionReceipt,
         raw_refs: Vec<String>,
         slice: &str,
     ) -> Result<Self, DevFastError> {
-        validate_text(candidate, "candidate")?;
+        validate_text(&candidate.candidate, "candidate")?;
         validate_text(slice, "slice")?;
         for raw in &raw_refs {
             validate_text(raw, "raw_refs")?;
@@ -856,27 +907,33 @@ impl VerificationProfileRun {
         receipt
             .validate()
             .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))?;
+        let candidate_identity = candidate.digest();
         if receipt.profile != DEV_FAST_PROFILE
             || receipt.profile_revision != DEV_FAST_PROFILE_REVISION
             || receipt.profile_digest != aggregate.profile_digest
             || receipt.dag_digest != aggregate.dag_digest
-            || receipt.candidate != candidate
+            || aggregate.candidate_identity.as_deref() != Some(candidate_identity.as_str())
+            || receipt.candidate != candidate.candidate
+            || receipt.candidate_identity != candidate_identity
         {
             return Err(DevFastError::ReceiptMismatch(
-                "receipt does not bind the aggregated dev-fast candidate and revision".to_owned(),
+                "aggregate and receipt do not bind the dev-fast candidate, configuration, and revision"
+                    .to_owned(),
             ));
         }
         let run_id = profile_run_id(
-            candidate,
+            &candidate.candidate,
             DEV_FAST_PROFILE,
             DEV_FAST_PROFILE_REVISION,
             &aggregate.aggregate_digest,
             &receipt.receipt_digest,
+            &candidate_identity,
         );
         let mut record = Self {
             version: VERIFICATION_PROFILE_RUN_VERSION.to_owned(),
             run_id,
-            candidate: candidate.to_owned(),
+            candidate: candidate.candidate.clone(),
+            candidate_identity: receipt.candidate_identity.clone(),
             profile: DEV_FAST_PROFILE.to_owned(),
             profile_revision: DEV_FAST_PROFILE_REVISION,
             aggregate_digest: aggregate.aggregate_digest.clone(),
@@ -893,10 +950,11 @@ impl VerificationProfileRun {
     /// Computes the digest binding every record field.
     fn compute_digest(&self) -> String {
         let material = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}",
             self.version,
             self.run_id,
             self.candidate,
+            self.candidate_identity,
             self.profile,
             self.profile_revision,
             self.aggregate_digest,
@@ -912,30 +970,46 @@ impl VerificationProfileRun {
     /// rerunning effects.
     ///
     /// The expected run identity is recomputed deterministically from the
-    /// retained candidate, aggregate, and receipt: when it names this exact
-    /// record, the caller reuses the retained record as the answer. A
-    /// renamed candidate, a different aggregate, or a rebound receipt fails
-    /// here instead of reconstructing an answer by rerunning build/test
-    /// effects.
+    /// retained candidate/configuration identity, aggregate, and receipt:
+    /// when it names this exact record, the caller reuses the retained record
+    /// as the answer. A renamed candidate, changed configuration, different
+    /// aggregate, or rebound receipt fails here instead of reconstructing an
+    /// answer by rerunning build/test effects.
     pub fn resolve_lost_ack(
         &self,
-        candidate: &str,
+        candidate: &DevFastCandidate,
         aggregate: &ProfileAggregate,
         receipt: &TestSelectionReceipt,
     ) -> Result<(), DevFastError> {
         receipt
             .validate()
             .map_err(|error| DevFastError::ReceiptMismatch(error.to_string()))?;
+        let candidate_identity = candidate.digest();
         let expected = profile_run_id(
-            candidate,
+            &candidate.candidate,
             &aggregate.profile,
             aggregate.revision,
             &aggregate.aggregate_digest,
             &receipt.receipt_digest,
+            &candidate_identity,
         );
-        if expected != self.run_id
-            || candidate != self.candidate
+        if self.version != VERIFICATION_PROFILE_RUN_VERSION
+            || aggregate.profile != DEV_FAST_PROFILE
+            || aggregate.revision != DEV_FAST_PROFILE_REVISION
+            || expected != self.run_id
+            || candidate.candidate != self.candidate
+            || candidate_identity != self.candidate_identity
+            || receipt.candidate != self.candidate
+            || receipt.candidate_identity != self.candidate_identity
+            || aggregate.candidate_identity.as_deref() != Some(self.candidate_identity.as_str())
+            || aggregate.profile != self.profile
+            || aggregate.revision != self.profile_revision
             || aggregate.aggregate_digest != self.aggregate_digest
+            || aggregate.status != self.status
+            || receipt.profile != self.profile
+            || receipt.profile_revision != self.profile_revision
+            || receipt.profile_digest != aggregate.profile_digest
+            || receipt.dag_digest != aggregate.dag_digest
             || receipt.receipt_digest != self.receipt_digest
             || self.compute_digest() != self.run_digest
         {
@@ -947,17 +1021,21 @@ impl VerificationProfileRun {
     }
 }
 
-/// Deterministic profile-run identity over candidate, profile revision,
-/// aggregate digest, and receipt digest.
+/// Deterministic profile-run identity over candidate/configuration identity,
+/// profile revision, aggregate digest, and receipt digest.
 fn profile_run_id(
     candidate: &str,
     profile: &str,
     revision: u64,
     aggregate_digest: &str,
     receipt_digest: &str,
+    candidate_identity: &str,
 ) -> String {
     sha256_hex(
-        format!("{candidate}\0{profile}\0{revision}\0{aggregate_digest}\0{receipt_digest}")
-            .as_bytes(),
+        format!(
+            "{candidate}\0{profile}\0{revision}\0{aggregate_digest}\0{receipt_digest}\0\
+             {candidate_identity}"
+        )
+        .as_bytes(),
     )
 }

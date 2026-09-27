@@ -146,9 +146,104 @@ impl CapabilityReadiness {
     /// never of `READY` alone.
     #[must_use]
     pub fn is_advertised_as_current(&self, health: ProcessHealthVector) -> bool {
-        self.required_dimensions
+        self.project_health(health).is_current()
+    }
+
+    /// Publishes this capability's own seven-dimension result for one observed
+    /// health vector.
+    ///
+    /// I1.10: a component is `READY` only for the capabilities whose required
+    /// dimensions pass. This evaluates each *declared* requirement against the
+    /// observed [`HealthDimension`] and records the exact failing dimensions, so
+    /// the decision is a per-capability result over the real dimension outcomes
+    /// and never a summary flag, and a process that is alive but not fresh
+    /// reports a visible stale/not-fresh condition instead of silently
+    /// advertising a current capability.
+    #[must_use]
+    pub fn project_health(&self, health: ProcessHealthVector) -> CapabilityHealth {
+        let required: Vec<HealthDimensionOutcome> = self
+            .required_dimensions
             .iter()
-            .all(|kind| matches!(health.dimension(*kind), HealthDimension::Healthy))
+            .map(|kind| HealthDimensionOutcome {
+                dimension: *kind,
+                observed: health.dimension(*kind),
+            })
+            .collect();
+        let failing: Vec<HealthDimensionKind> = required
+            .iter()
+            .filter(|outcome| !matches!(outcome.observed, HealthDimension::Healthy))
+            .map(|outcome| outcome.dimension)
+            .collect();
+        CapabilityHealth {
+            capability: self.capability.clone(),
+            required,
+            failing,
+        }
+    }
+}
+
+/// One independently observed health dimension result for a declared capability.
+///
+/// The dimension name and its observed value are kept as separate fields so a
+/// consumer can publish the vector itself; no dimension can be inferred from a
+/// peer dimension or collapsed into one summary value.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthDimensionOutcome {
+    /// Which of the seven I1.10 dimensions this result is for.
+    pub dimension: HealthDimensionKind,
+    /// The independently observed value of that dimension.
+    pub observed: HealthDimension,
+}
+
+/// The published, capability-scoped health result for one capability.
+///
+/// `required` carries every declared dimension with its own observed value and
+/// `failing` names exactly the ones that are not `HEALTHY`. A capability is
+/// current only when `failing` is empty; an alive process whose `FRESHNESS`
+/// dimension is not healthy therefore publishes an explicit failing-dimension
+/// list rather than quietly dropping the capability.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityHealth {
+    capability: String,
+    required: Vec<HealthDimensionOutcome>,
+    failing: Vec<HealthDimensionKind>,
+}
+
+impl CapabilityHealth {
+    /// Returns the capability identity this result is scoped to.
+    #[must_use]
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+
+    /// Returns every declared dimension with its own observed value.
+    #[must_use]
+    pub fn required(&self) -> &[HealthDimensionOutcome] {
+        &self.required
+    }
+
+    /// Returns exactly the required dimensions that are not `HEALTHY`.
+    #[must_use]
+    pub fn failing(&self) -> &[HealthDimensionKind] {
+        &self.failing
+    }
+
+    /// Returns true only when no required dimension is unassessed or failing.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.failing.is_empty()
+    }
+
+    /// Returns true when freshness is one of the required dimensions and is
+    /// not healthy, i.e. the visible stale/not-fresh condition from I1.10.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.required().iter().any(|outcome| {
+            matches!(outcome.dimension, HealthDimensionKind::Freshness)
+                && !matches!(outcome.observed, HealthDimension::Healthy)
+        })
     }
 }
 
@@ -248,6 +343,18 @@ impl ProcessHealthStatus {
     #[must_use]
     pub fn capability_is_current(&self, readiness: &CapabilityReadiness) -> bool {
         readiness.is_advertised_as_current(self.health)
+    }
+
+    /// Publishes one capability's own seven-dimension health result against
+    /// this process observation.
+    ///
+    /// The process lifecycle state and the generation/cutover machines are not
+    /// consulted: the result is a decision over the observed health dimensions
+    /// alone, so a live process whose graph is stale publishes a visible
+    /// not-fresh capability instead of a current one.
+    #[must_use]
+    pub fn capability_health(&self, readiness: &CapabilityReadiness) -> CapabilityHealth {
+        readiness.project_health(self.health)
     }
 }
 

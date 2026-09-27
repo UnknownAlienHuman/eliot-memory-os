@@ -737,6 +737,7 @@ pub(crate) trait ProcessStartPorts {
         &self,
         owner: &ProcessOwnerBinding,
         request: Self::Request,
+        outer_binding: Option<&HostKernelCandidateBinding>,
     ) -> Result<Self::Receipt, ProcessExecutionError>;
     fn persist_completed(
         &self,
@@ -1060,6 +1061,7 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         admission: ProcessExecutionAdmissionRequest,
         path_proof: ProcessPathProof,
+        outer_binding: HostKernelCandidateBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): admitted-launch boundary. Reservation,
         // replay, fence, and executor handoff stay inside
@@ -1067,7 +1069,15 @@ impl ProcessExecutionGateway {
         // start, and an `UnknownOutcome` (possible launch/response loss)
         // keeps its unknown code instead of a committed-start claim.
         observe_process("kernel.process.start_requested", "attempt");
-        match run_process_start(self, owner, admission, path_proof).await {
+        match Box::pin(run_process_start(
+            self,
+            owner,
+            admission,
+            path_proof,
+            Some(outer_binding),
+        ))
+        .await
+        {
             Ok(receipt) => {
                 observe_process("kernel.process.start_committed", "success");
                 Ok(receipt)
@@ -1409,6 +1419,7 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
     owner: &ProcessOwnerBinding,
     admission: ProcessExecutionAdmissionRequest,
     path_proof: P::PathProof,
+    outer_binding: Option<HostKernelCandidateBinding>,
 ) -> Result<P::Receipt, ProcessExecutionError> {
     admission.validate()?;
     ports.validate_path(&admission, &path_proof)?;
@@ -1541,7 +1552,7 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             });
         }
     };
-    let receipt = match ports.execute(owner, request).await {
+    let receipt = match ports.execute(owner, request, outer_binding.as_ref()).await {
         Ok(receipt) => receipt,
         Err(error) => {
             drop(context_guard);
@@ -1746,6 +1757,7 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         &self,
         owner: &ProcessOwnerBinding,
         request: Self::Request,
+        outer_binding: Option<&HostKernelCandidateBinding>,
     ) -> Result<Self::Receipt, ProcessExecutionError> {
         // CHILD-1 (#1918): register the descendant before the executor
         // handoff. A poisoned or conflicting registry refuses the launch: an
@@ -1765,23 +1777,55 @@ impl ProcessStartPorts for ProcessExecutionGateway {
             })?
             .register(registration)
             .map_err(ProcessExecutionError::Contract)?;
-        let started = self
-            .executor
-            .start(
-                request,
-                // Issue #269: the recovery sink wraps the evidence sink, so one
-                // executor handoff retains both the process-evidence record and
-                // the per-stream recovery projection for the same observation.
-                Arc::new(OrsProcessStreamRecoverySink {
-                    store: Arc::clone(&self.evidence_store),
-                    owner: owner.clone(),
-                    evidence: Arc::new(OrsProcessEvidenceSink {
-                        store: Arc::clone(&self.evidence_store),
-                        owner: owner.clone(),
-                    }),
-                }),
-            )
-            .await;
+        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(OrsProcessStreamRecoverySink {
+            store: Arc::clone(&self.evidence_store),
+            owner: owner.clone(),
+            evidence: Arc::new(OrsProcessEvidenceSink {
+                store: Arc::clone(&self.evidence_store),
+                owner: owner.clone(),
+            }),
+        });
+        #[cfg(windows)]
+        let started = match outer_binding {
+            Some(candidate) => {
+                let binding: Result<RecoverableJobBinding, ProcessExecutionError> =
+                    serde_json::to_value(&candidate.job_binding)
+                        .map_err(|_| {
+                            ProcessExecutionError::Unavailable(
+                                "Host Kernel Job binding cannot be encoded".to_owned(),
+                            )
+                        })
+                        .and_then(|value| {
+                            serde_json::from_value(value).map_err(|_| {
+                                ProcessExecutionError::Unavailable(
+                                    "Host Kernel Job binding is malformed".to_owned(),
+                                )
+                            })
+                        });
+                match binding {
+                    Ok(binding)
+                        if binding.job_identity().name() == candidate.job_object_id.as_str() =>
+                    {
+                        self.executor
+                            .start_with_kernel_outer_job_binding(request, sink, binding)
+                    }
+                    Ok(_) => Err(ProcessExecutionError::Contract(
+                        eliot_process::ContractError::DispatchBindingMismatch,
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            None => Err(ProcessExecutionError::Unavailable(
+                "current Host Kernel Job binding is required for Kernel child launch".to_owned(),
+            )),
+        };
+        #[cfg(not(windows))]
+        let started = {
+            let _ = (request, sink, outer_binding);
+            Err(ProcessExecutionError::Unavailable(
+                "Windows process launch is unavailable on this platform".to_owned(),
+            ))
+        };
         match started {
             Ok(receipt) => Ok(receipt),
             Err(error) => {
@@ -1900,12 +1944,12 @@ impl KernelComposition {
     pub(crate) fn reject_process_start_without_material_coverage(
         &self,
         admission: &eliot_process::ProcessExecutionAdmissionRequest,
-    ) -> Option<eliot_kernel_service::ProcessExecutionRejection> {
+    ) -> Result<HostKernelCandidateBinding, eliot_kernel_service::ProcessExecutionRejection> {
         match self.admit_material_process_start(admission) {
-            Ok(()) => None,
+            Ok(candidate) => Ok(candidate),
             Err(error) => {
                 observe_process("kernel.process.request_rejected", "watchdog_coverage");
-                Some(eliot_kernel_service::ProcessExecutionRejection {
+                Err(eliot_kernel_service::ProcessExecutionRejection {
                     code: eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
                         .to_owned(),
                     detail: error.to_string().chars().take(512).collect(),
@@ -1993,11 +2037,11 @@ impl KernelComposition {
             ProcessExecutionRequest::Start(admission) => {
                 // Material/Critical process start is fail-closed on the exact
                 // target fence before any external effect owner is entered.
-                if let Some(rejection) =
-                    self.reject_process_start_without_material_coverage(&admission)
-                {
-                    return ProcessExecutionResponse::Rejected(rejection);
-                }
+                let outer_binding =
+                    match self.reject_process_start_without_material_coverage(&admission) {
+                        Ok(outer_binding) => outer_binding,
+                        Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
+                    };
                 let proof = match self.retain_process_path_proof(&admission) {
                     Ok(proof) => proof,
                     Err(error) => {
@@ -2008,7 +2052,7 @@ impl KernelComposition {
                     }
                 };
                 gateway
-                    .start(&owner, admission, proof)
+                    .start(&owner, admission, proof, outer_binding)
                     .await
                     .map(ProcessExecutionResponse::Started)
             }

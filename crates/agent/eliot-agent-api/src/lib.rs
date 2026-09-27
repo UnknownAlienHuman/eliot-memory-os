@@ -752,9 +752,9 @@ impl CancelRequest {
 /// capability consumers. New producers and consumers use the closed,
 /// versioned owner in [`host_event::NormalizedHostEventEnvelope`]
 /// (`eliot-agent-api/host-event-v7`); old wires never deserialize as that
-/// schema. This enum and [`HostEventEnvelope`] are intentionally untouched
-/// (no rename, no Serde change) so existing codex/bridge consumers keep
-/// compiling.
+/// schema. This enum and [`HostEventEnvelope`] keep their names and no Serde
+/// change was made to the payload member, so existing codex/bridge consumers
+/// keep compiling.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostEventKind {
@@ -775,11 +775,22 @@ pub enum HostEventKind {
 }
 
 /// Legacy host-event wire retained as the quarantine boundary (issue #371,
-/// T4 S6). Intentionally untouched: no rename, no Serde change, so existing
-/// codex/bridge consumers keep compiling. New observations use
-/// [`host_event::NormalizedHostEventEnvelope`]; a legacy wire carrying
-/// `normalized_payload: serde_json::Value` never deserializes as that closed
-/// schema.
+/// T4 S6, hardened by #228 A6). The generic `normalized_payload:
+/// serde_json::Value` member stays on the wire as raw quarantine evidence and
+/// is never itself a policy input, but the wire may drive policy, authority,
+/// reactive-injection, or terminal-reduction logic only through the closed,
+/// versioned owner it carries in `normalized`.
+///
+/// `normalized` is required on the wire and is never defaulted: a legacy wire
+/// that carries no typed normalization does not deserialize at all, so no host
+/// can drive a sink with untyped JSON alone. [`Self::validate`] and
+/// [`Self::normalized`] both run the existing owner's
+/// [`host_event::validate_legacy_carry`], which validates the closed envelope
+/// (schema version, identities, adapter binding, causal predecessors, payload
+/// kind, raw-source handle/digest, normalization receipt with its recomputed
+/// output digest, loss/privacy/ceiling invariants, clock, and lineage) and
+/// requires the wire's `event_id`/`cursor`/`sequence` to equal the normalized
+/// observation's by value.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostEventEnvelope {
@@ -799,9 +810,22 @@ pub struct HostEventEnvelope {
     /// (see [`ProviderObservationLineage::attributable_binding`]).
     #[serde(default)]
     pub lineage: Option<ProviderObservationLineage>,
+    /// The closed, versioned, bounded ELIOT-owned normalized observation this
+    /// wire carries. Required, never defaulted, and validated by the existing
+    /// owner before any sink reads this envelope (see
+    /// [`host_event::validate_legacy_carry`]).
+    pub normalized: host_event::NormalizedHostEventEnvelope,
 }
 
 impl HostEventEnvelope {
+    /// Validates the legacy wire's own framing and its required binding to the
+    /// closed normalized observation it carries.
+    ///
+    /// The generic `normalized_payload` is never interpreted here: it stays
+    /// raw quarantine evidence. Admission to a policy, authority,
+    /// reactive-injection, or terminal-reduction sink comes from
+    /// [`Self::normalized`], which is this envelope's only typed, versioned,
+    /// bounded, owner-validated view of the observation.
     pub fn validate(&self) -> Result<(), ContractError> {
         self.route.validate()?;
         if self.sequence == 0 {
@@ -815,7 +839,18 @@ impl HostEventEnvelope {
                 return Err(ContractError::EmptyField(field));
             }
         }
+        self.normalized()?;
         Ok(())
+    }
+
+    /// Returns the closed, owner-validated normalized observation this wire
+    /// carries.
+    ///
+    /// Fails closed when the carried observation does not validate, so a
+    /// consumer reads typed fields from the closed owner instead of from this
+    /// wire's generic JSON or its host-chosen `kind`.
+    pub fn normalized(&self) -> Result<&host_event::NormalizedHostEventEnvelope, ContractError> {
+        host_event::validate_legacy_carry(self)
     }
 }
 

@@ -49,6 +49,7 @@ fn launch_environment(
         (
             Path::new(r"C:\\ProgramData\\Eliot"),
             Path::new(r"C:\\ProgramData\\Eliot\\kernel\\state"),
+            Path::new(r"C:\\ProgramData\\Eliot\\watchdog"),
             &roots_digest,
         )
     });

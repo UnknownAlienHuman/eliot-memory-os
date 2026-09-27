@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_authority::{
     AuthorityError, CrossRootQuarantineEvidence, GrantGraphRecoverySnapshot,
-    RevocationHistoryEvidence, VerifiedQuarantineBinding,
+    QuarantineEnforcementRef, RevocationHistoryEvidence, VerifiedQuarantineBinding,
 };
 use eliot_contracts::StateFence;
 use eliot_receipts::{GrantClosureDeclaration, ReceiptIdentity};
@@ -71,7 +71,13 @@ use crate::introduction_lifecycle::IntroductionHydration;
 ///   identities keyed by the immutable ORS closure operation identity;
 /// - `quarantine_evidence` are the typed owner quarantine evidence records
 ///   keyed by structural relation id, revalidated here before any omission
-///   they back may leave the fenced denominator.
+///   they back may leave the fenced denominator;
+/// - `retained_quarantine_decisions` are the typed semantic decisions the
+///   owner retained keyed by decision reference, proving presented
+///   evidence content;
+/// - `retained_quarantine_enforcements` are the exact enforcement results
+///   the owner retained keyed by ORS record reference, resolving claimed
+///   ORS references.
 #[derive(Clone, Debug)]
 pub struct GovernorClosureRestore {
     /// Durable grant-graph snapshot the closure is enumerated from.
@@ -108,21 +114,38 @@ pub struct GovernorClosureRestore {
     pub canonical_receipts: BTreeMap<String, ReceiptIdentity>,
     /// Typed owner quarantine evidence records keyed by structural
     /// relation id. Never defaulted: a missing section is a refusal, not
-    /// an empty one. Each record is revalidated against the admitted
-    /// snapshot, the current fence, and the durable receipt identities
-    /// before it may back an omission.
+    /// an empty one. Each record is revalidated against the retained
+    /// semantic decisions, the exact retained enforcement results, the
+    /// admitted snapshot, the current fence, and the durable receipt
+    /// identities before it may back an omission.
     pub quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+    /// Typed semantic quarantine decisions the owner retained, keyed by
+    /// semantic decision reference. Presented evidence content is proven
+    /// against these owner facts; absence fails closed to a partial
+    /// closure, never to a complete one.
+    pub retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+    /// Exact mechanical enforcement results the owner retained, keyed by
+    /// durable ORS record reference. A claimed ORS reference must resolve
+    /// here before any receipt readback can satisfy a fenced disposition;
+    /// absence fails closed to a partial closure, never to a complete one.
+    pub retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
 }
 
 /// Stable schema identity for the Governor-to-Kernel closure restore wire.
 pub const GOVERNOR_CLOSURE_RESTORE_SCHEMA: &str = "eliot.kernel.governor-closure-restore";
 /// Current Governor-to-Kernel closure restore wire version.
 ///
-/// v2 adds the typed quarantine-evidence map (#2976). This versions the
-/// Governor-to-Kernel restore contract once, coherently with — but
-/// separately from — the #2962 grant-graph recovery v2 it embeds: each
-/// contract carries its own single version lineage, never competing
-/// interpretations of one payload.
+/// v2 adds the typed quarantine-evidence map (#2976). The retained
+/// semantic decisions and exact enforcement results ride v2 as optional
+/// readback facts on the `canonical_receipts` precedent: their absence
+/// fails closed to a partial closure, never to a complete one, and an
+/// unpatched reader refuses patched bytes loudly through
+/// `deny_unknown_fields` instead of silently downgrading to
+/// identity-only readback. This versions the Governor-to-Kernel restore
+/// contract once, coherently with — but separately from — the #2962
+/// grant-graph recovery v2 it embeds: each contract carries its own
+/// single version lineage, never competing interpretations of one
+/// payload.
 pub const GOVERNOR_CLOSURE_RESTORE_VERSION: u16 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -140,6 +163,10 @@ struct GovernorClosureRestoreWire {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     canonical_receipts: BTreeMap<String, ReceiptIdentity>,
     quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
 }
 
 impl serde::Serialize for GovernorClosureRestore {
@@ -159,6 +186,8 @@ impl serde::Serialize for GovernorClosureRestore {
             preserved: self.preserved.clone(),
             canonical_receipts: self.canonical_receipts.clone(),
             quarantine_evidence: self.quarantine_evidence.clone(),
+            retained_quarantine_decisions: self.retained_quarantine_decisions.clone(),
+            retained_quarantine_enforcements: self.retained_quarantine_enforcements.clone(),
         }
         .serialize(serializer)
     }
@@ -187,6 +216,8 @@ impl<'de> serde::Deserialize<'de> for GovernorClosureRestore {
             preserved: wire.preserved,
             canonical_receipts: wire.canonical_receipts,
             quarantine_evidence: wire.quarantine_evidence,
+            retained_quarantine_decisions: wire.retained_quarantine_decisions,
+            retained_quarantine_enforcements: wire.retained_quarantine_enforcements,
         })
     }
 }
@@ -351,14 +382,17 @@ impl GovernorClosureSource {
         );
         // The Kernel revalidates the same typed quarantine binding the
         // Governor validated: snapshot membership is necessary but never
-        // sufficient, so every record is re-proven against the admitted
-        // snapshot rows, the current fence, and the durable receipt
-        // identities before any declaration may rely on it.
+        // sufficient, so every record is re-proven against the retained
+        // semantic decisions, the exact retained enforcement results, the
+        // admitted snapshot rows, the current fence, and the durable
+        // receipt identities before any declaration may rely on it.
         let quarantine_bindings = admit_quarantine_bindings(
             &restore.quarantine_evidence,
             &graph_snapshot,
             &history.state_fence,
             &restore.canonical_receipts,
+            &restore.retained_quarantine_decisions,
+            &restore.retained_quarantine_enforcements,
         )?;
 
         let mut hydration_operations = BTreeSet::new();
@@ -817,18 +851,29 @@ fn check_declaration_cross_root_closure(
     Ok(())
 }
 
-/// Revalidates every owner quarantine evidence record against the admitted
-/// snapshot rows, the current fence, and the durable receipt identities,
-/// returning the CURRENT verified binding map the declaration gate
-/// consumes. A record that names no retained relation, disagrees with the
-/// snapshot rows, or fails any readback clause refuses the whole restore:
+/// Revalidates every owner quarantine evidence record against the
+/// retained semantic decisions, the exact retained enforcement results,
+/// the admitted snapshot rows, the current fence, and the durable
+/// receipt identities, returning the CURRENT verified binding map the
+/// declaration gate consumes.
+///
+/// History and current proof stay distinct: a valid non-current
+/// lifecycle row — revoked, stale, unproven, or naming no retained
+/// relation — yields no binding and never satisfies an omission, while
+/// the restore itself proceeds; only a declaration actually dependent
+/// on the missing current proof refuses, at the declaration gate.
+/// Malformed or contradictory input still refuses the whole restore:
 /// invalid proof never becomes a silently satisfied omission.
 fn admit_quarantine_bindings(
     evidence_map: &BTreeMap<String, CrossRootQuarantineEvidence>,
     snapshot: &GrantGraphRecoverySnapshot,
     current_fence: &StateFence,
     canonical_receipts: &BTreeMap<String, ReceiptIdentity>,
+    retained_decisions: &BTreeMap<String, CrossRootQuarantineEvidence>,
+    retained_enforcements: &BTreeMap<String, QuarantineEnforcementRef>,
 ) -> Result<BTreeMap<String, VerifiedQuarantineBinding>, KernelError> {
+    validate_retained_decision_links(retained_decisions)?;
+    validate_retained_enforcement_links(retained_enforcements)?;
     let mut operation_ids = BTreeSet::new();
     let mut idempotency_keys = BTreeSet::new();
     let mut bindings = BTreeMap::new();
@@ -847,15 +892,17 @@ fn admit_quarantine_bindings(
                 reason: "operation identity is bound to more than one relation",
             });
         }
-        let relation = snapshot
+        let Some(relation) = snapshot
             .quarantined_cross_root
             .iter()
             .find(|candidate| &candidate.relation_id == relation_id)
-            .ok_or_else(|| {
-                KernelError::RecoveryUnavailable(
-                    "quarantine evidence names no retained structural relation".to_owned(),
-                )
-            })?;
+        else {
+            // No retained structural relation: the row is unprovable
+            // history, not current proof. It yields no binding, so a
+            // declaration that depends on it stays incomplete at the
+            // gate; unrelated declarations still restore.
+            continue;
+        };
         let parent_record = snapshot
             .grants
             .iter()
@@ -866,18 +913,19 @@ fn admit_quarantine_bindings(
                     .iter()
                     .find(|candidate| candidate.child.grant_id == relation.parent_grant_id)
                     .map(|candidate| &candidate.child)
-            })
-            .ok_or_else(|| {
-                KernelError::RecoveryUnavailable(
-                    "quarantine evidence names an unknown parent lineage".to_owned(),
-                )
-            })?;
+            });
+        let Some(parent_record) = parent_record else {
+            // Unknown parent lineage: the row cannot be proven against
+            // CURRENT records, so it stays inert history like any other
+            // unprovable row.
+            continue;
+        };
         let child_record = &relation.child;
         let child_admitted = snapshot
             .grants
             .iter()
             .any(|grant| grant.grant_id == child_record.grant_id);
-        let binding = VerifiedQuarantineBinding::admit_restored(
+        let binding = match VerifiedQuarantineBinding::admit_restored(
             evidence,
             relation,
             parent_record,
@@ -886,11 +934,84 @@ fn admit_quarantine_bindings(
             snapshot.revision,
             current_fence,
             canonical_receipts,
-        )
-        .map_err(map_quarantine_error)?;
+            retained_decisions,
+            retained_enforcements,
+        ) {
+            Ok(binding) => binding,
+            // Valid non-current lifecycle: revoked, stale, or unproven.
+            // Preserved as inert history — no binding, so it can never
+            // satisfy an omission — while the restore proceeds.
+            Err(AuthorityError::StaleQuarantineEvidence(_)) => continue,
+            // Malformed or contradictory input: the restore refuses
+            // loudly instead of silently dropping proof.
+            Err(error) => return Err(map_quarantine_error(error)),
+        };
         bindings.insert(relation_id.clone(), binding);
     }
     Ok(bindings)
+}
+
+/// Validates owner-retained semantic quarantine decisions before the
+/// restore becomes a trust anchor: map identity against the decision
+/// reference, closed shape, and operation identity uniqueness. CURRENT
+/// qualification is proven per binding, never here.
+fn validate_retained_decision_links(
+    links: &BTreeMap<String, CrossRootQuarantineEvidence>,
+) -> Result<(), KernelError> {
+    let mut operation_ids = BTreeSet::new();
+    let mut idempotency_keys = BTreeSet::new();
+    for (decision_ref, retained) in links {
+        if decision_ref != &retained.semantic_decision_ref {
+            return Err(KernelError::InvalidField {
+                field: "restore.retained_quarantine_decision.decision_ref",
+                reason: "map key disagrees with the retained decision reference",
+            });
+        }
+        retained.validate_shape().map_err(|error| {
+            KernelError::RecoveryUnavailable(format!(
+                "retained quarantine decision refused: {error}"
+            ))
+        })?;
+        if !operation_ids.insert(retained.operation_id.clone())
+            || !idempotency_keys.insert(retained.idempotency_key.clone())
+        {
+            return Err(KernelError::InvalidField {
+                field: "restore.retained_quarantine_decision.operation_id",
+                reason: "operation identity is bound to more than one decision",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates owner-retained exact enforcement results before the restore
+/// becomes a trust anchor: map identity against the ORS record
+/// reference, closed shape, and enforcement operation uniqueness.
+/// CURRENT qualification is proven per binding, never here.
+fn validate_retained_enforcement_links(
+    links: &BTreeMap<String, QuarantineEnforcementRef>,
+) -> Result<(), KernelError> {
+    let mut operation_ids = BTreeSet::new();
+    for (ors_record_ref, retained) in links {
+        if ors_record_ref != &retained.ors_record_ref {
+            return Err(KernelError::InvalidField {
+                field: "restore.retained_quarantine_enforcement.ors_record_ref",
+                reason: "map key disagrees with the retained ORS record reference",
+            });
+        }
+        retained.validate_shape().map_err(|error| {
+            KernelError::RecoveryUnavailable(format!(
+                "retained quarantine enforcement refused: {error}"
+            ))
+        })?;
+        if !operation_ids.insert(retained.operation_id.clone()) {
+            return Err(KernelError::InvalidField {
+                field: "restore.retained_quarantine_enforcement.operation_id",
+                reason: "operation identity is bound to more than one ORS record",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Maps one quarantine admission refusal onto the typed Kernel failure
@@ -1351,6 +1472,10 @@ mod tests {
             // No quarantine evidence was issued for this fixture: its single
             // grant has no quarantined dependents to omit.
             quarantine_evidence: BTreeMap::new(),
+            // No retained quarantine readback either: nothing was decided
+            // or enforced for this fixture.
+            retained_quarantine_decisions: BTreeMap::new(),
+            retained_quarantine_enforcements: BTreeMap::new(),
         })
     }
 

@@ -3,8 +3,8 @@
 //! Architecture: A13.2 (a minimally live Kernel can withhold unsupported
 //! authority and fence stale owners), A2.3 (one causal responsibility, one
 //! owner).
-//! Implementation: I1.5 (idle drain begins only when no RuntimeLease remains
-//! and no valid SupervisionLease requires live sensing/containment) and I14.23
+//! Implementation: I1.5 (idle drain begins only when no `RuntimeLease` remains
+//! and no valid `SupervisionLease` requires live sensing/containment) and I14.23
 //! (the `StoreStopLeaseZero` drain phase).
 //!
 //! The Kernel owns the canonical-data lease, the ORS supervision-lease head and
@@ -19,7 +19,7 @@
 //!   `Unavailable` and never `Idle`;
 //! * the bridge/host-request legs read the Kernel's own admitted front-door
 //!   session state, which is the live authenticated UI/CLI/MCP/bridge Session
-//!   an active RuntimeLease exists for;
+//!   an active `RuntimeLease` exists for;
 //! * the canonical-data leg reuses
 //!   [`ShutdownDrainCoordinator::check_lease_zero`], the existing I14.23
 //!   precondition.
@@ -49,7 +49,7 @@
 //! Option<&OperationIdentity>)`, and it does not exist on current source: a
 //! `#1751` residual recorded as
 //! [`CensusUnavailability::RuntimeLeaseCensusOwnerAbsent`]. Until that owner
-//! lands, the leg cannot answer KnownZero and never installs a default-zero
+//! lands, the leg cannot answer `KnownZero` and never installs a default-zero
 //! stub in its place.
 //!
 //! The census is read-only: it issues no lease, revokes nothing, and never

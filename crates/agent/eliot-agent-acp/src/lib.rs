@@ -1786,6 +1786,11 @@ pub struct AcpWireResultIds {
 /// `eliot-agent-coordinator::AgentCoordinator::submit_result` (candidate
 /// intake only, never Finish authority).
 ///
+/// STITCH (#370 W29/A21): the future live caller feeds one real received
+/// ACP message with its admitted wire identities; BLOCKED-BY the
+/// native-worker provider-runtime driver (no production caller exists).
+/// Forbidden: a synthetic or test-only message to manufacture a caller.
+///
 /// # Errors
 ///
 /// Returns [`AcpAdapterError`] when the bound identities are blank, the

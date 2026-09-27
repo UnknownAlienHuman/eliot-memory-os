@@ -1088,6 +1088,7 @@ dependencies = [
 name = "eliot-config"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "eliot-contracts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
@@ -1859,19 +1860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eliot-erasure"
-version = "0.1.0"
-dependencies = [
- "eliot-contracts",
- "eliot-evidence",
- "eliot-security-contracts",
- "eliot-store-api",
- "schemars",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "eliot-evaluation-contracts"
 version = "0.1.0"
 dependencies = [
@@ -2145,6 +2133,7 @@ dependencies = [
 name = "eliot-installation"
 version = "0.1.0"
 dependencies = [
+ "eliot-config",
  "eliot-contracts",
  "eliot-ipc",
  "eliot-platform",
@@ -2295,6 +2284,7 @@ dependencies = [
  "eliot-kernel-core",
  "eliot-kernel-service",
  "eliot-observability",
+ "eliot-observability-runtime",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
@@ -3211,6 +3201,7 @@ dependencies = [
  "eliot-installation",
  "eliot-ipc",
  "eliot-kernel-service",
+ "eliot-observability-runtime",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
@@ -3557,6 +3548,7 @@ dependencies = [
  "eliot-maintenance",
  "eliot-memory-quality",
  "eliot-observability",
+ "eliot-observability-runtime",
  "eliot-observation",
  "eliot-observation-contracts",
  "eliot-platform",

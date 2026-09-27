@@ -101,6 +101,17 @@ eliot-learning-state-view.workspace = true
 eliot-maintenance.workspace = true
 eliot-memory-quality = { path = "../../crates/smart/eliot-memory-quality", version = "0.1.0" }
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
+# Issue #1836 (W1): the shared observability runtime this composition root
+# installs from `main` before any live work starts.
+# Workspace edge (issue #1841, I16.2/I16.5): the bounded-label OpenMetrics
+# registry, exporter and execution-path recorders live in
+# eliot-observability-runtime, which HAS a [workspace.dependencies] entry, so
+# this is a plain workspace edge. scripts/audit-architecture-boundaries.py
+# permits it: the crate is in no forbidden_exact/forbidden_prefix set of the
+# eliotd runtime root (issue #18), and its closure (eliot-contracts,
+# eliot-platform-windows, serde, serde_json, thiserror, tracing,
+# tracing-subscriber) adds no forbidden reach.
+eliot-observability-runtime.workspace = true
 eliot-observation.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true

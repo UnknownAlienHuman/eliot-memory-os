@@ -411,6 +411,12 @@ enum InstallationCommand {
     /// overwriting the running executable. `eliot-kernel` and `eliot-host`
     /// are release-level and require `--release-approved`; optional modules
     /// stage as generation updates with rollback metadata.
+    ///
+    /// The running state is observed from a live Windows process snapshot and
+    /// reported as `running_target`. On a non-Windows build the observation
+    /// owner is unavailable, so this command always refuses with
+    /// `INSTALLATION_UPDATE_RUNNING_OBSERVATION_FAILED` rather than assuming
+    /// the target is idle.
     StageUpdate {
         /// Absolute installation root; `<root>/<package>/<version>` is created new.
         #[arg(long, value_parser = absolute_path)]
@@ -430,7 +436,10 @@ enum InstallationCommand {
         /// Absolute payload executable file staged into the versioned directory.
         #[arg(long, value_parser = absolute_path)]
         payload: PathBuf,
-        /// Optional running executable; staging fails closed on collision.
+        /// Optional exact path of an executable the operator declares running;
+        /// staging fails closed on collision. This is an independent fact from
+        /// the `running_target` observation, which is recorded from a live
+        /// Windows process snapshot and is not derived from this flag.
         #[arg(long, value_parser = absolute_path)]
         running_exe: Option<PathBuf>,
         /// Optional previous versioned directory recorded for module rollback.
@@ -658,6 +667,7 @@ enum CatalogueCommand {
 }
 
 /// Governor-backed first-run setup commands (issue #1962).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum SetupCommand {
     /// Decide typed per-role route state. Omitted roles stay `UNASSIGNED`;
@@ -733,6 +743,79 @@ enum SetupCommand {
         /// Affected scope reference.
         #[arg(long)]
         scope: String,
+    },
+    /// Prepare the first signed configuration payload from the confirmed
+    /// privacy mode and first-run choices (I3.2 milestone 7).
+    ///
+    /// Preparation is deterministic and model-free: it reads no configuration
+    /// file, signs nothing, publishes nothing, and executes no model. The
+    /// installation owner signs, publishes, re-reads and verifies the payload
+    /// before it advances the setup binding.
+    InitialConfig {
+        /// Identity of the immutable configuration snapshot being prepared.
+        #[arg(long)]
+        snapshot_id: String,
+        /// Installation identity confirmed at setup milestone 1.
+        #[arg(long)]
+        installation_id: String,
+        /// Selected profile reference: `system_service`, `user_mode`, or
+        /// `portable_dev`.
+        #[arg(long)]
+        profile_ref: String,
+        /// Confirmed System Owner reference and settings owner.
+        #[arg(long)]
+        owner_ref: String,
+        /// Active key identity bound to the established trust root.
+        #[arg(long)]
+        key_identity: String,
+        /// Machine identity the snapshot applies to.
+        #[arg(long)]
+        machine_id: String,
+        /// Scope identity the snapshot applies to.
+        #[arg(long)]
+        scope_id: String,
+        /// Lowercase SHA-256 digest of the profile-bound runtime root topology.
+        #[arg(long)]
+        runtime_state_roots_digest: String,
+        /// Setup binding revision at milestone 7. Must be non-zero.
+        #[arg(long)]
+        setup_revision: u64,
+        /// Canonical lowercase hyphenated authority-epoch lineage UUID observed
+        /// by the installation owner.
+        #[arg(long)]
+        authority_lineage: String,
+        /// Non-zero authority-epoch sequence observed by the installation owner.
+        #[arg(long)]
+        authority_sequence: u64,
+        /// Non-zero resource generation observed by the installation owner.
+        #[arg(long)]
+        resource_generation: u64,
+        /// Confirmed privacy mode: `local_only` or `standard`.
+        #[arg(long)]
+        privacy: String,
+        /// Dreamer route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        dreamer_route: Option<String>,
+        /// Watchdog route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        watchdog_route: Option<String>,
+        /// The setup screen displayed the Dreamer local/economy default.
+        #[arg(long, default_value = "false")]
+        dreamer_displayed: bool,
+        /// The setup screen displayed the Watchdog local/economy default.
+        #[arg(long, default_value = "false")]
+        watchdog_displayed: bool,
+        /// Explicit paid-route consent for Dreamer.
+        #[arg(long, default_value = "false")]
+        dreamer_explicit: bool,
+        /// Explicit paid-route consent for Watchdog.
+        #[arg(long, default_value = "false")]
+        watchdog_explicit: bool,
+        /// Automation mode: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`. Omitted keeps the
+        /// visible `SUGGEST_ONLY` default.
+        #[arg(long)]
+        automation: Option<String>,
     },
 }
 
@@ -838,6 +921,49 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             automation,
             family,
             scope,
+        }),
+        SetupCommand::InitialConfig {
+            snapshot_id,
+            installation_id,
+            profile_ref,
+            owner_ref,
+            key_identity,
+            machine_id,
+            scope_id,
+            runtime_state_roots_digest,
+            setup_revision,
+            authority_lineage,
+            authority_sequence,
+            resource_generation,
+            privacy,
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+            automation,
+        } => first_run_flow::run_setup_initial_config(&first_run_flow::SetupInitialConfigArgs {
+            snapshot_id,
+            installation_id,
+            profile_ref,
+            owner_ref,
+            key_identity,
+            machine_id,
+            scope_id,
+            runtime_state_roots_digest,
+            setup_revision,
+            authority_lineage,
+            authority_sequence,
+            resource_generation,
+            privacy,
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+            automation,
         }),
     }
 }
@@ -2102,6 +2228,9 @@ fn update_installer_error_code(error: &update_installer::UpdateInstallerError) -
         update_installer::UpdateInstallerError::RunningBinaryWouldBeOverwritten { .. } => {
             "INSTALLATION_UPDATE_RUNNING_GUARD"
         }
+        update_installer::UpdateInstallerError::RunningObservationFailed { .. } => {
+            "INSTALLATION_UPDATE_RUNNING_OBSERVATION_FAILED"
+        }
         update_installer::UpdateInstallerError::VersionedDirExists { .. } => {
             "INSTALLATION_UPDATE_VERSION_EXISTS"
         }
@@ -2210,6 +2339,7 @@ fn run_installation_stage_update(
             "release_approval_required": record.kind.requires_release_approval(),
             "installed_dir": record.installed_dir,
             "executable": record.executable_path,
+            "running_target": record.running_target,
             "generation": record.generation,
             "rollback_from": record.rollback_from,
             "scope": INSTALLATION_SCOPE,

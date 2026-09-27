@@ -61,6 +61,11 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+/// Execution-path `OpenMetrics` wiring (issue #1841, I16.1/I16.2/I16.5): the
+/// bounded schema, labels, registry and exporter stay owned by
+/// `eliot-observability-runtime`; this module only installs that stack and maps
+/// observations the daemon's own owners already hold onto its catalogue.
+pub mod execution_metrics;
 mod experience_runtime;
 pub mod external_attach_reconciliation;
 pub mod finish_attempt;
@@ -86,6 +91,7 @@ mod route_receipts;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
+mod skill_evidence_read;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
@@ -184,12 +190,15 @@ pub use experience_runtime::{
     run_experience_quality_event, run_experience_quality_event_with_revision,
 };
 pub use external_attach_reconciliation::{
-    AutomaticLaunchRefusal, CredentialDisposition, EXTERNAL_ATTACH_RECONCILIATION_REQUIRED,
-    ExternalAttachObservation, ExternalAttachReconciliationReceipt, ExternalEffectDisposition,
-    ImportedPreAttachCoverage, ObservedAttachCandidates, PendingAttachAction,
-    PreAttachBlindInterval, PreAttachStanding, ScopeAuthorityDisposition, UnownedContinuation,
-    WorkspaceArtifactDelta, admit_automatic_agent_launch, admit_material_continuation,
-    reconcile_external_attach,
+    AutomaticLaunchRefusal, ContinuationKind, CredentialDisposition,
+    EXTERNAL_ATTACH_RECONCILIATION_REQUIRED, ExternalAttachBindingView, ExternalAttachBridgeClaim,
+    ExternalAttachIngressRecord, ExternalAttachObservation, ExternalAttachReconciliationReceipt,
+    ExternalEffectDisposition, ImportedPreAttachCoverage, ObservedAttachCandidates,
+    PendingAttachAction, PreAttachBlindInterval, PreAttachStanding, ScopeAuthorityDisposition,
+    UnownedContinuation, WorkspaceArtifactDelta, admit_automatic_agent_launch,
+    admit_material_continuation, admit_material_continuation_for_record, binding_view,
+    claim_bridge_attach, reconcile_external_attach, replay_bridge_external_attach,
+    serve_bridge_external_attach,
 };
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
@@ -198,9 +207,9 @@ pub use first_run_wiring::{
 pub use freshness_admission::{
     CANDIDATE_COMMITTED_PROJECTION_PENDING, CandidateFetchOutcome, CommittedCandidate,
     FreshnessAdmission, FreshnessDisposition, FreshnessError, FreshnessEvaluation,
-    ProjectionPublicationRecord, ProjectionPublicationStatus, ProvenanceStanding, PublicationMode,
-    RequestedEffect, ReusableCandidateView, RevisionHead, TaskCompatibility,
-    evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
+    ObservedPublication, ProvenanceStanding, RequestedEffect, ReusableCandidateView, RevisionHead,
+    TaskCompatibility, evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
+    observed_publication, publication_serves_candidate,
 };
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
@@ -564,6 +573,26 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// Daemon-held Governor outcome registry view (issue #1961, I3.4).
+    ///
+    /// Constructed empty at [`DaemonComposition::start`] and owned here for
+    /// the daemon's lifetime, so a broad degradation outcome recorded by one
+    /// model-invoke attempt applies to later attempts instead of dying with
+    /// the call that observed it. Only evidence-backed broad scopes are
+    /// stored (installation blocks, generation blocks keyed by exact
+    /// fingerprint, session blocks keyed by session owner); item-, call- and
+    /// attempt-scoped outcomes are never stored here and stay visible on the
+    /// attempt receipt that produced them.
+    ///
+    /// Interior mutability is the established pattern on this composition
+    /// root (see `skill_catalogue`): the governed model adapter borrows
+    /// `&DaemonComposition`, so a held view it must record into cannot be
+    /// reached through a `&mut` accessor without changing that lifetime.
+    /// Semantics stay in [`CapabilityRegistryView`]; this field is only its
+    /// owner. It is in-process state: a restart re-derives from evidence
+    /// rather than reading a durable record back, and no canonical-store
+    /// persistence is claimed for it here.
+    capability_outcomes: std::sync::Mutex<CapabilityRegistryView>,
     /// Governor-owned durable learning-closure owner (issue #1863, I12.24).
     ///
     /// Constructed empty at [`DaemonComposition::start`] and owned by the
@@ -574,19 +603,23 @@ pub struct DaemonComposition {
     /// performs no transport, and is never read on the readiness path: closure
     /// must not block or fail the finish ceremony.
     learning_closure: eliot_governor::LearningClosureService,
-    /// Retained reconciliation receipt for an attach of an already-running
+    /// Retained ingress record for an attach of an already-running
     /// external agent (issue #1782, I11.11 lines 27-42).
     ///
-    /// `None` until [`Self::record_external_attach_reconciliation`] installs a
-    /// caller-observed receipt, which is what an empty supply honestly means:
-    /// no external agent has attached, so there is nothing to reconcile. It is
-    /// never defaulted to a reconciled attach and never derived from this
-    /// process's own config/state directories, which are not a user
-    /// `WorkScope`. Read by
-    /// [`Self::admit_material_continuation_after_attach`], which is the only
-    /// consumer and refuses a Material effect whenever the retained receipt has
-    /// no attributed continuation.
-    external_attach: Option<Box<ExternalAttachReconciliationReceipt>>,
+    /// `None` until an ingress installs a caller-observed receipt, which is
+    /// what an empty supply honestly means: no external agent has attached,
+    /// so there is nothing to reconcile. It is never defaulted to a
+    /// reconciled attach and never derived from this process's own
+    /// config/state directories, which are not a user `WorkScope`. The
+    /// record joins the compiled receipt to the exact Bridge
+    /// request/session/task/fence binding it was compiled under plus the
+    /// live Governor fence and Kernel-issued owner session observed at
+    /// ingest. Read by [`Self::admit_material_continuation_after_attach`]
+    /// and [`Self::admit_material_continuation_for_attach`], which refuse a
+    /// stale, substituted, or unattributed continuation, and by
+    /// [`Self::replay_bridge_external_attach`], which reads back the exact
+    /// retained binding on replay.
+    external_attach: Option<Box<ExternalAttachIngressRecord>>,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -854,6 +887,7 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            capability_outcomes: std::sync::Mutex::new(CapabilityRegistryView::default()),
             learning_closure: eliot_governor::LearningClosureService::new(),
             external_attach: None,
         })
@@ -1335,6 +1369,13 @@ impl DaemonComposition {
     /// [`eliot_governor::PromotionBoundaryInput::absent`], and the committed
     /// receipt records the withheld verdict with its exact reason.
     ///
+    /// `admissions` are the admission receipts this process holds for the
+    /// campaign's already-committed learning records. The prior attempt of the
+    /// campaign is the one proposed behavioural change that could reach this
+    /// attempt, and the Governor admits it only through one of these receipts;
+    /// an unadmitted one is not delivered, and the committed receipt records
+    /// the typed refusal.
+    ///
     /// The edge is non-blocking by construction: it reads retained owner
     /// images, performs no transport, and its result is returned to the caller
     /// instead of being propagated into the finish decision (I12.24 line 293).
@@ -1344,6 +1385,7 @@ impl DaemonComposition {
         decision: &eliot_governor::FinishDecisionReceipt,
         activity_name: &str,
         receipt: Option<&eliot_governor::AdmissionReceipt>,
+        admissions: &[eliot_governor::AdmissionReceipt],
         promotion: eliot_governor::PromotionBoundaryInput<'_>,
     ) -> Result<eliot_governor::LearningClosureOutcome, eliot_governor::LearningClosureError> {
         self.governor.close_attempt_learning(
@@ -1353,6 +1395,7 @@ impl DaemonComposition {
             activity_name,
             None,
             receipt,
+            admissions,
             promotion,
         )
     }
@@ -2040,6 +2083,57 @@ impl DaemonComposition {
         self.governor.owners().skill.admit_material_attempt(receipt)
     }
 
+    /// Publishes one window of execution evidence through the existing
+    /// Skill lifecycle/observation owner (issue #2663, I7.25).
+    ///
+    /// The daemon previously persisted only the outer host-response body and
+    /// returned "accepted" on that basis, discarding the very
+    /// [`SkillExecutionEvidence`](eliot_skill::SkillExecutionEvidence) slice
+    /// the ingest was admitted to carry. This seam binds the evidence to the
+    /// exact Skill identity the retained catalogue entry names and hands the
+    /// updated view back, so the caller returns the OWNER's result verbatim: a
+    /// claim never outruns persistence.
+    ///
+    /// Evidence is historical. It keeps the Skill revision, package digest and
+    /// attempt it was observed at, so ingesting it now never reactivates a
+    /// superseded Skill: the owner binds it to the stored view's exact
+    /// revision and package and refuses a mismatch.
+    ///
+    /// The crate error travels by value here like every neighboring
+    /// composition seam feeding the Governor lifecycle API, so the size
+    /// lint is allowed for this seam.
+    #[allow(clippy::result_large_err)]
+    pub fn skill_publish_execution_evidence(
+        &self,
+        payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+    ) -> Result<eliot_skill::SkillLifecycleView, eliot_skill::SkillError> {
+        self.skill_reconcile_tool_basis()?;
+        let entry = {
+            let catalogue = self
+                .skill_catalogue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = catalogue
+                .get(&payload.skill_id)
+                .ok_or(eliot_skill::SkillError::NotFound)?;
+            entry.validate()?;
+            // The evidence is bound to the exact identity the retained
+            // catalogue entry names, so a substituted revision or package
+            // cannot be filed under the stored view's identity.
+            if entry.body.body_version != payload.skill_revision {
+                return Err(eliot_skill::SkillError::IdentityMismatch);
+            }
+            entry.clone()
+        };
+        self.governor.owners().skill.record_execution_evidence(
+            &payload.skill_id,
+            &payload.skill_revision,
+            &payload.package_digest,
+            &entry,
+            &payload.executions,
+        )
+    }
+
     /// Carries the receiver ack back to the display boundary under a fresh
     /// tool-owner read (issue #1882).
     ///
@@ -2652,6 +2746,32 @@ impl DaemonComposition {
         Ok(&mut self.capability_admission)
     }
 
+    /// Borrows the daemon-held Governor outcome registry view (#1961, I3.4).
+    ///
+    /// Post-`start` attach-style accessor, mirroring
+    /// [`Self::capability_admission`]: readiness is checked first so a
+    /// refused view is never observed on the unadmitted path. The governed
+    /// model gate records a broad outcome into this held view and reads
+    /// eligibility back from it, which is what makes a generation-scope block
+    /// outlive the attempt that observed the reproduced failure: the block is
+    /// dropped by the owner's own expiry, never by the end of a call.
+    ///
+    /// The handle is borrowed rather than a guard handed out on purpose. The
+    /// gate is reached from an `async fn` that then awaits the provider
+    /// execution port, and a `std::sync::MutexGuard` held across an await would
+    /// make that future `!Send` and would serialise every model invoke for the
+    /// duration of a provider call. Locking is therefore scoped to the gate's
+    /// own synchronous body, and poisoning is recovered the same way the
+    /// `skill_catalogue` handle recovers it.
+    pub fn capability_outcomes(
+        &self,
+    ) -> Result<&std::sync::Mutex<CapabilityRegistryView>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(&self.capability_outcomes)
+    }
+
     /// Consults the held capability admission before route execution (#1957).
     ///
     /// Returns whether `skill_id` holds fresh exact-fingerprint
@@ -2824,33 +2944,116 @@ impl DaemonComposition {
     /// receipt, adopts no pre-attach effect, and derives nothing from a process
     /// name, PID, executable path, current directory or discovery order.
     ///
-    /// # Not yet reached (issue #1782)
+    /// # Not yet reached by a transport caller (issue #1782)
     ///
-    /// This method currently has zero call sites. The live attach transport for
-    /// an already-running external agent is `eliot-agent-bridge-core`
-    /// (`AttachRequest::external` requires an explicit pre-attach blind
-    /// interval, and `AttachView::reconciliation_required` is what refuses
-    /// forwarding until the bridge's own recovery disposition completes); the
-    /// daemon-side ingress that would report the attach to this composition does
-    /// not exist yet. A startup attach was deliberately not added to manufacture
-    /// a caller, and the daemon's own config/state directories were never used
-    /// as a stand-in `WorkScope`. The receipt is still enforced on the live
-    /// Material paths through
-    /// [`Self::admit_material_continuation_after_attach`].
+    /// This method currently has zero call sites. It validates the presented
+    /// receipt through [`ExternalAttachReconciliationReceipt::validate`] and
+    /// installs it as this composition's single retained attach state together
+    /// with the live Governor fence and the noted owner session, so even the
+    /// receipt-only path carries the applicability snapshots the continuation
+    /// recheck compares. It mints no receipt, adopts no pre-attach effect,
+    /// and derives nothing from a process name, PID, executable path, current
+    /// directory or discovery order. The Bridge ingress that binds a receipt
+    /// to its exact request/session/task/fence/attempt binding is
+    /// [`Self::serve_bridge_external_attach`].
     ///
     /// # Errors
     ///
     /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from
     /// [`ExternalAttachReconciliationReceipt::validate`] when the presented
-    /// receipt does not validate, leaving the previously retained receipt
+    /// receipt does not validate, leaving the previously retained record
     /// untouched.
     pub fn record_external_attach_reconciliation(
         &mut self,
         receipt: &ExternalAttachReconciliationReceipt,
     ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
         receipt.validate()?;
-        self.external_attach = Some(Box::new(receipt.clone()));
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        let live_session = self
+            .owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned());
+        self.external_attach = Some(Box::new(ExternalAttachIngressRecord {
+            claim: None,
+            receipt: receipt.clone(),
+            admitted_fence: live_fence,
+            owner_session_binding: live_session,
+        }));
         Ok(())
+    }
+
+    /// Serves one live Bridge external-attach request (issue #1782 audit
+    /// repair).
+    ///
+    /// This is the daemon side of the `eliot-agent-bridge-core` external
+    /// attach transport: `binding` is the exact
+    /// [`AttachBinding`](eliot_agent_bridge_core::AttachBinding) the trusted
+    /// host activation boundary sealed, `request` is the
+    /// [`AttachRequest`](eliot_agent_bridge_core::AttachRequest) that carried
+    /// it, and `observation` is what the authenticated platform/peer and
+    /// `WorkScope` owners actually observed for that attach. The binding
+    /// claim is copied and checked first, the owner observations are fed into
+    /// [`reconcile_external_attach`](crate::reconcile_external_attach)
+    /// unchanged, and the resulting record is retained before the returned
+    /// view is read back from that retention: the Bridge clears its own
+    /// reconciliation flag only after this method reports success, never
+    /// before the receipt is persisted here. A startup attach was
+    /// deliberately not added to manufacture a caller, and the daemon's own
+    /// config/state directories were never used as a stand-in `WorkScope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from the
+    /// binding-claim, compiler, or receipt-validation leg, leaving any
+    /// previously retained record untouched.
+    pub fn serve_bridge_external_attach(
+        &mut self,
+        binding: &eliot_agent_bridge_core::AttachBinding,
+        request: &eliot_agent_bridge_core::AttachRequest,
+        observation: &ExternalAttachObservation,
+    ) -> Result<ExternalAttachBindingView, Box<eliot_agent_bridge_core::BridgeError>> {
+        let claim = claim_bridge_attach(binding, request)?;
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        let live_session = self
+            .owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned());
+        let record =
+            serve_bridge_external_attach(claim, observation, &live_fence, live_session.as_deref())?;
+        self.external_attach = Some(Box::new(record));
+        let retained = self
+            .external_attach
+            .as_deref()
+            .ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::NotAttached))?;
+        binding_view(retained)
+    }
+
+    /// Replays the retained disposition for a lost Bridge response (issue
+    /// #1782 audit repair).
+    ///
+    /// The presenting binding must equal the retained claim field for field:
+    /// an exact match reads back the same disposition with the same
+    /// continuation and the same attempt identity, minting nothing, while
+    /// any other binding fails closed without touching the retained record.
+    /// A lost response therefore recovers the same disposition instead of
+    /// creating another continuation or silently resetting the
+    /// reconciliation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from the
+    /// binding-claim, replay-match, or receipt-validation leg.
+    pub fn replay_bridge_external_attach(
+        &self,
+        binding: &eliot_agent_bridge_core::AttachBinding,
+        request: &eliot_agent_bridge_core::AttachRequest,
+    ) -> Result<ExternalAttachBindingView, Box<eliot_agent_bridge_core::BridgeError>> {
+        let presenting = claim_bridge_attach(binding, request)?;
+        let record = self.external_attach.as_deref();
+        replay_bridge_external_attach(record, &presenting)?;
+        let retained =
+            record.ok_or_else(|| Box::new(eliot_agent_bridge_core::BridgeError::NotAttached))?;
+        binding_view(retained)
     }
 
     /// Borrows the retained external-attach reconciliation receipt, if any.
@@ -2859,7 +3062,9 @@ impl DaemonComposition {
     /// a synthesized read-only or attributed disposition.
     #[must_use]
     pub fn external_attach_reconciliation(&self) -> Option<&ExternalAttachReconciliationReceipt> {
-        self.external_attach.as_deref()
+        self.external_attach
+            .as_deref()
+            .map(|record| &record.receipt)
     }
 
     /// Admits one requested effect against the retained external-attach
@@ -2869,9 +3074,13 @@ impl DaemonComposition {
     /// disposition returns `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED`." I14.24
     /// line 23: "read-only inspection and unrelated tasks continue". A
     /// non-Material effect is therefore always admitted, and a Material effect
-    /// is admitted only when the retained receipt reached an attributed
-    /// continuation; a read-only attach or a new bounded attempt refuses with
-    /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`].
+    /// is admitted only when the retained record reached an attributed
+    /// continuation. Before that disposition gate, applicability is rechecked
+    /// against the live owners: the live Governor fence must still equal the
+    /// admitted fence and the live owner session must still equal the
+    /// recorded one, so workspace movement, source/task revision drift,
+    /// logout, or session replacement invalidates dependent use with a
+    /// typed stale-authority refusal instead of silently continuing.
     ///
     /// Live callers: the `eliot.finish` claim path through
     /// [`serve_finish_claim`](crate::serve_finish_claim), which the daemon
@@ -2880,14 +3089,67 @@ impl DaemonComposition {
     /// # Errors
     ///
     /// Returns [`eliot_agent_bridge_core::BridgeError::InvalidContract`] when
-    /// the retained receipt does not validate, and
+    /// the retained receipt does not validate,
+    /// [`eliot_agent_bridge_core::BridgeError::StaleAuthority`] when the live
+    /// fence or owner session no longer matches the retained record, and
     /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`]
     /// when a Material effect is requested before an attributed continuation.
     pub fn admit_material_continuation_after_attach(
         &self,
         effect: eliot_workscope::RequestedEffect,
     ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
-        admit_material_continuation(effect, self.external_attach.as_deref())
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        let live_session = self
+            .owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned());
+        admit_material_continuation_for_record(
+            effect,
+            self.external_attach.as_deref(),
+            None,
+            &live_fence,
+            live_session.as_deref(),
+        )
+    }
+
+    /// Admits one requested effect for a caller presenting its live Bridge
+    /// binding (issue #1782 audit repair).
+    ///
+    /// This is the same rechecking gate as
+    /// [`Self::admit_material_continuation_after_attach`], plus the exact
+    /// presenting-binding match: the request/session/task/fence binding the
+    /// caller presents must equal the retained claim field for field,
+    /// including direct calls that bypass the finish path. A stale or
+    /// substituted binding fails closed with a typed stale-authority refusal
+    /// and can never clear the gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`eliot_agent_bridge_core::BridgeError::InvalidContract`] for
+    /// a malformed presenting binding or a retained receipt that does not
+    /// validate, [`eliot_agent_bridge_core::BridgeError::StaleAuthority`]
+    /// for a stale or substituted binding, fence, or session, and
+    /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`]
+    /// when a Material effect is requested before an attributed continuation.
+    pub fn admit_material_continuation_for_attach(
+        &self,
+        effect: eliot_workscope::RequestedEffect,
+        binding: &eliot_agent_bridge_core::AttachBinding,
+        request: &eliot_agent_bridge_core::AttachRequest,
+    ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
+        let presenting = claim_bridge_attach(binding, request)?;
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        let live_session = self
+            .owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned());
+        admit_material_continuation_for_record(
+            effect,
+            self.external_attach.as_deref(),
+            Some(&presenting),
+            &live_fence,
+            live_session.as_deref(),
+        )
     }
 
     /// Borrows the Governor reconstruction read composition over the retained

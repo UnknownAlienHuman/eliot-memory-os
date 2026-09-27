@@ -670,14 +670,14 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
 /// republish. Absence stays absence per I5.16: `None` serializes absent,
 /// measured zero stays numeric zero, Booleans stay Booleans, and no
 /// formatting helper feeds stringified values back into this contract.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 // Four JSON Booleans are the versioned wire shape (#2787 step 4: Booleans
 // stay Booleans); an enum would break the Boolean contract.
 #[allow(clippy::struct_excessive_bools)]
 pub struct WasmHostResultFrame {
     /// Result wire identity.
-    pub wire_id: &'static str,
+    pub wire_id: String,
     /// Result wire version ([`WASM_HOST_RESULT_WIRE_VERSION`]).
     pub wire_version: u16,
     /// Closed observation phase (`execute`, `contain`, `reconcile`, `deny`):
@@ -857,7 +857,7 @@ fn project_result(
         .as_ref()
         .map(|_| DIVERGENCE_REASON_CODE.to_owned());
     WasmHostResultFrame {
-        wire_id: WASM_HOST_RESULT_WIRE_ID,
+        wire_id: WASM_HOST_RESULT_WIRE_ID.to_owned(),
         wire_version: WASM_HOST_RESULT_WIRE_VERSION,
         phase: command_phase(command).to_owned(),
         worker_command: Some(command_name(command).to_owned()),
@@ -1183,7 +1183,7 @@ fn denial_frame(
     error_code: &str,
 ) -> WasmHostResultFrame {
     WasmHostResultFrame {
-        wire_id: WASM_HOST_RESULT_WIRE_ID,
+        wire_id: WASM_HOST_RESULT_WIRE_ID.to_owned(),
         wire_version: WASM_HOST_RESULT_WIRE_VERSION,
         phase: phase.to_owned(),
         worker_command: worker_command.map(|command| command_name(command).to_owned()),
@@ -1242,7 +1242,7 @@ fn unknown_frame(
     error_code: &str,
 ) -> WasmHostResultFrame {
     WasmHostResultFrame {
-        wire_id: WASM_HOST_RESULT_WIRE_ID,
+        wire_id: WASM_HOST_RESULT_WIRE_ID.to_owned(),
         wire_version: WASM_HOST_RESULT_WIRE_VERSION,
         phase: phase.to_owned(),
         worker_command: worker_command.map(|command| command_name(command).to_owned()),
@@ -3948,6 +3948,81 @@ fn seal_inflight_claim(
     )
 }
 
+/// Seals the durable served evidence for one terminal outcome (#2786 step
+/// 7): the served marker first, then the exact terminal frame, both before
+/// physical reclaim. The pre-execution `InFlight` marker is already durable,
+/// so a failed seal still replays on restart instead of re-executing. Any
+/// failure preserves the claimed set and reports its original identity as
+/// unresolved instead of claiming success.
+fn seal_served_outcome(
+    directory: &std::path::Path,
+    claim: &crate::dispatch_material::DeliveryClaim,
+    frame: &OrdinaryOutcome,
+    now_ms: u64,
+) -> Result<(), OrdinaryDriveError> {
+    if crate::dispatch_material::write_served_marker(directory, claim.identity(), now_ms).is_err() {
+        let identity = claim.identity();
+        return Err(OrdinaryDriveError::DeliveryInProgress {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+        });
+    }
+    let retained = serde_json::to_value(frame).map_err(|_| {
+        let identity = claim.identity();
+        OrdinaryDriveError::DeliveryInProgress {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+        }
+    })?;
+    if crate::dispatch_material::write_served_result(directory, claim.identity(), &retained, now_ms)
+        .is_err()
+    {
+        let identity = claim.identity();
+        return Err(OrdinaryDriveError::DeliveryInProgress {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Reads back the durably retained terminal result for exactly the staged
+/// replay identity (#2786 step 7). Returns the original frame only when the
+/// retained record names this identity verbatim, the frame parses under the
+/// closed result contract, and the frame's own operation/claim/grant and
+/// proven digests bind back to the same identity; anything else — absent,
+/// unreadable, oversize, malformed, foreign-identity, non-terminal, or
+/// wire-mismatched — answers `None` so the caller reports identity-only
+/// in-progress with all evidence preserved. Never executes, never deletes.
+fn read_back_served_result(
+    directory: &std::path::Path,
+    identity: &crate::dispatch_material::StagedDeliveryIdentity,
+) -> Option<OrdinaryOutcome> {
+    let record = crate::dispatch_material::read_served_result(directory).ok()??;
+    if !record.names(identity) {
+        return None;
+    }
+    let frame: OrdinaryOutcome = serde_json::from_value(record.frame).ok()?;
+    if frame.wire_id != WASM_HOST_RESULT_WIRE_ID
+        || frame.wire_version != WASM_HOST_RESULT_WIRE_VERSION
+        || !frame.terminal
+    {
+        return None;
+    }
+    if frame.operation_id != identity.operation_id
+        || frame.claim_id != identity.claim_id
+        || frame.grant_digest != identity.grant_digest
+        || frame.artifact_digest != identity.artifact_digest
+        || frame.input_digest != identity.input_digest
+    {
+        return None;
+    }
+    Some(frame)
+}
+
 /// Runs the ordinary governed path for this process: binds the owner
 /// delivery set, resolves the authenticated grant into a local admitted port
 /// set, and serves the bounded request loop to its correlated terminal
@@ -4004,17 +4079,30 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
             inflight_marker.as_ref(),
         ) {
             crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
+                // Terminal-unacknowledged read-back: a fresh drive (no
+                // in-process outcome) returns the original retained
+                // terminal result for exactly this identity when one is
+                // durably retained, before any evidence is touched — the
+                // replay path deletes nothing. Absent, unreadable, or
+                // foreign records fall through to the identity-only
+                // in-progress report below; same-drive replays keep the
+                // in-process projection, never a file read-back.
+                if outcome.is_none()
+                    && let Some(frame) = read_back_served_result(&directory, &identity)
+                {
+                    return Ok(frame);
+                }
                 // The classifier also treats a differing identity under the
                 // same spent grant as Replay, and an InFlight-named set as
                 // Replay whether or not its effect settled. Preserve the
                 // staged identity; the final projection may reuse an outcome
                 // only when this identity exactly matches the latest one
-                // served in this process. A replay without a matching
-                // in-process outcome has no durable result or
-                // acknowledgement to authorize reclamation. Keep the claimed
-                // set and durable markers as local identity evidence; the
-                // projection below reports DeliveryInProgress with this
-                // exact identity until an owner can reconcile it.
+                // served in this process. A replay without a retained
+                // result has no acknowledgement to authorize reclamation.
+                // Keep the claimed set and durable markers as local
+                // identity evidence; the projection below reports
+                // DeliveryInProgress with this exact identity until an
+                // owner can reconcile it.
                 replayed = Some(identity);
                 break;
             }
@@ -4053,24 +4141,11 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 // attested as settled, so reclaiming here never races an
                 // unresolved guest child.
                 //
-                // The pre-execution InFlight marker is already durable, so a
-                // failed served write still replays on restart instead of
-                // re-executing. Preserve the claimed set and report its
-                // original identity as unresolved instead of claiming
-                // success.
-                if crate::dispatch_material::write_served_marker(
-                    &directory,
-                    claim.identity(),
-                    edge_now_ms(),
-                )
-                .is_err()
-                {
-                    return Err(OrdinaryDriveError::DeliveryInProgress {
-                        operation_id: claim.identity().operation_id.clone(),
-                        generation: claim.identity().generation,
-                        claim_id: claim.identity().claim_id.clone(),
-                    });
-                }
+                // The served marker and the exact terminal frame seal
+                // durably before physical reclaim, so restart reconciles
+                // terminal-unacknowledged state by returning the original
+                // result instead of re-executing.
+                seal_served_outcome(&directory, &claim, &ok_frame, edge_now_ms())?;
                 let reclamation = consume_delivery_set(&claim);
                 // The served marker is now durable, so the pre-execution
                 // InFlight evidence is redundant: drop it best-effort. A
@@ -4110,9 +4185,10 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
     // in-progress with its exact identity instead of borrowing the newer
     // result or re-executing under its spent grant. A same-grant replay for
     // another identity cannot borrow that result. Cross-restart
-    // terminal-unacknowledged state remains explicitly in-progress because
-    // its marker carries identity, not a result payload. Only a drive that
-    // observed nothing staged reports absence.
+    // terminal-unacknowledged state with a durably retained result already
+    // returned that original frame from the replay arm above; only a replay
+    // without a retained result reports in-progress with its exact identity.
+    // Only a drive that observed nothing staged reports absence.
     match (outcome, replayed) {
         (Some(frame), None) => Ok(frame),
         (Some(frame), Some(identity)) if served.last() == Some(&identity) => Ok(frame),

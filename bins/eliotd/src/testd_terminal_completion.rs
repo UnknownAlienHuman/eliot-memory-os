@@ -612,6 +612,12 @@ pub async fn commit_testd_terminal_owner_fact(
 /// stub: an unadmitted proposed behavioural change is not delivered to the
 /// subsequent attempt, and the durable receipt records the typed refusal.
 ///
+/// The same holds for the campaign's already-committed records, so an empty
+/// admission set is presented for the prior attempt of this campaign. The
+/// committed record then carries no relation to a prior proposal the Governor
+/// has not admitted, and the typed refusal for it is reported alongside the
+/// record's own delivery verdict.
+///
 /// No owner publishes a candidate-only promotion boundary at this seam, so
 /// [`eliot_governor::PromotionBoundaryInput::absent`] is presented and the
 /// committed receipt records the withheld promotion verdict with its exact
@@ -630,6 +636,7 @@ fn close_terminal_attempt_learning(
         decision,
         activity_name,
         None,
+        &[],
         eliot_governor::PromotionBoundaryInput::absent(),
     ) {
         Ok(eliot_governor::LearningClosureOutcome::Committed(receipt)) => {
@@ -643,10 +650,19 @@ fn close_terminal_attempt_learning(
                     format!("promotion withheld ({reason})")
                 }
             };
+            // A refused prior proposal is a delivery outcome, not a failure, so
+            // it is reported on its own: the record is durable and its retry
+            // relation is simply absent because nothing was delivered. The
+            // refusal is reported by variant name, which is the whole typed
+            // answer and never echoes a payload.
+            let prior = match receipt.prior_delivery {
+                Some(reason) => format!("; prior proposal not delivered ({reason:?})"),
+                None => String::new(),
+            };
             if receipt.delivered {
-                format!("committed; admitted delivery surface is live; {promotion}")
+                format!("committed; admitted delivery surface is live; {promotion}{prior}")
             } else {
-                format!("committed; unadmitted, behavioural effect withheld; {promotion}")
+                format!("committed; unadmitted, behavioural effect withheld; {promotion}{prior}")
             }
         }
         Ok(eliot_governor::LearningClosureOutcome::NonConsequential { .. }) => {

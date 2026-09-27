@@ -29,10 +29,10 @@ use super::wasm_runtime_port_grant::{
 };
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
-    GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState, MessageType,
-    PeerIdentity, ProcessExecutionRequest, ProtocolPayload, RequestIdentity, Session,
-    TESTD_ADMISSION_WIRE_ID, TestdAdmissionAttemptRequest, TransportError, caller_binding,
-    probe_ready_state_admitted, route_doctor_repair, route_testd_admission, status_frame, unix_ms,
+    KernelComposition, KernelFrameAction, KernelServiceState, MessageType, PeerIdentity,
+    ProcessExecutionRequest, ProtocolPayload, RequestIdentity, Session, TESTD_ADMISSION_WIRE_ID,
+    TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
+    route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
@@ -40,6 +40,7 @@ use eliot_kernel_core::{
     KernelRuntimeHealthEvidence, NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector,
     RouteScope, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
 };
+use eliot_observability_runtime::{ModuleIdentity, WorkClass, WorkTerminationOutcome};
 use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
 use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
@@ -118,6 +119,113 @@ fn observe_frame(event: &'static str, outcome: &'static str) {
         outcome = outcome_bound.text(),
         "frame dispatch observation"
     );
+}
+
+/// Publishes one capability-scoped health result on the Kernel diagnostics
+/// plane.
+///
+/// The observation carries the fixed dimension vocabulary, each dimension's own
+/// observed result, and one bounded capability label. The process identity, the
+/// authority epoch and the cutover record stay in the authenticated carrier;
+/// this makes the per-capability dimension vector and a visible stale/not-fresh
+/// condition observable without exporting authority or secret material into
+/// logs (I15.4, I07.20).
+fn observe_runtime_capability_health(capability: &eliot_kernel_core::CapabilityHealth) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    use eliot_runtime_contracts::HealthDimension;
+
+    let capability_bound = bound_field(capability.capability());
+    let dimension_name = |kind: &HealthDimensionKind| -> &'static str {
+        match kind {
+            HealthDimensionKind::Liveness => "LIVENESS",
+            HealthDimensionKind::Readiness => "READINESS",
+            HealthDimensionKind::Freshness => "FRESHNESS",
+            HealthDimensionKind::Compatibility => "COMPATIBILITY",
+            HealthDimensionKind::Integrity => "INTEGRITY",
+            HealthDimensionKind::Capacity => "CAPACITY",
+            HealthDimensionKind::SupervisionCoverage => "SUPERVISION_COVERAGE",
+        }
+    };
+    let dimension_result = |outcome: &eliot_kernel_core::HealthDimensionOutcome| -> &'static str {
+        match outcome.observed {
+            HealthDimension::Unknown => "UNKNOWN",
+            HealthDimension::Healthy => "HEALTHY",
+            HealthDimension::Degraded => "DEGRADED",
+            HealthDimension::Failed => "FAILED",
+        }
+    };
+    // Every declared dimension is published with its own result, so one
+    // unhealthy dimension is visible instead of being hidden behind a summary.
+    let dimensions: Vec<String> = capability
+        .required()
+        .iter()
+        .map(|outcome| {
+            format!(
+                "{}={}",
+                dimension_name(&outcome.dimension),
+                dimension_result(outcome)
+            )
+        })
+        .collect();
+    let failing: Vec<&str> = capability.failing().iter().map(dimension_name).collect();
+    let current_bound = bound_field(if capability.is_current() {
+        "current"
+    } else {
+        "not_current"
+    });
+    let stale_bound = bound_field(if capability.is_stale() {
+        "stale"
+    } else {
+        "fresh"
+    });
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = "kernel.health.capability_projected",
+        outcome = current_bound.text(),
+        capability = capability_bound.text(),
+        dimensions = dimensions.join(","),
+        failing = failing.join(","),
+        freshness = stale_bound.text(),
+        "capability-scoped health observation"
+    );
+}
+
+/// Stable name of the route one admitted action actually took.
+///
+/// I16.5 asks for requested-vs-actual route, so the actual route is named in one
+/// place and used by both the dispatch observation and the bounded route metric;
+/// two independent matches could drift apart and report a mismatch that the
+/// dispatch never had.
+fn actual_route_name(action: &KernelFrameAction) -> &'static str {
+    match action {
+        KernelFrameAction::Reply(_) => "reply_admitted",
+        KernelFrameAction::Daemon { .. } => "daemon_admitted",
+        KernelFrameAction::Process { .. } => "process_admitted",
+        KernelFrameAction::Doctor { .. } => "doctor_admitted",
+        KernelFrameAction::Testd { .. } => "testd_admitted",
+        KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+        KernelFrameAction::Research { .. } => "research_provider_admitted",
+        KernelFrameAction::Fence(_) => "fenced_reply",
+    }
+}
+
+/// Reads the requested route name out of one frame, if the frame carries one.
+///
+/// The read is the same closed selector input `dispatch_frame_inner` uses; a
+/// frame that is not an execute request, or whose payload is not JSON, yields
+/// `None` so the caller records an unreadable request rather than a fabricated
+/// route name.
+fn requested_route_name(frame: &Frame) -> Option<String> {
+    if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+        return None;
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return None;
+    };
+    payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn frame_terminal_code(error: &TransportError) -> &'static str {
@@ -274,11 +382,18 @@ impl KernelComposition {
             cutover_state,
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        // I1.10: a component is `READY` only for the capabilities whose
+        // required dimensions pass. `worker.execute` dispatches work against the
+        // admitted generation's derived state, so freshness is a required
+        // dimension here: a live process whose graph is not current must not
+        // advertise this capability, and the resulting not-fresh result is
+        // published with the failing dimension rather than silently dropped.
         let capability_readiness = CapabilityReadiness::new(
             RUNTIME_HEALTH_CAPABILITY,
             vec![
                 HealthDimensionKind::Liveness,
                 HealthDimensionKind::Readiness,
+                HealthDimensionKind::Freshness,
                 HealthDimensionKind::Compatibility,
                 HealthDimensionKind::Integrity,
                 HealthDimensionKind::Capacity,
@@ -298,12 +413,23 @@ impl KernelComposition {
             super::dispatch_launch::doctor_repair_advertised(),
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        // I1.10: the carrier is published with the capability-scoped result the
+        // producer actually observes, and it is read back from the validated
+        // carrier rather than recomputed. This is the production binding of the
+        // readiness decision to the per-capability dimension results: an
+        // alive-but-not-fresh process still gets a published carrier, but that
+        // carrier names `worker.execute` as not current with `FRESHNESS` as the
+        // failing dimension, so a consumer can never read a current capability
+        // out of a stale process.
+        for capability in evidence.capability_health() {
+            observe_runtime_capability_health(&capability);
+        }
         Ok(evidence)
     }
 
-    /// Only an ORS record for this authenticated daemon generation and epoch
-    /// can complete the carrier's independent cutover state. An empty, stale,
-    /// unrelated, or unreadable projection remains explicitly Preparing.
+    /// Reads route-switch status from the durable cutover record for this
+    /// authenticated daemon generation and epoch. An empty, stale, unrelated,
+    /// or unreadable projection remains explicitly Preparing.
     ///
     /// A durable `GenerationCutoverRecord` carries only a bare epoch sequence,
     /// so it can never establish the lineage of the presented
@@ -313,6 +439,15 @@ impl KernelComposition {
     /// holds. Two lineages at the same sequence are unrelated, and a record
     /// from a superseded lineage stays historical instead of completing a
     /// restore that minted a new one.
+    ///
+    /// The state is read FROM the matched cutover record itself and is never
+    /// inferred from the process state or the generation state. The newest
+    /// matching record wins, so a later cutover for the same generation is the
+    /// current route-switch status rather than an older one. A committed record
+    /// is reported as `Reconciling` rather than `Completed`: the ORS route
+    /// projection publishes the committed linearization point, and the
+    /// terminal `COMPLETED` transition is the reconciler's to record, so this
+    /// projection never claims a completion the record does not contain.
     fn runtime_cutover_state(
         &self,
         generation: eliot_contracts::ResourceGeneration,
@@ -339,16 +474,26 @@ impl KernelComposition {
         else {
             return GenerationCutoverState::Preparing;
         };
-        if cutovers.iter().any(|snapshot| {
-            let record = snapshot.record();
-            record.route_scope == RUNTIME_HEALTH_ROUTE_SCOPE
-                && record.state == GenerationCutoverState::Committed
-                && record.new_generation == generation
-                && record.new_epoch.value() == authority_epoch.sequence.get()
-        }) {
-            GenerationCutoverState::Completed
-        } else {
-            GenerationCutoverState::Preparing
+        match cutovers
+            .iter()
+            .filter(|snapshot| {
+                let record = snapshot.record();
+                record.route_scope == RUNTIME_HEALTH_ROUTE_SCOPE
+                    && record.new_generation == generation
+                    && record.new_epoch.value() == authority_epoch.sequence.get()
+            })
+            .max_by_key(|snapshot| snapshot.operation_order())
+        {
+            // The record is the owner of route-switch status, so its own state
+            // is projected verbatim. `Committed` is the ORS linearization point
+            // the published route projection exposes; reporting it as
+            // `Reconciling` keeps the projection honest that reconciliation has
+            // not been recorded as terminal on this record.
+            Some(snapshot) => match snapshot.record().state {
+                GenerationCutoverState::Committed => GenerationCutoverState::Reconciling,
+                state => state,
+            },
+            None => GenerationCutoverState::Preparing,
         }
     }
 
@@ -547,18 +692,23 @@ impl KernelComposition {
     ) -> Result<KernelFrameAction, TransportError> {
         observe_frame("kernel.frame_received", "attempt");
         let result = self.dispatch_frame_inner(session, frame);
+        // I16.5 (issue #1841): the requested route is read from the same closed
+        // payload the selector reads, and the actual route is the admitted
+        // action, so drift is a comparison of two observed values rather than an
+        // assertion. A frame whose payload is not a readable execute request
+        // records "unreadable" instead of inventing a requested route.
+        let requested = requested_route_name(frame);
+        if let Some(metrics) = super::execution_metrics::kernel_metrics() {
+            metrics.record(metrics.record_route(
+                ModuleIdentity::LocalHttpAdapter,
+                WorkClass::Interactive,
+                requested.as_deref().unwrap_or("unreadable"),
+                result.as_ref().ok().map(actual_route_name),
+            ));
+        }
         match &result {
             Ok(action) => {
-                let outcome = match action {
-                    KernelFrameAction::Reply(_) => "reply_admitted",
-                    KernelFrameAction::Daemon { .. } => "daemon_admitted",
-                    KernelFrameAction::Process { .. } => "process_admitted",
-                    KernelFrameAction::Doctor { .. } => "doctor_admitted",
-                    KernelFrameAction::Testd { .. } => "testd_admitted",
-                    KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
-                    KernelFrameAction::Research { .. } => "research_provider_admitted",
-                    KernelFrameAction::Fence(_) => "fenced_reply",
-                };
+                let outcome = actual_route_name(action);
                 observe_frame("kernel.frame_validated", "success");
                 observe_frame("kernel.frame_admitted", "success");
                 observe_frame("kernel.frame_dispatched", outcome);
@@ -586,6 +736,17 @@ impl KernelComposition {
                     // request (`kernel.frame_cancel_requested`). Info only;
                     // the terminal below stays the single designated terminal.
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
+                    // I16.5 (issue #1841): the same observation as a bounded
+                    // termination metric, so cancellation latency work has a
+                    // real producer instead of a comment.
+                    if let Some(metrics) = super::execution_metrics::kernel_metrics() {
+                        metrics.record(metrics.record_work_termination(
+                            ModuleIdentity::LocalHttpAdapter,
+                            WorkClass::Interactive,
+                            requested.as_deref().unwrap_or("unreadable"),
+                            WorkTerminationOutcome::Cancelled,
+                        ));
+                    }
                 }
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
                 observe_frame("kernel.frame_cleanup", "fenced");
@@ -1640,8 +1801,7 @@ impl KernelComposition {
             )
             .map_err(|_| TransportError::SessionFenced)?
         } else {
-            self.admit_material_authority_for_fence(
-                GovernanceProfile::full(),
+            self.admit_material_authority_for_governor_issued_fence(
                 &session.module_generation.state_fence,
             )
             .map_err(|_| TransportError::SessionFenced)?;
@@ -1945,8 +2105,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         if !cancellation {
-            self.admit_material_authority_for_fence(
-                GovernanceProfile::full(),
+            self.admit_material_authority_for_governor_issued_fence(
                 &session.module_generation.state_fence,
             )
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2079,11 +2238,8 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
-            &identity.request.state_fence,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        self.admit_material_authority_for_governor_issued_fence(&identity.request.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
         let request =
             super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -2169,8 +2325,7 @@ impl KernelComposition {
         // Material/Critical wasm grant. The fence check also proves the current
         // Ready, unfenced, candidate-bound Kernel generation, so it subsumes a
         // separate service-state read here.
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
+        self.admit_material_authority_for_governor_issued_fence(
             &session.module_generation.state_fence,
         )
         .map_err(|_| TransportError::SessionFenced)?;
