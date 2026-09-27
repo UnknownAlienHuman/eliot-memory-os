@@ -89,7 +89,7 @@ opaque_host_id!(
     HostObservedResourceRef,
     "host.observed_context.observed_resource_refs",
     MAX_HOST_RESOURCE_REF_BYTES,
-    "Opaque resource observation supplied by the host. It is not a NativeResourceLease or filesystem grant."
+    "Opaque resource observation supplied by the host. It is not a native resource lease or a filesystem grant."
 );
 opaque_host_id!(
     HostEventStreamId,

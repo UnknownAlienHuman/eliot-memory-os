@@ -29,7 +29,7 @@ use eliot_mcp::{
 };
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
-use eliot_protocol::{AckPhase, AgentActivationResolutionDisposition, EventEnvelope};
+use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
@@ -658,7 +658,7 @@ fn main() {
         // through to the private `op` loop below, and the private loop never
         // decodes an MCP frame. The exit code mirrors the provider discipline
         // of the private path.
-        let code = run_mcp_front_door(&host_gateway, &mut host_request_client, &mut runner);
+        let code = run_mcp_front_door(host_gateway, &mut host_request_client, &mut runner);
         std::process::exit(code);
     }
     let mut stdin_lock = io::stdin().lock();
@@ -791,7 +791,7 @@ fn main() {
             },
             Ok(Request::Invoke { request }) => {
                 let mut response =
-                    handle_invocation(&host_gateway, &mut host_request_client, &request);
+                    handle_invocation(host_gateway, &mut host_request_client, &request);
                 record_invocation_delivery(&mut runner, &mut response);
                 drain_reactive_pending_into_invocation(
                     &mut runner,
@@ -801,7 +801,7 @@ fn main() {
                 response
             }
             Ok(Request::Cancel { request }) => {
-                handle_cancellation(&host_gateway, &mut host_request_client, &request)
+                handle_cancellation(host_gateway, &mut host_request_client, &request)
             }
             Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
@@ -994,13 +994,13 @@ fn handle_bootstrap(
     tasks: &BootstrapTaskInputs,
     requested_assessment: CurrentAssessment,
 ) -> Response {
-    if let Some(context) = context {
-        if let Err(error) = runner.note_owner_snapshot(context, tasks.clone()) {
-            return Response::Error {
-                code: "BOOTSTRAP_CONTEXT_REJECTED",
-                detail: error.to_string(),
-            };
-        }
+    if let Some(context) = context
+        && let Err(error) = runner.note_owner_snapshot(context, tasks.clone())
+    {
+        return Response::Error {
+            code: "BOOTSTRAP_CONTEXT_REJECTED",
+            detail: error.to_string(),
+        };
     }
     if let Some(bootstrap) = runner.take_first_response_bootstrap(tasks, requested_assessment) {
         return Response::Bootstrap { bootstrap };
@@ -1106,7 +1106,7 @@ fn decode_bounded_request(text: &str) -> Result<Request, String> {
 }
 
 fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
-    gateway: &HostRequestGateway,
+    gateway: HostRequestGateway,
     port: &mut P,
     request: &HostInvocationRequest,
 ) -> Response {
@@ -1137,12 +1137,10 @@ fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response
     if let Response::Invocation {
         result, evidence, ..
     } = response
+        && evidence.is_none()
+        && let Some(view) = runner.record_tool_result_delivery(result.outcome())
     {
-        if evidence.is_none()
-            && let Some(view) = runner.record_tool_result_delivery(result.outcome())
-        {
-            *evidence = Some(view);
-        }
+        *evidence = Some(view);
     }
 }
 
@@ -1228,7 +1226,7 @@ fn forward_receipt_error(error: &BridgeError) -> Response {
 
 /// Delivers hook-carried reactive injections through the live stdio consumer.
 ///
-/// Runs the exact ForwardHook dispatch step: forwards the owner-observed
+/// Runs the exact `ForwardHook` dispatch step: forwards the owner-observed
 /// hook event, then drains the live session's pending injections through
 /// that hook, issuing one Delivery/Injection Receipt per item on the
 /// Forwarded response. Pure wiring over [`BridgeRunner`]: no planning, no
@@ -1254,7 +1252,7 @@ fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> 
 /// Delivers response-piggybacked reactive injections through the live stdio
 /// consumer.
 ///
-/// Runs the exact ForwardEvent dispatch step: forwards the event, then
+/// Runs the exact `ForwardEvent` dispatch step: forwards the event, then
 /// drains the live session's pending injections inside the next bridge
 /// response named by that event. Same wiring contract as
 /// [`handle_forward_hook`]: no planning, no assessment, no minting.
@@ -1418,7 +1416,7 @@ fn handle_reactive_snapshot(runner: &BridgeRunner) -> Response {
 }
 
 fn handle_cancellation<P: KernelHostRequestPort + ?Sized>(
-    gateway: &HostRequestGateway,
+    gateway: HostRequestGateway,
     port: &mut P,
     request: &HostCancellationRequest,
 ) -> Response {
@@ -2442,7 +2440,7 @@ struct McpFrameOutcome {
     reason = "MCP stdio loop mirrors the private op loop frame discipline step for step"
 )]
 fn run_mcp_front_door(
-    gateway: &HostRequestGateway,
+    gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
 ) -> i32 {
@@ -2596,15 +2594,12 @@ fn emit_mcp_frame(frame: &Value) -> bool {
 /// output bound enforced before any I/O, then emits through the shared
 /// bounded writer.
 fn write_mcp_frame(frame: &Value) -> StdioWriteReceipt {
-    let mut framed = match serde_json::to_vec(frame) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return StdioWriteReceipt {
-                bytes: 0,
-                flushed: false,
-                cause: StdioBreakCause::SerializeFailed,
-            };
-        }
+    let Ok(mut framed) = serde_json::to_vec(frame) else {
+        return StdioWriteReceipt {
+            bytes: 0,
+            flushed: false,
+            cause: StdioBreakCause::SerializeFailed,
+        };
     };
     framed.push(b'\n');
     if framed.len() > MAX_OUTPUT_FRAME_BYTES {
@@ -2634,7 +2629,7 @@ fn write_mcp_frame(frame: &Value) -> StdioWriteReceipt {
     reason = "closed MCP method table: one arm per negotiated method"
 )]
 fn handle_mcp_frame(
-    gateway: &HostRequestGateway,
+    gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
@@ -2740,27 +2735,21 @@ fn handle_mcp_initialize(
         Ok(version) => version,
         Err(rejection) => return render_rejection(Some(id), &rejection),
     };
-    let demand = match DemandId::new(MCP_DEMAND_ID) {
-        Ok(demand) => demand,
-        Err(_) => {
-            return render_error(
-                Some(id),
-                WIRE_INTERNAL_ERROR,
-                "transport demand identity is unavailable",
-                Value::Null,
-            );
-        }
+    let Ok(demand) = DemandId::new(MCP_DEMAND_ID) else {
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "transport demand identity is unavailable",
+            Value::Null,
+        );
     };
-    let connection = match ConnectionId::new(MCP_CONNECTION_ID) {
-        Ok(connection) => connection,
-        Err(_) => {
-            return render_error(
-                Some(id),
-                WIRE_INTERNAL_ERROR,
-                "transport connection identity is unavailable",
-                Value::Null,
-            );
-        }
+    let Ok(connection) = ConnectionId::new(MCP_CONNECTION_ID) else {
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "transport connection identity is unavailable",
+            Value::Null,
+        );
     };
     if let Err(error) = runner.attach(AttachRequest::managed(demand, connection)) {
         *provider_failure |= matches!(error, BridgeError::PlanGap(_));
@@ -2806,7 +2795,7 @@ fn handle_mcp_tools_list(id: &JsonRpcId, params: &Value) -> Value {
 /// and cancellation marks; response envelopes echo the original wire identity
 /// unchanged.
 fn handle_mcp_tools_call(
-    gateway: &HostRequestGateway,
+    gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
@@ -2989,16 +2978,13 @@ fn handle_mcp_resources_read(
         Ok(uri) => uri,
         Err(rejection) => return render_rejection(Some(id), &rejection),
     };
-    let (handle, operation_handle, binding) = match state.find_resource(uri) {
-        Some(resource) => resource,
-        None => {
-            return render_error(
-                Some(id),
-                WIRE_INVALID_PARAMS,
-                "unknown resource uri; only exact retained handles expand",
-                serde_json::json!({ "uri": bound_mcp_method(uri) }),
-            );
-        }
+    let Some((handle, operation_handle, binding)) = state.find_resource(uri) else {
+        return render_error(
+            Some(id),
+            WIRE_INVALID_PARAMS,
+            "unknown resource uri; only exact retained handles expand",
+            serde_json::json!({ "uri": bound_mcp_method(uri) }),
+        );
     };
     if let Err(error) = port.authorize_resource_read(operation_handle, binding) {
         emit_error("RESOURCE_SOURCE_REFUSED", &error.to_string());
@@ -3021,16 +3007,13 @@ fn handle_mcp_resources_read(
             );
         }
     };
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => {
-            return render_error(
-                Some(id),
-                WIRE_INTERNAL_ERROR,
-                "resource bytes are not UTF-8 text; binary expansion is not implemented on this path",
-                Value::Null,
-            );
-        }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "resource bytes are not UTF-8 text; binary expansion is not implemented on this path",
+            Value::Null,
+        );
     };
     render_result(
         id,
@@ -3054,7 +3037,7 @@ fn handle_mcp_resources_read(
 /// reconciliation entries remain the only recovery route, so this path never
 /// invents an outcome or retries the call.
 fn handle_mcp_cancelled(
-    gateway: &HostRequestGateway,
+    gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
     state: &mut McpFrontDoor,
     params: &Value,
@@ -3068,17 +3051,16 @@ fn handle_mcp_cancelled(
     };
     let correlation = target.correlation_text();
     state.note_cancelled(&correlation);
-    let handle = match state.find_handle(&correlation) {
-        Some(handle) => handle.clone(),
-        None => {
-            emit_error(
-                "CANCEL_UNKNOWN_TARGET",
-                &format!(
-                    "cancel names correlation {correlation:?} with no admitted operation; no new execution issued, durable reconciliation stays kernel-side"
-                ),
-            );
-            return;
-        }
+    let handle = if let Some(handle) = state.find_handle(&correlation) {
+        handle.clone()
+    } else {
+        emit_error(
+            "CANCEL_UNKNOWN_TARGET",
+            &format!(
+                "cancel names correlation {correlation:?} with no admitted operation; no new execution issued, durable reconciliation stays kernel-side"
+            ),
+        );
+        return;
     };
     let request = match build_host_cancellation(state.version, &target, &handle, reason) {
         Ok(request) => request,
@@ -3149,6 +3131,7 @@ mod tests {
     use super::*;
     use eliot_agent_bridge::ScopeLevel;
     use serde_json::Value;
+    use std::fmt::Write as _;
 
     const INVOKE: &str = r#"{
         "op":"invoke",
@@ -3564,7 +3547,7 @@ mod tests {
             panic!("expected invoke");
         };
         let mut port = UnavailableKernelHostRequestPort;
-        let response = handle_invocation(&HostRequestGateway, &mut port, &request);
+        let response = handle_invocation(HostRequestGateway, &mut port, &request);
         let value = serde_json::to_value(response).expect("response must serialize");
         assert_eq!(value["status"], Value::String("invocation".to_owned()));
         assert_eq!(
@@ -3592,7 +3575,7 @@ mod tests {
         };
         assert!(request.reason.is_none());
         let mut port = UnavailableKernelHostRequestPort;
-        let response = handle_cancellation(&HostRequestGateway, &mut port, &request);
+        let response = handle_cancellation(HostRequestGateway, &mut port, &request);
         let value = serde_json::to_value(response).expect("response must serialize");
         assert_eq!(value["status"], Value::String("cancellation".to_owned()));
         assert_eq!(
@@ -3817,6 +3800,10 @@ mod tests {
     // WORK_UNIT_CASE: 977/18
     // WORK_UNIT_CASE: 977/19
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered accept/skip/reject decoder sweep over the shared request_input_cases fixture; splitting would fragment the coverage proof"
+    )]
     fn bounded_decoder_fixture_covers_accept_skip_and_reject() {
         let fixture: Value =
             serde_json::from_str(include_str!("../tests/data/request_input_cases.json"))
@@ -3867,7 +3854,7 @@ mod tests {
                             if index > 0 {
                                 generated.push(',');
                             }
-                            generated.push_str(&format!("\"k{index:05}\":{index}"));
+                            let _ = write!(generated, "\"k{index:05}\":{index}");
                         }
                         generated.push('}');
                         generated
@@ -3932,9 +3919,8 @@ mod tests {
                 }
                 "reject" => {
                     let reason = case["reason"].as_str().expect("reject needs a reason");
-                    let detail = match decode_bounded_request(&text) {
-                        Ok(_) => panic!("{id} must reject"),
-                        Err(detail) => detail,
+                    let Err(detail) = decode_bounded_request(&text) else {
+                        panic!("{id} must reject")
                     };
                     assert!(
                         detail.contains(REQUEST_INPUT_PROFILE_ID),
@@ -4117,12 +4103,12 @@ mod tests {
             reactive_receipts: Vec::new(),
         };
         attach_auto_bootstrap(&mut runner, &mut first);
-        let carried = match first {
-            Response::Forwarded {
-                bootstrap: Some(ref bootstrap),
-                ..
-            } => bootstrap,
-            _ => panic!("first successful response must carry the bootstrap"),
+        let Response::Forwarded {
+            bootstrap: Some(ref bootstrap),
+            ..
+        } = first
+        else {
+            panic!("first successful response must carry the bootstrap")
         };
         assert!(
             !carried.governance.limiting_integration_evidence.is_empty(),
@@ -4295,7 +4281,7 @@ mod tests {
                 response: projection_response(ResponseKind::Projection, large_content()),
             };
             // Exact production order: gateway dispatch, then delivery recording.
-            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            let mut response = handle_invocation(super::HostRequestGateway, &mut port, &request);
             record_invocation_delivery(&mut runner, &mut response);
             let super::Response::Invocation {
                 result, evidence, ..
@@ -4371,7 +4357,7 @@ mod tests {
                 response: projection_response(ResponseKind::Unsupported, large_content()),
             };
             let mut response =
-                handle_invocation(&super::HostRequestGateway, &mut unsupported, &request);
+                handle_invocation(super::HostRequestGateway, &mut unsupported, &request);
             record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
             let value = serde_json::to_value(&response).expect("response must serialize");
@@ -4386,7 +4372,7 @@ mod tests {
                     serde_json::json!({"ok": true}),
                 ),
             };
-            let mut response = handle_invocation(&super::HostRequestGateway, &mut small, &request);
+            let mut response = handle_invocation(super::HostRequestGateway, &mut small, &request);
             record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
             let value = serde_json::to_value(&response).expect("response must serialize");
@@ -4397,7 +4383,7 @@ mod tests {
             // Rejected invocations carry no result: the error envelope records nothing.
             let mut unavailable = super::UnavailableKernelHostRequestPort;
             let mut response =
-                handle_invocation(&super::HostRequestGateway, &mut unavailable, &request);
+                handle_invocation(super::HostRequestGateway, &mut unavailable, &request);
             record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
         }
@@ -4409,7 +4395,7 @@ mod tests {
             let mut port = RespondedPort {
                 response: projection_response(ResponseKind::Projection, large_content()),
             };
-            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            let mut response = handle_invocation(super::HostRequestGateway, &mut port, &request);
             record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
             let value = serde_json::to_value(&response).expect("response must serialize");
@@ -4481,11 +4467,10 @@ mod tests {
             // the gateway, and answers with the exact host correlation on
             // both the admission step and the re-invoke step after the owning
             // Governor operation serves the answer.
-            let request = match decode_bounded_request(super::INVOKE_QUERY)
-                .expect("query invoke must decode")
-            {
-                super::Request::Invoke { request } => request,
-                _ => panic!("expected invoke"),
+            let super::Request::Invoke { request } =
+                decode_bounded_request(super::INVOKE_QUERY).expect("query invoke must decode")
+            else {
+                panic!("expected invoke")
             };
             assert_eq!(request.tool.canonical_name(), "eliot.query");
             assert_eq!(request.correlation_id.as_str(), "host-query-1");
@@ -4495,9 +4480,9 @@ mod tests {
                 calls: 0,
             };
             // Exact production order: gateway dispatch, then delivery recording.
-            let mut admitted = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            let mut admitted = handle_invocation(super::HostRequestGateway, &mut port, &request);
             record_invocation_delivery(&mut runner, &mut admitted);
-            let mut answered = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            let mut answered = handle_invocation(super::HostRequestGateway, &mut port, &request);
             record_invocation_delivery(&mut runner, &mut answered);
             assert_eq!(port.calls, 2);
             assert_eq!(runner.resource_registry_len(), 0);
@@ -4545,7 +4530,7 @@ mod tests {
 
     /// C1 live-consumer proof: items admitted through the REAL production
     /// chain (hand batch → live Governor derivation → transport → ledger)
-    /// are consumed by the REAL stdio ForwardHook dispatch step, and the
+    /// are consumed by the REAL stdio `ForwardHook` dispatch step, and the
     /// issued receipts ride the Forwarded wire frame. Withheld items yield
     /// an empty Forwarded frame with no receipt key. No stub assessor, no
     /// stub ledger, no direct ledger calls: the only producer is the
