@@ -10,6 +10,9 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
+use super::composition_bootstrap::{
+    HANDSHAKE_CANONICAL_FORMAT_REVISION, HANDSHAKE_PROTOCOL_REVISION,
+};
 use super::daemon_request_dispatch::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
@@ -73,9 +76,14 @@ fn runtime_compatibility_evidence(
     generation: eliot_contracts::ResourceGeneration,
     authority_epoch: &eliot_contracts::EpochId,
 ) -> Result<eliot_kernel_core::AcceptedCompatibilityEvidence, TransportError> {
-    let protocol_range = VersionRange::new(1, 1).map_err(|_| TransportError::SessionFenced)?;
-    let canonical_format_range =
-        VersionRange::new(1, 1).map_err(|_| TransportError::SessionFenced)?;
+    let protocol_range =
+        VersionRange::new(HANDSHAKE_PROTOCOL_REVISION, HANDSHAKE_PROTOCOL_REVISION)
+            .map_err(|_| TransportError::SessionFenced)?;
+    let canonical_format_range = VersionRange::new(
+        HANDSHAKE_CANONICAL_FORMAT_REVISION,
+        HANDSHAKE_CANONICAL_FORMAT_REVISION,
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
     let contract_set_digest = runtime_contract_set_digest()?;
     let architecture_source_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST;
     let normative_receipt = NormativePairReceipt::new(
