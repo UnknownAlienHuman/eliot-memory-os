@@ -849,6 +849,20 @@ def _case_sort_key(case_ref: str) -> tuple[str, int, str]:
     return (prefix, int(digits) if digits else -1, tail)
 
 
+def _same_case_set(
+    left: tuple[tuple[str, str, str, str], ...] | list[tuple[str, str, str, str]],
+    right: tuple[tuple[str, str, str, str], ...] | list[tuple[str, str, str, str]],
+) -> bool:
+    """Order-free equality of two denominator case selections.
+
+    The build mode (full expectation gate, exclusion scan, declared path
+    verification) is decided by the CONTENT of the selected cases, never by
+    how the caller ordered or passed them, so a shuffled traversal of the
+    real denominator produces byte-identical output.
+    """
+    return sorted(tuple(item) for item in left) == sorted(tuple(item) for item in right)
+
+
 def _load_files(root: Path, rels: tuple[str, ...] | list[str]) -> dict[str, dict[str, object]]:
     """Read, hash and mask every declared input exactly once, fail-closed."""
     cache: dict[str, dict[str, object]] = {}
@@ -1539,12 +1553,14 @@ def build_inventory(
 ) -> dict[str, object]:
     """Build the deterministic inventory (sorted, clock-free, fail-closed)."""
     root = _root(root)
-    frozen: tuple[tuple[str, str, str, str], ...] | None = None
-    if cases is not None:
-        frozen = tuple(tuple(item) for item in cases)  # type: ignore[arg-type]
+    selected: tuple[tuple[str, str, str, str], ...] = (
+        tuple(tuple(item) for item in cases)  # type: ignore[arg-type]
+        if cases is not None
+        else DENOMINATOR_CASES
+    )
+    default_denominator = _same_case_set(selected, DENOMINATOR_CASES)
     mapping, map_status, map_digest = load_owner_map(root) if owner_map is None else owner_map
-    active_cases = frozen if frozen is not None else DENOMINATOR_CASES
-    default_denominator = frozen is None
+    active_cases = selected
     if not active_cases:
         raise InventoryError("EMPTY_SCAN", "no denominator cases selected")
     extra_paths = (
@@ -2033,7 +2049,7 @@ def _validate_artifact(
 
 def _fail(code: str, detail: str, status: str = "error") -> int:
     print(json.dumps({"status": status, "code": code, "detail": detail}, sort_keys=True))
-    return 1 if status != "error" else 2
+    return 1 if status == "stale" else 2
 
 
 def cmd_sync(root: Path, generation_command: str) -> int:
@@ -2229,6 +2245,10 @@ def run_self_tests() -> int:
         raise AssertionError("expected fail-closed classification for unknown signal")
     assert _rule_digest() == _rule_digest(), "rule digest must be deterministic"
     assert _owner_digest(DENOMINATOR_CASES) == _owner_digest(tuple(reversed(DENOMINATOR_CASES)))
+    assert _same_case_set(tuple(reversed(DENOMINATOR_CASES)), DENOMINATOR_CASES), (
+        "the build mode is decided by case content, never by caller order"
+    )
+    assert not _same_case_set(BASELINE_CASES, DENOMINATOR_CASES)
     assert _stu(0) == 0 and _stu(1) == 1 and _stu(3) == 1 and _stu(4) == 2
     # Enclosing-scope detection: production before cfg(test), test inside it.
     scope_sample = (
@@ -2328,6 +2348,43 @@ def run_self_tests() -> int:
             raise AssertionError("malformed Rust source must fail closed")
         # An absent artifact is stale, never an empty success.
         assert cmd_check(troot) == 1
+
+        # check rejects missing / extra / hand-edited rows without writing.
+        baseline_raw = _emit_toml(first_build)
+        for label, mutate in (
+            ("missing", lambda art: art["rows"].pop()),
+            ("extra", lambda art: art["rows"].append(dict(art["rows"][0], id="c9999"))),
+            (
+                "hand-edited",
+                lambda art: art["rows"][0].__setitem__("classification", "test-only"),
+            ),
+            ("dropped-span", lambda art: art["rows"][0].__setitem__("span_start", 0)),
+        ):
+            tampered_rows = _parse_toml(baseline_raw, source="self-test")
+            mutate(tampered_rows)
+            try:
+                _validate_artifact(tampered_rows)
+            except InventoryError as exc:
+                assert exc.code != "OK", label
+            else:
+                raise AssertionError(f"check must reject a {label} row")
+        # Rule and owner allocation digests are sensitive to their inputs.
+        assert _sha256(_canonical_bytes({"a": 1})) != _sha256(_canonical_bytes({"a": 2}))
+        assert _owner_digest(DENOMINATOR_CASES) != _owner_digest(BASELINE_CASES)
+        assert _rule_digest() == _sha256(
+            _canonical_bytes(
+                {
+                    "rule_revision": RULE_REVISION,
+                    "classifications": list(CLASSIFICATIONS),
+                    "forbidden_owner": FORBIDDEN_OWNER,
+                    "unresolved_owner": UNRESOLVED_OWNER,
+                    "integration_owner": INTEGRATION_OWNER,
+                    "consumer_seams": dict(sorted(CONSUMER_SEAMS.items())),
+                    "stu_accounting_rule": STU_RULE,
+                    "upper_review_band_stu": UPPER_REVIEW_BAND_STU,
+                }
+            )
+        )
 
     print("PASS: context_measurement_inventory self-tests completed successfully")
     return 0
