@@ -15,9 +15,13 @@
 //! Diagnostics are tool observations, never model facts: they are exposed
 //! only as [`DiagnosticObservation`] values bound to a receipt, and this
 //! crate offers no conversion of observations into pass/fail verdicts.
-//! Rename output is an unapplied [`RenameCandidate`]; the bridge never writes
-//! to source files. No CodeCortex-private execution path exists in this
-//! crate; all launches go through [`LspBridge`] and the shared
+//! Rename output is an unapplied [`RenameCandidate`] (also named
+//! [`EditCandidate`] for the I10.10 "rename/edits as candidates" row); the
+//! bridge never writes to source files. No CodeCortex-private execution path
+//! exists: observations, candidates, and receipts are `#[non_exhaustive]`,
+//! so downstream crates cannot forge them with struct literals and must
+//! obtain them from the bridge constructors; all launches go through
+//! [`LspBridge`] and the shared
 //! [`ProcessExecutor`](eliot_process::ProcessExecutor) contract.
 
 #![forbid(unsafe_code)]
@@ -402,7 +406,14 @@ pub enum DiagnosticSeverity {
 /// Values of this type are evidence about one analyzer run. They are not
 /// model facts and must not be converted into verification verdicts; this
 /// crate provides no such conversion.
+///
+/// The struct is `#[non_exhaustive]` so only the bridge parsers
+/// ([`parse_diagnostics_output`], [`finalize_diagnostics`]) can mint
+/// observations. Downstream crates — including `CodeCortex` — cannot forge
+/// them with struct literals and must consume bridge results as evidence.
+/// There is no CodeCortex-private diagnostics execution path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DiagnosticObservation {
     /// File path as reported by the analyzer.
     pub file: String,
@@ -451,7 +462,12 @@ pub struct TextEdit {
 /// Rename output as an explicitly unapplied edit candidate.
 ///
 /// The bridge never writes to source files; `applied` is always `false`.
+///
+/// The struct is `#[non_exhaustive]` so only the bridge constructors
+/// ([`rename_candidate`], [`finalize_scip`]) can mint candidates.
+/// Downstream crates cannot forge them with struct literals.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RenameCandidate {
     /// Exact SCIP symbol string the candidate renames.
     pub symbol: String,
@@ -463,11 +479,24 @@ pub struct RenameCandidate {
     pub applied: bool,
 }
 
+/// Explicit edit-candidate name for the I10.10 "rename/edits as candidates"
+/// row.
+///
+/// This is the same unapplied [`RenameCandidate`] type under its edit
+/// spelling: one type, one bridge constructor path, always unapplied.
+pub type EditCandidate = RenameCandidate;
+
 impl RenameCandidate {
     /// Reports that this candidate was not applied to any file.
     #[must_use]
     pub const fn is_unapplied(&self) -> bool {
         !self.applied
+    }
+
+    /// States the candidate-only contract for consumers.
+    #[must_use]
+    pub const fn candidate_note() -> &'static str {
+        "edit candidate only: unapplied anchor edits; the bridge never writes to source files"
     }
 }
 
@@ -530,7 +559,13 @@ pub enum FailureDisposition {
 }
 
 /// Observation receipt attached to every normalized result.
+///
+/// The struct is `#[non_exhaustive]` so receipts are assembled only via
+/// [`ObservationReceipt::assemble`], which derives freshness and the success
+/// dispositions deterministically from run evidence instead of accepting
+/// caller-invented values.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ObservationReceipt {
     /// Exact analyzer executable as invoked.
     pub executable: String,
@@ -1014,6 +1049,11 @@ pub fn project_symbols(
 /// Occurrence anchors are start positions only, so edits are anchor-only:
 /// applying them requires LSP range resolution, which the bridge never
 /// performs. The returned candidate is always unapplied.
+///
+/// This is a pure projection over the borrowed `&ScipIndex`: it performs no
+/// filesystem writes and launches no process, so the rename path cannot
+/// modify files. The acceptance proof holds a witness file across both the
+/// direct and the `finalize_scip` rename paths and asserts it is unchanged.
 pub fn rename_candidate(
     index: &ScipIndex,
     symbol: &str,
@@ -1485,6 +1525,12 @@ pub fn finalize_scip(
 /// The bridge holds only the executor handle: no child, session, or cache
 /// survives a call. Each request spawns exactly one process through `start`
 /// and reconciles it through `reconcile`.
+///
+/// This is the sole analyzer launch path: the bridge constructor takes the
+/// shared executor handle (no ambient process access), [`LspCommand`] is the
+/// sole `rust-analyzer` argv projection, and [`LspBridge::launch`] admits
+/// only requests that match that projection with a bound receipt. There is
+/// no CodeCortex-private execution path around it.
 pub struct LspBridge<E> {
     executor: Arc<E>,
 }
