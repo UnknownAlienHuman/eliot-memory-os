@@ -553,32 +553,36 @@ impl GrantGraphRecoverySnapshot {
     }
 
     /// Reconstructs graph state for internal consistency validation:
-    /// admitted authority, admitted transition evidence, and inert
-    /// quarantined relations (#2875 item 9, #2962). Public restore entry
-    /// points separately reject transition-bearing snapshots because this
-    /// helper can check only snapshot-local consistency, not current owner
-    /// readback.
+    /// admitted authority and inert quarantined relations (#2875 item 9,
+    /// #2962). Stored transition rows stay unreadable without CURRENT owner
+    /// evidence and migrate to quarantine with their lineage retained.
+    /// Public restore entry points separately reject transition-bearing
+    /// snapshots because this helper can check only snapshot-local
+    /// consistency, not current owner readback.
     ///
-    /// Grants whose parent edge stays inside one root — or names exact admitted
-    /// transition evidence — restore into the authority map. Grants whose
-    /// parent edge crosses roots without such evidence migrate to inert
-    /// [`QuarantinedCrossRootRelation`] records with their full lineage
-    /// retained, as do their transitive descendants; migration is
-    /// deterministic, so exact replay restores the exact same graph. A
-    /// cross-root edge that is not even a narrowing is not lineage and is
-    /// refused with [`AuthorityError::GrantNotNarrower`]. Explicit
+    /// Grants whose parent edge stays inside one root restore into the
+    /// authority map. A cross-root edge carries no admittable evidence in a
+    /// snapshot-local pass — no CURRENT owner receipt is available — so its
+    /// child migrates to an inert [`QuarantinedCrossRootRelation`] record
+    /// with its full lineage retained, as do transitive descendants;
+    /// migration is deterministic, so exact replay restores the exact same
+    /// graph. A cross-root edge that is not even a narrowing is not lineage
+    /// and is refused with [`AuthorityError::GrantNotNarrower`]. Explicit
     /// quarantined records restore as quarantined evidence only: a record
     /// that is not cross-root, disagrees with its parent's root, or names
     /// an admitted grant fails closed instead of being silently
     /// reinterpreted. A legacy cross-root child therefore can never restore
     /// as active authority.
     ///
-    /// The internal consistency pass rechecks every transition row with
-    /// [`AdmittedRootTransition::admit_restored`] against the grants, graph
-    /// revision, and fence carried by this same snapshot. That is not current
-    /// owner readback and cannot authorize restoration. The public restore
-    /// entry points reject transition-bearing snapshots before invoking this
-    /// helper; the original input remains intact for audit and reconciliation.
+    /// The internal consistency pass runs NO admission: a snapshot-local pass
+    /// holds no CURRENT owner receipt, so every transition row stays
+    /// unreadable and its child migrates to inert quarantine. Stored field
+    /// equality is never owner readback and cannot authorize restoration.
+    /// The public restore entry points reject transition-bearing snapshots
+    /// before invoking this helper; the original input remains intact for
+    /// audit and reconciliation. Re-admission runs only through
+    /// [`AdmittedRootTransition::admit_restored`] with a CURRENT receipt plus
+    /// CURRENT grants, revision, and fence.
     #[allow(
         clippy::too_many_lines,
         reason = "restore keeps evidence admission, partitioning, quarantine and revocation in one fail-closed sequence"
@@ -600,12 +604,14 @@ impl GrantGraphRecoverySnapshot {
                 return Err(AuthorityError::MissingParent(parent_id.clone()));
             }
         }
-        // Structural pass over the transition section, then the admitted pass:
-        // structural correspondence alone never enters the transition map.
+        // Structural pass over the transition section, then the unreadable
+        // pass: structural correspondence alone never enters the transition
+        // map, and a snapshot-local pass holds no CURRENT owner receipt, so
+        // no row can satisfy owner readback here.
         for row in &snapshot.admitted_root_transitions {
             admit_transition_record(&full_map, &row.record, snapshot.revision)?;
         }
-        let mut transitions: BTreeMap<(GrantId, GrantId), AdmittedRootTransition> = BTreeMap::new();
+        let transitions: BTreeMap<(GrantId, GrantId), AdmittedRootTransition> = BTreeMap::new();
         let mut unreadable: BTreeSet<(GrantId, GrantId)> = BTreeSet::new();
         let mut transition_ids: BTreeSet<&str> = BTreeSet::new();
         for row in &snapshot.admitted_root_transitions {
@@ -615,36 +621,13 @@ impl GrantGraphRecoverySnapshot {
             if !transition_ids.insert(record.transition_id.as_str()) {
                 return Err(AuthorityError::IdentityConflict);
             }
-            let current_fence = full_map
-                .get(&child_id)
-                .map(|child| child.binding.state_fence.clone())
-                .ok_or(AuthorityError::InvalidField("root_transition.child"))?;
-            let admitted = match (full_map.get(&parent_id), full_map.get(&child_id)) {
-                (Some(parent), Some(child)) => AdmittedRootTransition::admit_restored(
-                    row,
-                    parent,
-                    child,
-                    snapshot.revision,
-                    &current_fence,
-                ),
-                _ => Err(AuthorityError::InvalidField("root_transition.edge")),
-            };
-            match admitted {
-                Ok(admitted) => {
-                    if transitions
-                        .insert((parent_id, child_id), admitted)
-                        .is_some()
-                    {
-                        return Err(AuthorityError::IdentityConflict);
-                    }
-                }
-                // Evidence that no longer matches CURRENT state is not authority:
-                // its child becomes inert quarantined evidence instead of a
-                // silently activated crossing.
-                Err(_) => {
-                    unreadable.insert((parent_id, child_id));
-                }
-            }
+            // Without a CURRENT validated receipt this row is unreadable
+            // owner evidence, however self-consistent its stored fields are:
+            // its child migrates to inert quarantine in `partition_restored`
+            // instead of a silently activated crossing. Re-admission runs
+            // only through `AdmittedRootTransition::admit_restored` with a
+            // CURRENT receipt plus CURRENT grants, revision, and fence.
+            unreadable.insert((parent_id, child_id));
         }
         let probe = GrantGraph {
             grants: full_map,
@@ -1946,11 +1929,10 @@ impl GrantGraph {
                 "grant_graph_recovery.partition",
             ));
         }
-        // Drop receipts orphaned by quarantine: a receipt whose parent or
+        // Drop crossings orphaned by quarantine: a crossing whose parent or
         // child no longer names an admitted grant is never consulted (all
-        // lookups key on in-map pairs), and retaining it would break
-        // re-emission round-trip (restore_owned re-admits receipts against
-        // the grants section only).
+        // lookups key on in-map pairs). Snapshot-local restore admits no
+        // crossing at all, so this only states the invariant.
         self.transitions.retain(|(parent, child), _| {
             admitted.contains_key(parent) && admitted.contains_key(child)
         });
