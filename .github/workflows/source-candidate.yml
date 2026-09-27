@@ -139,7 +139,7 @@ jobs:
           $sourceSha = (git rev-parse HEAD).Trim()
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Manual Source Candidate Run Manifest"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Source SHA: $sourceSha"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Actions: checkout@11bd7190, cache@1bd1e32a"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Actions: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683, actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: pinned rust-toolchain.toml identity shown via rustup show active-toolchain (no latest installer)"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cargo: --locked workspace check/clippy/test/build with nonzero listed and executed tests"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- NuGet: locked-mode restore of Eliot.Operator and Eliot.Operator.Tests packages.lock.json files"
