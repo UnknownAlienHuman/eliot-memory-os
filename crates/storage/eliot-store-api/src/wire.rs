@@ -23,10 +23,10 @@ use crate::{
     NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
     RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error, json_shape_name,
-    reconcile_same_operation, verify_canonical_request_hash,
+    SequenceDispositionRequest, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt,
+    SnapshotHandle, SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error,
+    json_shape_name, reconcile_same_operation, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -47,6 +47,17 @@ pub const CAPABILITY_APPLY: &str = "store.apply";
 /// session without this admitted capability rejects the operation before
 /// dispatch.
 pub const CAPABILITY_RESERVED_WRITE: &str = "store.reserved_write";
+/// Declared (not advertised) capability for the canonical gap-control
+/// sequence-disposition operation (issue #1684).
+///
+/// The wire variant selects this capability through
+/// [`StoreRequest::capability`], and it is deliberately absent from
+/// [`CAPABILITIES`]. It is the ONLY route that may resolve a blocked reserved
+/// position, so it is never advertised to an ordinary session: an ordinary
+/// write must not be able to reach it. API enum presence is not readiness,
+/// and a session without this admitted capability refuses the operation before
+/// dispatch.
+pub const CAPABILITY_SEQUENCE_DISPOSITION: &str = "store.sequence_disposition";
 /// Declared (not advertised) capability for the backup operation
 /// (issue #975).
 ///
@@ -257,6 +268,17 @@ pub enum StoreRequest {
     Backup {
         request: StoreBackupRequest,
     },
+    /// The named authorized gap-control transition (issue #1684).
+    ///
+    /// One coordinated wire integration: the authenticated transport context
+    /// and the closed sequence-disposition payload travel as one variant
+    /// under its own capability. It carries no domain mutation, so a normal
+    /// write request can never reach it: the shape is only constructible from
+    /// a blocked reserved position with its complete poison-operation record.
+    SequenceDisposition {
+        context: RequestMeta,
+        request: SequenceDispositionRequest,
+    },
     Recovery {
         request: StoreRecoveryRequest,
     },
@@ -330,6 +352,14 @@ impl StoreRequest {
             }
             Self::ReservedWrite { request } => request.validate(),
             Self::Backup { request } => request.validate(),
+            Self::SequenceDisposition { context, request } => {
+                context.validate().map_err(StoreError::Foundation)?;
+                request.validate()?;
+                if context.state_fence != request.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                Ok(())
+            }
             Self::RevisionHeads { keys } => bounded_unique(keys, "revision_keys", Clone::clone),
             Self::OrderingHeads { scopes } => {
                 bounded_unique(scopes, "ordering_scopes", Clone::clone)
@@ -353,6 +383,7 @@ impl StoreRequest {
             Self::Named { .. } => CAPABILITY_NAMED_READ,
             Self::Apply { .. } => CAPABILITY_APPLY,
             Self::ReservedWrite { .. } => CAPABILITY_RESERVED_WRITE,
+            Self::SequenceDisposition { .. } => CAPABILITY_SEQUENCE_DISPOSITION,
             Self::Backup { .. } => CAPABILITY_STORE_BACKUP,
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
@@ -502,6 +533,9 @@ impl StoreRequest {
                 request.validate_for_identity(request_id, identity)?;
                 Ok(())
             }
+            Self::SequenceDisposition { context, request } => {
+                validate_sequence_disposition_identity(context, request, request_id, identity)
+            }
             _ => Ok(()),
         }
     }
@@ -569,6 +603,50 @@ impl ReservedWriteRequest {
         }
         Ok(())
     }
+}
+
+/// Binds one decoded sequence-disposition request to the authenticated EBP
+/// request identity (issue #1684).
+///
+/// The transported context must equal the identity metadata and the
+/// disposition fence must equal the authenticated fence. The disposition is
+/// a governed control transition, so its own operation identity is a NEW
+/// identity distinct from the dead-lettered original: requiring the transport
+/// idempotency key to name the disposition's own control operation (never the
+/// original's) is what keeps a normal write or a re-admission of the original
+/// work from reaching this route under a borrowed key.
+fn validate_sequence_disposition_identity(
+    context: &RequestMeta,
+    request: &SequenceDispositionRequest,
+    request_id: &RequestId,
+    identity: &RequestIdentity,
+) -> Result<(), StoreWireError> {
+    request.validate().map_err(StoreWireError::Store)?;
+    identity
+        .validate()
+        .map_err(|error| StoreWireError::Protocol(error.to_string()))?;
+    if request_id != &identity.request.metadata.request_id {
+        return Err(StoreWireError::Identity(
+            "frame request_id does not match request identity metadata".to_owned(),
+        ));
+    }
+    if context != &identity.request.metadata {
+        return Err(StoreWireError::Identity(
+            "sequence-disposition context does not match request identity metadata".to_owned(),
+        ));
+    }
+    if request.state_fence != identity.request.state_fence {
+        return Err(StoreWireError::Identity(
+            "sequence-disposition fence does not match request identity".to_owned(),
+        ));
+    }
+    if identity.idempotency_key == request.operation.original.idempotency_key {
+        return Err(StoreWireError::Identity(
+            "sequence-disposition transport key must not be the dead-lettered operation's key"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_dreamer_identity(
