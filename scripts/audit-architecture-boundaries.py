@@ -1508,6 +1508,39 @@ def audit_dependencies(
     findings: list[Finding] = []
     ambiguous = frozenset(ambiguous)
 
+    # Every non-dev path ends in a normal/build declaration, so scanning each
+    # manifest catches transitive routes at their final edge too.
+    for manifest in sorted(manifests.values(), key=lambda item: item.name):
+        for edge in manifest.dependency_edges:
+            if (
+                edge.package != "eliot-test-support"
+                or edge.kind not in {"normal", "build"}
+            ):
+                continue
+            witness = _dependency_witness(
+                rule="test-support-production-boundary",
+                rule_scope="non-dev-declaration",
+                profile=PROFILE_SOURCE_WIDE,
+                path=_single_edge_path(manifests, edge),
+                manifests=manifests,
+                ambiguous=ambiguous,
+                counts=_dependency_counts(manifest, PROFILE_SOURCE_WIDE),
+                violations=1,
+            )
+            findings.append(
+                Finding(
+                    "HARD_VIOLATION",
+                    "test_support_production_dependency",
+                    manifest.path,
+                    manifest.name,
+                    f"Non-dev {edge.kind} dependency on 'eliot-test-support' "
+                    "violates the test-support boundary. "
+                    f"{_witness_suffix(witness)}",
+                    1146,
+                    witness=witness,
+                )
+            )
+
     store_table = policy.get("store_vendor", {})
     allowed_store_packages = set(store_table.get("allowed_packages", []))
     for manifest in sorted(manifests.values(), key=lambda item: item.name):
