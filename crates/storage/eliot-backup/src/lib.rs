@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod ecxf_export;
 mod isolated_restore;
 mod owner_adapters;
 mod portable_adapters;
@@ -32,6 +33,10 @@ mod product_command;
 mod product_run;
 mod restore_runner;
 
+pub use ecxf_export::{
+    CoherentSourceExport, EcxfExportReport, EcxfExportRequest, EcxfSourceStore, SealedBlobEntry,
+    WRITE_RECEIPT_RECORD_TYPE, export_ecxf_package,
+};
 pub use isolated_restore::{
     CutoverAuthorization, CutoverReceipt, IsolatedRestorePlan, IsolatedRoot, authorize_cutover,
     plan_isolated_restore,
@@ -2901,6 +2906,8 @@ pub enum BackupError {
     Blob(String),
     #[error("store contract: {0}")]
     Store(StoreError),
+    #[error("ECXF interchange contract: {0}")]
+    Interchange(String),
     #[error("serialization failed: {0}")]
     Serialization(String),
     #[error("restore target failed: {0}")]

@@ -7,7 +7,7 @@ license.workspace = true
 description = "Canonical ECXF/1 interchange source for ELIOT storage"
 
 [package.metadata.eliot]
-workspace_admission = "unreachable pending explicit owner disposition per #1716 (governed export path: #1871); not a selectable production fallback"
+workspace_admission = "single governed ECXF/1 builder per #1871 (eliot_backup::export_ecxf_package in eliot-backup, which calls EcxfArchive::build/layout and is the only writer of the format); the EcxfSourceStore port it reads has no implementor and no composition call site yet, so the format is NOT yet selectable in production and no export can complete; not a selectable storage fallback"
 
 [dependencies]
 eliot-blob-api.workspace = true
