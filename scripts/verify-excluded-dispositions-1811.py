@@ -87,21 +87,30 @@ RECEIPT_RECHECK_REL = Path(".eliot/excluded-dispositions/gate-recheck-receipt.js
 EVIDENCE = "provenance, lock, toolchain, license, SBOM"
 ADMISSION_POLICY = "deny-all"
 EVIDENCE_REFERENCE = "deny-all"
-# I15.17 build trust class. The receipt must bind a trust class, because
-# I15.17 requires that "cache identity includes trust class and
-# source/lock/toolchain fingerprints" and that "artifact reuse across trust
-# classes or mismatched BuildFingerprint is forbidden".
+# I15.17 build trust classes. The receipt binds a trust class because I15.17
+# requires that "cache identity includes trust class and source/lock/toolchain
+# fingerprints" and that "artifact reuse across trust classes or mismatched
+# BuildFingerprint is forbidden".
 #
-# No document names a trust-class value, and no trust-class taxonomy exists
-# anywhere in this repository, so exactly one class is defined rather than an
-# invented ladder: this gate runs inside a governed release build, so its
-# single class is the governed build. Tiers with no defined meaning are NOT
-# offered, because a selectable label nobody can interpret would let a caller
-# write a meaningless trust class into a supply-chain receipt and have it
-# revalidated as authoritative. The anti-reuse guarantee comes from the input
-# digests and the cache namespace derived from them, not from the label.
-GOVERNED_BUILD_TRUST_CLASS = "T0"
-DEFAULT_TRUST_CLASS = GOVERNED_BUILD_TRUST_CLASS
+# The three values are the DOCUMENT'S OWN taxonomy, quoted from
+# docs/architecture/I15-17-agent-generated-rust-build-threat-model.md
+# ("Build trust classes:"):
+#   T0 known first-party change
+#   T1 agent-generated change on admitted dependencies
+#   T2 new/untrusted dependency, build script, proc macro or foreign native code
+# They are not an invented ladder, and restricting the CLI to one of them would
+# make the cross-trust refusal in `recheck_receipt` unreachable: a T0 receipt can
+# never disagree with another T0 receipt, so "cross-trust cache reuse refused"
+# could never fire. Issue #1811's acceptance requires that cross-trust cache
+# reuse IS refused, which needs more than one class to exist.
+#
+# The DEFAULT is the one value this gate's own caller is: the release seam runs
+# the gate on a pinned, clean, isolated first-party source commit with a
+# dedicated target root, which is I15.17's T0 ("disposable worktree, dedicated
+# target, no user secrets, Job Object limits"). No document names which class
+# applies to this gate, hence the derivation above.
+TRUST_CLASSES = ("T0", "T1", "T2")
+DEFAULT_TRUST_CLASS = "T0"
 DEPENDENCY_SECTIONS = ("dependencies", "dev-dependencies", "build-dependencies")
 SECTION_ROLES = {
     "dependencies": "target-runtime",
@@ -776,10 +785,9 @@ def main() -> int:
     parser.add_argument(
         "--trust-class",
         default=DEFAULT_TRUST_CLASS,
-        # No invented ladder: see GOVERNED_BUILD_TRUST_CLASS. A caller that
-        # declares a different class is refusing this gate's own class, which
-        # fails closed rather than minting an uninterpretable receipt.
-        choices=(GOVERNED_BUILD_TRUST_CLASS,),
+        # The document's own taxonomy; an unrecognised class is refused rather
+        # than written into a supply-chain receipt.
+        choices=TRUST_CLASSES,
         help="I15.17 build trust class of the decision being made",
     )
     parser.add_argument(
