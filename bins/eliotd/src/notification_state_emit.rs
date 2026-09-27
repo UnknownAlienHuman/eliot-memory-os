@@ -283,6 +283,15 @@ pub struct AutomationFailureKey {
 pub fn automation_failure_key(
     decision: &AutomationTriggerDecision,
 ) -> Result<AutomationFailureKey, StoreError> {
+    let family_decision =
+        super::maintenance_family_catalog::entry_for(decision.family).decide(decision);
+    automation_failure_key_with_family_decision(decision, &family_decision)
+}
+
+fn automation_failure_key_with_family_decision(
+    decision: &AutomationTriggerDecision,
+    family_decision: &super::maintenance_family_catalog::MaintenanceFamilyDecision,
+) -> Result<AutomationFailureKey, StoreError> {
     let family = closed_wire_name(decision.family)?;
     let reason = closed_wire_name(decision.reason)?;
     let outcome = closed_wire_name(decision.decision)?;
@@ -302,21 +311,17 @@ pub fn automation_failure_key(
         notification_id: format!("notification-automation-{fingerprint}"),
         subject: format!("blocked maintenance automation {family}"),
         summary: format!(
-            "maintenance automation {family} at {} evaluated {outcome} for reason {reason} \
-             and admits no job; trigger identity {}",
-            decision.scope_ref, decision.trigger_id
+            "maintenance automation {family} at {} evaluated {outcome} for reason {reason}; \
+             Governor admits job: {}; catalog route admits start: {}; trigger identity {}",
+            decision.scope_ref,
+            decision.admits_job,
+            family_decision.admits_start,
+            decision.trigger_id
         ),
-        // Named after the decision's OWN closed reason, never after a cause the
-        // decision does not carry: `DecisionReason` is the closed set that
-        // states what actually blocked the job (policy off, outside schedule,
-        // route unavailable, budget unavailable, user session required,
-        // duplicate active job, expired, ...), and a fixed sentence about
-        // "absent Durable Job admission" would name a cause the Governor may
-        // not have decided at all.
-        required_action: format!(
-            "resolve the maintenance automation blocker for {family} reported as {reason} at {}",
-            decision.scope_ref
-        ),
+        // Preserve the Governor's closed reason above and carry the catalog's
+        // exact one actionable recommendation, including its reason, evidence,
+        // benefit, cost, expiry, and safe deferral consequence.
+        required_action: family_decision.recommendation.text(),
         fingerprint,
         owner: MAINTENANCE_AUTHORITY_OWNER.to_owned(),
         affected_scope: decision.scope_ref.clone(),
@@ -467,10 +472,12 @@ pub async fn emit_blocked_automation_notification(
     state_fence: StateFence,
     decision: &AutomationTriggerDecision,
 ) -> Result<Option<NotificationStateEmit>, NotificationEmitError> {
-    if decision.admits_job {
+    let family_decision =
+        super::maintenance_family_catalog::entry_for(decision.family).decide(decision);
+    if decision.admits_job && family_decision.admits_start {
         return Ok(None);
     }
-    let key = automation_failure_key(decision)?;
+    let key = automation_failure_key_with_family_decision(decision, &family_decision)?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     if notification_already_recorded(&reads, &key, &state_fence).await? {
         return Ok(None);

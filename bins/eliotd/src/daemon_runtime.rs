@@ -554,34 +554,29 @@ pub(super) fn run() -> Result<(), String> {
     // instead of withholding readiness for the whole daemon. It performs no IO
     // and starts nothing.
     let startup_readiness = StartupReadinessProjection::new(bindings, &composition);
-    // #1688 (I14.22): the Governor-owned maintenance trigger evaluator runs
-    // here, at the one startup-reconciliation site that holds both the concrete
-    // `Arc<DaemonKernelClient>` and the composition, and again once the declared
-    // startup binding ledger has completed. The first pass observes that owner
-    // recovery just rebuilt every owner at the current fence; the second
-    // observes that the daemon is now whole, so first-run obligations became
-    // visible. Both are pure reads of the composed Governor owner: no queue,
-    // no scheduler, no background maintenance loop, and no new thread. Neither
-    // is a startup gate - a trigger that cannot be evaluated is recorded as a
-    // typed gap and the daemon continues, exactly like the attach paths above.
-    note_maintenance_trigger_at(
-        &composition,
-        MaintenanceTriggerOrigin::StartupReconciliation,
-        vec![startup_readiness.ledger_report()],
-        false,
-    );
-    note_maintenance_trigger_at(
-        &composition,
-        MaintenanceTriggerOrigin::ColdStartCompletion,
-        vec![
-            format!(
-                "startup_bindings_complete={}",
-                startup_readiness.every_declared_capability_bound()
-            ),
-            startup_readiness.report(),
-        ],
-        false,
-    );
+    // #1688/#1693 (I14.22): retain the two real startup observations for the
+    // run-loop maintenance flight. The flight evaluates them after the daemon
+    // has published its ready projection, does no startup/readiness gating,
+    // and submits any unavailable-family decision through the canonical
+    // notification path using only the composition's admitted fence.
+    let startup_maintenance_observations = [
+        maintenance_observation(
+            MaintenanceTriggerOrigin::StartupReconciliation,
+            vec![startup_readiness.ledger_report()],
+            false,
+        ),
+        maintenance_observation(
+            MaintenanceTriggerOrigin::ColdStartCompletion,
+            vec![
+                format!(
+                    "startup_bindings_complete={}",
+                    startup_readiness.every_declared_capability_bound()
+                ),
+                startup_readiness.report(),
+            ],
+            false,
+        ),
+    ];
     // Issue #88, wave 3: the ready answer carries the once-per-generation
     // supervision bundle. The per-tick producer below cites it verbatim; the
     // Kernel re-verifies every echoed field on each submit.
@@ -702,6 +697,7 @@ pub(super) fn run() -> Result<(), String> {
         Arc::clone(&composition),
         supervision_progress,
         startup_readiness,
+        startup_maintenance_observations,
     ));
     // The loop dropped its handle on return, so this unwrap is deterministic;
     // the error arm documents the invariant instead of panicking on it.
@@ -1176,6 +1172,7 @@ async fn run_loop(
     // delta it actually observed, so there is one authoritative copy and a
     // late completion can never overwrite newer owner observations.
     startup_readiness: StartupReadinessProjection,
+    startup_maintenance_observations: [MaintenanceObservation; 2],
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // One projection instance is shared with the heartbeat future. Both
@@ -1230,6 +1227,12 @@ async fn run_loop(
     // but its wait remains in this independently polled flight. A later tick
     // cannot replace the observation already retained here.
     let mut maintenance_flight = MaintenanceFlight::Idle;
+    maybe_start_startup_maintenance_triggers(
+        &kernel,
+        &composition,
+        startup_maintenance_observations,
+        &mut maintenance_flight,
+    );
     // Health is a one-slot polled flight: a busy tick is coalesced and the
     // sole supervision producer moves into the future until settlement.
     let mut health_heartbeat_flight = HealthHeartbeatFlight::Idle;
@@ -1320,6 +1323,7 @@ async fn run_loop(
                 // literal. Separate cadence and separate observation from the
                 // health-heartbeat admitted-observation trigger below.
                 maybe_start_idle_maintenance_trigger(
+                    &kernel,
                     &composition,
                     &flight,
                     &mut maintenance_flight,
@@ -1619,27 +1623,75 @@ fn maintenance_observation(
     }
 }
 
-/// Runs one Governor maintenance trigger evaluation from a real durable
-/// trigger site (I14.22, issue #1688).
-///
-/// This is the single runtime entry for every wired trigger. It is
-/// deliberately tolerant: [`DaemonComposition::note_maintenance_trigger`]
-/// records an explicit typed gap through the existing minimal operational
-/// diagnostics and returns, so a maintenance observation can never become a
-/// startup gate, a readiness gate, or a daemon-killing error. I14.22 keeps an
-/// unevaluable trigger durable and surfaces it on the next eligible startup
-/// rather than dropping it.
-fn note_maintenance_trigger_at(
+/// Evaluates one real maintenance observation and captures the exact admitted
+/// fence the durable notification will use. A successful Governor decision is
+/// always handed to the notification owner: it decides whether the Governor
+/// admitted a job and the family catalog admits its execution route.
+fn maintenance_notification_candidate(
     composition: &DaemonComposition,
-    origin: MaintenanceTriggerOrigin,
-    evidence_refs: Vec<String>,
-    activation_in_flight: bool,
+    observation: MaintenanceObservation,
+) -> Option<(
+    eliot_contracts::StateFence,
+    eliot_maintenance::AutomationTriggerDecision,
+)> {
+    let decision = match composition.evaluate_maintenance_trigger(observation) {
+        Ok(decision) => decision,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+            return None;
+        }
+    };
+    match composition.notification_state_admission_fence() {
+        Ok(fence) => Some((fence, decision)),
+        Err(error) => {
+            // No exchange is attempted until the composition exposes an
+            // admitted Kernel fence. This remains a diagnostic gap, never a
+            // startup or readiness gate.
+            let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+            None
+        }
+    }
+}
+
+/// Evaluates one observation under the composition lock, then drops the guard
+/// before the canonical notification exchange. The exchange is a retained
+/// run-loop flight rather than detached work.
+async fn evaluate_and_emit_maintenance_notification(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    observation: MaintenanceObservation,
 ) {
-    composition.note_maintenance_trigger(maintenance_observation(
-        origin,
-        evidence_refs,
-        activation_in_flight,
-    ));
+    let candidate = {
+        let guard = composition.lock().await;
+        maintenance_notification_candidate(&guard, observation)
+    };
+    if let Some((fence, decision)) = candidate {
+        note_blocked_automation_notification(kernel, fence, &decision).await;
+    }
+}
+
+/// Starts the two startup observations in the one retained maintenance
+/// flight. The run loop continues polling all other work while any bounded
+/// notification exchange is in progress.
+fn maybe_start_startup_maintenance_triggers(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    observations: [MaintenanceObservation; 2],
+    flight: &mut MaintenanceFlight,
+) {
+    if !matches!(flight, MaintenanceFlight::Idle) {
+        return;
+    }
+    let kernel = Arc::clone(kernel);
+    let composition = Arc::clone(composition);
+    *flight = MaintenanceFlight::InFlight(MaintenanceFlightState {
+        future: Box::pin(async move {
+            for observation in observations {
+                evaluate_and_emit_maintenance_notification(&kernel, &composition, observation)
+                    .await;
+            }
+        }),
+    });
 }
 
 /// Captures the idle trigger from the activation-poll cadence observation.
@@ -1662,6 +1714,7 @@ fn idle_maintenance_observation(flight: &ActivationFlight) -> MaintenanceObserva
 /// idle. Capturing the observation before creating the future preserves the
 /// actual activation state that triggered it; a busy flight is left untouched.
 fn maybe_start_idle_maintenance_trigger(
+    kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     activation_flight: &ActivationFlight,
     flight: &mut MaintenanceFlight,
@@ -1670,11 +1723,11 @@ fn maybe_start_idle_maintenance_trigger(
         return;
     }
     let observation = idle_maintenance_observation(activation_flight);
+    let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
     *flight = MaintenanceFlight::InFlight(MaintenanceFlightState {
         future: Box::pin(async move {
-            let guard = composition.lock().await;
-            guard.note_maintenance_trigger(observation);
+            evaluate_and_emit_maintenance_notification(&kernel, &composition, observation).await;
         }),
     });
 }
@@ -1693,8 +1746,8 @@ fn settle_maintenance_completion(flight: &mut MaintenanceFlight) {
     *flight = MaintenanceFlight::Idle;
 }
 
-/// Submits one owner-side canonical notification for a blocked automation
-/// decision (issue #1780, I11.5).
+/// Submits one owner-side canonical notification when the evaluated family
+/// cannot start (issues #1780/#1693, I11.5/I14.22).
 ///
 /// I11.5 makes the persistent record the durable obligation and delivery only
 /// the presentation, so a refused emission is an explicit typed gap recorded
@@ -1842,11 +1895,11 @@ async fn run_health_heartbeat_tick(
     // signal. `activation_in_flight` is the activation state captured when
     // this timer event started the flight, so maintenance and supervision use
     // one immutable observation even as the loop continues polling work.
-    // Issue #1780 (I11.5): an admitted automation decision that admits no job
-    // is an automation failure, and I11.5 requires it to become one persistent
-    // canonical notification instead of a log line. The decision and the
-    // admission fence are both taken from the composition under this one lock;
-    // the canonical write itself happens after the lock is released, so no
+    // Issue #1780/#1693 (I11.5/I14.22): hand every successful decision plus its
+    // admitted fence to the notification owner. It checks both Governor job
+    // admission and the registered family's execution route, so a Governor-
+    // admitted decision whose family route cannot start is still persisted.
+    // The canonical write itself happens after this lock is released, so no
     // Kernel exchange ever crosses the composition mutex (issue #18 N3).
     let (readiness_verdict, readiness_report, blocked_automation) = {
         let guard = composition.lock().await;
@@ -1879,7 +1932,6 @@ async fn run_health_heartbeat_tick(
             ],
             activation_in_flight,
         )) {
-            Ok(decision) if decision.admits_job => None,
             Ok(decision) => match guard.notification_state_admission_fence() {
                 Ok(fence) => Some((fence, decision)),
                 // A not-ready composition is a typed refusal, not a reason to
