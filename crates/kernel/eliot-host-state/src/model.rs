@@ -1101,9 +1101,30 @@ impl DependencyResourceBudget {
     }
 }
 
+/// Strictly operational, Host-owned record for one managed dependency process
+/// (Implementation I1.9's fourth registry, kept in this minimal
+/// `HostStateJournal` rather than in Kernel ORS or Canonical Memory).
+///
+/// It binds the five operational properties the canonical-store process needs:
+/// the approved artifact/config hashes that approve the exact process
+/// ([`ManagedDependencyRecord::approved_artifact_hash`],
+/// [`ManagedDependencyRecord::approved_config_hash`]); launch lineage as the
+/// immutable [`ImmutableProcessManifest`] plus the process
+/// [`EpochTransition`] that launched it; Job Object/PID lineage as
+/// [`ManagedDependencyRecord::pid_job_lineage_refs`]; observed liveness as the
+/// carried [`PortOutcome`] process observation; and the restart budget as the
+/// remaining start/stop/restart counts in [`DependencyLifecycleBudget`]. It
+/// carries no DB claim, task state, schema meaning or canonical authority.
+///
+/// Two properties are enforced rather than asserted. An `Active` state is
+/// admitted only when the carried observation itself reports live liveness,
+/// because a managed dependency is alive when Host/Watchdog observed it alive,
+/// never because no stop was recorded. Inside one process generation the
+/// remaining budget is monotonic non-increasing, so an over-committed budget is
+/// refused rather than clamped.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DependencyRecord {
+pub struct ManagedDependencyRecord {
     pub fence: RecordFence,
     pub operation: IdempotencyIdentity,
     pub dependency: PlatformHandle,
@@ -1120,7 +1141,7 @@ pub struct DependencyRecord {
     pub disposition_evidence: Vec<PlatformHandle>,
 }
 
-impl DependencyRecord {
+impl ManagedDependencyRecord {
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
@@ -1135,14 +1156,32 @@ impl DependencyRecord {
         handle(&self.approved_artifact_hash, "approved_artifact_hash")?;
         handle(&self.approved_config_hash, "approved_config_hash")?;
         handles(&self.disposition_evidence, "disposition_evidence", true)?;
-        if self.state == DependencyState::Active && !matches!(self.outcome, PortOutcome::Known(_)) {
+        if self.state == DependencyState::Active && !self.observed_liveness() {
             return Err(JournalError::Invalid(
-                "active dependency requires a known process observation".into(),
+                "active dependency requires a process observation reporting live liveness".into(),
             ));
         }
         Ok(())
     }
+
+    /// Liveness is read only from the carried process observation. Absence,
+    /// an incomplete observation and provider failure are not observations, and
+    /// a terminal observed process state is not liveness either. Nothing here
+    /// consults `state`, a stop record, or any other dependency's outcome.
+    fn observed_liveness(&self) -> bool {
+        match &self.outcome {
+            PortOutcome::Known(process) => {
+                process.health.liveness == HealthDimension::Healthy && !process.state.is_terminal()
+            }
+            PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => false,
+        }
+    }
 }
+
+/// Compatibility alias for the canonical [`ManagedDependencyRecord`]. Host code
+/// that names the historical `DependencyRecord` type keeps compiling against
+/// the one canonical operational record; no parallel implementation remains.
+pub type DependencyRecord = ManagedDependencyRecord;
 
 fn validate_process_outcome(
     outcome: &PortOutcome<ServiceProcessRecord>,
@@ -2216,7 +2255,7 @@ pub(crate) fn store_rebind_transition(
 pub enum HostStateRecord {
     Activation(EliotActivationRecord),
     Kernel(KernelRecord),
-    Dependency(DependencyRecord),
+    Dependency(ManagedDependencyRecord),
     Drain(DrainRecord),
     DrainCommit(DrainCommitRecord),
     Wake(WakeRecord),
@@ -2332,7 +2371,7 @@ pub struct HostState {
     /// Retained/recovered evidence exists, but no exact prior Kernel record
     /// was available. Kernel authority must remain fenced in this state.
     pub prior_kernel_unknown: bool,
-    pub dependencies: Vec<DependencyRecord>,
+    pub dependencies: Vec<ManagedDependencyRecord>,
     pub drain: Option<DrainRecord>,
     pub drain_commit: Option<DrainCommitRecord>,
     pub wakes: Vec<WakeRecord>,
@@ -2734,8 +2773,8 @@ pub(crate) fn kernel_transition(
 }
 
 pub(crate) fn dependency_transition(
-    current: Option<&DependencyRecord>,
-    next: &DependencyRecord,
+    current: Option<&ManagedDependencyRecord>,
+    next: &ManagedDependencyRecord,
 ) -> Result<(), JournalError> {
     let Some(current) = current else {
         return if matches!(
@@ -2769,6 +2808,26 @@ pub(crate) fn dependency_transition(
         || current.resource_budget != next.resource_budget
     {
         return Err(JournalError::StaleFence);
+    }
+    // The admitted budget is spent, never re-granted: inside one process
+    // generation every remaining count is monotonic non-increasing. Raising a
+    // count is an over-commit, and it is refused here rather than clamped into
+    // the projection, because a silently clamped count would report a restart
+    // allowance this generation's admitted budget never granted (I1.4:
+    // "quarantine — after restart-budget exhaustion"). A direct-child process
+    // generation returns above and re-issues its own budget, so the rule does
+    // not cross that edge.
+    if next.lifecycle_budget.start_attempts_remaining
+        > current.lifecycle_budget.start_attempts_remaining
+        || next.lifecycle_budget.stop_attempts_remaining
+            > current.lifecycle_budget.stop_attempts_remaining
+        || next.lifecycle_budget.restart_attempts_remaining
+            > current.lifecycle_budget.restart_attempts_remaining
+    {
+        return Err(JournalError::Invalid(
+            "dependency lifecycle budget must not be over-committed within one process generation"
+                .into(),
+        ));
     }
     let legal = matches!(
         (current.state, next.state),
