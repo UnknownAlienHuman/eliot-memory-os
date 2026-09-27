@@ -9,9 +9,17 @@ the workspace is *forbidden* until its admission conditions are met, yet it
 ships 1 424 lines and 16 passing tests that no gate runs.
 
 It also compile-checks the test targets of every package listed in the root
-workspace `exclude` (Cargo.toml:139-185), which no workspace-wide `cargo test`
+workspace `exclude` (Cargo.toml:216), which no workspace-wide `cargo test`
 reaches, with a locked no-run build per package when `<crate>/Cargo.lock`
 exists and an offline no-run build otherwise (lockless libraries).
+
+That excluded cohort is currently EMPTY: the root `exclude` list measures
+`exclude = []` with 188 members. So the excluded-capability-cell leg below
+covers zero crates today, and `--list` reports `exclude:` for none of them.
+This is recorded as a measured value, not as an assumed one: an empty
+exclusion set is not evidence that every unadmitted crate is admitted. The
+discovery is tree-derived and the count is printed, so the denominator can
+never again be stated here as a number the code does not produce.
 
 This verifier discovers those crates from the tree rather than a hand-written
 list, and runs fmt, clippy and the tests for each one. It does not admit any
@@ -51,7 +59,7 @@ def exclude_norun_steps(crate: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
     #   lockless cohort uses `--offline` (documented equivalent per that help;
     #   compiles all targets without network using the cached registry).
     # - If `<crate>/Cargo.lock` exists, keep `--locked` (locked-cargo
-    #   convention scripts/verify.ps1:291); the 45 root workspace.exclude
+    #   convention scripts/verify.ps1:291); the root workspace.exclude
     #   packages are lockless libraries (no committed Cargo.lock;
     #   crates/*/*/Cargo.lock gitignored per .gitignore:77), so they take the
     #   `--offline` branch. A generated Cargo.lock is gitignored build output
