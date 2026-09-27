@@ -22,14 +22,59 @@ use eliot_platform_windows::{
 };
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationOwnerReadback,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding, AgentActivationResultAck,
-    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
-    AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
-    AgentBridgeAuthenticatedBinding, AgentBridgePeerChallenge, Frame, FrameKind, MessageType,
-    ProtocolPayload, RequestIdentity,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationDirectiveKind,
+    AgentActivationOwnerReadback, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationFence,
+    AgentBridgeActivationRequest, AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding,
+    AgentBridgePeerChallenge, AgentResponseDisposition, Frame, FrameKind, MessageType,
+    OpenAgentBridgeActivationDisposition, OpenAgentBridgeActivationResponse, ProtocolPayload,
+    RequestIdentity,
 };
+
+fn canonical_activation_denial(
+    detail: &AgentActivationResolutionDisposition,
+) -> Option<(
+    &'static str,
+    AgentResponseDisposition,
+    AgentActivationDirectiveKind,
+)> {
+    let (code, disposition, directive) = match detail {
+        AgentActivationResolutionDisposition::Resolved { .. } => return None,
+        AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => (
+            "TASK_SELECTION_REQUIRED",
+            AgentResponseDisposition::InvalidRequest,
+            AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection,
+        ),
+        AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => (
+            "TASK_SCOPE_INCOMPATIBLE",
+            AgentResponseDisposition::InvalidRequest,
+            AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection,
+        ),
+        AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => (
+            "AMBIGUOUS_RESULT",
+            AgentResponseDisposition::StaleOrConflict,
+            AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection,
+        ),
+        AgentActivationResolutionDisposition::NotReady { .. } => (
+            "DEFERRED_CAPACITY",
+            AgentResponseDisposition::UnavailableOrCapacity,
+            AgentActivationDirectiveKind::RetryRequiresNewTicket,
+        ),
+        AgentActivationResolutionDisposition::StaleFence { .. } => (
+            "STALE_STATE_FENCE",
+            AgentResponseDisposition::StaleOrConflict,
+            AgentActivationDirectiveKind::StaleFenceFailClosed,
+        ),
+        AgentActivationResolutionDisposition::FailedInternal { .. } => (
+            "RUNTIME_FAILED",
+            AgentResponseDisposition::Failed,
+            AgentActivationDirectiveKind::FailureCapsule,
+        ),
+    };
+    eliot_protocol::agent_reason_code(code).map(|entry| (entry.code, disposition, directive))
+}
 
 fn observe_bridge(event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
@@ -1720,8 +1765,45 @@ impl KernelComposition {
         reason_code: AgentBridgeActivationDenialCode,
         detail: Option<AgentActivationResolutionDisposition>,
     ) -> Result<Frame, TransportError> {
-        let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code, detail)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let response = match detail {
+            Some(detail) => {
+                let (code, disposition, directive) =
+                    canonical_activation_denial(&detail).ok_or(TransportError::SessionFenced)?;
+                OpenAgentBridgeActivationResponse::canonical_denied(
+                    &pending.request,
+                    code.to_owned(),
+                    disposition,
+                    directive,
+                    detail,
+                )
+                .map_err(|_| TransportError::SessionFenced)?
+            }
+            None => {
+                let legacy =
+                    AgentBridgeActivationResponse::denied(&pending.request, reason_code, None)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                let eliot_protocol::AgentBridgeActivationDisposition::Denied {
+                    reason_code,
+                    detail,
+                } = legacy.disposition
+                else {
+                    return Err(TransportError::SessionFenced);
+                };
+                OpenAgentBridgeActivationResponse {
+                    wire_id: legacy.wire_id,
+                    wire_version: legacy.wire_version,
+                    request_id: legacy.request_id,
+                    request_sha256: legacy.request_sha256,
+                    disposition: OpenAgentBridgeActivationDisposition::Denied {
+                        reason_code,
+                        detail,
+                    },
+                    response_sha256: String::new(),
+                }
+                .with_computed_digest()
+                .map_err(|_| TransportError::SessionFenced)?
+            }
+        };
         response
             .validate_request(&pending.request)
             .map_err(|_| TransportError::SessionFenced)?;

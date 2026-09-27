@@ -81,17 +81,11 @@ pub(super) fn agent_disposition_for_denial(code: AgentBridgeActivationDenialCode
 /// `AMBIGUOUS_RESULT` (state/conflict), `DEFERRED_CAPACITY`
 /// (capacity/availability), `STALE_STATE_FENCE` (state/conflict),
 /// `RUNTIME_FAILED` (route/integration), `UNKNOWN_OUTCOME`
-/// (security/recovery). Exhaustive with no wildcard arm.
-pub(super) fn agent_reason_for_denial(code: AgentBridgeActivationDenialCode) -> &'static str {
-    match code {
-        AgentBridgeActivationDenialCode::TaskSelectionRequired => "TASK_SELECTION_REQUIRED",
-        AgentBridgeActivationDenialCode::ScopeSelectionRequired => "TASK_SCOPE_INCOMPATIBLE",
-        AgentBridgeActivationDenialCode::ScopeAmbiguous => "AMBIGUOUS_RESULT",
-        AgentBridgeActivationDenialCode::NotReady => "DEFERRED_CAPACITY",
-        AgentBridgeActivationDenialCode::StaleFence => "STALE_STATE_FENCE",
-        AgentBridgeActivationDenialCode::FailedInternal => "RUNTIME_FAILED",
-        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => "UNKNOWN_OUTCOME",
-    }
+/// (security/recovery). A missing alias fails closed at the caller.
+pub(super) fn agent_reason_for_denial(
+    code: AgentBridgeActivationDenialCode,
+) -> Option<&'static str> {
+    eliot_protocol::bridge_reason_code_alias(code.as_str())
 }
 
 /// I7.20 Recovery / Conflict Directive kind for a typed activation denial.
@@ -148,7 +142,9 @@ pub(super) fn denial_report_for(
         return Err(provider_failure());
     }
     eliot_agent_bridge_core::ActivationDenialReport::new(
-        agent_reason_for_denial(code).to_owned(),
+        agent_reason_for_denial(code)
+            .ok_or_else(provider_failure)?
+            .to_owned(),
         agent_disposition_for_denial(code).to_owned(),
         denial_directive_kind(code).to_owned(),
         operation.to_owned(),
