@@ -664,7 +664,12 @@ function Test-IntegrationHarnessInventoryRow {
         }
     }
     $identity = ('{0}::{1}::{2}::{3}' -f $Row['packageId'], $Row['targetKind'], $Row['targetName'], $Row['testName'])
-    if ($identity -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,511}$') {
+    $packageId = [string]$Row['packageId']
+    $targetIdentity = ('{0}::{1}::{2}' -f $Row['targetKind'], $Row['targetName'], $Row['testName'])
+    if ($identity.Length -gt 512 -or
+        $packageId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:/+() #@%-]{0,510}$' -or
+        $packageId.Contains('::') -or
+        $targetIdentity -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,511}$') {
         throw [System.ArgumentException]::new("HARNESS-INVALID-ROW: identity '$identity' has an illegal shape.")
     }
     [void](Test-IntegrationHarnessDigestFormat -Digest ([string]$Row['rowDigest']))
