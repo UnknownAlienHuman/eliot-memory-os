@@ -147,7 +147,8 @@ impl McpForwardingPort for FakeForwarder {
         &mut self,
         _binding: &AttachBinding,
         _result: &ReconciliationPortResult,
-    ) {
+    ) -> Result<(), ProviderFailure> {
+        Ok(())
     }
 }
 
