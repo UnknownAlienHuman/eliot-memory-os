@@ -362,19 +362,9 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         {
             return Err(ProcessStreamSinkError::TotalLimitExceeded);
         }
-        let pressured = u64::from(limits.max_in_flight_chunks()) <= state.next_sequence
-            || request.byte_length()
-                > limits
-                    .max_in_flight_bytes()
-                    .saturating_sub(state.next_offset);
-        if pressured {
-            if request.wait_budget_ms() == 0 {
-                return Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded);
-            }
-            return Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                retry_after_ms: limits.max_append_wait_ms(),
-            });
-        }
+        // This synchronous adapter has no append queue: each request is
+        // admitted as one bounded chunk. The total byte and chunk ceilings
+        // bound staged memory and reject overflow explicitly above.
         state.digester.update(request.bytes());
         state.staged.extend_from_slice(request.bytes());
         state.next_sequence = state.next_sequence.saturating_add(1);
