@@ -231,6 +231,10 @@ struct LedgerRow {
     verb: &'static str,
     group: String,
     owner: String,
+    /// The ledger published this row under its excluded-scope section, so the
+    /// package is a standalone excluded crate and not a workspace member that is
+    /// merely unreachable from a binary.
+    excluded: bool,
 }
 
 impl LedgerRow {
@@ -238,6 +242,7 @@ impl LedgerRow {
         line: &str,
         heading_verb: Option<&'static str>,
         sub: Option<&'static str>,
+        excluded: bool,
     ) -> Option<Self> {
         let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
         if cells.len() < 2 {
@@ -260,6 +265,7 @@ impl LedgerRow {
             verb,
             group: group.to_owned(),
             owner: cells.get(2).unwrap_or(&"").trim_matches('`').to_owned(),
+            excluded,
         })
     }
 
@@ -276,6 +282,10 @@ impl LedgerRow {
             self.group.as_str()
         }
     }
+}
+
+fn opt_text(value: Option<&String>) -> Value {
+    value.map_or(Value::Null, |item| Value::from(item.clone()))
 }
 
 fn verb_of(cell: &str) -> Option<&'static str> {
@@ -312,6 +322,7 @@ fn parse_ledger(path: &Path) -> Result<BTreeMap<String, LedgerRow>, DevCrateChec
     let mut rows: BTreeMap<String, LedgerRow> = BTreeMap::new();
     let mut heading_verb: Option<&'static str> = None;
     let mut sub: Option<&'static str> = None;
+    let mut excluded = false;
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(heading) = trimmed.strip_prefix("## ") {
@@ -319,6 +330,7 @@ fn parse_ledger(path: &Path) -> Result<BTreeMap<String, LedgerRow>, DevCrateChec
                 .iter()
                 .copied()
                 .find(|verb| heading.starts_with(&format!("{verb} ")));
+            excluded = heading.starts_with("Excluded scope");
             sub = None;
             continue;
         }
@@ -332,7 +344,7 @@ fn parse_ledger(path: &Path) -> Result<BTreeMap<String, LedgerRow>, DevCrateChec
             }
         }
         if trimmed.starts_with('|') {
-            if let Some(row) = LedgerRow::parse(trimmed, heading_verb, sub) {
+            if let Some(row) = LedgerRow::parse(trimmed, heading_verb, sub, excluded) {
                 rows.entry(row.package.clone()).or_insert(row);
             }
             continue;
@@ -345,6 +357,7 @@ fn parse_ledger(path: &Path) -> Result<BTreeMap<String, LedgerRow>, DevCrateChec
                         verb: "KEEP",
                         group: sub.unwrap_or("KEEP").to_owned(),
                         owner: String::new(),
+                        excluded,
                     };
                     rows.entry(row.package.clone()).or_insert(row);
                 }
@@ -360,48 +373,81 @@ fn parse_ledger(path: &Path) -> Result<BTreeMap<String, LedgerRow>, DevCrateChec
     Ok(rows)
 }
 
+/// Emit an explicit disposition for every package the ledger enumerates.
+///
+/// The ledger is the closed enumeration of unreachable and excluded packages,
+/// so it is the driver: a package the corpus reports as unreachable or excluded
+/// but that the ledger omits is still reported, as `undispositioned`, because a
+/// package may not fall outside the proof and runtime topology without a
+/// recorded verdict. The corpus `reachability` is carried beside each row as
+/// the independent corroboration, and its absence is reported rather than
+/// defaulted.
 fn dispositions(repo_root: &Path) -> Result<Value, DevCrateCheckError> {
     let index_path = repo_root.join(CAPSULE_INDEX);
     let index = read_json(&index_path)?;
     let ledger = parse_ledger(&repo_root.join(DISPOSITION_LEDGER))?;
     let cells = array(&index, "cells", &index_path)?;
+    let corpus: BTreeMap<String, String> = cells
+        .iter()
+        .filter_map(|cell| {
+            Some((
+                text(cell, "crate", &index_path).ok()?,
+                text(cell, "reachability", &index_path).ok()?,
+            ))
+        })
+        .collect();
+    // The ledger's excluded-scope section is the only source that separates an
+    // excluded standalone package from a workspace member unreachable from a
+    // binary; the corpus reachability corroborates but never overrides it.
+    let scope_of = |row: &LedgerRow, reachability: Option<&String>| -> &'static str {
+        if row.excluded || reachability.is_some_and(|value| value == "EXCLUDED") {
+            "excluded"
+        } else {
+            "unreachable-from-binary"
+        }
+    };
     let mut entries: Vec<Value> = Vec::new();
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-    for cell in cells {
-        let reachability = text(cell, "reachability", &index_path)?;
-        if reachability != "UNREACHABLE" && reachability != "EXCLUDED" {
-            continue;
-        }
-        let package = text(cell, "crate", &index_path)?;
-        let (disposition, verb, group, owner) = match ledger.get(&package) {
-            Some(row) => (
-                disposition_for(row.verb, row.effective_group()),
-                Value::from(row.verb),
-                Value::from(row.effective_group()),
-                json!(row.owner),
-            ),
-            None => (
-                Disposition::Undispositioned,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ),
-        };
+    let mut undisp: Vec<&String> = corpus
+        .keys()
+        .filter(|package| {
+            matches!(
+                corpus.get(*package).map(String::as_str),
+                Some("UNREACHABLE" | "EXCLUDED")
+            ) && !ledger.contains_key(*package)
+        })
+        .collect();
+    undisp.sort();
+    for row in ledger.values() {
+        let reachability = corpus.get(&row.package);
+        let scope = scope_of(row, reachability);
+        let disposition = disposition_for(row.verb, row.effective_group());
         *counts
-            .entry(format!(
-                "{reachability} {} {}",
-                disposition.as_str(),
-                verb.as_str().unwrap_or("UNRECORDED")
-            ))
+            .entry(format!("{scope} {}", disposition.as_str()))
             .or_default() += 1;
         entries.push(json!({
-            "package": package,
-            "reachability": reachability,
+            "package": row.package,
+            "scope": scope,
             "disposition": disposition.as_str(),
-            "disposition_verb": verb,
-            "disposition_group": group,
-            "owner": owner,
+            "disposition_verb": row.verb,
+            "disposition_group": row.effective_group(),
+            "owner": row.owner,
+            "corpus_reachability": opt_text(reachability),
             "disposition_source": DISPOSITION_LEDGER,
+        }));
+    }
+    for package in undisp {
+        *counts.entry("undispositioned".to_owned()).or_default() += 1;
+        entries.push(json!({
+            "package": package,
+            "scope": "unreachable-from-binary",
+            "disposition": Disposition::Undispositioned.as_str(),
+            "disposition_verb": Value::Null,
+            "disposition_group": Value::Null,
+            "owner": Value::Null,
+            "corpus_reachability": opt_text(corpus.get(package)),
+            "disposition_source": DISPOSITION_LEDGER,
+            "note": "The corpus reports this package as unreachable or excluded, but the ledger carries no disposition row for it. It stays fail-closed and is never reported as a pass.",
         }));
     }
     entries.sort_by(|left, right| {
@@ -414,6 +460,11 @@ fn dispositions(repo_root: &Path) -> Result<Value, DevCrateCheckError> {
         "ledger": DISPOSITION_LEDGER,
         "ledger_rows": ledger.len(),
         "reported": entries.len(),
+        "corpus_index": CAPSULE_INDEX,
+        "corpus_capability_coverage": index
+            .get("capability_coverage")
+            .cloned()
+            .unwrap_or(Value::Null),
         "counts": counts,
         "dispositions": entries,
     }))
