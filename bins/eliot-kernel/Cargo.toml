@@ -23,6 +23,7 @@ blake3.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-installation.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true

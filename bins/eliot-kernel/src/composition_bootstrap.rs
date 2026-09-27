@@ -100,6 +100,34 @@ impl KernelComposition {
     pub fn watchdog_backup_owner_client() -> Result<WatchdogBackupOwnerClient, OwnerClientError> {
         WatchdogBackupOwnerClient::production()
     }
+
+    /// Enforces I3.2 setup completion at the Kernel authority entrypoint.
+    ///
+    /// Ordinary agent authority — process execution, daemon/worker dispatch,
+    /// and restart — is admitted only after the caller presents the verified
+    /// current setup binding produced by the installation owner. The sealed
+    /// [`VerifiedSetupBinding`] can only be produced by the installation
+    /// owner's trust-anchor verification, so a missing, corrupt, foreign,
+    /// stale, or partially published record cannot unlock ordinary agents. A
+    /// defaults object or cold-composition state cannot substitute for it.
+    ///
+    /// Returns the verified setup revision for the caller to record.
+    ///
+    /// # Errors
+    /// Returns [`KernelBuildError::Service`] when the verified binding belongs
+    /// to a foreign installation.
+    pub fn require_setup_admission(
+        &self,
+        verified: &eliot_installation::VerifiedSetupBinding,
+        expected_installation_id: &str,
+    ) -> Result<u64, KernelBuildError> {
+        if verified.installation_id() != expected_installation_id {
+            return Err(KernelBuildError::Service(
+                "verified setup binding belongs to a foreign installation".to_owned(),
+            ));
+        }
+        Ok(verified.setup_revision())
+    }
 }
 
 /// Maps one build failure to its stable owner-typed diagnostic code.

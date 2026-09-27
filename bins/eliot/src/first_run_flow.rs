@@ -14,11 +14,16 @@
 
 use anyhow::{Context, Result};
 use eliot_config::first_run::{
-    FirstRunAutomation, FirstRunInput, FirstRunRole, RecommendationBoard, RouteSelection,
-    apply_automation_update, apply_update, decide_first_run, describe_defaults, parse_kind,
-    parse_role, recommend_when_automation_disabled, to_settings,
+    FirstRunAutomation, FirstRunDecision, FirstRunInput, FirstRunRole, RecommendationBoard,
+    RouteSelection, apply_automation_update, apply_update, decide_first_run, describe_defaults,
+    parse_kind, parse_role, recommend_when_automation_disabled, to_settings,
 };
+use eliot_config::initial_snapshot::{
+    InitialSnapshotIdentity, PrivacyChoice, prepare_initial_snapshot_payload,
+};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 
 /// Decoded `setup apply` arguments. Every field is caller-supplied text; the
 /// owner validates it.
@@ -65,6 +70,38 @@ pub struct SetupRecommendArgs {
     pub scope: String,
 }
 
+/// Decoded `setup initial-config` arguments for the first signed configuration
+/// payload (I3.2 milestone 7).
+///
+/// Every identity value is an observed or user-confirmed fact supplied by the
+/// installation owner; this module never invents an identity, a root, or a key.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "CLI-decoded flag bundle mirrors the clap surface"
+)]
+pub struct SetupInitialConfigArgs {
+    pub snapshot_id: String,
+    pub installation_id: String,
+    pub profile_ref: String,
+    pub owner_ref: String,
+    pub key_identity: String,
+    pub machine_id: String,
+    pub scope_id: String,
+    pub runtime_state_roots_digest: String,
+    pub setup_revision: u64,
+    pub authority_lineage: String,
+    pub authority_sequence: u64,
+    pub resource_generation: u64,
+    pub privacy: String,
+    pub dreamer_route: Option<String>,
+    pub watchdog_route: Option<String>,
+    pub dreamer_displayed: bool,
+    pub watchdog_displayed: bool,
+    pub dreamer_explicit: bool,
+    pub watchdog_explicit: bool,
+    pub automation: Option<String>,
+}
+
 fn selection_for(
     route: Option<&str>,
     displayed: bool,
@@ -95,6 +132,46 @@ fn parse_automation(value: &str) -> Result<FirstRunAutomation> {
     }
 }
 
+fn parse_privacy(value: &str) -> Result<PrivacyChoice> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "local_only" | "local-only" | "localonly" => Ok(PrivacyChoice::LocalOnly),
+        "standard" => Ok(PrivacyChoice::Standard),
+        _ => anyhow::bail!("unknown privacy mode: {value}"),
+    }
+}
+
+fn first_run_decision(
+    dreamer: Option<(&str, bool, bool)>,
+    watchdog: Option<(&str, bool, bool)>,
+    automation: Option<&str>,
+) -> Result<FirstRunDecision> {
+    let mut selections = BTreeMap::new();
+    if let Some((route, displayed, explicit)) = dreamer
+        && let Some(selection) = selection_for(Some(route), displayed, explicit)?
+    {
+        selections.insert(FirstRunRole::Dreamer, selection);
+    }
+    if let Some((route, displayed, explicit)) = watchdog
+        && let Some(selection) = selection_for(Some(route), displayed, explicit)?
+    {
+        selections.insert(FirstRunRole::WatchdogAgent, selection);
+    }
+    decide_first_run(&FirstRunInput {
+        selections,
+        automation: automation.map(parse_automation).transpose()?,
+    })
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    .context("decide first-run route state")
+}
+
+fn route_choice(
+    route: Option<&String>,
+    displayed: bool,
+    explicit: bool,
+) -> Option<(&str, bool, bool)> {
+    route.map(|route| (route.as_str(), displayed, explicit))
+}
+
 /// Runs `setup apply`: decides typed per-role route state and projects it as
 /// JSON with the canonical `Setting` persistence payload. Omitted roles are
 /// `UNASSIGNED`; no paid route is selected without explicit consent.
@@ -103,32 +180,19 @@ pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
     if owner_ref.is_empty() {
         anyhow::bail!("settings owner_ref must be non-blank");
     }
-    let mut selections = BTreeMap::new();
-    if let Some(selection) = selection_for(
-        args.dreamer_route.as_deref(),
-        args.dreamer_displayed,
-        args.dreamer_explicit,
-    )? {
-        selections.insert(FirstRunRole::Dreamer, selection);
-    }
-    if let Some(selection) = selection_for(
-        args.watchdog_route.as_deref(),
-        args.watchdog_displayed,
-        args.watchdog_explicit,
-    )? {
-        selections.insert(FirstRunRole::WatchdogAgent, selection);
-    }
-    let automation = args
-        .automation
-        .as_deref()
-        .map(parse_automation)
-        .transpose()?;
-    let decision = decide_first_run(&FirstRunInput {
-        selections,
-        automation,
-    })
-    .map_err(|error| anyhow::anyhow!(error.to_string()))
-    .context("decide first-run route state")?;
+    let decision = first_run_decision(
+        route_choice(
+            args.dreamer_route.as_ref(),
+            args.dreamer_displayed,
+            args.dreamer_explicit,
+        ),
+        route_choice(
+            args.watchdog_route.as_ref(),
+            args.watchdog_displayed,
+            args.watchdog_explicit,
+        ),
+        args.automation.as_deref(),
+    )?;
     println!(
         "{}",
         serde_json::json!({
@@ -235,6 +299,71 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
             "admits_job": admits_job,
             "board_entries": board.len(),
             "is_new": is_new,
+        })
+    );
+    Ok(0)
+}
+
+/// Runs `setup initial-config`: prepares the first signed configuration payload
+/// from the confirmed privacy mode and the confirmed first-run choices.
+///
+/// Preparation is deterministic, model-free and read-only. It signs nothing,
+/// publishes nothing, and starts nothing: the installation owner signs with
+/// the protected key reference, publishes through its own operational journal,
+/// re-reads and verifies the result, and only then advances the setup binding.
+/// Omitted model roles stay `UNASSIGNED`, so setup finishes without a model
+/// subscription.
+pub fn run_setup_initial_config(args: &SetupInitialConfigArgs) -> Result<i32> {
+    let privacy = parse_privacy(&args.privacy)?;
+    let decision = first_run_decision(
+        route_choice(
+            args.dreamer_route.as_ref(),
+            args.dreamer_displayed,
+            args.dreamer_explicit,
+        ),
+        route_choice(
+            args.watchdog_route.as_ref(),
+            args.watchdog_displayed,
+            args.watchdog_explicit,
+        ),
+        args.automation.as_deref(),
+    )?;
+    let lineage = EpochLineageId::new(args.authority_lineage.trim())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .context("authority lineage identity")?;
+    let sequence = NonZeroU64::new(args.authority_sequence)
+        .ok_or_else(|| anyhow::anyhow!("authority_sequence must be non-zero"))?;
+    let authority_epoch = EpochId::new(lineage, sequence)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .context("authority epoch")?;
+    let resource_generation = ResourceGeneration::new(args.resource_generation)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .context("resource generation")?;
+    let state_fence = StateFence::new(authority_epoch, resource_generation);
+    let identity = InitialSnapshotIdentity {
+        snapshot_id: args.snapshot_id.trim().to_owned(),
+        installation_id: args.installation_id.trim().to_owned(),
+        profile_ref: args.profile_ref.trim().to_owned(),
+        owner_ref: args.owner_ref.trim().to_owned(),
+        key_identity: args.key_identity.trim().to_owned(),
+        machine_id: args.machine_id.trim().to_owned(),
+        scope_id: args.scope_id.trim().to_owned(),
+        runtime_state_roots_digest: args.runtime_state_roots_digest.trim().to_owned(),
+        setup_revision: args.setup_revision,
+        state_fence,
+    };
+    let payload = prepare_initial_snapshot_payload(&identity, privacy, &decision)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .context("prepare the first signed configuration payload")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "payload": payload,
+            "payload_digest": payload
+                .digest()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                .context("canonical payload digest")?,
+            "privacy_choice": privacy,
         })
     );
     Ok(0)

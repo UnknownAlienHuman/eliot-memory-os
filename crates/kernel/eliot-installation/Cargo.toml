@@ -18,6 +18,7 @@ source_layer = "C1"
 proof_entrypoint = "cargo test -p eliot-installation"
 
 [dependencies]
+eliot-config.workspace = true
 eliot-contracts.workspace = true
 eliot-ipc.workspace = true
 eliot-platform.workspace = true

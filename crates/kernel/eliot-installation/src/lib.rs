@@ -129,6 +129,7 @@ mod redb_state;
 mod registry_wire;
 mod runtime_root_contract;
 mod scm_approval;
+mod setup_binding;
 mod signed_activation;
 mod transaction;
 
@@ -233,6 +234,11 @@ pub use runtime_root_contract::{
     ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
 };
 pub use scm_approval::{InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval};
+pub use setup_binding::{
+    SETUP_BINDING_WIRE_VERSION, SetupAdmissionError, SetupAdvanceInput, SetupBinding,
+    SetupEffectObservation, SetupKeyReference, SetupMilestone, SetupStatus, VerifiedSetupBinding,
+    validate_setup_binding_json, verify_setup_binding,
+};
 #[cfg(test)]
 use transaction::decode_installation_transaction_json;
 use transaction::decode_installation_transaction_json_from_store;
