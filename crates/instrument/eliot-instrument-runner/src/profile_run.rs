@@ -24,12 +24,16 @@ use eliot_instrument_api::{
     ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
 };
 use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
+use eliot_process_executor::ExecutableObservation;
 use thiserror::Error;
 
-use crate::profile::{AdmittedProfile, AdmittedStage};
+use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage};
 use crate::registry::{RegistryEntry, RegistryError};
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
-use crate::{InstrumentBinding, InstrumentRequestPort, InstrumentRunner, RunnerError};
+use crate::{
+    InstrumentBinding, InstrumentRequestPort, InstrumentRunner, RunnerError,
+    bridge_executor_observation,
+};
 
 /// Failures raised while planning or recording profile runs.
 ///
@@ -595,6 +599,19 @@ impl StageOrchestrator {
     }
 
     /// Binds and launches one stage through the existing runner primitives.
+    ///
+    /// The pre-launch closure runs in fixed order before any child process
+    /// exists: the owning port binds the invocation shape into the sealed
+    /// process request (adapter schema authority), the executable
+    /// hash/file identity resolves from the machine against the
+    /// intent-sealed digest, the shared admission gate checks the fixed
+    /// argument template and executable identity into a sealed grant, and
+    /// only then does the runner launch. A changed executable, an unknown
+    /// identity, or an off-template argument combination becomes an
+    /// explicit missing run here instead of a child process. The tool
+    /// version stays unobserved (`None`): no version is attested on this
+    /// path, so none is claimed, while a spec-pinned version still gates
+    /// inside admission.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         planned: &PlannedStage,
@@ -634,17 +651,50 @@ impl StageOrchestrator {
                 "stage admission refused: invocation profile differs from admitted stage",
             );
         }
-        let admission = planned.stage.admission_request(&invocation, None);
-        let grant = match planned
-            .stage
-            .admit(&admission, None, route.stage().profile_revision)
-        {
-            Ok(grant) => grant,
+        let process_request = match launcher.port(planned).bind(&invocation) {
+            Ok(request) => request,
             Err(error) => {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
-        let mut binding = match InstrumentBinding::bind(invocation, launcher.port(planned)) {
+        let observed =
+            match ExecutableObservation::observe_from_intent(process_request.intent(), None) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!(
+                            "stage admission refused: {}",
+                            AdmissionError::ExecutableMismatch {
+                                detail: error.to_string(),
+                            }
+                        ),
+                    );
+                }
+            };
+        let identity = match bridge_executor_observation(invocation.instrument.as_str(), observed) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+            }
+        };
+        let admission = planned
+            .stage
+            .admission_request(&invocation, Some(&identity));
+        let grant =
+            match planned
+                .stage
+                .admit(&admission, Some(&identity), route.stage().profile_revision)
+            {
+                Ok(grant) => grant,
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!("stage admission refused: {error}"),
+                    );
+                }
+            };
+        let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
             Err(error) => {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
