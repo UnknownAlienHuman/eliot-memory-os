@@ -185,7 +185,7 @@ pub fn assess_reactive_risk(
 /// `assessment` is the owner-state attestation (tier, profile
 /// revision/fingerprint, echoed fence, criticality bit) evaluated under
 /// [`assess_reactive_risk`]. Provenance travels with the binding — profile
-/// revision and fingerprint name the exact GovernanceProfile derivation,
+/// revision and fingerprint name the exact `GovernanceProfile` derivation,
 /// the echoed fence names the evaluation posture — while atom-to-source
 /// resolution stays with the admission join, which owns the candidates.
 /// The binding carries no warning text and decides no admission outcome:
