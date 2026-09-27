@@ -599,7 +599,42 @@ impl KernelTransportOwner {
                 failure: Box::new(failure),
             });
         }
+        // The Kernel already reported non-success for this exact request, but
+        // its failure envelope failed validation. Fail closed with a typed
+        // rejection instead of reconciling toward a possible false success.
+        if is_correlated_failure_reply(&reply, frame) {
+            return Err(undecodable_failure_reply());
+        }
         Ok(reply)
+    }
+}
+
+/// Reports whether one reply is a correlated failure for the exact request
+/// even when its canonical failure envelope failed validation.
+///
+/// The correlation joins mirror [`decode_host_request_failure`]: a response
+/// for this exact request identity, protocol version, and connection whose
+/// payload carries `status: "failure"`. Such a reply is never decoded as a
+/// success and never reconciled as an unknown delivery.
+fn is_correlated_failure_reply(reply: &Frame, request: &Frame) -> bool {
+    reply.validate().is_ok()
+        && request.validate().is_ok()
+        && reply.kind == FrameKind::Response
+        && reply.message_type == MessageType::Result
+        && reply.protocol_version == request.protocol_version
+        && reply.connection_id == request.connection_id
+        && reply.request_id == request.request_id
+        && reply.request_identity.is_none()
+        && matches!(&reply.payload, ProtocolPayload::Json(payload)
+            if payload.get("status").and_then(serde_json::Value::as_str) == Some("failure"))
+}
+
+/// Typed rejection for a correlated Kernel failure whose envelope failed
+/// validation. The precise reason replaces the generic internal-error prose
+/// that would otherwise reach the caller.
+fn undecodable_failure_reply() -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: "Kernel reported a correlated host-request failure whose envelope failed validation; failing closed instead of reconciling".to_owned(),
     }
 }
 
