@@ -2330,7 +2330,7 @@ pub fn prepare_doctor_launch(
                 .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
             let target_fence = StateFence::new(epoch.clone(), target_generation);
             kernel
-                .admit_material_authority_for_fence(super::GovernanceProfile::full(), &target_fence)
+                .admit_material_authority_for_governor_issued_fence(&target_fence)
                 .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
         }
         let service = kernel

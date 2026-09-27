@@ -56,7 +56,7 @@
 //! the presenter.
 
 use super::{
-    GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState,
+    KernelComposition, KernelFrameAction, KernelServiceState,
     native_worker_lifecycle_route::{NativeWorkerRouteConflict, NativeWorkerRouteError},
     status_frame, unix_ms,
 };
@@ -337,7 +337,7 @@ impl KernelComposition {
             operation,
             NATIVE_WORKER_REPLAY_BEGIN_OPERATION | NATIVE_WORKER_REPLAY_APPEND_OPERATION
         ) {
-            self.admit_material_authority_for_fence(GovernanceProfile::full(), &presented_fence)
+            self.admit_material_authority_for_governor_issued_fence(&presented_fence)
                 .map_err(|_| TransportError::SessionFenced)?;
         }
         let receipt = match operation {

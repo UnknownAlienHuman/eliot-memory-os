@@ -314,11 +314,8 @@ impl KernelComposition {
                 | JobOperation::BeginVerification { .. }
                 | JobOperation::Publish { .. }
         ) {
-            self.admit_material_authority_for_fence(
-                GovernanceProfile::full(),
-                &envelope.context.state_fence,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+            self.admit_material_authority_for_governor_issued_fence(&envelope.context.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
         }
         Ok(())
     }

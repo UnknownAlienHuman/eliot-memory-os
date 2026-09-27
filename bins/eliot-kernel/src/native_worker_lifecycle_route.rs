@@ -44,10 +44,9 @@
 //! `UnknownRequest`; an elapsed absolute deadline is `Timeout`.
 
 use super::{
-    GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState,
-    ProcessExecutionRequest, caller_binding,
-    native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json, status_frame,
-    unix_ms,
+    KernelComposition, KernelFrameAction, KernelServiceState, ProcessExecutionRequest,
+    caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
+    status_frame, unix_ms,
 };
 use eliot_contracts::{CapabilityCellId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
@@ -836,7 +835,7 @@ impl KernelComposition {
                 .and_then(serde_json::Value::as_str)
                 == Some("BLOCKED");
         if native_worker_operation_requires_watchdog(operation) && !ready_is_blocked {
-            self.admit_material_authority_for_fence(GovernanceProfile::full(), &presented_fence)
+            self.admit_material_authority_for_governor_issued_fence(&presented_fence)
                 .map_err(|_| TransportError::SessionFenced)?;
         }
         if operation == NATIVE_WORKER_RECONCILE_OPERATION {
