@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use eliot_authority::{EffectAuthorizer, GrantGraph};
 use eliot_contracts::{
-    ClockReading, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence, TaskId,
-    canonical_json_bytes, sha256_hex,
+    CapabilityCellId, ClockReading, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration,
+    StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::FinishDecisionReceipt;
@@ -528,9 +528,11 @@ fn publish_valid(composition: &GovernorComposition<TestKernel>) -> NativeWorkerE
             &"f".repeat(64),
             "cmd-1",
             "facet-1",
+            CapabilityCellId::new("native-worker-core").expect("cell id"),
             vec!["intro-1".to_owned()],
             vec!["grant-1".to_owned()],
             1,
+            7,
             EffectClass::ReversibleMutation,
             vec!["cred-1".to_owned()],
             vec!["res-1".to_owned()],
@@ -621,9 +623,11 @@ fn stale_task_revision_fails_publish() {
         &"f".repeat(64),
         "cmd-1",
         "facet-1",
+        CapabilityCellId::new("native-worker-core").expect("cell id"),
         vec!["intro-1".to_owned()],
         vec!["grant-1".to_owned()],
         1,
+        7,
         EffectClass::ReversibleMutation,
         vec!["cred-1".to_owned()],
         vec!["res-1".to_owned()],

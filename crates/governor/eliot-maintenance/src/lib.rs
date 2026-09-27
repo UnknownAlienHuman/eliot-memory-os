@@ -23,8 +23,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod end_of_activity;
 mod improvement_admission;
 pub mod improvement_pipeline;
+
+pub use end_of_activity::{
+    ActivationScopeReference, AssessmentRecordReference, AssessmentSourceCoverage,
+    AssessmentSourceGap, AssessmentSourceRecord, AssessmentSourceSnapshot, ClosedActivityReference,
+    END_OF_ACTIVITY_ASSESSMENT_CONTRACT_NAME, END_OF_ACTIVITY_ASSESSMENT_VERSION,
+    EligibleServiceSafeRoute, EndOfActivityAssessmentDecision, EndOfActivityMaintenanceAssessment,
+    EndOfActivityMaintenanceAssessmentOutcome, EndOfActivityMaintenanceAssessmentRequest,
+    EndOfActivityMaintenanceAssessmentValidationError, MaintenanceDebtReference,
+    MaintenanceDuePolicyReference, UserSessionRequiredWorkReference,
+    end_of_activity_assessment_contract_identity,
+};
 
 pub use improvement_admission::{
     IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE, IMPROVEMENT_PROMOTION_MODULE,
@@ -560,20 +572,15 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             });
         }
         if input.safety_required {
-            let (decision, reason) = if !input.route_available {
-                (
-                    AutomationDecision::Escalate,
-                    DecisionReason::RouteUnavailable,
-                )
-            } else if !input.budget_available {
-                (AutomationDecision::Defer, DecisionReason::BudgetUnavailable)
-            } else if input.user_session_required && !input.user_session_available {
-                (
-                    AutomationDecision::Defer,
-                    DecisionReason::UserSessionRequired,
-                )
+            // This input is only a caller-projected flag; the maintenance
+            // evaluator does not own the registered protected-obligation
+            // authority needed to admit safety work. Preserve `off` without a
+            // proactive recommendation, and otherwise defer to the protected
+            // recovery owner instead of letting the flag authorize effects.
+            let (decision, reason) = if input.mode == MaintenanceAutomationMode::Off {
+                (AutomationDecision::Block, DecisionReason::AutomationOff)
             } else {
-                (AutomationDecision::Start, DecisionReason::SafetyRecovery)
+                (AutomationDecision::Defer, DecisionReason::SafetyRecovery)
             };
             return Ok(Self::decision(input, decision, reason));
         }

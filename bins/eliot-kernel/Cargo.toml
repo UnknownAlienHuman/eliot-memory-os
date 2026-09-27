@@ -19,12 +19,19 @@ name = "eliot-kernel"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
+# Path edge (issue #1842, I16.3/I16.9): eliot-observability is a workspace
+# member but has no [workspace.dependencies] entry, so a path+version edge
+# keeps root Cargo.toml and workspace membership byte-identical, exactly as
+# bins/eliotd declares it. No version upgrade: versions match the member
+# manifest.
+eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
 eliot-ors.workspace = true
 eliot-process-executor.workspace = true
 eliot-protocol.workspace = true

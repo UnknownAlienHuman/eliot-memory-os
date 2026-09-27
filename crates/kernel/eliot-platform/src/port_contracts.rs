@@ -420,3 +420,208 @@ impl InstallationRequest {
 pub trait InstallationPort {
     fn execute(&mut self, request: &InstallationRequest) -> PortOutcome<InstallationObservation>;
 }
+
+/// A scheduled provider timer: an identity, one operation, and the bounded
+/// trigger reference and arguments the provider needs to arm it.
+///
+/// The contract carries no command, executable path, account, logon token,
+/// credential, cadence, or durable schedule. I1.7 names Task Scheduler and its
+/// future `systemd` timer equivalent as one row, so the identity and the
+/// effect are the only things both providers have to agree on.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimerRequest {
+    pub context: RequestMetadata,
+    /// Opaque bounded reference to the timer identity in the provider.
+    pub timer: PlatformHandle,
+    pub operation: TimerOperation,
+    /// Opaque bounded reference to the trigger to arm. The provider owns its
+    /// own trigger vocabulary; this contract names no trigger, interval, or
+    /// start time and never derives one.
+    pub trigger: Option<PlatformHandle>,
+    /// Bounded opaque references the provider passes to the timer action.
+    /// This is an opaque argument list, not a command line.
+    pub arguments: Vec<PlatformHandle>,
+}
+
+/// The three bounded scheduler effects: observe a timer, arm it, remove it.
+///
+/// There is deliberately no "run now" operation. A trigger owns when a timer
+/// fires, and granting a separate manual start here would be a second
+/// authority over the same effect.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TimerOperation {
+    /// Observe the current state without changing the timer.
+    Inspect,
+    /// Establish the named timer with the supplied trigger and arguments.
+    Schedule,
+    /// Remove the timer from the provider and disarm its trigger.
+    Unregister,
+}
+
+/// The provider-observed state of one scheduled timer.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TimerState {
+    /// The provider could not classify the timer.
+    Unknown,
+    /// The provider has no timer for this identity.
+    Absent,
+    /// The timer is registered and the provider will trigger it.
+    Registered,
+    /// The provider has an active invocation of the timer right now.
+    Running,
+    /// The timer is registered but the provider will not trigger it.
+    Disabled,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimerObservation {
+    /// The timer this observation is about, echoed as the request named it.
+    pub timer: PlatformHandle,
+    pub state: TimerState,
+    /// The provider-established generation of the timer, when the provider
+    /// can establish one. Absent is not zero and never means "unchanged".
+    pub generation: Option<u64>,
+}
+
+impl TimerRequest {
+    pub fn validate(&self) -> Result<(), PortError> {
+        validate_context(&self.context)?;
+        validate_text(self.timer.as_str(), "timer")?;
+        if let Some(trigger) = &self.trigger {
+            validate_text(trigger.as_str(), "trigger")?;
+        }
+        unique(&self.arguments, "arguments")
+    }
+}
+
+/// Timer registration, observation and removal as one bounded effect.
+///
+/// The trait names the effect and the observation; it does not own a
+/// scheduler, a recurring horizon, a retry, a durable schedule, or the
+/// authority to start a process when a trigger fires. `Known` means the
+/// provider established the reported state, not that the timer is correct.
+pub trait TimerPort {
+    fn execute(&mut self, request: &TimerRequest) -> PortOutcome<TimerObservation>;
+}
+
+/// The bounded resource ceilings installed on a containment.
+///
+/// Every field is optional and absent means the provider installs no such
+/// ceiling. No default, fallback, or substitute ceiling is implied anywhere.
+/// I1.6 requires that "CPU, memory, and process limits are set by Module
+/// Manifest", so the values arrive from the owning manifest; this contract
+/// derives none.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessResourceLimits {
+    pub cpu_time_ms: Option<u64>,
+    pub memory_bytes: Option<u64>,
+    pub active_process_limit: Option<u32>,
+}
+
+/// A named process containment and its resource ceilings, as one bounded
+/// effect.
+///
+/// I1.6 keeps "a separate Job Object is created for each failure domain and
+/// Module generation" and requires that "all child processes enter the
+/// applicable Windows Job Object". This request is the provider-neutral shape
+/// of exactly that effect, so a future cgroup or process-group implementation
+/// substitutes into it rather than inventing one.
+///
+/// `Inspect` observes; `Create` establishes the named containment and installs
+/// its limits; `Assign` places one process under the established containment;
+/// `Terminate` ends the processes currently inside it. The contract carries no
+/// process identifier, handle, or path, and it grants no termination or
+/// resource authority of its own.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessContainmentRequest {
+    pub context: RequestMetadata,
+    /// Opaque bounded reference to the named containment identity.
+    pub containment: PlatformHandle,
+    pub operation: ProcessContainmentOperation,
+    /// Opaque bounded reference to the one process to place under the
+    /// containment. Used by `Assign`.
+    pub process: Option<PlatformHandle>,
+    /// The ceilings to install. Used by `Create`.
+    pub limits: Option<ProcessResourceLimits>,
+}
+
+/// The four bounded containment effects: observe a containment, establish it,
+/// place a process in it, end what is inside it.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProcessContainmentOperation {
+    /// Observe the containment without changing membership or ceilings.
+    Inspect,
+    /// Establish the named containment and install the supplied ceilings
+    /// before any process is assigned.
+    Create,
+    /// Place one already-running process under the established containment.
+    Assign,
+    /// End every process currently inside the containment.
+    Terminate,
+}
+
+/// The provider-observed state of one containment.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProcessContainmentState {
+    /// The provider could not classify the containment.
+    Unknown,
+    /// The provider has no containment for this identity.
+    Absent,
+    /// The containment exists with at least one live process inside it.
+    Active,
+    /// The containment exists and was observed with no live process inside it.
+    Empty,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessContainmentObservation {
+    /// The containment this observation is about, echoed as the request named
+    /// it.
+    pub containment: PlatformHandle,
+    pub state: ProcessContainmentState,
+    /// The ceilings the provider actually installed, not the ceilings that
+    /// were requested. Absent means none was installed or none is observable.
+    pub limits: Option<ProcessResourceLimits>,
+    /// The live process count the provider observed inside the containment.
+    /// It is an observation at one moment and is never a membership claim
+    /// about processes the provider did not see.
+    pub active_processes: u32,
+}
+
+impl ProcessContainmentRequest {
+    pub fn validate(&self) -> Result<(), PortError> {
+        validate_context(&self.context)?;
+        validate_text(self.containment.as_str(), "containment")?;
+        if let Some(process) = &self.process {
+            validate_text(process.as_str(), "process")?;
+        }
+        Ok(())
+    }
+}
+
+/// A named containment, its resource ceilings, and its process membership as
+/// one bounded effect.
+///
+/// The trait names the effect and the observation. It creates no containment,
+/// holds no handle, and cannot itself terminate a process; the adapter and
+/// the owning control plane retain that authority.
+///
+/// This is deliberately distinct from the fault-guard `ContainmentRequest` and
+/// `ContainmentObservation` in this crate: those record what a guard owner
+/// requested and what an independent reader observed after the fact, and
+/// neither of them requests this effect.
+pub trait ContainmentPort {
+    fn execute(
+        &mut self,
+        request: &ProcessContainmentRequest,
+    ) -> PortOutcome<ProcessContainmentObservation>;
+}

@@ -10,6 +10,7 @@
 mod admission;
 mod admission_input;
 mod atom;
+mod boundary;
 mod canonical_projections;
 mod decision_lineage;
 mod economy;
@@ -42,6 +43,13 @@ pub use atom::{
     MeasurementRef, PrivacyClass, ProviderDisposition, ProviderRoleDenominator, RepresentationKind,
     RoleLossRule,
 };
+pub use boundary::{
+    BOUNDARY_METADATA_SCHEMA_REVISION, BoundaryCompleteness, BoundaryCoordinateSystem,
+    BoundaryDenominator, BoundaryGap, BoundaryGapReason, BoundaryMember, BoundaryMemberCoverage,
+    BoundaryMemberReference, BoundaryMemberRole, BoundaryMetadataEnvelope, BoundaryMetadataSet,
+    BoundaryPrecision, BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits,
+    ExactSourceRange,
+};
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
     ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS,
@@ -71,7 +79,10 @@ pub use measurement::{
     MeasurementStatus, SerializedContextMeasurement, StuEstimate, TokenizerObservation,
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
-pub use quality::{QualityDimension, QualityDimensionResult, QualityScorecard};
+pub use quality::{
+    QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult, QualityDimensionState,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+};
 pub use reactive_attention::{
     AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,
     CriticalAttentionMember, CriticalAttentionProjection,

@@ -20,6 +20,7 @@ use eliot_contracts::{ClockReading, ContractError, StateFence, canonical_json_by
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::product_proof::{ProductProofRollup, ProductProofStatus};
 use crate::{CONTRACT_VERSION, ReportError, ReportKind, escape_markdown, valid_text};
 
 /// Canonical source of a report artifact's input.
@@ -220,6 +221,14 @@ pub struct ProductState {
     pub verified_deltas: Vec<VerifiedDelta>,
     /// Causal links the available evidence does not close.
     pub causal_gaps: Vec<CausalGap>,
+    /// Terminal product-proof status for the acceptance item, in canonical
+    /// order by `proof_id`.
+    ///
+    /// This is the machine-readable #11 status: each record carries one I18.24
+    /// outcome, its reason, the stop-imposing authority, the required missing
+    /// evidence, and its retained evidence handles. It sits beside
+    /// [`ProductState::support`] and never widens it.
+    pub product_proofs: Vec<ProductProofStatus>,
 }
 
 /// The `Product Progress` body: product support state, the absence of a live
@@ -242,6 +251,8 @@ pub struct ProductProgressProjection {
     pub verified_deltas: Vec<VerifiedDelta>,
     /// Open causal gaps.
     pub causal_gaps: Vec<CausalGap>,
+    /// Terminal product-proof statuses, in canonical order by `proof_id`.
+    pub product_proofs: Vec<ProductProofStatus>,
 }
 
 impl ProductProgressProjection {
@@ -258,6 +269,8 @@ impl ProductProgressProjection {
         verified_deltas.sort_by(|left, right| left.delta_id.cmp(&right.delta_id));
         let mut causal_gaps = state.causal_gaps.clone();
         causal_gaps.sort_by(|left, right| left.gap_id.cmp(&right.gap_id));
+        let mut product_proofs = state.product_proofs.clone();
+        product_proofs.sort_by(|left, right| left.proof_id.cmp(&right.proof_id));
         Self {
             product_identity: state.product_identity.clone(),
             product_objective: state.product_objective.clone(),
@@ -266,6 +279,7 @@ impl ProductProgressProjection {
             unproven_live_surfaces,
             verified_deltas,
             causal_gaps,
+            product_proofs,
         }
     }
 
@@ -284,9 +298,34 @@ impl ProductProgressProjection {
                 .map(|delta| delta.verified_by.clone()),
         );
         inputs.extend(self.causal_gaps.iter().map(|gap| gap.observed_by.clone()));
+        for proof in &self.product_proofs {
+            inputs.extend(
+                proof
+                    .live_evidence
+                    .iter()
+                    .map(|item| item.observed_by.clone()),
+            );
+            if let Some(build) = &proof.build_evidence {
+                inputs.push(build.evidence.observed_by.clone());
+            }
+        }
         inputs.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
         inputs.dedup();
         inputs
+    }
+
+    /// Rolls up every product-proof record on this projection.
+    ///
+    /// A record can only contribute a `Pass` when its own required
+    /// installed-route execution was observed; the rollup is refused otherwise
+    /// and the exact I18.24 outcome, reason, authority, and required missing
+    /// evidence stay visible per proof. Build evidence is never consulted here,
+    /// so a successful release build cannot promote a live product to `PASS`.
+    pub fn product_proof_rollups(&self) -> Vec<ProductProofRollup> {
+        self.product_proofs
+            .iter()
+            .map(ProductProofStatus::rollup)
+            .collect()
     }
 
     /// Renders the projection; the text repeats structured fields and adds no
@@ -358,6 +397,52 @@ impl ProductProgressProjection {
                     surface.observed_by.revision
                 )?;
             }
+        }
+        output.push_str(&self.product_proof_markdown()?);
+        Ok(output)
+    }
+
+    /// Renders the product-proof status table, repeating structured fields and
+    /// adding no claim of its own.
+    fn product_proof_markdown(&self) -> Result<String, ReportError> {
+        let mut output = String::new();
+        output.push_str("\n### Product proof status\n\n");
+        if self.product_proofs.is_empty() {
+            output.push_str("No product-proof status was read from canonical state.\n");
+            return Ok(output);
+        }
+        output.push_str("| Proof | Outcome | Disposition | Reason | Owner | Authority | Missing evidence | Build evidence |\n|---|---|---|---|---|---|---|---|\n");
+        for proof in &self.product_proofs {
+            let rollup = ProductProofStatus::rollup(proof);
+            let missing = if proof.missing_evidence.is_empty() {
+                "none".to_owned()
+            } else {
+                proof
+                    .missing_evidence
+                    .iter()
+                    .map(|item| escape_markdown(item))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            };
+            let build = match &proof.build_evidence {
+                Some(handle) => format!(
+                    "`{}` (build only, not product proof)",
+                    escape_markdown(&handle.evidence.evidence_id)
+                ),
+                None => "none".to_owned(),
+            };
+            writeln!(
+                output,
+                "| `{}` | `{}` | `{}` | {} | {} | `{}` | {} | {} |",
+                escape_markdown(&proof.proof_id),
+                proof.outcome,
+                if rollup.is_pass() { "PASS" } else { "REFUSED" },
+                escape_markdown(&proof.reason),
+                escape_markdown(&proof.authority.owner),
+                escape_markdown(&proof.authority.authority_ref),
+                missing,
+                build
+            )?;
         }
         Ok(output)
     }

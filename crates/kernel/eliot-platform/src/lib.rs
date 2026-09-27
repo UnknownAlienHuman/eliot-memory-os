@@ -6,6 +6,65 @@
 //! exception used for Host ownership and one-use Kernel activation. Platform
 //! adapters implement the ports and the owning control plane supplies request
 //! identity and fences.
+//!
+//! # Portability boundary (I1.7)
+//!
+//! I1.7 keeps module protocol messages, module lifecycle, the Store API,
+//! canonical formats, authority/fencing semantics, the job/checkpoint model
+//! and agent interaction contracts uncoupled from Windows, and isolates the
+//! operating-system mechanisms behind a platform layer. I1.7 also fixes the
+//! gate: *"Linux support begins only after CI, packaging, and fault tests on a
+//! real Linux installation."* Nothing in this crate declares Linux supported,
+//! and no type here is a Linux implementation.
+//!
+//! This crate is the isolation layer's contract side. The mapping below records
+//! which port in this crate each I1.7 mechanism sits behind, and the I1.7
+//! future Linux equivalent. Naming a port here claims only that the contract
+//! exists; it never claims that an adapter implements it.
+//!
+//! | I1.7 mechanism | port in this crate | I1.7 future Linux |
+//! |---|---|---|
+//! | SCM demand-start | [`ServicePort`] | systemd socket activation |
+//! | Task Scheduler | [`TimerPort`] | systemd timers |
+//! | named pipes | [`SessionPort`] | Unix domain sockets |
+//! | Job Objects | [`ContainmentPort`] | cgroups / process groups |
+//! | DPAPI / Credential Manager | [`SecretPort`] | keyring / secret service |
+//! | Windows notifications | [`NotificationPort`] | desktop notification adapter |
+//!
+//! Three further port traits here have no I1.7 row because they are not
+//! Windows-specific mechanisms: [`ClockPort`] (a point-in-time clock reading;
+//! wall time is never causal order), [`FilesystemPort`], and
+//! [`InstallationPort`].
+//!
+//! Host state persistence is isolated by [`HostStateStore`]; I1.7 lists no
+//! Windows mechanism against it either.
+//!
+//! ## The two Windows effects that are declared but not yet adapted
+//!
+//! [`TimerPort`] and [`ContainmentPort`] close the two I1.7 rows that had no
+//! port in this crate. Their contracts are declared here and are
+//! provider-neutral: a `systemd` timer and a cgroup or process group
+//! substitute into them.
+//!
+//! The Windows implementations and their production call sites are not part of
+//! this increment, so on this branch both traits are declared and bound to
+//! nothing. `TimerPort` is unbound because the only Windows scheduler effect
+//! in the tree is one fixed Watchdog fallback task whose registration carries
+//! installer-pinned paths, digests, SID and session that P-01 deliberately
+//! does not carry, and mapping this contract onto it would invent a policy.
+//! `ContainmentPort` is unbound because the Windows Job handle, suspended
+//! launch, membership history and termination lifecycle are owned by
+//! `eliot-platform-windows/src/process_job.rs` and reached through the Kernel
+//! execution gateway; binding them here would mean a second owner for that
+//! lifecycle.
+//!
+//! The remaining gap on these two rows is therefore a Windows adapter, not a
+//! missing contract, and the fault-guard vocabulary [`ContainmentRequest`] and
+//! [`ContainmentObservation`] is a separate record of what a guard owner
+//! requested and an independent reader observed - it is not the port.
+//!
+//! Nothing here moves Linux support. The I1.7 gate stands, and this crate is
+//! not the place a portability claim is made.
 
 #![forbid(unsafe_code)]
 
@@ -33,13 +92,15 @@ pub use handle_nonce::{
     HostProcessNonce, KernelActivationNonce, NonceContractError, PlatformHandle,
 };
 pub use port_contracts::{
-    ClockObservation, ClockPort, ClockRequest, FileKind, FilesystemObservation,
+    ClockObservation, ClockPort, ClockRequest, ContainmentPort, FileKind, FilesystemObservation,
     FilesystemOperation, FilesystemPort, FilesystemRequest, InstallationObservation,
     InstallationOperation, InstallationPort, InstallationRequest, InstallationState,
     NotificationObservation, NotificationPort, NotificationRequest, PortError, PortOutcome,
-    ProviderError, ProviderErrorCode, SecretObservation, SecretPort, SecretReference,
-    SecretRequest, ServiceObservation, ServiceOperation, ServicePort, ServiceRequest, ServiceState,
-    SessionObservation, SessionPort, SessionRequest, UnknownReason,
+    ProcessContainmentObservation, ProcessContainmentOperation, ProcessContainmentRequest,
+    ProcessContainmentState, ProcessResourceLimits, ProviderError, ProviderErrorCode,
+    SecretObservation, SecretPort, SecretReference, SecretRequest, ServiceObservation,
+    ServiceOperation, ServicePort, ServiceRequest, ServiceState, SessionObservation, SessionPort,
+    SessionRequest, TimerObservation, TimerOperation, TimerPort, TimerRequest, UnknownReason,
 };
 use port_contracts::{validate_context, validate_text};
 pub use work_scope_path::{AdapterContainment, AdapterPathInput, WorkScopePath};

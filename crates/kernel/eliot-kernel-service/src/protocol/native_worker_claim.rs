@@ -18,12 +18,12 @@
 //! `executable_binding` object carrying the T9-02 executable join. The nested
 //! object is JSON `null` for wire-v1 claims (which predate the join) and
 //! otherwise covers exactly the keys `adapter_id`, `adapter_revision`,
-//! `authority_epoch`, `config_digest`, `deadline_unix_ms`,
+//! `authority_epoch`, `capability_cell`, `config_digest`, `deadline_unix_ms`,
 //! `executable_binding_digest`, `executable_wire_version`,
 //! `expires_at_unix_ms`, `facet_manifest_ref`, `generation`,
-//! `grant_graph_revision`, `launch_nonce`, `process_invocation_digest`,
-//! `replay_stream_id`, `route_ref`, `state_fence`, with object keys sorted
-//! recursively before hashing. The worker-side transparent string newtypes
+//! `grant_graph_revision`, `launch_nonce`, `module_catalog_revision`,
+//! `process_invocation_digest`, `replay_stream_id`, `route_ref`, `state_fence`,
+//! with object keys sorted recursively before hashing. The worker-side transparent string newtypes
 //! and the plain strings used here serialize to identical JSON, and the
 //! epoch/fence/generation values on both sides come from the same
 //! `eliot-contracts` types, so equal logical claims yield equal digests on
@@ -41,7 +41,9 @@
 //! the Kernel join is expressed with raw digest bytes plus explicit
 //! currentness fields reusing the T9-01 field names.
 
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -162,8 +164,12 @@ pub struct NativeWorkerExecutableBinding {
     pub config_digest: String,
     /// Facet manifest reference.
     pub facet_manifest_ref: String,
+    /// Admitted `FunctionalCapabilityCell` identity from the owner record.
+    pub capability_cell: CapabilityCellId,
     /// Grant-graph revision the binding was compiled against; nonzero.
     pub grant_graph_revision: u64,
+    /// Admitted Module Catalog revision from the owner record; nonzero.
+    pub module_catalog_revision: u64,
     /// Replay stream identity bound to this claim.
     pub replay_stream_id: String,
     /// Claim-bound launch nonce (16..=256 chars, mirroring T9-01).
@@ -249,10 +255,13 @@ impl NativeWorkerExecutableBinding {
         ] {
             validate_wire_digest(digest, field)?;
         }
-        if self.adapter_revision == 0 || self.grant_graph_revision == 0 {
+        if self.adapter_revision == 0
+            || self.grant_graph_revision == 0
+            || self.module_catalog_revision == 0
+        {
             return Err(KernelServiceError::InvalidField {
                 field: "native_worker_claim.executable_binding.revisions",
-                reason: "adapter and grant-graph revisions must be non-zero",
+                reason: "adapter, grant-graph, and Module Catalog revisions must be non-zero",
             });
         }
         if self.generation.value() == 0 {
@@ -797,9 +806,19 @@ fn compare_executable_currentness(
             field: "native_worker_claim.executable_binding.facet_manifest_ref",
         });
     }
+    if presented.capability_cell != current.capability_cell {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "native_worker_claim.executable_binding.capability_cell",
+        });
+    }
     if presented.grant_graph_revision != current.grant_graph_revision {
         return Err(KernelServiceError::HandshakeMismatch {
             field: "native_worker_claim.executable_binding.grant_graph_revision",
+        });
+    }
+    if presented.module_catalog_revision != current.module_catalog_revision {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "native_worker_claim.executable_binding.module_catalog_revision",
         });
     }
     if presented.replay_stream_id != current.replay_stream_id {
@@ -1193,7 +1212,9 @@ mod executable_binding_tests {
             adapter_revision: 3,
             config_digest: "c".repeat(64),
             facet_manifest_ref: "facet-manifest-7".to_owned(),
+            capability_cell: CapabilityCellId::new("native-worker-core").expect("cell id"),
             grant_graph_revision: 5,
+            module_catalog_revision: 7,
             replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
             launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
             process_invocation_digest: "d".repeat(64),

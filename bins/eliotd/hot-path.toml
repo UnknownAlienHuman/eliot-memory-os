@@ -1,0 +1,128 @@
+# I12.14 hot-path declaration for the eliotd Governor daemon.
+#
+# The eliotd half of the same bounded synchronous control/evidence path as
+# `bins/eliot-kernel/hot-path.toml`. The shape is
+# `eliot.foundation.runtime-contracts.hot-path` / `HotPathManifestSetV1` in
+# `crates/foundation/eliot-runtime-contracts/src/hot_path.rs`; that contract is
+# the single owner of these fields and this file only declares values.
+#
+# One operation has one authoritative declaration source. Each protocol leg is
+# declared once, by the service that owns it: the Kernel owns admission,
+# fence checks, the bounded named read and the retained result; eliotd owns its
+# own outbound poll, admitted forward and submit steps. Neither service declares
+# the other's step.
+#
+# This is a declaration. It admits nothing, starts nothing and proves no
+# measurement. Every bound below is transcribed from an existing source
+# constant on current main.
+#
+# Sources of the declared values:
+#   exactly one in-flight local-read poll step
+#     -> bins/eliotd/src/daemon_runtime.rs::decide_local_read_tick returns
+#        SkipInFlight while a step is in flight
+#   max_frame_bytes 4 MiB
+#     -> crates/foundation/eliot-protocol/src/lib.rs::MAX_FRAME_BYTES
+#   operation_timeout 30 s
+#     -> bins/eliot-kernel/src/front_door_session.rs::IpcImplementation::limits
+
+schema = "eliot.foundation.runtime-contracts.hot-path.v1"
+contract_version = "1.0.0"
+owning_service = "eliotd"
+
+[[supported_operations]]
+operation = "local_read_claim"
+operation_version = "1.0.0"
+owning_service = "eliotd"
+entrypoint = "bins/eliotd/src/daemon_runtime.rs::start_local_read_poll"
+crate_closure = [
+  "eliotd",
+  "eliot-contracts",
+  "eliot-protocol",
+]
+
+# The poll is driven by the retained startup-readiness projection, not by a
+# freshly discovered module, so its dependency is that immutable projection.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "startup_readiness_projection"
+revision_key = "startup_readiness_projection.source_revision_heads"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_read_claim"
+bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
+
+synchronous_external_calls = []
+# An empty poll is a null result and leaves the flight idle; the daemon is never
+# blocked on an optional module here.
+fallback_or_degradation = { Unknown = {} }
+# #1734 owns profile production; no profile exists for this operation yet.
+hot_path_profile_ref = {}
+
+[[supported_operations]]
+operation = "local_read"
+operation_version = "1.0.0"
+owning_service = "eliotd"
+entrypoint = "bins/eliotd/src/governor_local_read.rs::forward_admitted_local_read"
+crate_closure = [
+  "eliotd",
+  "eliot-contracts",
+  "eliot-governor",
+  "eliot-protocol",
+  "eliot-read",
+  "eliot-store-api",
+]
+
+# The admitted pair proves its closed linkage and fence binding before any
+# transport. A wrong fence or malformed pair fails closed before the forward.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "admitted_pair_state_fence"
+revision_key = "admitted_pair_state_fence.authority_epoch"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_read"
+bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
+
+# The Kernel gateway is the synchronous in-process hop. Kernel remains the
+# admission and persistence authority; eliotd makes no admission decision.
+[[supported_operations.synchronous_external_calls]]
+call_id = "eliot-kernel.local_read"
+optional = false
+deadline_ms = 30000
+
+# Kernel returns the typed host-request result body, including its known stale
+# and expired outcomes; the daemon forwards it verbatim rather than inventing a
+# result.
+fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
+hot_path_profile_ref = {}
+
+[[supported_operations]]
+operation = "local_read_result"
+operation_version = "1.0.0"
+owning_service = "eliotd"
+entrypoint = "bins/eliotd/src/daemon_runtime.rs::submit_local_read_result_idempotent"
+crate_closure = [
+  "eliotd",
+  "eliot-contracts",
+  "eliot-protocol",
+]
+
+# The submit leg is bound to the attempt identity and the fence it was claimed
+# under; a stale or expired attempt is reported, not retried.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "claimed_attempt_state_fence"
+revision_key = "claimed_attempt_state_fence.authority_epoch"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_read_result"
+bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
+
+synchronous_external_calls = []
+fallback_or_degradation = { RecoveryDirective = { directive_ref = "eliot_runtime_contracts::RecoveryDirective" } }
+hot_path_profile_ref = {}
+
+[[unsupported_operations]]
+operation = "eliot.query.packet"
+reason = "The packet leg is dispatched by the campaign poller after its exact owner-read and Context-compiler work. I2.15 places Context compilation and semantic work in the cold path, and I12.14 forbids cold work entering a gate because the caller is waiting."
+
+[[unsupported_operations]]
+operation = "store_named.GetUnderstandingProjectionInputs"
+reason = "Projection inputs stay a port-shape fail-closed Unavailable on the Governor read port until the storage operation is activated; eliotd does not manufacture a successful Context hot path."

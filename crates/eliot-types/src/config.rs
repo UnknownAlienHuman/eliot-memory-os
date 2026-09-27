@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 /// and duplicate member keys are already refused by the derived `MapAccess`;
 /// nested section structs are closed too. `supervision`,
 /// `delegation_calibration` and `ul` stay `#[serde(default)]`: approved
-/// operational sections (the in-repo `config/eliot-governor.toml` omits two of
-/// them), still enforced afterwards by `GovernorConfig::validate`.
-/// Upstream ingress: decoded directly from TOML bytes by
+/// operational sections for this legacy decoder, still enforced afterwards
+/// by `GovernorConfig::validate`. These defaults do not grant current runtime
+/// configuration authority.
+/// Legacy ingress: decoded directly from TOML bytes by
 /// `crates/eliot-app/src/config.rs::load_config` (`toml::from_str`, which
 /// rejects duplicate keys itself) and then `validate`d; there is no `Value`
 /// hop in this causal chain.

@@ -1403,7 +1403,7 @@ impl From<StoreError> for StoreReadFailure {
             StoreError::ReceiptNotFound => Self::ReceiptNotFound,
             StoreError::MissingReceiptEnvelope => Self::MissingReceiptEnvelope,
             StoreError::PayloadTooLarge => Self::PayloadTooLarge,
-            StoreError::Unavailable => Self::Unavailable,
+            StoreError::Unavailable | StoreError::SnapshotClosePending { .. } => Self::Unavailable,
             StoreError::Serialization(detail) => Self::Serialization(detail),
         }
     }
@@ -1660,6 +1660,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
         } else {
             self.store.revision_heads(keys.clone()).await?
         };
+        validate_requested_heads(&before, &keys, &ctx.state_fence)?;
         validate_minimum_revisions(&before, dependencies)?;
         let request = NamedReadRequest {
             operation,
@@ -1680,7 +1681,8 @@ impl<C: CanonicalReadClient> ReadService<C> {
             consistency,
             ReadConsistency::StableScope | ReadConsistency::ExactFence
         ) {
-            let after = self.store.revision_heads(keys).await?;
+            let after = self.store.revision_heads(keys.clone()).await?;
+            validate_requested_heads(&after, &keys, &ctx.state_fence)?;
             validate_minimum_revisions(&after, dependencies)?;
             if !same_dependency_heads(&before, &after, dependencies) {
                 return Err(ReadError::RevisionChurn);
@@ -2194,6 +2196,31 @@ fn validate_minimum_revisions(
     Ok(())
 }
 
+fn validate_requested_heads(
+    heads: &[RevisionHead],
+    keys: &[RevisionKey],
+    fence: &StateFence,
+) -> Result<(), ReadError> {
+    let requested: BTreeSet<RevisionKey> = keys.iter().cloned().collect();
+    if heads.len() != requested.len() {
+        return Err(ReadError::ResponseMismatch);
+    }
+    let mut observed = BTreeSet::new();
+    for head in heads {
+        head.validate()?;
+        if head.state_fence != *fence
+            || !requested.contains(&head.key)
+            || !observed.insert(head.key.clone())
+        {
+            return Err(ReadError::ResponseMismatch);
+        }
+    }
+    if observed != requested {
+        return Err(ReadError::ResponseMismatch);
+    }
+    Ok(())
+}
+
 fn validate_response_heads(
     response: &NamedReadResponse,
     fence: &StateFence,
@@ -2214,15 +2241,9 @@ fn same_dependency_heads(
     dependencies: &BTreeMap<RevisionKey, u64>,
 ) -> bool {
     dependencies.keys().all(|key| {
-        let left_revision = left
-            .iter()
-            .find(|head| head.key == *key)
-            .map(|head| head.revision);
-        let right_revision = right
-            .iter()
-            .find(|head| head.key == *key)
-            .map(|head| head.revision);
-        left_revision == right_revision
+        let left_head = left.iter().find(|head| head.key == *key);
+        let right_head = right.iter().find(|head| head.key == *key);
+        left_head == right_head
     })
 }
 

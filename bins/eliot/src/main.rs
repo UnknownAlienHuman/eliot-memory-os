@@ -51,6 +51,8 @@ use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
 mod controlboard_status;
+mod dashboard;
+mod dev_crate_check;
 mod first_run_flow;
 mod plugin_preview;
 mod release_surface;
@@ -146,6 +148,18 @@ enum Command {
         #[command(subcommand)]
         command: ControlBoardCommand,
     },
+    /// Administrative, automation and recovery surface: open the
+    /// role-filtered terminal dashboard over the same authenticated
+    /// `ControlBoard` projection that `controlboard status` prints. I11.1
+    /// makes this CLI the mandatory admin/automation/recovery fallback; this
+    /// is the optional lightweight terminal view of it, not an
+    /// agent/provider prompt loop. Read-only: no prompt loop, no provider
+    /// selection, no arbitrary command execution, no persisted state, and no
+    /// mutation action. Requires an interactive terminal; under redirected or
+    /// noninteractive output it refuses without entering raw mode and directs
+    /// the caller to `eliot controlboard status`.
+    #[command(name = "dashboard")]
+    Dashboard,
     /// Backup creation/restore previews, issuance, isolated restore runs, key coverage (#1873; previews never issue; restore runs never cut over), and the three advertised `create`/`verify`/`restore-test` catalogue commands routed through the authenticated Kernel front door (#963).
     Backup {
         #[command(subcommand)]
@@ -155,6 +169,11 @@ enum Command {
     Scope {
         #[command(subcommand)]
         command: scope_observe::ScopeCommand,
+    },
+    /// Per-crate Instrument Plane verification surfaces (#1913).
+    Dev {
+        #[command(subcommand)]
+        command: dev_crate_check::DevCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -171,6 +190,9 @@ enum BootstrapCommand {
         /// Absolute repository root; never inferred from the current directory.
         #[arg(long)]
         repo_root: PathBuf,
+        /// Absolute path to the explicit caller-attributed recovery finding JSON.
+        #[arg(long)]
+        finding: PathBuf,
     },
 }
 
@@ -749,8 +771,10 @@ fn run() -> Result<i32> {
         Command::Doctor { command } => run_doctor(command),
         Command::Release { command } => run_release(command),
         Command::ControlBoard { command } => run_controlboard(command),
+        Command::Dashboard => dashboard::run_dashboard(),
         Command::Backup { command } => backup_entry::run_backup(command),
         Command::Scope { command } => Ok(run_scope(command)),
+        Command::Dev { command } => Ok(run_dev(command)),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -1177,12 +1201,26 @@ fn run_scope(command: scope_observe::ScopeCommand) -> i32 {
     }
 }
 
+fn run_dev(command: dev_crate_check::DevCommand) -> i32 {
+    match dev_crate_check::run(command) {
+        Ok(value) => {
+            println!("{value}");
+            0
+        }
+        Err(error) => {
+            println!("{}", error.envelope());
+            error.exit_code()
+        }
+    }
+}
+
 fn run_bootstrap(command: BootstrapCommand) -> i32 {
     match command {
         BootstrapCommand::Brief {
             work_unit,
             repo_root,
-        } => match bootstrap_draft::execute(&work_unit, &repo_root) {
+            finding,
+        } => match bootstrap_draft::execute(&work_unit, &repo_root, &finding) {
             Ok(success) => {
                 println!(
                     "{}",

@@ -5,8 +5,9 @@
 //! 1. structured `tracing` with bounded fields, writing JSON operational
 //!    records to the non-blocking rolling appender and to stderr;
 //! 2. the bounded-label `OpenMetrics` registry published for scraping;
-//! 3. the OTLP bridge disposition, active only when the `otlp` feature is
-//!    built;
+//! 3. the OTLP bridge disposition, which reports `no_transport` when the
+//!    `otlp` feature is built and no transport is present, `feature_disabled`
+//!    when the feature is off, and never reports an active bridge;
 //! 4. the `system_service` Windows Event Log stage, or the protected event
 //!    spool for `user_mode` and portable;
 //! 5. the I16.11 critical-path fallback machine.

@@ -24,12 +24,16 @@ use eliot_instrument_api::{
     ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
 };
 use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
+use eliot_process_executor::ExecutableObservation;
 use thiserror::Error;
 
-use crate::profile::{AdmittedProfile, AdmittedStage};
+use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage};
 use crate::registry::{RegistryEntry, RegistryError};
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
-use crate::{InstrumentBinding, InstrumentRequestPort, InstrumentRunner, RunnerError};
+use crate::{
+    InstrumentBinding, InstrumentRequestPort, InstrumentRunner, RunnerError,
+    bridge_executor_observation,
+};
 
 /// Failures raised while planning or recording profile runs.
 ///
@@ -595,6 +599,19 @@ impl StageOrchestrator {
     }
 
     /// Binds and launches one stage through the existing runner primitives.
+    ///
+    /// The pre-launch closure runs in fixed order before any child process
+    /// exists: the owning port binds the invocation shape into the sealed
+    /// process request (adapter schema authority), the executable
+    /// hash/file identity resolves from the machine against the
+    /// intent-sealed digest, the shared admission gate checks the fixed
+    /// argument template and executable identity into a sealed grant, and
+    /// only then does the runner launch. A changed executable, an unknown
+    /// identity, or an off-template argument combination becomes an
+    /// explicit missing run here instead of a child process. The tool
+    /// version stays unobserved (`None`): no version is attested on this
+    /// path, so none is claimed, while a spec-pinned version still gates
+    /// inside admission.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         planned: &PlannedStage,
@@ -634,17 +651,50 @@ impl StageOrchestrator {
                 "stage admission refused: invocation profile differs from admitted stage",
             );
         }
-        let admission = planned.stage.admission_request(&invocation, None);
-        let grant = match planned
-            .stage
-            .admit(&admission, None, route.stage().profile_revision)
-        {
-            Ok(grant) => grant,
+        let process_request = match launcher.port(planned).bind(&invocation) {
+            Ok(request) => request,
             Err(error) => {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
-        let mut binding = match InstrumentBinding::bind(invocation, launcher.port(planned)) {
+        let observed =
+            match ExecutableObservation::observe_from_intent(process_request.intent(), None) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!(
+                            "stage admission refused: {}",
+                            AdmissionError::ExecutableMismatch {
+                                detail: error.to_string(),
+                            }
+                        ),
+                    );
+                }
+            };
+        let identity = match bridge_executor_observation(invocation.instrument.as_str(), observed) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+            }
+        };
+        let admission = planned
+            .stage
+            .admission_request(&invocation, Some(&identity));
+        let grant =
+            match planned
+                .stage
+                .admit(&admission, Some(&identity), route.stage().profile_revision)
+            {
+                Ok(grant) => grant,
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!("stage admission refused: {error}"),
+                    );
+                }
+            };
+        let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
             Err(error) => {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
@@ -740,7 +790,8 @@ impl TestdPlaneAdmission {
     ///
     /// This is the exact [`TestdAdmissionPort::admit`] decision over the
     /// admitted stage identity instead of a full provider-neutral invocation,
-    /// so classification-only callers (issue #1813 W4: the governed describe
+    /// so classification-only callers (the registry composition in
+    /// [`compose_provider_dispatch`); issue #1813 W4: the governed describe
     /// path records per-stage testd admission without execution provisions)
     /// never fabricate invocation authority material such as a State Fence,
     /// session, or lease. The receipt still binds the registry-selected
@@ -837,12 +888,14 @@ impl ProviderDispatch {
 ///
 /// Runs the whole pre-execution closure in order: exactly-one-entry
 /// resolution, generation and fingerprint freshness, host support, then
-/// Testd's closed dispatch capability. The closure is total: no rejection is
-/// an `Err`, so a missing, duplicate, ambiguous, stale, unsupported, or
-/// unmapped provider is reported as a typed [`ProviderDispatch::Refused`]
-/// carrying its exact cause rather than an error that could be dropped from
-/// a denominator. No process, build root, task, budget, or Finish authority
-/// is created here; only Testd dispatches.
+/// admission of the resolved entry through
+/// [`TestdPlaneAdmission::admit_parts`] behind the test execution plane.
+/// The closure is total: no rejection is an `Err`, so a missing, duplicate,
+/// ambiguous, stale, unsupported, or unmapped provider is reported as a
+/// typed [`ProviderDispatch::Refused`] carrying its exact cause rather than
+/// an error that could be dropped from a denominator. No process, build
+/// root, task, budget, or Finish authority is created here; only Testd
+/// dispatches.
 ///
 /// Freshness inputs and the observed platform are supplied by the
 /// composition root, which owns the machine observations. A dispatch
@@ -862,22 +915,25 @@ pub fn compose_provider_dispatch(
             disposition: available.disposition(),
         };
     }
-    if !testd_dispatchable(kind) {
+    // `availability_parts` already ran the freshness-pinned resolution, so
+    // the ready arm is exactly the single current entry it returned.
+    let Some(entry) = available.entry() else {
         return ProviderDispatch::Refused {
+            disposition: crate::ProviderDisposition::Unmapped,
+        };
+    };
+    match TestdPlaneAdmission::admit_parts(instrument, kind, entry) {
+        Ok(_) => ProviderDispatch::Dispatch {
+            entry: Box::new(entry.clone()),
+        },
+        Err(TestdPortError::UnsupportedByTestd { kind }) => ProviderDispatch::Refused {
             disposition: crate::ProviderDisposition::Unsupported {
                 adapter: instrument.as_str().to_owned(),
                 kind,
             },
-        };
-    }
-    // `availability_parts` already ran the freshness-pinned resolution, so
-    // the ready arm is exactly the single current entry it returned.
-    match available.entry() {
-        Some(entry) => ProviderDispatch::Dispatch {
-            entry: Box::new(entry.clone()),
         },
-        None => ProviderDispatch::Refused {
-            disposition: crate::ProviderDisposition::Unmapped,
+        Err(TestdPortError::Registry(error)) => ProviderDispatch::Refused {
+            disposition: crate::disposition_for_parts(instrument.as_str(), kind, &error),
         },
     }
 }

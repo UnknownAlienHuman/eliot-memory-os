@@ -407,10 +407,12 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         }
 
         OperatorHandoff handoff;
+        OperatorProcessIdentity clientIdentity;
         try
         {
             handoff = await discovery.DiscoverAsync(budget.Token).ConfigureAwait(false);
-            handoff.RequireBindingTo(OperatorProcessIdentityProvider.Current, DateTimeOffset.UtcNow);
+            clientIdentity = OperatorProcessIdentityProvider.Current;
+            handoff.RequireBindingTo(clientIdentity, DateTimeOffset.UtcNow);
         }
         catch (OperatorHandoffRefusedException)
         {
@@ -488,6 +490,13 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // exchange are the initial authentication steps. They observe the
             // establishment window, not the request budget's remaining time and
             // not a fresh per-call window.
+            //
+            // The handshake presents the full I11.8 client binding proof the
+            // broker validates at redemption: the owner-issued session/nonce,
+            // the locally proved Windows user SID, logon session and Operator
+            // process generation/artifact, and the exact requested role and
+            // capability set. The broker admits only the granted set; anything
+            // wider is refused rather than narrowed.
             establishment.ThrowIfExpired();
             await streams.Writer.WriteLineAsync(JsonSerializer.Serialize(new
             {
@@ -496,6 +505,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 broker_epoch = handoff.Endpoint.BrokerEpoch,
                 interactive_session_id = handoff.Endpoint.InteractiveSessionId,
                 handoff_nonce = handoff.Endpoint.HandoffNonce,
+                windows_user_sid = clientIdentity.UserSid,
+                operator_process_generation = clientIdentity.ProcessGeneration,
+                operator_artifact_fingerprint = clientIdentity.ArtifactFingerprint,
+                requested_role = handoff.Endpoint.Role,
+                requested_capabilities = handoff.Endpoint.Capabilities,
                 client_nonce = Guid.NewGuid().ToString("N"),
                 profile = "human_operator",
                 requested_session_id = (string?)null

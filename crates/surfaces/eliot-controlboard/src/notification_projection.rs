@@ -213,10 +213,14 @@ pub fn unresolved_critical(rows: &[NotificationRow]) -> Vec<&NotificationRow> {
 
 /// Returns unresolved rows whose latest delivery failed, with the failure
 /// state preserved for board visibility.
+///
+/// This is the failed-delivery subset of [`inbox`]: every row returned here
+/// is also an inbox row.
 #[must_use]
 pub fn failed_delivery(rows: &[NotificationRow]) -> Vec<&NotificationRow> {
-    rows.iter()
-        .filter(|row| row.is_unresolved() && row.delivery_failed)
+    inbox(rows)
+        .into_iter()
+        .filter(|row| row.delivery_failed)
         .collect()
 }
 

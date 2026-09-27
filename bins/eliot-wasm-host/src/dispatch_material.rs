@@ -59,6 +59,14 @@ pub const WASM_HOST_CONTROL_FILE_NAME: &str = "eliot-wasm-host.control-request.j
 /// accumulation is possible, and a stale marker (naming a replaced set)
 /// never matches the staged identity.
 pub const WASM_HOST_SERVED_FILE_NAME: &str = "eliot-wasm-host.served.json";
+/// Durable pre-execution `InFlight` marker (#2786 step 7): written atomically
+/// after claim and before any guest effect, cleared only once the served
+/// marker above is durable. A crash or failed served write after the effect
+/// settled still leaves this claim, so restart classifies `InFlight` or
+/// terminal-unacknowledged as replay instead of re-executing. Single fixed
+/// name, overwritten by every claim: no accumulation is possible, and a
+/// stale marker (naming a replaced set) never matches the staged identity.
+pub const WASM_HOST_INFLIGHT_FILE_NAME: &str = "eliot-wasm-host.inflight.json";
 /// Material envelope wire identity, matched exactly with the publisher.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
 /// Material envelope wire version, matched exactly with the publisher.
@@ -1473,7 +1481,9 @@ pub fn reclaim_claimed_file(
 /// the fixed name is renamed aside under the claimed-identity name and
 /// only aside bytes that still verify against the claim are deleted, so
 /// a replacement B landing after the pre-check is restored, never
-/// deleted. No single-owner condition is asserted — the owner publisher
+/// deleted. A matching readable served marker is required before reclaim:
+/// absent or uncertain served state leaves the claimed bytes for recovery.
+/// No single-owner condition is asserted — the owner publisher
 /// stages replacements and retires expired sets concurrently by design —
 /// which is exactly why every deletion re-verifies after the move.
 /// Residual windows: the Unix restore path without hard-link support
@@ -1506,6 +1516,14 @@ pub fn reclaim_claimed_delivery(
         };
     }
     let identity = claim.identity();
+    match read_served_marker(install_dir) {
+        Ok(Some(mark)) if mark.names(identity) => {}
+        Ok(_) | Err(_) => {
+            return ClaimedReclamation::RetainedForRecovery {
+                claimed: identity.clone(),
+            };
+        }
+    }
     let artifact = reclaim_claimed_file(
         install_dir,
         WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
@@ -1545,7 +1563,7 @@ pub fn reclaim_claimed_delivery(
     if reclamation_gone(&artifact)
         && reclamation_gone(&input)
         && reclamation_gone(&material)
-        && let Some(mark) = read_served_marker(install_dir)
+        && let Ok(Some(mark)) = read_served_marker(install_dir)
         && mark.names(claim.identity())
     {
         let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_FILE_NAME));
@@ -1559,11 +1577,12 @@ pub fn reclaim_claimed_delivery(
 }
 
 /// Restart/discovery classification (#2786 step 7): restart discovers owner
-/// publication/claim state through staged identity plus served retention, not
-/// arbitrary files alone. Legacy v1 fixed-name sets are an explicit
+/// publication/claim state through staged identity plus durable retention,
+/// not arbitrary files alone. Legacy v1 fixed-name sets are an explicit
 /// compatibility state — consumed only under full admission with the staged
 /// identity verbatim, never reinterpreted as a fresh generation with new
-/// identity. Terminal-unacknowledged sets reconcile through the durable
+/// identity. `InFlight` sets reconcile through the durable pre-execution
+/// claim marker and terminal-unacknowledged sets through the durable
 /// served marker; cross-operation owner ack/retirement stays with the
 /// kernel publisher half.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1579,20 +1598,28 @@ pub enum StagedDeliveryState {
 /// is a replay of spent one-shot authority, never a fresh execution. The
 /// served set carries every identity this drive served, so an older grant
 /// re-staged after a newer serve still replays instead of re-executing. The
-/// durable marker extends the same rule across restart: a staged set the
-/// marker names is terminal-unacknowledged (a crash between publish and
-/// reclaim), so it replays instead of re-executing.
+/// durable markers extend the same rule across restart: a staged set the
+/// served marker names is terminal-unacknowledged (a crash between publish
+/// and reclaim), and a staged set the `InFlight` marker names was claimed for
+/// execution (a crash between claim and served durability), so both replay
+/// instead of re-executing.
 #[must_use]
 pub fn classify_staged_delivery(
     material: &ValidatedDispatchMaterial,
     served: &[StagedDeliveryIdentity],
     marker: Option<&ServedDeliveryMarker>,
+    inflight: Option<&InFlightDeliveryMarker>,
 ) -> StagedDeliveryState {
     let identity = StagedDeliveryIdentity::from_material(material);
     if served.contains(&identity)
         || served
             .iter()
             .any(|prior| prior.grant_digest == identity.grant_digest)
+    {
+        return StagedDeliveryState::Replay { identity };
+    }
+    if let Some(mark) = inflight
+        && (mark.names(&identity) || mark.grant_digest == identity.grant_digest)
     {
         return StagedDeliveryState::Replay { identity };
     }
@@ -1646,24 +1673,58 @@ impl ServedDeliveryMarker {
     }
 }
 
-/// Reads the durable served marker, if any. Absent, oversize, or
-/// unparseable answers `None`: an unreadable marker must not wedge
-/// execution; the staged-identity behavior is the fallback. Bounded read:
-/// a legitimate marker is a few hundred bytes.
-#[must_use]
-pub fn read_served_marker(install_dir: &std::path::Path) -> Option<ServedDeliveryMarker> {
-    let bytes = std::fs::read(install_dir.join(WASM_HOST_SERVED_FILE_NAME)).ok()?;
-    if bytes.len() > 4096 {
-        return None;
+/// Reads the durable served marker, if any. Only an absent marker answers
+/// `Ok(None)`; read failures, oversize files, and malformed records fail
+/// closed so callers cannot treat uncertain served state as a fresh delivery.
+/// The bounded read accepts a few hundred bytes for a legitimate marker.
+pub fn read_served_marker(
+    install_dir: &std::path::Path,
+) -> Result<Option<ServedDeliveryMarker>, MaterialError> {
+    const MAX_BYTES: usize = 4096;
+
+    let path = install_dir.join(WASM_HOST_SERVED_FILE_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.len() > MAX_BYTES as u64 => {
+            return Err(MaterialError::TooLarge);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
     }
-    serde_json::from_slice(&bytes).ok()
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(MaterialError::Unreadable(other.kind().to_string())),
+                Ok(_) => Err(MaterialError::Unreadable(error.kind().to_string())),
+            };
+        }
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    };
+    let mut bounded = std::io::Read::take(file, (MAX_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    if bytes.len() > MAX_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    let marker: ServedDeliveryMarker =
+        serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
+    if marker.operation_id.trim().is_empty()
+        || marker.claim_id.trim().is_empty()
+        || marker.generation == 0
+    {
+        return Err(MaterialError::Malformed);
+    }
+    hex_digest(&marker.grant_digest, "served-marker-grant-digest")?;
+    Ok(Some(marker))
 }
 
 /// Writes the served marker atomically (process-scoped partial, flushed,
-/// then renamed): the reader never observes partial JSON. Best-effort
-/// durability signal: the serve already happened exactly once, so callers
-/// proceed on failure — without a marker only crash-recovery replay is
-/// lost, never the correctness of this serve.
+/// then renamed): the reader never observes partial JSON. Callers must
+/// propagate a write failure and retain the claimed set for recovery.
 pub fn write_served_marker(
     install_dir: &std::path::Path,
     identity: &StagedDeliveryIdentity,
@@ -1682,6 +1743,139 @@ pub fn write_served_marker(
     std::fs::File::open(&partial)?.sync_all()?;
     std::fs::rename(&partial, install_dir.join(WASM_HOST_SERVED_FILE_NAME))?;
     Ok(())
+}
+
+/// Durable pre-execution claim record: the identity this drive is about to
+/// execute. Decisions match on identity only; `claimed_at_unix_ms` is
+/// informational (wall-clock at write, never a derivation input).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InFlightDeliveryMarker {
+    /// Claimed operation identity.
+    pub operation_id: String,
+    /// Claimed generation.
+    pub generation: u64,
+    /// Claimed claim identity.
+    pub claim_id: String,
+    /// Claimed grant digest (hex).
+    pub grant_digest: String,
+    /// Wall-clock milliseconds when the marker was written.
+    pub claimed_at_unix_ms: u64,
+}
+
+impl InFlightDeliveryMarker {
+    /// Captures the claim record for one delivery identity.
+    #[must_use]
+    pub fn from_identity(identity: &StagedDeliveryIdentity, claimed_at_unix_ms: u64) -> Self {
+        Self {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+            grant_digest: identity.grant_digest.clone(),
+            claimed_at_unix_ms,
+        }
+    }
+
+    /// Whether this marker names exactly the staged identity.
+    #[must_use]
+    pub fn names(&self, identity: &StagedDeliveryIdentity) -> bool {
+        self.operation_id == identity.operation_id
+            && self.generation == identity.generation
+            && self.claim_id == identity.claim_id
+            && self.grant_digest == identity.grant_digest
+    }
+}
+
+/// Reads the durable `InFlight` marker, if any. Only an absent marker answers
+/// `Ok(None)`; read failures, oversize files, and malformed records fail
+/// closed so callers cannot treat an uncertain claim as a fresh delivery.
+/// The bounded read accepts a few hundred bytes for a legitimate marker.
+pub fn read_inflight_marker(
+    install_dir: &std::path::Path,
+) -> Result<Option<InFlightDeliveryMarker>, MaterialError> {
+    const MAX_BYTES: usize = 4096;
+
+    let path = install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.len() > MAX_BYTES as u64 => {
+            return Err(MaterialError::TooLarge);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    }
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(MaterialError::Unreadable(other.kind().to_string())),
+                Ok(_) => Err(MaterialError::Unreadable(error.kind().to_string())),
+            };
+        }
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    };
+    let mut bounded = std::io::Read::take(file, (MAX_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    if bytes.len() > MAX_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    let marker: InFlightDeliveryMarker =
+        serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
+    if marker.operation_id.trim().is_empty()
+        || marker.claim_id.trim().is_empty()
+        || marker.generation == 0
+    {
+        return Err(MaterialError::Malformed);
+    }
+    hex_digest(&marker.grant_digest, "inflight-marker-grant-digest")?;
+    Ok(Some(marker))
+}
+
+/// Writes the `InFlight` marker atomically (process-scoped partial, flushed,
+/// then renamed): the reader never observes partial JSON. Callers must
+/// propagate a write failure and refuse execution without durable claim
+/// evidence.
+pub fn write_inflight_marker(
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+    claimed_at_unix_ms: u64,
+) -> std::io::Result<()> {
+    let marker = InFlightDeliveryMarker::from_identity(identity, claimed_at_unix_ms);
+    let bytes =
+        serde_json::to_vec(&marker).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let partial = install_dir.join(format!(
+        ".{}.{}.partial",
+        WASM_HOST_INFLIGHT_FILE_NAME,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&partial);
+    std::fs::write(&partial, &bytes)?;
+    std::fs::File::open(&partial)?.sync_all()?;
+    std::fs::rename(&partial, install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME))?;
+    Ok(())
+}
+
+/// Clears the `InFlight` marker once the served marker is durable: only a
+/// marker naming exactly this identity is removed, so a successor claim is
+/// never touched. Best-effort by contract — the served marker remains the
+/// primary replay guard, so a leftover only replays, never re-executes.
+/// Returns whether no marker for this identity remains.
+#[must_use]
+pub fn clear_inflight_marker(
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+) -> bool {
+    match read_inflight_marker(install_dir) {
+        Ok(Some(mark)) if mark.names(identity) => {
+            std::fs::remove_file(install_dir.join(WASM_HOST_INFLIGHT_FILE_NAME)).is_ok()
+        }
+        Ok(Some(_) | None) => true,
+        Err(_) => false,
+    }
 }
 
 /// Whether one staged file is gone: removed by this reclaim, or already

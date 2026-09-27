@@ -88,13 +88,10 @@ where
                     execution,
                 })
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
-                let wake_ids = self.wake.cancel_pending_wakes(request).await?;
-                Ok(UserAutomationHostExecutionResponse::Cancelled {
-                    request_sha256,
-                    state_fence,
-                    wake_ids,
-                })
+            UserAutomationHostExecutionOperation::CancelPendingWakes { .. } => {
+                // Cancellation receipts bind a server-authenticated channel,
+                // so this convenience path cannot authorize the effect.
+                Err(UserAutomationRuntimeError::IdentityConflict)
             }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 let readback = self.wake.read_pending_wake(request).await?;
@@ -103,6 +100,12 @@ where
                     state_fence,
                     readback,
                 })
+            }
+            // Batch enumeration receipts bind the authenticated Host channel.
+            // This convenience dispatch has no server-authored session, so it
+            // must not issue a receipt from caller-carried channel fields.
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. } => {
+                Err(UserAutomationRuntimeError::IdentityConflict)
             }
         }
     }
@@ -137,6 +140,14 @@ where
                 })
             }
             UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+                let channel_binding_sha256 = session.authenticated_channel_binding_digest()?;
+                let receipt = request
+                    .enumeration_receipt
+                    .as_deref()
+                    .ok_or(UserAutomationRuntimeError::IdentityConflict)?;
+                receipt
+                    .validate_authenticated_channel(&channel_binding_sha256)
+                    .map_err(|_| UserAutomationRuntimeError::IdentityConflict)?;
                 let wake_ids = self.wake.cancel_pending_wakes(request).await?;
                 Ok(UserAutomationHostExecutionResponse::Cancelled {
                     request_sha256,
@@ -150,6 +161,18 @@ where
                     request_sha256,
                     state_fence,
                     readback,
+                })
+            }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                let channel_binding_sha256 = session.authenticated_channel_binding_digest()?;
+                let receipt = self
+                    .wake
+                    .enumerate_pending_wakes_authenticated(request, channel_binding_sha256)
+                    .await?;
+                Ok(UserAutomationHostExecutionResponse::WakeEnumeration {
+                    request_sha256,
+                    state_fence,
+                    receipt: Box::new(receipt),
                 })
             }
         }

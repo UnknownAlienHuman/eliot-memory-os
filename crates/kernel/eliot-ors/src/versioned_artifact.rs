@@ -6,11 +6,15 @@
 //! cutover/rollback verifies the candidate hash plus I1.12 compatibility
 //! evidence. Any update targeting the path of an active executable is
 //! rejected. This module is pure domain logic: it owns no processes, store
-//! handles, or canonical memory.
+//! handles, or canonical memory. [`VersionedArtifactEntry`] and the
+//! registry's `durable_entries`/`from_durable_entries` pair are the pure
+//! projection the ORS store writes and reads back, so a restart can rebuild
+//! the registry from durable rows instead of an empty map; they are the same
+//! registry state, not a second registry owner.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{OrsError, sha256_hex, validate_digest, validate_text};
 use eliot_contracts::canonical_json_bytes;
@@ -114,6 +118,83 @@ pub enum ArtifactGenerationState {
     Active,
     Draining,
     Retired,
+}
+
+/// One durable ORS row for one versioned-artifact registry entry.
+///
+/// The row is a registry entry projected onto storage: it carries the
+/// immutable artifact identity, the entry's [`ArtifactGenerationState`] and
+/// its drain mark, and nothing else. `state` also selects which registry map
+/// the row belongs to - `Staged` is a staged candidate, `Active`/`Draining`
+/// are retained generations - so one durable table holds both maps without a
+/// second table owner and without a side field that could disagree with the
+/// state it duplicates.
+///
+/// `Retired` has no row: [`VersionedArtifactRegistry::retire`] removes the
+/// entry from the registry, so no transition can produce one and
+/// [`Self::validate`] refuses it on both the write and the read side.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionedArtifactEntry {
+    pub artifact: VersionedArtifact,
+    pub state: ArtifactGenerationState,
+    pub drained: bool,
+}
+
+impl VersionedArtifactEntry {
+    /// Durable key prefix for a retained generation row.
+    pub const RETAINED_KEY_PREFIX: &'static str = "retained:";
+    /// Durable key prefix for a staged candidate row.
+    pub const STAGED_KEY_PREFIX: &'static str = "staged:";
+
+    /// Validates the row-local invariants: the artifact keeps its exact
+    /// canonical generation-addressed identity, a retired generation has no
+    /// row at all, and only a `Draining` generation may carry a drain mark.
+    ///
+    /// The row-local rules only. Whether a set of rows can be a registry at all
+    /// (no duplicate registry key within one side, one `Active` generation per
+    /// module, staged and retained agreeing on a shared key) is decided by
+    /// [`VersionedArtifactRegistry::from_durable_entries`], which sees the whole
+    /// family.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        self.artifact.validate()?;
+        if self.state == ArtifactGenerationState::Retired {
+            return Err(OrsError::InvalidField {
+                field: "versioned_artifact_state",
+                reason: "a retired generation has no durable registry row",
+            });
+        }
+        if self.drained && self.state != ArtifactGenerationState::Draining {
+            return Err(OrsError::InvalidField {
+                field: "versioned_artifact_drained",
+                reason: "only a draining generation may carry a drain mark",
+            });
+        }
+        Ok(())
+    }
+
+    /// The exact durable key this row must be stored under.
+    ///
+    /// Pure key computation, so it is also the read-side check: a stored row
+    /// whose key differs from this value is refused rather than reinterpreted.
+    /// Only `Staged` selects the staged prefix; every other state is a
+    /// retained-side key, so the computation is total and can never produce an
+    /// empty or partial key. The generation is rendered last and never contains
+    /// a separator, so the key is injective: two distinct registry entries can
+    /// never share one.
+    #[must_use]
+    pub fn record_key(&self) -> String {
+        let prefix = match self.state {
+            ArtifactGenerationState::Staged => Self::STAGED_KEY_PREFIX,
+            ArtifactGenerationState::Active
+            | ArtifactGenerationState::Draining
+            | ArtifactGenerationState::Retired => Self::RETAINED_KEY_PREFIX,
+        };
+        format!(
+            "{prefix}{}:{}",
+            self.artifact.module_id, self.artifact.generation
+        )
+    }
 }
 
 /// Status projection identifying the active generation's exact artifact.
@@ -546,6 +627,94 @@ impl VersionedArtifactRegistry {
         self.retained
             .get(&(module_id.to_owned(), generation))
             .map(|entry| (entry.artifact.clone(), entry.state, entry.drained))
+    }
+
+    /// Projects every registry entry onto its durable row.
+    ///
+    /// A staged candidate becomes a `Staged` row and each retained generation
+    /// becomes a row carrying its own state and drain mark, so the rows are
+    /// exactly the registry's two maps with nothing added. Staged rows come
+    /// first, then retained rows, each in `(module_id, generation)` order, so
+    /// the projection is a deterministic function of the registry.
+    pub fn durable_entries(&self) -> Result<Vec<VersionedArtifactEntry>, OrsError> {
+        let mut rows = Vec::with_capacity(self.staged.len() + self.retained.len());
+        for artifact in self.staged.values() {
+            let row = VersionedArtifactEntry {
+                artifact: artifact.clone(),
+                state: ArtifactGenerationState::Staged,
+                drained: false,
+            };
+            row.validate()?;
+            rows.push(row);
+        }
+        for entry in self.retained.values() {
+            let row = VersionedArtifactEntry {
+                artifact: entry.artifact.clone(),
+                state: entry.state,
+                drained: entry.drained,
+            };
+            row.validate()?;
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Rebuilds a registry from durable rows (issue #1971).
+    ///
+    /// This is the restart reconstruction path: the staged candidates, the
+    /// retained generations, each one's `ArtifactGenerationState` and its
+    /// drain mark all come from the rows, so the `ActiveExecutableReplacement`
+    /// refusal and the active generation's exact hash/path are re-derived from
+    /// durable state instead of from process memory.
+    ///
+    /// A row set that cannot be a registry is refused, never repaired:
+    /// [`VersionedArtifactEntry::validate`] rejects a `Retired` row, this loop
+    /// rejects two rows projecting onto one registry key within the same side,
+    /// it rejects two `Active` generations for one module because that would
+    /// make the active generation unidentifiable, and it rejects a key present
+    /// in both maps under differing artifact identities, which is exactly the
+    /// identity `install_candidate` enforces when it re-stages a retained
+    /// artifact for rollback.
+    pub fn from_durable_entries(rows: Vec<VersionedArtifactEntry>) -> Result<Self, OrsError> {
+        let mut staged: BTreeMap<(String, u64), VersionedArtifact> = BTreeMap::new();
+        let mut retained: BTreeMap<(String, u64), RetainedEntry> = BTreeMap::new();
+        let mut active_modules: BTreeSet<String> = BTreeSet::new();
+        for row in rows {
+            // `validate` is the single row-level gate: it refuses `Retired`, so
+            // the `retained` arm below can only ever see `Active` or `Draining`.
+            row.validate()?;
+            let key = (row.artifact.module_id.clone(), row.artifact.generation);
+            if row.state == ArtifactGenerationState::Staged {
+                if staged.insert(key.clone(), row.artifact.clone()).is_some() {
+                    return Err(OrsError::VersionedArtifactConflict);
+                }
+                continue;
+            }
+            if retained.contains_key(&key) {
+                return Err(OrsError::VersionedArtifactConflict);
+            }
+            if row.state == ArtifactGenerationState::Active
+                && !active_modules.insert(row.artifact.module_id.clone())
+            {
+                return Err(OrsError::VersionedArtifactConflict);
+            }
+            retained.insert(
+                key,
+                RetainedEntry {
+                    artifact: row.artifact,
+                    state: row.state,
+                    drained: row.drained,
+                },
+            );
+        }
+        for (key, artifact) in &staged {
+            if let Some(entry) = retained.get(key)
+                && entry.artifact != *artifact
+            {
+                return Err(OrsError::VersionedArtifactConflict);
+            }
+        }
+        Ok(Self { staged, retained })
     }
 }
 

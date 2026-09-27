@@ -45,10 +45,22 @@ mod backup_capture;
 mod backup_capture_ports;
 mod backup_restore;
 mod backup_restore_ports;
+#[cfg(windows)]
+mod blackboard;
 mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
+/// Kernel problem-diagnostic projection (issue #1844; I16.7): the bounded
+/// `LogWindowRef`/`DiagnosticBrief` compiler over the canonical audit chain
+/// and the captured operational log windows. It emits references, gaps, and
+/// one next step, never rolling log content and never an assigned cause.
+pub mod diagnostic_brief;
+/// Kernel-owned durable audit evidence (issue #1837; I16): the single
+/// BLAKE3-chained audit chain plus the single Watchdog-domain anchor sink.
+/// Every authority/lifecycle boundary appends through the composition's
+/// one [`KernelAuditChain`] handle; there is no second writer.
+pub mod kernel_audit;
 mod kernel_build_contract;
 mod kernel_config;
 /// Kernel structured diagnostics facade (F-LOG-KERNEL-0, #895): compiled
@@ -90,6 +102,11 @@ pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
     BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
     BlobProbeSuccess, BlobReadyReceipt, BlobRef, BlobStoreController, BlobStoreManifest,
+};
+pub use kernel_audit::{
+    AuditAnchor, AuditAnchorBinding, AuditAssuranceClass, AuditCaptureMode, AuditEventDraft,
+    AuditEventKind, AuditLineage, AuditRecord, ChainVerification, KernelAuditChain,
+    KernelAuditError, kernel_audit_anchor_dir, kernel_audit_chain_path, kernel_audit_dir,
 };
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
 #[cfg(windows)]
@@ -206,7 +223,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// DISPATCH-CONTOUR-2 Slice B launch contour (issues #461 and #22).
 ///
@@ -583,6 +600,14 @@ pub struct KernelComposition {
     agent_bridge_peer_set_changed: tokio::sync::Notify,
     #[cfg(windows)]
     agent_bridge_connections: Mutex<BTreeMap<String, AgentBridgeConnectionState>>,
+    /// Application-owned ELIOT session authorities keyed by semantic session
+    /// identity (I7.14). Unlike `agent_bridge_connections`, these survive a
+    /// transport disconnect: a pipe/stdio/HTTP reconnect records a new
+    /// transport-binding continuity observation and the application session
+    /// stays ACTIVE. Only application-level expiry, revocation or explicit
+    /// detach moves the session to a terminal state.
+    #[cfg(windows)]
+    agent_application_sessions: Mutex<BTreeMap<String, eliot_ipc::ApplicationSession>>,
     #[cfg(windows)]
     agent_activation_pending: Mutex<AgentActivationPendingState>,
     #[cfg(windows)]
@@ -626,6 +651,12 @@ pub struct KernelComposition {
     /// from the assembly store so later owner operations never reopen the
     /// database file or invent a second recovery store.
     p07_ors: Arc<RedbRecoveryStore>,
+    /// The single Kernel-owned durable audit chain (issue #1837; I16).
+    /// Leaf lock: chain appends never acquire another Kernel lock, so
+    /// boundaries may observe while holding queue/session locks. Opened
+    /// once at assembly below the canonical work root; every boundary
+    /// appends through [`KernelComposition::audit_observe`].
+    pub(crate) kernel_audit: Mutex<KernelAuditChain>,
 }
 
 impl KernelComposition {
@@ -2779,6 +2810,8 @@ impl KernelComposition {
             .lock()
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
         coordinator.revoke_supervision_evidence();
+        // Issue #1837: durable audit evidence for lease revocation.
+        self.audit_observe(AuditEventDraft::lease_supervision_revoked());
         Ok(())
     }
 
@@ -3512,6 +3545,11 @@ impl KernelComposition {
             .ok_or(KernelServiceError::ReadinessNotProven)?;
         let snapshot = Self::commit_or_replay_active_supervision(authority, &contour, unix_ms())
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        // Issue #1837: durable audit evidence for lease establishment.
+        self.audit_observe(AuditEventDraft::lease_supervision_established(
+            &snapshot,
+            Some(session),
+        ));
         Ok((contour, snapshot))
     }
 
@@ -3766,6 +3804,8 @@ impl KernelComposition {
             )?;
             (renewed, published)
         };
+        // Issue #1837: durable audit evidence for lease renewal.
+        self.audit_observe(AuditEventDraft::lease_supervision_renewed(&renewed, None));
         Ok((renewed, published))
     }
 
@@ -3980,6 +4020,8 @@ impl KernelComposition {
         coordinator
             .request_shutdown()
             .map_err(ProcessExecutionError::Unavailable)?;
+        // Issue #1837: durable audit evidence for shutdown phases.
+        self.audit_observe(AuditEventDraft::shutdown_drain_requested());
         let drain = self.run_shutdown_drain(&coordinator).await;
         let process_result = self
             .process_gateway
@@ -4000,6 +4042,10 @@ impl KernelComposition {
             coordinator
                 .complete_terminal(ShutdownTerminal::Intentional)
                 .map_err(ProcessExecutionError::Unavailable)?;
+            self.audit_observe(AuditEventDraft::shutdown_terminal_published(
+                "intentional",
+                0,
+            ));
         } else {
             if pending.is_empty() {
                 pending.push(
@@ -4010,9 +4056,14 @@ impl KernelComposition {
                         .to_owned(),
                 );
             }
+            let pending_count = pending.len();
             coordinator
                 .complete_terminal(ShutdownTerminal::Incomplete { pending })
                 .map_err(ProcessExecutionError::Unavailable)?;
+            self.audit_observe(AuditEventDraft::shutdown_terminal_published(
+                "incomplete",
+                pending_count,
+            ));
         }
         coordinator.observe_published_state();
         process_result?;
@@ -4084,9 +4135,11 @@ impl KernelComposition {
         // receipt (ORS store-rebind rows) must resolve before the
         // linearization point; the bounded wait retains the remainder. The
         // next phase proceeds only on a successful complete observation, not
-        // on a raw empty collection.
+        // on a raw empty collection. This registration pass is itself a
+        // bounded page walk, bounded by the same receipt deadline the wait
+        // below owns.
         let scanned = self
-            .pending_rebind_receipts()
+            .pending_rebind_receipts(DRAIN_RECEIPT_DEADLINE)
             .map_err(|_| DrainHalt::new("ors-rebind-scan-failed"))?;
         for identity in scanned.pending.iter().map(ReceiptOwnerEvidence::identity) {
             coordinator
@@ -4097,7 +4150,7 @@ impl KernelComposition {
             .reconcile_pending_observation(
                 DRAIN_RECEIPT_DEADLINE,
                 ReceiptOwnerFamily::StoreRebind,
-                || self.pending_rebind_receipts(),
+                |remaining| self.pending_rebind_receipts(remaining),
             )
             .await
         {
@@ -4242,6 +4295,11 @@ impl KernelComposition {
         coordinator.commit_drain(decision.clone()).map_err(|_| {
             DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
         })?;
+        // Issue #1837: durable audit evidence for the drain commit.
+        self.audit_observe(AuditEventDraft::shutdown_drain_committed(
+            &decision.generation,
+            decision.authority_epochs_fenced.len(),
+        ));
 
         // Service stop follows linearization; a committed drain without a
         // clean stop is incomplete recovery state, never a silent success.
@@ -4334,37 +4392,60 @@ impl KernelComposition {
     ///
     /// Every row is reported with the exact operation/request binding the
     /// owner stored, so reconciliation proves resolution against the owner
-    /// instead of an unversioned string. The read is one bounded page: a
-    /// family that does not fit the page budget is reported as an incomplete
-    /// observation, which carries no removal authority, rather than being
-    /// silently truncated. Absence is not resolution here — the owner
-    /// removes an aborted row, so a miss is a query miss and never success.
-    fn pending_rebind_receipts(&self) -> Result<ReceiptRescanObservation, String> {
-        let (records, has_more) = self
-            .generation_gateway
-            .ors
-            .load_store_rebind_page(eliot_ors::MAX_RECOVERY_PAGE)
-            .map_err(|_| "ors-rebind-scan-failed".to_owned())?;
+    /// instead of an unversioned string. The read walks the whole family one
+    /// bounded page at a time, so a family larger than a single page is
+    /// covered rather than truncated, and no read is a synchronous full-table
+    /// load. The walk admits the next page only while `budget` remains: a walk
+    /// that runs out of budget mid-family reports an incomplete observation,
+    /// which carries no removal authority, instead of extending the deadline.
+    /// Absence is not resolution here — the owner removes an aborted row, so a
+    /// miss is a query miss and never success.
+    fn pending_rebind_receipts(
+        &self,
+        budget: Duration,
+    ) -> Result<ReceiptRescanObservation, String> {
+        let scan_start = Instant::now();
+        let mut after_key: Option<String> = None;
         let mut pending = Vec::new();
         let mut resolved = Vec::new();
         let mut revision = 0_u64;
-        for record in &records {
-            let evidence = ReceiptOwnerEvidence::new(
-                format!("store-rebind:{}", record.operation_id.as_str()),
-                record.request_digest.clone(),
-                record.generation,
-                record.commit_order,
-            );
-            revision = revision.max(record.commit_order);
-            if record.state == eliot_ors::StoreRebindReplayState::Pending {
-                pending.push(evidence);
-            } else {
-                resolved.push(evidence);
+        let mut complete = false;
+        loop {
+            let (records, continuation) = self
+                .generation_gateway
+                .ors
+                .load_store_rebind_page(after_key.as_deref(), eliot_ors::MAX_RECOVERY_PAGE)
+                .map_err(|_| "ors-rebind-scan-failed".to_owned())?;
+            for record in &records {
+                let evidence = ReceiptOwnerEvidence::new(
+                    format!("store-rebind:{}", record.operation_id.as_str()),
+                    record.request_digest.clone(),
+                    record.generation,
+                    record.commit_order,
+                );
+                revision = revision.max(record.commit_order);
+                if record.state == eliot_ors::StoreRebindReplayState::Pending {
+                    pending.push(evidence);
+                } else {
+                    resolved.push(evidence);
+                }
             }
+            let Some(next_key) = continuation else {
+                complete = true;
+                break;
+            };
+            // Remaining time is checked around the read: the family continues,
+            // so the next page is admitted only by budget this scan was already
+            // given. Exhausting it here reports truncated coverage rather than
+            // starting a fresh budget.
+            if scan_start.elapsed() >= budget {
+                break;
+            }
+            after_key = Some(next_key);
         }
         Ok(ReceiptRescanObservation {
             family: ReceiptOwnerFamily::StoreRebind,
-            complete: !has_more,
+            complete,
             absence_resolves: false,
             revision,
             pending,

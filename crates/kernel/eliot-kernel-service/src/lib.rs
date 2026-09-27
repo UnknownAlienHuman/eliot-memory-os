@@ -44,6 +44,7 @@ mod protocol;
 mod reactive_state;
 #[cfg(test)]
 mod reactive_state_tests;
+mod storage_replacement;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
@@ -178,6 +179,11 @@ pub use reactive_state::{
     ResourceSnapshotResponse, handle_reactive_ledger_read, handle_reactive_ledger_request,
     handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
 };
+pub use storage_replacement::{
+    CANONICAL_STORE_CAPABILITY, IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT,
+    StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
+    StorageRollbackDisposition,
+};
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
     StoreClientFaultHarness,
@@ -210,18 +216,21 @@ pub use user_automation::{
     UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
 };
 pub use user_automation_execution::{
-    UserAutomationDueWakeRejection, UserAutomationDueWakeRejectionCause,
-    UserAutomationDueWakeResolution, UserAutomationDurableJobPort, UserAutomationExecutionError,
-    UserAutomationExecutionOutcome, UserAutomationExecutionRequest, UserAutomationFailureHistory,
-    UserAutomationFailureHistoryPort, UserAutomationFailurePublication,
-    UserAutomationFailureRecord, UserAutomationHorizonTrigger, UserAutomationNotificationDelivery,
-    UserAutomationNotificationPort, UserAutomationRemovalResult, UserAutomationRuntimeAdmission,
-    UserAutomationRuntimeComposition, UserAutomationRuntimeError, UserAutomationRuntimePort,
-    UserAutomationWakeCancellation, UserAutomationWakeCancellationTarget,
-    UserAutomationWakeHorizonEntry, UserAutomationWakeHorizonPublication, UserAutomationWakePort,
-    UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
-    advance_wake_horizon, compile_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
-    resolve_due_wake,
+    USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION, UserAutomationDueWakeRejection,
+    UserAutomationDueWakeRejectionCause, UserAutomationDueWakeResolution,
+    UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationExecutionRequest, UserAutomationFailureHistory, UserAutomationFailureHistoryPort,
+    UserAutomationFailurePublication, UserAutomationFailureRecord, UserAutomationHorizonTrigger,
+    UserAutomationNotificationDelivery, UserAutomationNotificationPort,
+    UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationCoverage,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonEntry, UserAutomationWakeHorizonPublication,
+    UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOwnerEvidence,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, advance_wake_horizon, compile_wake_horizon, horizon_retry_handle,
+    refuse_consumed_wake, resolve_due_wake, wake_occurrence_denominator_digest,
 };
 #[cfg(windows)]
 pub use user_automation_execution_client::AuthenticatedUserAutomationHostExecutionTransport;

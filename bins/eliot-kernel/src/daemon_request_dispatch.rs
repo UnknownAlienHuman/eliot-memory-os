@@ -25,9 +25,10 @@ use eliot_kernel_service::{
     UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
     UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeHorizonPublication, UserAutomationWakePort,
-    UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
-    advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
+    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -146,7 +147,7 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
-/// Typed refusal kind answered by the four P-07 authority arms (`#1110`).
+/// Typed refusal kind answered by the P-07 authority arms (`#1110`).
 /// Refusals are completed application answers, never missing frames or receipts.
 const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
 /// I7.20 dispositions emitted only where the P-07 variant establishes a
@@ -154,6 +155,7 @@ const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
 const P07_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
 const P07_DISPOSITION_RECOVERY_REQUIRED: &str = "RECOVERY_REQUIRED";
 const P07_DISPOSITION_INVALID_REQUEST: &str = "INVALID_REQUEST";
+const P07_DISPOSITION_DENIED: &str = "DENIED";
 const P07_DISPOSITION_FAILED: &str = "FAILED";
 const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 
@@ -920,6 +922,33 @@ fn p07_cause_classification(
         ),
         Cause::P07OwnerUnavailable => (
             eliot_kernel_service::REASON_CAPABILITY_UNAVAILABLE,
+            P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::AuthorityReceiptExpired => (
+            "DEADLINE_EXCEEDED",
+            P07_DISPOSITION_DENIED,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::ControlReserveExhausted
+        | Cause::NormalCapacityExhausted
+        | Cause::ProtectedReserveExhausted
+        | Cause::EmergencySlotUnavailable => (
+            "DEFERRED_CAPACITY",
+            P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::ControlGuaranteeLost | Cause::RecoveryUnavailable | Cause::RecoveryStateFailure => (
+            "RECOVERY_REQUIRED",
+            P07_DISPOSITION_RECOVERY_REQUIRED,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::DependencyUnavailable => (
+            "ENVIRONMENT_UNAVAILABLE",
             P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
             Directive::OwnerEscalation,
             TransportError::SessionFenced,
@@ -3128,20 +3157,31 @@ impl KernelComposition {
                 }
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt = eliot_authority::P07AuthorityPort::activate_root_transition(
+                // A decided port refusal is a completed application answer, not
+                // a lost acknowledgement: it is answered with its exact typed
+                // cause, I7.20 classification and snapshot, like the four
+                // lifecycle arms, instead of collapsing to one bare transport
+                // code that the daemon can only read as a generic failure.
+                match eliot_authority::P07AuthorityPort::activate_root_transition(
                     bound.port(),
                     &request,
-                )
-                .map_err(|error| map_p07_port_error(&error).transport)?;
-                receipt
-                    .validate(&request)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": ROOT_TRANSITION_RECEIPT_KIND,
-                    "value": value,
-                }))
+                ) {
+                    Ok(receipt) => {
+                        receipt
+                            .validate(&request)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "kind": ROOT_TRANSITION_RECEIPT_KIND,
+                            "value": value,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response(
+                        ACTIVATE_ROOT_TRANSITION_OPERATION,
+                        &refusal,
+                    )),
+                }
             }
             "publish_wasm_dispatch_bundle" => {
                 self.wasm_dispatch_bundle_operation(session, payload.clone())
@@ -3332,6 +3372,8 @@ impl KernelComposition {
             "kernel.daemon.supervision_expired_effects_revoked",
             "success",
         );
+        // Issue #1837: durable audit evidence for lease expiry.
+        self.audit_observe(AuditEventDraft::lease_supervision_expired());
         Ok(())
     }
 
@@ -3562,6 +3604,14 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                if let Err(error) = request.validate() {
+                    return Ok(Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Rejected(error.to_string()),
+                    ));
+                }
+                &request.context.state_fence
+            }
         };
         if request_fence != &session.module_generation.state_fence {
             return Err(TransportError::SessionFenced);
@@ -3591,6 +3641,12 @@ impl KernelComposition {
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_wake_read(session, request)
+                        .await,
+                )
+            }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_enumeration(session, request)
                         .await,
                 )
             }
@@ -3647,6 +3703,12 @@ impl KernelComposition {
                         .await,
                 )
             }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_enumeration(session, request)
+                        .await,
+                )
+            }
         };
         if let Some(answer) = owner_check {
             return Ok(answer);
@@ -3696,6 +3758,19 @@ impl KernelComposition {
                         "value": {
                             "outcome": "wake_readback",
                             "readback": readback,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
+                match Box::pin(client.enumerate_pending_wakes(request)).await {
+                    Ok(receipt) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "wake_enumeration",
+                            "receipt": receipt,
                         },
                         "recovery": null,
                     })),
@@ -5083,7 +5158,7 @@ impl KernelComposition {
                 resolution,
                 &publication,
                 &requested_occurrence_ids,
-                acknowledgement,
+                &acknowledgement,
             ),
             Err(error) => {
                 let reason = error.to_string();
@@ -5163,7 +5238,7 @@ impl KernelComposition {
         resolution: &UserAutomationDueWakeResolution,
         publication: &UserAutomationWakeHorizonPublication,
         requested_occurrence_ids: &[String],
-        acknowledgement: UserAutomationWakePublication,
+        acknowledgement: &UserAutomationWakePublication,
     ) -> UserAutomationHorizonPhase {
         if let Err(error) = acknowledgement.validate_for(publication) {
             return Self::user_automation_unacknowledged_horizon(
@@ -5176,31 +5251,79 @@ impl KernelComposition {
                 true,
             );
         }
+        // One flight is bounded (issue #2806 item 10): the owner acknowledged
+        // only the requested prefix, so the denominator tail past this flight
+        // is still owed. It joins the owner's own remaining set, and a
+        // non-empty combined remainder forces `Partial` with a handle over the
+        // exact combined set — never a `Published` horizon for occurrences that
+        // were never sent.
+        let tail = match publication.uncapped_tail_ids() {
+            Ok(tail) => tail,
+            Err(error) => {
+                return Self::user_automation_unacknowledged_horizon(
+                    resolution,
+                    requested_occurrence_ids,
+                    &publication.identity,
+                    &format!(
+                        "the bounded horizon slice after the admitted occurrence does not account \
+                         for its own denominator tail: {error}"
+                    ),
+                    true,
+                );
+            }
+        };
+        let mut remaining_occurrence_ids = acknowledgement.remaining_occurrence_ids.clone();
+        remaining_occurrence_ids.extend(tail.iter().cloned());
         let publication_operation_id = Box::new(acknowledgement.publication_operation_id.clone());
-        let outcome = if acknowledgement.acknowledged_all() {
-            UserAutomationHorizonOutcome::Published {
-                publication_operation_id,
-            }
+        let (outcome, retry_handle) = if remaining_occurrence_ids.is_empty()
+            && acknowledgement.acknowledged_all()
+        {
+            (
+                UserAutomationHorizonOutcome::Published {
+                    publication_operation_id,
+                },
+                acknowledgement.retry_handle.clone(),
+            )
         } else {
-            UserAutomationHorizonOutcome::Partial {
-                publication_operation_id,
-                reason: format!(
-                    "the schedule owner acknowledged {} of the {} occurrences that follow the \
-                     admitted one; the exact remaining set is retained and must be replayed under \
-                     its handle",
-                    acknowledgement.acknowledged_occurrence_ids.len(),
-                    requested_occurrence_ids.len()
-                ),
-            }
+            let retry_handle = match publication.retry_handle(&remaining_occurrence_ids) {
+                Ok(retry_handle) => retry_handle,
+                Err(error) => {
+                    return Self::user_automation_unacknowledged_horizon(
+                        resolution,
+                        requested_occurrence_ids,
+                        &publication.identity,
+                        &format!(
+                            "the combined horizon remainder after the admitted occurrence cannot \
+                             be named for replay: {error}"
+                        ),
+                        true,
+                    );
+                }
+            };
+            (
+                UserAutomationHorizonOutcome::Partial {
+                    publication_operation_id,
+                    reason: format!(
+                        "the schedule owner acknowledged {} of the {} requested occurrences that \
+                         follow the admitted one; {} further occurrence(s) past the single-flight \
+                         bound were never sent; the exact remaining set is retained and must be \
+                         replayed under its handle",
+                        acknowledgement.acknowledged_occurrence_ids.len(),
+                        requested_occurrence_ids.len(),
+                        tail.len()
+                    ),
+                },
+                retry_handle,
+            )
         };
         UserAutomationHorizonPhase {
             trigger: publication.trigger,
             automation_id: publication.automation_id.clone(),
             automation_revision: publication.automation_revision.clone(),
             revision_digest: publication.revision_digest.clone(),
-            remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids,
+            remaining_occurrence_ids,
             requested_occurrence_ids: requested_occurrence_ids.to_vec(),
-            retry_handle: acknowledgement.retry_handle,
+            retry_handle,
             outcome,
         }
     }
@@ -5364,6 +5487,64 @@ impl KernelComposition {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         ensure_user_automation_store_receipt(&*gateway, &lookup.state_fence, &request.identity)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates a complete committed-revision enumeration request against
+    /// the authenticated owner and canonical parent operation receipt before Host.
+    async fn revalidate_user_automation_enumeration(
+        &self,
+        session: &Session,
+        request: &UserAutomationWakeEnumerationRequest,
+    ) -> Result<(), UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                )
+            })?;
+        if request.authenticated_principal != authenticated_principal
+            || request.context.state_fence != session.module_generation.state_fence
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.automation_id.clone(),
+            requested_revision: request.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            )
+        })?;
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)?;
+        let owner_denominator = owner
+            .revision
+            .compile_occurrence_identities()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        if owner.automation_id != request.automation_id
+            || owner.revision.revision != request.automation_revision
+            || owner.revision.owner_principal != authenticated_principal
+            || owner
+                .revision
+                .digest()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?
+                != request.revision_digest
+            || owner_denominator != request.denominator
+        {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        ensure_user_automation_store_receipt(&gateway, &lookup.state_fence, &request.identity)
             .await
             .map(|_| ())
     }
@@ -6120,6 +6301,7 @@ impl KernelComposition {
         if operation.transition.state_fence != operation.context.state_fence {
             return Err(TransportError::SessionFenced);
         }
+        super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         for head in &operation.expected_revision_heads {
             if let Err(error) = head.validate() {
                 return Ok(Self::store_error_response_text(
@@ -6795,11 +6977,12 @@ impl KernelComposition {
         let admission = host_request_route::check_local_read_admission(&envelope, &tool)?;
         let selectors = match admission {
             host_request_route::LocalReadAdmission::Query(selectors) => selectors,
-            host_request_route::LocalReadAdmission::CampaignPacket { .. } => {
+            host_request_route::LocalReadAdmission::CampaignPacket { .. }
+            | host_request_route::LocalReadAdmission::Skill => {
                 // `local_read` is the query-only Gateway leg. A campaign
-                // packet is served only by the dedicated packet claim/compile/
-                // result flight; admitting it here would risk reinterpreting
-                // packet material as `GetEvidencePack` selectors.
+                // packet has its dedicated claim/compile/result flight; Skill
+                // tools are served by the daemon's Skill dispatcher. Neither
+                // may be reinterpreted as `GetEvidencePack` selectors.
                 return Err(TransportError::SessionFenced);
             }
         };

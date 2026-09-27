@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ActInput, CoordinateInput, FinishAttemptDraft, McpResponse, ObserveInput, PacketInput,
-    QueryInput, StateInput, VerifyInput,
+    ActInput, CANONICAL_DEFINITION_VERSION, CoordinateInput, FinishAttemptDraft, McpResponse,
+    ObserveInput, PacketInput, QueryInput, StateInput, VerifyInput,
 };
 
 /// Exact canonical hot-tool names. The compatibility alias is intentionally absent.
@@ -35,6 +35,8 @@ pub struct ToolSchema {
     pub input_schema: Value,
     /// Output schema generated from [`McpResponse`].
     pub output_schema: Value,
+    /// Tool Definition version whose decoder and semantic profile own this schema.
+    pub definition_version: String,
     /// Digest over canonical input and output schema bytes.
     pub schema_sha256: String,
 }
@@ -45,6 +47,9 @@ pub enum SchemaError {
     /// Schema serialization failed.
     #[error("schema serialization failed: {0}")]
     Serialization(String),
+    /// A generated descriptor and its semantic owner name different versions.
+    #[error("generated schema and semantic owner disagree on definition version for {tool}")]
+    DefinitionVersionMismatch { tool: String },
 }
 
 /// Generates the canonical tool catalogue in stable semantic order.
@@ -78,6 +83,7 @@ fn descriptor<T: JsonSchema>(name: &str, description: &str) -> Result<ToolSchema
         description: description.to_owned(),
         input_schema,
         output_schema,
+        definition_version: CANONICAL_DEFINITION_VERSION.to_owned(),
         schema_sha256: hex_digest(&Sha256::digest(bytes)),
     })
 }

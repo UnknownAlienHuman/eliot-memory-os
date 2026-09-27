@@ -18,6 +18,7 @@ use eliot_process::{
 };
 use thiserror::Error;
 
+pub mod build_projection;
 pub mod cache_lane;
 pub mod process_owner;
 pub mod profile;
@@ -25,7 +26,16 @@ pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
 pub mod testd_port;
+pub mod verification_profile;
+pub mod work_envelope;
 
+pub use build_projection::{
+    AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
+    BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,
+    CleanupDecision, DeclaredWorkItem, PreemptionClass, ProducerClaim, ProducerCompletion,
+    ProducerOutcome, ProjectedBuild, QuarantinedArtifact, TargetClass, TargetRootBuildCoordinator,
+    restrict_agent_argv,
+};
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
@@ -57,6 +67,20 @@ pub use registry::{
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
+};
+pub use verification_profile::{
+    AggregateOutcome, DeclaredEnvironmentDependency, ExternalToolProvenance, PROFILE_PROOF_CEILING,
+    ParityVerdict, ProfileRunEvidence, RECEIPT_SCHEMA, RECEIPT_SCHEMA_VERSION, ReceiptBindings,
+    ReceiptSchemaIdentity, StageEvidenceRecord, ToolIdentityRecord, VERIFICATION_OPERATION_KIND,
+    VERIFICATION_PROFILE_VERIFIER, VERIFICATION_PROFILE_VERIFIER_REVISION,
+    VerificationProfileError, VerificationProfileReceipt, build_verification_profile_receipt,
+    check_declared_environment_dependencies, issue_receipt_envelope, parity_summary,
+    require_provenance, verify_profile_parity,
+};
+pub use work_envelope::{
+    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity,
+    EnvelopedInstrumentResult, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
+    WorkEnvelopeError,
 };
 
 /// Stable identity of the shared instrument runner contract.

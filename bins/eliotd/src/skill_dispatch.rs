@@ -80,6 +80,9 @@ enum PlannedSkillPair {
     Resolved(SkillResultEnvelope),
     /// Display consumes the live composition owner synchronously.
     Display(eliot_agent_bridge_core::SkillDisplayPayload),
+    /// Material-use evidence is admitted against the live catalogue and
+    /// Governor standing only after the plan's fence is rechecked.
+    Activation(Box<eliot_skill::SkillHarnessActivationReceipt>),
     /// The acceptance read returned an owner-backed record at this fence.
     AcceptedIntake {
         /// Decoded candidate the Skill owner will validate and ingest.
@@ -150,7 +153,12 @@ pub async fn plan_skill_pair(
                 error.as_ref(),
             ))),
         },
-        SkillToolKind::Activate => plan(PlannedSkillPair::Resolved(drive_activation(&arguments))),
+        SkillToolKind::Activate => match decode_activation(&arguments) {
+            Ok(receipt) => plan(PlannedSkillPair::Activation(Box::new(receipt))),
+            Err(error) => plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                error.as_ref(),
+            ))),
+        },
         SkillToolKind::Execute => plan(PlannedSkillPair::Resolved(drive_execution_evidence(
             &arguments,
         ))),
@@ -264,6 +272,16 @@ pub fn commit_skill_pair(
                     SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
                 }
             }
+            PlannedSkillPair::Activation(receipt) => {
+                if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
+                    match composition.skill_admit_material_attempt(&receipt) {
+                        Ok(summary) => SkillResultEnvelope::attempt(summary),
+                        Err(error) => SkillResultEnvelope::refused(&error),
+                    }
+                } else {
+                    SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
+                }
+            }
             PlannedSkillPair::AcceptedIntake { payload, record } => {
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
                     match composition.skill_ingest_accepted_intake(&payload, &record) {
@@ -324,17 +342,18 @@ fn bind_accepted_intake(
     Ok(())
 }
 
-/// Drives one decoded harness activation receipt into its attempt summary.
+/// Decodes one harness activation receipt for admission at the live owner.
 ///
 /// The wire receipt is validated on decode (eligibility↔retrieval,
 /// delivery↔retrieval, activation↔delivery, adherence↔activation bindings);
 /// the fold keeps delivered, retrieved, activated, adhered and useful
 /// distinct, so a packet-included but never activated Skill is never marked
 /// successful and usefulness still requires verifier-backed outcome refs.
-/// Material-use gating (stale/quarantine standing) stays at the install and
-/// display boundaries against the live registry — this ingest reports stages,
-/// it never admits Material use.
-fn drive_activation(arguments: &Value) -> SkillResultEnvelope {
+/// Decoding alone cannot admit Material use: the commit leg checks the live
+/// catalogue and Governor standing before returning an attempt summary.
+fn decode_activation(
+    arguments: &Value,
+) -> Result<eliot_skill::SkillHarnessActivationReceipt, Box<eliot_skill::SkillError>> {
     let payload = match canonical_json_bytes(&arguments)
         .map_err(|error| error.to_string())
         .and_then(|bytes| {
@@ -343,12 +362,12 @@ fn drive_activation(arguments: &Value) -> SkillResultEnvelope {
         }) {
         Ok(payload) => payload,
         Err(detail) => {
-            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+            return Err(Box::new(eliot_skill::SkillError::Surface(format!(
                 "activation arguments fail their shape: {detail}"
-            )));
+            ))));
         }
     };
-    SkillResultEnvelope::attempt(eliot_skill::derive_attempt_summary(&payload.receipt))
+    Ok(payload.receipt)
 }
 
 /// Drives one decoded execution-evidence ingest through unknown-effects

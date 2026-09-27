@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,12 +86,25 @@ use crate::{
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
-    UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
-    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
-    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriterReservationToken,
-    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
-    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
+    UserBrokerRegistrationReceipt, VersionedArtifactEntry, VersionedArtifactRegistry,
+    WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin, WorkerReplayCursors,
+    WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision, WorkerReplayRequestRecord,
+    WorkerReplayStreamRecord, WriterReservationToken, is_replay_terminal_phase,
+    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    signed_terminal_supervision_lease_from_verified,
 };
+
+/// The versioned-artifact family rides the same ORS persistence codec as every
+/// other record family: no second codec, no second journal. `validate()` is the
+/// single fail-closed gate that re-establishes the exact canonical
+/// generation-addressed artifact identity and the drain-mark rule on readback.
+impl persistence_codec::PersistedValue for VersionedArtifactEntry {
+    const RECORD_TYPE: &'static str = "versioned_artifact_entry";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
 const ENVELOPES: TableDefinition<&str, &str> = TableDefinition::new("ors_envelopes_v1");
@@ -165,6 +179,21 @@ const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+/// Durable versioned-artifact registry rows (issue #1971; I1.6, I1.12, I14.14).
+///
+/// One row per versioned-artifact registry entry, keyed
+/// `staged:<module_id>:<generation>` or `retained:<module_id>:<generation>`, so
+/// one table carries both registry maps and the key alone says which side the
+/// row is on. Each row holds the immutable artifact identity, its
+/// `ArtifactGenerationState` and its drain mark, which is what makes a restart
+/// reconstruct the staged and retained generations - and with them the
+/// `ActiveExecutableReplacement` refusal and the active generation's exact
+/// hash/path - from durable state instead of from an empty map. This is one
+/// more table in the existing ORS table family, owned by the same
+/// `RedbRecoveryStore` and written through the same `persistence_codec`; it is
+/// not a second registry or a second table owner.
+const VERSIONED_ARTIFACTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_versioned_artifacts_v1");
 /// Durable bridge-event rows (issue #2561): one staged durable/control event
 /// per `(stream_id, event_id)` identity with its bound canonical envelope
 /// bytes. Disjoint from `HOST_REQUESTS`; keyed by `stream::event`.
@@ -3576,32 +3605,58 @@ impl RedbRecoveryStore {
     /// Returns one bounded page of store-rebind replay rows in durable key
     /// order, bounded by [`crate::MAX_RECOVERY_PAGE`].
     ///
-    /// The second tuple element reports that the family continues past this
-    /// page, so a caller can never mistake a bounded page for a complete
+    /// The page resumes strictly after `after_key`; `None` starts at the first
+    /// durable key. The second tuple element is the continuation: `Some(key)`
+    /// proves the family continues past this page and names the durable key the
+    /// next page resumes after, so a caller walks a family larger than one page
+    /// without ever reading a row twice or loading the whole table. The
+    /// continuation is absent only when the enumeration reached the end of the
+    /// family, so a caller can never mistake a bounded page for a complete
     /// snapshot: an unbounded full-table read inside an async caller stays
-    /// unavailable, and a caller that needs a complete family must report the
+    /// unavailable, and a caller whose own deadline stops the walk reports the
     /// truncated coverage instead of treating absence as resolution.
     pub fn load_store_rebind_page(
         &self,
+        after_key: Option<&str>,
         limit: u16,
-    ) -> Result<(Vec<crate::StoreRebindReplayRecord>, bool), OrsError> {
+    ) -> Result<(Vec<crate::StoreRebindReplayRecord>, Option<String>), OrsError> {
         if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
             return Err(OrsError::InvalidCursorLimit);
         }
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
         let page = usize::from(limit);
+        // The exclusive bound seeks to the continuation instead of walking the
+        // rows an earlier page already returned, so a walk costs the rows it
+        // still owes rather than the rows it already covered.
+        let rows = match after_key {
+            Some(after_key) => table
+                .range::<&str>((Bound::Excluded(after_key), Bound::Unbounded))
+                .map_err(storage)?,
+            None => table.range::<&str>(..).map_err(storage)?,
+        };
         let mut records = Vec::new();
-        // One extra row proves that the family continues past this page.
-        for entry in table.iter().map_err(storage)?.take(page + 1) {
-            let (_, value) = entry.map_err(storage)?;
+        let mut last_key = None;
+        let mut family_continues = false;
+        // One extra key is enumerated only to prove the family continues past
+        // this page. It is not read, because it belongs to the next page.
+        for (offset, entry) in rows.take(page + 1).enumerate() {
+            if offset == page {
+                family_continues = true;
+                break;
+            }
+            let (key, value) = entry.map_err(storage)?;
             let record: crate::StoreRebindReplayRecord = decode(value.value())?;
             record.validate()?;
+            last_key = Some(key.value().to_owned());
             records.push(record);
         }
-        let has_more = records.len() > page;
-        records.truncate(page);
-        Ok((records, has_more))
+        // The continuation is the last durable key this page actually returned,
+        // and it is absent only when the enumeration reached the end of the
+        // family: a page that exactly fills the budget still reports `None` when
+        // no further durable key exists.
+        let continuation = if family_continues { last_key } else { None };
+        Ok((records, continuation))
     }
 
     /// Retains one closed typed Store failure bound to its exact admitted
@@ -16784,6 +16839,12 @@ impl RedbRecoveryStore {
                 .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
                 .map_err(storage)?,
         );
+        // #1971: the durable versioned-artifact registry is part of the base
+        // ORS table family, materialized empty on every open like every other
+        // base table, so a load on a store that never installed a candidate
+        // reads authoritatively empty instead of failing on a missing table.
+        // No row is backfilled or inferred here.
+        drop(write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?);
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
         drop(
             write
@@ -19263,6 +19324,107 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(fenced)
+    }
+
+    /// Publishes the whole versioned-artifact registry to durable ORS state
+    /// (issue #1971).
+    ///
+    /// This is the family's only durable write path, so the durable rows are
+    /// exactly the presented registry once the transaction commits: every
+    /// entry is written under its own canonical
+    /// `staged:`/`retained:` `(<module_id>, <generation>)` key, and every
+    /// durable key outside that set is removed in the same transaction - which
+    /// is how a retired generation stops being retained, without a second
+    /// tombstone family. The commit is the durable linearization point, so a
+    /// crash before it leaves the prior durable set and a crash after it
+    /// reconstructs this one.
+    pub fn commit_versioned_artifact_registry(
+        &self,
+        registry: &VersionedArtifactRegistry,
+    ) -> Result<(), OrsError> {
+        let rows = registry.durable_entries()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        Self::replace_versioned_artifact_rows(&write, &rows)?;
+        write.commit().map_err(storage)
+    }
+
+    /// Writes `rows` as the exact durable content of the versioned-artifact
+    /// family inside the caller's open write transaction.
+    ///
+    /// Every row is validated, inserted under its own canonical key, and every
+    /// key the rows do not name is removed, so the family's durable content is
+    /// a function of `rows` alone rather than of whatever the table happened to
+    /// hold. A rollback re-staged candidate and the retained generation it was
+    /// re-staged from are two rows under two different keys, which is why the
+    /// side is part of the key and not a field inside the row.
+    fn replace_versioned_artifact_rows(
+        write: &redb::WriteTransaction,
+        rows: &[VersionedArtifactEntry],
+    ) -> Result<(), OrsError> {
+        let mut table = write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?;
+        let mut durable_keys: BTreeSet<String> = BTreeSet::new();
+        for row in rows {
+            row.validate()?;
+            let key = row.record_key();
+            let payload = encode(row)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+            durable_keys.insert(key);
+        }
+        let mut obsolete: Vec<String> = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, _) = entry.map_err(storage)?;
+            if !durable_keys.contains(key.value()) {
+                obsolete.push(key.value().to_owned());
+            }
+        }
+        for key in &obsolete {
+            table.remove(key.as_str()).map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the versioned-artifact registry from durable ORS state
+    /// (issue #1971).
+    ///
+    /// A restart re-derives the staged candidates, the retained generations,
+    /// each one's `ArtifactGenerationState` and each one's drain mark from the
+    /// store, so the active generation's exact hash and path stay readable
+    /// through [`VersionedArtifactRegistry::active_status`] and the
+    /// `ActiveExecutableReplacement` refusal is re-derived from durable state
+    /// rather than from process memory. Every row is decoded through the
+    /// existing ORS codec, revalidated, and checked against its own canonical
+    /// key; a row that fails any of those is refused, never repaired or
+    /// reinterpreted. `limit` bounds the rebuilt family exactly as
+    /// [`Self::latest_committed_cutover_ownership`] bounds its own read, so a
+    /// malformed table cannot force an unbounded allocation on load.
+    pub fn load_versioned_artifact_registry(
+        &self,
+        limit: u16,
+    ) -> Result<VersionedArtifactRegistry, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(VERSIONED_ARTIFACTS).map_err(storage)?;
+        let mut rows: Vec<VersionedArtifactEntry> = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            if rows.len() == usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            let (key, value) = entry.map_err(storage)?;
+            let row: VersionedArtifactEntry =
+                decode_named(value.value(), "versioned_artifact_entry")?;
+            if row.record_key() != key.value() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "versioned_artifact_entry",
+                    reason: "durable row does not match its canonical registry key".to_owned(),
+                });
+            }
+            rows.push(row);
+        }
+        VersionedArtifactRegistry::from_durable_entries(rows)
     }
 
     /// Commits one authority replay snapshot with a receipt-fenced compare

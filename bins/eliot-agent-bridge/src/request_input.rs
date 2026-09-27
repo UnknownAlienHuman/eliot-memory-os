@@ -602,7 +602,7 @@ fn field_between_backticks(message: &str) -> String {
 ///
 /// Derived read-only from `bins/eliot-agent-bridge/src/main.rs` `Request`;
 /// this table moves with that enum when its owner changes the operation set.
-const GLOBAL_ENVELOPE_KEYS: [&str; 22] = [
+const GLOBAL_ENVELOPE_KEYS: [&str; 24] = [
     "op",
     "request",
     "event",
@@ -625,6 +625,8 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 22] = [
     "memory_handle",
     "disposition",
     "cursor",
+    "handle",
+    "offset",
 ];
 
 /// Validates the top-level operation envelope before typed construction.
@@ -639,7 +641,8 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 22] = [
 /// caller-supplied admission members; `reactive_record_use` carries exactly
 /// `item_id` plus `update`; `reactive_record_use_by_handle` carries exactly
 /// `memory_handle` plus `update`; `reactive_record_disposition` carries
-/// exactly `item_id` plus `disposition`; `reactive_snapshot` and the terminal
+/// exactly `item_id` plus `disposition`; `resource_read` carries one exact
+/// immutable handle and a byte offset; `reactive_snapshot` and the terminal
 /// operations carry only `op`; `recovery_projection_page` carries an explicit
 /// bounded-read cursor. Keys outside the global
 /// allowlist are unknown protected fields; known keys on the wrong operation
@@ -746,6 +749,7 @@ fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeR
             &["op"]
         }
         "recovery_projection_page" => &["op", "cursor"],
+        "resource_read" => &["op", "handle", "offset"],
         "reactive_admit" => &[
             "op",
             "cue",

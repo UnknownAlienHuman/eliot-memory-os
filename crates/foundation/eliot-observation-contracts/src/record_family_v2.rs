@@ -755,6 +755,7 @@ mod tests {
                     core: event(ObservationKind::Maintenance)?,
                     maintenance_action: "rebuild projection".to_owned(),
                     trigger_ref: "problem:1".to_owned(),
+                    result: None,
                 }),
                 caller_family_hint: Some(ObservationRecordKind::Maintenance),
                 parent_record_id: None,

@@ -2808,9 +2808,10 @@ async fn run_local_read_poll(
     // the absent producer are separate owner acts in files this lane does not
     // own, so this branch stays source-reachable only.
     //
-    // The same gates make the `is_skill_tool` branches above unreachable as well;
-    // that is recorded here, not claimed here. For `operator.command` the answer
-    // is the same: adding a branch for it would NOT create a production caller,
+    // #1882: Skill pairs now have their own closed admission, claim, daemon
+    // validation and submit gates; this ControlBoard analysis does not apply
+    // to the Skill branch above. For `operator.command`, adding a branch
+    // would NOT create a production caller,
     // and claiming one would be false, because that capability is refused by
     // every one of those four gates and no producer presents it either.
     if eliotd::is_controlboard_read_tool(&tool) {

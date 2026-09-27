@@ -63,6 +63,7 @@ mod learning_closure;
 mod learning_delta_integration;
 mod learning_promotion;
 mod observation_reconciliation;
+mod operator_intent;
 mod operator_reconciliation;
 mod owner_closure_feed;
 mod owner_closure_provider;
@@ -142,6 +143,13 @@ pub use learning_promotion::{
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
+};
+pub use operator_intent::{
+    OPERATOR_INTENT_CONTRACT_NAME, OPERATOR_INTENT_CONTRACT_VERSION, OperatorIntentApprovals,
+    OperatorIntentAuthenticationBinding, OperatorIntentBudget, OperatorIntentCandidate,
+    OperatorIntentEffect, OperatorIntentIdentity, OperatorIntentPlan, OperatorIntentPlanRevision,
+    OperatorIntentPlanRevisionRef, OperatorIntentRisk, OperatorIntentRoute, OperatorIntentScope,
+    OperatorIntentValidationError,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use owner_closure_feed::{

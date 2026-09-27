@@ -21,6 +21,7 @@ use eliot_process::{
     ProcessStartReceipt,
 };
 
+use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
     ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
     KernelComposition, daemon_status_proves_ready, eliotd_launch_attempt_identity,
@@ -128,6 +129,12 @@ impl KernelComposition {
         launched: &ProcessStartReceipt,
         timeout: Duration,
     ) -> Result<(), KernelBuildError> {
+        enum AwaitDecision {
+            Ready,
+            Running,
+            Rejected(&'static str, KernelBuildError),
+        }
+
         // F-LOG-KERNEL-4 (#903): readiness-rendezvous observations. This
         // rendezvous is always a subordinate phase of a larger operation
         // (recovery, control request, or probe), so every outcome here is an
@@ -137,47 +144,54 @@ impl KernelComposition {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let changed = self.daemon_status_changed.notified();
-            {
+            let decision = {
                 let state = self.daemon_runtime.lock().map_err(|_| {
                     KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
                 })?;
-                if state.receipt.as_ref() != Some(launched) {
-                    observe_daemon_runtime("kernel.daemon.await_rejected", "receipt_mismatch");
-                    return Err(KernelBuildError::Service(
-                        "eliotd readiness is not bound to the exact launched process receipt"
-                            .to_owned(),
-                    ));
-                }
-                match &state.status {
-                    DaemonRuntimeStatus::Ready => {
-                        observe_daemon_runtime("kernel.daemon.await_satisfied", "success");
-                        return Ok(());
-                    }
-                    DaemonRuntimeStatus::Running => {}
-                    DaemonRuntimeStatus::Degraded(reason) => {
-                        observe_daemon_runtime(
-                            "kernel.daemon.await_rejected",
+                if state.receipt.as_ref() == Some(launched) {
+                    match &state.status {
+                        DaemonRuntimeStatus::Ready => AwaitDecision::Ready,
+                        DaemonRuntimeStatus::Running => AwaitDecision::Running,
+                        DaemonRuntimeStatus::Degraded(reason) => AwaitDecision::Rejected(
                             "degraded_before_ready",
-                        );
-                        return Err(KernelBuildError::Service(format!(
-                            "eliotd degraded before authenticated readiness: {reason}"
-                        )));
-                    }
-                    DaemonRuntimeStatus::Failed(reason) => {
-                        observe_daemon_runtime(
-                            "kernel.daemon.await_rejected",
+                            KernelBuildError::Service(format!(
+                                "eliotd degraded before authenticated readiness: {reason}"
+                            )),
+                        ),
+                        DaemonRuntimeStatus::Failed(reason) => AwaitDecision::Rejected(
                             "failed_before_ready",
-                        );
-                        return Err(KernelBuildError::Service(format!(
-                            "eliotd failed before authenticated readiness: {reason}"
-                        )));
+                            KernelBuildError::Service(format!(
+                                "eliotd failed before authenticated readiness: {reason}"
+                            )),
+                        ),
+                        DaemonRuntimeStatus::NotLaunched | DaemonRuntimeStatus::Launching => {
+                            AwaitDecision::Rejected(
+                                "not_launched",
+                                KernelBuildError::Service(
+                                    "eliotd readiness wait has no launched process".to_owned(),
+                                ),
+                            )
+                        }
                     }
-                    DaemonRuntimeStatus::NotLaunched | DaemonRuntimeStatus::Launching => {
-                        observe_daemon_runtime("kernel.daemon.await_rejected", "not_launched");
-                        return Err(KernelBuildError::Service(
-                            "eliotd readiness wait has no launched process".to_owned(),
-                        ));
-                    }
+                } else {
+                    AwaitDecision::Rejected(
+                        "receipt_mismatch",
+                        KernelBuildError::Service(
+                            "eliotd readiness is not bound to the exact launched process receipt"
+                                .to_owned(),
+                        ),
+                    )
+                }
+            };
+            match decision {
+                AwaitDecision::Ready => {
+                    observe_daemon_runtime("kernel.daemon.await_satisfied", "success");
+                    return Ok(());
+                }
+                AwaitDecision::Running => {}
+                AwaitDecision::Rejected(outcome, error) => {
+                    observe_daemon_runtime("kernel.daemon.await_rejected", outcome);
+                    return Err(error);
                 }
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
@@ -623,24 +637,34 @@ impl KernelComposition {
             && state.status == DaemonRuntimeStatus::Ready
             && state.supervision.is_some()
         {
+            drop(state);
             observe_daemon_runtime("kernel.daemon.ready_reported", "already_ready");
             return Ok(());
         }
         #[cfg(windows)]
         if state.supervision.is_none() {
+            drop(state);
             observe_daemon_runtime("kernel.daemon.ready_reported", "supervision_unproven");
             return Err(KernelServiceError::ReadinessNotProven);
         }
         if state.receipt.is_none() || state.status != DaemonRuntimeStatus::Running {
+            drop(state);
             observe_daemon_runtime("kernel.daemon.ready_reported", "readiness_unproven");
             return Err(KernelServiceError::ReadinessNotProven);
         }
         state.status = DaemonRuntimeStatus::Ready;
+        let receipt = state.receipt.clone();
         drop(state);
         #[cfg(windows)]
         self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         observe_daemon_runtime("kernel.daemon.ready_proven", "success");
+        // Issue #1837: durable audit evidence for process lifecycle.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_READY_PROVEN,
+            receipt.as_ref(),
+            "ready",
+        ));
         Ok(())
     }
 
@@ -663,9 +687,17 @@ impl KernelComposition {
         if state.receipt.is_none() {
             return Err(KernelServiceError::ReadinessNotProven);
         }
+        let receipt = state.receipt.clone();
+        let detail = reason.clone();
         state.status = DaemonRuntimeStatus::Degraded(reason);
         drop(state);
         self.daemon_status_changed.notify_one();
+        // Issue #1837: durable audit evidence for process lifecycle.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_DEGRADED,
+            receipt.as_ref(),
+            &detail,
+        ));
         Ok(())
     }
 
@@ -688,6 +720,7 @@ impl KernelComposition {
             .daemon_runtime
             .lock()
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        let receipt = state.receipt.clone();
         state.status = DaemonRuntimeStatus::Failed(reason.to_owned());
         state.recovery_fenced |= recovery_fenced;
         #[cfg(windows)]
@@ -712,6 +745,12 @@ impl KernelComposition {
                     .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
             service.apply(KernelControlCommand::Degrade(reason_handle))?;
         }
+        // Issue #1837: durable audit evidence for process lifecycle.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_FAILED,
+            receipt.as_ref(),
+            reason,
+        ));
         Ok(())
     }
 }

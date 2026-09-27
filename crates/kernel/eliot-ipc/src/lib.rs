@@ -20,6 +20,7 @@ use thiserror::Error;
 mod frame_codec;
 mod host_conformance;
 mod role_lease;
+mod session_lifecycle;
 
 pub use frame_codec::{FrameDecoder, decode_frame, encode_frame};
 pub use host_conformance::{
@@ -31,6 +32,10 @@ pub use role_lease::{
     AgentRole, CapabilityContext, CapabilityToken, DelegatedAuthority, IndependenceDowngrade,
     IndependenceProfile, RoleLeaseError, RoleTransitionRecord, ScopeBinding, WorkScopePolicy,
     compile_capability, op,
+};
+pub use session_lifecycle::{
+    ApplicationSession, ApplicationSessionState, DurableWorkCheckpoint, SessionLease,
+    SessionLifecycleError, TransportBindingObservation, TransportKind,
 };
 
 /// A provider-neutral peer result. A PID or pipe name is not an identity proof.

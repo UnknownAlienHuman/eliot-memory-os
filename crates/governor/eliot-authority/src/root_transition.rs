@@ -261,6 +261,16 @@ impl RootTransitionActivationRequest {
         &self.canonical_request_digest
     }
 
+    /// Exact canonical preimage bytes hashed to produce this request's digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError::InvalidField`] if canonical serialization
+    /// fails.
+    pub fn canonical_request_bytes(&self) -> Result<Vec<u8>, AuthorityError> {
+        canonical_request_preimage_bytes(&self.record, &self.subject)
+    }
+
     /// Governor owner snapshot identity this operation is presented under.
     #[must_use]
     pub fn graph_snapshot_id(&self) -> &str {
@@ -684,11 +694,19 @@ fn canonical_request_digest(
     record: &RootTransitionRecord,
     subject: &AuthorityRequestSubject,
 ) -> Result<String, AuthorityError> {
-    let bytes = canonical_json_bytes(&RootTransitionCanonicalPreimage {
+    let bytes = canonical_request_preimage_bytes(record, subject)?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Canonical preimage of one exact root-transition presentation.
+fn canonical_request_preimage_bytes(
+    record: &RootTransitionRecord,
+    subject: &AuthorityRequestSubject,
+) -> Result<Vec<u8>, AuthorityError> {
+    canonical_json_bytes(&RootTransitionCanonicalPreimage {
         operation_kind: ROOT_TRANSITION_OPERATION_KIND,
         record,
         subject,
     })
-    .map_err(|_| AuthorityError::InvalidField("root_transition.canonical_request_digest"))?;
-    Ok(sha256_hex(&bytes))
+    .map_err(|_| AuthorityError::InvalidField("root_transition.canonical_request_digest"))
 }

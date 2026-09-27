@@ -74,7 +74,7 @@
 use std::collections::BTreeMap;
 
 use eliot_context_candidates::ProjectionState;
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{ClockReading, RequestMetadata};
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
     ReadApi, ReadError, ReadIdentity, ReadOrderingBinding, ReadOutcome, RequiredAssurance,
@@ -301,6 +301,11 @@ pub struct SevenRoleInputs {
     pub scope_id: ScopeId,
     /// Fence every role was acquired under.
     pub state_fence: eliot_contracts::StateFence,
+    /// Request/assembly time observations carried by the validated request.
+    /// These are not source-event time or proof that the reconstructed inputs
+    /// remain fresh; `transaction_sequence`, when present, is causal order,
+    /// not transaction wall-clock time.
+    pub clock: ClockReading,
     /// Dependency heads captured before acquisition.
     pub heads_before: ScopeRevisionView,
     /// Dependency heads re-read after acquisition (equal to `heads_before`).
@@ -496,6 +501,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         Ok(SevenRoleInputs {
             scope_id: request.scope_id.clone(),
             state_fence: ctx.state_fence.clone(),
+            clock: ctx.clock,
             heads_before,
             heads_after,
             task_frame,
@@ -1358,6 +1364,7 @@ mod reconstruction_tests {
         let inputs = SevenRoleInputs {
             scope_id: ScopeId::new("scope-a")?,
             state_fence: test_fence()?,
+            clock: ClockReading::default(),
             heads_before: test_heads("scope-a")?,
             heads_after: test_heads("scope-a")?,
             task_frame: unavailable_role(NamedReadOperation::GetTaskState),

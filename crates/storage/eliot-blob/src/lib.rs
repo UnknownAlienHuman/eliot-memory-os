@@ -812,6 +812,17 @@ fn bind_platform_capacity_attempt(
     Ok(BlobError::StorageCapacity { failure })
 }
 
+/// Binds a durable journal create/replace failure to the operation that owns the
+/// journal.
+///
+/// The caller states `JournalWrite` because the *journal* is the object being
+/// written; whether the port failed while writing the journal or while flushing
+/// it is the port's own observation and is preserved by
+/// [`bind_platform_capacity_with_effect`]'s stage rule (issue #864: "Wrapped
+/// ports must preserve typed cause/code and stage"). The serialized buffer
+/// length is likewise only a caller-side default, so a port that observed its
+/// own progress keeps that observation rather than having it restated as the
+/// whole buffer.
 fn bind_journal_capacity(
     error: BlobError,
     journal: &StageJournal,
@@ -837,10 +848,45 @@ fn bind_journal_capacity(
     let BlobError::StorageCapacity { mut failure } = error else {
         return Ok(error);
     };
-    failure.evidence.attempted_bytes = Some(attempted_bytes);
+    // A port that observed its own partial progress keeps that observation. The
+    // encoded journal length is only what reached the native write boundary, so
+    // it fills in an unobserved value and never overwrites a real one, which
+    // would read as committed bytes.
+    failure.evidence.attempted_bytes = failure.evidence.attempted_bytes.or(Some(attempted_bytes));
     Ok(BlobError::StorageCapacity { failure })
 }
 
+/// Binds a wrapped port's typed capacity failure to this service's own
+/// operation/stage identity.
+///
+/// Stage collision rule (issue #864, "Wrapped ports must preserve typed
+/// cause/code and stage before conversion to text"):
+///
+/// ```text
+/// port reported a durability boundary (FileFlush | DirectoryFlush)
+///   → the port's stage wins, verbatim;
+/// port reported any other stage
+///   → the caller's stage wins.
+/// ```
+///
+/// The asymmetry is not arbitrary. A `BlobPlatformPort` method such as
+/// `write_new_durable` or `replace_durable` is structurally unable to know
+/// which Blob object the service asked it to write, so a stage it reports there
+/// is an internal phase label of one port call and the caller's stage is the
+/// more precise statement about *which* object failed. The two boundary rows are
+/// the opposite case: only the port performed the `fsync`, and only the port can
+/// distinguish its own file flush from its own directory flush — the service sees
+/// one failed call and cannot express that difference at all. Overwriting those
+/// two with the caller's stage is the exact information loss issue #864 names.
+///
+/// Root-lease create versus heartbeat is not a collision: the heartbeat path
+/// writes the lease file directly and never reaches a port, so the only port
+/// that can author a root-lease stage is `claim_root`, whose stage the caller
+/// states identically.
+///
+/// The rule drops nothing: a port stage the rule does not prefer is still the
+/// same value the caller would have supplied, and the port's cause, native code
+/// and effect evidence are carried through untouched either way.
 fn bind_platform_capacity_with_effect(
     error: BlobError,
     stage: BlobCapacityStage,
@@ -863,6 +909,11 @@ fn bind_platform_capacity_with_effect(
         BlobCapacityEffect::NotAttempted | BlobCapacityEffect::PartialWriteUnknown => {
             BlobCapacityRecovery::CapacityRevalidationRequired
         }
+    };
+    let stage = if failure.stage.reports_durability_boundary() {
+        failure.stage
+    } else {
+        stage
     };
     let bound = BlobError::StorageCapacity {
         failure: Box::new(BlobCapacityFailure {
@@ -887,6 +938,16 @@ fn bind_platform_capacity_with_effect(
     }
 }
 
+/// Binds a conditional-mutation capacity failure to its exact CAS request.
+///
+/// `CasJournal` is stated by the caller rather than deferred to a port-reported
+/// stage because the capacity validators make that stage the *only* stage that
+/// may carry `cas_request`/`cas_observed`/`cas_backend_generation`/
+/// `cas_durability`: preserving any other port stage here would make
+/// `BlobCapacityFailure::validate` reject the record and downgrade typed
+/// capacity evidence to an unknown outcome. The reconciliation frame the caller
+/// owns is therefore the stage of record, and the port's typed cause, native
+/// code and effect evidence are carried through unchanged.
 fn bind_capacity_cas(
     error: BlobError,
     request: &BlobCasRequest,

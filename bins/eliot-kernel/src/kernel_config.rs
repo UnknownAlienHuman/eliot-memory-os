@@ -16,8 +16,8 @@
 #[cfg(windows)]
 use super::SupervisionLeaseAuthorityConfig;
 use super::{
-    AgentBridgeAdmissionDescriptor, BlobStoreManifest, DEFAULT_PIPE_NAME, EliotdLaunchDescriptor,
-    EliotdReceiptRootBinding, HostStoreBootstrapRequirement, PathBuf,
+    AgentBridgeAdmissionDescriptor, AuditAnchorBinding, BlobStoreManifest, DEFAULT_PIPE_NAME,
+    EliotdLaunchDescriptor, EliotdReceiptRootBinding, HostStoreBootstrapRequirement, PathBuf,
 };
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 
@@ -80,6 +80,11 @@ pub struct KernelConfig {
     /// signer is fabricated by the production composition.
     #[cfg(windows)]
     pub supervision_lease_authority: Option<SupervisionLeaseAuthorityConfig>,
+    /// Host-owned Watchdog-failure-domain directory receiving the periodic
+    /// audit digest anchors (issue #1837; I16.10). `None` keeps the default
+    /// sink below the Kernel work root; the sink is always exactly one
+    /// directory and the Kernel never creates the foreign one.
+    pub audit_anchor_binding: Option<AuditAnchorBinding>,
     /// Production startup must opt into consuming the exact authority receipt
     /// from the already protected process handoff descriptor. Tests and
     /// library-only process-authority compositions do not silently synthesize
@@ -112,6 +117,7 @@ impl KernelConfig {
             agent_bridge_admission: None,
             #[cfg(windows)]
             supervision_lease_authority: None,
+            audit_anchor_binding: None,
             #[cfg(windows)]
             require_descriptor_supervision_authority: false,
         }
@@ -259,6 +265,14 @@ impl KernelConfig {
     #[must_use]
     pub fn require_descriptor_supervision_authority(mut self) -> Self {
         self.require_descriptor_supervision_authority = true;
+        self
+    }
+
+    /// Injects the Host-owned Watchdog-domain anchor sink directory.
+    /// No default; `None` keeps the sink below the Kernel work root.
+    #[must_use]
+    pub fn with_audit_anchor_binding(mut self, binding: AuditAnchorBinding) -> Self {
+        self.audit_anchor_binding = Some(binding);
         self
     }
 }

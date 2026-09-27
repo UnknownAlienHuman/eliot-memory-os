@@ -225,7 +225,7 @@ impl SurrealServerSupervisor {
         let mut data_root_guard = self.deny_bridge_owned_data_root()?;
 
         let existing_password = self.read_existing_password()?;
-        if !self.start_lock_path().is_file()
+        if !self.start_lock_path()?.is_file()
             && let Some(password) = existing_password.as_ref()
         {
             match self.connect_and_auth(password, 750).await {
@@ -377,7 +377,7 @@ impl SurrealServerSupervisor {
 
     pub async fn stop(&self) -> Result<bool, StoreError> {
         self.validate_admission()?;
-        let pid_path = self.pid_path();
+        let pid_path = self.pid_path()?;
         if !pid_path.is_file() {
             return Ok(false);
         }
@@ -413,7 +413,7 @@ impl SurrealServerSupervisor {
             // itself off as the canonical server -- and is never recorded as
             // an owned pid this runtime would later terminate.
             self.verify_owned_process_identity(pid)?;
-            let pid_path = self.pid_path();
+            let pid_path = self.pid_path()?;
             if let Some(parent) = pid_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -474,7 +474,7 @@ impl SurrealServerSupervisor {
     }
 
     fn spawn_server(&self, password: &SecretString) -> Result<tokio::process::Child, StoreError> {
-        let log_path = self.log_path();
+        let log_path = self.log_path()?;
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -676,26 +676,27 @@ impl SurrealServerSupervisor {
         self.connect_and_auth(&password, connect_timeout_ms).await
     }
 
-    fn pid_path(&self) -> PathBuf {
-        self.runtime_root().join("tmp").join("surreal.pid")
+    fn pid_path(&self) -> Result<PathBuf, StoreError> {
+        Ok(self.runtime_root()?.join("tmp").join("surreal.pid"))
     }
 
-    fn start_lock_path(&self) -> PathBuf {
-        self.runtime_root().join("tmp").join("surreal.start.lock")
+    fn start_lock_path(&self) -> Result<PathBuf, StoreError> {
+        Ok(self.runtime_root()?.join("tmp").join("surreal.start.lock"))
     }
 
-    fn client_lease_dir(&self) -> PathBuf {
-        self.runtime_root().join("tmp").join("surreal.clients")
+    fn client_lease_dir(&self) -> Result<PathBuf, StoreError> {
+        Ok(self.runtime_root()?.join("tmp").join("surreal.clients"))
     }
 
-    fn log_path(&self) -> PathBuf {
-        self.runtime_root()
+    fn log_path(&self) -> Result<PathBuf, StoreError> {
+        Ok(self
+            .runtime_root()?
             .join("logs")
-            .join("surreal-server-current.jsonl")
+            .join("surreal-server-current.jsonl"))
     }
 
     fn try_acquire_start_lock(&self) -> Result<Option<StartLock>, StoreError> {
-        let path = self.start_lock_path();
+        let path = self.start_lock_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -731,7 +732,7 @@ impl SurrealServerSupervisor {
     }
 
     fn create_client_lease(&self) -> Result<PathBuf, StoreError> {
-        let dir = self.client_lease_dir();
+        let dir = self.client_lease_dir()?;
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}-{}.lease", process::id(), Uuid::new_v4()));
         OpenOptions::new()
@@ -761,7 +762,7 @@ impl SurrealServerSupervisor {
     }
 
     fn active_client_lease_count(&self) -> Result<usize, StoreError> {
-        let dir = self.client_lease_dir();
+        let dir = self.client_lease_dir()?;
         cleanup_stale_client_leases(&dir, self.config.startup_timeout_ms)?;
         if !dir.is_dir() {
             return Ok(0);
@@ -831,7 +832,7 @@ impl SurrealServerSupervisor {
     }
 
     fn remove_pid_file_if_matches(&self, pid: u32) -> Result<(), StoreError> {
-        let pid_path = self.pid_path();
+        let pid_path = self.pid_path()?;
         if !pid_path.is_file() {
             return Ok(());
         }
@@ -846,10 +847,16 @@ impl SurrealServerSupervisor {
         Ok(())
     }
 
-    fn runtime_root(&self) -> PathBuf {
+    fn runtime_root(&self) -> Result<PathBuf, StoreError> {
         storage_path(&self.config.storage)
             .and_then(|path| path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from(".eliot-governor"))
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                StoreError::PolicyViolation(
+                    "SurrealDB server runtime paths require path-backed rocksdb: storage"
+                        .to_owned(),
+                )
+            })
     }
 
     /// Stops the `SurrealDB` process this runtime started, returning whether the
@@ -1780,7 +1787,7 @@ mod lifecycle_tests {
         let root = test_root("identity")?;
         let supervisor = supervisor_for("cmd", &root);
         let self_pid = std::process::id();
-        let pid_path = supervisor.pid_path();
+        let pid_path = supervisor.pid_path()?;
         fs::create_dir_all(pid_path.parent().ok_or("pid path has no parent")?)?;
         fs::write(&pid_path, self_pid.to_string())?;
 

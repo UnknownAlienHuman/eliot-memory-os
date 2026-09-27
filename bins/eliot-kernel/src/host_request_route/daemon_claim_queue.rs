@@ -43,7 +43,9 @@ impl KernelComposition {
     ) -> Result<(), TransportError> {
         match check_local_read_admission(envelope, tool)? {
             LocalReadAdmission::CampaignPacket { .. } => {}
-            LocalReadAdmission::Query(_) => return Err(TransportError::SessionFenced),
+            LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {
+                return Err(TransportError::SessionFenced);
+            }
         }
         let _admission_owner = self
             .agent_activation_pending
@@ -998,6 +1000,18 @@ fn finish_admission(
         .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
         .ok_or(TransportError::SessionFenced)?;
     if task_id.len() > MAX_FINISH_REF_BYTES {
+        return Err(TransportError::SessionFenced);
+    }
+    // #1861 hard boundary 1 (strict canonical finish only): a finish draft
+    // that names a different task than the envelope's bound task is a weak
+    // legacy finish survivor. The envelope's task binding is the Kernel-owned
+    // authority for which task this finish may complete, so the draft's
+    // `task_id` must equal it whenever the envelope binds one. An envelope
+    // without a task binding leaves the draft's task standing alone, exactly
+    // as before; the join never widens what the draft may name.
+    if let Some(bound_task) = envelope.identity.task_id.as_deref()
+        && bound_task != task_id
+    {
         return Err(TransportError::SessionFenced);
     }
     if arguments

@@ -2,7 +2,7 @@
 
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
-    QualityScorecard, SerializedContextMeasurement,
+    QualityOperation, QualityScorecard, SerializedContextMeasurement,
 };
 
 use crate::{AssemblyError, bounds, measurement, render};
@@ -94,6 +94,9 @@ where
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
     admitted.validate()?;
+    if admitted.economy.recipe_digest != recipe.recipe_sha256 {
+        return Err(AssemblyError::Contract(ContextError::IdentityConflict));
+    }
     if admitted.economy.measurement.digest != admitted.canonical_payload_digest()? {
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
@@ -119,7 +122,7 @@ where
         }
         return Err(error.into());
     }
-    if !quality.results.iter().all(|result| result.passed) {
+    if quality.suitability(QualityOperation::Compile, &[]).is_err() {
         return Err(AssemblyError::QualityIncomplete(Box::new(quality)));
     }
     let expected_fence_digest =

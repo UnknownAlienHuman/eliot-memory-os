@@ -2,6 +2,12 @@
 //!
 //! The canonical wire contract remains owned by `eliot-host-service`; this
 //! cell owns only the bounded authenticated endpoint and its in-process queue.
+//!
+//! Transport exclusion (I7.5): this admin surface — Kernel restart, store
+//! recovery, and authenticated UserAutomation execution — is named-pipe-only
+//! and is excluded from the agent-facing loopback HTTP transport profile by
+//! routing policy; the loopback HTTP bridge never routes to this endpoint,
+//! and this endpoint never exposes itself over HTTP.
 
 #![allow(
     clippy::all,

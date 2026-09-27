@@ -10,6 +10,15 @@ mod protocol_v1;
 
 pub use protocol_v1::*;
 
+mod maintenance_trigger;
+pub use maintenance_trigger::{
+    MAINTENANCE_TRIGGER_CONTRACT_NAME, MAINTENANCE_TRIGGER_CONTRACT_VERSION,
+    MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerContentRef,
+    MaintenanceTriggerPayloadRef, MaintenanceTriggerPosition, MaintenanceTriggerRecord,
+    MaintenanceTriggerRoutingClass, MaintenanceTriggerSourceEvent,
+    maintenance_trigger_contract_identity,
+};
+
 pub mod activation_resolution_v1;
 
 mod reason_codes;
@@ -63,4 +72,14 @@ mod finish_attempt;
 pub use finish_attempt::{
     FINISH_ATTEMPT_WIRE_ID, FINISH_ATTEMPT_WIRE_VERSION, FINISH_INVOKE_PAYLOAD_SCHEMA_ID,
     FINISH_RESULT_BODY_WIRE_ID, FINISH_RESULT_BODY_WIRE_VERSION, FinishAttempt, FinishResultBody,
+};
+
+pub mod route_continuation;
+pub use route_continuation::{
+    ContinuityKind, HandoffCausalLink, HandoffCompleteness, InFlightEffectDisposition,
+    MAX_ROUTE_CONTINUATION_HANDLES, MAX_ROUTE_CONTINUATION_IN_FLIGHT_DISPOSITIONS,
+    MAX_ROUTE_CONTINUATION_OPAQUE_STATE_BYTES, MAX_ROUTE_CONTINUATION_TEXT_BYTES,
+    ROUTE_CONTINUATION_CONTRACT_NAME, ROUTE_CONTINUATION_CONTRACT_VERSION,
+    ROUTE_CONTINUATION_PAYLOAD_TYPE, RehydrationBundle, RouteContinuationDeletionReason,
+    RouteContinuationState, RouteFingerprint, route_continuation_contract_identity,
 };

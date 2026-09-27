@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use super::kernel_audit::AuditEventDraft;
 use super::{
     AGENT_ACTIVATION_CLAIM_LEASE_MS, AGENT_BRIDGE_ACTIVATION_WINDOW_MS,
     ActivationResultDisposition, AgentActivationLifecycle, AgentActivationPending,
@@ -12,9 +13,10 @@ use super::{
     KernelComposition, activation_deadline_expired, classify_activation_result,
     load_agent_bridge_declaration, sha256_json, unix_ms,
 };
+use eliot_contracts::EpochId;
 use eliot_ipc::{
-    PeerIdentity, ServerFirstConnection, Session, TransportError,
-    agent_bridge_admission_receipt_frame,
+    ApplicationSession, PeerIdentity, ServerFirstConnection, Session, TransportError,
+    TransportKind, agent_bridge_admission_receipt_frame,
 };
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_platform_windows::{
@@ -1691,6 +1693,12 @@ impl KernelComposition {
             accepted.client_hello().module_generation.clone(),
             session_nonce.clone(),
         )?;
+        self.record_application_session_binding(
+            &binding.session_id,
+            &session.connection_id,
+            &session.authority_epoch,
+            session.session_epoch,
+        )?;
         let authenticated = AgentBridgeAuthenticatedBinding {
             principal_id: binding.principal_id.clone(),
             session_id: binding.session_id.clone(),
@@ -2282,6 +2290,90 @@ impl KernelComposition {
         }
     }
 
+    /// Records one transport binding against the application-owned ELIOT
+    /// session authority for `session_id` (I7.14).
+    ///
+    /// This is the application-owned reconnect path, distinct from the
+    /// per-connection transport fence: the first binding creates the
+    /// application session (`ATTACHING → ACTIVE`); a replacement binding
+    /// appends a transport-binding continuity observation and leaves the
+    /// session `ACTIVE`. The application session authority survives a
+    /// transport disconnect, so a pipe/stdio/HTTP reconnect never ends the
+    /// ELIOT session and never deletes its durable work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::SessionFenced`] when the composition lock
+    /// is poisoned or the application lifecycle rejects the binding.
+    #[cfg(windows)]
+    pub fn record_application_session_binding(
+        &self,
+        session_id: &str,
+        connection_id: &str,
+        authority_epoch: &EpochId,
+        session_epoch: u64,
+    ) -> Result<(), TransportError> {
+        let observed_at_unix_ms = unix_ms();
+        let mut sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let result = if let Some(session) = sessions.get_mut(session_id) {
+            session.record_transport_binding(
+                connection_id,
+                TransportKind::Pipe,
+                session_epoch,
+                observed_at_unix_ms,
+            )
+        } else {
+            let mut session = ApplicationSession::new(session_id, authority_epoch.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+            session
+                .attach()
+                .map_err(|_| TransportError::SessionFenced)?;
+            session.record_transport_binding(
+                connection_id,
+                TransportKind::Pipe,
+                session_epoch,
+                observed_at_unix_ms,
+            )
+        };
+        result.map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Explicitly revokes the application-owned ELIOT session for
+    /// `session_id` (I7.14).
+    ///
+    /// Revokes every session-bound lease, checkpoints durable work, and
+    /// prevents reassignment until a higher authority epoch is recorded. The
+    /// revoked application session authority is returned to the caller and
+    /// removed from the live set; a successor session may be established only
+    /// under a higher authority epoch via
+    /// [`ApplicationSession::reassign`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::SessionFenced`] when no live application
+    /// session exists for `session_id`, the composition lock is poisoned, or
+    /// the lifecycle rejects the revocation.
+    #[cfg(windows)]
+    pub fn revoke_agent_bridge_application_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ApplicationSession, TransportError> {
+        let mut sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut session = sessions
+            .remove(session_id)
+            .ok_or(TransportError::SessionFenced)?;
+        session
+            .revoke(unix_ms())
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(session)
+    }
+
     /// Revokes all retained bridge authority for one disconnected connection.
     ///
     /// Transport revocation is connection-scoped: the exchange is aborted,
@@ -2319,6 +2411,8 @@ impl KernelComposition {
         } else {
             observe_bridge("kernel.bridge_cleanup", "complete");
             observe_bridge("kernel.session_cleanup", "complete");
+            // Issue #1837: durable audit evidence for session transition.
+            self.audit_observe(AuditEventDraft::session_revoked(connection_id));
         }
     }
 

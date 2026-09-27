@@ -739,6 +739,7 @@ mod cue_composition_tests {
         Ok(SevenRoleInputs {
             scope_id: ScopeId::new("scope-a")?,
             state_fence: fence,
+            clock: eliot_contracts::ClockReading::default(),
             heads_before: heads.clone(),
             heads_after: heads,
             task_frame: unavailable(),

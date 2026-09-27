@@ -17,8 +17,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod control_reserve;
+mod hot_path;
+mod hot_path_profile;
 mod i14_backpressure;
 mod installation_activation;
+mod restart_policy;
 mod runtime_live;
 mod supervision_authority;
 mod supervision_incarnation;
@@ -26,8 +29,28 @@ mod supervision_lease;
 mod watchdog_admission;
 
 pub use control_reserve::{
-    BottleneckCoverageState, CapacityBottleneck, CapacityClass, CapacityUnit,
-    ControlOperationClass, EmergencyOperationClass, NormalWorkClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckOwnerBinding, CapacityBottleneck,
+    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
+    ControlReserveProfile, EmergencyOperationClass, NormalWorkClass, frozen_bottleneck_owner_map,
+};
+pub use hot_path::{
+    HOT_PATH_CONTRACT_NAME, HOT_PATH_CONTRACT_VERSION, HOT_PATH_MANIFEST_VERSION,
+    HotPathDegradation, HotPathExternalCall, HotPathManifest, HotPathManifestSetV1,
+    HotPathProfileRef, HotPathQueueBounds, HotPathQueueDeclaration, HotPathSnapshotDependency,
+    HotPathUnsupportedOperation, hot_path_contract_identity, hot_spine_membership,
+};
+pub use hot_path_profile::{
+    HOT_PATH_PROFILE_MAX_CLOCK_DOMAINS, HOT_PATH_PROFILE_MAX_EVIDENCE_REFS,
+    HOT_PATH_PROFILE_MAX_INVALIDATION_TRIGGERS, HOT_PATH_PROFILE_VERSION,
+    HotPathAllocationAttribution, HotPathAllocationCoverage, HotPathAllocations,
+    HotPathAttemptDisposition, HotPathBuildEnvironment, HotPathCacheBehaviour, HotPathCacheState,
+    HotPathClockDomain, HotPathCollectionMode, HotPathConcurrencyCondition,
+    HotPathCounterAttributionMethod, HotPathDegradationRate, HotPathDurationMs,
+    HotPathEligiblePopulation, HotPathExecutionConditions, HotPathLockContention,
+    HotPathManifestRevision, HotPathMeasurement, HotPathMeasurementMetrics, HotPathMetricLabels,
+    HotPathObservation, HotPathObservationKind, HotPathObservationWindow, HotPathProfile,
+    HotPathProfileError, HotPathProfileQualification, HotPathQualificationStatus,
+    HotPathSamplePlan, HotPathStage,
 };
 pub use i14_backpressure::{
     AffectedOperationClass, BottleneckAvailability, BottleneckObservationV1,
@@ -50,6 +73,12 @@ pub use installation_activation::{
     InstallationDigestBinding, InstallationScmReadback, InstallationScmRole,
     SignedInstallationActivation, SignedInstallationActivationApproval,
     VerifiedInstallationActivationApproval,
+};
+pub use restart_policy::{
+    AutomaticRestartDecision, RestartClass, RestartDependency, RestartDependencyKind,
+    RestartFailureEvidence, RestartGroupStrategy, RestartIdentityEvidence, RestartIntensityPolicy,
+    RestartInvalidationTrigger, RestartOwnerLifecycle, RestartPolicyAdmissionBinding,
+    RestartPolicyError, RestartPolicyV1, decide_automatic_restart,
 };
 pub use runtime_live::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,

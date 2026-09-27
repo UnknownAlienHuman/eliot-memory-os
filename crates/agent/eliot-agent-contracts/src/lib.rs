@@ -6,6 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+mod bridge_admission;
+pub use bridge_admission::*;
+
 use std::collections::BTreeSet;
 
 use eliot_contracts::{StateFence, sha256_hex};

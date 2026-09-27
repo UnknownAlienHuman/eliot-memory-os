@@ -40,7 +40,7 @@ use eliot_ors::{
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use serde_json::{Value, json};
 
 use super::{CoordinatorError, WriteCoordinator, WriteCoordinatorConfig, default_executor_lanes};
@@ -132,6 +132,7 @@ fn request(
             privacy_and_visibility_class: RecoveryAccessClass {
                 privacy: PrivacyClass::Private,
                 visibility: label("owner-only")?,
+                instruction_taint: InstructionTaint::DataOnly,
             },
             authority_epoch: writer_epoch.clone(),
             state_fence,

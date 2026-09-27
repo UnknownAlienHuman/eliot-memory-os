@@ -790,7 +790,12 @@ pub fn validate_tool_request_owner(
 pub fn published_mcp_tool_surface() -> Result<Vec<ToolSchema>, SchemaError> {
     let mut surface = Vec::new();
     for descriptor in canonical_tool_schemas()? {
-        if known_tool_profile(&descriptor.name).is_ok() {
+        if let Ok(profile) = known_tool_profile(&descriptor.name) {
+            if profile.method.definition_version != descriptor.definition_version {
+                return Err(SchemaError::DefinitionVersionMismatch {
+                    tool: descriptor.name,
+                });
+            }
             surface.push(descriptor);
         }
     }

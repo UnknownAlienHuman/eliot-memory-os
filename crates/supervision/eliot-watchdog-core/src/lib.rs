@@ -386,7 +386,9 @@ pub fn unix_timestamp(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+mod health_detectors;
 mod reconciliation;
+mod rules;
 mod signals;
 
 pub use signals::{
@@ -403,4 +405,22 @@ pub use reconciliation::{
     WatchdogSpoolReconciliationError, WatchdogSpoolSinkDisposition,
     acknowledgement_advances_cursor, export_retry_identity_equal, is_duplicate_ack,
     validate_acknowledgement, validate_batch, validate_batch_freshness, validate_cursor,
+};
+
+pub use rules::{
+    CompetentIntegrationCoverage, IntegrationGapEvaluation, IntegrationGapObservation,
+    IntegrationGapRule, IntegrationGapSensor, IntegrationGapSignalCandidate,
+    IntegrationGapSignalContext, IntegrationGapUnknown, ProviderAttemptIdentity,
+    ProviderEventIdentity, StateFenceProjection, evaluate_provider_host_event_gap,
+    provider_host_event_gap_rule,
+};
+
+pub use health_detectors::{
+    AgentLoopSignal, ContextQualityBounds, ContextQualityDrift, ContextQualityObservation,
+    CountDelta, CoverageGapExplanation, HealthDetection, HealthEvidenceHandles,
+    HealthNoSignalReason, HealthObservationPair, HealthSignalContext, MaintenanceDebt,
+    MaintenanceDebtInput, MemoryUtilityDeltas, MemoryUtilityDrift, ObservationCoverageGap,
+    ObservationCoverageInput, PolicyBound, StateDeltaPresence, evaluate_agent_loop,
+    evaluate_context_quality, evaluate_maintenance_debt, evaluate_memory_utility,
+    evaluate_observation_coverage,
 };

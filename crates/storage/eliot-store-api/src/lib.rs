@@ -39,7 +39,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod architecture_self_model;
 mod backup_io;
+mod blackboard;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
@@ -70,6 +72,19 @@ pub use backup_io::{
     SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
     SnapshotPage, SnapshotSourceIdentity, SnapshotValidationReceipt, classify_restore_conflict,
     is_backup_io_capability, reconcile_same_operation,
+};
+
+pub use architecture_self_model::{
+    AdoptedArchitectureRevision, ArchitectureConformanceEntry, ArchitectureConformanceGap,
+    ArchitectureConformanceState, ArchitectureGapCause, ArchitectureInvalidation,
+    SelfKnowledgeCategory, SelfKnowledgeEvidence, SystemSelfModel,
+    invalidate_architecture_self_model, validate_architecture_self_model,
+};
+
+pub use blackboard::{
+    BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
+    BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
+    blackboard_item_request, decode_blackboard_item,
 };
 
 pub use dreamer_job::{
@@ -164,11 +179,16 @@ pub use request_hash::{
 pub use store_failure::{
     ErasureFailureKind, LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN,
     MAX_STORE_FAILURE_EVIDENCE_HANDLES, MAX_STORE_FAILURE_REFERENCE_LEN,
-    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
-    StoreConflictObservation, StoreEvidenceHandles, StoreFailure, StoreFailureContractError,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreFailureRequestContext,
-    StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreRetryDirective,
-    decode_legacy_store_failure_v1, erasure_store_failure,
+    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, MigratedV1Failure,
+    STORE_FAILURE_CONTRACT_REVISION, StoreConflictObservation, StoreEvidenceHandles, StoreFailure,
+    StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
+    StoreFailureRequestContext, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
+    StoreRetryDirective, V1_FAILURE_USE_SITES, V1_UNSCANNED_SURFACES, V1CompatWindow,
+    V1DispositionStatus, V1FailureUseInventory, V1FailureUseSite, V1Interpretation,
+    V1MigrationDisposition, V1RemovalBlocker, V1UnscannedSurface, bridge_v1_within_window,
+    decode_legacy_store_failure_v1, erasure_store_failure, migrate_legacy_store_failure_v1,
+    v1_compat_window, v1_decoder_removal_gate, v1_failure_use_inventory, v1_migration_disposition,
+    v1_use_inventory_digest,
 };
 
 pub use named_mutation_receipt::{
@@ -231,8 +251,9 @@ pub use experience_store::{
 };
 
 pub use write_admission::{
-    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservedScopeBinding,
-    ReservedWriteRequest, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
+    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservationEnvelopeState,
+    ReservedScopeBinding, ReservedWriteOutcome, ReservedWriteReconciliation, ReservedWriteRequest,
+    ReservedWriteUnsupported, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
     WriteAdmissionProjection, WriterEpochBinding, prepared_transition_digest,
 };
 
@@ -3657,6 +3678,8 @@ pub enum NamedReadOperation {
     /// Canonical agent-feedback range read (issue #223). Same durable
     /// rule as the bank range read.
     GetAgentFeedbackRange,
+    /// Exact, fenced lookup of one immutable blackboard candidate revision.
+    GetBlackboardItem,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -3746,6 +3769,11 @@ pub enum NamedMutationOperation {
     /// Canonical agent-feedback commit (issue #223). Same durable rule
     /// as the bank commit leg.
     CommitAgentFeedback,
+    /// Canonical typed blackboard candidate persistence (issue #1822).
+    /// Persists a Kernel-admitted candidate revision under the candidate-only
+    /// ceiling; it does not perform decisions, truth promotion, acceptance,
+    /// or write-authority changes.
+    ApplyBlackboardItem,
 }
 
 impl NamedMutationOperation {
@@ -3766,7 +3794,7 @@ impl NamedMutationOperation {
                 TransitionClass::ReactiveState
             }
             Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
-            Self::CommitExperienceBank | Self::CommitAgentFeedback => {
+            Self::CommitExperienceBank | Self::CommitAgentFeedback | Self::ApplyBlackboardItem => {
                 TransitionClass::CaptureCandidate
             }
         }
@@ -5476,6 +5504,19 @@ pub enum StoreError {
     },
     #[error("receipt not found")]
     ReceiptNotFound,
+    /// A snapshot close could not observe its bound source point, so the live
+    /// capture remains pending under this exact owner-issued identity. The
+    /// served counters are recovery progress, not a terminal receipt or a
+    /// claim that the source stayed stable.
+    #[error("snapshot close is pending after the source point could not be observed")]
+    SnapshotClosePending {
+        /// The exact handle originally issued for the still-live capture.
+        handle: SnapshotHandle,
+        /// Exact cumulative member count still retained by the capture owner.
+        members_served: u64,
+        /// Exact cumulative byte count still retained by the capture owner.
+        bytes_served: u64,
+    },
     #[error("receipt envelope is missing; write outcome is unknown")]
     MissingReceiptEnvelope,
     #[error("payload exceeds named-operation limit")]
@@ -5696,19 +5737,20 @@ pub trait CanonicalStoreClient: Send + Sync {
     /// authenticated Store path (issue #991).
     ///
     /// The default body validates the closed #990 request shape and then
-    /// refuses with [`StoreError::UnknownOperation`] without manufacturing
-    /// durable evidence, touching provider state, or falling back to ordinary
-    /// `Apply`. No successful default body exists: backends without an
-    /// accepted scheduler explicitly report unsupported, and support is
-    /// advertised only from the accepted concrete backend. Real execution
-    /// lands in a later backend slice; the exact Kernel client override lives
-    /// in `eliot-kernel-service`.
+    /// refuses with [`ReservedWriteUnsupported`], which is
+    /// [`StoreError::UnknownOperation`]. It does so without manufacturing
+    /// durable evidence, touching provider state, or delegating to the
+    /// ordinary unreserved `Apply` as a fallback. No successful default body
+    /// exists: backends without an accepted reserved-write backend explicitly
+    /// report unsupported, and support is advertised only from the accepted
+    /// concrete backend. Real execution lands in a later backend slice; the
+    /// exact Kernel client override lives in `eliot-kernel-service`.
     async fn apply_reserved_write(
         &self,
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, StoreError> {
         request.validate()?;
-        Err(StoreError::UnknownOperation)
+        Err(ReservedWriteUnsupported::REFUSAL.into_error())
     }
 
     /// Reads one bounded, same-fence recovery snapshot. Wave 1 keeps the

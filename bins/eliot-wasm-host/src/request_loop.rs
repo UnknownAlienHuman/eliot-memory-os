@@ -3927,6 +3927,27 @@ impl std::error::Error for OrdinaryDriveError {}
 /// fails closed as in-progress with the staged set left for the owner.
 const MAX_SERVED_DELIVERIES_PER_DRIVE: usize = 8;
 
+/// Seals the durable pre-execution `InFlight` claim after admission and
+/// before any guest effect (#2786 step 7). A write failure fails closed
+/// without executing — admission alone started no guest, so the staged set
+/// stays for the owner to re-drive, and a denied delivery leaves no marker.
+fn seal_inflight_claim(
+    directory: &std::path::Path,
+    claim: &crate::dispatch_material::DeliveryClaim,
+    now_ms: u64,
+) -> Result<(), OrdinaryDriveError> {
+    crate::dispatch_material::write_inflight_marker(directory, claim.identity(), now_ms).map_err(
+        |_| {
+            let identity = claim.identity();
+            OrdinaryDriveError::DeliveryInProgress {
+                operation_id: identity.operation_id.clone(),
+                generation: identity.generation,
+                claim_id: identity.claim_id.clone(),
+            }
+        },
+    )
+}
+
 /// Runs the ordinary governed path for this process: binds the owner
 /// delivery set, resolves the authenticated grant into a local admitted port
 /// set, and serves the bounded request loop to its correlated terminal
@@ -3962,30 +3983,38 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // The claim arrives with the material from one claim-first read:
         // the pre-read envelope identity selected this operation before
         // the payload files were trusted, so the claim below is that
-        // selection — never a copy derived after the fact. Durable served
-        // state extends in-memory retention across restart: a staged set
-        // the marker names is terminal-unacknowledged (a crash between
-        // publish and reclaim), so it replays below instead of
+        // selection — never a copy derived after the fact. Durable
+        // retention extends in-memory state across restart: a staged set
+        // the served marker names is terminal-unacknowledged (a crash
+        // between publish and reclaim), and a staged set the InFlight
+        // marker names was claimed for execution (a crash between claim
+        // and served durability), so both replay below instead of
         // re-executing.
-        let served_marker = crate::dispatch_material::admitted_material_path()
+        let directory = crate::dispatch_material::admitted_material_path()
             .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-            .and_then(|directory| crate::dispatch_material::read_served_marker(&directory));
+            .ok_or(OrdinaryDriveError::Drive(DriveError::NoMaterial))?;
+        let served_marker = crate::dispatch_material::read_served_marker(&directory)
+            .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
+        let inflight_marker = crate::dispatch_material::read_inflight_marker(&directory)
+            .map_err(|error| OrdinaryDriveError::Drive(DriveError::Material(error)))?;
         match crate::dispatch_material::classify_staged_delivery(
             &material,
             served.as_slice(),
             served_marker.as_ref(),
+            inflight_marker.as_ref(),
         ) {
             crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
                 // The classifier also treats a differing identity under the
-                // same spent grant as Replay. Preserve the staged identity;
-                // the final projection may reuse an outcome only when this
-                // identity exactly matches the latest one served in this
-                // process. A replay without a matching in-process outcome
-                // has no durable result or acknowledgement to authorize
-                // reclamation. Keep the claimed set and served marker as
-                // local identity evidence; the projection below reports
-                // DeliveryInProgress with this exact identity until an owner
-                // can reconcile it.
+                // same spent grant as Replay, and an InFlight-named set as
+                // Replay whether or not its effect settled. Preserve the
+                // staged identity; the final projection may reuse an outcome
+                // only when this identity exactly matches the latest one
+                // served in this process. A replay without a matching
+                // in-process outcome has no durable result or
+                // acknowledgement to authorize reclamation. Keep the claimed
+                // set and durable markers as local identity evidence; the
+                // projection below reports DeliveryInProgress with this
+                // exact identity until an owner can reconcile it.
                 replayed = Some(identity);
                 break;
             }
@@ -4008,6 +4037,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         }
         let runtime =
             build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
+        seal_inflight_claim(&directory, &claim, edge_now_ms())?;
         let frame = run_request_loop(runtime, &material);
         // The delivery set is one-shot: a published terminal outcome reclaims
         // exactly the claimed generation, so a leftover is a fresh-drive
@@ -4023,21 +4053,30 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 // attested as settled, so reclaiming here never races an
                 // unresolved guest child.
                 //
-                // Durable served marker (#2786 step 7): after the terminal
-                // outcome published, before reclaim. A crash between the two
-                // leaves staged bytes plus this marker, so restart replays
-                // instead of re-executing. Best-effort: the serve already
-                // happened exactly once.
-                if let Some(directory) = crate::dispatch_material::admitted_material_path()
-                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                // The pre-execution InFlight marker is already durable, so a
+                // failed served write still replays on restart instead of
+                // re-executing. Preserve the claimed set and report its
+                // original identity as unresolved instead of claiming
+                // success.
+                if crate::dispatch_material::write_served_marker(
+                    &directory,
+                    claim.identity(),
+                    edge_now_ms(),
+                )
+                .is_err()
                 {
-                    let _ = crate::dispatch_material::write_served_marker(
-                        &directory,
-                        claim.identity(),
-                        edge_now_ms(),
-                    );
+                    return Err(OrdinaryDriveError::DeliveryInProgress {
+                        operation_id: claim.identity().operation_id.clone(),
+                        generation: claim.identity().generation,
+                        claim_id: claim.identity().claim_id.clone(),
+                    });
                 }
                 let reclamation = consume_delivery_set(&claim);
+                // The served marker is now durable, so the pre-execution
+                // InFlight evidence is redundant: drop it best-effort. A
+                // leftover only replays, never re-executes.
+                let _ =
+                    crate::dispatch_material::clear_inflight_marker(&directory, claim.identity());
                 // Bounded residual only: a partial reclamation never
                 // overwrites the primary result; retained files stay for
                 // maintenance under the exact claimed identity.

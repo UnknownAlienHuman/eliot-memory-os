@@ -23,6 +23,23 @@
 //! are part of [`OrsBackupSnapshot::snapshot_digest`], and a snapshot that
 //! declares no family denominator can never validate as `Complete`.
 //!
+//! Issue #953 binds the capture to ONE owner-established read consistency
+//! point and rebinds every page digest to its own token. Three contract changes
+//! carry that:
+//! - [`OrsBackupPage`] is now self-describing: it carries the
+//!   [`OrsBackupPage::fence_token`] the store derived from the state it actually
+//!   observed through the capture transaction, plus the creation/expiry pair that
+//!   bounds how long the page stays triageable. A page that does not state its own
+//!   token cannot have its digest recomputed, which is why the digest used to be
+//!   shape-checked only and independently sourced pages could be mixed.
+//! - [`OrsBackupPage::expected_page_digest`] is the ONE digest derivation over a
+//!   page. The store produces the page with it and the validators re-derive it
+//!   from the page's own bytes, so a page that does not hash to its declared
+//!   digest is refused instead of being trusted on shape.
+//! - [`OrsBackupRequest::observed_fence_token`] folds the owner-observed
+//!   high-water order and family revision into the page token, so the token binds
+//!   owner-established state and not only caller-asserted fields.
+//!
 //! Storage-free: no `redb`, no filesystem, no `eliot-backup` dependency.
 //! Distinct from `snapshot_model`; every new name starts `OrsBackup`/`Backup`.
 
@@ -34,7 +51,20 @@ use sha2::{Digest, Sha256};
 use crate::OrsError;
 
 /// Schema version of the backup-snapshot wire shape.
-pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+///
+/// Issue #953 bumps this from `1` to `2` because the v1 wire shape cannot express
+/// the property the issue requires: a v1 [`OrsBackupPage`] carries neither a fence
+/// token nor a capture window, so its `page_digest` is not recomputable from the
+/// page and two independently sourced pages are indistinguishable from one
+/// snapshot. The bump is a WIRE constant, not durable schema: no table, column or
+/// row changes, nothing is rewritten, and no migration is introduced. The existing
+/// refusal mechanism covers it unchanged — [`OrsBackupSourceIdentity::new`]
+/// already returns [`OrsError::MigrationRequired`] for any schema other than this
+/// constant, so a v1 request or snapshot is rejected at construction and at import
+/// rather than being silently reinterpreted. I05-22 keeps migration IDs and
+/// checksums immutable after release, which is why this is a version bump with no
+/// migration rather than an in-place widening of v1.
+pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u16 = 2;
 /// Hard ceiling for entries in one backup page (mirrors `MAX_RECOVERY_PAGE`).
 pub const MAX_BACKUP_PAGE_ENTRIES: u16 = 256;
 /// Hard ceiling for pages in one backup snapshot.
@@ -43,6 +73,16 @@ pub const MAX_BACKUP_PAGES: u16 = 256;
 pub const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
 /// Hard ceiling for installation/admission identifier length.
 pub const MAX_BACKUP_ID_LEN: usize = 256;
+/// Hard ceiling for the capture window a page may declare (issue #953).
+///
+/// The issue requires "bounded pages/bytes/work/lifetime", and an unbounded
+/// capture window is how a page outlives the state it claims: a page exported
+/// under a fence would stay triageable indefinitely while the store moved on. One
+/// hour is the ceiling, not the stamped value, so a caller cannot buy a longer
+/// window by asking for it. Reuses the crate's existing expiry convention
+/// (I05-2: `expires_at` is a cleanup horizon, never an automatic deletion), so
+/// this bounds triage eligibility and deletes nothing.
+pub const MAX_BACKUP_PAGE_LIFETIME_MS: i64 = 60 * 60 * 1000;
 /// Version tag of the typed row-family cursor contract (issue #2884).
 pub const ORS_FAMILY_CURSOR_VERSION: u16 = 1;
 /// Lowercase 64-hex digest shape check (local copy: `model` is private).
@@ -168,6 +208,9 @@ pub enum RowFamilyKind {
     StoreFailureRetention,
     UnknownCommitRecovery,
     CutoverOwnership,
+    /// Versioned-artifact registry metadata is installation-bound generation
+    /// authority. A restored installation must not reactivate its old paths.
+    VersionedArtifacts,
     HostRequests,
     ActivationLifecycle,
     ActivationResultRetention,
@@ -255,6 +298,7 @@ impl RowFamilyKind {
             | Self::ActivationResultRetention
             | Self::NativeWorkerClaims
             | Self::CutoverOwnership
+            | Self::VersionedArtifacts
             | Self::ScanDisclosure => RowDisposition::NonrestorableHistorical,
             // Everything else, including the #269 process-stream recovery
             // family, is `Restorable`. That word only means eligible for the
@@ -618,6 +662,38 @@ impl OrsBackupRequest {
             .as_bytes(),
         )
     }
+    /// Deterministic page token for a capture taken through one
+    /// owner-established read consistency point (issue #953).
+    ///
+    /// [`OrsBackupRequest::page_fence_token`] is computed purely from
+    /// caller-asserted fields, so on its own it binds a claim and not a fact: two
+    /// requests that assert the same fence are indistinguishable from two requests
+    /// read at two different moments. This folds the two store-wide values the
+    /// capture transaction actually observed into the token, so a page states the
+    /// owner-established high-water order and family revision it was read under
+    /// and a page token can no longer be minted from caller input alone.
+    ///
+    /// The owner is the only producer of the observation arguments, so the token
+    /// cannot be retargeted by the caller. The observation is taken once per
+    /// capture and threaded through every page, which is what makes "one
+    /// consistency point" observable in the exported bytes: every page of one
+    /// snapshot carries the same owner-observed values by construction.
+    #[must_use]
+    pub fn observed_fence_token(
+        &self,
+        observed_high_water_order: u64,
+        observed_family_revision: u64,
+    ) -> String {
+        sha256_hex(
+            format!(
+                "{}|{}|{}",
+                self.page_fence_token(),
+                observed_high_water_order,
+                observed_family_revision
+            )
+            .as_bytes(),
+        )
+    }
 }
 /// One backup entry: digests only, never raw payload (redaction).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -680,7 +756,30 @@ pub struct OrsBackupPage {
     /// Zero-based page index; pages must be continuous.
     pub page_index: u32,
     pub entries: Vec<OrsBackupEntry>,
-    /// Digest binding this page.
+    /// Token this page's capture was read under (issue #953).
+    ///
+    /// Owner-derived from the store-wide high-water order and process-stream
+    /// recovery family revision the capture transaction actually observed, via
+    /// [`OrsBackupRequest::observed_fence_token`]. It is the field that makes the
+    /// page self-describing: without it the page cannot state which
+    /// owner-established consistency point produced it, so its digest cannot be
+    /// recomputed and an independently sourced page is indistinguishable from one
+    /// of this snapshot.
+    pub fence_token: String,
+    /// When the store stamped this page, in Unix milliseconds (issue #953).
+    ///
+    /// Stamped by the store through its own clock at capture, never supplied by
+    /// the caller, and paired with [`OrsBackupPage::expires_at_ms`] under the
+    /// crate's existing ordered-positive-pair rule (the same
+    /// `expires_at_ms <= created_at_ms` refusal as `ReservationRequest`).
+    pub created_at_ms: i64,
+    /// Capture-window end in Unix milliseconds (issue #953).
+    ///
+    /// A refusal horizon for triage eligibility only, never an automatic deletion
+    /// and never a claim that the state behind the page still exists (I05-2).
+    pub expires_at_ms: i64,
+    /// Digest binding this page, recomputable through
+    /// [`OrsBackupPage::expected_page_digest`].
     pub page_digest: String,
     /// True only on the final page.
     ///
@@ -693,6 +792,104 @@ pub struct OrsBackupPage {
     /// Family continuation this page was read under, or `None` when the request
     /// declared no family continuation.
     pub family_continuation: Option<OrsFamilyContinuation>,
+}
+impl OrsBackupPage {
+    /// The one digest derivation over a page's own content (issue #953).
+    ///
+    /// Single derivation, two callers: the store builds a page and assigns
+    /// `page.expected_page_digest()` to `page_digest`, and
+    /// [`OrsBackupPage::validate_binding`] re-derives the same value from the page
+    /// a caller presented. There is deliberately no second implementation, because
+    /// two implementations would let a producer and a validator disagree about
+    /// what a page binds, which is exactly the gap issue #953 closes: "Independent
+    /// per-page read transactions with a reused timestamp are not one snapshot"
+    /// and a shape-checked digest bound nothing at all.
+    ///
+    /// Binds, in order: the capture token, the page index, finality, the whole
+    /// capture window, the entry count, the family continuation in force and the
+    /// exact next cursor, then one 64-hex digest per entry. Every contribution is
+    /// either a fixed-width digest or a delimiter-separated decimal/bool field, so
+    /// the concatenation is length-delimited by construction and an embedded
+    /// separator inside a `record_id` cannot make two different pages produce the
+    /// same material.
+    #[must_use]
+    pub fn expected_page_digest(&self) -> String {
+        let mut material = format!(
+            "eliot.ors.backup_page.v2|{}|{}|{}|{}|{}|{}|",
+            self.fence_token,
+            self.page_index,
+            self.is_last,
+            self.created_at_ms,
+            self.expires_at_ms,
+            self.entries.len()
+        );
+        match &self.family_continuation {
+            Some(continuation) => {
+                material.push_str(&continuation.cursor.fence_token());
+                material.push(':');
+                match &continuation.next {
+                    Some(next) => material.push_str(&next.fence_token()),
+                    None => material.push_str("no-next"),
+                }
+            }
+            None => material.push_str("no-family"),
+        }
+        material.push(':');
+        for entry in &self.entries {
+            // Fixed-width per entry, so a record id containing the delimiter
+            // cannot shift a field boundary and alias one entry set onto another.
+            material.push_str(&sha256_hex(
+                format!(
+                    "eliot.ors.backup_entry.v2|{}|{:?}|{}|{}|{:?}",
+                    entry.record_id,
+                    entry.family,
+                    entry.order,
+                    entry.payload_digest,
+                    entry.effect_class
+                )
+                .as_bytes(),
+            ));
+            material.push(':');
+        }
+        sha256_hex(material.as_bytes())
+    }
+    /// Recompute and compare everything this page claims about itself
+    /// (issue #953).
+    ///
+    /// The page no longer validates on shape alone: a well-formed 64-hex
+    /// `page_digest` that does not hash to the page's own content is
+    /// [`OrsError::PayloadIntegrityMismatch`], the crate's existing typed
+    /// content/digest disagreement, so a page assembled from more than one source
+    /// cannot pass as one snapshot. `fence_token` is shape-checked as a digest
+    /// because its value is only meaningful next to the store that minted it, and
+    /// the capture window is checked as the crate's existing ordered-positive pair
+    /// bounded by [`MAX_BACKUP_PAGE_LIFETIME_MS`]; whether that window has actually
+    /// elapsed needs a clock and is the store's check, not this pure one.
+    ///
+    /// Single-page entrypoint for quarantined import triage, which receives one
+    /// page out of a snapshot and therefore cannot apply the continuity rules of
+    /// [`OrsBackupSnapshot::validate`]. Shared with `check_page_shape`, so both
+    /// paths judge a page by the same function.
+    pub fn validate_binding(&self) -> Result<(), OrsError> {
+        require_digest(&self.fence_token, "backup_page_fence_token")?;
+        require_digest(&self.page_digest, "backup_page_digest")?;
+        if self.entries.len() > usize::from(MAX_BACKUP_PAGE_ENTRIES) {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        if self.expires_at_ms <= self.created_at_ms {
+            return Err(OrsError::InvalidExpiry);
+        }
+        if self.expires_at_ms - self.created_at_ms > MAX_BACKUP_PAGE_LIFETIME_MS {
+            return Err(OrsError::InvalidExpiry);
+        }
+        if let Some(continuation) = &self.family_continuation {
+            continuation.validate()?;
+        }
+        if self.expected_page_digest() != self.page_digest {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
+    }
 }
 /// Completeness of a backup snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -745,6 +942,14 @@ impl OrsBackupSnapshot {
     /// The frozen family snapshot identity, every page's family cursor and the
     /// outstanding next cursor are all folded in, so the denominator certifies
     /// the composite snapshot and not just one table's pages (issue #2884).
+    ///
+    /// Since issue #953 the denominator also transitively binds each page's
+    /// capture token and capture window, because it folds `page_digest` and
+    /// `page_digest` is recomputable from those fields by
+    /// [`OrsBackupPage::expected_page_digest`]. The denominator itself is still
+    /// only shape-checked by [`OrsBackupSnapshot::validate`]; it is the page
+    /// binding that is re-derived, and a snapshot whose declared denominator does
+    /// not equal this value is a residual gap outside issue #953's three items.
     pub fn snapshot_digest(&self) -> String {
         let mut material = format!(
             "{}:{}:{}:{}:",
@@ -882,8 +1087,14 @@ impl OrsBackupSnapshot {
         check_completeness(&self.completeness, counted, &self.pages)
     }
 }
-/// Validate one page's index continuity, finality, digest, entry bound, and
-/// family continuation.
+/// Validate one page's index continuity, finality, self-binding and entry bound.
+///
+/// The self-binding half is [`OrsBackupPage::validate_binding`] and is NOT
+/// duplicated here: shape alone is not evidence of anything, and a validator
+/// that re-derives the page digest differently from the producer is the defect
+/// issue #953 names. This function only adds what a single page in isolation
+/// cannot know: that the pages before it were not final and that this page's index
+/// is the one the sequence demands.
 fn check_page_shape(
     page: &OrsBackupPage,
     index: usize,
@@ -905,18 +1116,17 @@ fn check_page_shape(
             reason: "pages must be continuous from zero",
         });
     }
-    require_digest(&page.page_digest, "backup_page_digest")?;
-    if page.entries.len() > usize::from(MAX_BACKUP_PAGE_ENTRIES) {
-        return Err(OrsError::InvalidCursorLimit);
-    }
-    if let Some(continuation) = &page.family_continuation {
-        continuation.validate()?;
-        if page.is_last && continuation.family_open() {
-            return Err(OrsError::InvalidField {
-                field: "backup_page_is_last",
-                reason: "a final page must not leave an open family continuation",
-            });
-        }
+    page.validate_binding()?;
+    if page.is_last
+        && page
+            .family_continuation
+            .as_ref()
+            .is_some_and(OrsFamilyContinuation::family_open)
+    {
+        return Err(OrsError::InvalidField {
+            field: "backup_page_is_last",
+            reason: "a final page must not leave an open family continuation",
+        });
     }
     Ok(())
 }

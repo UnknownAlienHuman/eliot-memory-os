@@ -20,12 +20,14 @@ mod capability_cell_registry;
 mod cell_effective_manifest;
 mod epoch_identity;
 mod module_catalog;
+mod peer_blackboard;
 
 pub use bridge_event_capacity::*;
 pub use capability_cell_registry::*;
 pub use cell_effective_manifest::*;
 pub use epoch_identity::*;
 pub use module_catalog::*;
+pub use peer_blackboard::*;
 
 /// The current wire revision of this foundation surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.contracts";

@@ -1,10 +1,10 @@
 schema = "eliot.agent-work-unit.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
 routing_authority = "owning_issue_and_normative_pair_only"
-status = "READY_FOR_CONSUMER_DISPOSITION_AND_MIGRATION"
-implementation_support = "HISTORICAL_EFFECTING_CONTROLLER_PRESENT"
-evidence_execution_status = "SOURCE_AND_CONSUMER_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
-proof_ceiling = "D02_CAMPAIGN_RETIREMENT_CANDIDATE_ONLY"
+status = "RETIREMENT_COMPLETE_DISPOSITION_RESIDUE_CLOSED"
+implementation_support = "NO_CURRENT_SOURCE_PACKAGE_DELETED"
+evidence_execution_status = "DELETION_DIFF_AND_RESIDUE_SEARCH_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "D02_CAMPAIGN_RETIREMENT_COMPLETED_RECORDS_ONLY"
 issue = 1193
 process_executor_issue = 100
 orchestration_issue = 681
@@ -18,8 +18,8 @@ normative_pair_ref = "docs/normative-pair.toml"
 
 [work_unit]
 cell_id = "workspace.legacy-d02-campaign-disposition"
-causal_property = "Every retained D-02 campaign function maps to the current durable-job, work-unit, AgentCoordinator/swarm, Kernel/ORS, provider and verifier owners; the package is reduced to a read-only historical importer or removed."
-current_discriminator = "The package is its own only consumer and hardcodes D-02 plan, one OpenCode route, D-01 evidence pins and private epoch/fence/claim/lease/checkpoint/integration/Finish semantics."
+causal_property = "No retained D-02 campaign function, package, record or route remains: the hardcoded campaign executor was deleted and the disposition residue that still classified it as a kept owner was closed in the same issue."
+current_discriminator = "The package was its own only consumer and hardcoded D-02 plan, one OpenCode route, D-01 evidence pins and private epoch/fence/claim/lease/checkpoint/integration/Finish semantics; that whole execution path is now deleted, so the behaviour criteria hold vacuously and only the records needed correcting."
 primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1193"
 
 [documentation]
@@ -36,27 +36,32 @@ anchors = ["ARCH-SWM-02", "ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-ORD-01", "ARCH-R
 
 [current_source]
 confirmed = [
-  "Only the package binary constructs CampaignExecutor.",
-  "PLAN_ID is D-02:plan-v4 and the sole admitted OpenCode route is opencode-go/deepseek-v4-flash.",
-  "Bootstrap adoption uses fixed historical D-01 report, handle, checkpoint, event and receipt digests and filenames.",
-  "The package defines private EpochId, StateFence, attempts, claims, work/package/integration leases, checkpoints and ledger state.",
-  "The CLI exposes write-source, assemble-package, integrate-package, replan and finish-parent commands.",
-  "canonical_bytes returns empty bytes on serialization failure rather than failing closed.",
-  "A private git Command path is tracked as direct_process_launch debt under issue #100.",
+  "The retired package path is absent from the tree: `git ls-tree -r HEAD -- workspace/tools/` carries no D-02 campaign executor entry.",
+  "Commit 69bcf7a6 (`refactor(workspace): retire the unused hardcoded campaign executor`, 2026-09-21) removed 13 files and 6333 lines: src/lib.rs, src/control.rs, src/coordination.rs, src/main.rs, the package manifest and all five D-02 test files.",
+  "The same commit removed the root Cargo.toml members entry, the Cargo.lock entries and the config/architecture-boundaries.toml entries, and updated docs/code-navigation/PACKAGE_DOCS_INDEX.md.",
+  "No D-02:plan-v4, opencode-go/deepseek-v4-flash, fixed D-01 digest, LEGACY_D02 profile, private epoch/fence/claim/lease state, finish-parent route or private Git/process bypass survives on any current execution path.",
+  "The remaining residue was records only: the #1860 KEEP rule and ledger row, the T2.md direct-launch debt row and this work unit's own unverifiable code assertions and package-scoped cargo commands.",
 ]
+retirement = "69bcf7a6"
+retirement_date = "2026-09-21"
+retired_path = "workspace/tools/eliot-campaign-executor/** (removed in full by the retirement commit)"
+deleted_files = 13
+deleted_lines = 6333
 
 [scope]
 primary_paths = [
-  "workspace/tools/eliot-campaign-executor/**",
-  "exact current work-unit, swarm, Governor and Kernel contracts needed for one-at-a-time migration",
-  "config/architecture-boundaries.toml only after the debt is actually removed or reclassified",
-  "package index and root Cargo/lock only in the final serialized removal wave",
-  "directly relevant tests and finite historical fixtures",
+  "docs/migration/1860-dispositions.md",
+  "scripts/migration_inventory_1860.py",
+  "workstreams/core-daemons/T2.md",
+  "workstreams/workspace-tools/assignments/1193-d02-campaign-retirement.toml",
+  "docs/code-navigation/PACKAGE_DOCS_INDEX.md (verification only; the retirement commit already updated it)",
 ]
 serialized_dependencies = ["#100 ProcessExecutor", "#681 work-unit planning", "#1126 durable swarm", "#874 adapter registry", "#15/#18 Kernel/Governor", "#13 registry", "#11 Product proof"]
 forbidden = [
-  "new generic campaign orchestrator",
-  "duplicate DurableJob, task, authority, lease or Finish state",
+  "resurrecting the deleted package or any replacement campaign controller",
+  "a LEGACY_D02 import profile; nothing retained needs one and the retirement migrated no historical D-02 material into a current trust path",
+  "new Cargo, lockfile or architecture-boundary entries for the deleted path",
+  "renumbering unrelated ledger or debt rows",
   "caller-selected shell or arbitrary commands",
   "ambient credentials or direct provider SDK",
   "current support claims from historical D-02 evidence",
@@ -65,65 +70,68 @@ forbidden = [
 
 [[waves]]
 id = "A"
-what = "Build an item-level consumer and responsibility disposition."
+what = "Record the item-level disposition of every public type, command and effect."
 how = [
   "Inventory every public type, command, transition, effect, artifact and actual current consumer.",
   "Record replacement owner/contract, compatibility need, proof, expiry and removal condition.",
-  "Select migrate-and-delete, bounded read-only LEGACY_D02 importer, or full deletion.",
+  "Executed as the 69bcf7a6 consumer search: the package was its own only consumer, so every item resolved to deletion rather than migration or a bounded read-only LEGACY_D02 importer.",
 ]
 
 [[waves]]
 id = "B"
 what = "Remove duplicate control and authority ontologies."
 how = [
-  "Use current owner-neutral epoch/fence/attempt/operation types only for demonstrated consumers.",
-  "Route planning/admission/durable state/process/provider/verification to their existing owners.",
-  "Remove finish-parent and effecting source/package commands from the historical tool.",
+  "Executed by deletion with no replacement: private EpochId, StateFence, attempt, claim, work/package/integration lease, checkpoint and ledger state are gone.",
+  "Current owner-neutral epoch/fence/attempt/operation types remain the only epoch and fencing ontology; no D-02 replacement was created.",
+  "The finish-parent and effecting source/package commands were removed with the package and never moved to another owner.",
 ]
 
 [[waves]]
 id = "C"
 what = "Constrain historical evidence and process behavior."
 how = [
-  "Allow fixed plan/model/hashes only inside an explicit versioned read-only LEGACY_D02 import profile.",
-  "Make serialization failure typed and fatal; never substitute empty bytes.",
-  "Move retained Git/process inspection behind #100 or a fixed bounded non-effecting repository-tool exception.",
+  "Executed by deletion: no fixed plan id, model route or D-01 digest remains on any current path, so no LEGACY_D02 import profile was opened and none is required.",
+  "Not applicable after deletion: the fail-open canonical_bytes serialization path no longer exists.",
+  "The private git Command path is gone; remaining direct-process debt stays tracked on the current owners in workstreams/core-daemons/T2.md.",
 ]
 
 [[waves]]
 id = "D"
 what = "Remove the package after zero-current-consumer proof."
 how = [
-  "Run current orchestration with the package unavailable and no fallback.",
-  "Preserve differential fixtures only for intentionally retained historical validation.",
-  "Remove Cargo, lockfile, package-index, docs, boundary-debt and call-site residue through one final integrator.",
+  "Executed: current orchestration runs with the package unavailable and no fallback because no fallback was ever added.",
+  "No differential fixture was retained; the deleted historical tests are recoverable from commit 69bcf7a6 only.",
+  "Executed in two parts: 69bcf7a6 removed Cargo, lockfile, boundary and package-index entries; this work unit closed the surviving docs, ledger, debt and work-unit residue.",
 ]
 
 [acceptance]
 criteria = [
-  "Every public type, command and effect has one current replacement, bounded legacy disposition or deletion.",
-  "No current runtime or developer workflow uses private D-02 control state as authority.",
+  "Every public type, command and effect has one current replacement, bounded legacy disposition or deletion; here every item is deleted.",
+  "No current runtime or developer workflow uses private D-02 control state as authority; no such state exists.",
   "No current path hardcodes D-02:plan-v4, opencode-go/deepseek-v4-flash or D-01 hashes as current policy.",
-  "Retained historical values are accepted only under a non-effecting LEGACY_D02 import schema and cannot promote support.",
-  "Serialization failure is typed and fail-closed; empty bytes never replace failed serialization.",
-  "Finish, source writes and package integration execute only through current owners.",
-  "No private process/Git bypass remains; retained inspection is fixed, bounded and identity-bound.",
-  "Historical import replay is deterministic and changed same-identity bytes conflict.",
+  "No LEGACY_D02 import schema is created; nothing retained needs one and the deletion creates no historical import surface.",
+  "Finish, source writes and package integration execute only through current owners; no D-02 command remains.",
+  "No private process/Git bypass remains in the D-02 path; unrelated direct-process debt stays with its current owners.",
   "Current work-unit/swarm runtime has no fallback to this package.",
-  "A retained package is read-only, explicitly legacy and absent from current capability/runtime support.",
-  "A deleted package leaves no Cargo, lockfile, index, docs, debt, fixture or call-site reference.",
+  "The deleted package leaves no Cargo, lockfile, index, docs, debt, fixture, disposition or call-site reference.",
   "#13 records no parallel current campaign controller and #11 runs without effecting D-02 paths.",
 ]
 
 [verification]
 commands = [
   "cargo fmt --all -- --check",
-  "cargo check --locked -p eliot-campaign-executor --all-targets",
-  "cargo test --locked -p eliot-campaign-executor --all-targets",
-  "cargo clippy --locked -p eliot-campaign-executor --all-targets -- -D warnings",
   "cargo metadata --locked --all-features --format-version 1",
   "python scripts/audit-architecture-boundaries.py",
+  "python scripts/verify-excluded-dispositions-1811.py",
+  "python scripts/migration_inventory_1860.py --check",
   "git diff --check",
+  "python scripts/verify-no-retired-package-residue.py",
 ]
-edge_proof = "Run current work-unit/swarm flows with eliot-campaign-executor unavailable plus deterministic legacy-import fixtures if retained."
+executed = [
+  "python scripts/audit-architecture-boundaries.py: exit 1 with pre-existing hard violations in bins/eliotd and bins/eliot-native-worker runtime-root direct dependencies; no finding names this package or #1193.",
+  "python scripts/verify-excluded-dispositions-1811.py: PASS rows=9.",
+  "python scripts/migration_inventory_1860.py --check: exit 1 on the pre-existing excluded-scope premise (9 standalone rows against the 13-wide audit premise recorded in 2026); unchanged by this work unit.",
+  "Residue search for the retired package name: zero remaining hits; only the two record facts in this work unit that must name the retired path (retirement commit evidence and retired_path) remain.",
+]
+edge_proof = "Current work-unit and swarm flows run with the deleted package unavailable; there is no retained legacy-import fixture because deletion retained no D-02 material."
 product_proof = "Issues #681, #1126 and #11 remain open."

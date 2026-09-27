@@ -5,14 +5,16 @@ mod request_input;
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
-    KernelHostRequestClient, NormalizedCue, Profile, UnderstandingBootstrap, UseOutcome,
-    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
+    KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue, Profile, TransportAdmissionError,
+    TransportProfile, UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration,
+    loopback_http_route, parse_args, reactive_runtime_composition, validate_credential,
+    validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
     DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
-    RecoveryProjectionPage, SessionId,
+    RecoveryProjectionPage, ResourceHandle, SessionId,
 };
 use eliot_contracts::{BridgeEventCapacityPressure, BridgeTransportBackpressure, EpochId};
 use eliot_mcp::{
@@ -39,7 +41,7 @@ use request_input::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -73,6 +75,10 @@ const STDIO_OUTPUT_PROFILE_ID: &str = "eliot.agent-bridge.stdio-output.v1";
 /// outer-record ceiling: a transport frame, a request line, and a response
 /// frame are separate budgets.
 const MAX_OUTPUT_FRAME_BYTES: usize = 524_288;
+/// Raw bytes per explicit resource expansion page. JSON byte-array encoding
+/// needs at most four bytes per source byte; the 1/8 frame bound leaves room
+/// for the response envelope, handle and framing even at worst case.
+const MAX_RESOURCE_CHUNK_BYTES: usize = MAX_OUTPUT_FRAME_BYTES / 8;
 /// Maximum responses outstanding on the synchronous stdio transport.
 ///
 /// The loop serializes, writes, and flushes exactly one response before the
@@ -207,6 +213,11 @@ enum Request {
         #[serde(default)]
         cursor: Option<String>,
     },
+    /// Explicitly expands one exact immutable handle in bounded binary pages.
+    ResourceRead {
+        handle: ResourceHandle,
+        offset: usize,
+    },
     /// Reads one bounded recovery page inside the declared window (issue
     /// #2732).
     ///
@@ -310,7 +321,10 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
     },
     Invocation {
+        #[serde(skip)]
         result: HostInvocationResult,
+        #[serde(rename = "result")]
+        wire_result: Value,
         completion: HostCorrelationReceipt,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
@@ -414,6 +428,15 @@ enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
+    /// One bounded byte chunk from a previously issued immutable handle.
+    ResourceChunk {
+        handle: ResourceHandle,
+        offset: usize,
+        next_offset: usize,
+        total_bytes: usize,
+        bytes: Vec<u8>,
+        complete: bool,
+    },
     Bootstrap {
         bootstrap: UnderstandingBootstrap,
     },
@@ -423,9 +446,9 @@ enum Response {
     /// [`Response::Cancellation`]: reusing the admitted/responded shape would
     /// let a preview be mistaken for kernel admission, which the bridge must
     /// never imply. The envelope stays normalized stdio framing carrying the
-    /// caller correlation, the dry-run disposition, the static effect preview
-    /// with its evidence/source, and the owner-derived attach binding the
-    /// preview is valid under.
+    /// caller correlation, the unsupported disposition, the static effect
+    /// preview with its evidence/source, and the exact attach snapshot
+    /// observed while constructing it.
     DryRun {
         correlation_id: String,
         operation: &'static str,
@@ -500,19 +523,10 @@ struct StopPendingIdentity {
 
 /// Stable identity of the bridge-local static dry-run preview contract.
 const DRY_RUN_PREVIEW_SOURCE: &str = "bridge-static-preview.v1";
-/// Disposition of a dry run over a read-only tool with real inert validation.
-const DRY_RUN_PREVIEW_DISPOSITION: &str = "DRY_RUN_PREVIEW";
 /// Honest disposition where the bridge owns no safe simulator (I7.17).
 const DRY_RUN_UNSUPPORTED_DISPOSITION: &str = "DRY_RUN_UNSUPPORTED";
 /// Route label used when no entry may be named as a would-be dispatch.
 const DRY_RUN_ROUTE_WITHHELD: &str = "withheld-no-simulator";
-
-/// Closed kernel entries that serve real dispatch, owned by
-/// `bins/eliot-kernel/src/host_request_route.rs`. Repeated here for dry-run
-/// route labeling only: a dry run never sends them, it only names which entry
-/// a validated read-only request would have ridden.
-const DRY_RUN_SUBMIT_OPERATION: &str = "agent_host_request_submit";
-const DRY_RUN_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
 
 /// Static effect preview for one dry run: what the validated request names,
 /// without any claim that the target accepted, staged, or simulated it.
@@ -525,7 +539,7 @@ struct DryRunPreview {
     operation_handle: Option<String>,
     /// `read-only`, `effectful`, or `cancellation-probe`.
     effect_class: &'static str,
-    /// Would-be kernel entry, or `withheld-no-simulator`.
+    /// `withheld-no-simulator`: this bridge has no operation simulator.
     route: &'static str,
     /// Caller deadline preference echoed verbatim; the kernel would own it.
     deadline_preference_ms: Option<u64>,
@@ -539,17 +553,17 @@ struct DryRunPreview {
 struct DryRunEvidence {
     /// Static preview contract identity.
     source: &'static str,
-    /// Outcome of bridge-local inert request validation.
+    /// Outcome of bridge-local request-shape validation only.
     inert_validation: &'static str,
     /// Honest statement of what ran and what explicitly did not.
     statement: String,
 }
 
-/// Owner-derived attach binding a dry-run preview is valid under.
+/// Exact owner-sealed attach snapshot observed while constructing the preview.
 ///
-/// Every fact is echoed from the live activation-sealed binding; nothing is
-/// minted here. When unattached the preview says so instead of binding stale
-/// facts, so callers cannot treat it as current.
+/// These values identify the snapshot under which the static preview was
+/// assembled; they do not prove that the owner is still at this revision.
+/// Missing route identity remains unknown because `AttachBinding` carries none.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DryRunBinding {
@@ -557,7 +571,16 @@ struct DryRunBinding {
     connection_id: Option<String>,
     session_id: Option<String>,
     activation_generation: Option<u64>,
+    task_id: Option<String>,
+    work_unit_id: Option<String>,
+    work_scope_id: Option<String>,
+    task_revision: Option<String>,
+    plan_id: Option<String>,
+    plan_revision: Option<String>,
     authority_epoch: Option<EpochId>,
+    state_fence: Option<FencingToken>,
+    /// `AttachBinding` has no route/fingerprint carrier; do not invent one.
+    route_fingerprint: Option<String>,
 }
 
 /// Fail-closed placeholder retained for unit tests only.
@@ -623,6 +646,7 @@ fn main() {
                 CliError::InvalidClientDeclarationPath(path) => {
                     ("INVALID_CLIENT_DECLARATION_PATH", path)
                 }
+                CliError::TransportRejected(code) => ("TRANSPORT_REJECTED", code),
             };
             emit_error(code, &detail);
             std::process::exit(INVALID_ARGUMENT_EXIT);
@@ -658,6 +682,19 @@ fn main() {
             format!("request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent");
         emit_error("BRIDGE_COMPOSITION_REJECTED", &detail);
         std::process::exit(PROVIDER_PORT_EXIT);
+    }
+    // Transport-profile admission (I7.5): the stdio shim is the default
+    // route and keeps the existing stdio front doors below. The optional
+    // loopback HTTP profile is disabled by default and, once admitted with
+    // its literal loopback bind and scoped short-lived bearer credential,
+    // serves the agent-facing MCP surface over that bind only. Losing this
+    // process removes only the transport binding: the profile holds no
+    // Kernel or canonical state, and the Kernel session and work state stay
+    // intact kernel-side.
+    if let TransportProfile::LoopbackHttp(profile) = config.transport {
+        let code =
+            run_loopback_http_bridge(profile, host_gateway, &mut host_request_client, &mut runner);
+        std::process::exit(code);
     }
     if mcp_mode {
         // The MCP front door owns its stdio loop from here: it never falls
@@ -872,6 +909,9 @@ fn main() {
                     Err(error) => bridge_error(&error),
                 }
             }
+            Ok(Request::ResourceRead { handle, offset }) => {
+                handle_resource_read(&runner, handle, offset)
+            }
             Ok(Request::RecoverNextPage {}) => match runner.recover_next_page() {
                 Ok(_) => match runner.recovery_projection_page(None) {
                     Ok(page) => Response::RecoveryPage {
@@ -1083,6 +1123,7 @@ fn response_bootstrap_slot(response: &mut Response) -> Option<&mut Option<Unders
         | Response::RecoveryProjectionPage { bootstrap, .. }
         | Response::Stopped { bootstrap, .. } => Some(bootstrap),
         Response::Bootstrap { .. }
+        | Response::ResourceChunk { .. }
         | Response::Backpressure { .. }
         | Response::TransportBackpressure { .. }
         | Response::Error { .. }
@@ -1118,36 +1159,163 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     request: &HostInvocationRequest,
 ) -> Response {
     match gateway.invoke_with_receipt(port, request) {
-        Ok((result, completion)) => Response::Invocation {
-            result,
-            completion,
-            bootstrap: None,
-            evidence: None,
-            reactive_receipts: Vec::new(),
+        Ok((result, completion)) => match invocation_wire_result(&result, None) {
+            Ok(wire_result) => Response::Invocation {
+                wire_result,
+                result,
+                completion,
+                bootstrap: None,
+                evidence: None,
+                reactive_receipts: Vec::new(),
+            },
+            Err(()) => invocation_projection_error(),
         },
         Err(error) => host_gateway_error(&error),
     }
 }
 
 /// Records one supported tool-result delivery after gateway return and
-/// projects its handle onto the outgoing Invocation response.
+/// projects its bounded preview and retained handle onto the outgoing response.
 ///
-/// Runs on the normal Invoke path with the exact authenticated outcome the gateway
-/// produced. The gateway-shaped result and completion are never touched: only the
-/// additive `evidence` slot is filled, and only when recording yields a snapshot
-/// (supported kind with content beyond the hot preview bound). Auxiliary only: a
-/// `None` (admission, rejection, gap, unsupported kind, small inline content,
-/// detached runner, or full registry) leaves the response exactly as the gateway
-/// shaped it, with the key absent on the wire.
+/// The typed gateway result and completion remain available in-process. Large
+/// candidate/projection content is serialized only after its wire projection
+/// has been replaced with a bounded preview. If retaining or projecting that
+/// preview fails, the response is replaced with a fixed refusal.
 /// See [`BridgeRunner::record_tool_result_delivery`].
 fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response) {
+    let content_result = match response {
+        Response::Invocation { result, .. } => Some(invocation_content_bytes(result)),
+        _ => None,
+    };
+    let content = match content_result {
+        Some(Ok(Some(bytes))) => bytes,
+        Some(Ok(None)) | None => return,
+        Some(Err(())) => {
+            *response = invocation_projection_error();
+            return;
+        }
+    };
+    if content.len() <= eliot_agent_bridge::MAX_PREVIEW_BYTES {
+        return;
+    }
+    let view = match response {
+        Response::Invocation { result, .. } => runner.record_tool_result_delivery(result.outcome()),
+        _ => None,
+    };
+    let Some(view) = view else {
+        *response = Response::Error {
+            code: "TOOL_RESULT_NOT_RETAINED",
+            detail: format!(
+                "large candidate/projection result ({} bytes) could not be retained for explicit resource expansion",
+                content.len()
+            ),
+        };
+        return;
+    };
+    let projected = match response {
+        Response::Invocation { result, .. } => invocation_wire_result(result, Some(&view)),
+        _ => return,
+    };
+    let Ok(projected) = projected else {
+        *response = invocation_projection_error();
+        return;
+    };
     if let Response::Invocation {
-        result, evidence, ..
+        wire_result,
+        evidence,
+        ..
     } = response
-        && evidence.is_none()
-        && let Some(view) = runner.record_tool_result_delivery(result.outcome())
     {
+        *wire_result = projected;
         *evidence = Some(view);
+    }
+}
+
+fn invocation_projection_error() -> Response {
+    Response::Error {
+        code: "TOOL_RESULT_PROJECTION_FAILED",
+        detail: "invocation result could not be safely projected for the private response"
+            .to_owned(),
+    }
+}
+
+/// Serializes content only for classification and resource persistence. The
+/// typed invocation result remains available to in-process callers but is
+/// never itself serialized on the private stdio response.
+fn invocation_content_bytes(result: &HostInvocationResult) -> Result<Option<Vec<u8>>, ()> {
+    let HostInvocationOutcome::Responded { response, .. } = result.outcome() else {
+        return Ok(None);
+    };
+    if !matches!(
+        response.kind,
+        eliot_mcp::ResponseKind::Candidate | eliot_mcp::ResponseKind::Projection
+    ) {
+        return Ok(None);
+    }
+    serde_json::to_vec(&response.content)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+/// Projects a typed invocation result onto the private hot wire surface.
+/// Small outcomes retain their existing shape. Large candidate/projection
+/// content is replaced with a byte preview, total size and retained handle.
+fn invocation_wire_result(
+    result: &HostInvocationResult,
+    evidence: Option<&HotResourceView>,
+) -> Result<Value, ()> {
+    let mut wire = serde_json::to_value(result).map_err(|_| ())?;
+    let Some(content) = invocation_content_bytes(result)? else {
+        return Ok(wire);
+    };
+    if content.len() <= eliot_agent_bridge::MAX_PREVIEW_BYTES {
+        return Ok(wire);
+    }
+    let preview_len = content.len().min(eliot_agent_bridge::MAX_PREVIEW_BYTES);
+    let response = wire
+        .get_mut("outcome")
+        .and_then(|outcome| outcome.get_mut("response"))
+        .ok_or(())?;
+    let response = response.as_object_mut().ok_or(())?;
+    response.insert(
+        "content".to_owned(),
+        serde_json::json!({
+            "preview_bytes": &content[..preview_len],
+            "total_bytes": content.len(),
+            "truncated": true,
+        }),
+    );
+    let resource = evidence
+        .map(|view| serde_json::to_value(view.handle()).map_err(|_| ()))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    response.insert("resource".to_owned(), resource);
+    Ok(wire)
+}
+
+/// Expands a previously issued immutable resource handle in one response-safe
+/// page. The owning runner verifies attach scope and digest on every read.
+fn handle_resource_read(runner: &BridgeRunner, handle: ResourceHandle, offset: usize) -> Response {
+    let bytes = match runner.expand_resource(&handle) {
+        Ok(bytes) => bytes,
+        Err(error) => return bridge_error(&error),
+    };
+    if offset > bytes.len() {
+        return Response::Error {
+            code: "RESOURCE_OFFSET_INVALID",
+            detail: "resource read offset exceeds the retained content length".to_owned(),
+        };
+    }
+    let end = offset
+        .saturating_add(MAX_RESOURCE_CHUNK_BYTES)
+        .min(bytes.len());
+    Response::ResourceChunk {
+        handle,
+        offset,
+        next_offset: end,
+        total_bytes: bytes.len(),
+        bytes: bytes[offset..end].to_vec(),
+        complete: end == bytes.len(),
     }
 }
 
@@ -1437,11 +1605,12 @@ fn handle_cancellation<P: KernelHostRequestPort + ?Sized>(
     }
 }
 
-/// Reads the live activation-sealed binding for one dry-run preview.
+/// Reads the exact activation-sealed attach snapshot for one static preview.
 ///
-/// Read-only: echoes kernel-issued connection/session/generation/epoch facts
-/// from the runner attach view without dispatching, probing, or minting
-/// anything, so the preview stays bound to the revision it was computed under.
+/// Read-only: echoes owner-issued transport, task/revision/scope and opaque
+/// State Fence facts without dispatching, probing, or minting anything. This
+/// binds the preview to the observed snapshot, not to freshly validated owner
+/// state. `AttachBinding` carries no route fingerprint, so that remains absent.
 fn dry_run_binding(runner: &BridgeRunner) -> DryRunBinding {
     match runner.attach_view() {
         None => DryRunBinding {
@@ -1449,38 +1618,47 @@ fn dry_run_binding(runner: &BridgeRunner) -> DryRunBinding {
             connection_id: None,
             session_id: None,
             activation_generation: None,
+            task_id: None,
+            work_unit_id: None,
+            work_scope_id: None,
+            task_revision: None,
+            plan_id: None,
+            plan_revision: None,
             authority_epoch: None,
+            state_fence: None,
+            route_fingerprint: None,
         },
-        Some(view) => DryRunBinding {
-            attached: true,
-            connection_id: Some(view.binding().connection_id().as_str().to_owned()),
-            session_id: Some(view.binding().session_id().as_str().to_owned()),
-            activation_generation: Some(view.binding().activation_generation().get()),
-            authority_epoch: Some(view.binding().state_fence().authority_epoch().clone()),
-        },
+        Some(view) => {
+            let binding = view.binding();
+            let task = binding.task_binding();
+            DryRunBinding {
+                attached: true,
+                connection_id: Some(binding.connection_id().as_str().to_owned()),
+                session_id: Some(binding.session_id().as_str().to_owned()),
+                activation_generation: Some(binding.activation_generation().get()),
+                task_id: Some(task.task_id().as_str().to_owned()),
+                work_unit_id: Some(task.work_unit_id().as_str().to_owned()),
+                work_scope_id: Some(task.work_scope_id().to_owned()),
+                task_revision: Some(task.task_revision().to_owned()),
+                plan_id: Some(task.plan_id().to_owned()),
+                plan_revision: Some(task.plan_revision().to_owned()),
+                authority_epoch: Some(binding.state_fence().authority_epoch().clone()),
+                state_fence: Some(binding.state_fence().clone()),
+                route_fingerprint: None,
+            }
+        }
     }
 }
 
 /// Classifies one invocation tool for dry-run preview (I7.17).
 ///
-/// Read-only projections (`eliot.state`, `eliot.packet`, `eliot.query`) carry
-/// no external effects, so the bridge answers them with a validated static
-/// preview naming the entry they would have ridden. Every other tool is
-/// effectful and the bridge owns no safe simulator for it, so the honest
-/// answer is `DRY_RUN_UNSUPPORTED`. Returns the effect class, the route
-/// label, and the disposition in that order.
+/// Classifies the static effect shape of one invocation. Although some tools
+/// are read-only, this bridge has no operation-level simulator or validation
+/// capability for any tool, so each path is `DRY_RUN_UNSUPPORTED`. Returns
+/// effect class, withheld route, and disposition in that order.
 fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'static str) {
-    match tool {
-        ToolRequest::State(_) => (
-            "read-only",
-            DRY_RUN_SUBMIT_OPERATION,
-            DRY_RUN_PREVIEW_DISPOSITION,
-        ),
-        ToolRequest::Packet(_) | ToolRequest::Query(_) => (
-            "read-only",
-            DRY_RUN_INVOKE_READ_OPERATION,
-            DRY_RUN_PREVIEW_DISPOSITION,
-        ),
+    let effect_class = match tool {
+        ToolRequest::State(_) | ToolRequest::Packet(_) | ToolRequest::Query(_) => "read-only",
         ToolRequest::Observe(_)
         | ToolRequest::Act(_)
         | ToolRequest::Verify(_)
@@ -1488,36 +1666,30 @@ fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'sta
         | ToolRequest::Finish(_)
         | ToolRequest::UserAutomation(_)
         | ToolRequest::SkillInject(_)
-        | ToolRequest::SkillDisplay(_) => (
-            "effectful",
-            DRY_RUN_ROUTE_WITHHELD,
-            DRY_RUN_UNSUPPORTED_DISPOSITION,
-        ),
-    }
+        | ToolRequest::SkillDisplay(_) => "effectful",
+    };
+    (
+        effect_class,
+        DRY_RUN_ROUTE_WITHHELD,
+        DRY_RUN_UNSUPPORTED_DISPOSITION,
+    )
 }
 
 /// Answers one invocation dry run with zero side effects (I7.17).
 ///
-/// Runs the same bridge-local inert validation as a real invoke so malformed
-/// input fails closed with the identical `HOST_REQUEST_INVALID` shape, then
-/// returns the normalized dry-run envelope with the static preview and its
-/// evidence/source. The gateway, the trusted port, and the admitted transport
-/// are never called: no envelope is built, no replay entry is recorded, and
-/// the target state plus the external-effect ledger stay exactly unchanged.
-/// No kernel simulation or external validation runs on this path.
+/// Runs bridge-local request-shape validation so malformed input fails closed
+/// with the identical `HOST_REQUEST_INVALID` shape, then returns the
+/// normalized unsupported envelope with a static preview and its
+/// evidence/source. The gateway, trusted port and admitted transport are
+/// never called. Request-shape validation is not operation validation or
+/// simulation; no kernel simulation or external validation runs here.
 fn dry_run_invocation(runner: &BridgeRunner, request: &HostInvocationRequest) -> Response {
     if let Err(error) = request.validate() {
         return host_gateway_error(&HostGatewayError::from(error));
     }
     let (effect_class, route, disposition) = dry_run_invoke_plan(&request.tool);
-    let statement = if disposition == DRY_RUN_UNSUPPORTED_DISPOSITION {
-        "DRY_RUN_UNSUPPORTED: no validation/simulation ran against the target operation; \
-         only bridge-local request-shape validation passed; no effects were issued and \
-         no transport bytes were sent"
-    } else {
-        "bridge-local inert validation passed; no kernel simulation or external validation \
-         ran; no effects were issued and no transport bytes were sent"
-    };
+    let statement = "DRY_RUN_UNSUPPORTED: no operation validation or simulation ran; only bridge-local \
+         request-shape validation passed; no effects were issued and no transport bytes were sent";
     Response::DryRun {
         correlation_id: request.correlation_id.as_str().to_owned(),
         operation: "invoke",
@@ -2503,6 +2675,377 @@ fn run_mcp_front_door(
         PROVIDER_PORT_EXIT
     } else {
         0
+    }
+}
+
+/// Bounded header bytes accepted for one loopback HTTP request.
+const HTTP_HEADER_LIMIT_BYTES: usize = 8 * 1024;
+/// Bounded body bytes accepted for one loopback HTTP request; mirrors the
+/// stdio record ceiling so one transport's bound cannot exceed the other's.
+const HTTP_BODY_LIMIT_BYTES: usize = REQUEST_INPUT_PROFILE.max_record_bytes;
+/// Read timeout for one loopback HTTP request; an idle keep-alive connection
+/// is closed silently once it elapses.
+const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One parsed loopback HTTP request: only the fields the admission policy
+/// reads, all bounded by the reader.
+struct LoopbackHttpRequest {
+    method: String,
+    target: String,
+    host: Option<String>,
+    origin: Option<String>,
+    authorization: Option<String>,
+    body: Vec<u8>,
+}
+
+/// One loopback HTTP intake classification for the connection loop.
+enum LoopbackHttpRead {
+    /// One fully framed request ready for admission.
+    Request(LoopbackHttpRequest),
+    /// The peer closed the connection or the read timeout elapsed.
+    Eof,
+    /// The request bytes are malformed; the detail never echoes request
+    /// content.
+    Rejected(String),
+}
+
+/// Connection flow after one request: serve the next request on the same
+/// keep-alive connection, or close it.
+enum ConnectionFlow {
+    Continue,
+    Close,
+}
+
+/// Serves the admitted loopback HTTP profile until a transport failure.
+///
+/// The listener binds the exact admitted literal loopback endpoint and
+/// nothing else. Every request is admitted through the I7.5 policy before
+/// any dispatch: exact `Host`, exact browser `Origin` when present, and the
+/// scoped short-lived bearer credential presented on this endpoint only.
+/// Only the agent-facing MCP surface is routed; admin and database surfaces
+/// have no route. A provider failure or transport failure ends the bridge
+/// with the provider exit code; the Kernel session and work state are owned
+/// kernel-side and are never mutated by this process's death.
+fn run_loopback_http_bridge(
+    profile: LoopbackHttpProfile,
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+) -> i32 {
+    let listener = match std::net::TcpListener::bind(profile.bind_addr()) {
+        Ok(listener) => listener,
+        Err(error) => {
+            emit_error("HTTP_TRANSPORT_BIND_REJECTED", &error.to_string());
+            return PROVIDER_PORT_EXIT;
+        }
+    };
+    let mut provider_failure = false;
+    loop {
+        let (stream, _peer) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                emit_error("HTTP_TRANSPORT_ACCEPT_FAILED", &error.to_string());
+                return PROVIDER_PORT_EXIT;
+            }
+        };
+        match serve_loopback_http_connection(
+            stream,
+            &profile,
+            gateway,
+            port,
+            runner,
+            &mut provider_failure,
+        ) {
+            Ok(()) => {}
+            Err(error) => {
+                emit_error("HTTP_TRANSPORT_CONNECTION_FAILED", &error);
+                return PROVIDER_PORT_EXIT;
+            }
+        }
+        if provider_failure {
+            return PROVIDER_PORT_EXIT;
+        }
+    }
+}
+
+/// Serves one keep-alive loopback HTTP connection until the peer closes, a
+/// request is rejected, or a provider failure ends the bridge.
+fn serve_loopback_http_connection(
+    mut stream: std::net::TcpStream,
+    profile: &LoopbackHttpProfile,
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    provider_failure: &mut bool,
+) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(STDOUT_WRITE_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let mut state = McpFrontDoor::new();
+    loop {
+        let request = match read_loopback_http_request(&mut stream) {
+            LoopbackHttpRead::Request(request) => request,
+            LoopbackHttpRead::Eof => return Ok(()),
+            LoopbackHttpRead::Rejected(detail) => {
+                write_loopback_http_rejection(&mut stream, 400, "BAD_REQUEST", &detail)?;
+                return Ok(());
+            }
+        };
+        match validate_and_dispatch(
+            &mut stream,
+            request,
+            profile,
+            gateway,
+            port,
+            runner,
+            &mut state,
+            provider_failure,
+        ) {
+            Ok(ConnectionFlow::Continue) => {}
+            Ok(ConnectionFlow::Close) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if *provider_failure {
+            return Ok(());
+        }
+    }
+}
+
+/// Admits one request through the I7.5 policy and dispatches it.
+///
+/// Admission order is deliberate: `Host` on every request first, then the
+/// routing policy (only the agent-facing MCP surface is served), then the
+/// method, then `Origin` for browser-originated requests, then the scoped
+/// bearer credential. Every rejection writes its typed response and closes
+/// the connection; no rejection ever reaches a handler, gateway, port, or
+/// runner call.
+#[allow(
+    clippy::too_many_lines,
+    reason = "loopback HTTP admission mirrors the I7.5 policy step for step"
+)]
+fn validate_and_dispatch(
+    stream: &mut std::net::TcpStream,
+    request: LoopbackHttpRequest,
+    profile: &LoopbackHttpProfile,
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    provider_failure: &mut bool,
+) -> Result<ConnectionFlow, String> {
+    if let Err(error) = validate_host(request.host.as_deref(), profile) {
+        write_loopback_http_rejection(stream, 403, error.code(), "host admission rejected")?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if loopback_http_route(request.target.as_str()).is_none() {
+        write_loopback_http_rejection(
+            stream,
+            404,
+            "SURFACE_NOT_ROUTED",
+            "no admin or database surface is routed",
+        )?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if request.method != "POST" {
+        write_loopback_http_rejection(
+            stream,
+            405,
+            "METHOD_NOT_ADMITTED",
+            "POST is the only admitted method",
+        )?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if let Some(origin) = request.origin.as_deref()
+        && let Err(error) = validate_origin(Some(origin), profile)
+    {
+        write_loopback_http_rejection(stream, 403, error.code(), "origin admission rejected")?;
+        return Ok(ConnectionFlow::Close);
+    }
+    if let Err(error) = validate_loopback_bearer(request.authorization.as_deref(), profile) {
+        write_loopback_http_rejection(stream, 401, error.code(), "credential admission rejected")?;
+        return Ok(ConnectionFlow::Close);
+    }
+    let body = String::from_utf8_lossy(&request.body).into_owned();
+    let outcome = handle_mcp_frame(gateway, port, runner, state, &body, provider_failure);
+    match outcome.response {
+        Some(response) => {
+            let bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+            if bytes.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+                let refusal = serde_json::json!({
+                    "error": "HTTP_RESPONSE_TOO_LARGE",
+                    "detail": format!(
+                        "structured MCP response exceeds {HARD_STRUCTURED_RESPONSE_BYTES} bytes"
+                    ),
+                });
+                let refusal_bytes =
+                    serde_json::to_vec(&refusal).map_err(|error| error.to_string())?;
+                write_loopback_http_response(stream, 503, "Service Unavailable", &refusal_bytes)?;
+                return Ok(ConnectionFlow::Close);
+            }
+            write_loopback_http_response(stream, 200, "OK", &bytes)?;
+        }
+        None => {
+            write_loopback_http_response(stream, 202, "Accepted", b"")?;
+        }
+    }
+    Ok(ConnectionFlow::Continue)
+}
+
+/// Validates the `Authorization` header as the scoped bearer credential,
+/// presented on the exact loopback endpoint it was issued for.
+fn validate_loopback_bearer(
+    authorization: Option<&str>,
+    profile: &LoopbackHttpProfile,
+) -> Result<(), TransportAdmissionError> {
+    let presented = authorization
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(TransportAdmissionError::CredentialMismatch)?;
+    validate_credential(presented, profile.credential_scope(), profile)
+}
+
+/// Reads one bounded loopback HTTP request: headers up to the header
+/// terminator, then exactly `Content-Length` body bytes.
+fn read_loopback_http_request(stream: &mut std::net::TcpStream) -> LoopbackHttpRead {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let header_end = loop {
+        if buffer.len() > HTTP_HEADER_LIMIT_BYTES {
+            return LoopbackHttpRead::Rejected(
+                "request headers exceed the loopback HTTP bound".to_owned(),
+            );
+        }
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => return LoopbackHttpRead::Eof,
+            Ok(read) => read,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return LoopbackHttpRead::Eof;
+            }
+            Err(error) => {
+                return LoopbackHttpRead::Rejected(format!("request header read failed: {error}"));
+            }
+        };
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
+        }
+    };
+    let header_text = match String::from_utf8(buffer[..header_end].to_vec()) {
+        Ok(text) => text,
+        Err(_) => {
+            return LoopbackHttpRead::Rejected("request headers are not valid UTF-8".to_owned());
+        }
+    };
+    let mut body_prefix = buffer[header_end + 4..].to_vec();
+    let mut lines = header_text.split("\r\n");
+    let request_line = match lines.next() {
+        Some(line) => line,
+        None => return LoopbackHttpRead::Rejected("empty request line".to_owned()),
+    };
+    let mut request_parts = request_line.split(' ');
+    let method = request_parts.next().unwrap_or_default().to_owned();
+    let target = request_parts.next().unwrap_or_default().to_owned();
+    let mut host: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut authorization: Option<String> = None;
+    let mut content_length: usize = 0;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return LoopbackHttpRead::Rejected("malformed header line".to_owned());
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "host" => host = Some(value.to_owned()),
+            "origin" => origin = Some(value.to_owned()),
+            "authorization" => authorization = Some(value.to_owned()),
+            "content-length" => match value.parse::<usize>() {
+                Ok(length) => content_length = length,
+                Err(_) => return LoopbackHttpRead::Rejected("malformed content-length".to_owned()),
+            },
+            _ => {}
+        }
+    }
+    if content_length > HTTP_BODY_LIMIT_BYTES {
+        return LoopbackHttpRead::Rejected(
+            "request body exceeds the loopback HTTP bound".to_owned(),
+        );
+    }
+    let buffered = body_prefix.len();
+    if buffered > content_length {
+        return LoopbackHttpRead::Rejected("request body exceeds content-length".to_owned());
+    }
+    body_prefix.resize(content_length, 0);
+    if buffered < content_length {
+        match stream.read_exact(&mut body_prefix[buffered..]) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return LoopbackHttpRead::Eof;
+            }
+            Err(error) => {
+                return LoopbackHttpRead::Rejected(format!("request body read failed: {error}"));
+            }
+        }
+    }
+    LoopbackHttpRead::Request(LoopbackHttpRequest {
+        method,
+        target,
+        host,
+        origin,
+        authorization,
+        body: body_prefix,
+    })
+}
+
+/// Writes one loopback HTTP response and flushes it.
+fn write_loopback_http_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|error| error.to_string())?;
+    stream.write_all(body).map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())
+}
+
+/// Writes one typed loopback HTTP admission rejection.
+fn write_loopback_http_rejection(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    code: &str,
+    detail: &str,
+) -> Result<(), String> {
+    let body = format!("{{\"error\":{code:?},\"detail\":{detail:?}}}");
+    write_loopback_http_response(stream, status, reason_phrase(status), body.as_bytes())
+}
+
+/// Reason phrase for one rejection status.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Rejected",
     }
 }
 

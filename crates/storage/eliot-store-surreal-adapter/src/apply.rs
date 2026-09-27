@@ -42,6 +42,7 @@ mod receipt_reconciliation;
 mod recovery;
 mod schema_contract;
 pub(crate) mod surreal_automation;
+pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_experience;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
@@ -910,7 +911,9 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
             | StoreError::AutomationContinuation(_)
             | StoreError::PayloadTooLarge => AttemptOutcome::Rejected(store),
             StoreError::Serialization(_) => AttemptOutcome::Cancelled,
-            StoreError::MissingReceiptEnvelope | StoreError::Unavailable => {
+            StoreError::MissingReceiptEnvelope
+            | StoreError::Unavailable
+            | StoreError::SnapshotClosePending { .. } => {
                 AttemptOutcome::Unknown { retry_after_ms: 0 }
             }
         },

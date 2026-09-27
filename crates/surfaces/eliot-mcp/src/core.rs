@@ -18,8 +18,9 @@ use crate::{
     ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
     HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
-    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection, canonical_tool_schemas,
-    decode_protected_request_bytes, reject_duplicate_keys, validate_proof_ceiling,
+    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection,
+    decode_protected_request_bytes, published_mcp_tool_surface, reject_duplicate_keys,
+    validate_proof_ceiling, validate_tool_request_owner,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -839,7 +840,7 @@ impl McpCore {
         request: ApplicationRequest,
     ) -> Result<McpResponse, BridgeError> {
         transport.validate()?;
-        validate_application_request(&request)?;
+        let semantic_profile = validate_application_request(&request)?;
         let correlation = RequestCorrelation {
             request_id: request
                 .identity
@@ -915,7 +916,11 @@ impl McpCore {
             }
             Err(other) => return Err(BridgeError::Port(other)),
         };
-        validate_projection(&forwarded.request.session, &projection)?;
+        validate_projection(
+            &forwarded.request.session,
+            &projection,
+            semantic_profile.evidence_ceiling,
+        )?;
         let kind = match projection.kind {
             ProjectionKind::Candidate => ResponseKind::Candidate,
             ProjectionKind::Projection => ResponseKind::Projection,
@@ -1072,7 +1077,9 @@ impl BridgeError {
     }
 }
 
-fn validate_application_request(request: &ApplicationRequest) -> Result<(), BridgeError> {
+fn validate_application_request(
+    request: &ApplicationRequest,
+) -> Result<crate::ToolSemanticProfile, BridgeError> {
     request
         .identity
         .validate()
@@ -1115,7 +1122,7 @@ fn validate_application_request(request: &ApplicationRequest) -> Result<(), Brid
         ));
     }
     request.tool.validate().map_err(contract_violation)?;
-    validate_tool_semantic_owner(&request.tool)?;
+    let semantic_profile = validate_tool_semantic_owner(&request.tool)?;
     if let ToolRequest::Finish(draft) = &request.tool {
         let metadata_task = request.identity.request.metadata.task_id.as_ref();
         if !matches!(metadata_task, Some(value) if value.as_str() == draft.task_id.as_str()) {
@@ -1134,7 +1141,7 @@ fn validate_application_request(request: &ApplicationRequest) -> Result<(), Brid
             ));
         }
     }
-    Ok(())
+    Ok(semantic_profile)
 }
 
 fn contract_violation(value: ContractViolation) -> BridgeError {
@@ -1159,14 +1166,15 @@ fn canonical_tool_count() -> usize {
 /// registered [`crate::ToolSemanticProfile`] before any port call; a method
 /// with no owner fails closed here. Routing behavior is read from the profile
 /// by downstream consumers, never inferred from the tool name.
-fn validate_tool_semantic_owner(tool: &ToolRequest) -> Result<(), BridgeError> {
+fn validate_tool_semantic_owner(
+    tool: &ToolRequest,
+) -> Result<crate::ToolSemanticProfile, BridgeError> {
     crate::validate_tool_request_owner(tool).map_err(|error| {
         BridgeError::invalid(
             "tool.name",
             format!("no registered semantic owner: {error}"),
         )
-    })?;
-    Ok(())
+    })
 }
 
 fn validate_active_session_binding(
@@ -1596,8 +1604,15 @@ pub fn derive_transformed_lineage(
 fn validate_projection(
     request_session: &SessionBinding,
     projection: &PortProjection,
+    evidence_ceiling: ProofCeiling,
 ) -> Result<(), BridgeError> {
     validate_proof_ceiling(projection.proof_ceiling).map_err(contract_violation)?;
+    if !projection.proof_ceiling.is_at_most(evidence_ceiling) {
+        return Err(BridgeError::invalid(
+            "response.proof_ceiling",
+            "must not exceed the tool semantic profile evidence ceiling",
+        ));
+    }
     let mut artifacts = BTreeSet::new();
     for artifact in &projection.artifacts {
         if !is_sha256(&artifact.sha256) {
@@ -2253,6 +2268,36 @@ pub fn build_host_invocation(
             json!({ "tool": bound_wire_text(tool_name) }),
         )
     })?;
+    let descriptor = published_mcp_tool_surface()
+        .map_err(|_| {
+            WireRejection::new(
+                WIRE_INTERNAL_ERROR,
+                "generated tool schemas are unavailable",
+            )
+        })?
+        .into_iter()
+        .find(|descriptor| descriptor.name == tool_name)
+        .ok_or_else(|| {
+            WireRejection::with_data(
+                WIRE_METHOD_NOT_FOUND,
+                "tool has no advertised canonical contract",
+                json!({ "tool": bound_wire_text(tool_name) }),
+            )
+        })?;
+    let owner = validate_tool_request_owner(&tool).map_err(|_| {
+        WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool has no registered semantic owner",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        )
+    })?;
+    if descriptor.definition_version != owner.method.definition_version {
+        return Err(WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool schema version does not match its decoder contract",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        ));
+    }
     reject_blank_wire_id(correlation)?;
     let correlation_id = HostCorrelationId::new(correlation.correlation_text()).map_err(|_| {
         WireRejection::new(
@@ -2626,7 +2671,7 @@ fn bound_wire_text(value: &str) -> String {
 }
 
 fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
-    let schemas = canonical_tool_schemas().map_err(|_| {
+    let schemas = published_mcp_tool_surface().map_err(|_| {
         WireRejection::new(
             WIRE_INTERNAL_ERROR,
             "generated tool schemas are unavailable",
@@ -2640,6 +2685,10 @@ fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
                 "description": schema.description,
                 "inputSchema": schema.input_schema,
                 "outputSchema": schema.output_schema,
+                "_meta": {
+                    "eliot/schemaSha256": schema.schema_sha256,
+                    "eliot/definitionVersion": schema.definition_version,
+                },
             })
         })
         .collect();

@@ -51,6 +51,106 @@ fn observe_recovery(event: &'static str, outcome: &'static str) {
     );
 }
 
+/// F-LOG-KERNEL-4 (#903 W7): cutover-scoped persistence observations.
+///
+/// Same #895-only shape as [`observe_recovery`] plus the cutover call's own
+/// validated operation identity (already echoed on the authenticated
+/// `GenerationCutoverOutcome` reply; I15.4, I07.20, W6), policy-screened and
+/// bounded by `bound_field` before formatting. Deferred phase records of
+/// concurrent cutovers correlate by identity with no dedup cache, no new
+/// probe, and no lock-held emission.
+fn observe_recovery_cutover(event: &'static str, outcome: &'static str, cutover_id: &str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    let cutover_bound = bound_field(cutover_id);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        cutover_id = cutover_bound.text(),
+        "generation recovery observation"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum HandshakePolicyObservation {
+    Projected,
+    Absent,
+}
+
+impl HandshakePolicyObservation {
+    fn emit(self) {
+        match self {
+            Self::Projected => {
+                observe_recovery("kernel.recovery.handshake_projected", "success");
+            }
+            Self::Absent => observe_recovery("kernel.recovery.handshake_absent", "absent"),
+        }
+    }
+
+    /// Cutover-scoped handshake observation: the same subordinate record,
+    /// correlated to its cutover call by the validated operation identity (W7).
+    fn emit_for_cutover(self, cutover_id: &str) {
+        match self {
+            Self::Projected => {
+                observe_recovery_cutover(
+                    "kernel.recovery.handshake_projected",
+                    "success",
+                    cutover_id,
+                );
+            }
+            Self::Absent => {
+                observe_recovery_cutover("kernel.recovery.handshake_absent", "absent", cutover_id);
+            }
+        }
+    }
+}
+
+/// Fixed-size record of the persistence phases reached by one cutover.
+///
+/// The owner performs each phase synchronously while it holds the generation,
+/// service, policy, and poison guards. The caller emits this record only after
+/// those guards have been released, preserving the phase order without adding
+/// a queue or another state owner. Every emitted record carries the cutover's
+/// own validated operation identity, so concurrent cutovers correlate by
+/// identity as well as by order (W7).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PersistAndPublishObservations {
+    cutover_staged: bool,
+    cutover_committed: bool,
+    handshake_policy: Option<HandshakePolicyObservation>,
+    cutover_applied: bool,
+}
+
+pub(crate) struct PersistAndPublishResult {
+    pub(crate) result: Result<(), String>,
+    pub(crate) observations: PersistAndPublishObservations,
+}
+
+impl PersistAndPublishObservations {
+    pub(crate) fn emit(self, succeeded: bool, cutover_id: &str) {
+        observe_recovery_cutover("kernel.recovery.persist_requested", "attempt", cutover_id);
+        if self.cutover_staged {
+            observe_recovery_cutover("kernel.recovery.cutover_staged", "success", cutover_id);
+        }
+        if self.cutover_committed {
+            observe_recovery_cutover("kernel.recovery.cutover_committed", "success", cutover_id);
+        }
+        if let Some(observation) = self.handshake_policy {
+            observation.emit_for_cutover(cutover_id);
+        }
+        if self.cutover_applied {
+            observe_recovery_cutover("kernel.recovery.cutover_applied", "success", cutover_id);
+        }
+        if succeeded {
+            observe_recovery_cutover("kernel.recovery.persist_completed", "success", cutover_id);
+        } else {
+            observe_recovery_cutover("kernel.recovery.persist_failed", "rejected", cutover_id);
+        }
+    }
+}
+
 pub(crate) struct OrsGenerationCoordinator {
     pub(crate) ors: Arc<RedbRecoveryStore>,
     /// Committed I14.14 route ownership rebuilt during startup recovery.
@@ -202,15 +302,19 @@ impl OrsGenerationCoordinator {
         generations: &mut GenerationRouter,
         service: &mut KernelService,
         policy: &mut ServerHandshakePolicy,
-    ) -> Result<(), String> {
-        observe_recovery("kernel.recovery.persist_requested", "attempt");
-        let outcome = self.persist_and_publish_inner(decision, generations, service, policy);
-        if outcome.is_ok() {
-            observe_recovery("kernel.recovery.persist_completed", "success");
-        } else {
-            observe_recovery("kernel.recovery.persist_failed", "rejected");
+    ) -> PersistAndPublishResult {
+        let mut observations = PersistAndPublishObservations::default();
+        let result = self.persist_and_publish_inner(
+            decision,
+            generations,
+            service,
+            policy,
+            &mut observations,
+        );
+        PersistAndPublishResult {
+            result,
+            observations,
         }
-        outcome
     }
 
     fn persist_and_publish_inner(
@@ -219,6 +323,7 @@ impl OrsGenerationCoordinator {
         generations: &mut GenerationRouter,
         service: &mut KernelService,
         policy: &mut ServerHandshakePolicy,
+        observations: &mut PersistAndPublishObservations,
     ) -> Result<(), String> {
         let mut candidate = generations.clone();
         candidate
@@ -240,7 +345,7 @@ impl OrsGenerationCoordinator {
         self.ors
             .stage_generation_cutover(staged.clone())
             .map_err(|error| error.to_string())?;
-        observe_recovery("kernel.recovery.cutover_staged", "success");
+        observations.cutover_staged = true;
         let committed = self
             .ors
             .commit_generation_cutover_state(staged)
@@ -248,7 +353,7 @@ impl OrsGenerationCoordinator {
         if committed.record().state != GenerationCutoverState::Committed {
             return Err("ORS did not return a committed cutover".to_owned());
         }
-        observe_recovery("kernel.recovery.cutover_committed", "success");
+        observations.cutover_committed = true;
         // Same exact-tuple bridge as `recover`: the durable record projected the
         // canonical decision sequence; the service is then synchronized on the
         // complete tuple, which fails closed on a cross-lineage target or a
@@ -257,9 +362,11 @@ impl OrsGenerationCoordinator {
         service
             .synchronize_authority_epoch(decision_canonical)
             .map_err(|error| error.to_string())?;
-        update_handshake_policy(policy, &candidate)?;
+        observations.handshake_policy = Some(update_handshake_policy_without_observation(
+            policy, &candidate,
+        )?);
         *generations = candidate;
-        observe_recovery("kernel.recovery.cutover_applied", "success");
+        observations.cutover_applied = true;
         Ok(())
     }
 }
@@ -296,6 +403,15 @@ pub(crate) fn update_handshake_policy(
     policy: &mut ServerHandshakePolicy,
     generations: &GenerationRouter,
 ) -> Result<(), String> {
+    let observation = update_handshake_policy_without_observation(policy, generations)?;
+    observation.emit();
+    Ok(())
+}
+
+fn update_handshake_policy_without_observation(
+    policy: &mut ServerHandshakePolicy,
+    generations: &GenerationRouter,
+) -> Result<HandshakePolicyObservation, String> {
     let daemon = RouteScope::new("daemon").map_err(|error| error.to_string())?;
     if let Ok(route) = generations.route(&daemon) {
         let artifact_digest = policy.config_snapshot.get("artifact_digest").cloned();
@@ -342,11 +458,10 @@ pub(crate) fn update_handshake_policy(
         if let Some(protected_snapshot_digest) = protected_snapshot_digest {
             policy.config_snapshot["protected_snapshot_digest"] = protected_snapshot_digest;
         }
-        observe_recovery("kernel.recovery.handshake_projected", "success");
+        Ok(HandshakePolicyObservation::Projected)
     } else {
-        observe_recovery("kernel.recovery.handshake_absent", "absent");
+        Ok(HandshakePolicyObservation::Absent)
     }
-    Ok(())
 }
 
 #[cfg(test)]

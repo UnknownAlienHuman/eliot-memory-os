@@ -153,6 +153,13 @@ pub struct RetentionPolicy {
 }
 
 /// Durable home interpreting one family's retention rule.
+///
+/// The six variants are the six I16.9 retention classes that this crate's
+/// families actually need. The four log/metric/audit/BlobStore classes map
+/// onto the sinks `eliot-observability-runtime` owns; the two evidence
+/// classes are the I16.9 classes that those four cannot express, because
+/// their lifecycle is governed by an incident and by provider policy rather
+/// than by a rolling or bounded buffer.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RetentionStore {
@@ -160,6 +167,12 @@ pub enum RetentionStore {
     MetricBuffer,
     AuditCanonical,
     BlobStore,
+    /// Security/incident evidence: retained under an explicit incident
+    /// retention/erasure decision, never by a rolling window.
+    SecurityIncidentEvidence,
+    /// Model provider receipts: retained under the provider privacy/cost
+    /// policy, never by a rolling window.
+    ModelProviderReceipt,
 }
 
 impl RetentionStore {
@@ -170,6 +183,8 @@ impl RetentionStore {
             Self::MetricBuffer => "metric_buffer",
             Self::AuditCanonical => "audit_canonical",
             Self::BlobStore => "blob_store",
+            Self::SecurityIncidentEvidence => "security_incident_evidence",
+            Self::ModelProviderReceipt => "model_provider_receipt",
         }
     }
 }
@@ -634,6 +649,22 @@ fn base_retention(
     }
 }
 
+/// Real rolling-operational-log retention bound (I16.9 `operational logs:
+/// rolling policy`).
+///
+/// This is the mechanism the runtime actually runs, not a restatement of it:
+/// `eliot-observability-runtime` rotates at
+/// `max_bytes_per_generation` and retains `max_generations` generations, each
+/// capacity independently bounded (64 MiB and 64 generations, see
+/// `RollingLogPolicy`). Rotation drops the oldest generation, so a record's
+/// lifetime is a byte window, never a record count.
+const ROLLING_LOG_BOUND: &str =
+    "rolling generations of bounded bytes; oldest generation dropped on rotation";
+
+/// Erasure rule shared by every rolling-log family.
+const ROLLING_LOG_ERASURE: &str =
+    "drop oldest generation on rotation; purge generations on operator erasure request";
+
 fn query_metadata_policy() -> TelemetryFieldPolicy {
     TelemetryFieldPolicy {
         family: TelemetryFieldFamily::QueryMetadata,
@@ -657,8 +688,8 @@ fn query_metadata_policy() -> TelemetryFieldPolicy {
             "Handles disclose presence and identity only; raw text stays in BlobStore.".to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance",
-            "drop oldest on bound; purge on operator erasure request",
+            ROLLING_LOG_BOUND,
+            ROLLING_LOG_ERASURE,
             "redacted handles only; raw text export requires explicit incident grant",
         ),
         downstream_use: "Trace correlation and diagnostic briefs.".to_owned(),
@@ -691,7 +722,7 @@ fn principal_policy() -> TelemetryFieldPolicy {
             .to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance",
+            ROLLING_LOG_BOUND,
             "drop oldest on bound; purge on session close plus erasure request",
             "opaque references only; no principal export",
         ),
@@ -721,7 +752,7 @@ fn session_policy() -> TelemetryFieldPolicy {
         disclosure_closure: "Opaque references disclose no session secret.".to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance",
+            ROLLING_LOG_BOUND,
             "drop oldest on bound; purge on session close plus erasure request",
             "opaque references only; no session export",
         ),
@@ -753,7 +784,7 @@ fn task_id_policy() -> TelemetryFieldPolicy {
         disclosure_closure: "Task identifiers disclose no content or principal.".to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance",
+            ROLLING_LOG_BOUND,
             "drop oldest on bound; purge on task close plus window",
             "identifiers may export with redacted event extracts",
         ),
@@ -785,7 +816,7 @@ fn trace_id_policy() -> TelemetryFieldPolicy {
         disclosure_closure: "Trace identifiers disclose no content or principal.".to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance",
+            ROLLING_LOG_BOUND,
             "drop oldest on bound; purge with the owning event window",
             "identifiers may export with redacted event extracts",
         ),
@@ -818,8 +849,8 @@ fn route_fingerprint_policy() -> TelemetryFieldPolicy {
         disclosure_closure: "Fingerprints disclose no route arguments or topology.".to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance",
-            "drop oldest on bound; purge with the owning event window",
+            ROLLING_LOG_BOUND,
+            "drop oldest generation on rotation; purge with the owning event window",
             "fingerprints may export with redacted event extracts",
         ),
         downstream_use: "Route-mismatch detection and dispatch dashboards.".to_owned(),
@@ -846,7 +877,7 @@ fn lease_policy() -> TelemetryFieldPolicy {
         disclosure_closure: "Lease references disclose no holder material.".to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance",
+            ROLLING_LOG_BOUND,
             "drop oldest on bound; purge on lease release plus window",
             "lease references may export with redacted event extracts",
         ),
@@ -904,7 +935,7 @@ fn operational_log_policy() -> TelemetryFieldPolicy {
             .to_owned(),
         retention: base_retention(
             RetentionStore::RollingLog,
-            "rolling 10_000 events per instance with explicit gap records",
+            ROLLING_LOG_BOUND,
             "drop oldest on bound; purge on operator erasure request",
             "scrubbed extracts only; raw re-export is forbidden",
         ),
@@ -928,9 +959,9 @@ fn crash_report_policy() -> TelemetryFieldPolicy {
         disclosure_closure: "Crash class is public to supervision; dumps require incident grant."
             .to_owned(),
         retention: base_retention(
-            RetentionStore::BlobStore,
-            "bounded 256 MiB per instance; 30 day ceiling",
-            "delete blobs past ceiling; erase on incident close plus request",
+            RetentionStore::SecurityIncidentEvidence,
+            "explicit incident retention/erasure decision; never a rolling window",
+            "erase on incident close; retention only under an open incident record",
             "incident-scoped grant with audit receipt; no bulk export",
         ),
         downstream_use: "Incident analysis and restart accounting.".to_owned(),
@@ -1034,4 +1065,87 @@ pub fn policy_for(family: TelemetryFieldFamily) -> Option<TelemetryFieldPolicy> 
 #[must_use]
 pub fn retention_for(family: TelemetryFieldFamily) -> Option<RetentionPolicy> {
     policy_for(family).map(|policy| policy.retention)
+}
+
+/// One exact, bounded operational-log window handed to an agent (I16.7).
+///
+/// I16.7 requires that an agent receive an exact `LogWindowRef` — never an
+/// unbounded log dump — naming the source/process generation, the time and
+/// sequence range, a content hash, the redaction status, and the retention
+/// rule. The redaction status reuses [`RedactionReason`] and the retention
+/// rule reuses [`RetentionPolicy`], so a window and the field policy that
+/// governs its records cannot disagree about either.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogWindowRef {
+    /// Source that produced the window (for example a rolling-log surface).
+    pub source_ref: String,
+    /// Process generation the window was read from.
+    pub process_generation: String,
+    /// First record in the window.
+    pub first_sequence: u64,
+    /// Last record in the window, inclusive.
+    pub last_sequence: u64,
+    /// Lower bound of the window's known time, in Unix milliseconds.
+    pub first_known_time_ms: i64,
+    /// Upper bound of the window's known time, in Unix milliseconds.
+    pub last_known_time_ms: i64,
+    /// SHA-256 of the exact window bytes, in lowercase hex.
+    pub content_hash: String,
+    /// Why the window's records were redacted, from [`RedactionReason`].
+    pub redaction_status: String,
+    /// Retention rule governing this window, from the family policy.
+    pub retention: RetentionPolicy,
+}
+
+impl LogWindowRef {
+    /// Validates that the window is exact, ordered, hashed, redacted and
+    /// retained, so a diagnostic brief can join it without opening a dump.
+    pub fn validate(&self) -> Result<(), ObservabilityError> {
+        policy_text(&self.source_ref, "log_window.source_ref")?;
+        policy_text(&self.process_generation, "log_window.process_generation")?;
+        if self.last_sequence < self.first_sequence {
+            return Err(ObservabilityError::InvalidField {
+                field: "log_window.sequence",
+                reason: "sequence range is reversed",
+            });
+        }
+        if self.last_known_time_ms < self.first_known_time_ms {
+            return Err(ObservabilityError::InvalidField {
+                field: "log_window.known_time",
+                reason: "known time range is reversed",
+            });
+        }
+        if self.content_hash.len() != 64
+            || !self
+                .content_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ObservabilityError::InvalidField {
+                field: "log_window.content_hash",
+                reason: "must be 64 lowercase hex characters",
+            });
+        }
+        if !redaction_status_valid(&self.redaction_status) {
+            return Err(ObservabilityError::InvalidField {
+                field: "log_window.redaction_status",
+                reason: "must be a recorded redaction status",
+            });
+        }
+        self.retention.validate()
+    }
+
+    /// Returns the stable identity of this window, derived from its exact
+    /// content hash and its bound ranges.
+    #[must_use]
+    pub fn window_id(&self) -> String {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(self.content_hash.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(self.source_ref.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(self.process_generation.as_bytes());
+        format!("log-window:{}", sha256_hex(&bytes))
+    }
 }

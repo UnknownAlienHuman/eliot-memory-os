@@ -7,9 +7,12 @@ use thiserror::Error;
 
 use crate::{
     ClosureCompleteness, DeclassificationReceipt, DisclosureDecision, DisclosureDecisionKind,
-    DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, ObservationDomainRef,
-    PurgeLedgerEntry, PurgeState, SelectionIntegrityReceipt, SourceAssurance,
-    TransformationLineage,
+    DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState,
+    LegacySelectionIntegrityReceiptV1, MAX_SELECTION_MEMBERS, MAX_SELECTION_STAGES,
+    ObservationDomainRef, PurgeLedgerEntry, PurgeState, SELECTION_INTEGRITY_SCHEMA,
+    SelectionInfluenceState, SelectionIntegrityReceipt, SelectionMember,
+    SelectionMemberDisposition, SelectionMemberDispositionKind, SelectionStage, SelectionStageLink,
+    SourceAssurance, TransformationLineage,
 };
 
 /// Validation failure that never carries protected payload content.
@@ -41,6 +44,73 @@ pub enum SecurityContractError {
     PurgeResurrection,
     #[error("selection integrity lineage is invalid")]
     SelectionIntegrityViolation,
+    #[error("selection integrity schema or contract version is unsupported")]
+    SelectionSchemaUnsupported,
+    #[error("selection chain declares {count} stages, above the bound {bound}")]
+    SelectionStageLimitExceeded { count: usize, bound: usize },
+    #[error("selection {field} declares {count} members, above the bound {bound}")]
+    SelectionMemberLimitExceeded {
+        field: &'static str,
+        count: usize,
+        bound: usize,
+    },
+    #[error(
+        "selection stage {stage_id} is at ordinal {ordinal}, outside the contiguous chain order"
+    )]
+    SelectionStageOrder { stage_id: String, ordinal: usize },
+    #[error("selection stage {stage_id} at ordinal {ordinal} conflicts with an earlier stage")]
+    SelectionStageConflict { stage_id: String, ordinal: usize },
+    #[error(
+        "selection stage {stage_id} at ordinal {ordinal} does not continue its declared input link"
+    )]
+    SelectionStageLinkBroken { stage_id: String, ordinal: usize },
+    #[error(
+        "selection stage {stage_id} at ordinal {ordinal} does not bind its {digest} membership"
+    )]
+    SelectionStageMembershipDigest {
+        stage_id: String,
+        ordinal: usize,
+        digest: &'static str,
+    },
+    #[error("selection initial candidate membership does not bind its {field} digest")]
+    SelectionInitialMembershipDigest { field: &'static str },
+    #[error(
+        "selection stage {stage_id} at ordinal {ordinal} introduces member {member_ref} without admitted source evidence"
+    )]
+    SelectionMemberFabricated {
+        stage_id: String,
+        ordinal: usize,
+        member_ref: String,
+    },
+    #[error(
+        "selection stage {stage_id} at ordinal {ordinal} drops member {member_ref} without a disposition"
+    )]
+    SelectionMemberLoss {
+        stage_id: String,
+        ordinal: usize,
+        member_ref: String,
+    },
+    #[error(
+        "selection stage {stage_id} at ordinal {ordinal} records a disposition that contradicts the membership of {member_ref}"
+    )]
+    SelectionMemberDisposition {
+        stage_id: String,
+        ordinal: usize,
+        member_ref: String,
+    },
+    #[error(
+        "selection chain claims {claimed:?} untrusted influence while a stage records {observed:?}"
+    )]
+    SelectionInfluenceUnderstated {
+        claimed: SelectionInfluenceState,
+        observed: SelectionInfluenceState,
+    },
+    #[error(
+        "legacy selection member {member_ref} has no owner-supplied revision and representation binding"
+    )]
+    SelectionLegacyMemberUnbound { member_ref: String },
+    #[error("legacy selection stage at ordinal {ordinal} is not attributable to its input members")]
+    SelectionLegacyStageUnattributable { ordinal: usize },
     #[error("canonical security contract serialization failed: {0}")]
     Serialization(String),
 }
@@ -330,21 +400,326 @@ impl PurgeLedgerEntry {
     }
 }
 
+/// Computes the canonical digest of one selection membership collection.
+///
+/// The digest binds member identity, revision and representation in declared
+/// order, so it proves the exact ordered membership a stage consumed or
+/// produced. A display label, a count or an order-insensitive set digest is not
+/// a substitute for it (#1728 step 2).
+///
+/// # Errors
+///
+/// Returns an error when the membership cannot be serialized canonically.
+pub fn selection_member_digest(
+    members: &[SelectionMember],
+) -> Result<String, SecurityContractError> {
+    canonical_json_bytes(&members)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| SecurityContractError::Serialization(error.to_string()))
+}
+
+fn member_refs(members: &[SelectionMember]) -> BTreeSet<&str> {
+    members
+        .iter()
+        .map(|member| member.member_ref.as_str())
+        .collect()
+}
+
+fn validate_members(
+    members: &[SelectionMember],
+    field: &'static str,
+) -> Result<(), SecurityContractError> {
+    if members.len() > MAX_SELECTION_MEMBERS {
+        return Err(SecurityContractError::SelectionMemberLimitExceeded {
+            field,
+            count: members.len(),
+            bound: MAX_SELECTION_MEMBERS,
+        });
+    }
+    unique(members.iter().map(|member| &member.member_ref), field)?;
+    for member in members {
+        text(&member.member_ref, "selection.member.member_ref")?;
+        text(&member.member_revision, "selection.member.member_revision")?;
+        text(
+            &member.representation_ref,
+            "selection.member.representation_ref",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_disposition(
+    stage: &SelectionStage,
+    ordinal: usize,
+    disposition: &SelectionMemberDisposition,
+) -> Result<(), SecurityContractError> {
+    text(
+        &disposition.member_ref,
+        "selection.member_disposition.member_ref",
+    )?;
+    if let Some(reason) = &disposition.reason {
+        text(reason, "selection.member_disposition.reason")?;
+    }
+    if let Some(derived) = &disposition.derived_output_ref {
+        text(derived, "selection.member_disposition.derived_output_ref")?;
+    }
+    if let Some(evidence) = &disposition.source_evidence_ref {
+        text(evidence, "selection.member_disposition.source_evidence_ref")?;
+    }
+    let conflict = || SecurityContractError::SelectionMemberDisposition {
+        stage_id: stage.stage_id.clone(),
+        ordinal,
+        member_ref: disposition.member_ref.clone(),
+    };
+    let derived_is_output = disposition
+        .derived_output_ref
+        .as_deref()
+        .is_some_and(|derived| {
+            stage
+                .output_members
+                .iter()
+                .any(|member| member.member_ref == derived)
+        });
+    let coherent = match disposition.disposition {
+        SelectionMemberDispositionKind::Retained => {
+            disposition.reason.is_none()
+                && disposition.derived_output_ref.is_none()
+                && disposition.source_evidence_ref.is_none()
+        }
+        SelectionMemberDispositionKind::Removed => {
+            disposition.reason.is_some()
+                && disposition.derived_output_ref.is_none()
+                && disposition.source_evidence_ref.is_none()
+        }
+        SelectionMemberDispositionKind::Derived => {
+            disposition.derived_output_ref.is_some()
+                && derived_is_output
+                && disposition.source_evidence_ref.is_none()
+        }
+        SelectionMemberDispositionKind::Admitted => {
+            disposition.source_evidence_ref.is_some()
+                && disposition.derived_output_ref.is_none()
+                && disposition.reason.is_none()
+        }
+    };
+    if coherent { Ok(()) } else { Err(conflict()) }
+}
+
+/// Validates one stage's declared input link against the earlier stages.
+///
+/// Ordinal zero starts from the declared initial set. Every later ordinal either
+/// names the immediately preceding stage and reproduces its complete output
+/// membership, or names a join over the complete output memberships of two or
+/// more earlier stages.
+fn validate_stage_link(
+    receipt: &SelectionIntegrityReceipt,
+    stage: &SelectionStage,
+    ordinal: usize,
+) -> Result<(), SecurityContractError> {
+    let broken = || SecurityContractError::SelectionStageLinkBroken {
+        stage_id: stage.stage_id.clone(),
+        ordinal,
+    };
+    let input = member_refs(&stage.input_members);
+    let Some(link) = &stage.input_link else {
+        return if ordinal == 0 && stage.input_members == receipt.initial_candidate_members {
+            Ok(())
+        } else {
+            Err(broken())
+        };
+    };
+    if ordinal == 0 {
+        return Err(broken());
+    }
+    match link {
+        SelectionStageLink::FromPredecessor {
+            predecessor_stage_id,
+        } => {
+            let Some(predecessor) = receipt.transformation_stages.get(ordinal - 1) else {
+                return Err(broken());
+            };
+            if predecessor.stage_id != *predecessor_stage_id
+                || stage.input_members != predecessor.output_members
+            {
+                return Err(broken());
+            }
+            Ok(())
+        }
+        SelectionStageLink::FromJoin { parent_stage_ids } => {
+            if parent_stage_ids.len() < 2
+                || unique(parent_stage_ids.iter(), "parent_stage_ids").is_err()
+            {
+                return Err(broken());
+            }
+            let mut covered = BTreeSet::new();
+            for parent_stage_id in parent_stage_ids {
+                let Some(parent) = receipt
+                    .transformation_stages
+                    .iter()
+                    .find(|candidate| candidate.stage_id == *parent_stage_id)
+                else {
+                    return Err(broken());
+                };
+                if parent.ordinal >= ordinal {
+                    return Err(broken());
+                }
+                covered.extend(member_refs(&parent.output_members));
+            }
+            if covered == input {
+                Ok(())
+            } else {
+                Err(broken())
+            }
+        }
+    }
+}
+
+/// Validates one disposition row against the stage membership it accounts for.
+fn validate_disposition_placement(
+    stage: &SelectionStage,
+    ordinal: usize,
+    disposition: &SelectionMemberDisposition,
+    input: &BTreeSet<&str>,
+    output: &BTreeSet<&str>,
+) -> Result<(), SecurityContractError> {
+    let member_ref = disposition.member_ref.as_str();
+    let contradiction = || SecurityContractError::SelectionMemberDisposition {
+        stage_id: stage.stage_id.clone(),
+        ordinal,
+        member_ref: disposition.member_ref.clone(),
+    };
+    if input.contains(member_ref) {
+        let reaches_output = output.contains(member_ref);
+        return match (disposition.disposition, reaches_output) {
+            (SelectionMemberDispositionKind::Retained, true)
+            | (
+                SelectionMemberDispositionKind::Removed | SelectionMemberDispositionKind::Derived,
+                false,
+            ) => Ok(()),
+            _ => Err(contradiction()),
+        };
+    }
+    if output.contains(member_ref)
+        && disposition.disposition == SelectionMemberDispositionKind::Admitted
+    {
+        Ok(())
+    } else {
+        Err(contradiction())
+    }
+}
+
+/// Validates one stage's membership accounting: exact digests, a disposition
+/// for every input member, admitted source evidence for every newly introduced
+/// output member, and no unexplained loss.
+fn validate_stage_membership(
+    stage: &SelectionStage,
+    ordinal: usize,
+) -> Result<(), SecurityContractError> {
+    for (members, declared, digest) in [
+        (&stage.input_members, &stage.input_digest, "input_digest"),
+        (&stage.output_members, &stage.output_digest, "output_digest"),
+    ] {
+        if declared != &selection_member_digest(members)? {
+            return Err(SecurityContractError::SelectionStageMembershipDigest {
+                stage_id: stage.stage_id.clone(),
+                ordinal,
+                digest,
+            });
+        }
+    }
+    if stage.member_dispositions.len() > MAX_SELECTION_MEMBERS {
+        return Err(SecurityContractError::SelectionMemberLimitExceeded {
+            field: "stage.member_dispositions",
+            count: stage.member_dispositions.len(),
+            bound: MAX_SELECTION_MEMBERS,
+        });
+    }
+    let input = member_refs(&stage.input_members);
+    let output = member_refs(&stage.output_members);
+    let mut accounted = BTreeSet::new();
+    let mut introduced = BTreeSet::new();
+    for disposition in &stage.member_dispositions {
+        validate_disposition(stage, ordinal, disposition)?;
+        if !accounted.insert(disposition.member_ref.as_str()) {
+            return Err(SecurityContractError::DuplicateReference {
+                field: "stage.member_dispositions",
+            });
+        }
+        if let Some(derived) = &disposition.derived_output_ref {
+            introduced.insert(derived.as_str());
+        }
+        if disposition.disposition == SelectionMemberDispositionKind::Admitted {
+            introduced.insert(disposition.member_ref.as_str());
+        }
+        validate_disposition_placement(stage, ordinal, disposition, &input, &output)?;
+    }
+    for member in &stage.input_members {
+        if !accounted.contains(member.member_ref.as_str()) {
+            return Err(SecurityContractError::SelectionMemberLoss {
+                stage_id: stage.stage_id.clone(),
+                ordinal,
+                member_ref: member.member_ref.clone(),
+            });
+        }
+    }
+    for member in &stage.output_members {
+        let member_ref = member.member_ref.as_str();
+        if !input.contains(member_ref) && !introduced.contains(member_ref) {
+            return Err(SecurityContractError::SelectionMemberFabricated {
+                stage_id: stage.stage_id.clone(),
+                ordinal,
+                member_ref: member.member_ref.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl SelectionIntegrityReceipt {
-    /// Validates candidate membership and every declared transformation stage.
+    /// Validates candidate membership and stage-to-stage continuity of the
+    /// declared transformation chain.
+    ///
+    /// Structural validation accepts a well-formed record of known or unknown
+    /// untrusted influence so the history can be audited; it never discards a
+    /// history because the recorded outcome is unsafe. Whether the recorded
+    /// membership may be relied on is a separate selection, disclosure and
+    /// admission decision.
     ///
     /// # Errors
     ///
-    /// Returns an error when candidate membership, stage fencing, or selection
-    /// lineage is invalid.
+    /// Returns a typed error naming the exact stage ordinal, stage identity or
+    /// member that failed.
     pub fn validate(&self) -> Result<(), SecurityContractError> {
+        self.validate_header()?;
+        self.validate_stages()?;
+        self.validate_outcome()
+    }
+
+    /// Validates the chain identity, the immutable initial membership and the
+    /// candidate-level admission partition.
+    fn validate_header(&self) -> Result<(), SecurityContractError> {
+        if self.schema != SELECTION_INTEGRITY_SCHEMA
+            || self.contract_version != crate::CONTRACT_VERSION
+        {
+            return Err(SecurityContractError::SelectionSchemaUnsupported);
+        }
         text(&self.selection_id, "selection_id")?;
-        if self.initial_candidate_refs.is_empty() {
+        text(&self.root_context_ref, "root_context_ref")?;
+        text(&self.recipe_revision, "recipe_revision")?;
+        fence(&self.state_fence, "selection.state_fence")?;
+        if self.initial_candidate_members.is_empty() {
             return Err(SecurityContractError::EmptyCollection {
-                field: "initial_candidate_refs",
+                field: "initial_candidate_members",
             });
         }
-        unique(self.initial_candidate_refs.iter(), "initial_candidate_refs")?;
+        validate_members(&self.initial_candidate_members, "initial_candidate_members")?;
+        if self.initial_candidate_digest
+            != selection_member_digest(&self.initial_candidate_members)?
+        {
+            return Err(SecurityContractError::SelectionInitialMembershipDigest {
+                field: "initial_candidate_digest",
+            });
+        }
         unique(
             self.admitted_candidate_refs.iter(),
             "admitted_candidate_refs",
@@ -354,7 +729,6 @@ impl SelectionIntegrityReceipt {
             "rejected_candidate_refs",
         )?;
         unique(self.final_output_refs.iter(), "final_output_refs")?;
-        fence(&self.state_fence, "selection.state_fence")?;
         if self
             .admitted_candidate_refs
             .iter()
@@ -362,45 +736,337 @@ impl SelectionIntegrityReceipt {
         {
             return Err(SecurityContractError::SelectionIntegrityViolation);
         }
-        if self.initial_candidate_refs.iter().any(|item| {
-            !self.admitted_candidate_refs.contains(item)
-                && !self.rejected_candidate_refs.contains(item)
+        let initial = member_refs(&self.initial_candidate_members);
+        if initial.iter().any(|item| {
+            !self.admitted_candidate_refs.contains(&(*item).to_owned())
+                && !self.rejected_candidate_refs.contains(&(*item).to_owned())
         }) {
-            return Err(SecurityContractError::SelectionIntegrityViolation);
-        }
-        for stage in &self.transformation_stages {
-            if stage.input_refs.is_empty()
-                || stage.output_refs.is_empty()
-                || stage.disclosure_closure_ref.trim().is_empty()
-            {
-                return Err(SecurityContractError::SelectionIntegrityViolation);
-            }
-            fence(&stage.state_fence, "selection.stage.state_fence")?;
-            if stage.state_fence != self.state_fence {
-                return Err(SecurityContractError::FenceMismatch);
-            }
-            if stage
-                .input_refs
-                .iter()
-                .any(|item| !self.admitted_candidate_refs.contains(item))
-            {
-                return Err(SecurityContractError::SelectionIntegrityViolation);
-            }
-        }
-        if self.final_output_refs.iter().any(|item| {
-            !self.admitted_candidate_refs.contains(item)
-                && !self
-                    .transformation_stages
-                    .iter()
-                    .any(|stage| stage.output_refs.contains(item))
-        }) {
-            return Err(SecurityContractError::SelectionIntegrityViolation);
-        }
-        if self.untrusted_structure_changed_membership {
             return Err(SecurityContractError::SelectionIntegrityViolation);
         }
         Ok(())
     }
+
+    /// Validates the bounded, contiguously ordered stage chain and every stage
+    /// against the initial set and its declared predecessor.
+    fn validate_stages(&self) -> Result<(), SecurityContractError> {
+        if self.transformation_stages.is_empty() {
+            return Err(SecurityContractError::EmptyCollection {
+                field: "transformation_stages",
+            });
+        }
+        if self.transformation_stages.len() > MAX_SELECTION_STAGES {
+            return Err(SecurityContractError::SelectionStageLimitExceeded {
+                count: self.transformation_stages.len(),
+                bound: MAX_SELECTION_STAGES,
+            });
+        }
+        let mut seen_stage_ids = BTreeSet::new();
+        for (ordinal, stage) in self.transformation_stages.iter().enumerate() {
+            self.validate_stage_shape(stage, ordinal, &mut seen_stage_ids)?;
+            validate_members(&stage.input_members, "stage.input_members")?;
+            validate_members(&stage.output_members, "stage.output_members")?;
+            validate_stage_link(self, stage, ordinal)?;
+            validate_stage_membership(stage, ordinal)?;
+        }
+        Ok(())
+    }
+
+    /// Validates one stage's identity, order, transformer binding, evidence
+    /// references and fence before its membership is accounted for.
+    fn validate_stage_shape<'a>(
+        &self,
+        stage: &'a SelectionStage,
+        ordinal: usize,
+        seen_stage_ids: &mut BTreeSet<&'a str>,
+    ) -> Result<(), SecurityContractError> {
+        text(&stage.stage_id, "stage.stage_id")?;
+        if stage.ordinal != ordinal {
+            return Err(SecurityContractError::SelectionStageOrder {
+                stage_id: stage.stage_id.clone(),
+                ordinal,
+            });
+        }
+        if !seen_stage_ids.insert(stage.stage_id.as_str()) {
+            return Err(SecurityContractError::SelectionStageConflict {
+                stage_id: stage.stage_id.clone(),
+                ordinal,
+            });
+        }
+        text(
+            &stage.transformer_identity_and_config_revision,
+            "stage.transformer_identity_and_config_revision",
+        )?;
+        text(
+            &stage.disclosure_closure_ref,
+            "stage.disclosure_closure_ref",
+        )?;
+        for (refs, field) in [
+            (
+                &stage.suppressed_counterevidence_refs,
+                "stage.suppressed_counterevidence_refs",
+            ),
+            (
+                &stage.budget_or_policy_omission_refs,
+                "stage.budget_or_policy_omission_refs",
+            ),
+            (
+                &stage.influence_evidence_refs,
+                "stage.influence_evidence_refs",
+            ),
+        ] {
+            unique(refs.iter(), field)?;
+            for reference in refs {
+                text(reference, "stage.evidence_ref")?;
+            }
+        }
+        fence(&stage.state_fence, "selection.stage.state_fence")?;
+        if stage.state_fence != self.state_fence {
+            return Err(SecurityContractError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validates the final membership backing and the chain influence ceiling.
+    fn validate_outcome(&self) -> Result<(), SecurityContractError> {
+        if self.final_output_refs.iter().any(|item| {
+            !self.admitted_candidate_refs.contains(item)
+                && !self.transformation_stages.iter().any(|stage| {
+                    stage
+                        .output_members
+                        .iter()
+                        .any(|member| &member.member_ref == item)
+                })
+        }) {
+            return Err(SecurityContractError::SelectionIntegrityViolation);
+        }
+        let observed = self
+            .transformation_stages
+            .iter()
+            .map(|stage| stage.untrusted_input_influenced_membership)
+            .max();
+        if let Some(observed) = observed
+            && self.chain_untrusted_influence < observed
+        {
+            return Err(SecurityContractError::SelectionInfluenceUnderstated {
+                claimed: self.chain_untrusted_influence,
+                observed,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Reason recorded for a member the legacy v1 shape dropped without one.
+const LEGACY_V1_MISSING_REASON: &str = "legacy v1 recorded no disposition for this member";
+/// Reason recorded for a member legacy v1 listed as rejected.
+const LEGACY_V1_REJECTED_REASON: &str = "legacy v1 listed this member in rejected_candidate_refs";
+
+/// Builds the versioned stage that accounts for the v1 admission boundary.
+///
+/// v1 stated the admission outcome exactly as `initial_candidate_refs`,
+/// `admitted_candidate_refs` and `rejected_candidate_refs`, but recorded no
+/// stage for it and validated stage inputs against the admitted set instead of
+/// the initial set. Projecting that boundary as ordinal zero is the only way a
+/// v1 record can state where its chain starts; no member is invented.
+fn import_legacy_admission_stage_v1(
+    initial_candidate_members: &[SelectionMember],
+    admitted_candidate_refs: &[String],
+    state_fence: &StateFence,
+) -> Result<SelectionStage, SecurityContractError> {
+    let admitted = admitted_candidate_refs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let output_members = initial_candidate_members
+        .iter()
+        .filter(|member| admitted.contains(member.member_ref.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let member_dispositions = initial_candidate_members
+        .iter()
+        .map(|member| {
+            let admitted_here = admitted.contains(member.member_ref.as_str());
+            SelectionMemberDisposition {
+                member_ref: member.member_ref.clone(),
+                disposition: if admitted_here {
+                    SelectionMemberDispositionKind::Retained
+                } else {
+                    SelectionMemberDispositionKind::Removed
+                },
+                reason: (!admitted_here).then(|| LEGACY_V1_REJECTED_REASON.to_owned()),
+                derived_output_ref: None,
+                source_evidence_ref: None,
+            }
+        })
+        .collect();
+    Ok(SelectionStage {
+        stage_id: "legacy-v1-admission".to_owned(),
+        ordinal: 0,
+        input_link: None,
+        stage: crate::SelectionStageKind::Prune,
+        transformer_identity_and_config_revision: "unrecorded-in-legacy-v1".to_owned(),
+        input_digest: selection_member_digest(initial_candidate_members)?,
+        input_members: initial_candidate_members.to_vec(),
+        output_digest: selection_member_digest(&output_members)?,
+        output_members,
+        member_dispositions,
+        suppressed_counterevidence_refs: Vec::new(),
+        budget_or_policy_omission_refs: Vec::new(),
+        untrusted_input_influenced_membership: SelectionInfluenceState::Unknown,
+        influence_evidence_refs: Vec::new(),
+        disclosure_closure_ref: "unrecorded-in-legacy-v1".to_owned(),
+        state_fence: state_fence.clone(),
+    })
+}
+
+/// Projects one legacy v1 stage onto the versioned stage shape.
+///
+/// v1 recorded no relation for an output member it did not consume, so such a
+/// stage is refused rather than attributed to a member v1 never named.
+fn import_legacy_stage_v1(
+    legacy_stage: &crate::LegacySelectionStageV1,
+    legacy_index: usize,
+    predecessor_stage_id: &str,
+    bind: &dyn Fn(&str) -> Result<SelectionMember, SecurityContractError>,
+) -> Result<SelectionStage, SecurityContractError> {
+    let input_members = legacy_stage
+        .input_refs
+        .iter()
+        .map(|member_ref| bind(member_ref))
+        .collect::<Result<Vec<_>, _>>()?;
+    let output_members = legacy_stage
+        .output_refs
+        .iter()
+        .map(|member_ref| bind(member_ref))
+        .collect::<Result<Vec<_>, _>>()?;
+    let input = member_refs(&input_members);
+    if legacy_stage
+        .output_refs
+        .iter()
+        .any(|member_ref| !input.contains(member_ref.as_str()))
+    {
+        return Err(SecurityContractError::SelectionLegacyStageUnattributable {
+            ordinal: legacy_index,
+        });
+    }
+    let member_dispositions = input_members
+        .iter()
+        .map(|member| {
+            let reaches_output = output_members
+                .iter()
+                .any(|output| output.member_ref == member.member_ref);
+            SelectionMemberDisposition {
+                member_ref: member.member_ref.clone(),
+                disposition: if reaches_output {
+                    SelectionMemberDispositionKind::Retained
+                } else {
+                    SelectionMemberDispositionKind::Removed
+                },
+                reason: (!reaches_output).then(|| LEGACY_V1_MISSING_REASON.to_owned()),
+                derived_output_ref: None,
+                source_evidence_ref: None,
+            }
+        })
+        .collect();
+    Ok(SelectionStage {
+        stage_id: format!("legacy-v1-stage-{}", legacy_index + 1),
+        ordinal: legacy_index + 1,
+        input_link: Some(SelectionStageLink::FromPredecessor {
+            predecessor_stage_id: predecessor_stage_id.to_owned(),
+        }),
+        stage: legacy_stage.stage,
+        transformer_identity_and_config_revision: "unrecorded-in-legacy-v1".to_owned(),
+        input_digest: selection_member_digest(&input_members)?,
+        input_members,
+        output_digest: selection_member_digest(&output_members)?,
+        output_members,
+        member_dispositions,
+        suppressed_counterevidence_refs: Vec::new(),
+        budget_or_policy_omission_refs: Vec::new(),
+        untrusted_input_influenced_membership: SelectionInfluenceState::Unknown,
+        influence_evidence_refs: Vec::new(),
+        disclosure_closure_ref: legacy_stage.disclosure_closure_ref.clone(),
+        state_fence: legacy_stage.state_fence.clone(),
+    })
+}
+
+/// Imports one legacy v1 selection receipt as an explicitly unverified chain.
+///
+/// The migration is one-directional and loss-visible, exactly as
+/// [`crate::SELECTION_INTEGRITY_LEGACY_V1_DISPOSITION`] records. v1 recorded no
+/// stage identity, ordinal, membership digest, per-member disposition or
+/// stage-level influence, so every imported stage is
+/// [`SelectionInfluenceState::Unknown`]: a v1
+/// `untrusted_structure_changed_membership` of `false` never becomes
+/// [`SelectionInfluenceState::Absent`], and a v1 `true` is not attributed to any
+/// stage v1 never named, so the chain ceiling stays `Unknown` too.
+/// `bindings` supplies the member revision and representation that v1 did not
+/// record; an unbound member is refused rather than filled with a placeholder.
+/// A v1 stage that emitted a member it did not consume is refused as
+/// unattributable, because v1 recorded no relation for it.
+///
+/// The imported record is validated before it is returned, so this function can
+/// never manufacture a stage-continuous chain.
+///
+/// # Errors
+///
+/// Returns a typed error when a member lacks an owner-supplied binding, a
+/// legacy stage is not attributable to its input members, or the projected
+/// record fails [`SelectionIntegrityReceipt::validate`].
+pub fn import_legacy_selection_receipt_v1(
+    legacy: &LegacySelectionIntegrityReceiptV1,
+    bindings: &[SelectionMember],
+) -> Result<SelectionIntegrityReceipt, SecurityContractError> {
+    let bound = |member_ref: &str| -> Result<SelectionMember, SecurityContractError> {
+        bindings
+            .iter()
+            .find(|member| member.member_ref == member_ref)
+            .cloned()
+            .ok_or_else(|| SecurityContractError::SelectionLegacyMemberUnbound {
+                member_ref: member_ref.to_owned(),
+            })
+    };
+    let initial_candidate_members = legacy
+        .initial_candidate_refs
+        .iter()
+        .map(|member_ref| bound(member_ref))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut stages = vec![import_legacy_admission_stage_v1(
+        &initial_candidate_members,
+        &legacy.admitted_candidate_refs,
+        &legacy.state_fence,
+    )?];
+    for (index, legacy_stage) in legacy.transformation_stages.iter().enumerate() {
+        let predecessor_stage_id = if index == 0 {
+            "legacy-v1-admission".to_owned()
+        } else {
+            format!("legacy-v1-stage-{}", index - 1)
+        };
+        stages.push(import_legacy_stage_v1(
+            legacy_stage,
+            index,
+            &predecessor_stage_id,
+            &bound,
+        )?);
+    }
+    let receipt = SelectionIntegrityReceipt {
+        schema: SELECTION_INTEGRITY_SCHEMA.to_owned(),
+        contract_version: crate::CONTRACT_VERSION,
+        selection_id: legacy.selection_id.clone(),
+        root_context_ref: "unrecorded-in-legacy-v1".to_owned(),
+        recipe_revision: "unrecorded-in-legacy-v1".to_owned(),
+        initial_candidate_digest: selection_member_digest(&initial_candidate_members)?,
+        initial_candidate_members,
+        admitted_candidate_refs: legacy.admitted_candidate_refs.clone(),
+        rejected_candidate_refs: legacy.rejected_candidate_refs.clone(),
+        transformation_stages: stages,
+        final_output_refs: legacy.final_output_refs.clone(),
+        chain_untrusted_influence: SelectionInfluenceState::Unknown,
+        state_fence: legacy.state_fence.clone(),
+        revision: legacy.revision,
+    };
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 /// Validates one selection receipt and returns a digest suitable for lineage.

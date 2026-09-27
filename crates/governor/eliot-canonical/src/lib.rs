@@ -263,6 +263,13 @@ impl<'a> StoreRecoveryProjection<'a> {
                 RetrySameIdentityAfterBackoff,
                 RestoreStoreConnectivity,
             ),
+            StoreError::SnapshotClosePending { .. } => (
+                Unavailable,
+                "SNAPSHOT_CLOSE_PENDING",
+                NotAttempted,
+                RetrySameIdentityAfterBackoff,
+                RestoreStoreConnectivity,
+            ),
             StoreError::Serialization(_) => internal_defect_parts("SERIALIZATION_FAILURE"),
         };
         StoreRecoveryProjection {

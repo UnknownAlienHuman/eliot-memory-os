@@ -304,7 +304,11 @@ impl NormativePair {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceRecord {
-    /// Stable domain/field identity.
+    /// Stable domain/field identity. Candidate identity coverage uses the
+    /// `identity.active_generations_epochs`,
+    /// `identity.verifier_test_manifest_environment`, and
+    /// `identity.installation_receipts` keys; an unobserved dimension is an
+    /// explicit `UNKNOWN` record rather than an omitted field.
     pub key: String,
     /// Public observed value; secrets are out of scope for this surface.
     pub value: String,
@@ -313,6 +317,12 @@ pub struct EvidenceRecord {
     /// Evaluation status of the observation.
     pub evaluation: EvidenceEvaluation,
 }
+
+const PRODUCT_IDENTITY_COVERAGE_KEYS: [&str; 3] = [
+    "identity.active_generations_epochs",
+    "identity.verifier_test_manifest_environment",
+    "identity.installation_receipts",
+];
 
 /// Evaluation state of one current-system observation.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -339,6 +349,20 @@ pub struct CurrentSystemEvidenceSource {
     pub selected_source_head: String,
     /// Dirty-tree evidence artifact, if the source owner captured one.
     pub dirty_delta_artifact_ref: Option<String>,
+    /// Lockfile digest (`Cargo.lock`) observed at the capture root, if present.
+    pub lockfile_digest: Option<String>,
+    /// Toolchain digest (`rust-toolchain.toml`) observed at the capture root, if present.
+    pub toolchain_digest: Option<String>,
+    /// Generated-schema digest observed at the capture root, if present.
+    pub generated_schema_digest: Option<String>,
+    /// Binary/package digest observed at the capture root, if present.
+    pub binary_package_digest: Option<String>,
+    /// Workspace manifest digest (`Cargo.toml`) observed at the capture root, if present.
+    pub manifest_digest: Option<String>,
+    /// Config/policy digest (`config/`) observed at the capture root, if present.
+    pub config_policy_digest: Option<String>,
+    /// Credential-profile digest observed at the capture root, if present.
+    pub credential_profile_digest: Option<String>,
     /// External state root evidence.
     pub external_state_root: String,
     /// Exact source/runtime/data/integration observation records.
@@ -369,6 +393,20 @@ pub struct CurrentSystemEvidenceSnapshot {
     pub selected_source_head: String,
     /// Dirty-tree evidence artifact, if captured.
     pub dirty_delta_artifact_ref: Option<String>,
+    /// Lockfile digest (`Cargo.lock`) observed at the capture root, if present.
+    pub lockfile_digest: Option<String>,
+    /// Toolchain digest (`rust-toolchain.toml`) observed at the capture root, if present.
+    pub toolchain_digest: Option<String>,
+    /// Generated-schema digest observed at the capture root, if present.
+    pub generated_schema_digest: Option<String>,
+    /// Binary/package digest observed at the capture root, if present.
+    pub binary_package_digest: Option<String>,
+    /// Workspace manifest digest (`Cargo.toml`) observed at the capture root, if present.
+    pub manifest_digest: Option<String>,
+    /// Config/policy digest (`config/`) observed at the capture root, if present.
+    pub config_policy_digest: Option<String>,
+    /// Credential-profile digest observed at the capture root, if present.
+    pub credential_profile_digest: Option<String>,
     /// External state root evidence.
     pub external_state_root: String,
     /// Canonically ordered evidence records.
@@ -414,7 +452,21 @@ impl CurrentSystemEvidenceSnapshot {
             "snapshot".to_owned(),
             "external_state_root",
         )?;
+        for (digest, field) in [
+            (&self.lockfile_digest, "lockfile_digest"),
+            (&self.toolchain_digest, "toolchain_digest"),
+            (&self.generated_schema_digest, "generated_schema_digest"),
+            (&self.binary_package_digest, "binary_package_digest"),
+            (&self.manifest_digest, "manifest_digest"),
+            (&self.config_policy_digest, "config_policy_digest"),
+            (&self.credential_profile_digest, "credential_profile_digest"),
+        ] {
+            if let Some(value) = digest {
+                text(value, "snapshot".to_owned(), field)?;
+            }
+        }
         validate_records(&self.records, "snapshot")?;
+        validate_product_identity_coverage(&self.records, "snapshot")?;
         exact_strings(&self.unavailable_domains, "snapshot", "unavailable_domains")?;
         validate_conformance_coverage(&self.domain_coverage, "snapshot")?;
         validate_support_claim_set(&self.support_rows)
@@ -455,6 +507,38 @@ fn validate_records(records: &[EvidenceRecord], source: &str) -> Result<(), Boot
         }
     }
     Ok(())
+}
+
+fn ensure_product_identity_coverage(records: &mut Vec<EvidenceRecord>, source: &str) {
+    let evidence_ref = format!("bootstrap:unobserved-input:{source}");
+    for key in PRODUCT_IDENTITY_COVERAGE_KEYS {
+        if !records.iter().any(|record| record.key.as_str() == key) {
+            records.push(EvidenceRecord {
+                key: key.to_owned(),
+                value: "UNKNOWN".to_owned(),
+                evidence_ref: evidence_ref.clone(),
+                evaluation: EvidenceEvaluation::Unknown,
+            });
+        }
+    }
+}
+
+fn validate_product_identity_coverage(
+    records: &[EvidenceRecord],
+    source: &str,
+) -> Result<(), BootstrapCompileError> {
+    if PRODUCT_IDENTITY_COVERAGE_KEYS
+        .iter()
+        .all(|key| records.iter().any(|record| record.key.as_str() == *key))
+    {
+        return Ok(());
+    }
+
+    Err(BootstrapCompileError::InvalidExactArray {
+        source_id: source.to_owned(),
+        field: "records",
+        detail: "candidate identity is missing a generation, verifier, or installation coverage record",
+    })
 }
 
 fn conformance_error(source: &str, error: &ConformanceContractError) -> BootstrapCompileError {
@@ -552,19 +636,36 @@ impl CurrentSystemEvidenceCompiler {
         if let Some(reference) = &input.dirty_delta_artifact_ref {
             text(reference, source_id.clone(), "dirty_delta_artifact_ref")?;
         }
+        for (digest, field) in [
+            (&input.lockfile_digest, "lockfile_digest"),
+            (&input.toolchain_digest, "toolchain_digest"),
+            (&input.generated_schema_digest, "generated_schema_digest"),
+            (&input.binary_package_digest, "binary_package_digest"),
+            (&input.manifest_digest, "manifest_digest"),
+            (&input.config_policy_digest, "config_policy_digest"),
+            (
+                &input.credential_profile_digest,
+                "credential_profile_digest",
+            ),
+        ] {
+            if let Some(value) = digest {
+                text(value, source_id.clone(), field)?;
+            }
+        }
         exact_strings(
             &input.unavailable_domains,
             &source_id,
             "unavailable_domains",
         )?;
-        validate_records(&input.records, &source_id)?;
+        let mut records = input.records;
+        ensure_product_identity_coverage(&mut records, &format!("{source_id}@{revision}"));
+        validate_records(&records, &source_id)?;
         let domain_coverage = canonicalize_domain_coverage(input.domain_coverage)
             .map_err(|error| conformance_error(&source_id, &error))?;
         let support_rows = canonicalize_support_claim_set(input.support_rows, &domain_coverage)
             .map_err(|error| conformance_error(&source_id, &error))?;
         enforce_support_ceiling(&support_rows, &domain_coverage, &source_id)?;
 
-        let mut records = input.records;
         records.sort_by(|left, right| left.key.cmp(&right.key));
         let mut unavailable_domains = input.unavailable_domains;
         unavailable_domains.sort();
@@ -575,6 +676,13 @@ impl CurrentSystemEvidenceCompiler {
             selected_repository_root: input.selected_repository_root,
             selected_source_head: input.selected_source_head,
             dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
+            lockfile_digest: input.lockfile_digest,
+            toolchain_digest: input.toolchain_digest,
+            generated_schema_digest: input.generated_schema_digest,
+            binary_package_digest: input.binary_package_digest,
+            manifest_digest: input.manifest_digest,
+            config_policy_digest: input.config_policy_digest,
+            credential_profile_digest: input.credential_profile_digest,
             external_state_root: input.external_state_root,
             records,
             unavailable_domains,
@@ -624,6 +732,13 @@ impl CurrentSystemEvidenceCompiler {
                 selected_repository_root: input.selected_repository_root,
                 selected_source_head: input.selected_source_head,
                 dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
+                lockfile_digest: None,
+                toolchain_digest: None,
+                generated_schema_digest: None,
+                binary_package_digest: None,
+                manifest_digest: None,
+                config_policy_digest: None,
+                credential_profile_digest: None,
                 external_state_root: input.external_state_root,
                 records: input.records,
                 unavailable_domains: input.unavailable_domains,
@@ -1359,6 +1474,66 @@ pub enum DraftImportDisposition {
     Rejected,
 }
 
+/// Caller-attributed recovery finding carried by a candidate-only draft.
+///
+/// These fields describe an observation supplied to the bootstrap command.
+/// They do not establish runtime verification, implementation support, or
+/// canonical acceptance.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapRecoveryFinding {
+    /// Owning functional capability cell supplied by the finding owner.
+    pub owning_functional_cell: String,
+    /// Behavior observed by the caller on the bound source/runtime identity.
+    pub observed_behavior: String,
+    /// Caller-supplied discriminator for the finding.
+    pub discriminator: String,
+    /// Exact affected path supplied by the caller.
+    pub affected_path: String,
+    /// Attributed claim state; verifier-backed states are not accepted here.
+    pub claim_status: EvidenceEvaluation,
+    /// Explicit caller-attributed runtime identity observation, including an
+    /// UNKNOWN or UNAVAILABLE record when runtime identity was not observed.
+    pub runtime_identity: EvidenceRecord,
+}
+
+impl BootstrapRecoveryFinding {
+    pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+        for (value, field) in [
+            (&self.owning_functional_cell, "owning_functional_cell"),
+            (&self.observed_behavior, "observed_behavior"),
+            (&self.discriminator, "discriminator"),
+            (&self.affected_path, "affected_path"),
+            (&self.runtime_identity.key, "runtime_identity.key"),
+            (&self.runtime_identity.value, "runtime_identity.value"),
+            (
+                &self.runtime_identity.evidence_ref,
+                "runtime_identity.evidence_ref",
+            ),
+        ] {
+            text(value, "bootstrap-recovery-finding".to_owned(), field)?;
+        }
+        let attributed_only = |status| {
+            matches!(
+                status,
+                EvidenceEvaluation::Raw
+                    | EvidenceEvaluation::Contested
+                    | EvidenceEvaluation::Stale
+                    | EvidenceEvaluation::Unknown
+                    | EvidenceEvaluation::Unavailable
+            )
+        };
+        if !attributed_only(self.claim_status) || !attributed_only(self.runtime_identity.evaluation)
+        {
+            return Err(BootstrapCompileError::ProviderValidation {
+                provider: "bootstrap-recovery-finding",
+                detail: "claim and runtime identity statuses must remain caller-attributed and unverified".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Provider-owned inputs shared by the candidate failure and improvement drafts.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1367,8 +1542,7 @@ pub struct BootstrapDraftInput {
     pub normative_pair: NormativePair,
     pub snapshot_ref: String,
     pub catalogue_ref: String,
-    pub owner: String,
-    pub discriminator: String,
+    pub finding: BootstrapRecoveryFinding,
     pub import_disposition: DraftImportDisposition,
 }
 
@@ -1380,8 +1554,7 @@ pub struct BootstrapFailureDraft {
     pub snapshot_ref: String,
     pub catalogue_ref: String,
     pub work_unit_id: String,
-    pub owner: String,
-    pub discriminator: String,
+    pub finding: BootstrapRecoveryFinding,
     pub import_disposition: DraftImportDisposition,
     pub canonical_digest: String,
 }
@@ -1394,8 +1567,7 @@ pub struct BootstrapImprovementDraft {
     pub snapshot_ref: String,
     pub catalogue_ref: String,
     pub work_unit_id: String,
-    pub owner: String,
-    pub discriminator: String,
+    pub finding: BootstrapRecoveryFinding,
     pub import_disposition: DraftImportDisposition,
     pub canonical_digest: String,
 }
@@ -1416,10 +1588,15 @@ macro_rules! draft_impl {
                     (&input.source_identity, "source_identity"),
                     (&input.snapshot_ref, "snapshot_ref"),
                     (&input.catalogue_ref, "catalogue_ref"),
-                    (&input.owner, "owner"),
-                    (&input.discriminator, "discriminator"),
                 ] {
                     text(value, "bootstrap-draft".to_owned(), field)?;
+                }
+                input.finding.validate()?;
+                if input.import_disposition != DraftImportDisposition::CandidateOnly {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft",
+                        detail: "draft intake must remain candidate-only until a canonical receipt exists".to_owned(),
+                    });
                 }
                 input.normative_pair.validate("bootstrap-draft")?;
                 digest(
@@ -1438,8 +1615,7 @@ macro_rules! draft_impl {
                     snapshot_ref: input.snapshot_ref,
                     catalogue_ref: input.catalogue_ref,
                     work_unit_id: seed.id.clone().into(),
-                    owner: input.owner,
-                    discriminator: input.discriminator,
+                    finding: input.finding,
                     import_disposition: input.import_disposition,
                     canonical_digest: String::new(),
                 };
@@ -1458,12 +1634,13 @@ macro_rules! draft_impl {
                     "bootstrap-draft".to_owned(),
                     "work_unit_id",
                 )?;
-                text(&self.owner, "bootstrap-draft".to_owned(), "owner")?;
-                text(
-                    &self.discriminator,
-                    "bootstrap-draft".to_owned(),
-                    "discriminator",
-                )?;
+                self.finding.validate()?;
+                if self.import_disposition != DraftImportDisposition::CandidateOnly {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft",
+                        detail: "draft intake must remain candidate-only until a canonical receipt exists".to_owned(),
+                    });
+                }
                 self.normative_pair.validate("bootstrap-draft")?;
                 digest(
                     &self.snapshot_ref,
@@ -1493,6 +1670,150 @@ macro_rules! draft_impl {
 
 draft_impl!(BootstrapFailureDraft);
 draft_impl!(BootstrapImprovementDraft);
+
+/// Explicit import/rejection receipt reconciling one immutable candidate-only
+/// bootstrap draft with its canonical outcome (Implementation I17.2).
+///
+/// A published draft stays `CANDIDATE_ONLY` forever: draft construction and
+/// validation refuse any other disposition, and publication is create-new with
+/// byte-exact readback. This separate artifact records that a governed owner
+/// imported the draft into canonical memory (`Imported`, bound to the exact
+/// canonical write) or explicitly rejected it (`Rejected`, with a reason).
+/// Filename presence never promotes a draft; only this receipt reconciles it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapDraftImportReceipt {
+    /// Content digest of the reconciled immutable candidate draft.
+    pub draft_digest: String,
+    /// Reconciliation outcome: `Imported` or `Rejected`, never `CandidateOnly`.
+    pub disposition: DraftImportDisposition,
+    /// Canonical input hash of the admitting write; present only on import.
+    pub canonical_input_hash: Option<String>,
+    /// Canonical write identity of the admitting write; present only on import.
+    pub canonical_write_id: Option<String>,
+    /// Explicit rejection reason; present only on rejection.
+    pub rejection_reason: Option<String>,
+    /// Content digest of this receipt with `receipt_digest` cleared.
+    pub receipt_digest: String,
+}
+
+impl BootstrapDraftImportReceipt {
+    /// Records the canonical import of one validated candidate-only draft.
+    ///
+    /// The caller is the governed importing owner: it must have validated the
+    /// draft as candidate-only with a matching content digest before calling.
+    /// This constructor records the supplied outcome; it does not perform the
+    /// import and grants no canonical authority by itself.
+    pub fn imported(
+        draft_digest: &str,
+        canonical_input_hash: &str,
+        canonical_write_id: &str,
+    ) -> Result<Self, BootstrapCompileError> {
+        let source = "bootstrap-draft-import-receipt".to_owned();
+        digest(draft_digest, source.clone(), "draft_digest")?;
+        digest(canonical_input_hash, source.clone(), "canonical_input_hash")?;
+        text(canonical_write_id, source, "canonical_write_id")?;
+        let mut receipt = Self {
+            draft_digest: draft_digest.to_owned(),
+            disposition: DraftImportDisposition::Imported,
+            canonical_input_hash: Some(canonical_input_hash.to_owned()),
+            canonical_write_id: Some(canonical_write_id.to_owned()),
+            rejection_reason: None,
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt_digest(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Records the explicit rejection of one validated candidate-only draft.
+    ///
+    /// The caller is the governed importing owner: it must have validated the
+    /// draft as candidate-only with a matching content digest before calling.
+    /// Rejection performs no canonical write, so no canonical reference is
+    /// accepted here.
+    pub fn rejected(draft_digest: &str, reason: &str) -> Result<Self, BootstrapCompileError> {
+        let source = "bootstrap-draft-import-receipt".to_owned();
+        digest(draft_digest, source.clone(), "draft_digest")?;
+        text(reason, source, "rejection_reason")?;
+        let mut receipt = Self {
+            draft_digest: draft_digest.to_owned(),
+            disposition: DraftImportDisposition::Rejected,
+            canonical_input_hash: None,
+            canonical_write_id: None,
+            rejection_reason: Some(reason.to_owned()),
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt_digest(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Validates field invariants and the receipt content digest.
+    pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+        let source = "bootstrap-draft-import-receipt".to_owned();
+        digest(&self.draft_digest, source.clone(), "draft_digest")?;
+        match self.disposition {
+            DraftImportDisposition::Imported => {
+                let input_hash = self.canonical_input_hash.as_deref().ok_or(
+                    BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "an imported receipt must bind the canonical input hash".to_owned(),
+                    },
+                )?;
+                digest(input_hash, source.clone(), "canonical_input_hash")?;
+                let write_id = self.canonical_write_id.as_deref().ok_or(
+                    BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "an imported receipt must bind the canonical write identity"
+                            .to_owned(),
+                    },
+                )?;
+                text(write_id, source.clone(), "canonical_write_id")?;
+                if self.rejection_reason.is_some() {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "an imported receipt must not carry a rejection reason".to_owned(),
+                    });
+                }
+            }
+            DraftImportDisposition::Rejected => {
+                let reason = self.rejection_reason.as_deref().ok_or(
+                    BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "a rejected receipt must carry an explicit reason".to_owned(),
+                    },
+                )?;
+                text(reason, source.clone(), "rejection_reason")?;
+                if self.canonical_input_hash.is_some() || self.canonical_write_id.is_some() {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft-import-receipt",
+                        detail: "a rejected receipt must not bind a canonical write".to_owned(),
+                    });
+                }
+            }
+            DraftImportDisposition::CandidateOnly => {
+                return Err(BootstrapCompileError::ProviderValidation {
+                    provider: "bootstrap-draft-import-receipt",
+                    detail:
+                        "an import receipt must record Imported or Rejected, never CandidateOnly"
+                            .to_owned(),
+                });
+            }
+        }
+        digest(&self.receipt_digest, source, "receipt_digest")?;
+        if receipt_digest(self)? != self.receipt_digest {
+            return Err(BootstrapCompileError::DigestMismatch {
+                artifact: "bootstrap-draft-import-receipt",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn receipt_digest(value: &BootstrapDraftImportReceipt) -> Result<String, BootstrapCompileError> {
+    let mut unsigned = value.clone();
+    unsigned.receipt_digest.clear();
+    canonical_digest(&unsigned, "bootstrap-draft-import-receipt")
+}
 
 fn canonical_digest<T: Serialize>(
     value: &T,
@@ -1724,6 +2045,13 @@ mod tests {
                 selected_repository_root: "repo-root".to_owned(),
                 selected_source_head: "head-1".to_owned(),
                 dirty_delta_artifact_ref: None,
+                lockfile_digest: None,
+                toolchain_digest: None,
+                generated_schema_digest: None,
+                binary_package_digest: None,
+                manifest_digest: None,
+                config_policy_digest: None,
+                credential_profile_digest: None,
                 external_state_root: "state-root".to_owned(),
                 records: vec![EvidenceRecord {
                     key: "source.head".to_owned(),
@@ -1959,8 +2287,19 @@ mod tests {
                 normative_pair: pair.clone(),
                 snapshot_ref: snapshot_ref.clone(),
                 catalogue_ref: first.catalogue_sha256.clone(),
-                owner: "Luna-A".to_owned(),
-                discriminator: "missing-catalogue".to_owned(),
+                finding: BootstrapRecoveryFinding {
+                    owning_functional_cell: "foundation.bootstrap.work-unit-brief".to_owned(),
+                    observed_behavior: "normative catalogue was unavailable".to_owned(),
+                    discriminator: "missing-catalogue".to_owned(),
+                    affected_path: "docs/normative-pair.toml".to_owned(),
+                    claim_status: EvidenceEvaluation::Raw,
+                    runtime_identity: EvidenceRecord {
+                        key: "runtime_identity".to_owned(),
+                        value: "UNKNOWN".to_owned(),
+                        evidence_ref: "caller:unknown-runtime".to_owned(),
+                        evaluation: EvidenceEvaluation::Unknown,
+                    },
+                },
                 import_disposition: DraftImportDisposition::CandidateOnly,
             },
             &seed(),
@@ -1971,8 +2310,19 @@ mod tests {
                 normative_pair: pair,
                 snapshot_ref,
                 catalogue_ref: first.catalogue_sha256,
-                owner: "Luna-A".to_owned(),
-                discriminator: "activate-catalogue".to_owned(),
+                finding: BootstrapRecoveryFinding {
+                    owning_functional_cell: "foundation.bootstrap.work-unit-brief".to_owned(),
+                    observed_behavior: "catalogue activation remains a candidate".to_owned(),
+                    discriminator: "activate-catalogue".to_owned(),
+                    affected_path: "crates/foundation/eliot-bootstrap/src/lib.rs".to_owned(),
+                    claim_status: EvidenceEvaluation::Raw,
+                    runtime_identity: EvidenceRecord {
+                        key: "runtime_identity".to_owned(),
+                        value: "UNAVAILABLE".to_owned(),
+                        evidence_ref: "caller:unavailable-runtime".to_owned(),
+                        evaluation: EvidenceEvaluation::Unavailable,
+                    },
+                },
                 import_disposition: DraftImportDisposition::CandidateOnly,
             },
             &seed(),

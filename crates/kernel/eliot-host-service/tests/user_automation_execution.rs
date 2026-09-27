@@ -175,6 +175,7 @@ fn cancellation(
         automation_revision: "revision-7".to_owned(),
         only_unadmitted: true,
         targets: vec![target],
+        enumeration_receipt: None,
     }
 }
 

@@ -157,6 +157,10 @@ pub enum ParameterShape {
     CampaignViewLookup,
     /// Closed owner-separated swarm revision record and complete canonical bytes.
     SwarmOwnerRevision,
+    /// Exact task/item identity selector for issue #1822.
+    BlackboardItemLookup,
+    /// Closed typed blackboard item revision and predecessor CAS for issue #1822.
+    BlackboardItemRevision,
 }
 
 impl ParameterShape {
@@ -172,6 +176,8 @@ impl ParameterShape {
             Self::CampaignSourcePublications => "eliot.learning.campaign-source-publications.v1",
             Self::CampaignViewLookup => "eliot.learning.campaign-view-lookup.v1",
             Self::SwarmOwnerRevision => "eliot.swarm.owner-revision.v1",
+            Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
+            Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
         }
     }
 }
@@ -929,6 +935,23 @@ static APPLY_SWARM_OWNER_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [Param
     shape: ParameterShape::SwarmOwnerRevision,
     required: true,
 }];
+static BLACKBOARD_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "task_id",
+        shape: ParameterShape::BlackboardItemLookup,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "item_id",
+        shape: ParameterShape::BlackboardItemLookup,
+        required: true,
+    },
+];
+static APPLY_BLACKBOARD_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "revision",
+    shape: ParameterShape::BlackboardItemRevision,
+    required: true,
+}];
 
 /// Returns the canonical operation name bound into manifests and digests.
 ///
@@ -944,6 +967,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetUserAutomationState => "GetUserAutomationState",
         NamedReadOperation::GetExperienceBankRange => "GetExperienceBankRange",
         NamedReadOperation::GetAgentFeedbackRange => "GetAgentFeedbackRange",
+        NamedReadOperation::GetBlackboardItem => "GetBlackboardItem",
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
         NamedReadOperation::GetTaskState => "GetTaskState",
@@ -994,6 +1018,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetUserAutomationState" => Some(NamedReadOperation::GetUserAutomationState),
         b"GetExperienceBankRange" => Some(NamedReadOperation::GetExperienceBankRange),
         b"GetAgentFeedbackRange" => Some(NamedReadOperation::GetAgentFeedbackRange),
+        b"GetBlackboardItem" => Some(NamedReadOperation::GetBlackboardItem),
         _ => None,
     }
 }
@@ -1019,6 +1044,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyUserAutomationState => "ApplyUserAutomationState",
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
+        NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
     }
 }
 
@@ -1043,6 +1069,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ApplyUserAutomationState" => Some(NamedMutationOperation::ApplyUserAutomationState),
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
+        b"ApplyBlackboardItem" => Some(NamedMutationOperation::ApplyBlackboardItem),
         _ => None,
     }
 }
@@ -1073,6 +1100,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// decimal `max_records` bound plus the optional opaque `cursor`
 /// continuation selector (issue #223; scope arrives through the typed
 /// `scope_id` request field, mirroring `GetEvidencePack`);
+/// `GetBlackboardItem` declares the exact `task_id` and `item_id` selectors
+/// (issue #1822);
 /// `GetAuditRange` declares the optional opaque `cursor` continuation
 /// selector (issue #223; absent cursors read from the start);
 /// every other variant declares none, so any supplied parameter fails closed. Variants without a catalogue entry never
@@ -1105,6 +1134,7 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetExperienceBankRange | NamedReadOperation::GetAgentFeedbackRange => {
             &GET_EXPERIENCE_RANGE_PARAMETERS
         }
+        NamedReadOperation::GetBlackboardItem => &BLACKBOARD_ITEM_LOOKUP_PARAMETERS,
         NamedReadOperation::GetAuditRange => &GET_AUDIT_RANGE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
@@ -1157,6 +1187,8 @@ pub const fn declared_read_parameters(
 /// `record_revision` as its decimal string, `scope_digest`,
 /// `fence_digest`, `idempotency_key`; family bound by the operation
 /// variant, digest re-proof at the Governor read edge);
+/// `ApplyBlackboardItem` declares the required typed `revision` candidate
+/// and predecessor CAS (issue #1822);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -1173,6 +1205,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
+        NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
@@ -1259,13 +1292,16 @@ pub fn verify_declaration_holds_no_payload_encoding(
     declaration: &ParameterDeclaration,
 ) -> Result<(), StoreError> {
     let structured = match declaration.shape {
-        ParameterShape::OperationId | ParameterShape::Subject => false,
+        ParameterShape::OperationId
+        | ParameterShape::Subject
+        | ParameterShape::BlackboardItemLookup => false,
         ParameterShape::EpistemicRevision
         | ParameterShape::NotificationState
         | ParameterShape::CampaignSourceLookup
         | ParameterShape::CampaignSourcePublications
         | ParameterShape::CampaignViewLookup
-        | ParameterShape::SwarmOwnerRevision => true,
+        | ParameterShape::SwarmOwnerRevision
+        | ParameterShape::BlackboardItemRevision => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1444,5 +1480,33 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             record.validate()
         }
+        ParameterShape::BlackboardItemLookup => {
+            validate_blackboard_lookup_selector(declaration, value)
+        }
+        ParameterShape::BlackboardItemRevision => {
+            let revision: crate::BlackboardItemRevision = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            revision.validate()
+        }
     }
+}
+
+fn validate_blackboard_lookup_selector(
+    declaration: &ParameterDeclaration,
+    value: &Value,
+) -> Result<(), StoreError> {
+    let text = value.as_str().ok_or(StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "blackboard identity selector must be a string",
+    })?;
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "blackboard identity selector must be non-blank text",
+        });
+    }
+    if declaration.name == "task_id" {
+        eliot_contracts::TaskId::new(text).map_err(StoreError::Foundation)?;
+    }
+    Ok(())
 }

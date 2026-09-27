@@ -39,6 +39,7 @@ use super::SessionId;
 use super::current_process_named_pipe_expectation;
 use super::eliotd_launch_attempt_identity;
 use super::eliotd_operation_id;
+use super::kernel_audit::AuditEventDraft;
 use super::observe_named_pipe_peer_process;
 use super::stable_owner_principal_digest;
 use super::unix_ms;
@@ -93,12 +94,18 @@ impl KernelComposition {
         match self.launch_eliotd_inner().await {
             Ok(receipt) => {
                 observe_daemon_launch("kernel.daemon.launch_committed", "success");
+                // Issue #1837: durable audit evidence for process lifecycle.
+                self.audit_observe(AuditEventDraft::process_launch_committed(&receipt));
                 Ok(receipt)
             }
             Err(error) => {
                 observe_daemon_launch("kernel.daemon.launch_failed", "rejected");
                 super::kernel_diagnostics::observe_terminal_error(daemon_launch_terminal_code(
                     &error,
+                ));
+                // Issue #1837: durable audit evidence for process lifecycle.
+                self.audit_observe(AuditEventDraft::process_launch_failed(
+                    daemon_launch_terminal_code(&error),
                 ));
                 Err(error)
             }

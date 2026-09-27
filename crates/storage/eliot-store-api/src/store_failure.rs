@@ -735,6 +735,14 @@ impl StoreFailure {
                     StoreRecoveryAction::ResolveWriteReceipt,
                     None,
                 ),
+                StoreError::SnapshotClosePending { .. } => (
+                    StoreFailureDisposition::Unavailable,
+                    "SNAPSHOT_CLOSE_PENDING",
+                    StoreMutationDisposition::NotAttempted,
+                    StoreRetryDirective::RetrySameIdentityAfterBackoff,
+                    StoreRecoveryAction::RestoreStoreConnectivity,
+                    None,
+                ),
                 StoreError::MissingReceiptEnvelope => {
                     return Self::unknown_outcome(&context, "RECEIPT_ENVELOPE_MISSING");
                 }
@@ -1113,4 +1121,423 @@ pub enum StoreFailureContractError {
     },
     #[error("unknown outcome requires an exact operation identity")]
     MissingOperationIdentity,
+}
+
+// ── Issue #1859: v1 string-failure migration disposition ──
+//
+// Work items W1–W5 and the acceptance clause are covered here as code
+// records per I19.16 (not prose): the use inventory (W1), the raw-preserving
+// typed mapping with explicit weak/legacy marking per I19.6 (W2), the bounded
+// read/migration bridge (W3), the MigrationDisposition record (W4), and the
+// decoder-removal precondition gate (W5). New failures are emitted only
+// through `StoreResponse::canonical_failure` (wire.rs) at every store
+// emission site. The kernel compatibility reader lives outside this scope
+// (lane W1-2806 owns `bins/eliot-kernel` and `crates/kernel`), so the bridge
+// read-path wiring and the decoder deletion itself are reported
+// BLOCKED-BY scope with STITCH references; everything in scope is wired.
+
+/// Issue #1859: enumerated use sites of the v1 string-failure representation.
+///
+/// This is the code inventory required by Work item W1: every persisted,
+/// queued, exported, fixture, integration, and compatibility use of the v1
+/// representation observable from current source. Installed and live runtime
+/// surfaces that no source scan can observe are recorded separately as
+/// [`V1UnscannedSurface`] unknown candidates per I19.6, never as verified
+/// absence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V1FailureUseSite {
+    /// `StoreResponse::Error` wire variant (`wire.rs`): legacy string failure
+    /// retained for a bounded compatibility window.
+    WireErrorVariant,
+    /// `StoreResponse::Unknown` wire variant (`wire.rs`): legacy
+    /// unknown/rejected reconciliation outcome.
+    WireUnknownVariant,
+    /// `StoreResponse::from_transaction_receipt` / `from_receipt` (`wire.rs`):
+    /// queued-receipt constructors that still build the legacy `Unknown`
+    /// variant for envelope-less receipts.
+    ReceiptUnknownConstructor,
+    /// `LegacyStoreFailureV1` (`store_failure.rs`): the two representation
+    /// classes (`Error` free string, `Unknown` operation prose).
+    LegacyEnum,
+    /// `decode_legacy_store_failure_v1` (`store_failure.rs`): the v1 decoder
+    /// queued for deletion under #1714.
+    LegacyDecoder,
+    /// `decode_legacy_compat`
+    /// (`crates/kernel/eliot-kernel-service/src/store_exchange.rs`): the only
+    /// live decoder caller. Cross-scope (lane W1-2806 owns
+    /// `bins/eliot-kernel` and `crates/kernel`); the decoder must not be
+    /// removed while this route requires it.
+    KernelCompatDecode,
+    /// `crates/storage/eliot-store-api/tests/store_failure.rs`: fixture use
+    /// of the decoder and the legacy shape.
+    ContractFixture,
+    /// `classify_response` / `emit_dispatch_outcome`
+    /// (`bins/eliot-store-surreal/src/diagnostics.rs`): observe-only
+    /// classification of legacy variants. No prose is parsed or decoded.
+    StoreDiagnosticsClassify,
+}
+
+impl V1FailureUseSite {
+    /// Returns the stable source identity of the use site.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::WireErrorVariant => {
+                "crates/storage/eliot-store-api/src/wire.rs::StoreResponse::Error"
+            }
+            Self::WireUnknownVariant => {
+                "crates/storage/eliot-store-api/src/wire.rs::StoreResponse::Unknown"
+            }
+            Self::ReceiptUnknownConstructor => {
+                "crates/storage/eliot-store-api/src/wire.rs::StoreResponse::from_transaction_receipt/from_receipt"
+            }
+            Self::LegacyEnum => {
+                "crates/storage/eliot-store-api/src/store_failure.rs::LegacyStoreFailureV1"
+            }
+            Self::LegacyDecoder => {
+                "crates/storage/eliot-store-api/src/store_failure.rs::decode_legacy_store_failure_v1"
+            }
+            Self::KernelCompatDecode => {
+                "crates/kernel/eliot-kernel-service/src/store_exchange.rs::decode_legacy_compat"
+            }
+            Self::ContractFixture => {
+                "crates/storage/eliot-store-api/tests/store_failure.rs::v1-shape-fixtures"
+            }
+            Self::StoreDiagnosticsClassify => {
+                "bins/eliot-store-surreal/src/diagnostics.rs::classify_response/emit_dispatch_outcome"
+            }
+        }
+    }
+
+    /// Returns whether this site is an active route that requires v1
+    /// decoding. Only the live kernel compatibility reader qualifies:
+    /// fixtures observe the shape without serving traffic, diagnostics
+    /// classify without decoding, and the decoder definition itself requires
+    /// nothing.
+    #[must_use]
+    pub const fn requires_v1_decoding(self) -> bool {
+        matches!(self, Self::KernelCompatDecode)
+    }
+}
+
+/// Issue #1859: v1-relevant surfaces no source scan can observe (W1).
+///
+/// Per I19.6 these stay explicit UNKNOWN candidates: unknown legacy
+/// semantics become candidates, never invented verified state. Each blocks
+/// decoder removal through [`v1_decoder_removal_gate`] until data inspection
+/// clears it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V1UnscannedSurface {
+    /// Persisted v1 failure payloads in the live store generation.
+    LiveStoreRecords,
+    /// v1 payloads inside installed artifacts and generations.
+    InstalledArtifacts,
+    /// In-flight v1 frames and runtime integration state.
+    RuntimeIntegrationState,
+}
+
+impl V1UnscannedSurface {
+    /// Returns the stable identity of the unscanned surface.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::LiveStoreRecords => "live-store-records",
+            Self::InstalledArtifacts => "installed-artifacts",
+            Self::RuntimeIntegrationState => "runtime-integration-state",
+        }
+    }
+}
+
+/// Issue #1859: code inventory of v1 string-failure uses (Work item W1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct V1FailureUseInventory {
+    /// Use sites observable from current source.
+    pub sites: &'static [V1FailureUseSite],
+    /// Surfaces no source scan observes; unknown candidates per I19.6.
+    pub unscanned_surfaces: &'static [V1UnscannedSurface],
+}
+
+/// Every v1 use site observable from current source (Work item W1).
+pub const V1_FAILURE_USE_SITES: &[V1FailureUseSite] = &[
+    V1FailureUseSite::WireErrorVariant,
+    V1FailureUseSite::WireUnknownVariant,
+    V1FailureUseSite::ReceiptUnknownConstructor,
+    V1FailureUseSite::LegacyEnum,
+    V1FailureUseSite::LegacyDecoder,
+    V1FailureUseSite::KernelCompatDecode,
+    V1FailureUseSite::ContractFixture,
+    V1FailureUseSite::StoreDiagnosticsClassify,
+];
+
+/// v1-relevant surfaces no source scan observes (W1, unknown per I19.6).
+pub const V1_UNSCANNED_SURFACES: &[V1UnscannedSurface] = &[
+    V1UnscannedSurface::LiveStoreRecords,
+    V1UnscannedSurface::InstalledArtifacts,
+    V1UnscannedSurface::RuntimeIntegrationState,
+];
+
+/// Returns the v1 string-failure use inventory (Work item W1).
+#[must_use]
+pub const fn v1_failure_use_inventory() -> V1FailureUseInventory {
+    V1FailureUseInventory {
+        sites: V1_FAILURE_USE_SITES,
+        unscanned_surfaces: V1_UNSCANNED_SURFACES,
+    }
+}
+
+/// Binds the use inventory to a stable digest for window and disposition
+/// records.
+pub fn v1_use_inventory_digest(
+    inventory: &V1FailureUseInventory,
+) -> Result<String, StoreFailureContractError> {
+    let names: Vec<&str> = inventory
+        .sites
+        .iter()
+        .map(|site| site.symbol())
+        .chain(
+            inventory
+                .unscanned_surfaces
+                .iter()
+                .map(|surface| surface.symbol()),
+        )
+        .collect();
+    let bytes = canonical_json_bytes(&names)
+        .map_err(|_| invalid("inventory_digest", "canonical inventory encoding failed"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Issue #1859: how a migrated v1 failure is interpreted (Work item W2).
+///
+/// Per I19.6 the original raw payload is always preserved and any unmappable
+/// meaning is marked weak/legacy rather than invented into a verified
+/// interpretation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V1Interpretation {
+    /// The v1 `Unknown` arm maps exactly: the admitted operation identity is
+    /// preserved as `UnknownOutcome` with exact-operation reconciliation.
+    TypedExact,
+    /// The v1 `Error` free string carries no mappable meaning: it survives
+    /// only as bounded `human_detail` while the control fields come from the
+    /// transport observation, never from parsing the prose.
+    WeakLegacy,
+}
+
+/// Issue #1859: a migrated v1 failure with its exact raw representation and
+/// explicit typed/legacy interpretation (Work item W2, acceptance).
+///
+/// The raw v1 value is preserved byte-for-content under [`Self::raw`] with
+/// its digest under [`Self::raw_sha256`]; the typed v2 envelope under
+/// [`Self::typed`] never invents meaning beyond [`Self::interpretation`].
+pub struct MigratedV1Failure {
+    raw: serde_json::Value,
+    raw_sha256: String,
+    typed: StoreFailure,
+    interpretation: V1Interpretation,
+}
+
+impl MigratedV1Failure {
+    /// Returns the exact original v1 representation.
+    #[must_use]
+    pub fn raw(&self) -> &serde_json::Value {
+        &self.raw
+    }
+
+    /// Returns the digest binding the exact original raw representation.
+    #[must_use]
+    pub fn raw_sha256(&self) -> &str {
+        &self.raw_sha256
+    }
+
+    /// Returns the typed v2 interpretation of the raw representation.
+    #[must_use]
+    pub fn typed(&self) -> &StoreFailure {
+        &self.typed
+    }
+
+    /// Returns whether the interpretation is exact or weak/legacy.
+    #[must_use]
+    pub fn interpretation(&self) -> V1Interpretation {
+        self.interpretation
+    }
+}
+
+/// Migrates one v1 string failure into the typed envelope (Work item W2).
+///
+/// The exact original value is preserved with its digest; the `Unknown` arm
+/// maps exactly while the `Error` free string is marked [`V1Interpretation::WeakLegacy`]
+/// per I19.6 instead of receiving an invented verified interpretation.
+pub fn migrate_legacy_store_failure_v1(
+    value: &serde_json::Value,
+    context: &StoreFailureIdentityContext,
+) -> Result<MigratedV1Failure, StoreFailureContractError> {
+    let legacy: LegacyStoreFailureV1 = serde_json::from_value(value.clone())
+        .map_err(|_| invalid("legacy_failure", "not a supported v1 store failure shape"))?;
+    let interpretation = match &legacy {
+        LegacyStoreFailureV1::Unknown { .. } => V1Interpretation::TypedExact,
+        LegacyStoreFailureV1::Error { .. } => V1Interpretation::WeakLegacy,
+    };
+    let typed = decode_legacy_store_failure_v1(value, context)?;
+    let raw_bytes = canonical_json_bytes(value)
+        .map_err(|_| invalid("legacy_raw", "canonical raw encoding failed"))?;
+    Ok(MigratedV1Failure {
+        raw: value.clone(),
+        raw_sha256: sha256_hex(&raw_bytes),
+        typed,
+        interpretation,
+    })
+}
+
+/// Issue #1859: bounded read/migration window for v1 failures (Work item W3).
+///
+/// The window is bound to the exact use inventory it was opened for: it
+/// covers only the identified legacy sites, and a window opened for a stale
+/// inventory fails closed. It grants no authority and changes no fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V1CompatWindow {
+    /// Digest of the use inventory this window was opened for.
+    pub inventory_digest: String,
+}
+
+/// Opens the bounded v1 read window for the identified records (W3).
+pub fn v1_compat_window(
+    inventory: &V1FailureUseInventory,
+) -> Result<V1CompatWindow, StoreFailureContractError> {
+    Ok(V1CompatWindow {
+        inventory_digest: v1_use_inventory_digest(inventory)?,
+    })
+}
+
+/// Reads one v1 failure through the bounded compatibility window (W3).
+///
+/// Only the identified legacy representation classes are accepted, and only
+/// while the window is bound to the current use inventory. New failures are
+/// never produced here; they are emitted exclusively through
+/// `StoreResponse::canonical_failure`.
+pub fn bridge_v1_within_window(
+    value: &serde_json::Value,
+    context: &StoreFailureIdentityContext,
+    window: &V1CompatWindow,
+) -> Result<MigratedV1Failure, StoreFailureContractError> {
+    let current = v1_use_inventory_digest(&v1_failure_use_inventory())?;
+    if window.inventory_digest != current {
+        return Err(invalid(
+            "compat_window",
+            "window bound to a stale use inventory",
+        ));
+    }
+    migrate_legacy_store_failure_v1(value, context)
+}
+
+/// Issue #1859: I19.16 disposition states for the v1 representation (W4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum V1DispositionStatus {
+    Migrated,
+    Merged,
+    Superseded,
+    Archived,
+    Rejected,
+    Unresolved,
+}
+
+/// Issue #1859: migration disposition for the v1 string-failure
+/// representation (Work item W4, I19.16).
+///
+/// Every active source object has one disposition. While the decoder is
+/// retained and the kernel compatibility route is live, the disposition is
+/// `UNRESOLVED` and the cutover receipt names the blockers instead of a
+/// cutover.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct V1MigrationDisposition {
+    pub source_object_identity_and_hash: String,
+    pub source_semantics_and_owner: String,
+    pub target_object_identity_and_hash: String,
+    pub disposition: V1DispositionStatus,
+    pub transform_and_verifier_refs: String,
+    pub provider_memory_or_external_effect_reconciliation: String,
+    pub rollback_or_no_return_boundary: String,
+    pub canonical_cutover_receipt: String,
+}
+
+/// Produces the migration disposition for the v1 representation (W4).
+///
+/// The verdict of [`v1_decoder_removal_gate`] decides between `UNRESOLVED`
+/// (decoder retained; the receipt names the blockers) and `SUPERSEDED` (gate
+/// clear; decoder deletion authorized for the owning lane with this receipt).
+pub fn v1_migration_disposition(
+    inventory: &V1FailureUseInventory,
+) -> Result<V1MigrationDisposition, StoreFailureContractError> {
+    let digest = v1_use_inventory_digest(inventory)?;
+    let source_object_identity_and_hash =
+        format!("v1-string-failure(LegacyStoreFailureV1) inventory-sha256:{digest}");
+    let (disposition, canonical_cutover_receipt) = match v1_decoder_removal_gate(inventory) {
+        Ok(()) => (
+            V1DispositionStatus::Superseded,
+            "removal gate clear: no active route requires v1 decoding and no unscanned surface is unknown; decoder deletion authorized for the owning lane with this receipt"
+                .to_owned(),
+        ),
+        Err(blocker) => (
+            V1DispositionStatus::Unresolved,
+            format!("no cutover issued: decoder removal blocked by {blocker}"),
+        ),
+    };
+    Ok(V1MigrationDisposition {
+        source_object_identity_and_hash,
+        source_semantics_and_owner: "weak/legacy free-string failure prose; owner: store-api compat surface with the kernel compatibility reader (lane W1-2806)"
+            .to_owned(),
+        target_object_identity_and_hash: format!(
+            "{STORE_FAILURE_CONTRACT_REVISION} (StoreFailure typed envelope)"
+        ),
+        disposition,
+        transform_and_verifier_refs: "transform store_failure.rs::migrate_legacy_store_failure_v1 via decode_legacy_store_failure_v1 within bridge_v1_within_window; verifiers StoreFailure::validate and StoreFailure::semantic_digest; acceptance execution deferred to TEST-PHASE"
+            .to_owned(),
+        provider_memory_or_external_effect_reconciliation: "none: v1 strings carry no provider memory; peer operation identity and prose are never adopted, and UnknownOutcome reconciliation stays exact-operation on the admitted context"
+            .to_owned(),
+        rollback_or_no_return_boundary: "no-return boundary not crossed: the v1 decoder is retained and raw records remain inspectable through the current route; rollback is continued decoding"
+            .to_owned(),
+        canonical_cutover_receipt,
+    })
+}
+
+/// Issue #1859: why the v1 decoder must currently be retained (W5).
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum V1RemovalBlocker {
+    /// A live route still requires v1 decoding.
+    #[error("active v1 decode route still requires the decoder: {site}")]
+    ActiveDecodeRoute {
+        /// Stable source identity of the dependent route.
+        site: &'static str,
+    },
+    /// Installed/live surfaces are still unknown candidates per I19.6.
+    #[error("unscanned v1 surfaces remain unknown candidates: {count}")]
+    UnscannedSurfacesUnknown {
+        /// Number of unscanned surfaces.
+        count: usize,
+    },
+}
+
+/// Issue #1859: removal precondition for the v1 decoder (Work item W5).
+///
+/// The decoder may be removed only after reference scans and data inspection
+/// show no active dependency and the retained raw records remain inspectable
+/// through the current route. Per I19.16, missing mappings block retirement
+/// only for the affected scope: this gate returns the first blocker instead
+/// of authorizing removal.
+pub fn v1_decoder_removal_gate(inventory: &V1FailureUseInventory) -> Result<(), V1RemovalBlocker> {
+    if let Some(site) = inventory
+        .sites
+        .iter()
+        .find(|site| site.requires_v1_decoding())
+    {
+        return Err(V1RemovalBlocker::ActiveDecodeRoute {
+            site: site.symbol(),
+        });
+    }
+    if !inventory.unscanned_surfaces.is_empty() {
+        return Err(V1RemovalBlocker::UnscannedSurfacesUnknown {
+            count: inventory.unscanned_surfaces.len(),
+        });
+    }
+    Ok(())
 }

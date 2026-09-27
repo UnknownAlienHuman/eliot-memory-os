@@ -22,7 +22,7 @@ use eliot_ors::{
     test_support::{KernelRouteStoreFixture, kernel_fixture_dir, kernel_route_writer_epoch},
 };
 use eliot_platform::SecretReference;
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 
 const LINEAGE_2031: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -44,6 +44,7 @@ fn reservation_request(tag: &str) -> ReservationRequest {
             privacy_and_visibility_class: RecoveryAccessClass {
                 privacy: PrivacyClass::Private,
                 visibility: OpaqueLabel::new("owner-only").expect("2031 visibility label"),
+                instruction_taint: InstructionTaint::DataOnly,
             },
             authority_epoch: writer_epoch.clone(),
             state_fence: snapshot,

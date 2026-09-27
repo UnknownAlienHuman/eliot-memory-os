@@ -6,11 +6,22 @@
 //! connection. [`otlp_enabled`] is the single honest answer to "is the bridge
 //! compiled in", and it is `false` in every default build.
 //!
-//! The bridge is a bridge, not an authority: enabling it exports operational
-//! events and bounded metrics; it never becomes durable audit, never claims
-//! downstream delivery, and never turns a metrics sample into proof (I16.1).
-//! A configured endpoint with the feature disabled is reported as
+//! The bridge is a bridge, not an authority: it never becomes durable audit,
+//! never claims downstream delivery, and never turns a metrics sample into proof
+//! (I16.1). A configured endpoint with the feature disabled is reported as
 //! [`OtlpDisposition::FeatureDisabled`], never as a silent no-op.
+//!
+//! # No transport, therefore no fabricated export
+//!
+//! This crate declares no OTLP or HTTP transport dependency, so with the
+//! `otlp` feature built there is still nothing that can put a record on the
+//! wire. A configured endpoint is therefore reported as
+//! [`OtlpDisposition::NoTransport`], never as an active bridge, and
+//! [`OtlpBridge::export`] refuses with
+//! [`OtlpBridgeError::NoTransportConfigured`] instead of reporting an export
+//! that never happened. I16.11 forbids silent success, and a recorded success
+//! for an unsent record is exactly that. Supplying a real exporter needs a
+//! transport dependency, which is a separate decision from this module.
 
 /// Whether the OTLP bridge body is compiled into this build.
 #[must_use]
@@ -21,8 +32,11 @@ pub const fn otlp_enabled() -> bool {
 /// Honest state of the OTLP bridge for one process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OtlpDisposition {
-    /// The bridge is compiled in and an endpoint is configured.
-    BridgeActive,
+    /// An endpoint is configured and this build has the `otlp` feature on, but
+    /// no transport is present, so no record can leave the process. Reported
+    /// instead of an active bridge: a bridge that cannot transmit is not a
+    /// bridge, and I16.11 forbids reporting it as one.
+    NoTransport,
     /// An endpoint is configured but this build has the `otlp` feature off.
     FeatureDisabled,
     /// No endpoint is configured; the bridge stays inert.
@@ -34,7 +48,7 @@ impl OtlpDisposition {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::BridgeActive => "bridge_active",
+            Self::NoTransport => "no_transport",
             Self::FeatureDisabled => "feature_disabled",
             Self::NotConfigured => "not_configured",
         }
@@ -59,6 +73,10 @@ pub struct OtlpExport {
 /// Constructed only when [`otlp_enabled`] is true. With the feature disabled
 /// the type still exists so the bootstrap can report `FeatureDisabled`
 /// honestly, but [`OtlpBridge::export`] is unreachable in a default build.
+///
+/// A constructed bridge records a configured endpoint; it does not imply a
+/// working transport, because this crate declares none. See
+/// [`OtlpDisposition::NoTransport`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OtlpBridge {
     endpoint: String,
@@ -66,6 +84,9 @@ pub struct OtlpBridge {
 
 impl OtlpBridge {
     /// Builds the bridge over a configured collector endpoint.
+    ///
+    /// Success means the endpoint is configured and the feature is built. It
+    /// does not mean a record can be exported: see [`Self::export`].
     ///
     /// # Errors
     ///
@@ -94,14 +115,19 @@ impl OtlpBridge {
     ///
     /// # Errors
     ///
-    /// Returns [`OtlpBridgeError::FeatureDisabled`] in a default build. No
-    /// result is ever fabricated: a refused export stays an error, never a
-    /// recorded success.
+    /// Returns [`OtlpBridgeError::FeatureDisabled`] in a default build, and
+    /// [`OtlpBridgeError::NoTransportConfigured`] in a build with the feature
+    /// on, because this crate declares no transport and the record cannot
+    /// reach the configured endpoint.
+    ///
+    /// No result is ever fabricated: a refused export stays an error, never a
+    /// recorded success. The record is deliberately not consumed, so an
+    /// unsent record is never mistaken for a sent one.
     pub fn export(&self, _record: &OtlpExport) -> Result<(), OtlpBridgeError> {
         if !otlp_enabled() {
             return Err(OtlpBridgeError::FeatureDisabled);
         }
-        Ok(())
+        Err(OtlpBridgeError::NoTransportConfigured)
     }
 }
 
@@ -114,6 +140,10 @@ pub enum OtlpBridgeError {
     /// No collector endpoint is configured.
     #[error("otlp bridge has no configured endpoint")]
     EndpointNotConfigured,
+    /// The bridge is built and an endpoint is configured, but this crate
+    /// declares no transport, so the record was not exported.
+    #[error("otlp bridge has no transport, so the record was not exported")]
+    NoTransportConfigured,
 }
 
 /// Reports the honest bridge disposition for a configured endpoint.
@@ -122,6 +152,6 @@ pub fn disposition(configured_endpoint: Option<&str>) -> OtlpDisposition {
     match configured_endpoint {
         None => OtlpDisposition::NotConfigured,
         Some(_) if !otlp_enabled() => OtlpDisposition::FeatureDisabled,
-        Some(_) => OtlpDisposition::BridgeActive,
+        Some(_) => OtlpDisposition::NoTransport,
     }
 }

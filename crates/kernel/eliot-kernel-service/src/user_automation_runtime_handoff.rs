@@ -35,8 +35,9 @@ use super::user_automation::{
 use super::user_automation_execution::{
     UserAutomationDurableJobPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
     UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationWakeCancellation, UserAutomationWakePort,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionTransport,
@@ -747,6 +748,13 @@ where
         request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Vec<String>, UserAutomationRuntimeError> {
         UserAutomationWakePort::cancel_pending_wakes(self.client, request).await
+    }
+
+    async fn enumerate_pending_wakes(
+        &self,
+        request: impl Into<Box<UserAutomationWakeEnumerationRequest>>,
+    ) -> Result<UserAutomationWakeEnumerationReceipt, UserAutomationRuntimeError> {
+        UserAutomationWakePort::enumerate_pending_wakes(self.client, request).await
     }
 }
 

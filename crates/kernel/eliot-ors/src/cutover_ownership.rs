@@ -20,11 +20,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_receipts::ReceiptDispositionKind;
 use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{OrsError, sha256_hex, validate_digest, validate_text};
+use crate::model::{OperationIdentity, OrsError, sha256_hex, validate_digest, validate_text};
 
 /// Maximum retained in-flight dispositions on one cutover record.
 pub const MAX_CUTOVER_IN_FLIGHT: usize = 256;
@@ -211,6 +212,156 @@ impl InFlightDisposition {
     /// Validates the allowlist entry.
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_text(&self.operation_id, "cutover_in_flight_operation_id")?;
+        Ok(())
+    }
+}
+
+/// Durable, non-renewable, single-operation continuation permit (I14.14).
+///
+/// An external effect that the old generation had already issued at cutover
+/// may finish only through this permit, and only under the exact binding
+/// recorded here. Old general generation authority is not sufficient.
+///
+/// * **Single-operation** — the authorized operation identity is not a
+///   parameter of [`OperationContinuationPermit::issue`]: it is copied from
+///   the one `finish_exact_authorized_operation` entry of one committed
+///   cutover, and issuance is refused unless that cutover classifies exactly
+///   one such operation. The record holds a single operation identity, not a
+///   set, so a second operation is unrepresentable.
+/// * **Non-renewable** — `issue` is the only constructor, and it copies every
+///   binding except the deadline and the allowed completion messages out of
+///   one committed, linearized cutover record. The type declares no `&mut self`
+///   method, so there is no path that extends, re-points or reissues a permit;
+///   a later deadline can only come from a different committed cutover, and
+///   [`Self::validate`] refuses `Unknown` among the allowed messages because an
+///   unknown outcome is not final: the permit is consumed by the final
+///   `OutcomeReceipt` only and is never reissued after old-process loss.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationContinuationPermit {
+    /// Identity of the committed cutover that issued this permit.
+    pub cutover_id: String,
+    /// ORS linearization identity of that committed cutover. A permit exists
+    /// only after the commit that created it, so this is never absent.
+    pub linearization_record_id: String,
+    /// The one operation identity this permit may complete.
+    pub operation_id: String,
+    /// Hash of the one already-issued external effect.
+    pub effect_hash: String,
+    /// Fenced generation of the old process.
+    pub old_generation: ResourceGeneration,
+    /// Fenced authority epoch of the old process.
+    pub old_epoch: AuthorityEpoch,
+    /// Exact scope; the permit cannot widen it.
+    pub scope: CapabilityRouteScope,
+    /// Absolute deadline in Unix milliseconds, fixed at issuance.
+    pub deadline_unix_ms: u64,
+    /// The only completion messages this permit accepts.
+    pub allowed_completion_messages: Vec<ReceiptDispositionKind>,
+}
+
+impl OperationContinuationPermit {
+    /// Issues the one permit a committed cutover may create for its single
+    /// authorized operation.
+    ///
+    /// Refuses a staged or unlinearized cutover, a cutover with no fenced old
+    /// generation, and a cutover that classifies zero or several
+    /// `finish_exact_authorized_operation` operations. The authorized
+    /// operation, the effect scope, the fenced generation and the fenced epoch
+    /// are taken from that cutover rather than from the caller, so they cannot
+    /// be retargeted, widened or transferred at issuance.
+    pub fn issue(
+        cutover: &GenerationCutoverOwnership,
+        effect_hash: impl Into<String>,
+        deadline_unix_ms: u64,
+        allowed_completion_messages: Vec<ReceiptDispositionKind>,
+    ) -> Result<Self, OrsError> {
+        cutover.validate()?;
+        if cutover.state != GenerationCutoverState::Committed {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(linearization_record_id) = cutover.linearization_record_id.clone() else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "continuation_permit",
+                reason: "committed cutover has no linearization identity".to_owned(),
+            });
+        };
+        let Some(old_generation) = cutover.old_generation else {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_old_generation",
+                reason: "a continuation permit requires a fenced old generation",
+            });
+        };
+        let mut authorized = cutover
+            .in_flight
+            .iter()
+            .filter(|entry| entry.kind == InFlightDispositionKind::FinishExactAuthorizedOperation);
+        let Some(entry) = authorized.next() else {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_operation",
+                reason: "the committed cutover authorizes no operation to continue",
+            });
+        };
+        if authorized.next().is_some() {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_operation",
+                reason: "one operation must receive exactly one continuation permit",
+            });
+        }
+        let permit = Self {
+            cutover_id: cutover.cutover_id.clone(),
+            linearization_record_id,
+            operation_id: entry.operation_id.clone(),
+            effect_hash: effect_hash.into(),
+            old_generation,
+            old_epoch: cutover.old_epoch,
+            scope: cutover.scope.clone(),
+            deadline_unix_ms,
+            allowed_completion_messages,
+        };
+        permit.validate()?;
+        Ok(permit)
+    }
+
+    /// Returns the stable hash of the exact scope the permit cannot widen.
+    #[must_use]
+    pub fn scope_hash(&self) -> &str {
+        &self.scope.route_scope_hash
+    }
+
+    /// Validates the permit binding. An unknown outcome is not a final
+    /// outcome, so it is refused here: a permit is completed by the final
+    /// `OutcomeReceipt` only and is never reissued.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.cutover_id, "continuation_permit_cutover_id")?;
+        validate_text(
+            &self.linearization_record_id,
+            "continuation_permit_linearization",
+        )?;
+        validate_text(&self.operation_id, "continuation_permit_operation_id")?;
+        validate_digest(&self.effect_hash, "continuation_permit_effect_hash")?;
+        self.scope.validate()?;
+        if self.deadline_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_deadline",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.allowed_completion_messages.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_allowed_completion_messages",
+                reason: "must allow at least one final completion message",
+            });
+        }
+        if self
+            .allowed_completion_messages
+            .contains(&ReceiptDispositionKind::Unknown)
+        {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_allowed_completion_messages",
+                reason: "an unknown outcome is not final and cannot complete a permit",
+            });
+        }
         Ok(())
     }
 }
@@ -421,6 +572,128 @@ impl GenerationCutoverOwnershipReceipt {
             unresolved_scopes: record.unresolved_scopes.clone(),
             state: record.state,
         })
+    }
+}
+
+/// The boundary after which an unstaged old-daemon proposal is stale
+/// (I14.15).
+///
+/// An unstaged proposal from the fenced prior daemon generation, carrying the
+/// fenced prior epoch, is rejected once a cutover with a newer epoch is
+/// committed; the old epoch is never revived.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OldDaemonProposalFence {
+    /// Fenced prior daemon generation.
+    pub generation: ResourceGeneration,
+    /// Fenced prior authority epoch of that generation.
+    pub epoch: AuthorityEpoch,
+}
+
+/// Durable Kernel-owned daemon-generation cutover record (I14.15).
+///
+/// The typed content committed at the ORS cutover linearization point and
+/// bound to the durable [`crate::DaemonCutoverRecord`] row. Kernel stays the
+/// authority boundary while `eliotd` is replaced: the record names the
+/// candidate that becomes authoritative, the proposal fence that makes unstaged
+/// old-daemon proposals stale, the staged-operation identities already owned by
+/// Kernel, the old in-flight disposition set, and the unresolved effect scopes.
+/// A tool/external effect launched by the old daemon follows the same I14.14
+/// in-flight rules as a module cutover.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonCutoverOwnership {
+    /// Cutover identity.
+    pub cutover_id: String,
+    /// Prior daemon generation being replaced, if any.
+    pub prior_daemon_generation: Option<ResourceGeneration>,
+    /// Candidate daemon generation becoming authoritative.
+    pub candidate_daemon_generation: ResourceGeneration,
+    /// New authority epoch issued by the cutover.
+    pub new_epoch: AuthorityEpoch,
+    /// Fence after which unstaged prior-daemon proposals are stale.
+    pub old_proposal_fence: OldDaemonProposalFence,
+    /// Exact staged-operation identities already owned by Kernel; they
+    /// continue by operation identity even if the proposing daemon exits.
+    pub staged_operation_ids: Vec<OperationIdentity>,
+    /// Old in-flight disposition set, reusing the I14.14 dispositions.
+    pub in_flight: Vec<InFlightDisposition>,
+    /// Unresolved effect scopes carried from the old daemon.
+    pub unresolved_scopes: Vec<String>,
+    /// ORS linearization identity, linking this record to the store receipt of
+    /// its [`crate::DaemonCutoverRecord`] row commit; `None` while staged.
+    pub linearization_record_id: Option<String>,
+}
+
+impl DaemonCutoverOwnership {
+    /// Validates the full daemon-cutover record.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.cutover_id, "daemon_cutover_id")?;
+        if self.prior_daemon_generation == Some(self.candidate_daemon_generation) {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_candidate_generation",
+                reason: "cutover must select a distinct daemon generation",
+            });
+        }
+        if self
+            .prior_daemon_generation
+            .is_some_and(|prior| prior != self.old_proposal_fence.generation)
+        {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_old_proposal_fence",
+                reason: "the proposal fence must name the prior daemon generation",
+            });
+        }
+        if self.new_epoch.value() <= self.old_proposal_fence.epoch.value() {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_new_epoch",
+                reason: "the new epoch must supersede the fenced old epoch",
+            });
+        }
+        let mut staged = BTreeSet::new();
+        for operation_id in &self.staged_operation_ids {
+            if !staged.insert(operation_id.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "daemon_cutover_staged_operation_ids",
+                    reason: "one staged operation identity is recorded once",
+                });
+            }
+        }
+        if self.in_flight.len() > MAX_CUTOVER_IN_FLIGHT {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_in_flight",
+                reason: "in-flight disposition set exceeds its bound",
+            });
+        }
+        let mut operations = BTreeSet::new();
+        for entry in &self.in_flight {
+            entry.validate()?;
+            if !operations.insert(entry.operation_id.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "daemon_cutover_in_flight",
+                    reason: "one operation must receive exactly one disposition",
+                });
+            }
+        }
+        if self.unresolved_scopes.len() > MAX_CUTOVER_UNRESOLVED_SCOPES {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_unresolved_scopes",
+                reason: "unresolved scope set exceeds its bound",
+            });
+        }
+        for scope in &self.unresolved_scopes {
+            validate_text(scope, "daemon_cutover_unresolved_scope")?;
+            if operations.contains(scope.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "daemon_cutover_unresolved_scopes",
+                    reason: "a classified operation must not also be unresolved",
+                });
+            }
+        }
+        if let Some(linearization) = &self.linearization_record_id {
+            validate_text(linearization, "daemon_cutover_linearization")?;
+        }
+        Ok(())
     }
 }
 

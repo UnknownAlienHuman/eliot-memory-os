@@ -7,7 +7,8 @@ and every root `workspace.exclude` entry must have a checked-in disposition
 row with a named owner in
 `workstreams/security/standalone-crate-dispositions.toml`, using one of
 KEEP, WRAP, EXTRACT, REWORK, REPLACE, RETIRE, UNKNOWN, and must declare the
-gate's own admission state in `evidence_reference`.
+gate's own supply-chain admission state in `supply_chain_admission`, read from
+the admission vocabulary the inventory itself declares.
 
 Additionally, any real build or release input that consumes an inventoried
 package is rejected. The product-input closure is derived structurally, not
@@ -30,10 +31,27 @@ by substring:
   root `Cargo.lock`.
 
 The role label distinguishes host/build/proc-macro from target/runtime; the
-admission decision does not: there is no evidence-qualified separate-package
-route, so every role fails closed with the evidence list named. That deny-all
-posture is declared per row (`evidence_reference = "deny-all"`) and re-asserted
-in the receipt instead of inventing an empty evidence record.
+admission decision does not. Each row declares one state of the inventory's
+admission vocabulary in `supply_chain_admission`:
+
+- `deny-all` is the deny marker. The package is not a product input, so every
+  role fails closed with the evidence list named. Every row carries it today.
+- `evidence-qualified` is the single admitted route for an intentionally
+  consumed separate package. It is declared in the inventory and unexercised:
+  zero rows carry it, so the live policy stays deny-all and no placeholder
+  evidence record is invented. A row qualifies only when its
+  `[crate.supply_chain_evidence]` table binds every element the governing
+  documents name, with an explicit bound state and an exact binding value, and
+  only when its disposition is not UNKNOWN/REPLACE/RETIRE. A KEEP/WRAP/EXTRACT
+  row is not sufficient without that evidence and is never a promotion claim
+  by itself. A missing, unbound, empty or out-of-taxonomy element refuses the
+  row, and a nonproduction admitted use is refused because the I15.9 evidence
+  set is a production-artifact requirement set.
+
+A qualified row reached by a real edge is the only case in which an edge onto an
+inventoried package is admitted; every other edge, and any inventoried package
+present in the root `Cargo.lock`, still fails closed — membership in the root
+workspace deletes the row instead of qualifying it.
 
 Discovery never trusts the inventory: the denominator is derived from the tree
 with the same rule as scripts/verify-standalone-crates.py. The declared
@@ -44,14 +62,16 @@ silently.
 The decision is emitted as a retained, versioned receipt
 (`--receipt-out`, default `.eliot/excluded-dispositions/gate-receipt.json`,
 a gitignored output path) naming the exact denominator (package and path, with
-the count the gate computed) and the source/build identity it decided against:
-source commit and repository, root manifest, Cargo.lock, build toolchain,
-inventory and verifier digests, per-package byte digests, every resolved
-consumer edge, the I15.9 production-artifact evidence names, and the result.
-`--receipt` re-validates a retained receipt against the current identity at the
-owned pre-publication boundary: a changed source commit, lock, toolchain,
-inventory, verifier, trust class or package byte invalidates it, and a receipt
-whose cache namespace crosses trust classes is refused.
+the count the gate computed), the admission vocabulary with its admitted set, and
+the source/build identity it decided against: source commit and repository, root
+manifest, Cargo.lock, build toolchain, inventory and verifier digests,
+per-package byte digests, every resolved consumer edge, the I15.9
+production-artifact evidence names with a computed per-element state, and the
+result. `--receipt` re-validates a retained receipt against the current identity
+at the owned pre-publication boundary: a changed source commit, lock, toolchain,
+inventory, verifier, trust class, package byte, admission state or admitted set
+invalidates it, and a receipt whose cache namespace crosses trust classes is
+refused.
 """
 
 from __future__ import annotations
@@ -85,8 +105,104 @@ RECEIPT_SCHEMA = "eliot.excluded-disposition-gate-receipt.v1"
 RECEIPT_OUT_REL = Path(".eliot/excluded-dispositions/gate-receipt.json")
 RECEIPT_RECHECK_REL = Path(".eliot/excluded-dispositions/gate-recheck-receipt.json")
 EVIDENCE = "provenance, lock, toolchain, license, SBOM"
-ADMISSION_POLICY = "deny-all"
+# Supply-chain admission vocabulary (issue #1811, item A4). The vocabulary lives
+# in the inventory and is re-read from it on every run, so the inventory, this
+# gate and the release seam cannot disagree about which admission states exist.
+# `deny-all` is the deny marker; `evidence-qualified` is the one admitted route
+# for an intentionally consumed separate package. No row is admitted today, so
+# the live policy is the deny marker and nothing here invents an evidence record
+# for a package that has none.
+DENY_MARKER = "deny-all"
+EVIDENCE_ADMISSION = "evidence-qualified"
+ADMISSION_STATES_KEY = "allowed_admission_states"
+ADMISSION_EVIDENCE_STATE_KEY = "evidence_qualified_state"
+ADMISSION_EVIDENCE_COUNT_KEY = "evidence_qualified_package_count"
+SUPPLY_CHAIN_ADMISSION_KEY = "supply_chain_admission"
+SUPPLY_CHAIN_EVIDENCE_KEY = "supply_chain_evidence"
+# The admitted-value a deny-state row's `evidence_reference` must still carry:
+# the same declaration as `supply_chain_admission`, kept as its own key.
 EVIDENCE_REFERENCE = "deny-all"
+# I15.9's evidence set is a *production* artifact requirement set, so an admitted
+# row must declare a production use; a fixture, documentation or tool-only use
+# cannot be qualified by it.
+EVIDENCE_BOUND = "bound"
+EVIDENCE_ADMITTED_USES = ("production",)
+# UNKNOWN/REPLACE/RETIRE are never a production input (issue #1811 acceptance),
+# whatever evidence a row presents.
+NON_PRODUCTION_DISPOSITIONS = frozenset({"UNKNOWN", "REPLACE", "RETIRE"})
+# Every element an evidence-qualified row must bind, with the governing source
+# for each. I15.9 names the production-artifact evidence set; I15.17 adds the
+# exact build inputs and the trust/cache identity; I2.18 defines the
+# BuildFingerprint; I15.19 requires authenticated origin rather than a digest
+# alone. Each must be present as a table with `state = "bound"` and an exact
+# binding value.
+REQUIRED_EVIDENCE = (
+    "source_identity",  # repository, commit and source tree (I15.9, I15.19)
+    "independent_lock",  # the package's own lockfile, not the root one (I15.9)
+    "build_fingerprint",  # toolchain, target, profile, features (I15.17, I2.18)
+    "license",  # license report and decision (I15.9)
+    "advisory",  # known vulnerabilities and exceptions (I15.9)
+    "sbom",  # SBOM (I15.9)
+    "artifact_hash",  # artifact hash (I15.9)
+    "artifact_signature",  # artifact signature / origin attestation (I15.9, I15.19)
+    "test_canary",  # test and canary receipts (I15.9, I2.18)
+    "owner",  # named owner (I15.9)
+    "rollback",  # rollback / owner-approved removal boundary (I15.9)
+    "trust_class",  # I15.17 build trust class
+    "cache_namespace",  # I15.17 dedicated target/cache namespace
+    "admitted_use",  # the admitted use class; only a production use qualifies
+)
+# How each required element maps onto the I15.9 production-artifact evidence
+# names the receipt already carries, and who owns the elements this gate does not
+# itself produce.
+EVIDENCE_TO_I15_9 = {
+    "source_identity": "source_commit_and_repository",
+    "independent_lock": "cargo_lock_and_build_toolchain",
+    "build_fingerprint": "cargo_lock_and_build_toolchain",
+    "license": "license_report",
+    "advisory": "known_vulnerabilities_and_exceptions",
+    "sbom": "sbom",
+    "artifact_hash": "artifact_hash_and_signature",
+    "artifact_signature": "artifact_hash_and_signature",
+    "test_canary": "test_canary_receipts",
+    "owner": "owner",
+    "rollback": "rollback",
+}
+I15_9_EVIDENCE_ORDER = (
+    "source_commit_and_repository",
+    "cargo_lock_and_build_toolchain",
+    "license_report",
+    "sbom",
+    "artifact_hash_and_signature",
+    "module_manifest",
+    "test_canary_receipts",
+    "known_vulnerabilities_and_exceptions",
+    "owner",
+    "rollback",
+)
+I15_9_ELEMENT_OWNERS = {
+    "license_report": "scripts/verify-dependency-policy.py",
+    "sbom": (
+        "release build plan; generated SBOM stays out of Git per "
+        "docs/DEPENDENCY_POLICY.md"
+    ),
+    "artifact_hash_and_signature": (
+        "scripts/build-eliot-windows-x64-release.ps1 (RELEASE.json, SHA256SUMS.json)"
+    ),
+    "module_manifest": "per-crate module.toml manifests",
+    "test_canary_receipts": "crates/instrument/eliot-build-test-graph (BuildTestGraph, I2.18)",
+    "known_vulnerabilities_and_exceptions": "scripts/verify-dependency-policy.py advisory snapshot",
+}
+# The two computed per-element states: what this decision actually bound itself,
+# and an element this gate only routes to its owner. Neither is a placeholder
+# record for evidence the gate does not hold.
+EVIDENCE_STATE_BOUND = "bound-by-this-gate"
+EVIDENCE_STATE_OWNER = "named-owner-not-verified-by-this-gate"
+ROLLBACK_DECLARATION = (
+    "a package leaves this receipt by moving into the root workspace "
+    "(its [[crate]] row is deleted in the same change) or by an "
+    "owner-approved removal; an inventory row is never a package deletion"
+)
 # I15.17 build trust classes. The receipt binds a trust class because I15.17
 # requires that "cache identity includes trust class and source/lock/toolchain
 # fingerprints" and that "artifact reuse across trust classes or mismatched
@@ -526,6 +642,167 @@ def line_tokens(line: str) -> list[str]:
     return [token for token in tokens if token]
 
 
+def read_admission_vocabulary(data: dict, failures: list[str]) -> tuple[list[str], str]:
+    """The admission states the inventory itself declares.
+
+    The inventory is the owner of the vocabulary, not this gate: reading it back
+    means a row cannot claim a state the inventory never declared, and a
+    vocabulary that loses either the deny marker or the evidence-qualified state
+    fails closed instead of silently admitting whatever remains.
+    """
+    states = data.get(ADMISSION_STATES_KEY)
+    if (
+        not isinstance(states, list)
+        or not states
+        or not all(isinstance(state, str) and state.strip() for state in states)
+    ):
+        failures.append(
+            f"{ADMISSION_STATES_KEY} must be a non-empty list of admission state "
+            f"names, got {states!r}"
+        )
+        return [], EVIDENCE_ADMISSION
+    normalized = [str(state).strip() for state in states]
+    if len(set(normalized)) != len(normalized):
+        failures.append(f"duplicate admission states: {normalized}")
+    if DENY_MARKER not in normalized:
+        failures.append(
+            f"the admission vocabulary must declare the deny marker "
+            f"{DENY_MARKER!r}: {normalized}"
+        )
+    evidence_state = str(data.get(ADMISSION_EVIDENCE_STATE_KEY, "")).strip()
+    if evidence_state not in normalized:
+        failures.append(
+            f"{ADMISSION_EVIDENCE_STATE_KEY} {evidence_state!r} is not one of the "
+            f"declared admission states {normalized}"
+        )
+    return normalized, evidence_state or EVIDENCE_ADMISSION
+
+
+def qualify_evidence(path: str, row: dict, evidence_state: str) -> tuple[list[str], dict[str, str]]:
+    """Check one evidence-qualified row's evidence table element by element.
+
+    Returns the refusals and the bindings the row actually presented. A row is
+    not qualified by the presence of the table: every element must be present,
+    bound, and bound to an exact value, and a trust class outside I15.17's own
+    taxonomy or an admitted use that is not a production use refuses the row.
+    """
+    table = row.get(SUPPLY_CHAIN_EVIDENCE_KEY)
+    if not isinstance(table, dict):
+        return (
+            [
+                f"{path}: supply_chain_admission {evidence_state!r} requires a "
+                f"[crate.{SUPPLY_CHAIN_EVIDENCE_KEY}] table binding every element "
+                f"{list(REQUIRED_EVIDENCE)}"
+            ],
+            {},
+        )
+    refusals: list[str] = []
+    bindings: dict[str, str] = {}
+    for element in REQUIRED_EVIDENCE:
+        entry = table.get(element)
+        if not isinstance(entry, dict):
+            refusals.append(f"{path}: evidence element {element!r} is missing or is not a table")
+            continue
+        state = str(entry.get("state", "")).strip()
+        binding = str(entry.get("binding", "")).strip()
+        if state != EVIDENCE_BOUND:
+            refusals.append(
+                f"{path}: evidence element {element!r} must be {EVIDENCE_BOUND!r}, got {state!r}"
+            )
+        elif not binding:
+            refusals.append(
+                f"{path}: evidence element {element!r} is {EVIDENCE_BOUND!r} with no binding value"
+            )
+        elif element == "trust_class" and binding not in TRUST_CLASSES:
+            refusals.append(
+                f"{path}: evidence element 'trust_class' binds {binding!r}, which is not an "
+                f"I15.17 build trust class {list(TRUST_CLASSES)}"
+            )
+        elif element == "admitted_use" and binding not in EVIDENCE_ADMITTED_USES:
+            refusals.append(
+                f"{path}: evidence element 'admitted_use' binds {binding!r}, which is not a "
+                f"production use {list(EVIDENCE_ADMITTED_USES)}"
+            )
+        else:
+            bindings[element] = binding
+    undeclared = sorted(set(table) - set(REQUIRED_EVIDENCE))
+    if undeclared:
+        refusals.append(
+            f"{path}: evidence table names elements this gate neither requires nor binds: "
+            f"{undeclared}"
+        )
+    return refusals, bindings
+
+
+def admission_decision(
+    path: str,
+    row: dict,
+    states: list[str],
+    evidence_state: str,
+) -> tuple[dict, list[str]]:
+    """The gate's own supply-chain admission decision for one inventoried row.
+
+    The deny marker is a decision, not a failure: a package declared deny-all is
+    simply not a product input, and the consumer/lock checks below refuse any
+    edge that contradicts that. Only a row that claims the evidence-qualified
+    state, or that claims a state the inventory never declared, can fail here.
+    """
+    package = str(row.get("package", ""))
+    state = str(row.get(SUPPLY_CHAIN_ADMISSION_KEY, "")).strip()
+    reference = str(row.get("evidence_reference", "")).strip()
+    decision = {
+        "path": path,
+        "package": package,
+        "state": state,
+        "decision": "denied",
+        "evidence": {},
+        "required_elements": list(REQUIRED_EVIDENCE),
+        "unbound_elements": list(REQUIRED_EVIDENCE),
+        "reasons": [],
+    }
+    if state == DENY_MARKER:
+        # `evidence_reference` stays the same declaration for a deny-state row:
+        # a row that claims anything else is refused rather than implying an
+        # evidence record that does not exist.
+        if reference != EVIDENCE_REFERENCE:
+            decision["reasons"] = [
+                f"supply_chain_admission {DENY_MARKER!r} requires "
+                f"evidence_reference {EVIDENCE_REFERENCE!r}, got {reference!r}"
+            ]
+            return decision, [f"{path}: {decision['reasons'][0]}"]
+        decision["reasons"] = [
+            f"supply_chain_admission {DENY_MARKER!r}: not an admitted separate-package input"
+        ]
+        return decision, []
+    if state != evidence_state:
+        return decision, [
+            f"{path}: supply_chain_admission {state!r} is not a declared admission state "
+            f"{states}"
+        ]
+    refusals, bindings = qualify_evidence(path, row, evidence_state)
+    disposition = str(row.get("disposition", "")).strip()
+    if disposition in NON_PRODUCTION_DISPOSITIONS:
+        refusals.append(
+            f"{path}: disposition {disposition} is never admissible as a production input"
+        )
+    if not reference or reference == EVIDENCE_REFERENCE:
+        refusals.append(
+            f"{path}: supply_chain_admission {evidence_state!r} requires an "
+            f"evidence_reference naming the qualifying evidence record, got {reference!r}"
+        )
+    unbound = [element for element in REQUIRED_EVIDENCE if element not in bindings]
+    decision["unbound_elements"] = unbound
+    decision["evidence"] = bindings
+    if refusals:
+        decision["reasons"] = refusals
+        return decision, refusals
+    decision["decision"] = "admitted"
+    decision["reasons"] = [
+        f"supply_chain_admission {evidence_state!r}: every required element is bound"
+    ]
+    return decision, []
+
+
 def locked_packages(root: Path, package_names: set[str]) -> list[str]:
     lock = root / LOCK_REL
     if not lock.is_file():
@@ -597,6 +874,69 @@ def source_identity(root: Path) -> dict:
     }
 
 
+def build_admission_block(
+    states: list[str],
+    evidence_state: str,
+    decisions: list[dict],
+) -> dict:
+    """The admission decision the receipt carries and the cache namespace binds.
+
+    `qualified` holds one decision per row that claimed the evidence-qualified
+    state, whether or not it qualified, so a refused row is retained as a
+    refusal rather than disappearing. `admitted_packages` is the set a release
+    build is allowed to treat as an intentionally consumed separate package; it
+    is empty unless a row presented a complete, bound evidence table.
+    """
+    qualified = [decision for decision in decisions if decision["state"] == evidence_state]
+    admitted = sorted(
+        decision["package"] for decision in qualified if decision["decision"] == "admitted"
+    )
+    return {
+        "deny_marker": DENY_MARKER,
+        "declared_states": list(states),
+        "evidence_qualified_state": evidence_state,
+        "required_evidence_elements": list(REQUIRED_EVIDENCE),
+        "policy": EVIDENCE_ADMISSION if admitted else DENY_MARKER,
+        "admitted_packages": admitted,
+        "qualified": qualified,
+        "denied_packages": sorted(
+            decision["package"] for decision in decisions if decision["decision"] == "denied"
+        ),
+    }
+
+
+def production_artifact_evidence(admission: dict) -> dict:
+    """I15.9's production-artifact evidence with a computed per-element state.
+
+    An element is `bound-by-this-gate` only when this decision really holds a
+    binding for it: the gate's own computed inputs, or a binding an
+    evidence-qualified row presented and this gate checked element by element. An
+    element the gate merely routes to its owner is reported as that owner's
+    evidence, so the receipt never presents a record it did not produce.
+    """
+    bound: dict[str, str] = {
+        "source_commit_and_repository": "inputs.source",
+        "cargo_lock_and_build_toolchain": "inputs.cargo_lock, inputs.rust_toolchain",
+        "owner": "denominator.packages[].owner",
+    }
+    for decision in admission.get("qualified", []):
+        for element, binding in sorted(decision.get("evidence", {}).items()):
+            name = EVIDENCE_TO_I15_9.get(element)
+            if name is not None:
+                bound.setdefault(
+                    name, f"admission.qualified[{decision['package']}].{element} = {binding}"
+                )
+    block: dict[str, dict] = {}
+    for name in I15_9_EVIDENCE_ORDER:
+        if name in bound:
+            block[name] = {"state": EVIDENCE_STATE_BOUND, "binding": bound[name]}
+        elif name == "rollback":
+            block[name] = {"state": "declared", "value": ROLLBACK_DECLARATION}
+        else:
+            block[name] = {"state": EVIDENCE_STATE_OWNER, "owner": I15_9_ELEMENT_OWNERS[name]}
+    return block
+
+
 def build_receipt(
     root: Path,
     data: dict,
@@ -604,6 +944,9 @@ def build_receipt(
     edges: list[dict],
     locked: list[str],
     trust_class: str,
+    states: list[str],
+    evidence_state: str,
+    decisions: list[dict],
 ) -> dict:
     members, exclude = workspace_sets(root)
     rows = {str(row.get("path")): row for row in data.get("crate", [])}
@@ -615,9 +958,13 @@ def build_receipt(
             "disposition": str(rows.get(path, {}).get("disposition", "")),
             "owner": str(rows.get(path, {}).get("owner", "")),
             "evidence_reference": str(rows.get(path, {}).get("evidence_reference", "")),
+            "supply_chain_admission": str(
+                rows.get(path, {}).get(SUPPLY_CHAIN_ADMISSION_KEY, "")
+            ),
         }
         for path in sorted(inventory)
     ]
+    admission = build_admission_block(states, evidence_state, decisions)
     inputs = {
         "source": source_identity(root),
         "root_manifest": file_evidence(root, ROOT_MANIFEST_REL),
@@ -639,6 +986,10 @@ def build_receipt(
             },
             "consumer_edges": edges,
             "locked_standalone_packages": locked,
+            # The admission decision is inside the hashed identity, so flipping a
+            # row's admission state, dropping a binding or changing the admitted
+            # set invalidates the retained receipt instead of reusing it.
+            "admission": admission,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -649,7 +1000,8 @@ def build_receipt(
         "issue": 1811,
         "generator": GATE_REL.as_posix(),
         "trust_class": trust_class,
-        "admission_policy": ADMISSION_POLICY,
+        "admission_policy": admission["policy"],
+        "admission": admission,
         "inputs": inputs,
         "denominator": {
             "rule": (
@@ -691,47 +1043,20 @@ def build_receipt(
                 "docs/architecture/I15-09-source-admission-and-executable-supply-chain.md"
                 "#executable-module-supply-chain"
             ),
-            "source_commit_and_repository": {"state": "bound", "binding": "inputs.source"},
-            "cargo_lock_and_build_toolchain": {
-                "state": "bound",
-                "binding": "inputs.cargo_lock, inputs.rust_toolchain",
-            },
-            "license_report": {
-                "state": "not-produced-by-this-gate",
-                "owner": "scripts/verify-dependency-policy.py",
-            },
-            "sbom": {
-                "state": "not-produced-by-this-gate",
-                "owner": "release build plan; generated SBOM stays out of Git per docs/DEPENDENCY_POLICY.md",
-            },
-            "artifact_hash_and_signature": {
-                "state": "not-produced-by-this-gate",
-                "owner": "scripts/build-eliot-windows-x64-release.ps1 (RELEASE.json, SHA256SUMS.json)",
-            },
-            "module_manifest": {
-                "state": "not-produced-by-this-gate",
-                "owner": "per-crate module.toml manifests",
-            },
-            "test_canary_receipts": {
-                "state": "not-produced-by-this-gate",
-                "owner": "crates/instrument/eliot-build-test-graph (BuildTestGraph, I2.18)",
-            },
-            "known_vulnerabilities_and_exceptions": {
-                "state": "not-produced-by-this-gate",
-                "owner": "scripts/verify-dependency-policy.py advisory snapshot",
-            },
-            "owner": {"state": "bound", "binding": "denominator.packages[].owner"},
-            "rollback": {
-                "state": "declared",
-                "value": (
-                    "a package leaves this receipt by moving into the root workspace "
-                    "(its [[crate]] row is deleted in the same change) or by an "
-                    "owner-approved removal; an inventory row is never a package deletion"
-                ),
-            },
+            **production_artifact_evidence(admission),
         },
         "cache_namespace": "sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest(),
     }
+
+
+def summarize_admission_field(value) -> str:
+    """A short description of one admission field for a refusal message."""
+    if isinstance(value, list):
+        if value and isinstance(value[0], dict):
+            names = sorted(str(item.get("package", "")) for item in value)
+            return f"{len(value)} decision(s) for {names}"
+        return f"{len(value)} entr{'y' if len(value) == 1 else 'ies'}: {value}"
+    return repr(value)
 
 
 def recheck_receipt(root: Path, prior_path: Path, receipt: dict, failures: list[str]) -> None:
@@ -762,6 +1087,23 @@ def recheck_receipt(root: Path, prior_path: Path, receipt: dict, failures: list[
             "inventory, verifier, trust class or package byte identity "
             f"(retained {prior.get('cache_namespace')} vs current {receipt['cache_namespace']})"
         )
+    # The admission decision is refused explicitly as well as through the cache
+    # namespace: a receipt that admitted a separate package under one evidence
+    # binding must not authorise a build whose row, bindings or admitted set
+    # differ.
+    if prior.get("admission_policy") != receipt["admission_policy"]:
+        failures.append(
+            "retained gate receipt admission policy differs from the current decision "
+            f"(retained {prior.get('admission_policy')!r} vs current {receipt['admission_policy']!r})"
+        )
+    prior_admission = prior.get("admission") if isinstance(prior.get("admission"), dict) else {}
+    for field in ("declared_states", "admitted_packages", "qualified", "denied_packages"):
+        if prior_admission.get(field) != receipt["admission"][field]:
+            failures.append(
+                f"retained gate receipt admission.{field} differs from the current decision "
+                f"(retained {summarize_admission_field(prior_admission.get(field))} vs current "
+                f"{summarize_admission_field(receipt['admission'][field])})"
+            )
     for field in ("inputs", "denominator", "consumer_edges", "locked_standalone_packages"):
         if prior.get(field) != receipt[field]:
             failures.append(f"retained gate receipt {field} differs from the current decision")
@@ -853,41 +1195,73 @@ def main() -> int:
                 "standalone_package_count drift: declared "
                 f"{declared_count} vs {len(discovered)} discovered standalone packages"
             )
-    # 3. every row: disposition verb + named owner + declared admission state
+    # 2c. the declared evidence-qualified row count, and the admission
+    #     vocabulary the rows are read against.
+    states, evidence_state = read_admission_vocabulary(data, failures)
+    declared_evidence_rows = data.get(ADMISSION_EVIDENCE_COUNT_KEY)
+    evidence_rows = [
+        path
+        for path, row in by_path.items()
+        if str(row.get(SUPPLY_CHAIN_ADMISSION_KEY, "")).strip() == evidence_state
+    ]
+    if isinstance(declared_evidence_rows, bool) or not isinstance(declared_evidence_rows, int):
+        failures.append(
+            f"{ADMISSION_EVIDENCE_COUNT_KEY} must be an integer, got "
+            f"{declared_evidence_rows!r}"
+        )
+    elif declared_evidence_rows != len(evidence_rows):
+        failures.append(
+            f"{ADMISSION_EVIDENCE_COUNT_KEY} drift: declared "
+            f"{declared_evidence_rows} vs {len(evidence_rows)} rows declaring "
+            f"supply_chain_admission {evidence_state!r}"
+        )
+    # 3. every row: disposition verb + named owner + its admission decision
+    decisions: list[dict] = []
     for path in sorted(by_path):
         row = by_path[path]
         disp = str(row.get("disposition", "")).strip()
         owner = str(row.get("owner", "")).strip()
-        evidence = str(row.get("evidence_reference", "")).strip()
         if disp not in ALLOWED:
             failures.append(f"{path}: disposition must be one of {sorted(ALLOWED)}, got {disp!r}")
         if not owner:
             failures.append(f"{path}: owner must be a named non-empty value")
-        if evidence != EVIDENCE_REFERENCE:
-            failures.append(
-                f"{path}: evidence_reference {evidence!r} is not the admitted "
-                f"{EVIDENCE_REFERENCE!r} state; this gate admits no evidence-qualified "
-                "separate-package route"
-            )
         if row.get("package") != discovered.get(path, row.get("package")):
             failures.append(f"{path}: package name drift vs tree")
-    # 4. fail-closed consumption without evidence
+        decision, refusals = admission_decision(path, row, states, evidence_state)
+        decisions.append(decision)
+        failures.extend(refusals)
+    # 4. fail-closed consumption without evidence. A qualified row is the only
+    #    package an edge may reach; every other edge still fails closed.
     inventory = discovered or {str(r.get("path")): str(r.get("package")) for r in rows}
     edges = find_consumers(root, inventory)
-    if edges:
+    admitted_paths = {
+        decision["path"] for decision in decisions if decision["decision"] == "admitted"
+    }
+    unevidenced_edges = [edge for edge in edges if edge["package_path"] not in admitted_paths]
+    if unevidenced_edges:
         failures.append(
             "undeclared excluded-input consumption without "
             f"{EVIDENCE} evidence: "
             + "; ".join(
                 f"{edge['source']} {edge['kind']} [{edge['role']}] -> {edge['package']} ({edge['detail']})"
-                for edge in edges
+                for edge in unevidenced_edges
             )
         )
     locked = locked_packages(root, set(inventory.values()))
     if locked:
         failures.append(f"inventoried package present in root Cargo.lock without {EVIDENCE} evidence: {locked}")
 
-    receipt = build_receipt(root, data, inventory, edges, locked, args.trust_class)
+    receipt = build_receipt(
+        root,
+        data,
+        inventory,
+        edges,
+        locked,
+        args.trust_class,
+        states,
+        evidence_state,
+        decisions,
+    )
     if args.receipt is not None:
         recheck_receipt(root, args.receipt, receipt, failures)
         receipt["recheck_of"] = args.receipt.as_posix()
@@ -902,7 +1276,12 @@ def main() -> int:
             print(f"  - {failure}")
         print(f"  receipt={receipt_out.as_posix()} sha256={receipt_sha256} trust_class={args.trust_class}")
         return 1
-    print(f"EXCLUDED_DISPOSITIONS: PASS rows={total} consumers=0 locked=0")
+    print(
+        f"EXCLUDED_DISPOSITIONS: PASS rows={total} consumers={len(edges)} "
+        f"locked={len(locked)} "
+        f"admitted_separate_packages={len(receipt['admission']['admitted_packages'])} "
+        f"admission_policy={receipt['admission_policy']}"
+    )
     print(
         f"  receipt={receipt_out.as_posix()} sha256={receipt_sha256} "
         f"schema={RECEIPT_SCHEMA} trust_class={args.trust_class} "
