@@ -23,7 +23,7 @@ use eliot_wasm_runtime::{
 
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
 use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
-use crate::typed_bindings::{TypedWorld, export_matches_interface, typed_wit_digest};
+use crate::typed_bindings::{TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld, typed_wit_digest};
 
 const ENGINE_VERSION: &str = "47.0.4";
 const PROVIDER_STACK_SIZE: u64 = 8 * 1024;
@@ -128,6 +128,9 @@ pub enum TypedExecutionError {
         /// Stable reason code.
         reason: String,
     },
+    /// A selected interface or one of its descriptor/domain functions has
+    /// the wrong generated Wasmtime type.
+    ExportTypeMismatch(String),
     /// Missing or wrongly typed descriptor/domain export: the admitted
     /// method is absent (canonical introduction-required denial).
     MissingExport(String),
@@ -154,6 +157,7 @@ impl fmt::Display for TypedExecutionError {
             Self::GovernedAdmissionRequired => formatter.write_str("KERNEL_ADMISSION_REQUIRED"),
             Self::WorldUnknown(world) => write!(formatter, "WORLD_UNKNOWN:{world}"),
             Self::WorldSelection { reason } => write!(formatter, "WORLD_SELECTION:{reason}"),
+            Self::ExportTypeMismatch(name) => write!(formatter, "EXPORT_TYPE_MISMATCH:{name}"),
             Self::MissingExport(name) | Self::ForbiddenImport(name) => {
                 write!(formatter, "{CAPABILITY_INTRODUCTION_REQUIRED}:{name}")
             }
@@ -345,45 +349,11 @@ pub fn execute_describe_experimental(
     let component = wasmtime::component::Component::new(&engine, artifact)
         .map_err(|error| map_compile_error(&error))?;
 
-    // Pre-instantiation inspection: imports/exports before any invocation.
-    let component_type = component.component_type();
-    let imports: Vec<String> = component_type
-        .imports(&engine)
-        .map(|(name, _)| name.to_owned())
-        .collect();
-    if !imports.is_empty() {
-        let first = imports.first().cloned().unwrap_or_default();
-        let bounded: String = first.chars().take(96).collect();
-        return Err(TypedExecutionError::ForbiddenImport(bounded));
-    }
-    let exports: Vec<String> = component_type
-        .exports(&engine)
-        .map(|(name, _)| name.to_owned())
-        .collect();
-    // Absent-by-default (issue #21, A2): no export, or an export naming
-    // anything but the admitted interface, means the admitted method was
-    // never introduced — a canonical introduction-required denial naming
-    // the missing interface. Only genuinely ambiguous exports keep the
-    // world-selection code.
-    if exports.is_empty() {
-        return Err(TypedExecutionError::MissingExport(
-            world.interface_name().to_owned(),
-        ));
-    }
-    if exports.len() != 1 {
-        return Err(TypedExecutionError::WorldSelection {
-            reason: "ambiguous-exports".to_owned(),
-        });
-    }
-    let export_name = exports[0].clone();
-    if export_name == crate::typed_bindings::LEGACY_EXPORT || export_name == "run" {
-        return Err(TypedExecutionError::LegacyMismatch);
-    }
-    if !export_matches_interface(&export_name, world.interface_name()) {
-        return Err(TypedExecutionError::MissingExport(
-            world.interface_name().to_owned(),
-        ));
-    }
+    // Inspect the exact component type before any instance is created or any
+    // guest function is called. Generated bindings provide the expected WIT
+    // function signatures; the Wasmtime ComponentFunc type checker compares
+    // them against the compiled component metadata.
+    let (imports, exports) = preflight_component_type(world, &engine, &component)?;
 
     let (descriptor, usage) = dispatch_describe(world, &engine, &component, limits)?;
     let (output_digest, output_bytes) =
@@ -421,6 +391,186 @@ pub fn execute_describe_experimental(
         ),
     };
     Ok((receipt, descriptor))
+}
+
+fn preflight_component_type(
+    world: TypedWorld,
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+) -> Result<(Vec<String>, Vec<String>), TypedExecutionError> {
+    use wasmtime::component::types::ComponentItem;
+
+    let component_type = component.component_type();
+    let imports: Vec<String> = component_type
+        .imports(engine)
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    if let Some(import) = imports.first() {
+        let bounded: String = import.chars().take(96).collect();
+        return Err(TypedExecutionError::ForbiddenImport(bounded));
+    }
+
+    let exports: Vec<_> = component_type.exports(engine).collect();
+    if exports.is_empty() {
+        return Err(TypedExecutionError::MissingExport(
+            world.interface_name().to_owned(),
+        ));
+    }
+    if exports.len() != 1 {
+        return Err(TypedExecutionError::WorldSelection {
+            reason: "ambiguous-exports".to_owned(),
+        });
+    }
+
+    let (name, interface) = &exports[0];
+    if *name == crate::typed_bindings::LEGACY_EXPORT || *name == "run" {
+        return Err(TypedExecutionError::LegacyMismatch);
+    }
+    let package_interface = format!("{TYPED_PACKAGE_ID}/{}", world.interface_name());
+    let canonical_interface = format!(
+        "eliot:current/{0}@{TYPED_WIT_VERSION}",
+        world.interface_name()
+    );
+    let accepted_names = [
+        world.interface_name().to_owned(),
+        package_interface.clone(),
+        canonical_interface.clone(),
+    ];
+    if !accepted_names.iter().any(|candidate| candidate == name) {
+        return Err(TypedExecutionError::MissingExport(
+            world.interface_name().to_owned(),
+        ));
+    }
+
+    let ComponentItem::ComponentInstance(interface_type) = &interface.ty else {
+        return Err(TypedExecutionError::ExportTypeMismatch(
+            world.interface_name().to_owned(),
+        ));
+    };
+    let expected_exports = [
+        world.describe_func().to_owned(),
+        world.domain_func().to_owned(),
+    ];
+    for (name, item) in interface_type.exports(engine) {
+        if expected_exports.iter().any(|expected| expected == name) {
+            continue;
+        }
+        // WIT interface types may be exported alongside functions. Permit
+        // those generated type identities while rejecting extra callable or
+        // structural exports that are outside the selected world's contract.
+        if !matches!(item.ty, ComponentItem::Type(_) | ComponentItem::Resource(_)) {
+            return Err(TypedExecutionError::WorldSelection {
+                reason: "extra-interface-export".to_owned(),
+            });
+        }
+    }
+
+    let descriptor = component_function(interface_type, engine, world.describe_func())?;
+    let domain = component_function(interface_type, engine, world.domain_func())?;
+    typecheck_world_signatures(world, &descriptor, &domain, component)?;
+
+    Ok((imports, vec![(*name).to_owned()]))
+}
+
+fn typecheck_world_signatures(
+    world: TypedWorld,
+    descriptor: &wasmtime::component::types::ComponentFunc,
+    domain: &wasmtime::component::types::ComponentFunc,
+    component: &wasmtime::component::Component,
+) -> Result<(), TypedExecutionError> {
+    let component_type = component.component_type();
+    let type_context = &component_type.instance_type();
+    match world {
+        TypedWorld::ContextAdmission => {
+            use crate::typed_bindings::context_admission::exports::eliot::current::admission as wit;
+            descriptor
+                .typecheck::<(), (wit::AbiDescriptor,)>(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("describe".to_owned()))?;
+            domain
+                .typecheck::<
+                    (wit::AdmissionRequest,),
+                    (Result<wit::AdmissionResult, wit::AdmissionError>,),
+                >(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("admit".to_owned()))?;
+        }
+        TypedWorld::ContextAssembly => {
+            use crate::typed_bindings::context_assembly::exports::eliot::current::assembly as wit;
+            descriptor
+                .typecheck::<(), (wit::AbiDescriptor,)>(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("describe".to_owned()))?;
+            domain
+                .typecheck::<
+                    (wit::AssemblyRequest,),
+                    (Result<wit::AssemblyResult, wit::AssemblyError>,),
+                >(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("assemble".to_owned()))?;
+        }
+        TypedWorld::CueActivation => {
+            use crate::typed_bindings::cue_activation::exports::eliot::current::activation as wit;
+            descriptor
+                .typecheck::<(), (wit::AbiDescriptor,)>(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("describe".to_owned()))?;
+            domain
+                .typecheck::<
+                    (wit::ActivationRequest,),
+                    (Result<wit::ActivationOutcome, wit::ActivationError>,),
+                >(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("activate".to_owned()))?;
+        }
+        TypedWorld::DreamerHandler => {
+            use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler as wit;
+            descriptor
+                .typecheck::<(), (wit::AbiDescriptor,)>(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("describe".to_owned()))?;
+            domain
+                .typecheck::<
+                    (wit::ValidatedCandidate,),
+                    (Result<wit::HandlerOutcome, wit::HandlerError>,),
+                >(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("handle".to_owned()))?;
+        }
+        TypedWorld::MemoryCurationScreen => {
+            use crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen as wit;
+            descriptor
+                .typecheck::<(), (wit::AbiDescriptor,)>(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("describe".to_owned()))?;
+            domain
+                .typecheck::<
+                    (wit::ScreenRequest,),
+                    (Result<wit::ScreenOutcome, wit::ScreenError>,),
+                >(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("screen".to_owned()))?;
+        }
+        TypedWorld::DreamerCycle => {
+            use crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle as wit;
+            descriptor
+                .typecheck::<(), (wit::AbiDescriptor,)>(type_context)
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("describe".to_owned()))?;
+            domain
+                .typecheck::<(wit::CycleStepInput,), (Result<wit::CycleOutcome, wit::CycleError>,)>(
+                    type_context,
+                )
+                .map_err(|_| TypedExecutionError::ExportTypeMismatch("step".to_owned()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn component_function(
+    interface: &wasmtime::component::types::ComponentInstance,
+    engine: &wasmtime::Engine,
+    name: &str,
+) -> Result<wasmtime::component::types::ComponentFunc, TypedExecutionError> {
+    use wasmtime::component::types::ComponentItem;
+
+    let export = interface
+        .get_export(engine, name)
+        .ok_or_else(|| TypedExecutionError::MissingExport(name.to_owned()))?;
+    match export.ty {
+        ComponentItem::ComponentFunc(function) if !function.async_() => Ok(function),
+        _ => Err(TypedExecutionError::ExportTypeMismatch(name.to_owned())),
+    }
 }
 
 fn map_compile_error(error: &wasmtime::Error) -> TypedExecutionError {
