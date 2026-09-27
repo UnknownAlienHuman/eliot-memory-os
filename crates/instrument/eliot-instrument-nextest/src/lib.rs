@@ -66,7 +66,16 @@ impl NextestCommand {
             NEXTEST_LIBTEST_JSON_FORMAT_VERSION.to_owned(),
         ];
         for filter in filters {
-            arguments.push(checked_text(filter.clone(), "filter")?);
+            let filter = checked_text(filter.clone(), "filter")?;
+            // Trailing positionals are test selections, never flags: a
+            // filter that parses as a flag could redirect the actual build
+            // output away from the admitted target root (issue #1806).
+            if filter.starts_with('-') {
+                return Err(NextestError::Invocation(
+                    "filter must be a test selection, not a command flag".to_owned(),
+                ));
+            }
+            arguments.push(filter);
         }
         Ok(Self {
             executable: "cargo-nextest".to_owned(),

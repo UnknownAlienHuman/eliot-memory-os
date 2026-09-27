@@ -33,6 +33,7 @@ use uuid::Uuid;
 mod claim;
 mod nextest_partition;
 mod resources;
+mod target_layout;
 mod typed_evidence;
 
 pub use claim::{
@@ -43,6 +44,10 @@ pub use resources::{
     JobClass, NextestLanePlan, ResourceClaim, ResourceError, ResourceKind, ResourceLease,
     ResourceLeaseAllocator, ResourceWeight, SchedulingDecision, TestResourceProfile,
     scheduling_decision,
+};
+pub use target_layout::{
+    BoundTargetRoots, BuildClass, TARGET_LAYOUT_REVISION, TargetLayoutBinding,
+    bound_roots_conflict, derive_layout_path, verify_layout_binding,
 };
 pub use typed_evidence::{
     EphemeralSourceBytes, ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackPort,
@@ -618,7 +623,7 @@ pub fn testd_profile_environment(
     .map_err(|error| TestdError::Contract(error.to_string()))
 }
 
-fn is_binding_digest(value: &str) -> bool {
+pub(crate) fn is_binding_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -998,7 +1003,7 @@ fn default_job_class() -> JobClass {
     JobClass::Verification
 }
 
-fn validate_text(value: &str, field: &'static str) -> Result<(), TestdError> {
+pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), TestdError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(TestdError::Invalid {
             field,
@@ -1381,6 +1386,11 @@ pub struct TestJob {
     pub process: ProcessAdmission,
     /// Canonical roots retained for later execution/reconciliation checks.
     pub target_roots: TargetRoots,
+    /// Owner-issued workspace/checkout/class binding the roots were verified
+    /// against (issue #1806). `None` preserves the pre-binding authority for
+    /// rows admitted without a layout; it never selects a fallback root.
+    #[serde(default)]
+    pub target_layout: Option<TargetLayoutBinding>,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
     /// Declared job class. The class, not the raw `priority` integer, is the
@@ -1813,6 +1823,10 @@ pub struct TestdVerifierJobSubmission {
     pub project_id: String,
     pub invocation: InstrumentInvocation,
     pub target_roots: TargetRoots,
+    /// Owner-issued layout binding the roots resolve from, when the
+    /// submitting owner derived them from a workspace/checkout/class layout.
+    #[serde(default)]
+    pub target_layout: Option<TargetLayoutBinding>,
     pub priority: i32,
     /// Declared class and resource requirements for this verification job.
     /// A submission that omits it is a verification job with the default
@@ -2086,6 +2100,9 @@ impl TestdVerifierJobSubmission {
                 field: "invocation",
                 reason: "productive submission requires the registered TestD profile and no caller arguments",
             });
+        }
+        if let Some(layout) = self.target_layout.as_ref() {
+            layout.validate()?;
         }
         self.target_roots.validate()?;
         self.metadata.validate()
@@ -2615,6 +2632,9 @@ impl VerificationReceipt {
     /// Validates identity and exact raw-handle lineage before publication.
     pub fn validate(&self, job: &TestJob) -> Result<(), TestdError> {
         job.target_roots.validate()?;
+        if let Some(layout) = job.target_layout.as_ref() {
+            verify_layout_binding(&job.target_roots, layout)?;
+        }
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
         self.started_at
@@ -3742,6 +3762,38 @@ impl TestdStore {
             invocation,
             permit,
             target_roots,
+            None,
+            priority,
+            JobSubmissionMetadata::verification(),
+            at_ms,
+            None,
+        )
+    }
+
+    /// Admits one job whose roots were resolved from an owner-issued
+    /// workspace/checkout/class layout (issue #1806). The roots must verify
+    /// against the binding before the row commits; a missing safe root is a
+    /// typed refusal, never a fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_layout(
+        &self,
+        job_id: impl Into<String>,
+        project_id: impl Into<String>,
+        invocation: InstrumentInvocation,
+        permit: ProcessAdmissionPermit,
+        target_roots: TargetRoots,
+        target_layout: TargetLayoutBinding,
+        priority: i32,
+        metadata: JobSubmissionMetadata,
+        at_ms: u64,
+    ) -> Result<TestJob, TestdError> {
+        self.submit_inner(
+            job_id.into(),
+            project_id.into(),
+            invocation,
+            permit,
+            target_roots,
+            Some(target_layout),
             priority,
             metadata,
             at_ms,
@@ -3760,6 +3812,7 @@ impl TestdStore {
         invocation: InstrumentInvocation,
         permit: ProcessAdmissionPermit,
         target_roots: TargetRoots,
+        target_layout: Option<TargetLayoutBinding>,
         priority: i32,
         metadata: JobSubmissionMetadata,
         at_ms: u64,
@@ -3848,6 +3901,9 @@ impl TestdStore {
         let mut target_roots = target_roots;
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
+        if let Some(layout) = target_layout.as_ref() {
+            verify_layout_binding(&target_roots, layout)?;
+        }
         let digest = payload_digest(
             &invocation,
             &process,
@@ -3868,6 +3924,9 @@ impl TestdStore {
         if let Some(existing) = existing {
             let mut existing = existing.map_err(|error| TestdError::Corrupt(error.to_string()))?;
             if existing.payload_digest != digest {
+                return Err(TestdError::JobConflict(job_id));
+            }
+            if existing.target_layout != target_layout {
                 return Err(TestdError::JobConflict(job_id));
             }
             if let Some(identity) = identity {
@@ -3951,6 +4010,7 @@ impl TestdStore {
             invocation,
             process,
             target_roots,
+            target_layout,
             priority,
             job_class,
             resource_profile,
@@ -4028,6 +4088,7 @@ impl TestdStore {
             submission.invocation,
             permit,
             submission.target_roots,
+            submission.target_layout,
             submission.priority,
             submission.metadata,
             now,
@@ -4160,6 +4221,9 @@ impl TestdStore {
             .get(job_id)?
             .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
         job.target_roots.validate()?;
+        if let Some(layout) = job.target_layout.as_ref() {
+            verify_layout_binding(&job.target_roots, layout)?;
+        }
         let request = permit.request();
         request
             .validate()
@@ -4678,7 +4742,10 @@ fn payload_digest(
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn validate_root_identity(value: &str, field: &'static str) -> Result<PathBuf, TestdError> {
+pub(crate) fn validate_root_identity(
+    value: &str,
+    field: &'static str,
+) -> Result<PathBuf, TestdError> {
     validate_text(value, field)?;
     let path = Path::new(value);
     if !path.is_absolute() {
@@ -4770,7 +4837,7 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
-fn is_strict_descendant(path: &Path, parent: &Path) -> bool {
+pub(crate) fn is_strict_descendant(path: &Path, parent: &Path) -> bool {
     if path == parent {
         return false;
     }

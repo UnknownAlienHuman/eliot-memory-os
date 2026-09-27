@@ -84,6 +84,82 @@ pub enum InstrumentKind {
     Format,
 }
 
+/// Exact governed build-output class (issue #1806, I18.6 initial classes).
+///
+/// The class is the final path level of the canonical target layout
+/// `<build-root>/<workspace-id>/<checkout-id>/<build-class>`: distinct
+/// classes never share a mutable output root. Serialized form is the exact
+/// directory name. Classes merge only after measured lock/cache/memory
+/// evidence, never by string equality or local convenience.
+#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildClass {
+    /// Interactive development-loop builds.
+    Interactive,
+    /// Governed lint compilation.
+    Clippy,
+    /// Governed test execution.
+    Nextest,
+    /// Semantic analyzer indexes.
+    RustAnalyzer,
+    /// Coverage instrumentation runs.
+    Coverage,
+    /// Mutation testing runs.
+    Mutation,
+}
+
+impl BuildClass {
+    /// Exact directory name used as the final layout level.
+    #[must_use]
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Clippy => "clippy",
+            Self::Nextest => "nextest",
+            Self::RustAnalyzer => "rust-analyzer",
+            Self::Coverage => "coverage",
+            Self::Mutation => "mutation",
+        }
+    }
+
+    /// Parses an owner-issued class name; unknown names fail closed.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "interactive" => Some(Self::Interactive),
+            "clippy" => Some(Self::Clippy),
+            "nextest" => Some(Self::Nextest),
+            "rust-analyzer" => Some(Self::RustAnalyzer),
+            "coverage" => Some(Self::Coverage),
+            "mutation" => Some(Self::Mutation),
+            _ => None,
+        }
+    }
+
+    /// Selects the dedicated build class for an admitted stage kind.
+    ///
+    /// Only kinds with a canonical output owner resolve here. `None` means
+    /// the kind has no dedicated class: the stage either emits no build
+    /// output or requires an explicitly owner-issued class. Failing closed
+    /// here never silently merges a kind into a neighbor class.
+    #[must_use]
+    pub const fn for_instrument_kind(kind: InstrumentKind) -> Option<Self> {
+        match kind {
+            InstrumentKind::Build => Some(Self::Interactive),
+            InstrumentKind::Test => Some(Self::Nextest),
+            InstrumentKind::Lint => Some(Self::Clippy),
+            InstrumentKind::Inspect | InstrumentKind::Verify | InstrumentKind::Format => None,
+        }
+    }
+}
+
+/// Revision of the workspace/checkout/class target-layout derivation.
+///
+/// The revision versions the derivation table as a whole: a new revision
+/// re-derives every root under an explicit owner-reviewed migration, never
+/// by silently reinterpreting revision-1 components.
+pub const TARGET_LAYOUT_REVISION: u32 = 1;
+
 /// Execution status of an instrument stage, independent of semantic verdict.
 #[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

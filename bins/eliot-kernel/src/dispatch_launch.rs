@@ -119,12 +119,13 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
+    BuildClass, JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy,
-    TESTD_OWNER_SUBMIT_OPERATION, TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE,
-    TargetRoots, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse,
-    TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
-    testd_profile_binding, verification_receipt_sha256,
+    TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION, TESTD_OWNER_SUBMIT_WIRE_VERSION,
+    TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots, TestdOwnerSubmitDirective,
+    TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding,
+    TestdVerifierJobSubmission, derive_layout_path, issue_process_admission, testd_profile_binding,
+    verification_receipt_sha256, verify_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1347,21 +1348,54 @@ pub(crate) async fn submit_testd_owner_job(
             "Kernel TestD execution contour is not canonical".to_owned(),
         ));
     }
-    let target_root = contour_root.join(&job_digest);
-    std::fs::create_dir_all(&target_root)
+    // Issue #1806: resolve one owner-issued workspace/checkout/class layout
+    // before process admission. The admitted build root is today's contour
+    // from the installation mapping (a dedicated `%LOCALAPPDATA%\Eliot\build`
+    // mapping awaits the #1771 path-profile owner); workspace and checkout
+    // components derive deterministically from Governor-issued material, and
+    // the class comes from the admitted productive invocation kind. The same
+    // checkout and class always resolve to the same stable root — never a
+    // fresh directory per request — while distinct checkouts, including ones
+    // sharing a branch or commit, resolve apart.
+    let workspace_component =
+        TargetLayoutBinding::derive_workspace_component(&request.submission.project_id)
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let checkout_component =
+        TargetLayoutBinding::derive_checkout_component(&source_root.to_string_lossy())
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let build_class = BuildClass::for_instrument_kind(request.submission.invocation.kind)
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD submission kind has no admitted build class".to_owned(),
+            )
+        })?;
+    let target_layout = TargetLayoutBinding::new(
+        TARGET_LAYOUT_REVISION,
+        contour_root.to_string_lossy(),
+        workspace_component,
+        checkout_component,
+        build_class,
+        None,
+    )
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let layout_root = derive_layout_path(&target_layout)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    std::fs::create_dir_all(&layout_root)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    if std::fs::canonicalize(&target_root).ok().as_deref() != Some(target_root.as_path()) {
+    if std::fs::canonicalize(&layout_root).ok().as_deref() != Some(layout_root.as_path()) {
         return Err(DispatchLaunchError::Gate(
-            "Kernel TestD target root is not canonical".to_owned(),
+            "Kernel TestD layout root is not canonical".to_owned(),
         ));
     }
     let target_roots = TargetRoots::new(
         contour_root.to_string_lossy().into_owned(),
         source_root.to_string_lossy().into_owned(),
-        target_root.to_string_lossy().into_owned(),
-        target_root.to_string_lossy().into_owned(),
+        layout_root.to_string_lossy().into_owned(),
+        layout_root.to_string_lossy().into_owned(),
     )
     .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    verify_layout_binding(&target_roots, &target_layout)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let environment = request
         .process_tool
         .validate_for_roots(&target_roots.target_root, &target_roots.cache_root)
@@ -1445,6 +1479,7 @@ pub(crate) async fn submit_testd_owner_job(
         project_id: request.submission.project_id.clone(),
         invocation: request.submission.invocation.clone(),
         target_roots,
+        target_layout: Some(target_layout),
         priority: 0,
         // This is the Kernel's productive verifier launch: the job class is
         // verification, so it is ordered ahead of every background lane and

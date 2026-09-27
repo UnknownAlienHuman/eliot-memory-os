@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use eliot_contracts::{ModuleRuntimeClass, sha256_hex};
 use eliot_instrument_api::{
-    ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
+    BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
+    TARGET_LAYOUT_REVISION,
 };
 use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
 use eliot_process_executor::ExecutableObservation;
@@ -318,6 +319,32 @@ impl StageEvidence {
     }
 }
 
+/// Target-layout evidence recorded for one launched stage (issue #1806).
+///
+/// Resolved configuration (layout revision, build class from the admitted
+/// stage kind) stays separate from observed filesystem use (working
+/// directory and output roots sealed from the launch request). Workspace
+/// and checkout identities are recorded only when issued to this boundary;
+/// they are never inferred from branch names, paths, or caller strings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StageTargetLayout {
+    /// Layout derivation revision in force at launch.
+    pub layout_revision: u32,
+    /// Build class selected from the admitted stage kind, when the kind
+    /// has a dedicated class.
+    pub build_class: Option<BuildClass>,
+    /// Workspace identity, when issued to this boundary.
+    pub workspace_id: Option<String>,
+    /// Checkout (worktree) identity, when issued to this boundary.
+    pub checkout_id: Option<String>,
+    /// Working directory sealed from the launch request.
+    pub working_directory_observed: String,
+    /// `CARGO_TARGET_DIR` sealed from the launch request, when carried.
+    pub target_root_observed: Option<String>,
+    /// `CARGO_HOME` sealed from the launch request, when carried.
+    pub cache_root_observed: Option<String>,
+}
+
 /// One durable run record per stage (I16.17).
 ///
 /// The record binds the durable [`StageIdentity`], the owning plane, the
@@ -347,11 +374,16 @@ pub struct InstrumentRun {
     /// Candidate/configuration identity inherited from the stage plan, when
     /// this run belongs to a candidate-bound plan.
     pub candidate_identity: Option<String>,
+    /// Target-layout evidence sealed at launch, when the stage launched.
+    pub target_layout: Option<StageTargetLayout>,
 }
 
 impl InstrumentRun {
     /// Records a launched stage whose terminal observation is still owned by
     /// the supervising lane.
+    ///
+    /// `target_layout` carries the layout evidence sealed at launch; a stage
+    /// that launched without it records no layout claim.
     ///
     /// A malformed sealed operation identity fails closed into an explicit
     /// missing proof instead of an unbound launched run.
@@ -359,6 +391,7 @@ impl InstrumentRun {
         route: &TestExecutionPlaneRoute,
         operation_id: String,
         grant: &InstrumentAdmissionGrant,
+        target_layout: Option<StageTargetLayout>,
     ) -> Self {
         let Ok(stage) = route.stage().clone().bound(operation_id) else {
             return Self::missing(route, "sealed operation identity is malformed");
@@ -375,6 +408,7 @@ impl InstrumentRun {
             executable_digest: None,
             grant_digest: Some(grant.grant_digest.clone()),
             candidate_identity: None,
+            target_layout,
         }
     }
 
@@ -391,6 +425,7 @@ impl InstrumentRun {
             executable_digest: None,
             grant_digest: None,
             candidate_identity: None,
+            target_layout: None,
         }
     }
 
@@ -780,7 +815,19 @@ impl StageOrchestrator {
         match runner.launch(&mut binding, launcher.sink(planned)).await {
             Ok(receipt) => {
                 let operation = receipt.process.operation_id().as_str().to_owned();
-                InstrumentRun::launched(route, operation, &grant)
+                // Workspace/checkout identities are not issued to this
+                // boundary, so they stay explicitly absent: a declared but
+                // never-issued identity is never inferred into evidence.
+                let target_layout = StageTargetLayout {
+                    layout_revision: TARGET_LAYOUT_REVISION,
+                    build_class: planned.stage.build_class(),
+                    workspace_id: None,
+                    checkout_id: None,
+                    working_directory_observed: receipt.working_directory.clone(),
+                    target_root_observed: receipt.target_root_observed.clone(),
+                    cache_root_observed: receipt.cache_root_observed.clone(),
+                };
+                InstrumentRun::launched(route, operation, &grant, Some(target_layout))
             }
             Err(error) => InstrumentRun::missing(route, format!("stage launch failed: {error}")),
         }
