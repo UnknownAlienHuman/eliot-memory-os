@@ -113,6 +113,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::{
@@ -684,6 +685,75 @@ pub struct CanonicalComparisonPair {
     pub dimensions: Vec<CanonicalDimensionEntry>,
 }
 
+/// Confirms one commitment is bound to the position it is supplied for.
+///
+/// A commitment carries the handle it was issued for, so a mismatch means the
+/// evidence names a different position than the one being admitted.
+fn check_commitment_binding(
+    commitment: &SourceRecordCommitment,
+    source: &str,
+    field: &str,
+) -> Result<(), ConflictAnalysisError> {
+    if commitment.source() == source {
+        return Ok(());
+    }
+    Err(ConflictAnalysisError::Binding {
+        field: format!("{field}_commitment"),
+        detail: format!(
+            "commitment names source {} but is bound to comparison position {}",
+            redact(commitment.source()),
+            redact(source)
+        ),
+    })
+}
+
+/// Maps one caller-declared dimension onto the canonical orientation.
+///
+/// `swapped` is the single ordering decision taken by the pair. The values move
+/// with the source that declared them, so a mirrored declaration carrying the
+/// same associations yields the same outcome, and one carrying different
+/// associations does not.
+fn canonical_dimension_outcome(
+    entry: &DimensionComparison,
+    swapped: bool,
+) -> Result<CanonicalDimensionOutcome, ConflictAnalysisError> {
+    match &entry.outcome {
+        DimensionOutcome::Equal { value } => {
+            check_bounded_text(value, "comparison.equal", MAX_TEXT_BYTES)?;
+            Ok(CanonicalDimensionOutcome::Equal {
+                value: value.clone(),
+            })
+        }
+        DimensionOutcome::Differing { left, right } => {
+            check_bounded_text(left, "comparison.left_value", MAX_TEXT_BYTES)?;
+            check_bounded_text(right, "comparison.right_value", MAX_TEXT_BYTES)?;
+            if left == right {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "a differing dimension must state two distinct values, not {} twice",
+                        entry.dimension.as_str()
+                    ),
+                });
+            }
+            let (first_value, second_value) = if swapped {
+                (right.clone(), left.clone())
+            } else {
+                (left.clone(), right.clone())
+            };
+            Ok(CanonicalDimensionOutcome::Differing {
+                first_value,
+                second_value,
+            })
+        }
+        DimensionOutcome::Unnormalizable { reason } => {
+            check_bounded_text(reason, "comparison.unnormalizable", MAX_NOTE_BYTES)?;
+            Ok(CanonicalDimensionOutcome::Unnormalizable {
+                reason: reason.clone(),
+            })
+        }
+    }
+}
+
 impl CanonicalComparisonPair {
     /// Normalizes one caller declaration into its single canonical orientation.
     ///
@@ -708,26 +778,8 @@ impl CanonicalComparisonPair {
                 detail: "a comparison must name two distinct positions".to_owned(),
             });
         }
-        if left_commitment.source() != supplied.left_source {
-            return Err(ConflictAnalysisError::Binding {
-                field: "comparison.left_commitment".to_owned(),
-                detail: format!(
-                    "commitment names source {} but is bound to comparison position {}",
-                    redact(left_commitment.source()),
-                    redact(&supplied.left_source)
-                ),
-            });
-        }
-        if right_commitment.source() != supplied.right_source {
-            return Err(ConflictAnalysisError::Binding {
-                field: "comparison.right_commitment".to_owned(),
-                detail: format!(
-                    "commitment names source {} but is bound to comparison position {}",
-                    redact(right_commitment.source()),
-                    redact(&supplied.right_source)
-                ),
-            });
-        }
+        check_commitment_binding(left_commitment, &supplied.left_source, "comparison.left")?;
+        check_commitment_binding(right_commitment, &supplied.right_source, "comparison.right")?;
         if supplied.dimensions.len() != EXPECTED_COMPARISON_DIMENSIONS {
             return Err(ConflictAnalysisError::Denominator {
                 detail: format!(
@@ -769,46 +821,8 @@ impl CanonicalComparisonPair {
                     ),
                 });
             };
-            let outcome = match &entry.outcome {
-                DimensionOutcome::Equal { value } => {
-                    check_bounded_text(value, "comparison.equal", MAX_TEXT_BYTES)?;
-                    CanonicalDimensionOutcome::Equal {
-                        value: value.clone(),
-                    }
-                }
-                DimensionOutcome::Differing { left, right } => {
-                    check_bounded_text(left, "comparison.left_value", MAX_TEXT_BYTES)?;
-                    check_bounded_text(right, "comparison.right_value", MAX_TEXT_BYTES)?;
-                    if left == right {
-                        return Err(ConflictAnalysisError::Denominator {
-                            detail: format!(
-                                "a differing dimension must state two distinct values, not {} twice",
-                                dimension.as_str()
-                            ),
-                        });
-                    }
-                    // The values move with the source that declared them.
-                    let (first_value, second_value) = if swapped {
-                        (right.clone(), left.clone())
-                    } else {
-                        (left.clone(), right.clone())
-                    };
-                    CanonicalDimensionOutcome::Differing {
-                        first_value,
-                        second_value,
-                    }
-                }
-                DimensionOutcome::Unnormalizable { reason } => {
-                    check_bounded_text(reason, "comparison.unnormalizable", MAX_NOTE_BYTES)?;
-                    CanonicalDimensionOutcome::Unnormalizable {
-                        reason: reason.clone(),
-                    }
-                }
-            };
-            dimensions.push(CanonicalDimensionEntry {
-                dimension,
-                outcome,
-            });
+            let outcome = canonical_dimension_outcome(entry, swapped)?;
+            dimensions.push(CanonicalDimensionEntry { dimension, outcome });
         }
 
         let pair = Self {
@@ -829,7 +843,10 @@ impl CanonicalComparisonPair {
     /// same key as the pair it claims to be.
     #[must_use]
     pub fn canonical_key(&self) -> String {
-        let mut parts = vec![self.canonical_position_key(0), self.canonical_position_key(1)];
+        let mut parts = [
+            self.canonical_position_key(0),
+            self.canonical_position_key(1),
+        ];
         parts.sort_unstable();
         format!("{}|{}", parts[0], parts[1])
     }
@@ -937,13 +954,14 @@ impl CanonicalComparisonPair {
                 }
                 CanonicalDimensionOutcome::Unnormalizable { reason } => reason.clone(),
             };
-            key.push_str(&format!(
+            let _ = write!(
+                key,
                 "|{}:{}:{}:{}",
                 entry.dimension.as_str().len(),
                 entry.dimension.as_str(),
                 value.len(),
                 value
-            ));
+            );
         }
         key
     }
