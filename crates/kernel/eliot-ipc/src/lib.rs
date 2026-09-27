@@ -1296,7 +1296,7 @@ impl Session {
         })
     }
 
-    /// Performs the server-authoritative handshake and capability intersection.
+    /// Performs the server-authoritative handshake and rejects unsupported capability claims.
     pub fn establish_with_server(
         connection_id: impl Into<String>,
         peer: PeerIdentity,
@@ -1316,6 +1316,27 @@ impl Session {
             || client.launch_nonce != server.launch_nonce
         {
             return Err(TransportError::SessionFenced);
+        }
+        if client
+            .capabilities
+            .iter()
+            .any(|capability| !server.allowed_capabilities.contains(capability))
+        {
+            return Err(TransportError::Protocol(ProtocolError::InvalidField {
+                field: "client.capabilities",
+                reason: "must be a subset of server-admitted capabilities",
+            }));
+        }
+        if client
+            .module_contract
+            .required_capabilities
+            .iter()
+            .any(|capability| !server.allowed_capabilities.contains(capability))
+        {
+            return Err(TransportError::Protocol(ProtocolError::InvalidField {
+                field: "client.module_contract.required_capabilities",
+                reason: "must be a subset of server-admitted capabilities",
+            }));
         }
         let protocol_version = negotiate(client, server.protocol_range)?;
         let capabilities = intersection(&client.capabilities, &server.allowed_capabilities);
