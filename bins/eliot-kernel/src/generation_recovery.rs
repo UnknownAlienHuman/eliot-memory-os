@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use eliot_contracts::{AuthorityEpoch, StateFence};
+use eliot_contracts::StateFence;
 use eliot_ipc::ServerHandshakePolicy;
 use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::KernelService;
@@ -239,46 +239,42 @@ impl OrsGenerationCoordinator {
             observe_recovery("kernel.recovery.load_empty", "empty");
             return Ok(());
         }
-        let epoch_value = snapshots
+        // Current bindings are rebuilt from verified records, and the current
+        // tuple is the complete `(lineage_id, sequence)` of the most recently
+        // committed cutover in durable ORS order. A bare `max()` over sequences
+        // is undefined as soon as more than one lineage exists, and re-deriving
+        // that number on the service's own lineage would silently attach
+        // today's lineage to a record that never carried one. A row written
+        // before the typed migration no longer decodes, so it cannot reach here
+        // at all: a historical valid tuple never reactivates current authority.
+        let current = snapshots
             .iter()
-            .map(|snapshot| snapshot.record().new_epoch.value())
-            .max()
+            .max_by_key(|snapshot| snapshot.operation_order())
+            .map(|snapshot| snapshot.record().new_epoch.clone())
             .ok_or_else(|| "committed cutover projection was empty".to_owned())?;
         for snapshot in &snapshots {
-            let record = snapshot.record();
-            if record.state != GenerationCutoverState::Committed
-                || record.new_epoch.value() > epoch_value
-            {
+            if snapshot.record().state != GenerationCutoverState::Committed {
                 return Err("ORS route projection has invalid committed epochs".to_owned());
             }
         }
         observe_recovery("kernel.recovery.cutovers_validated", "success");
-        // Lineage-aware bridge (Implements #64): the durable ORS cutover record
-        // carries only the sequence, so it can never prove a lineage. The
-        // canonical service epoch keeps its own lineage and advances to the
-        // maximal committed sequence; `synchronize` fails closed on a lineage
-        // mismatch or a regression, and the rebuilt route table is then bound
-        // to that exact tuple rather than to a bare counter.
-        let current_lineage = service.authority_epoch().lineage_id.clone();
-        let canonical = eliot_contracts::EpochId::new(
-            current_lineage,
-            std::num::NonZeroU64::new(epoch_value)
-                .ok_or_else(|| "committed cutover epoch must be non-zero".to_owned())?,
-        )
-        .map_err(|error| error.to_string())?;
+        // The service keeps its own Host-approved lineage and refuses a
+        // cross-lineage or regressing target, so a record from a superseded
+        // lineage fails closed here instead of being adopted.
         service
-            .synchronize_authority_epoch(canonical)
+            .synchronize_authority_epoch(current)
             .map_err(|error| error.to_string())?;
         let active_epoch = service.authority_epoch();
         let mut recovered = GenerationRouter::at_epoch(active_epoch.clone());
         for snapshot in &snapshots {
             let record = snapshot.record();
-            // A committed record at any other sequence belongs to a superseded
-            // position in the epoch history. Adopting it here would replay a
-            // bare scalar into the current lineage, so it stays historical and
+            // A committed record for any other tuple — a pre-restore tuple, a
+            // superseded sequence, or a tuple from a lineage that is no longer
+            // active — belongs to epoch history only. Adopting it would replay
+            // history into the current binding, so it stays historical and
             // never becomes the active route.
             if record.state != GenerationCutoverState::Committed
-                || record.new_epoch.value() != active_epoch.sequence.get()
+                || !record.new_epoch.is_same_authority(&active_epoch)
             {
                 continue;
             }
@@ -334,12 +330,13 @@ impl OrsGenerationCoordinator {
             route_scope: decision.route_scope().as_str().to_owned(),
             old_generation: decision.old_generation(),
             new_generation: decision.new_generation(),
-            // The durable ORS record is still a scalar contour (W3 residual,
-            // #64): only the sequence is projected into it, and no
-            // authorization decision reads it back. The lineage-bearing
-            // decision stays in `decision` and in the live route table.
-            old_epoch: durable_epoch_projection(decision.old_epoch())?,
-            new_epoch: durable_epoch_projection(decision.new_epoch())?,
+            // The durable ORS record carries the complete typed tuples, so a
+            // reader can no longer lose the lineage. Nothing here narrows an
+            // `EpochId` to a sequence: the record written here is the same
+            // tuple the router advanced on, and every authorization decision
+            // still reads the live route table.
+            old_epoch: decision.old_epoch().clone(),
+            new_epoch: decision.new_epoch().clone(),
             state: GenerationCutoverState::Armed,
         };
         self.ors
@@ -369,20 +366,6 @@ impl OrsGenerationCoordinator {
         observations.cutover_applied = true;
         Ok(())
     }
-}
-
-/// Projects one lineage-aware epoch into the still-scalar durable ORS cutover
-/// record.
-///
-/// This is the only place a canonical epoch is narrowed to a bare counter, and
-/// it exists because [`RuntimeGenerationCutoverRecord`] is a durable contract
-/// that a versioned compatibility decoder (issue #64 W3) has not migrated yet.
-/// The projection is write-only: every read and every authorization decision
-/// in this file uses the complete [`eliot_contracts::EpochId`] tuple, so a
-/// sequence-only record can never decide lineage.
-fn durable_epoch_projection(epoch: &eliot_contracts::EpochId) -> Result<AuthorityEpoch, String> {
-    AuthorityEpoch::new(epoch.sequence.get())
-        .map_err(|error| format!("epoch projection is not representable: {error}"))
 }
 
 /// Older ORS databases predate the optional I14.14 ownership table. An absent
@@ -474,6 +457,7 @@ mod generation_recovery_diagnostics_tests {
 
     use super::*;
     use crate::{KernelComposition, KernelConfig, unix_ms};
+    use eliot_contracts::AuthorityEpoch;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 

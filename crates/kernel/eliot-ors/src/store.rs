@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
-    BridgeRecoveryWindowDisposition, HostCorrelationProjection, HostJsonRpcCorrelationId,
-    HostRequestLogicalKind, canonical_json_bytes, host_request_legacy_presence_key,
-    host_request_logical_key,
+    BridgeRecoveryWindowDisposition, EpochId, EpochRelation, EpochTransition,
+    HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
+    canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key,
 };
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
@@ -19906,7 +19906,13 @@ impl RedbRecoveryStore {
     fn generation_operational_input(
         record: &RuntimeGenerationCutoverRecord,
     ) -> Result<OperationalRecordInput, OrsError> {
-        let epoch = record.old_epoch.value();
+        // The ORS row's own `EpochIdentity` contour is a non-authoritative
+        // locator (A13.6: ORS holds no authority), so it keeps the sequence.
+        // Lineage is never inferred from it: the canonical fence below binds
+        // the complete typed tuple, which `StateFenceSnapshot::validate_against_epoch`
+        // reads back as an exact `(lineage_id, sequence)` match, and the
+        // payload digest covers the same tuple.
+        let epoch = record.old_epoch.sequence.get();
         let authority_epoch = EpochLineage {
             current: EpochIdentity {
                 lineage_id: OpaqueLabel::new("generation-cutover")?,
@@ -19918,7 +19924,7 @@ impl RedbRecoveryStore {
             &json!({
                 "cutover_id": record.cutover_id,
                 "route_scope": record.route_scope,
-                "authority_epoch": epoch,
+                "authority_epoch": record.old_epoch,
             }),
             epoch,
         )?;
@@ -20213,8 +20219,19 @@ impl RedbRecoveryStore {
             {
                 return Err(OrsError::InvalidTransition);
             }
-            if prior.new_epoch.value() > record.old_epoch.value()
-                || Some(prior.new_generation) != record.old_generation
+            // Scope fence: this scope's committed tuple may only be replaced by
+            // a tuple in its own lineage that is not older, because a live
+            // router re-fences a lagging scope to the current global tuple
+            // before cutting it over again. This is a fence-scope predecessor
+            // relation, NOT an authority grant: which tuple is currently active
+            // is decided by the exact global comparison below and, at dispatch,
+            // by the router's `is_same_authority`. A foreign lineage is
+            // unrelated and is denied here instead of being ordered by its
+            // number, and a backward step is denied too.
+            if !matches!(
+                record.old_epoch.relation_to(&prior.new_epoch),
+                EpochRelation::Same | EpochRelation::DirectParent | EpochRelation::SameLineageNewer
+            ) || Some(prior.new_generation) != record.old_generation
             {
                 return Err(OrsError::InvalidEpochLineage);
             }
@@ -20222,9 +20239,15 @@ impl RedbRecoveryStore {
             return Err(OrsError::InvalidEpochLineage);
         }
 
+        // The global current epoch is the tuple of the most recently committed
+        // cutover, read in the ORS operation order that already orders these
+        // rows. A `max()` over bare sequences is undefined as soon as more than
+        // one lineage exists: equal sequences from different lineages are
+        // unrelated, and a foreign lineage's larger number must never decide
+        // which tuple is current.
         let global_epoch = {
             let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
-            let mut maximum = None;
+            let mut latest: Option<(u64, EpochId)> = None;
             for row in current.iter().map_err(storage)? {
                 let (_, value) = row.map_err(storage)?;
                 let candidate: DurableOperationalRecord =
@@ -20239,20 +20262,29 @@ impl RedbRecoveryStore {
                             reason: "active generation route is not committed".to_owned(),
                         });
                     }
-                    maximum = Some(maximum.map_or(cutover.new_epoch.value(), |value: u64| {
-                        value.max(cutover.new_epoch.value())
-                    }));
+                    if latest
+                        .as_ref()
+                        .is_none_or(|(order, _)| candidate.operation_order > *order)
+                    {
+                        latest = Some((candidate.operation_order, cutover.new_epoch));
+                    }
                 }
             }
-            maximum
+            latest.map(|(_, epoch)| epoch)
         };
-        if let Some(global_epoch) = global_epoch
-            && record.old_epoch.value() != global_epoch
+        if let Some(global_epoch) = &global_epoch
+            && !record.old_epoch.is_same_authority(global_epoch)
         {
             return Err(OrsError::InvalidEpochLineage);
         }
-        if global_epoch.is_none() && record.old_epoch.value() != 1 {
-            return Err(OrsError::InvalidEpochLineage);
+        if global_epoch.is_none() {
+            // With no committed cutover anywhere, the first one starts from the
+            // genesis of its own lineage. No lineage is invented and no bare
+            // number is accepted as a stand-in for a missing lineage.
+            let genesis = EpochTransition::genesis(record.old_epoch.lineage_id.clone()).current;
+            if !record.old_epoch.is_same_authority(&genesis) {
+                return Err(OrsError::InvalidEpochLineage);
+            }
         }
 
         let committed = RuntimeGenerationCutoverRecord {

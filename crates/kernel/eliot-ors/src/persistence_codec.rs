@@ -686,7 +686,15 @@ impl PersistedValue for DurableOperationalRecord {
                 OperationalKind::GenerationTransition | OperationalKind::GenerationCutover
             ) || self.input.record_id != expected_record_id
                 || self.input.subject_id != expected_subject
-                || self.input.authority_epoch.current.epoch != record.old_epoch.value()
+                // The persisted fence carries the complete typed tuple, so a
+                // row whose input epoch is a bare sequence, or whose lineage
+                // disagrees with the record, is refused here rather than read
+                // back as current authority.
+                || self
+                    .input
+                    .state_fence
+                    .validate_against_epoch(&record.old_epoch)
+                    .is_err()
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: Self::RECORD_TYPE,
