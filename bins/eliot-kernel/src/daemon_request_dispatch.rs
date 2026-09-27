@@ -5700,9 +5700,19 @@ impl KernelComposition {
             eliot_kernel_service::WasmControlKind::Shutdown,
         )?;
         let cancelled = gateway
-            .cancel_with_origin_grant(&owner, operation.operation_id, &grant)
+            .cancel_with_origin_grant(&owner, operation.operation_id.clone(), &grant)
             .await
             .map_err(|_| TransportError::SessionFenced)?;
+        // CHILD-1/CHILD-2 (#1918): closing the kill produces the
+        // descendant-closure receipt as durable audit evidence. The kill
+        // receipt stays authoritative: a close fault keeps its own terminal
+        // diagnostic from the close boundary and never loses the kill.
+        if let Ok(receipt) = gateway
+            .close_registered_descendant(&owner, operation.operation_id.clone())
+            .await
+        {
+            self.audit_observe(AuditEventDraft::descendant_closure(&receipt));
+        }
         let mut value = serde_json::json!({
             "kind": "origin_control_kill",
             "grant": grant,

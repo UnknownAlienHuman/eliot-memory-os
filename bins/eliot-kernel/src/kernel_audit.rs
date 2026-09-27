@@ -339,6 +339,8 @@ impl AuditEventKind {
     pub const PROCESS_DEGRADED: &'static str = "process.degraded";
     /// Authenticated daemon failure was recorded.
     pub const PROCESS_FAILED: &'static str = "process.failed";
+    /// The descendant-closure receipt observed for one launched child.
+    pub const PROCESS_DESCENDANT_CLOSED: &'static str = "process.descendant_closed";
     /// Ordered safe shutdown was requested.
     pub const SHUTDOWN_DRAIN_REQUESTED: &'static str = "shutdown.drain_requested";
     /// The drain commit decision linearized.
@@ -376,6 +378,7 @@ impl AuditEventKind {
         Self::PROCESS_READY_PROVEN,
         Self::PROCESS_DEGRADED,
         Self::PROCESS_FAILED,
+        Self::PROCESS_DESCENDANT_CLOSED,
         Self::SHUTDOWN_DRAIN_REQUESTED,
         Self::SHUTDOWN_DRAIN_COMMITTED,
         Self::SHUTDOWN_TERMINAL_PUBLISHED,
@@ -1182,6 +1185,31 @@ impl AuditEventDraft {
             kind: AuditEventKind::PROCESS_LAUNCH_FAILED,
             lineage,
             body: serde_json::json!({"terminal_code": terminal_code}),
+        }
+    }
+
+    /// Returns the descendant-closure draft for one launched child
+    /// (CHILD-1/CHILD-2, #1918): the exact observed lifecycle and tree state,
+    /// never a success claim on its own. Crate-internal: the receipt shape is
+    /// a Kernel-internal projection, not exported audit API.
+    #[must_use]
+    pub(crate) fn descendant_closure(
+        receipt: &super::activation_lifecycle::DescendantClosureReceipt,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.controller = Some("kernel".to_owned());
+        Self {
+            kind: AuditEventKind::PROCESS_DESCENDANT_CLOSED,
+            lineage,
+            body: serde_json::json!({
+                "operation_id": receipt.operation_id().as_str(),
+                "owner_module": receipt.owner_module(),
+                "lifecycle": format!("{:?}", receipt.lifecycle()),
+                "cancellation": format!("{:?}", receipt.cancellation()),
+                "tree_terminated": receipt.tree_terminated(),
+                "all_closed": receipt.all_closed(),
+                "evidence_ref": receipt.evidence_ref(),
+            }),
         }
     }
 
