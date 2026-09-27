@@ -52,6 +52,16 @@
 //! defaulted, and no outcome here claims decryptability, isolated restore
 //! success or cutover authority.
 //!
+//! A closed set is a vocabulary, not a proof, so [`require_proven_claim`] also
+//! checks the COMPLETE relation between those members: a
+//! provenance-bound/class-qualified level or a `capture-owner-proven` archived
+//! fence REQUIRES the owner-issued capture receipt that proves it, a
+//! structural candidate REQUIRES that receipt's absence, and a level this
+//! surface cannot relate is refused rather than reported. A claim that fails
+//! that relation is reported as a [`BACKUP_STATE_REFUSED`] outcome naming the
+//! exact missing owner evidence, never as a verified archive and never
+//! silently dropped.
+//!
 //! The advertised protocol effect classification and proof ceiling are not
 //! restated here either. [`catalogued_ceiling`] reads them from the closed
 //! `CommandSpec` row through the same catalogue lookup
@@ -246,7 +256,9 @@ pub const BACKUP_LEVEL_CLASS_QUALIFIED: &str = "class-qualified";
 /// silent pass: a level this surface cannot name is a level it cannot bound,
 /// and the outcome state, the proven lifecycle level and the reported
 /// archive status all follow the owner's own level instead of a local
-/// default.
+/// default. Membership is not proof: every member of this array must also have
+/// its capture-receipt relation defined in [`require_proven_claim`], which
+/// refuses a member that has none.
 pub const BACKUP_LEVELS: [&str; 3] = [
     BACKUP_LEVEL_STRUCTURAL_CANDIDATE,
     BACKUP_LEVEL_PROVENANCE_BOUND,
@@ -295,7 +307,26 @@ const BACKUP_ARCHIVE_FENCE_RELATIONS: [&str; 6] = [
 /// exact or same-lineage value from being printed as proven installation
 /// history: without a capture-owner receipt the only honest qualifier is
 /// `structural-only`.
-const BACKUP_ARCHIVE_FENCE_PROOFS: [&str; 2] = ["structural-only", "capture-owner-proven"];
+const BACKUP_ARCHIVE_FENCE_PROOFS: [&str; 2] = [
+    BACKUP_ARCHIVE_FENCE_PROOF_STRUCTURAL_ONLY,
+    BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN,
+];
+
+/// Archived-fence PROOF qualifier that reports the archived fence VALUE only,
+/// with no claim about who produced it.
+///
+/// The honest qualifier when no capture owner has vouched for the fence, which
+/// is why it is not a weaker spelling of the same fact: it declines a
+/// provenance claim instead of making one.
+const BACKUP_ARCHIVE_FENCE_PROOF_STRUCTURAL_ONLY: &str = "structural-only";
+/// Archived-fence PROOF qualifier that names a capture owner as the origin of
+/// the archived fence.
+///
+/// This is a PROVENANCE claim on its own axis, so it is admitted only together
+/// with the owner-issued capture receipt that proves it; see
+/// [`require_proven_claim`]. A level or a relation this surface prints beside
+/// it is not a substitute: neither names a capture owner.
+const BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN: &str = "capture-owner-proven";
 
 /// The capture owner a create refusal names while admitted capture is missing.
 ///
@@ -1270,7 +1301,13 @@ pub fn backup_create(
 /// identity, class, integrity digest and member counts decode first, then
 /// the owner's verification level, class ceiling and archived-fence
 /// relation are checked against their closed vocabularies with the capture
-/// receipt's absence kept explicit. Only the
+/// receipt's absence kept explicit. The complete relation BETWEEN those
+/// answers is then checked by [`require_proven_claim`]: a
+/// provenance-bound/class-qualified level, or a `capture-owner-proven`
+/// archived fence, without the owner-issued capture receipt that proves it -
+/// and a structural candidate that claims one - is reported as a
+/// [`BACKUP_STATE_REFUSED`] outcome naming the exact missing owner evidence,
+/// never as a verified archive. Only the
 /// [`BACKUP_LEVEL_PROVENANCE_BOUND`] or [`BACKUP_LEVEL_CLASS_QUALIFIED`]
 /// level reports [`BACKUP_STATE_VERIFIED`]; a
 /// [`BACKUP_LEVEL_STRUCTURAL_CANDIDATE`] archive is reported as
@@ -1356,17 +1393,11 @@ pub fn backup_verify(
             // field the owner must answer is decoded and closed-checked here
             // before any state or proven level is reported.
             let evidence = verify_evidence(&response)?;
-            outcome.archive_id = Some(evidence.bundle_id);
-            outcome.requested_class = Some(evidence.class.to_owned());
-            outcome.verification_level = Some(evidence.level.to_owned());
-            outcome.class_ceiling = Some(evidence.class_ceiling.to_owned());
-            outcome.archive_fence_relation = Some(evidence.archive_fence_relation.to_owned());
-            outcome.archive_fence_proof = Some(evidence.archive_fence_proof.to_owned());
-            // A verify reply never states target compatibility, so the field
-            // stays explicitly absent instead of borrowing the relation.
-            outcome.target_compatibility = None;
-            outcome.capture_receipt = evidence.capture_receipt.map(str::to_owned);
-            outcome.gates_passed = evidence.member_counts;
+            // A closed set is not a proof: the owner's own answers must agree.
+            if let Err(unproven) = require_proven_claim(&evidence) {
+                return refuse_unproven_claim(request, &operation_id, outcome, unproven);
+            }
+            apply_verify_evidence(&mut outcome, &evidence);
             // The owner did prove this archive's identity and class at every
             // level it names, so both are reported exactly as answered.
             match evidence.level {
@@ -1457,6 +1488,9 @@ struct VerifyEvidence<'a> {
 /// with a value outside its closed set is a typed result mismatch rather than a
 /// partially trusted outcome: this surface cannot bound evidence it cannot
 /// name, and a caller-authored self-consistent checksum is not provenance.
+/// Reading each field into its closed set is not the whole check - the relation
+/// BETWEEN those fields is proved separately by [`require_proven_claim`],
+/// which this decoder's caller runs before any of them is reported.
 fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientError> {
     // The exact archive identity, the closed class and the integrity digest
     // shape come first: a reply that fails those is not a verification answer.
@@ -1513,6 +1547,163 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
         capture_receipt,
         member_counts,
     })
+}
+
+/// One owner proof claim this surface cannot believe, carrying the exact
+/// relation that failed.
+///
+/// A closed vocabulary is not a proof. Every field of a verify claim is the
+/// owner's own answer, so the fields have to agree with each other before any
+/// of them becomes a reported outcome; a claim whose own parts contradict each
+/// other is the owner's answer failing to be one answer. The two bounded texts
+/// are what the operator sees instead of a silently dropped or a
+/// success-shaped result: [`Self::obligation`] names the exact owner evidence
+/// the claim needs, and [`Self::reason`] names the claim that was refused.
+struct UnprovenClaim {
+    /// Bounded obligation naming the owner evidence the claim requires.
+    obligation: String,
+    /// Bounded reason naming the refused claim and the relation that refused it.
+    reason: String,
+}
+
+/// Checks the COMPLETE relation between the proof-vocabulary members of one
+/// decoded verify claim, instead of admitting each member on its own.
+///
+/// [`verify_evidence`] proves that every string is inside a closed set; this
+/// proves that the set members agree. Before this check existed, a
+/// [`BACKUP_LEVEL_PROVENANCE_BOUND`] or [`BACKUP_LEVEL_CLASS_QUALIFIED`] reply
+/// carrying no capture receipt was reported as [`BACKUP_STATE_VERIFIED`], a
+/// [`BACKUP_LEVEL_STRUCTURAL_CANDIDATE`] reply could carry a receipt it did not
+/// earn, and a [`BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN`] fence could
+/// be printed with no capture owner behind it at all. I5.13 keeps backup
+/// existence from being recovery proof and a caller-authored self-consistent
+/// checksum is not capture provenance, so a claim whose owner evidence is
+/// absent, contradictory, or unrelatable is refused and reported at
+/// [`BACKUP_STATE_REFUSED`] with the missing owner named - never reported at the
+/// level it claimed.
+///
+/// The class ceiling's relation to the evidenced class is deliberately NOT
+/// checked here. Its only typed owner is
+/// `eliot_backup::RestoreEvidenceLevel::for_class`, reached through
+/// `BackupClass::evidence_level`, and `eliot-cli` does not depend on
+/// `eliot-backup`. Admitting that dependency, or mirroring its table here,
+/// would put a second class-to-ceiling owner in a surface crate, so that half
+/// of the relation is an owner decision and not a table this file may write.
+fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenClaim> {
+    // The archived fence's PROOF axis is a provenance claim in its own right,
+    // so it is held to the same rule as the level that carries one: naming a
+    // capture owner requires the owner-issued receipt that proves that name.
+    // The converse is deliberately NOT required - a capture receipt for the
+    // archive says nothing about who produced the archived fence VALUE, so an
+    // honest `structural-only` qualifier beside a receipt stays admissible and
+    // refusing it would forbid a truthful future answer.
+    if evidence.archive_fence_proof == BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN
+        && evidence.capture_receipt.is_none()
+    {
+        return Err(UnprovenClaim {
+            obligation: format!(
+                "owner-issued capture receipt backing archive_fence_proof {} for archive {} (absent from the owner's own answer)",
+                BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN, evidence.bundle_id
+            ),
+            reason: format!(
+                "owner claimed archive fence proof {} for archive {} with no capture receipt; a capture-owner-proven fence is a provenance claim about who produced the archived fence, and this surface reports none that no owner receipt backs",
+                BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN, evidence.bundle_id
+            ),
+        });
+    }
+    match evidence.level {
+        BACKUP_LEVEL_PROVENANCE_BOUND | BACKUP_LEVEL_CLASS_QUALIFIED => {
+            if evidence.capture_receipt.is_none() {
+                return Err(UnprovenClaim {
+                    obligation: format!(
+                        "owner-issued capture receipt matching archive {} and claimed verification level {} (absent from the owner's own answer)",
+                        evidence.bundle_id, evidence.level
+                    ),
+                    reason: format!(
+                        "owner claimed verification level {} for archive {} at class ceiling {} with no capture receipt; a provenance-bound or class-qualified level is a claim of retained capture provenance, and a self-consistent decode of caller-supplied bytes is not one",
+                        evidence.level, evidence.bundle_id, evidence.class_ceiling
+                    ),
+                });
+            }
+        }
+        BACKUP_LEVEL_STRUCTURAL_CANDIDATE => {
+            if evidence.capture_receipt.is_some() {
+                return Err(UnprovenClaim {
+                    obligation: format!(
+                        "owner-issued capture receipt is contradictory at claimed verification level {} for archive {}: a structural candidate proves no retained capture provenance, so this surface reports no level beside a receipt",
+                        evidence.level, evidence.bundle_id
+                    ),
+                    reason: format!(
+                        "owner claimed verification level {} for archive {} AND supplied a capture receipt; those two answers are not one answer, and a candidate that claims a receipt is claiming provenance it does not have",
+                        evidence.level, evidence.bundle_id
+                    ),
+                });
+            }
+        }
+        // Fail closed on a level this surface cannot relate. `verify_evidence`
+        // already refuses a level outside [`BACKUP_LEVELS`], so this arm is the
+        // standing guard for a level added to that closed set without its
+        // relation: an unnamed relation is not a relation, and a level with no
+        // relation to the owner's capture evidence is not a level this surface
+        // may report.
+        _ => {
+            return Err(UnprovenClaim {
+                obligation: format!(
+                    "a defined capture-provenance relation for verification level {} (no relation to the owner's capture evidence is defined for it on this surface)",
+                    evidence.level
+                ),
+                reason: format!(
+                    "owner claimed verification level {} for archive {}, which this surface cannot relate to the owner's own capture evidence; it reports no proof level it cannot bound",
+                    evidence.level, evidence.bundle_id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Echoes the owner's decoded verify answers into one outcome, verbatim.
+///
+/// Every field below is the owner's own answer copied across unchanged: none is
+/// derived from the archive, inferred from a sibling field, or defaulted, so
+/// this projection cannot report a fact the reply did not carry. Target
+/// compatibility is set explicitly absent because a verify reply never states
+/// one, and absence stays distinguishable from a proven answer. The same
+/// discipline as [`apply_cancellation`], and the same reason the state decision
+/// downstream is a separate step: this projects evidence, it does not grade it.
+fn apply_verify_evidence(outcome: &mut BackupOperationOutcome, evidence: &VerifyEvidence<'_>) {
+    outcome.archive_id = Some(evidence.bundle_id.clone());
+    outcome.requested_class = Some(evidence.class.to_owned());
+    outcome.verification_level = Some(evidence.level.to_owned());
+    outcome.class_ceiling = Some(evidence.class_ceiling.to_owned());
+    outcome.archive_fence_relation = Some(evidence.archive_fence_relation.to_owned());
+    outcome.archive_fence_proof = Some(evidence.archive_fence_proof.to_owned());
+    outcome.target_compatibility = None;
+    outcome.capture_receipt = evidence.capture_receipt.map(str::to_owned);
+    outcome.gates_passed.clone_from(&evidence.member_counts);
+}
+
+/// Projects one refused proof claim as this operation's typed refusal.
+///
+/// This is the module's existing refusal shape, not a new error scheme: the
+/// outcome reports [`BACKUP_STATE_REFUSED`], names the exact owner evidence the
+/// claim needed as its one missing obligation, carries the bounded reason, and
+/// keeps the same operation identity for same-operation reconciliation. No
+/// claimed evidence field is echoed from a refused claim, so nothing the owner
+/// asserted about its level, ceiling, receipt or fence is printed as proved, and
+/// a refusal is never a success with only a `reason` string attached.
+fn refuse_unproven_claim(
+    request: &CommandRequest,
+    operation_id: &str,
+    mut outcome: BackupOperationOutcome,
+    unproven: UnprovenClaim,
+) -> Result<CommandResponse, BackupClientError> {
+    BACKUP_STATE_REFUSED.clone_into(&mut outcome.state);
+    outcome.missing_obligations = vec![unproven.obligation];
+    outcome.reason = unproven.reason;
+    outcome.next_reconciliation =
+        next_action(&outcome.state, BACKUP_VERIFY_OPERATION, operation_id);
+    respond(request, CommandId::BackupVerify, &outcome)
 }
 
 /// One decoded cancellation answer, with every vocabulary closed.
