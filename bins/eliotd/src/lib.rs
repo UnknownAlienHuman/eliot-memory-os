@@ -200,8 +200,9 @@ pub use governor_observe_serve::{
     observe_suboperation_owner, serve_admitted_observe,
 };
 pub use improvement_candidate_route::{
-    ImprovementRouteRequest, assess_improvement_repeat, improvement_operation_owners,
-    improvement_route_owner, reconcile_improvement_unknown, route_improvement_candidate,
+    ImprovementRouteRequest, assess_improvement_repeat, improvement_candidate_retry_permitted,
+    improvement_operation_owners, improvement_route_owner, reconcile_improvement_unknown,
+    route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};

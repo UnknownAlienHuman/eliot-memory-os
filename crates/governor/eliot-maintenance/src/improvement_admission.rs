@@ -790,11 +790,11 @@ mod tests {
     use super::*;
 
     use crate::improvement_pipeline::{
-        IMPROVEMENT_DISCRIMINATOR_DOMAIN, IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION,
-        IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN, IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION,
-        IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN, IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
-        IMPROVEMENT_PROPOSAL_ENCODING_VERSION, ImprovementDiscriminatorProjection,
-        ImprovementMaterialEquality,
+        ExperimentPlan, IMPROVEMENT_DISCRIMINATOR_DOMAIN,
+        IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION, IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN,
+        IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION, IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN,
+        IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM, IMPROVEMENT_PROPOSAL_ENCODING_VERSION,
+        ImprovementDiscriminatorProjection, ImprovementMaterialEquality,
     };
 
     fn candidate() -> ImprovementCandidateView {
@@ -1022,14 +1022,35 @@ mod tests {
         }
     }
 
+    /// Exact bounded experiment plan of one fixture candidate.
+    ///
+    /// The retained record keeps the whole plan, so the replay identity is the
+    /// commitment *and* the plan. The retained records below are built from
+    /// this same plan unless a case deliberately changes one of its fields.
+    fn plan(experiment_id: &str, scope_ref: &str) -> ExperimentPlan {
+        ExperimentPlan {
+            experiment_id: experiment_id.to_string(),
+            testd_owner_id: "testd-20".to_string(),
+            evaluator_id: "instrument-verifier-20-1111-1145-a".to_string(),
+            scope_ref: scope_ref.to_string(),
+            budget_ref: "budget-1145-a".to_string(),
+            deadline_ref: "deadline-1145-a".to_string(),
+            operation_ref: "op-1145-a".to_string(),
+            idempotency_key: "idem-1145-a".to_string(),
+            scope_refinement: None,
+        }
+    }
+
     /// The one current checked record the gate is given: a single commitment
-    /// plus the discriminator projection and material-equality key of the same
-    /// content and the same experiment.
+    /// plus the discriminator projection, material-equality key and exact
+    /// experiment plan of the same content and the same experiment.
     fn current() -> ImprovementCurrentProposal {
         ImprovementCurrentProposal {
+            candidate_id: candidate().candidate_id,
             commitment: prior_commitment("commitment-1145-a", "op-1145-a"),
             discriminator: projection("hypothesis-1145-a", "evidence-1145-a"),
             material_equality: material("exp-1145-a", "evidence-1145-a"),
+            experiment_plan: plan("exp-1145-a", "scope-1145-a"),
         }
     }
 
@@ -1044,6 +1065,7 @@ mod tests {
             commitment: current.commitment.clone(),
             discriminator: current.discriminator.clone(),
             material_equality: current.material_equality.clone(),
+            experiment_plan: current.experiment_plan.clone(),
         });
         match admit_improvement_candidate(&candidate(), &ev, &policy(), &current) {
             Ok(ImprovementAdmissionDecision::NoProgress { reason, .. }) => {
@@ -1062,6 +1084,7 @@ mod tests {
             commitment: prior_commitment("commitment-1144-z", "op-1144-z"),
             discriminator: projection("hypothesis-1144-z", "evidence-1144-z"),
             material_equality: material("exp-1144-z", "evidence-1144-z"),
+            experiment_plan: plan("exp-1144-z", "scope-1144-z"),
         });
         assert!(matches!(
             admit_improvement_candidate(&candidate(), &fresh, &policy(), &current),

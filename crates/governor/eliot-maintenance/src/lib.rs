@@ -57,13 +57,13 @@ pub use improvement_pipeline::{
     ImprovementCandidateIngress, ImprovementCurrentProposal, ImprovementEvidenceExecution,
     ImprovementMaterialEquality, ImprovementOperation, ImprovementPipelineInputs,
     ImprovementProposal, ImprovementProposalCommitmentEnvelope, ImprovementReplayAssessment,
-    ImprovementTerminalDisposition, KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT,
-    OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS, OP_EVALUATE, OP_EXECUTE_EXPERIMENT, OP_MEASURE,
-    OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError, ProposalCommitment,
-    RetainedImprovementProposal, RollbackContract, TESTD_OWNER, UnestablishedPriorCause,
-    VERIFIER_OWNER_FAMILY, assess_improvement_replay, compare_improvement_commitments,
-    ingest_improvement_candidate, proposal_digest, reconcile_unknown_activation,
-    run_improvement_candidate_pipeline,
+    ImprovementTerminalDisposition, ImprovementUnknownEffect, KERNEL_CANARY_OWNER,
+    MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS, OP_EVALUATE,
+    OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError,
+    ProposalCommitment, RetainedImprovementProposal, RollbackContract, TESTD_OWNER,
+    UnestablishedPriorCause, VERIFIER_OWNER_FAMILY, assess_improvement_replay,
+    compare_improvement_commitments, improvement_retry_permitted, ingest_improvement_candidate,
+    proposal_digest, reconcile_unknown_activation, run_improvement_candidate_pipeline,
 };
 
 /// Stable wire name for the maintenance governor contract.

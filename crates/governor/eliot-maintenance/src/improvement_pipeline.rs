@@ -79,7 +79,7 @@
 //!
 //! # Wire revision
 //!
-//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `5`. Revision `2` added typed
+//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `6`. Revision `2` added typed
 //! `cause`/`remedy` fields to the rejection and block branches, added the
 //! `Blocked` disposition and the inspectable canary handoff, bound
 //! candidate/experiment/content-revision/run identities onto the admission
@@ -107,6 +107,17 @@
 //! the admission owner, and the rollback owner; adds the `improvement_candidate`
 //! ingress operation identity; and adds the material-equality projection,
 //! comparator, and `MateriallyEquivalentRepeat` outcome.
+//! Revision `6` requires an exact replay to reproduce the retained experiment
+//! plan as well as the retained commitment, so a changed proposal, mechanism,
+//! target, or experiment under one operation and idempotency key is a typed
+//! identity conflict instead of a replay and never an automatic retry; carries
+//! the exact checked experiment plan on both the retained and the current
+//! record; carries the committed candidate identity on the current record; and
+//! replaces the unknown-outcome disposition's reason text with the typed
+//! [`ImprovementUnknownEffect`] obligation, which names the exact unresolved
+//! external effect and carries the [`improvement_retry_permitted`] gate so an
+//! unknown activation or effect outcome is reconciled before a retry is a new
+//! attempt.
 //!
 //! Deserialization is fail-closed: bytes written before the current revision no
 //! longer decode, so a stale disposition cannot be read as a current one.
@@ -209,7 +220,7 @@ pub const IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN: &str =
 /// current one and stays an unestablished observation.
 pub const IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION: &str = "1";
 /// Wire revision of the improvement pipeline result and identity contracts.
-pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 5;
+pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 6;
 /// Maximum members in one declared set of the committed proposal.
 ///
 /// Matches the nearest existing declared-set ceiling in the repository
@@ -762,6 +773,10 @@ pub struct RetainedImprovementProposal {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImprovementCurrentProposal {
+    /// Candidate identity the committed proposal declares. Carried from the
+    /// same committed bytes, so an obligation built on this record names the
+    /// exact candidate whose external effect is unresolved.
+    pub candidate_id: String,
     /// The single commitment computed for these exact bytes.
     pub commitment: ProposalCommitment,
     /// Discriminator projection of the same normalized bytes.
@@ -863,6 +878,70 @@ pub struct ImprovementCanaryHandoff {
     pub execution_authorized: bool,
 }
 
+/// Exact unresolved external effect that must be reconciled before any retry.
+///
+/// An unknown activation or effect outcome is a distinct machine state, not a
+/// weaker success and not an absent result. `I0.5` names it
+/// `EvidenceExecutionStatus::UNKNOWN_OUTCOME`, I12.24 records it as
+/// `materially_equivalent_to_prior_attempt: unknown`, and I14.24 requires an
+/// unknown effect to be preserved rather than assumed away. This type is the one
+/// representation of that debt inside this pipeline: it names the exact
+/// candidate and commitment whose external effect is unresolved, the owner
+/// holding the reconciliation, the exact evidence reference that settles it, and
+/// the rollback contract's forward-repair and invalidation bindings that cover
+/// it.
+///
+/// A retry is a *new* attempt only after this obligation is discharged. The
+/// obligation is deliberately not self-clearing: it carries no proof that the
+/// effect happened or did not happen, so [`Self::retry_permitted`] is false
+/// until its owner supplies the exact outcome evidence. Naming a rollback
+/// contract does not discharge it, and a proposal, a new identity, or a new
+/// idempotency key does not discharge it either.
+///
+/// The forward-repair and invalidation bindings are copied from the checked
+/// [`RollbackContract`], never from the caller. They make the repair path part
+/// of the debt this obligation names, so an unresolved effect carries the exact
+/// invalidation targets it may have to quarantine instead of leaving the
+/// pipeline holding a rollback contract that no disposition ever references.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementUnknownEffect {
+    /// Candidate whose external activation or effect outcome is unresolved.
+    pub candidate_id: String,
+    /// Exact bounded experiment the unresolved effect belongs to.
+    pub experiment_id: String,
+    /// Current proposal commitment the unresolved effect is bound to.
+    pub commitment: ProposalCommitment,
+    /// Exact evidence reference that settles the external outcome.
+    ///
+    /// This is the reference the reconciling owner must produce, named once at
+    /// the moment the outcome became unknown. It is never filled in by the
+    /// pipeline and never inferred from a reason string.
+    pub reconciliation_evidence_ref: String,
+    /// Owner that holds the unresolved reconciliation debt.
+    pub owner_id: String,
+    /// Forward-repair reference the checked rollback contract names for an
+    /// incomplete rollback effect.
+    pub forward_repair_ref: String,
+    /// Invalidation targets the checked rollback contract covers, in the
+    /// contract's own committed order.
+    pub invalidation_set: Vec<String>,
+}
+
+impl ImprovementUnknownEffect {
+    /// Retry is permitted only once the owner has produced the exact outcome
+    /// evidence named on the obligation.
+    ///
+    /// An absent, blank, or whitespace-only reference is absence of evidence,
+    /// never an observed no-effect. A known failed effect is a new attempt, but
+    /// that is the caller's evidence to supply through the named reference, not
+    /// a value this pipeline can assume.
+    #[must_use]
+    pub fn retry_permitted(&self) -> bool {
+        !self.reconciliation_evidence_ref.trim().is_empty()
+    }
+}
+
 /// Terminal disposition for one improvement candidate pipeline run.
 ///
 /// Advisory-only: no variant performs promotion, activation, canary cutover, or
@@ -899,11 +978,15 @@ pub enum ImprovementTerminalDisposition {
         owner_id: String,
     },
     /// External outcome is unknown; reconciliation is required before retry.
+    ///
+    /// The obligation is a value, not a sentence: a consumer reads the exact
+    /// candidate, experiment, commitment, owner, and the retry gate directly
+    /// from it, so no wording of the reason can be reinterpreted as a
+    /// reconciliation. A retry after this disposition is a new attempt only
+    /// once [`ImprovementUnknownEffect::retry_permitted`] is true.
     UnknownRequiresReconciliation {
-        /// What must be reconciled before any retry.
-        reason: String,
-        /// Owner holding the reconciliation debt.
-        owner_id: String,
+        /// Exact unresolved external effect owed by its owner.
+        obligation: Box<ImprovementUnknownEffect>,
     },
     /// Retained historical representation of an observed completed rollback.
     ///
@@ -1185,6 +1268,7 @@ fn current_proposal_of(
     experiment: &ExperimentPlan,
 ) -> Result<ImprovementCurrentProposal, PipelineError> {
     Ok(ImprovementCurrentProposal {
+        candidate_id: normalized.candidate_id.clone(),
         commitment: commitment_of(normalized)?,
         discriminator: discriminator_of(normalized),
         material_equality: material_equality_of(normalized, experiment),
@@ -1566,17 +1650,41 @@ pub enum ImprovementReplayAssessment {
 /// Reconciles an unknown external activation outcome without retrying blindly.
 ///
 /// Exhaustive and meaning-preserving: an unresolved prior outcome stays
-/// `UnknownRequiresReconciliation`, and every other prior decision keeps its own
-/// typed cause, owner, and remedy instead of collapsing into an evidence gap. A
-/// named rollback contract still never clears an unknown external effect.
+/// `UnknownRequiresReconciliation` and now carries the typed
+/// [`ImprovementUnknownEffect`] obligation built from the checked record, and
+/// every other prior decision keeps its own typed cause, owner, and remedy
+/// instead of collapsing into an evidence gap. A named rollback contract still
+/// never clears an unknown external effect.
+///
+/// `current` is the checked record this run committed and `rollback` the
+/// gap-free contract it was admitted against. Both are required, not optional:
+/// an obligation without the exact commitment and experiment that went unknown
+/// would name a debt against a candidate nobody can identify, and an
+/// unidentifiable debt is one no owner can discharge, while an obligation
+/// without the contract's forward-repair and invalidation bindings would name a
+/// repair path no disposition can be held to. A caller holding only a prior
+/// decision must run the pipeline to obtain those records, because the
+/// reconciliation is about *this* attempt, not about a remembered sentence.
+///
+/// `reconciliation_evidence_ref` is the exact evidence reference the reconciling
+/// owner already holds. It is empty while the outcome is still unknown, which is
+/// what makes [`ImprovementUnknownEffect::retry_permitted`] false: the gate is
+/// driven by the machine state, not by a caller asserting it reconciled.
 pub fn reconcile_unknown_activation(
     prior: &ImprovementAdmissionDecision,
+    current: &ImprovementCurrentProposal,
+    rollback: &RollbackContract,
+    reconciliation_evidence_ref: &str,
 ) -> ImprovementTerminalDisposition {
     match prior {
-        ImprovementAdmissionDecision::RequiresReconciliation { reason, owner_id } => {
+        ImprovementAdmissionDecision::RequiresReconciliation { owner_id, .. } => {
             ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-                reason: reason.clone(),
-                owner_id: owner_id.clone(),
+                obligation: Box::new(unknown_effect_of(
+                    current,
+                    rollback,
+                    reconciliation_evidence_ref,
+                    owner_id,
+                )),
             }
         }
         ImprovementAdmissionDecision::Reject {
@@ -1611,6 +1719,52 @@ pub fn reconcile_unknown_activation(
             ),
             owner_id: rollback_owner_id.clone(),
         },
+    }
+}
+
+/// Builds the unresolved external-effect obligation from checked records only.
+///
+/// The single construction site of [`ImprovementUnknownEffect`]. Every identity
+/// is copied from a record this run checked — the candidate and experiment from
+/// the committed record, the repair bindings from the gap-free rollback
+/// contract — and the owner is the decision's own owner. Nothing here is read
+/// from a reason string or supplied by a caller, so the obligation cannot name a
+/// candidate, an experiment, or a repair path the checked records do not
+/// contain.
+fn unknown_effect_of(
+    current: &ImprovementCurrentProposal,
+    rollback: &RollbackContract,
+    reconciliation_evidence_ref: &str,
+    owner_id: &str,
+) -> ImprovementUnknownEffect {
+    ImprovementUnknownEffect {
+        candidate_id: current.candidate_id.clone(),
+        experiment_id: current.experiment_plan.experiment_id.clone(),
+        commitment: current.commitment.clone(),
+        reconciliation_evidence_ref: reconciliation_evidence_ref.to_string(),
+        owner_id: owner_id.to_string(),
+        forward_repair_ref: rollback.forward_repair_ref.clone(),
+        invalidation_set: rollback.invalidation_set.clone(),
+    }
+}
+
+/// Returns whether a disposition permits a retry attempt.
+///
+/// One gate over the whole terminal disposition, so a caller reads the retry
+/// answer from the typed outcome instead of re-deciding it. Only an unresolved
+/// external effect blocks: an unresolved
+/// [`ImprovementUnknownEffect`] owes its owner the exact outcome evidence and
+/// is the single case where a retry would be a blind repeat of an attempt whose
+/// effect nobody knows. Every other disposition is not an unresolved effect —
+/// a rejection, an inconclusive, a regression, a block, and a no-progress
+/// decision each carry their own owner and remedy — and none of them is an
+/// unreceipted external effect, so none of them needs this gate.
+pub fn improvement_retry_permitted(disposition: &ImprovementTerminalDisposition) -> bool {
+    match disposition {
+        ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation } => {
+            obligation.retry_permitted()
+        }
+        _ => true,
     }
 }
 
@@ -2296,10 +2450,21 @@ fn map_decision(
             reason,
             owner_id,
         } => map_block(*cause, reason, owner_id),
-        ImprovementAdmissionDecision::RequiresReconciliation { reason, owner_id } => {
+        // The obligation is built from the checked record and the gap-free
+        // rollback contract, not from the decision's reason text: the reason is
+        // prose the owner may reword, while the obligation names the exact
+        // candidate, experiment, commitment, repair bindings and owner this run
+        // checked. The evidence reference is empty exactly when the outcome is
+        // still unknown, which is what keeps `improvement_retry_permitted`
+        // false until it is settled.
+        ImprovementAdmissionDecision::RequiresReconciliation { owner_id, .. } => {
             ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-                reason: reason.clone(),
-                owner_id: owner_id.clone(),
+                obligation: Box::new(unknown_effect_of(
+                    &joined.current,
+                    joined.rollback,
+                    "",
+                    owner_id,
+                )),
             }
         }
         ImprovementAdmissionDecision::NoProgress { reason, owner_id } => {
