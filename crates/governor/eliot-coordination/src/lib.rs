@@ -15,9 +15,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod integration_candidate;
 mod peer_communication;
 mod swarm_plan_attachment;
 mod work_lease_issuance;
+
+pub use integration_candidate::{
+    IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateReceipt,
+    IntegrationCandidateRevision, IntegrationCandidateStatus, IntegrationQueue,
+    StaleIntegrationCandidateRequest,
+};
 
 pub use peer_communication::{
     AdmitArtifactRevision, AnchorResolution, AnchoredReview, ArgumentAcceptability, AssertedEffect,
@@ -203,6 +210,7 @@ pub enum CoordinationEventKind {
     Checkpointed,
     ResultSubmitted,
     IntegrationCandidateSubmitted,
+    IntegrationCandidateStaled,
     IntegrationClaimed,
     WorkReassigned,
     ReadyAdmitted,
@@ -467,30 +475,10 @@ pub struct AgentResultReceipt {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct IntegrationCandidateDraft {
-    pub request_id: String,
-    pub candidate_id: String,
-    pub source_work_item_id: String,
-    pub session_id: String,
-    pub authority_epoch: EpochId,
-    pub state_fence: StateFence,
-    pub candidate_ref: String,
-    pub target_scope: String,
-    pub now: u64,
-}
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct IntegrationCandidateReceipt {
-    pub candidate_id: String,
-    pub target_scope: String,
-    pub event: CoordinationEvent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct IntegrationLeaseRequest {
     pub request_id: String,
     pub lease_id: String,
+    pub candidate_id: String,
     pub target_scope: String,
     pub session_id: String,
     pub authority_epoch: EpochId,
@@ -502,6 +490,8 @@ pub struct IntegrationLeaseRequest {
 #[serde(deny_unknown_fields)]
 pub struct IntegrationLease {
     pub lease_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
     pub target_scope: String,
     pub holder_session_id: String,
     pub authority_epoch: EpochId,
@@ -559,6 +549,10 @@ pub struct CoordinationOwner {
     work: BTreeMap<String, WorkItem>,
     leases: BTreeMap<String, WorkLease>,
     integrations: BTreeMap<String, IntegrationLease>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    integration_candidates: BTreeMap<String, IntegrationCandidate>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    integration_lease_by_request: BTreeMap<String, IntegrationLease>,
     messages: BTreeMap<String, MailboxMessage>,
     event_by_request: BTreeMap<String, CoordinationEvent>,
     events: Vec<CoordinationEvent>,
@@ -658,6 +652,7 @@ impl CoordinationOwner {
         }
         snapshot.validate_active_bindings()?;
         snapshot.validate_issuance_snapshot()?;
+        integration_candidate::validate_candidate_snapshot(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -1094,6 +1089,37 @@ impl CoordinationOwner {
         fence
             .validate()
             .map_err(|_| CoordinationError::FenceMismatch)
+    }
+
+    fn validate_integration_lease(
+        &self,
+        target_scope: &str,
+        lease_id: &str,
+        session_id: &str,
+        now: u64,
+        authority_epoch: &EpochId,
+        state_fence: &StateFence,
+    ) -> Result<(), CoordinationError> {
+        let session = self.session(session_id, authority_epoch.clone(), state_fence)?;
+        validate_active_session_heartbeat(&session, Some(now))?;
+        let lease = self
+            .integrations
+            .get(target_scope)
+            .ok_or(CoordinationError::WorkAlreadyOwned)?;
+        if lease.lease_id != lease_id || lease.holder_session_id != session_id {
+            return Err(CoordinationError::LeaseOwnerMismatch {
+                holder: lease.holder_session_id.clone(),
+            });
+        }
+        if now > lease.expires_at {
+            return Err(CoordinationError::LeaseExpired);
+        }
+        if lease.state_fence != *state_fence
+            || !lease.authority_epoch.is_same_authority(authority_epoch)
+        {
+            return Err(CoordinationError::FenceMismatch);
+        }
+        Ok(())
     }
 
     fn exact_work_replay(
@@ -1860,10 +1886,27 @@ impl CoordinationOwner {
         &mut self,
         req: IntegrationCandidateDraft,
     ) -> Result<IntegrationCandidateReceipt, CoordinationError> {
-        text(&req.candidate_id, "candidate_id")?;
-        text(&req.candidate_ref, "candidate_ref")?;
-        text(&req.target_scope, "target_scope")?;
+        integration_candidate::validate_candidate_text(&req)?;
+        self.request(&req.request_id)?;
+        nonzero(req.now, "now")?;
         self.common(req.authority_epoch.clone(), &req.state_fence)?;
+        if let Some(existing) = self.event_by_request.get(&req.request_id) {
+            return integration_candidate::exact_candidate_replay(
+                &self.integration_candidates,
+                &req,
+                existing,
+            );
+        }
+        if self.integration_candidates.contains_key(&req.candidate_id) {
+            return Err(CoordinationError::Duplicate(req.candidate_id));
+        }
+        if self
+            .work
+            .get(&req.source_work_item_id)
+            .is_none_or(|work| work.task_id != req.task_id)
+        {
+            return Err(CoordinationError::InvalidState);
+        }
         self.read_active_work_lease(
             &req.source_work_item_id,
             &req.session_id,
@@ -1871,6 +1914,29 @@ impl CoordinationOwner {
             req.authority_epoch.clone(),
             &req.state_fence,
         )?;
+        let candidate = IntegrationCandidate {
+            candidate_id: req.candidate_id.clone(),
+            task_id: req.task_id,
+            source_work_item_id: req.source_work_item_id,
+            producer_attempt: req.producer_attempt,
+            producer_lineage: req.producer_lineage,
+            base_commit: req.base_commit,
+            state_fence: req.state_fence.clone(),
+            worktree_or_artifact_refs: req.worktree_or_artifact_refs,
+            diff_ref: req.diff_ref,
+            changed_paths: req.changed_paths,
+            declared_read_effects: req.declared_read_effects,
+            declared_write_effects: req.declared_write_effects,
+            evidence_refs: req.evidence_refs,
+            verification_refs: req.verification_refs,
+            unresolved_conflicts: req.unresolved_conflicts,
+            unknowns: req.unknowns,
+            rollback_or_compensation: req.rollback_or_compensation,
+            target_scope: req.target_scope,
+            submitted_at: req.now,
+            status: IntegrationCandidateStatus::Proposed,
+            history: Vec::new(),
+        };
         let event = self.event(
             &req.request_id,
             format!("candidate:{}", req.candidate_id),
@@ -1880,7 +1946,7 @@ impl CoordinationOwner {
             (self.sequence != 0).then_some(self.sequence),
             req.authority_epoch.clone(),
             req.state_fence,
-            req.candidate_ref,
+            req.candidate_id.clone(),
             ClockReading {
                 valid_time_ms: None,
                 known_time_ms: None,
@@ -1889,9 +1955,22 @@ impl CoordinationOwner {
             },
         )?;
         let event = self.commit(&req.request_id, event)?;
+        let mut candidate = candidate;
+        candidate.history.push(IntegrationCandidateRevision {
+            event_sequence: event.sequence,
+            status: IntegrationCandidateStatus::Proposed,
+            lease_id: None,
+            observed_at: req.now,
+            evidence_refs: candidate.evidence_refs.clone(),
+            unresolved_conflicts: candidate.unresolved_conflicts.clone(),
+            unknowns: candidate.unknowns.clone(),
+        });
+        self.integration_candidates
+            .insert(candidate.candidate_id.clone(), candidate.clone());
         Ok(IntegrationCandidateReceipt {
-            candidate_id: req.candidate_id,
-            target_scope: req.target_scope,
+            candidate_id: candidate.candidate_id.clone(),
+            target_scope: candidate.target_scope.clone(),
+            candidate,
             event,
         })
     }
@@ -1900,48 +1979,7 @@ impl CoordinationOwner {
         &mut self,
         req: IntegrationLeaseRequest,
     ) -> Result<IntegrationLeaseDecision, CoordinationError> {
-        text(&req.target_scope, "target_scope")?;
-        self.session(
-            &req.session_id,
-            req.authority_epoch.clone(),
-            &req.state_fence,
-        )?;
-        if let Some(old) = self.integrations.get(&req.target_scope)
-            && old.expires_at >= req.now
-        {
-            return Err(CoordinationError::WorkAlreadyOwned);
-        }
-        let lease = IntegrationLease {
-            lease_id: req.lease_id.clone(),
-            target_scope: req.target_scope.clone(),
-            holder_session_id: req.session_id.clone(),
-            authority_epoch: req.authority_epoch.clone(),
-            state_fence: req.state_fence.clone(),
-            expires_at: req
-                .now
-                .checked_add(req.lease_duration)
-                .ok_or(CoordinationError::InvalidField("lease_duration"))?,
-        };
-        let event = self.event(
-            &req.request_id,
-            format!("integration:{}", req.target_scope),
-            CoordinationEventKind::IntegrationClaimed,
-            req.target_scope.clone(),
-            req.session_id,
-            (self.sequence != 0).then_some(self.sequence),
-            req.authority_epoch.clone(),
-            req.state_fence,
-            req.lease_id,
-            ClockReading {
-                valid_time_ms: None,
-                known_time_ms: None,
-                transaction_sequence: None,
-                monotonic_ns: None,
-            },
-        )?;
-        let event = self.commit(&req.request_id, event)?;
-        self.integrations.insert(req.target_scope, lease.clone());
-        Ok(IntegrationLeaseDecision { lease, event })
+        integration_candidate::acquire_integration(self, req)
     }
 
     /// Appends a caller-supplied event while enforcing causal order and fences.
@@ -2074,11 +2112,24 @@ mod tests {
         IntegrationCandidateDraft {
             request_id: "candidate-request".to_owned(),
             candidate_id: "candidate-1".to_owned(),
+            task_id: "task-1".to_owned(),
             source_work_item_id: "work-1".to_owned(),
+            producer_attempt: "attempt-1".to_owned(),
+            producer_lineage: vec!["attempt-1".to_owned()],
             session_id: "session-1".to_owned(),
             authority_epoch: test_epoch(1),
             state_fence: fence(),
-            candidate_ref: "candidate-ref".to_owned(),
+            base_commit: "commit-1".to_owned(),
+            worktree_or_artifact_refs: vec!["candidate-ref".to_owned()],
+            diff_ref: "diff-ref".to_owned(),
+            changed_paths: BTreeSet::from(["src/lib.rs".to_owned()]),
+            declared_read_effects: BTreeSet::new(),
+            declared_write_effects: BTreeSet::from(["src/lib.rs".to_owned()]),
+            evidence_refs: vec!["evidence-ref".to_owned()],
+            verification_refs: vec!["verification-ref".to_owned()],
+            unresolved_conflicts: Vec::new(),
+            unknowns: Vec::new(),
+            rollback_or_compensation: None,
             target_scope: "scope-1".to_owned(),
             now: 50,
         }
