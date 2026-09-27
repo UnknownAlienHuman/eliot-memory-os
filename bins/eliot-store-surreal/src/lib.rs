@@ -389,8 +389,7 @@ impl StoreComposition {
         let _access = self.connections.validate_lease(&lease)?;
         let outcome = self.store.health().await;
         if matches!(outcome, Err(StoreError::Unavailable)) {
-            self.connections.mark_broken(ClientClass::Health);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Health).await;
         }
         outcome
     }
@@ -415,8 +414,7 @@ impl StoreComposition {
         let _access = self.connections.validate_lease(&lease)?;
         let outcome = self.readiness_inner().await;
         if matches!(outcome, Err(StoreError::Unavailable)) {
-            self.connections.mark_broken(ClientClass::Health);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Health).await;
         }
         outcome
     }
@@ -523,8 +521,7 @@ impl StoreComposition {
         let _access = self.connections.validate_lease(&lease)?;
         let outcome = self.store.execute_named(request).await;
         if matches!(outcome, Err(StoreError::Unavailable)) {
-            self.connections.mark_broken(ClientClass::Read);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Read).await;
         }
         outcome
     }
@@ -605,8 +602,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Write);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Write).await;
         }
         outcome
     }
@@ -640,8 +636,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Write);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Write).await;
         }
         outcome
     }
@@ -682,8 +677,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Write);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Write).await;
         }
         outcome
     }
@@ -723,8 +717,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Read);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Read).await;
         }
         outcome
     }
@@ -760,8 +753,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Write);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Write).await;
         }
         outcome
     }
@@ -804,8 +796,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Write);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Write).await;
         }
         outcome
     }
@@ -841,8 +832,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Write);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Write).await;
         }
         outcome
     }
@@ -878,8 +868,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Read);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Read).await;
         }
         outcome
     }
@@ -915,8 +904,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Read);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Read).await;
         }
         let receipt = outcome?;
         let is_complete = receipt.as_ref().is_some_and(|receipt| {
@@ -960,8 +948,7 @@ impl StoreComposition {
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
         ) {
-            self.connections.mark_broken(ClientClass::Write);
-            self.store.note_connection_loss();
+            self.mark_broken_and_recover(ClientClass::Write).await;
         }
         outcome
     }
@@ -992,10 +979,8 @@ impl StoreComposition {
         &self,
         operation_id: &OperationId,
     ) -> Result<ReplayVerdict, StoreError> {
-        let mut gate = UnknownWriteGate::unknown(operation_id.clone());
-        let receipt = self.receipt(operation_id.clone()).await?;
-        gate.resolve_lookup(receipt.as_ref());
-        match gate.verdict() {
+        let (_receipt, verdict) = self.classified_receipt_lookup(operation_id).await?;
+        match verdict {
             ReplayVerdict::UseExistingReceipt => Ok(ReplayVerdict::UseExistingReceipt),
             ReplayVerdict::MustReconcile => Ok(ReplayVerdict::MustReconcile),
             ReplayVerdict::NewIdentityOnly => {
@@ -1009,6 +994,24 @@ impl StoreComposition {
                 Ok(ReplayVerdict::RequiresGapDisposition)
             }
         }
+    }
+
+    /// One `ResolveWriteReceipt` lookup classified by the gate, keeping both
+    /// the answer and its verdict from the same read (I5.19, issue #1933).
+    ///
+    /// `resolve_unknown_write` needs only the verdict; a caller that must
+    /// forward the receipt body needs the answer too. Reading once and
+    /// classifying through the same [`UnknownWriteGate`] keeps both consumers
+    /// on one provider read and one gate decision, instead of letting a
+    /// dispatch surface forward an unclassified answer.
+    pub async fn classified_receipt_lookup(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(Option<WriteReceipt>, ReplayVerdict), StoreError> {
+        let mut gate = UnknownWriteGate::unknown(operation_id.clone());
+        let receipt = self.receipt(operation_id.clone()).await?;
+        gate.resolve_lookup(receipt.as_ref());
+        Ok((receipt, gate.verdict()))
     }
 
     /// Returns the bounded bridge client sets: generations, bounds,
@@ -1040,6 +1043,60 @@ impl StoreComposition {
         let generation = self.connections.replace_generation(class)?;
         self.store.note_connection_loss();
         Ok(generation)
+    }
+
+    /// Marks one class's client generation broken after a transport failure
+    /// and runs its declared recovery (issue #1933).
+    ///
+    /// This is the production owner of the broken-generation latch. Without
+    /// it nothing ever replaced a marked-broken generation, so the one
+    /// `try_acquire` refusal it causes outlived the transient failure: every
+    /// later canonical write, named read, and health call in that class
+    /// returned `Unavailable` for the lifetime of the process, which is the
+    /// opposite of I5.9 "a broken generation is replaced explicitly".
+    ///
+    /// Recovery is the existing real reconnect path,
+    /// [`Self::replace_client_generation`], and the dial is the adapter's own
+    /// reconnect entry point [`SurrealStoreAdapter::connect`] — the same entry
+    /// point [`Self::connect`] uses. No second reconnect mechanism, schedule,
+    /// or bound is introduced here.
+    ///
+    /// Both fail-closed properties hold by construction, not by convention:
+    ///
+    /// - A failed replacement does not clear the latch.
+    ///   [`StoreConnectionManager::replace_generation`] is reached only after a
+    ///   successful dial, so a class whose reconnect failed keeps refusing and
+    ///   never admits traffic on a generation that is still down. The
+    ///   reconnect budget ([`StoreConnectionManager::note_reconnect_attempt`])
+    ///   then refuses further dials and escalates instead of replacing
+    ///   silently, and the proved provider identity stays forgotten
+    ///   ([`SurrealStoreAdapter::note_connection_loss`]).
+    /// - The failed request is never told it succeeded. This method returns
+    ///   nothing and every caller returns its own original
+    ///   [`StoreError::Unavailable`] unchanged, whether the replacement
+    ///   succeeded or not.
+    ///
+    /// The awaited recovery is bounded and paid only by the request that just
+    /// failed: one policy backoff (at most the class policy's `max_backoff_ms`)
+    /// plus one adapter connect already bounded by the configured connect
+    /// timeout, and only while reconnect budget remains. No healthy request is
+    /// delayed behind it — a broken class refuses immediately instead of
+    /// queueing for the replacement.
+    async fn mark_broken_and_recover(&self, class: ClientClass) {
+        self.connections.mark_broken(class);
+        self.store.note_connection_loss();
+        // The replacement result is deliberately not returned: the caller's
+        // disposition is its own original `Unavailable`, and the still-broken
+        // latch plus the exhausted reconnect budget are the escalation a failed
+        // replacement leaves behind.
+        let _replaced_generation = self
+            .replace_client_generation(class, async || {
+                self.store
+                    .connect()
+                    .await
+                    .map_err(AdapterError::into_store_error)
+            })
+            .await;
     }
 
     /// Reads revision heads through the neutral store boundary.
