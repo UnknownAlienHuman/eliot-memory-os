@@ -8,6 +8,18 @@
 //! operations requiring the release approval path, while optional module
 //! updates are normal hot-generation operations carrying explicit
 //! generation/rollback metadata.
+//!
+//! # Platform precondition
+//!
+//! The running-state observation is sourced from a live **Windows** process
+//! snapshot. The observation owner returns `Unavailable` from a compile-time
+//! `#[cfg(not(windows))]` branch, so on a non-Windows build every
+//! [`install_update`] refuses with
+//! [`UpdateInstallerError::RunningObservationFailed`] rather than assuming the
+//! target is idle (I3.15 forbids adopting an unknown process). Update staging is
+//! therefore a Windows-only operation as written; this is recorded rather than
+//! worked around, because a non-Windows observation owner does not exist in this
+//! tree.
 
 #![forbid(unsafe_code)]
 
@@ -178,10 +190,15 @@ fn is_lower_hex(byte: u8) -> bool {
 pub enum RunningTargetObservation {
     /// A live process carries the target's executable basename.
     Running {
-        /// The executable basename the live process snapshot matched.
+        /// The **requested** executable basename the snapshot search used, not
+        /// the casing observed on the matched process: the owner matches
+        /// case-insensitively (`eq_ignore_ascii_case`), so a live
+        /// `ELIOT-KERNEL.EXE` is reported here as the requested
+        /// `eliot-kernel.exe`.
         process_basename: String,
     },
-    /// The live process snapshot observed no process with that basename.
+    /// The live process snapshot observed no process matching the requested
+    /// basename, under the owner's case-insensitive match.
     NotRunning,
 }
 
@@ -191,8 +208,12 @@ pub struct InstallUpdateRequest<'a> {
     /// Installation root; the versioned directory is created below it.
     pub install_root: &'a Path,
     /// Optional exact path of an executable the operator declares as running.
-    /// This is an additional exact path-identity check on top of the observed
-    /// running state, not the source of that state.
+    ///
+    /// This is an independent fact from the observed running state in
+    /// [`UpdateRecord::running_target`]: the two are computed from different
+    /// sources and neither is a layer over the other. Nothing currently
+    /// branches on `running_target`; activation, which is where the observation
+    /// would have to be enforced, is owned outside this module.
     pub running_executable: Option<&'a Path>,
     /// Package metadata for the update.
     pub package: &'a PackageMetadata,
@@ -297,21 +318,28 @@ pub fn running_binary_would_be_overwritten(running: &Path, new_executable: &Path
 /// `executable` is currently running (I3.8: the installer never overwrites a
 /// running binary).
 ///
-/// The snapshot owner matches the exact executable basename across the whole
-/// machine, so the result is deliberately conservative in one direction:
-/// [`RunningTargetObservation::Running`] proves that *some* live process runs
-/// that executable name, not which copy runs or from which directory. It never
-/// proves that a particular path is or is not executing, and it never
-/// replaces the exact path-identity check in
-/// [`running_binary_would_be_overwritten`].
+/// Only the **basename** of `executable` is searched, across the whole machine,
+/// under the owner's case-insensitive match. The result is deliberately
+/// conservative in one direction: [`RunningTargetObservation::Running`] proves
+/// that *some* live process runs that executable name, not which copy runs or
+/// from which directory. The converse is narrower than it looks:
+/// [`RunningTargetObservation::NotRunning`] proves only that no live process
+/// carries *the searched basename*. If the copy that actually runs under a
+/// different file name, this reports `NotRunning` while the target is running.
+/// Callers must pass the basename of the executable they actually run.
+///
+/// This is an independent observation: it neither reads nor is read by the
+/// exact path-identity check in [`running_binary_would_be_overwritten`].
 ///
 /// # Errors
 ///
 /// Returns [`UpdateInstallerError::InvalidPackage`] when `executable` has no
 /// single-segment file name, and
 /// [`UpdateInstallerError::RunningObservationFailed`] when the live process
-/// snapshot is unavailable or errors. There is no path that reports
-/// [`RunningTargetObservation::NotRunning`] without a completed snapshot.
+/// snapshot is unavailable or errors — including unconditionally on a
+/// non-Windows build, where the owner reports `Unavailable`. There is no path
+/// that reports [`RunningTargetObservation::NotRunning`] without a completed
+/// snapshot.
 pub fn observe_running_executable(
     executable: &Path,
 ) -> Result<RunningTargetObservation, UpdateInstallerError> {
@@ -337,9 +365,18 @@ pub fn observe_running_executable(
 /// The running executable is never overwritten. Before any filesystem effect
 /// the running state of the update target is **observed** from a live process
 /// snapshot ([`observe_running_executable`]) and carried into the returned
-/// [`UpdateRecord`]; an unavailable snapshot fails closed with
-/// [`UpdateInstallerError::RunningObservationFailed`] rather than assuming the
-/// target is idle. When `request.running_executable` additionally resolves to
+/// [`UpdateRecord`]. The observed target is the *would-be staged* executable
+/// `<installed_dir>/<package>.exe` — a file that does not exist yet — so the
+/// search covers the package's conventional executable name, not the file name
+/// of the copy that is actually live. Neither
+/// `request.running_executable` (the operator-declared live path) nor
+/// `request.previous_version_dir` (where the running copy usually lives) is
+/// consulted for the observation, so a live copy stored under a different file
+/// name is reported as `NotRunning`. The observation is recorded, not enforced:
+/// nothing here branches on it, and activation — the point at which it would
+/// have to gate — is owned outside this module.
+///
+/// Separately and independently, when `request.running_executable` resolves to
 /// the staged executable path or its parent versioned directory, installation
 /// fails closed with
 /// [`UpdateInstallerError::RunningBinaryWouldBeOverwritten`]. Kernel/Host
@@ -348,8 +385,17 @@ pub fn observe_running_executable(
 /// # Errors
 ///
 /// Returns an error for invalid metadata, a missing release approval, a
-/// failed running-state observation, a running-binary collision, an
+/// running-state observation failure, a running-binary collision, an
 /// already-existing versioned directory, or any staging I/O failure.
+///
+/// **Platform precondition:** the running-state observation is a live Windows
+/// process snapshot. On a non-Windows build the owner reports `Unavailable` from
+/// a compile-time `#[cfg(not(windows))]` branch, so this function **always**
+/// returns [`UpdateInstallerError::RunningObservationFailed`] and stages
+/// nothing there. That refusal is deliberate: I3.15 forbids adopting an unknown
+/// process, and `docs/architecture/I01-07-linux-portability-boundary.md` keeps
+/// authority/fencing semantics off the Windows-coupled path, so
+/// [`RunningTargetObservation::NotRunning`] is never synthesized off-Windows.
 pub fn install_update(
     request: &InstallUpdateRequest<'_>,
 ) -> Result<UpdateRecord, UpdateInstallerError> {
