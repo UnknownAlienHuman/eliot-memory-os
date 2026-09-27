@@ -320,8 +320,8 @@ impl TransportLimits {
 ///
 /// `Cancel`, heartbeat, and `Control` frames must remain sendable while
 /// ordinary request capacity is exhausted (issue #1881). Lane classification
-/// is enforced inside [`AdmissionQueue::admit_frame`], which derives the lane
-/// from the frame kind through this predicate; no caller supplies it.
+/// is enforced inside [`AdmissionQueue::admit_frame`], which validates the
+/// frame before deriving the lane from its kind; no caller supplies it.
 #[must_use]
 pub const fn is_control_capacity_frame(frame: &Frame) -> bool {
     matches!(
@@ -1513,13 +1513,15 @@ impl AdmissionQueue {
     ///
     /// # Errors
     ///
-    /// Returns `ZeroLengthFrame` / `OversizeFrame` for size violations and
-    /// `Backpressure` when the applicable in-flight bound is exhausted.
+    /// Returns a protocol error for invalid frames, `ZeroLengthFrame` /
+    /// `OversizeFrame` for size violations, and `Backpressure` when the
+    /// applicable in-flight bound is exhausted.
     pub fn admit_frame(
         &mut self,
         frame: &Frame,
         encoded_bytes: usize,
     ) -> Result<QueueReservation, TransportError> {
+        frame.validate()?;
         self.admit(encoded_bytes, is_control_capacity_frame(frame))
     }
 
