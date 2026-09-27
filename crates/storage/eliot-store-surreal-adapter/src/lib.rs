@@ -26,6 +26,7 @@ mod health;
 mod plan;
 mod readiness;
 mod schema;
+mod schema_inventory;
 mod write_execution;
 mod write_scheduler;
 

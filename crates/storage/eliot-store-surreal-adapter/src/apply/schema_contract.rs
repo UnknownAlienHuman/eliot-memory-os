@@ -52,10 +52,6 @@ pub(super) fn v1_identity() -> SchemaMigrationIdentity {
     }
 }
 
-pub(super) fn validate_v1_pin() -> bool {
-    eliot_store_api::sha256_hex(schema::SCHEMA_DDL.as_bytes()) == schema::SCHEMA_DDL_V1_SHA256
-}
-
 pub(super) fn schema_meta_record(
     migration: &CompiledMigration,
     updated_at: &str,

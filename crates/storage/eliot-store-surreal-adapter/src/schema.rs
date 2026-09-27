@@ -152,12 +152,10 @@ pub(crate) const MIGRATION_ID_V2: &str = "eliot.store.surreal.schema.v2";
 pub(crate) const MIGRATION_ID_V1_TO_V2: &str = "eliot.store.surreal.schema.v1_to_v2";
 /// Additive erasure-table migration: creates only `erasure_intent` and
 /// `erasure_outcome` on top of a v2 baseline (688-B).
-#[allow(dead_code)]
 pub(crate) const MIGRATION_ID_V2_TO_V3: &str = "eliot.store.surreal.schema.v2_to_v3";
 /// Schema generation reached by the erasure-table migration. The tables are
 /// additive, so v3 contains every v2 table verbatim plus the two erasure
 /// tables below.
-#[allow(dead_code)]
 pub(crate) const GENERATION_V3: &str = "3.0.0";
 pub(crate) const SCHEMA_DDL_V1_SHA256: &str =
     "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b";
@@ -241,7 +239,6 @@ pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
 /// carries the sealed per-surface outcomes (`operation_id`, `outcomes`).
 /// `operation_id` is unique in each table; one intent row plus its single
 /// outcome seal per operation — never a second ledger.
-#[allow(dead_code)]
 pub(crate) const ERASURE_TABLES_DDL: &str = r"
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
@@ -260,7 +257,6 @@ DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 
 /// Forward-migration body for the v2-to-v3 erasure step. Like the v1-to-v2
 /// body it is a delta: no `schema_meta` redefinition, no data statements.
-#[allow(dead_code)]
 pub(crate) const SCHEMA_MIGRATION_V2_TO_V3_DDL: &str = ERASURE_TABLES_DDL;
 
 /// Notification record table (issue #1780). Additive delta in the erasure
@@ -268,7 +264,6 @@ pub(crate) const SCHEMA_MIGRATION_V2_TO_V3_DDL: &str = ERASURE_TABLES_DDL;
 /// ordered admitted leg history, the owner revision, and the admission
 /// fence. Applied explicitly where the owning slice proves it; never
 /// executed implicitly by the adapter.
-#[allow(dead_code)]
 pub(crate) const NOTIFICATION_TABLES_DDL: &str = r"
 DEFINE TABLE notification_record SCHEMALESS;
 DEFINE FIELD dedup_key ON notification_record TYPE string;
@@ -287,7 +282,6 @@ DEFINE INDEX notify_dedup ON notification_record FIELDS dedup_key UNIQUE;
 /// verbatim base64 bytes, the owner revision, and the admission fence.
 /// Applied explicitly where the owning slice proves it; never executed
 /// implicitly by the adapter.
-#[allow(dead_code)]
 pub(crate) const REACTIVE_TABLES_DDL: &str = r"
 DEFINE TABLE reactive_session SCHEMALESS;
 DEFINE FIELD session_id ON reactive_session TYPE string;
@@ -318,7 +312,6 @@ DEFINE INDEX snapshot_uri ON resource_snapshot FIELDS uri UNIQUE;
 /// create-only row per occurrence identity with the verbatim invocation
 /// document. Applied explicitly where the owning slice proves it; never
 /// executed implicitly by the adapter.
-#[allow(dead_code)]
 pub(crate) const AUTOMATION_TABLES_DDL: &str = r"
 DEFINE TABLE automation_revision SCHEMALESS;
 DEFINE FIELD automation_id ON automation_revision TYPE string;
@@ -354,7 +347,6 @@ DEFINE INDEX invocation_occurrence ON automation_invocation FIELDS occurrence_id
 /// `experience_feedback` carries the same shape for feedback records.
 /// Applied explicitly where the owning slice proves it; never executed
 /// implicitly by the adapter.
-#[allow(dead_code)]
 pub(crate) const EXPERIENCE_TABLES_DDL: &str = r"
 DEFINE TABLE experience_bank SCHEMALESS;
 DEFINE FIELD handle ON experience_bank TYPE string;
@@ -445,7 +437,6 @@ DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
 /// v1, then the v1-to-v2 delta, then the v2-to-v3 delta below, in order; the
 /// assembled body here is the checksum-level proof that the chain stays
 /// exactly additive.
-#[allow(dead_code)]
 pub(crate) const SCHEMA_DDL_V3: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
 DEFINE FIELD generation ON schema_meta TYPE string;
