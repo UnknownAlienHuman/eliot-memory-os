@@ -6,12 +6,20 @@
 
 #![forbid(unsafe_code)]
 
+mod obligations;
 mod self_quality;
 mod validation;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use obligations::{
+    ActiveConformanceObligation, ActiveConformanceObligationSet, ActiveObligationHotset,
+    ActiveObligationHotsetEntry, ColdSourceClaim, ColdSourceLineage, OBLIGATION_CONTRACT_VERSION,
+    OBLIGATION_SCHEMA, ObligationError, ObligationStatus, ProductIdentityCapabilitySet,
+    compile_active_conformance_obligations, validate_active_conformance_obligation,
+    validate_cold_source_claim, validate_obligation_set,
+};
 pub use self_quality::{
     BlockedDiagnosis, CauseHypothesisStatus, ConflictedDiagnosis, DenominatorCompleteness,
     DimensionOutcome, DimensionStatus, EvidenceCeilings, ISSUE_A36_LEARNING_ACTIVATION,
