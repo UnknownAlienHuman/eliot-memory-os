@@ -1,9 +1,15 @@
 //! Bounded timing helpers for the existing Host Watchdog start convergence.
 //!
-//! The canonical architecture anchors are `ELIOT_ARCHITECTURE.md` A8.1
-//! (`ARCH-WDG-01`), A13.2, and A13.8, with implementation anchors
-//! `ELIOT_IMPLEMENTATION.md` I8.1, I8.2, I2.16, and I2.23. The timing behavior
-//! is mechanically extracted from the `WatchdogStartClock`,
+//! The canonical architecture anchors are A8.1
+//! (`docs/architecture/A08-01-purpose.md`, `ARCH-WDG-01`), A13.2
+//! (`docs/architecture/A13-02-kernel-and-failure-domains.md`), and A13.8
+//! (`docs/architecture/A13-08-integrity.md`), with implementation anchors I8.1
+//! (`docs/architecture/I08-01-process-and-authority.md`), I8.2
+//! (`docs/architecture/I08-02-independent-observation-routes.md`), I2.16
+//! (`docs/architecture/I02-16-crate-size-and-agent-context-envelope.md`), and
+//! I2.23
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`).
+//! The timing behavior is mechanically extracted from the `WatchdogStartClock`,
 //! `SystemWatchdogStartClock`, `watchdog_start_wait`, and
 //! `watchdog_unknown_wait` cell in `watchdog_service_start.rs`.
 //!

@@ -8,12 +8,24 @@ schema_version = "eliot-doc-traceability-retirement-v1"
 path = "crates/kernel/eliot-platform-windows/src/process_identity.rs"
 reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I07-03-handshake.md",
+  "docs/architecture/I07-14-session-lifecycle.md",
+  "docs/architecture/I15-02-principal-and-session-binding.md",
+  "docs/architecture/I15-03-least-privilege-processes.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -21,6 +33,9 @@ required_tokens = [
 path = "crates/kernel/eliot-platform-windows/src/process_job.rs"
 reason = "Replace the pre-sharding project/free-form identifiers and nonexistent I2.2 with current paths and indexed numeric handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
   "Durable-Job-execution",
@@ -29,8 +44,14 @@ forbidden_patterns = [
   "Когда-capability-становится-отдельным-crate",
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A13-01-let-it-fail-locally.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A13-03-module-supervision-and-doctor.md",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md",
+  "docs/architecture/I10-03-bridge-types.md",
+  "docs/architecture/APPENDIX-A-modulegeneration-lifecycle-projection.md",
+  "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -38,12 +59,19 @@ required_tokens = [
 path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_expectation.rs"
 reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I07-05-named-pipes.md",
+  "docs/architecture/I07-14-session-lifecycle.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -51,58 +79,97 @@ required_tokens = [
 path = "crates/kernel/eliot-platform-windows/src/named_pipe_peer_auth.rs"
 reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
-  "docs/ARCHITECTURE_CONTRACT.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I07-05-named-pipes.md",
+  "docs/architecture/I07-14-session-lifecycle.md",
+  "docs/architecture/I15-02-principal-and-session-binding.md",
 ]
 
 [[surface]]
 path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_server.rs"
 reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
-  "docs/ARCHITECTURE_CONTRACT.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I07-05-named-pipes.md",
+  "docs/architecture/I07-14-session-lifecycle.md",
 ]
 
 [[surface]]
 path = "crates/kernel/eliot-platform-windows/src/directory_publication.rs"
 reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
-  "docs/ARCHITECTURE_CONTRACT.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-01-security-assumes-breach.md",
+  "docs/architecture/A13-01-let-it-fail-locally.md",
+  "docs/architecture/A13-06-operational-recovery-state.md",
+  "docs/architecture/A13-09-concurrency-and-durable-execution.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+  "docs/architecture/I02-15-hot-path-modularity.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I03-15-installation-and-update-transaction.md",
+  "docs/architecture/I05-23-recoveryimport-inbox.md",
 ]
 
 [[surface]]
 path = "crates/kernel/eliot-platform-windows/src/named_pipe_process_admission.rs"
 reason = "Replace the pre-sharding project identifier and nonexistent I2.2 with current paths and indexed numeric handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
-  "docs/ARCHITECTURE_CONTRACT.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I07-05-named-pipes.md",
+  "docs/architecture/I07-14-session-lifecycle.md",
+  "docs/architecture/I15-02-principal-and-session-binding.md",
 ]
 
 [[surface]]
 path = "crates/kernel/eliot-platform-windows/src/secret_store.rs"
 reason = "Replace nonexistent I2.2, stale documentation line coordinates, and the old CodeBase Memory source pin while preserving valid A16.1 Decision Anchors."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
   'ELIOT_ARCHITECTURE\.md:\d+',
   'ELIOT_IMPLEMENTATION\.md:\d+',
@@ -110,23 +177,27 @@ forbidden_patterns = [
   'crates/kernel/eliot-platform-windows/src/lib\.rs:\d+',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
-  "docs/ARCHITECTURE_CONTRACT.md",
+  "docs/architecture/A02-01-complementary-fallibility.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A13-01-let-it-fail-locally.md",
+  "docs/architecture/I15-04-secrets.md",
+  "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
 ]
 
 [[surface]]
 path = "crates/kernel/eliot-platform-windows/src/tests.rs"
 reason = "Replace stale CodeBase Memory project/source pins in the test-module header with current repository authority."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   "eliot-memory-os-44e8b4b-live",
   "2ecd3da",
   "lines ~9212–12827",
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -138,12 +209,22 @@ required_tokens = [
 path = "bins/eliot-host/src/credential_control/codec.rs"
 reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A12-06-external-model-routes-and-secrets.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I01-04-supervision-tree.md",
+  "docs/architecture/I03-12-credential-lifecycle.md",
+  "docs/architecture/I03-15-installation-and-update-transaction.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -151,12 +232,21 @@ required_tokens = [
 path = "bins/eliot-host/src/journal_append/readiness_append.rs"
 reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+  "docs/architecture/I01-09-three-registries-three-owners.md",
+  "docs/architecture/I02-15-hot-path-modularity.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -164,12 +254,19 @@ required_tokens = [
 path = "bins/eliot-host/src/kernel_front_door_client.rs"
 reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I01-04-supervision-tree.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -177,18 +274,28 @@ required_tokens = [
 path = "bins/eliot-host/src/launch_descriptor_validation.rs"
 reason = "Retire pre-sharding doc project ID and ensure architecture and implementation document references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "ELIOT_ARCHITECTURE.md",
-  "ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A05-05-verifier-and-evaluation-contract.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+  "docs/architecture/I01-11-startup-algorithm.md",
+  "docs/architecture/I-PREFACE-04-runtime-layer-model.md",
 ]
 
 [[surface]]
 path = "bins/eliot-host/src/host_job_launch.rs"
 reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -202,6 +309,9 @@ required_tokens = [
 path = "bins/eliot-store-surreal/src/adapter_materialization.rs"
 reason = "Retire predecessor digests and pre-sharding project ID while ensuring canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D[8]",
   "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0[B]",
@@ -217,12 +327,21 @@ required_tokens = [
 path = "bins/eliot-store-surreal/src/launch_config.rs"
 reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I05-09-surrealdb-implementation.md",
+  "docs/architecture/I15-03-least-privilege-processes.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -230,12 +349,19 @@ required_tokens = [
 path = "bins/eliot-store-surreal/src/launch_mode.rs"
 reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I05-storage-and-canonical-memory.md",
+  "docs/architecture/I05-01-storage-boundary.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -243,6 +369,9 @@ required_tokens = [
 path = "bins/eliot-watchdog/src/self_admission.rs"
 reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -256,14 +385,24 @@ required_tokens = [
 path = "crates/eliot-engine/src/context_contracts.rs"
 reason = "Retire pre-sharding doc project ID and stale git hashes while ensuring canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   "eliot-memory-os-121e27d-live",
   "121e27dfd232f18900253e2f06a6b6b4723473c7",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A07-01-active-understanding-view.md",
+  "docs/architecture/A07-04-context-as-intervention.md",
+  "docs/architecture/A07-06-compaction-and-resume.md",
+  "docs/architecture/A07-09-context-economy.md",
+  "docs/architecture/I07-11-context-payload-profiles-and-decision-safety-floor.md",
+  "docs/architecture/I07-19-reactive-context-sequence.md",
+  "docs/architecture/I07-26-reversible-payload-budget-and-omission-handles.md",
+  "docs/architecture/I12-13-context-compiler.md",
+  "docs/architecture/I12-17-compaction-and-resume.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -271,6 +410,9 @@ required_tokens = [
 path = "crates/eliot-engine/src/project_understanding/continuity.rs"
 reason = "Retire predecessor digests, pre-sharding project ID, and stale line coordinates while ensuring canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D[8]",
   "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0[B]",
@@ -278,8 +420,10 @@ forbidden_patterns = [
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A07-06-compaction-and-resume.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I07-15-route-continuation-and-transfer.md",
+  "docs/architecture/I12-17-compaction-and-resume.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -287,14 +431,20 @@ required_tokens = [
 path = "crates/eliot-engine/src/read/l2_and_graph_health.rs"
 reason = "Retire predecessor digests and pre-sharding project ID while ensuring canonical architecture, implementation, and contract references."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D[8]",
   "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0[B]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
 required_tokens = [
-  "docs/architecture/ELIOT_ARCHITECTURE.md",
-  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/architecture/A04-05-evidence-relations-and-continuity.md",
+  "docs/architecture/I05-03-store-neutral-semantic-api.md",
+  "docs/architecture/I05-08-canonical-event-and-projections.md",
+  "docs/architecture/I05-09-surrealdb-implementation.md",
+  "docs/architecture/I05-20-read-model-consistency-and-cache.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
 
@@ -302,6 +452,9 @@ required_tokens = [
 path = "bins/eliot-kernel/src/store_receipt_dispatch.rs"
 reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -315,6 +468,9 @@ required_tokens = [
 path = "crates/kernel/eliot-ipc/src/frame_codec.rs"
 reason = "Retire nonexistent I2.2 handle and ensure implementation and architecture handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -327,6 +483,9 @@ required_tokens = [
 path = "crates/kernel/eliot-kernel-service/src/store_receipt_gateway.rs"
 reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -340,6 +499,9 @@ required_tokens = [
 path = "crates/governor/eliot-governor/src/authority_recovery.rs"
 reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -361,6 +523,9 @@ required_tokens = [
 path = "bins/eliot-watchdog/src/host_identity_observation.rs"
 reason = "Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -374,6 +539,9 @@ required_tokens = [
 path = "bins/eliot-watchdog/src/runtime_loop.rs"
 reason = "Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog/runtime handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -387,6 +555,9 @@ required_tokens = [
 path = "bins/eliot-watchdog/src/service_registration_projection.rs"
 reason = "Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -400,6 +571,9 @@ required_tokens = [
 path = "bins/eliot-watchdog/src/supervision_lease_load.rs"
 reason = "Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog/kernel handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -413,6 +587,9 @@ required_tokens = [
 path = "bins/eliot-watchdog/src/watchdog_composition/authority_state.rs"
 reason = "Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical watchdog/kernel handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -426,6 +603,9 @@ required_tokens = [
 path = "crates/kernel/eliot-platform-windows/src/service_registration.rs"
 reason = "Retire pre-sharding project ID and nonexistent I2.2 while ensuring canonical kernel handles (issue 1147 WRITER-A scope; TOML owned by WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-fa94113[5]",
   '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
 ]
@@ -439,6 +619,9 @@ required_tokens = [
 path = "crates/eliot-engine/src/context/packet_quality.rs"
 reason = "Retire verified-from/Source-of-truth draft pins, live graph pin, docs-project wildcard, and base SHAs while ensuring canonical A7/I7/I12 handles (issue 1147 WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-architecture-docs-",
   "eliot-memory-os-[0-9a-f]+-live",
   '4\.5-draft',
@@ -461,6 +644,9 @@ required_tokens = [
 path = "crates/eliot-engine/src/codecortex/memory_writer.rs"
 reason = "Retire canonical base SHA and live graph pin while ensuring canonical A12/A10/A5/I12/I5/I10 handles (issue 1147 WRITER-1147B)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "eliot-memory-os-[0-9a-f]+-live",
   "canonical base",
   "8e1b66d267633052dc2b9eac7776dff743a6827b",
@@ -477,6 +663,9 @@ required_tokens = [
 path = "crates/eliot-engine/src/codecortex.rs"
 reason = "Retire codebase-memory adapter strings while keeping honest unavailable status and typed CodeEvidenceSource (issue 1147 WRITER-1147B; CodebaseMemory enum retained as serialization contract, reported as residual)."
 forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
   "codebase_memory_adapter",
   "codebase-memory",
   "project_memory",
@@ -486,4 +675,392 @@ forbidden_patterns = [
 required_tokens = [
   "unavailable_evidence_adapter",
   "no direct in-process adapter is wired in D1",
+]
+
+[[surface]]
+path = "bins/eliot-kernel/src/control_plane.rs"
+reason = "Retire the compatibility-facade citation and the unresolved P.3 handle in favour of current Architecture fragments plus the R1 runtime layer (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+  "P.3",
+]
+required_tokens = [
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A13-05-bounded-resources-and-control-reserve.md",
+  "docs/architecture/I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md",
+  "docs/architecture/I14-13-idle-drain-and-cancellation.md",
+  "docs/architecture/I14-23-safe-shutdown.md",
+  "docs/architecture/I-PREFACE-04-runtime-layer-model.md",
+]
+
+[[surface]]
+path = "bins/eliot-kernel/src/composition_bootstrap.rs"
+reason = "Retire the compatibility-facade citation and the unresolved P.3 handle in favour of current Implementation fragments plus the R1 runtime layer (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+  "P.3",
+]
+required_tokens = [
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A13-05-bounded-resources-and-control-reserve.md",
+  "docs/architecture/I01-11-startup-algorithm.md",
+  "docs/architecture/I14-16-kernel-and-host-update.md",
+  "docs/architecture/I-PREFACE-04-runtime-layer-model.md",
+]
+
+[[surface]]
+path = "bins/eliot-kernel/src/kernel_config.rs"
+reason = "Retire the compatibility-facade citation and the unresolved P.3 handle in favour of current Architecture/Implementation fragments plus the R1 runtime layer (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+  "P.3",
+]
+required_tokens = [
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A13-05-bounded-resources-and-control-reserve.md",
+  "docs/architecture/I03-09-configuration-layers.md",
+  "docs/architecture/I-PREFACE-04-runtime-layer-model.md",
+]
+
+[[surface]]
+path = "bins/eliot-kernel/src/tests.rs"
+reason = "Retire the compatibility-facade citation and the nonexistent I2.2 handle in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/I02-16-crate-size-and-agent-context-envelope.md",
+]
+
+[[surface]]
+path = "bins/eliot-kernel/src/tests/activation.rs"
+reason = "Retire the compatibility-facade citation and the nonexistent I2.2 handle in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/I02-16-crate-size-and-agent-context-envelope.md",
+]
+
+[[surface]]
+path = "bins/eliot-kernel/src/tests/process_execution.rs"
+reason = "Retire the compatibility-facade citation and the nonexistent I2.2 handle in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/I02-16-crate-size-and-agent-context-envelope.md",
+  "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/launch_artifact_lease.rs"
+reason = "Retire the compatibility-facade citation and the unresolved B.0 handle in favour of current canonical fragments plus the storage boundary (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+  "B.0",
+]
+required_tokens = [
+  "docs/architecture/A05-05-verifier-and-evaluation-contract.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I05-01-storage-boundary.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/watchdog_start_timing.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A08-01-purpose.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A13-08-integrity.md",
+  "docs/architecture/I08-01-process-and-authority.md",
+  "docs/architecture/I08-02-independent-observation-routes.md",
+  "docs/architecture/I02-16-crate-size-and-agent-context-envelope.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/runtime_restart_state/pending_codec.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A13-06-operational-recovery-state.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I02-19-layered-module-cell.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/readiness_gate/contract.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A13-03-module-supervision-and-doctor.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I01-04-supervision-tree.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+  "docs/architecture/I01-10-service-health-state-model.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/store_kernel_launch_sequence.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/I00-01-three-development-contours.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I01-04-supervision-tree.md",
+]
+
+[[surface]]
+path = "bins/eliot-native-worker/src/kernel_admission_client.rs"
+reason = "Retire the compatibility-facade citation and the unresolved P.3 handle in favour of current canonical fragments plus the R1 runtime layer (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+  "P.3",
+]
+required_tokens = [
+  "docs/architecture/A00-03-hard-boundaries.md",
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md",
+  "docs/architecture/I07-03-handshake.md",
+  "docs/architecture/I07-05-named-pipes.md",
+  "docs/architecture/I15-02-principal-and-session-binding.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I-PREFACE-04-runtime-layer-model.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-kernel-core/src/authority_snapshot.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+]
+
+[[surface]]
+path = "crates/eliot-app/src/provider_runtime_contract.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/I10-11-external-model-bridges.md",
+  "docs/architecture/I10-17-adapter-subsystem.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/eliot-app/src/host_runtime/supervised_process_contract.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A13-03-module-supervision-and-doctor.md",
+  "docs/architecture/I01-01-process-principle.md",
+  "docs/architecture/I01-04-supervision-tree.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-process/src/dispatch_permit.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-02-roles.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+  "docs/architecture/I06-10-authority-records.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-installation/src/registry_wire/current_models.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/I03-14-registry-revalidation.md",
+  "docs/architecture/I03-15-installation-and-update-transaction.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/user_owned_leases.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A02-03-modular-architecture.md",
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/I02-03-workspace-topology-and-dependency-direction.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform-windows/src/nonce_generation.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-platform/src/handle_nonce.rs"
+reason = "Retire the compatibility-facade citation in favour of current canonical fragments (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+]
+required_tokens = [
+  "docs/architecture/A12-02-principal-session-and-visibility.md",
+  "docs/architecture/I01-08-exact-ownership-and-call-paths.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-kernel-service/src/store_exchange.rs"
+reason = "Retire the compatibility-facade citation and the unresolved R2/B.2 handles in favour of current canonical fragments plus the runtime layer and storage boundary (issue #1147)."
+forbidden_patterns = [
+  'ELIOT_ARCHITECTURE\.md',
+  'ELIOT_IMPLEMENTATION\.md',
+
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9A-Za-z])',
+  "B.2",
+  "R2",
+]
+required_tokens = [
+  "docs/architecture/A12-03-one-governed-write-path.md",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md",
+  "docs/architecture/A16-01-decision-anchors.md",
+  "docs/architecture/I05-01-storage-boundary.md",
+  "docs/architecture/I05-09-surrealdb-implementation.md",
+  "docs/architecture/I05-11-storage-replacement.md",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+  "docs/architecture/I-PREFACE-04-runtime-layer-model.md",
 ]

@@ -7,8 +7,11 @@
 //! Kernel unit tests — acceptance-only scope.
 //!
 //! Architecture traceability:
-//! - `ELIOT_ARCHITECTURE.md` :: A2.3 and `ARCH-MOD-01` — modular architecture, ordinary module boundary.
-//! - `ELIOT_IMPLEMENTATION.md` :: I2.2 and `I2.16` — crate capability extraction and crate-size/Agent Context Envelope.
+//! - `A2.3` (`docs/architecture/A02-03-modular-architecture.md`) and
+//!   `ARCH-MOD-01` — modular architecture, ordinary module boundary.
+//! - `I2.16`
+//!   (`docs/architecture/I02-16-crate-size-and-agent-context-envelope.md`) —
+//!   crate-size/Agent Context Envelope.
 //!
 //! This module owns no runtime authority and exercises only the Kernel composition
 //! boundary via `super::*`. It is an ordinary module kept under 10k LOC.

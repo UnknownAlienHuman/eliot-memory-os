@@ -17,10 +17,8 @@
 //! - `I15.2` (`docs/architecture/I15-02-principal-and-session-binding.md`)
 //! - `I15.3` (`docs/architecture/I15-03-least-privilege-processes.md`)
 //!
-//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
-//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
-//! the governing shards are named per anchor above).
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
+//! sharded fragments named per anchor above.
 //!
 //! This module owns shared file, process, and token identity observation
 //! primitives only. It forbids `NamedPipe` admission, job or process lifecycle,

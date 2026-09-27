@@ -1,8 +1,17 @@
 //! Process execution tests — test-oracle only.
 //!
 //! Architecture traceability:
-//! - `ELIOT_ARCHITECTURE.md` :: A2.3 and `ARCH-MOD-01` — modular architecture, ordinary module boundary.
-//! - `ELIOT_IMPLEMENTATION.md` :: I2.2, `I2.16`, `I2.20`, `I2.23` — kernel process execution orchestration.
+//! - `A2.3` (`docs/architecture/A02-03-modular-architecture.md`) and
+//!   `ARCH-MOD-01` — modular architecture, ordinary module boundary.
+//! - `I2.16`
+//!   (`docs/architecture/I02-16-crate-size-and-agent-context-envelope.md`),
+//!   `I2.20`
+//!   (`docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md`)
+//!   is the Module Contract Kit, Crate Context Capsule, and Module Test
+//!   Capsule; and
+//!   `I2.23`
+//!   (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`)
+//!   — kernel process execution orchestration.
 //!
 //! This module is test-oracle only with no process, authority, Store or daemon ownership and exercises only the Kernel composition boundary via `super::*`.
 

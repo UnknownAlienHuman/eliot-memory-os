@@ -1,18 +1,20 @@
 //! Kernel control-plane transition and authenticated request handling.
 //!
 //! Architecture traceability:
-//! - `ELIOT_ARCHITECTURE.md :: A13.2. Kernel и failure domains` keeps Kernel
-//!   as the lifecycle and failure boundary for this control path.
-//! - `ELIOT_ARCHITECTURE.md :: A13.5. Bounded resources и Control Reserve`
+//! - `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`) keeps
+//!   Kernel as the lifecycle and failure boundary for this control path.
+//! - `A13.5` (`docs/architecture/A13-05-bounded-resources-and-control-reserve.md`)
 //!   binds control work to the existing protected-control reserve; this module
 //!   exposes its capacity without creating a second budget.
-//! - `ELIOT_IMPLEMENTATION.md :: P.3. Kernel control boundary` keeps
+//! - The R1 Kernel runtime layer
+//!   (`docs/architecture/I-PREFACE-04-runtime-layer-model.md`) keeps
 //!   front-door request admission and lifecycle transitions in Kernel while
 //!   service semantics stay behind the existing `KernelService` gateway.
-//! - `ELIOT_IMPLEMENTATION.md :: I1.5. Demand-start, observable use,
-//!   supervision and idle shutdown` and `I14.13. Idle drain and cancellation`
+//! - `I1.5`
+//!   (`docs/architecture/I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md`)
+//!   and `I14.13` (`docs/architecture/I14-13-idle-drain-and-cancellation.md`)
 //!   constrain shutdown to the existing runtime signal and drain owners.
-//! - `ELIOT_IMPLEMENTATION.md :: I14.23. Safe shutdown` leaves the complete
+//! - `I14.23` (`docs/architecture/I14-23-safe-shutdown.md`) leaves the complete
 //!   cooperative shutdown sequence in `KernelComposition::shutdown`.
 //!
 //! The implementation remains an ordinary module so the composition root keeps

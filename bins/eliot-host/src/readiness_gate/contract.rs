@@ -1,11 +1,18 @@
 //! Readiness cadence, contour, and classification contract.
 //!
-//! Architecture anchors: `docs/architecture/ELIOT_ARCHITECTURE.md` section
-//! `A2.2` (Host Supervisor), `A13.2` (Kernel and failure domains), and `A13.3`
-//! (Module supervision and Doctor). Implementation anchors:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` section `I1.2` (Host
-//! ownership), `I1.4` (supervision tree), `I1.8` (exact ownership and call
-//! paths), and `I1.10` (service health state model).
+//! Architecture anchors: section `A2.2`
+//! (`docs/architecture/A02-02-roles.md`, Host Supervisor), `A13.2`
+//! (`docs/architecture/A13-02-kernel-and-failure-domains.md`, Kernel and failure
+//! domains), and `A13.3`
+//! (`docs/architecture/A13-03-module-supervision-and-doctor.md`, Module
+//! supervision and Doctor). Implementation anchors: section `I1.2`
+//! (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`,
+//! Host ownership), `I1.4` (`docs/architecture/I01-04-supervision-tree.md`,
+//! supervision tree), `I1.8`
+//! (`docs/architecture/I01-08-exact-ownership-and-call-paths.md`, exact ownership
+//! and call paths), and `I1.10`
+//! (`docs/architecture/I01-10-service-health-state-model.md`, service health
+//! state model).
 //!
 //! This child owns only the immutable readiness values and pure classification
 //! helpers. It owns no lease/retry state, lifecycle reconciliation, journal

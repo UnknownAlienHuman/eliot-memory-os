@@ -1,11 +1,16 @@
 //! Store launch configuration and validation.
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A2.3`,
-//! `A12.3`, and `A13.2`, plus Decision Anchors `ARCH-MOD-02`, `ARCH-SEC-02`,
-//! and `ARCH-RES-01`. Implementation:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I1.2`, `I2.23`,
-//! `I5.9`, and `I15.3`. Normative precedence remains in
-//! `docs/ARCHITECTURE_CONTRACT.md`.
+//! Architecture: `A2.3` (`docs/architecture/A02-03-modular-architecture.md`),
+//! `A12.3` (`docs/architecture/A12-03-one-governed-write-path.md`), and `A13.2`
+//! (`docs/architecture/A13-02-kernel-and-failure-domains.md`), plus Decision
+//! Anchors `docs/architecture/A16-01-decision-anchors.md` `ARCH-MOD-02`,
+//! `ARCH-SEC-02`, and `ARCH-RES-01`. Implementation: `I1.2`
+//! (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`),
+//! `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`),
+//! `I5.9` (`docs/architecture/I05-09-surrealdb-implementation.md`), and `I15.3`
+//! (`docs/architecture/I15-03-least-privilege-processes.md`). Normative
+//! precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This module owns Store launch configuration validation, materialization,
 //! digest binding, and bounded JSON/TOML loading only. It forbids runtime

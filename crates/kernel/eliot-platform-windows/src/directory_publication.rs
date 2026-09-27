@@ -1,14 +1,25 @@
 //! Handle-bound create-new directory publication for the Windows platform contour.
 //!
-//! Architecture anchors: `A2.3`,
-//! ARCH-MOD-02, A12.1, ARCH-SEC-01, A13.1, ARCH-RES-01, A13.6, A13.9,
-//! and ARCH-ORD-01. This module owns one independently understandable
+//! Architecture anchors: `A2.3`
+//! (`docs/architecture/A02-03-modular-architecture.md`), ARCH-MOD-02, `A12.1`
+//! (`docs/architecture/A12-01-security-assumes-breach.md`), ARCH-SEC-01, `A13.1`
+//! (`docs/architecture/A13-01-let-it-fail-locally.md`), ARCH-RES-01, `A13.6`
+//! (`docs/architecture/A13-06-operational-recovery-state.md`), `A13.9`
+//! (`docs/architecture/A13-09-concurrency-and-durable-execution.md`),
+//! and ARCH-ORD-01; the `ARCH-*` anchors resolve through
+//! `docs/architecture/A16-01-decision-anchors.md`. This module owns one
+//! independently understandable
 //! physical publication capability: retained no-follow parent handles,
 //! create-new staging, identity fences, handle-relative no-replace rename,
 //! and typed post-commit reconciliation.
 //!
-//! Implementation anchors: `I2.1`, `I2.15`,
-//! I2.23, I3.15, and I5.23. The implementation remains a normal Rust module
+//! Implementation anchors: `I2.1`
+//! (`docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md`),
+//! `I2.15` (`docs/architecture/I02-15-hot-path-modularity.md`), `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`),
+//! I3.15 (`docs/architecture/I03-15-installation-and-update-transaction.md`),
+//! and `I5.23` (`docs/architecture/I05-23-recoveryimport-inbox.md`).
+//! The implementation remains a normal Rust module
 //! because its public contract is part of this crate and its native contour
 //! is tightly coupled to shared platform identity/path primitives.
 //!
@@ -21,10 +32,8 @@
 //! and reconcilable rather than being converted into success or pre-commit
 //! errors.
 //!
-//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
-//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
-//! the governing shards are named per anchor above).
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
+//! sharded fragments named per anchor above.
 
 use std::path::{Path, PathBuf};
 

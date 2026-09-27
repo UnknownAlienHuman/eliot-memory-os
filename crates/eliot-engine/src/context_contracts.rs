@@ -34,11 +34,16 @@
 //!   invocation, Dreamer orchestration, canonical store write, or service
 //!   lifecycle code is moved here.
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A7.1`,
-//! `A7.4`, `A7.6`, and `A7.9`. Implementation:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I7.11`, `I7.19`,
-//! `I7.26`, and `I12.13`–`I12.17`. Normative precedence remains in
-//! `docs/ARCHITECTURE_CONTRACT.md`.
+//! Architecture: `A7.1` (`docs/architecture/A07-01-active-understanding-view.md`),
+//! `A7.4` (`docs/architecture/A07-04-context-as-intervention.md`), `A7.6`
+//! (`docs/architecture/A07-06-compaction-and-resume.md`), and `A7.9`
+//! (`docs/architecture/A07-09-context-economy.md`). Implementation: `I7.11`
+//! (`docs/architecture/I07-11-context-payload-profiles-and-decision-safety-floor.md`),
+//! `I7.19` (`docs/architecture/I07-19-reactive-context-sequence.md`), `I7.26`
+//! (`docs/architecture/I07-26-reversible-payload-budget-and-omission-handles.md`),
+//! and `I12.13` (`docs/architecture/I12-13-context-compiler.md`),
+//! `I12.17` (`docs/architecture/I12-17-compaction-and-resume.md`). Normative
+//! precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! - Architecture: `A7.1` Active Understanding View, `A7.4` Context as
 //!   intervention, `A7.6` Compaction & resume, `A7.9` Context economy.

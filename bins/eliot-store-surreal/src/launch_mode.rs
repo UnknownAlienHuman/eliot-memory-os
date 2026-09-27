@@ -2,11 +2,15 @@
 
 //! Launch mode cell for `eliot-store-surreal`.
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A12.3`
-//! and `A13.2`, plus Decision Anchors `ARCH-AUTH-01`, `ARCH-SEC-02`, and
-//! `ARCH-RES-01`. Implementation:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I5`, `B.2`, and
-//! `I2.23`. Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
+//! Architecture: `A12.3` (`docs/architecture/A12-03-one-governed-write-path.md`)
+//! and `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`), plus
+//! Decision Anchors `docs/architecture/A16-01-decision-anchors.md`
+//! `ARCH-AUTH-01`, `ARCH-SEC-02`, and `ARCH-RES-01`. Implementation: `I5`
+//! (`docs/architecture/I05-storage-and-canonical-memory.md`), the Kernel-Store
+//! storage boundary `I5.1` (`docs/architecture/I05-01-storage-boundary.md`), and
+//! `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`).
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This cell owns closed launch-mode parsing, launch preparation routing,
 //! portable-dev clock observation, and control-frame construction only. It

@@ -99,6 +99,14 @@ tokens = [
   "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B",
   "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md",
   "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md",
+  # Issue #1147: the two stable monolith paths survive on disk as generated
+  # COMPATIBILITY MAPS, not the normative book. Their own header requires
+  # agents to use the reading protocol, route table, or handle index and open
+  # only the returned canonical fragments. A production comment that cites one
+  # of them as current authority therefore teaches a retired reading path and
+  # is rejected; the canonical shard path belongs in the comment instead.
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
 ]
 # These implementation modules retain pre-sharding traceability markers. Each
 # exception is exact path/token scoped; all other operational source remains
@@ -153,6 +161,71 @@ path = "scripts/doc_code_conformance_core.py"
 token = "docs/normative/"
 reason = "The detector's default configuration and its self-test fixtures must contain the token they reject."
 
+# Issue #1147 bounded exceptions for the two compatibility-map paths. Every entry
+# below names one surface that reads the facade as real, current product
+# behaviour rather than citing it as documentation authority. Each exception is
+# exact path/token scoped; every other production path stays fail-closed.
+
+[[retired_references.allow]]
+path = "config/doc-code-conformance.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "This file owns the retired-token list and the compatibility-map prohibition itself."
+
+[[retired_references.allow]]
+path = "config/doc-code-conformance.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "This file owns the retired-token list and the compatibility-map prohibition itself."
+
+[[retired_references.allow]]
+path = "scripts/doc_code_conformance_core.py"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "The detector's own negative self-test fixtures must contain the legacy handle line they reject."
+
+[[retired_references.allow]]
+path = "scripts/doc_code_conformance_core.py"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "The detector's own negative self-test fixtures must contain the legacy handle line they reject."
+
+[[retired_references.allow]]
+path = "config/doc-traceability-retirement.toml"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "The DCC-014 surface rules record the compatibility-map paths they forbid; banning them in their own ledger is impossible."
+
+[[retired_references.allow]]
+path = "config/doc-traceability-retirement.toml"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "The DCC-014 surface rules record the compatibility-map paths they forbid; banning them in their own ledger is impossible."
+
+[[retired_references.allow]]
+path = "crates/foundation/eliot-bootstrap/src/normative.rs"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "ARCHITECTURE_COMPATIBILITY_PATH is a current product constant naming the stable compatibility-map path, not a documentation citation."
+
+[[retired_references.allow]]
+path = "crates/foundation/eliot-bootstrap/src/normative.rs"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "IMPLEMENTATION_COMPATIBILITY_PATH is a current product constant naming the stable compatibility-map path, not a documentation citation."
+
+[[retired_references.allow]]
+path = "workspace/tools/eliot-runtime-compiler/src/lib.rs"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "The runtime compiler resolves, reads, and shadow-guards the stable compatibility-map payload; the path is the product input it operates on."
+
+[[retired_references.allow]]
+path = "workspace/tools/eliot-runtime-compiler/src/lib.rs"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "The runtime compiler resolves, reads, and shadow-guards the stable compatibility-map payload; the path is the product input it operates on."
+
+[[retired_references.allow]]
+path = "crates/surfaces/eliot-cli/src/lib.rs"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "The CLI test module asserts the compatibility monoliths stay in place; the path is the asserted product surface, not a citation."
+
+[[retired_references.allow]]
+path = "crates/surfaces/eliot-cli/src/lib.rs"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "The CLI test module asserts the compatibility monoliths stay in place; the path is the asserted product surface, not a citation."
+
 [[retired_references.allow]]
 path = "scripts/docs_shards_core.py"
 token = "docs/architecture/ELIOT_ARCHITECTURE_ENGLISH_FINAL_2026-08-28.md"
@@ -162,6 +235,36 @@ reason = "docs_shards_core raises DocsError when this retired surface reappears;
 path = "scripts/docs_shards_core.py"
 token = "docs/architecture/ELIOT_IMPLEMENTATION_ENGLISH_FINAL_2026-08-28.md"
 reason = "docs_shards_core raises DocsError when this retired surface reappears; the guard names it."
+
+[[retired_references.allow]]
+path = "README.md"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "The operator-facing index links the accepted normative pair; the facade is the stable public link target and its bounded index sits beside it."
+
+[[retired_references.allow]]
+path = "README.md"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "The operator-facing index links the accepted normative pair; the facade is the stable public link target and its bounded index sits beside it."
+
+[[retired_references.allow]]
+path = "scripts/doc_code_conformance_lib/traceability_retirement.py"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "The DCC-014 detector owns the surface rules and must be able to name the compatibility-map path it rejects."
+
+[[retired_references.allow]]
+path = "scripts/doc_code_conformance_lib/traceability_retirement.py"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "The DCC-014 detector owns the surface rules and must be able to name the compatibility-map path it rejects."
+
+[[retired_references.allow]]
+path = "scripts/docs_router_core.py"
+token = "docs/architecture/ELIOT_ARCHITECTURE.md"
+reason = "The router resolves the stable compatibility-map paths as legacy-anchor entry points so incoming links keep working; the route table is the current read path."
+
+[[retired_references.allow]]
+path = "scripts/docs_router_core.py"
+token = "docs/architecture/ELIOT_IMPLEMENTATION.md"
+reason = "The router resolves the stable compatibility-map paths as legacy-anchor entry points so incoming links keep working; the route table is the current read path."
 
 [script_inventory]
 directory = "scripts"
