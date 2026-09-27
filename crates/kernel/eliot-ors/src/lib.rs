@@ -25,9 +25,11 @@ mod versioned_artifact;
 pub mod test_support;
 
 pub use admission_reservation::{
-    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationDisposition,
+    ActiveAdmissionReservation, AdmissionReservationClaimRef, AdmissionReservationClaims,
+    AdmissionReservationDisposition, AdmissionReservationLaunchPrerequisite,
     AdmissionReservationRecord, AdmissionReservationSnapshot, AdmissionReservationStage,
     AdmissionReservationState, AdmissionReservationTransitionRequest,
+    verify_admission_reservation_launch_prerequisite,
 };
 pub use backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_ID_LEN,
