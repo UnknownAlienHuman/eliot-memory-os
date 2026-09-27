@@ -94,6 +94,9 @@ where
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
     admitted.validate()?;
+    if admitted.economy.recipe_digest != recipe.recipe_sha256 {
+        return Err(AssemblyError::Contract(ContextError::IdentityConflict));
+    }
     if admitted.economy.measurement.digest != admitted.canonical_payload_digest()? {
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
