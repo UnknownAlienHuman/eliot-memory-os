@@ -34,12 +34,11 @@ use std::sync::Arc;
 
 use eliot_authority::{
     GrantActivationRequest, GrantRevocationRequest, IntroductionActivationRequest,
-    IntroductionRevocationRequest, P07AuthorityPort, P07PortError, RootTransitionActivationReceipt,
-    RootTransitionActivationRequest, SnapshotId,
+    IntroductionRevocationRequest, P07AuthorityPort, P07PortError, P07RefusalCause,
+    RootTransitionActivationReceipt, RootTransitionActivationRequest, SnapshotId,
 };
 use eliot_contracts::StateFence;
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
-use eliot_kernel_service::{REASON_IDENTITY_CONFLICT, REASON_UNKNOWN_OUTCOME};
 use eliot_receipts::{AuthorityBinding, AuthorityRequestSubject};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 
@@ -80,6 +79,16 @@ const DAEMON_SESSION_CAPABILITY: &str = "daemon";
 const PRE_ADMISSION_RECEIPT_PENDING: &str =
     "Kernel has not published the exact launched process receipt";
 
+/// Exact typed P-07 error variant names carried by the refusal frame. The
+/// client matches the frame on these closed tokens, never on free prose, so a
+/// refusal that arrives under any other name fails closed.
+const P07_ERROR_IDENTITY_CONFLICT: &str = "IdentityConflict";
+const P07_ERROR_UNKNOWN_OUTCOME: &str = "UnknownOutcome";
+const P07_ERROR_INVALID_BINDING: &str = "InvalidBinding";
+const P07_ERROR_UNAVAILABLE: &str = "Unavailable";
+const P07_ERROR_NOT_ADMITTED: &str = "NotAdmitted";
+const P07_ERROR_REFUSED: &str = "Refused";
+
 /// Authenticated P-07 transport over an already-connected Kernel client.
 ///
 /// The client is retained exactly once by the daemon composition root. This
@@ -112,6 +121,12 @@ impl KernelAuthorityClient {
     /// not a refusal of the presented authority, so it degrades to
     /// `Unavailable` and the caller reconnects instead of presenting an
     /// unbound subject.
+    ///
+    /// The two decisions stay distinct. Absent session evidence keeps
+    /// `Unavailable`, because I7.20 classifies no cause for a session the
+    /// Kernel has not yet published and inventing one would over-claim. A
+    /// subject the *proven* session facts cannot bind into is a different
+    /// decision and reports its own cause.
     fn subject(&self) -> Result<AuthorityRequestSubject, P07PortError> {
         let facts = self
             .kernel
@@ -122,7 +137,9 @@ impl KernelAuthorityClient {
             facts.connection_id(),
             DAEMON_SESSION_CAPABILITY,
         )
-        .map_err(|_| P07PortError::InvalidBinding)
+        .map_err(|_| P07PortError::Refused {
+            cause: P07RefusalCause::SessionSubjectUnbindable,
+        })
     }
 }
 
@@ -302,10 +319,15 @@ fn map_transition_validation_error(error: &eliot_authority::AuthorityError) -> P
 
 /// Validates the caller-side binding before any transport is touched: the
 /// fence must be well-formed, the epoch must agree with the fence, and the
-/// presented fence must be the currently active Kernel fence. Anything else is
-/// an internally inconsistent presentation, never a Kernel refusal. The
-/// principal/session/scope subject travels beside this binding and is proved
-/// separately by [`KernelAuthorityClient::subject`], so neither check is
+/// presented fence must be the currently active Kernel fence.
+///
+/// The three decisions are reported as three distinct typed I7.20 causes rather
+/// than one `InvalidBinding`, because the code has already separated them: a
+/// presentation that contradicts *itself* (`INVALID_ARGUMENT`, repair the
+/// binding) is not the same failure as a well-formed presentation of a fence
+/// that is not the current Kernel fence (`STALE_STATE_FENCE`, fail closed).
+/// The principal/session/scope subject travels beside this binding and is
+/// proved separately by [`KernelAuthorityClient::subject`], so neither check is
 /// satisfied by the other.
 fn check_binding(
     binding: &AuthorityBinding,
@@ -314,11 +336,18 @@ fn check_binding(
     binding
         .state_fence
         .validate()
-        .map_err(|_| P07PortError::InvalidBinding)?;
-    if binding.authority_epoch != binding.state_fence.authority_epoch
-        || binding.state_fence != *active_fence
-    {
-        return Err(P07PortError::InvalidBinding);
+        .map_err(|_| P07PortError::Refused {
+            cause: P07RefusalCause::StateFenceUnvalidated,
+        })?;
+    if binding.authority_epoch != binding.state_fence.authority_epoch {
+        return Err(P07PortError::Refused {
+            cause: P07RefusalCause::AuthorityEpochDisagreesWithFence,
+        });
+    }
+    if binding.state_fence != *active_fence {
+        return Err(P07PortError::Refused {
+            cause: P07RefusalCause::StaleStateFence,
+        });
     }
     Ok(())
 }
@@ -349,6 +378,10 @@ fn map_transport(error: KernelPortError, snapshot_id: &SnapshotId) -> P07PortErr
 /// Decodes an answered P-07 route, checking for its typed refusal before
 /// comparing the success receipt kind. A completed refusal is not a transport
 /// loss and must not become `UnknownOutcome`.
+///
+/// A frame that answers with neither the typed refusal nor the receipt kind
+/// this operation must return has a name of its own: the answer did not come
+/// from the route that was presented.
 fn p07_route_value(
     value: &serde_json::Value,
     receipt_kind: &str,
@@ -357,62 +390,106 @@ fn p07_route_value(
     if value.get("kind").and_then(serde_json::Value::as_str) == Some(P07_AUTHORITY_REFUSAL_KIND) {
         return Err(p07_refusal_error(value, operation));
     }
-    kind_value(value, receipt_kind).map_err(|_| P07PortError::InvalidBinding)
+    kind_value(value, receipt_kind).map_err(|_| P07PortError::Refused {
+        cause: P07RefusalCause::ResponseRouteMismatch,
+    })
 }
 
-/// Preserves the exact existing P-07 error variant and any recovery snapshot.
-/// This bounded P-07 wire emits only supported I7.20 classifications; full
-/// I7.20 projection remains incomplete until the owner supplies richer cause
-/// detail for the other variants.
+/// Accepts only the closed I7.20 disposition vocabulary the canonical protocol
+/// enum defines, so a new or misspelled control value fails closed here too.
+fn is_i720_disposition(value: &str) -> bool {
+    serde_json::from_value::<eliot_protocol::AgentResponseDisposition>(serde_json::Value::String(
+        value.to_owned(),
+    ))
+    .is_ok()
+}
+
+/// Projects one answered P-07 refusal frame onto the typed P-07 error.
+///
+/// The projection is strict in both directions. The frame must name the
+/// operation that was presented, and a classified refusal must carry a typed
+/// cause, the closed directive that cause establishes, a disposition the
+/// canonical I7.20 enum defines, and a reason code the canonical additive
+/// registry contains. Each vocabulary is checked rather than assumed, so a
+/// frame this adapter cannot classify is reported as exactly that instead of
+/// decaying into a generic `InvalidBinding`.
+///
+/// Refusals the Kernel could not classify keep their exact existing variant and
+/// carry no I7.20 field at all: their producers sit behind a boundary the frame
+/// cannot see, and no cause is invented to fill the gap.
 fn p07_refusal_error(value: &serde_json::Value, expected_operation: &str) -> P07PortError {
+    use eliot_authority::{P07RefusalCause as Cause, P07RefusalDirective as Directive};
+
     let refusal = value.get("value");
-    let operation = refusal
-        .and_then(|body| body.get("operation"))
-        .and_then(serde_json::Value::as_str);
-    if operation != Some(expected_operation) {
-        return P07PortError::InvalidBinding;
+    let framed = |name: &str| refusal.and_then(|body| body.get(name));
+    let framed_str = |name: &str| framed(name).and_then(serde_json::Value::as_str);
+    let unclassifiable = || P07PortError::Refused {
+        cause: Cause::RefusalFrameIncompatible,
+    };
+    if framed_str("operation") != Some(expected_operation) {
+        return unclassifiable();
     }
-    let disposition = refusal
-        .and_then(|body| body.get("disposition"))
-        .and_then(serde_json::Value::as_str);
-    let reason_code = refusal
-        .and_then(|body| body.get("reason_code"))
-        .and_then(serde_json::Value::as_str);
-    let p07_error = refusal
-        .and_then(|body| body.get("p07_error"))
-        .and_then(serde_json::Value::as_str);
-    let wire_snapshot = refusal.and_then(|body| body.get("snapshot_id"));
-    match (p07_error, disposition, reason_code) {
-        (Some("IdentityConflict"), Some("STALE_OR_CONFLICT"), Some(REASON_IDENTITY_CONFLICT))
-            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
+    let snapshot = framed("snapshot_id");
+    let carries_no_snapshot = snapshot.is_some_and(serde_json::Value::is_null);
+    // A classified refusal is recognised only when all four of its I7.20 fields
+    // are present and each belongs to the vocabulary it claims.
+    let classified = match (
+        framed_str("cause").and_then(Cause::from_wire),
+        framed_str("directive").and_then(Directive::from_wire),
+        framed_str("disposition").filter(|value| is_i720_disposition(value)),
+        framed_str("reason_code")
+            .filter(|value| eliot_protocol::agent_reason_code(value).is_some()),
+    ) {
+        (Some(cause), Some(directive), Some(_), Some(_)) => Some((cause, directive)),
+        _ => None,
+    };
+    match framed_str("p07_error") {
+        // Identity conflict keeps its exact variant and its absent snapshot; the
+        // typed cause only states what the operator is already being told.
+        Some(P07_ERROR_IDENTITY_CONFLICT)
+            if carries_no_snapshot
+                && classified
+                    == Some((
+                        Cause::OperationIdentityAlreadyCommitted,
+                        Directive::ResubmitFromCurrentState,
+                    )) =>
         {
             P07PortError::IdentityConflict
         }
-        (Some("InvalidBinding"), None, None)
-            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
+        // A lost acknowledgement keeps its exact snapshot for reconciliation and
+        // is never collapsed to unavailable or non-executed.
+        Some(P07_ERROR_UNKNOWN_OUTCOME)
+            if classified
+                == Some((
+                    Cause::CommitOutcomeUnproven,
+                    Directive::ReconcileExactSnapshot,
+                )) =>
         {
-            P07PortError::InvalidBinding
-        }
-        (Some("Unavailable"), None, None)
-            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
-        {
-            P07PortError::Unavailable
-        }
-        (Some("NotAdmitted"), None, None)
-            if wire_snapshot.is_some_and(serde_json::Value::is_null) =>
-        {
-            P07PortError::NotAdmitted
-        }
-        (Some("UnknownOutcome"), Some("RECOVERY_REQUIRED"), Some(REASON_UNKNOWN_OUTCOME)) => {
-            let Some(snapshot_value) = wire_snapshot.and_then(serde_json::Value::as_str) else {
-                return P07PortError::InvalidBinding;
+            let Some(snapshot_value) = snapshot.and_then(serde_json::Value::as_str) else {
+                return unclassifiable();
             };
             let Ok(snapshot_id) = SnapshotId::new(snapshot_value.to_owned()) else {
-                return P07PortError::InvalidBinding;
+                return unclassifiable();
             };
             P07PortError::UnknownOutcome { snapshot_id }
         }
-        _ => P07PortError::InvalidBinding,
+        // Refusals whose cause the Kernel cannot see keep their exact variant.
+        Some(P07_ERROR_INVALID_BINDING) if carries_no_snapshot && classified.is_none() => {
+            P07PortError::InvalidBinding
+        }
+        Some(P07_ERROR_UNAVAILABLE) if carries_no_snapshot && classified.is_none() => {
+            P07PortError::Unavailable
+        }
+        Some(P07_ERROR_NOT_ADMITTED) if carries_no_snapshot && classified.is_none() => {
+            P07PortError::NotAdmitted
+        }
+        // The Kernel classified the refusal, so the exact typed cause crosses
+        // the boundary instead of one generic code standing in for it.
+        Some(P07_ERROR_REFUSED) => match classified {
+            Some((cause, _)) => P07PortError::Refused { cause },
+            None => unclassifiable(),
+        },
+        _ => unclassifiable(),
     }
 }
 
@@ -525,21 +602,27 @@ mod tests {
         let fence = test_fence();
         let request = grant_request(&fence);
 
-        // The binding gate runs before any transport: a stale fence, a split
-        // epoch, or a malformed fence fails closed as InvalidBinding.
+        // The binding gate runs before any transport, and keeps its three
+        // decisions apart: a presentation that contradicts itself and a
+        // well-formed presentation of a fence that is not the current Kernel
+        // fence are different typed failures, neither of them a receipt.
         let mut stale_fence = fence.clone();
         stale_fence.resource_generation = ResourceGeneration::new(2).expect("resource generation");
         let mut stale_binding = test_binding(&fence);
         stale_binding.state_fence = stale_fence;
         assert!(matches!(
             check_binding(&stale_binding, &fence),
-            Err(P07PortError::InvalidBinding)
+            Err(P07PortError::Refused {
+                cause: P07RefusalCause::StaleStateFence
+            })
         ));
         let mut split_binding = test_binding(&fence);
         split_binding.authority_epoch = test_epoch(2);
         assert!(matches!(
             check_binding(&split_binding, &fence),
-            Err(P07PortError::InvalidBinding)
+            Err(P07PortError::Refused {
+                cause: P07RefusalCause::AuthorityEpochDisagreesWithFence
+            })
         ));
         check_binding(&request.binding, &fence).expect("exact binding passes");
 

@@ -153,6 +153,8 @@ const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
 /// precise agent-facing classification.
 const P07_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
 const P07_DISPOSITION_RECOVERY_REQUIRED: &str = "RECOVERY_REQUIRED";
+const P07_DISPOSITION_INVALID_REQUEST: &str = "INVALID_REQUEST";
+const P07_DISPOSITION_FAILED: &str = "FAILED";
 /// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
 ///
 /// This is the exact string published as `USER_AUTOMATION_ROUTE` in
@@ -852,12 +854,114 @@ struct P07PortRefusal {
     snapshot_id: Option<String>,
     disposition: Option<&'static str>,
     reason_code: Option<&'static str>,
+    /// Exact typed I7.20 cause of the refusal, present only where the Kernel
+    /// has already proven it. It is absent, never invented, for a variant whose
+    /// producers live behind a boundary this frame cannot see.
+    cause: Option<eliot_authority::P07RefusalCause>,
+    /// Closed typed I7.20 Recovery/Conflict Directive that applies to `cause`.
+    directive: Option<eliot_authority::P07RefusalDirective>,
+}
+
+/// The exact I7.20 classification one proven P-07 cause establishes.
+///
+/// I7.20 owns `disposition` as a small closed control enum and `reason_code` as
+/// an exact member of the open additive registry; this is the one place the
+/// Kernel decides which of them a proven cause is. Every reason code named here
+/// is a current member of that registry and is re-checked against it when the
+/// frame is built, so no code can be introduced that the catalogue does not
+/// define. `ROUTE_MISMATCH` has no `eliot-kernel-service` constant, so it is
+/// named here and proved against the same registry.
+///
+/// The Kernel observation travels with the classification for the same reason:
+/// a cause about the presented identity reports an identity problem, and a
+/// cause about the frame the Kernel itself answered with reports a fenced
+/// session, so the terminal diagnostic never misattributes one as the other.
+fn p07_cause_classification(
+    cause: eliot_authority::P07RefusalCause,
+) -> (
+    &'static str,
+    &'static str,
+    eliot_authority::P07RefusalDirective,
+    TransportError,
+) {
+    use eliot_authority::{P07RefusalCause as Cause, P07RefusalDirective as Directive};
+    const ROUTE_MISMATCH: &str = "ROUTE_MISMATCH";
+    match cause {
+        // A presentation that contradicts itself: the fence, the epoch it
+        // carries, or the session subject it is built from is repaired, never
+        // retried as presented.
+        Cause::StateFenceUnvalidated
+        | Cause::AuthorityEpochDisagreesWithFence
+        | Cause::SessionSubjectUnbindable => (
+            eliot_kernel_service::REASON_INVALID_ARGUMENT,
+            P07_DISPOSITION_INVALID_REQUEST,
+            Directive::RepairPresentedBinding,
+            TransportError::IdentityConflict,
+        ),
+        // The presented fence was compared against the live Kernel snapshot and
+        // is not it: a genuine Kernel refusal, distinct from a presentation
+        // that contradicts itself.
+        Cause::StaleStateFence => (
+            eliot_kernel_service::REASON_STALE_STATE_FENCE,
+            P07_DISPOSITION_STALE_OR_CONFLICT,
+            Directive::StaleFenceFailClosed,
+            TransportError::IdentityConflict,
+        ),
+        // The answered frame is not the receipt kind this operation returns, or
+        // the refusal frame cannot be classified at all: the Kernel cannot serve
+        // this answer, so the session is fenced rather than blamed on identity.
+        Cause::ResponseRouteMismatch => (
+            ROUTE_MISMATCH,
+            P07_DISPOSITION_FAILED,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::RefusalFrameIncompatible => (
+            eliot_kernel_service::REASON_PROTOCOL_INCOMPATIBLE,
+            P07_DISPOSITION_FAILED,
+            Directive::OwnerEscalation,
+            TransportError::SessionFenced,
+        ),
+        Cause::OperationIdentityAlreadyCommitted => (
+            eliot_kernel_service::REASON_IDENTITY_CONFLICT,
+            P07_DISPOSITION_STALE_OR_CONFLICT,
+            Directive::ResubmitFromCurrentState,
+            TransportError::IdentityConflict,
+        ),
+        Cause::CommitOutcomeUnproven => (
+            eliot_kernel_service::REASON_UNKNOWN_OUTCOME,
+            P07_DISPOSITION_RECOVERY_REQUIRED,
+            Directive::ReconcileExactSnapshot,
+            TransportError::UnknownOutcome,
+        ),
+    }
+}
+
+/// Builds the refusal answer for one proven typed cause, using the transport
+/// failure that same cause establishes.
+fn p07_classified_refusal(cause: eliot_authority::P07RefusalCause) -> P07PortRefusal {
+    let (reason_code, disposition, directive, transport) = p07_cause_classification(cause);
+    P07PortRefusal {
+        transport,
+        p07_error: "Refused",
+        snapshot_id: None,
+        disposition: Some(disposition),
+        reason_code: Some(reason_code),
+        cause: Some(cause),
+        directive: Some(directive),
+    }
 }
 
 /// Maps one retained-port refusal to the existing typed dispatch failure and
 /// P-07 wire variant. Only identity conflict and unknown outcome establish an
 /// exact I7.20 classification here; only unknown outcome may report a possible
 /// commit, and it retains its original snapshot identity.
+///
+/// A `Refused` refusal already carries the cause its producer proved, so it is
+/// classified by that cause rather than collapsed. `InvalidBinding`,
+/// `NotAdmitted`, and `Unavailable` keep their exact existing projection: their
+/// producers sit behind a boundary this frame cannot see, so no cause,
+/// disposition, or reason code is invented for them.
 fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
     match error {
         eliot_authority::P07PortError::UnknownOutcome { snapshot_id } => P07PortRefusal {
@@ -866,6 +970,8 @@ fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
             snapshot_id: Some(snapshot_id.as_str().to_owned()),
             disposition: Some(P07_DISPOSITION_RECOVERY_REQUIRED),
             reason_code: Some(eliot_kernel_service::REASON_UNKNOWN_OUTCOME),
+            cause: Some(eliot_authority::P07RefusalCause::CommitOutcomeUnproven),
+            directive: Some(eliot_authority::P07RefusalDirective::ReconcileExactSnapshot),
         },
         eliot_authority::P07PortError::IdentityConflict => P07PortRefusal {
             transport: TransportError::IdentityConflict,
@@ -873,13 +979,18 @@ fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
             snapshot_id: None,
             disposition: Some(P07_DISPOSITION_STALE_OR_CONFLICT),
             reason_code: Some(eliot_kernel_service::REASON_IDENTITY_CONFLICT),
+            cause: Some(eliot_authority::P07RefusalCause::OperationIdentityAlreadyCommitted),
+            directive: Some(eliot_authority::P07RefusalDirective::ResubmitFromCurrentState),
         },
+        eliot_authority::P07PortError::Refused { cause } => p07_classified_refusal(*cause),
         eliot_authority::P07PortError::InvalidBinding => P07PortRefusal {
             transport: TransportError::IdentityConflict,
             p07_error: "InvalidBinding",
             snapshot_id: None,
             disposition: None,
             reason_code: None,
+            cause: None,
+            directive: None,
         },
         eliot_authority::P07PortError::NotAdmitted => P07PortRefusal {
             transport: TransportError::SessionFenced,
@@ -887,6 +998,8 @@ fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
             snapshot_id: None,
             disposition: None,
             reason_code: None,
+            cause: None,
+            directive: None,
         },
         eliot_authority::P07PortError::Unavailable => P07PortRefusal {
             transport: TransportError::SessionFenced,
@@ -894,7 +1007,44 @@ fn map_p07_port_error(error: &eliot_authority::P07PortError) -> P07PortRefusal {
             snapshot_id: None,
             disposition: None,
             reason_code: None,
+            cause: None,
+            directive: None,
         },
+    }
+}
+
+/// Accepts only the closed I7.20 disposition vocabulary the canonical protocol
+/// enum defines, so a new or misspelled control value is never published.
+fn is_i720_disposition(value: &str) -> bool {
+    serde_json::from_value::<eliot_protocol::AgentResponseDisposition>(serde_json::Value::String(
+        value.to_owned(),
+    ))
+    .is_ok()
+}
+
+/// Classifies one refusal for the wire.
+///
+/// A classified refusal may only claim a disposition and a reason code that the
+/// canonical I7.20 vocabularies actually define, and both must be the ones its
+/// own proven cause establishes. A refusal that fails that check is still a
+/// *decided* refusal, so it stays a decided answer and is downgraded to the
+/// unclassifiable cause rather than reported as a lost acknowledgement: this
+/// check exists so no invented control value can reach the operator surface.
+fn p07_wire_refusal(error: &eliot_authority::P07PortError) -> P07PortRefusal {
+    let refusal = map_p07_port_error(error);
+    let Some(cause) = refusal.cause else {
+        return refusal;
+    };
+    let (reason_code, disposition, directive, _) = p07_cause_classification(cause);
+    let classified = refusal.reason_code == Some(reason_code)
+        && refusal.disposition == Some(disposition)
+        && refusal.directive == Some(directive)
+        && is_i720_disposition(disposition)
+        && eliot_protocol::agent_reason_code(reason_code).is_some();
+    if classified {
+        refusal
+    } else {
+        p07_classified_refusal(eliot_authority::P07RefusalCause::RefusalFrameIncompatible)
     }
 }
 
@@ -905,7 +1055,7 @@ fn p07_refusal_response(
     operation: &'static str,
     error: &eliot_authority::P07PortError,
 ) -> serde_json::Value {
-    let refusal = map_p07_port_error(error);
+    let refusal = p07_wire_refusal(error);
     super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(&refusal.transport));
     serde_json::json!({
         "status": "known",
@@ -914,6 +1064,8 @@ fn p07_refusal_response(
             "value": {
                 "disposition": refusal.disposition,
                 "reason_code": refusal.reason_code,
+                "directive": refusal.directive.map(eliot_authority::P07RefusalDirective::as_str),
+                "cause": refusal.cause.map(eliot_authority::P07RefusalCause::as_str),
                 "p07_error": refusal.p07_error,
                 "snapshot_id": refusal.snapshot_id,
                 "operation": operation,
