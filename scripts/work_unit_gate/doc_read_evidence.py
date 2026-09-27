@@ -409,6 +409,7 @@ def _compare(
     candidate_tree: str,
     changed: Sequence[str],
     candidate_root: Path,
+    work_issue: int | None = None,
 ) -> ChecklistState:
     _compare_identity(envelope, base_tree, candidate_tree, changed, candidate_root)
     _compare_router_input(envelope, recomputed)
@@ -417,7 +418,7 @@ def _compare(
     _compare_optional(envelope["optional_expansions"], recomputed)
     _compare_contract_inputs(envelope["contract_inputs"], candidate_root)
     _compare_attestation(envelope["attestation"])
-    return _checklist_state(envelope["checklist"], candidate_root, candidate_tree)
+    return _checklist_state(envelope["checklist"], candidate_root, candidate_tree, work_issue)
 
 
 def _compare_identity(
@@ -658,7 +659,18 @@ def _compare_attestation(recorded: Any) -> None:
 _ACTIVE_DISPOSITIONS = ("assigned", "planned", "blocked")
 
 
-def _checklist_state(recorded: Any, candidate_root: Path, candidate_tree: str) -> ChecklistState:
+def _checklist_state(
+    recorded: Any, candidate_root: Path, candidate_tree: str, work_issue: int | None = None
+) -> ChecklistState:
+    """Conditional checklist state; a trusted controller issue overrides the body selector.
+
+    When the merge controller supplies its own assigned work-issue ID, the
+    requirement lookup uses that trusted ID and the body selector must agree
+    with it; disagreement fails closed as CHECKLIST_REQUIRED_MISSING so a
+    body-supplied null/unassigned number cannot select a not-required row.
+    Without a trusted ID the body selector is used (legacy path); the
+    controller stitch that supplies the trusted ID remains BLOCKED-BY.
+    """
     checklist = _closed(recorded, ("issue", "recorded", "bound_candidate_tree"), "checklist")
     issue = checklist["issue"]
     if issue is not None and (type(issue) is not int or issue <= 0):
@@ -668,6 +680,15 @@ def _checklist_state(recorded: Any, candidate_root: Path, candidate_tree: str) -
     bound_tree = checklist["bound_candidate_tree"]
     if bound_tree is not None:
         _sha256(bound_tree, "checklist.bound_candidate_tree", EvidenceFailure.CHECKLIST_REQUIRED_MISSING)
+    if work_issue is not None:
+        if type(work_issue) is not int or work_issue <= 0:
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "trusted work-issue must be a positive integer")
+        if issue != work_issue:
+            _fail(
+                EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
+                f"checklist.issue {issue!r} does not match the trusted work-issue {work_issue}",
+            )
+        issue = work_issue
 
     required, _unit = _assignment_requires_checklist(candidate_root, issue)
     if not required:
@@ -755,7 +776,9 @@ def merge_integration_status(root: Path) -> dict[str, Any]:
 # Verification entrypoint.
 # ---------------------------------------------------------------------------
 
-def verify(root: Path, base: str, candidate: str, pr_body: str) -> dict[str, Any]:
+def verify(
+    root: Path, base: str, candidate: str, pr_body: str, work_issue: int | None = None
+) -> dict[str, Any]:
     """Recompute every envelope field for the final merge candidate and compare.
 
     Raises :class:`EvidenceError` with a stable typed code on any failure.
@@ -778,6 +801,7 @@ def verify(root: Path, base: str, candidate: str, pr_body: str) -> dict[str, Any
         recomputed = _recompute(candidate_root, changed, topic)
         checklist_state = _compare(
             envelope, recomputed, base_tree, candidate_tree, changed, candidate_root,
+            work_issue,
         )
     finally:
         shutil.rmtree(candidate_root, ignore_errors=True)
@@ -1229,6 +1253,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pr-body", help="path to the pull request body markdown file")
     parser.add_argument("--root", default=".", help="repository root holding the candidate history")
+    parser.add_argument(
+        "--work-issue", default=None,
+        help="trusted assigned work-issue ID from the merge controller; when supplied, "
+        "the checklist requirement lookup uses it and the body checklist.issue must match it",
+    )
     parser.add_argument("--json", action="store_true", help="emit the JSON projection instead of the human one")
     return parser
 
@@ -1273,6 +1302,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         root = Path(parsed.root).resolve()
+        work_issue: int | None = None
+        if parsed.work_issue is not None:
+            try:
+                work_issue = int(str(parsed.work_issue), 10)
+            except (TypeError, ValueError):
+                work_issue = None
+            if work_issue is None or work_issue <= 0:
+                print(
+                    "DOC_READ_EVIDENCE_FAIL: usage/configuration failure: "
+                    "--work-issue must be a positive integer when supplied",
+                    file=sys.stderr,
+                )
+                return 2
         try:
             body = Path(parsed.pr_body).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -1282,7 +1324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        _emit(verify(root, parsed.base, parsed.candidate, body), parsed.json)
+        _emit(verify(root, parsed.base, parsed.candidate, body, work_issue), parsed.json)
         return 0
     except EvidenceError as exc:
         print(f"DOC_READ_EVIDENCE_FAIL: {exc.code.value}: {exc.detail}", file=sys.stderr)
