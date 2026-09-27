@@ -189,6 +189,79 @@ impl EvidentiaryReference {
                 field: "reference.observed_at",
             })
     }
+
+    /// Opens the validated inspector projection of this reference.
+    ///
+    /// An inspector navigates from the derived conclusion through this one
+    /// record to the frozen source revision and exact anchor, sees whether
+    /// the support is an exact fragment or a paraphrase, and finds the
+    /// independent faithfulness record for a load-bearing paraphrase.
+    pub fn inspect(&self) -> Result<EvidenceInspection, EvidenceError> {
+        self.validate()?;
+        Ok(EvidenceInspection {
+            source_id: self.source_id.clone(),
+            source_revision: self.source_revision.clone(),
+            content_sha256: self.content_sha256.clone(),
+            anchor: self.anchor.clone(),
+            fragment: self.fragment,
+            excerpt: self.excerpt.clone(),
+            load_bearing: self.load_bearing,
+            faithfulness: self.faithfulness.clone(),
+        })
+    }
+}
+
+/// Inspector projection of one validated evidentiary reference (A1).
+///
+/// The projection carries the frozen source identity and revision, the exact
+/// supporting anchor, whether the support is an exact fragment or a
+/// paraphrase (A4.6), and the independent faithfulness record when a
+/// load-bearing conclusion rests on a paraphrase. It is a read-only view:
+/// constructing it validates the reference and never rewrites history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceInspection {
+    /// Immutable source identity.
+    pub source_id: SourceId,
+    /// Immutable revision within that source.
+    pub source_revision: String,
+    /// Content identity of the complete frozen source bytes.
+    pub content_sha256: String,
+    /// Exact location anchor within the frozen revision.
+    pub anchor: EvidenceAnchor,
+    /// Whether the support is an exact fragment or a paraphrase.
+    pub fragment: FragmentKind,
+    /// Verbatim source wording at the anchor; never paraphrase text.
+    pub excerpt: Option<String>,
+    /// Whether this reference is the basis of a load-bearing conclusion.
+    pub load_bearing: bool,
+    /// Separate faithfulness evaluation bound to this anchor's fragment.
+    pub faithfulness: Option<FaithfulnessEvaluation>,
+}
+
+impl EvidenceInspection {
+    /// Whether the projected support may serve as a load-bearing basis.
+    ///
+    /// An exact fragment with its wording present qualifies directly; a
+    /// paraphrase qualifies only with a recorded faithful evaluation (A4.6).
+    /// Unfaithful and unevaluated paraphrases stay representable but do not
+    /// qualify, so quotation is never silently replaced in a conclusion's
+    /// basis.
+    pub fn supports_load_bearing_basis(&self) -> bool {
+        if self
+            .excerpt
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty())
+        {
+            return false;
+        }
+        match self.fragment {
+            FragmentKind::Exact => true,
+            FragmentKind::Paraphrase => self.faithfulness.as_ref().is_some_and(|check| {
+                check.faithful && check.fragment_sha256 == self.anchor.excerpt_sha256
+            }),
+        }
+    }
 }
 
 /// A report as a projection of one frozen evidence revision (A5.7).
@@ -269,6 +342,19 @@ impl SourceCorrection {
         }
         Ok(())
     }
+
+    /// Whether this correction supersedes the frozen basis of a reference.
+    ///
+    /// A derived record names its frozen basis; a correction never rewrites
+    /// that basis (A4.3). When the reference names this correction's source
+    /// at the prior revision and content identity, the reference's basis is
+    /// superseded and its holder belongs on the dependent-review route
+    /// instead of being silently moved to the corrected revision.
+    pub fn supersedes(&self, reference: &EvidentiaryReference) -> bool {
+        reference.source_id == self.source_id
+            && reference.source_revision == self.prior_revision
+            && reference.content_sha256 == self.prior_content_sha256
+    }
 }
 
 /// Disposition of one dependent-review route.
@@ -309,6 +395,16 @@ impl RevalidationRoute {
             });
         }
         Ok(())
+    }
+
+    /// Whether a dependent is visibly awaiting review under this route.
+    ///
+    /// The route stays visible until the canonical owner advances each
+    /// dependent by revalidation or supersession; a dependent counts as
+    /// awaiting review only while the route disposition is pending.
+    pub fn is_pending_for(&self, dependent: &ArtifactId) -> bool {
+        self.disposition == RevalidationDisposition::PendingReview
+            && self.dependents.contains(dependent)
     }
 }
 
