@@ -2375,6 +2375,20 @@ pub(crate) fn check_observe_tool_linkage(
     if bytes.is_empty() || bytes.len() > MAX_OBSERVE_TOOL_BYTES {
         return Err(TransportError::SessionFenced);
     }
+    // #1861 hard boundary 2 (lossless generic payload authority): the payload
+    // digest commits to the canonical form of these bytes, while the bytes the
+    // Kernel retains and later serves to the claiming daemon are the raw
+    // `serde_json::Value`. Prove the raw/native meaning survives the Kernel's
+    // own serde boundary unchanged: a re-serialize/re-parse round trip that does
+    // not reproduce the exact same value is a lossy transport and is rejected
+    // here, before the pair is ever staged. The check is value-level (JSON
+    // object key order is not semantic), so it never rejects a faithful
+    // transport and never admits a lossy one.
+    let round_tripped = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|_| TransportError::SessionFenced)?;
+    if round_tripped != *tool {
+        return Err(TransportError::SessionFenced);
+    }
     Ok(())
 }
 
