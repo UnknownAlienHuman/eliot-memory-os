@@ -2593,6 +2593,32 @@ impl KernelComposition {
             .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
     }
 
+    /// Queued-attach release admission through the startup coordinator
+    /// (I1.11 step 10, issue #1892 W5).
+    ///
+    /// This is the single ordered-startup gate on the attach queue: a queued
+    /// attach is released only when the same `front_door_ready` fact
+    /// [`Self::startup_status`] reports is true. It reads the existing
+    /// [`StartupCoordinator`] field rather than a queue-side latch, so the
+    /// release cannot proceed independently of the ordered I1.11 cursor that
+    /// proves required capability evaluation and front-door publication
+    /// complete. The refusal reuses the existing [`StartupRejection`] and
+    /// [`StartupPrerequisite`] vocabulary used by every other startup gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] as a platform error naming
+    /// the unmet prerequisite, or a lock-poison platform error.
+    pub(crate) fn admit_queued_attach_release(&self) -> Result<(), KernelServiceError> {
+        let coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .admit_queued_attach_release()
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
     /// Validate the exact Kernel target fence before a protected effect.
     ///
     /// The fence is supplied by the authenticated route, never reconstructed
