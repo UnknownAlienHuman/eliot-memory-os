@@ -77,11 +77,11 @@ use eliotd::testd_terminal_completion::{
     query_testd_owner_terminal_evidence,
 };
 use eliotd::{
-    ActivationClaim, DaemonComposition, DaemonConfig, DaemonError, DaemonKernelClient,
-    DaemonStatus, FinishSubmitOutcome, KernelContextReadClient, LocalReadSubmitOutcome,
-    MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome, PROTOCOL_VERSION,
-    SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome, forward_admitted_local_read,
-    serve_admitted_observe, terminal_for_invalid_ticket,
+    ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
+    DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome, KernelContextReadClient,
+    LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
+    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
+    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -2013,8 +2013,15 @@ fn resolve_valid_ticket(
     // then obtains one independent current-owner readback below. Any Err is a
     // real validation/readiness failure and must fail closed rather than
     // silently discarding a disposition.
-    let result = composition
-        .resolve_agent_activation_v2(&ticket, now)
+    //
+    // #839 (W2/W15/A7): the loop dispatches through the
+    // [`AgentActivationResolver`] boundary, not the inherent
+    // `DaemonComposition` method. The inherent method and the trait method
+    // share one name, so this fully qualified call is the trait-dispatch
+    // production caller: the trait implementation on `DaemonComposition`
+    // delegates to the same projection, and nothing about the resolved
+    // result changes.
+    let result = AgentActivationResolver::resolve_agent_activation_v2(composition, &ticket, now)
         .map_err(|error| {
             format!(
                 "daemon activation resolve ticket {}: {error}",
@@ -3686,13 +3693,27 @@ async fn dispatch_agent_activation_result(
         .await
     {
         Ok(ack) => classify_submit_ack(ticket, &result, &ack),
-        Err(DaemonError::ActivationExpired) => Err(ActivationDispatchError::Expired),
-        Err(submit_error) => {
+        // #839 (W14/A3): the submit failure's own provenance now decides the
+        // path. A failure that provably never reached the transport, and a
+        // definitive non-acceptance, hold nothing for Kernel to reconcile and
+        // are reported as-is; only a possibly-submitted failure retains the
+        // exact ticket/result identity and reconciles it from Kernel retention
+        // before any second Governor read. The retained result is never
+        // recomputed on any path.
+        Err(ActivationSubmitError::Expired) => Err(ActivationDispatchError::Expired),
+        Err(
+            ActivationSubmitError::NotAttempted { detail }
+            | ActivationSubmitError::Rejected { detail },
+        ) => Err(ActivationDispatchError::Hard(format!(
+            "daemon activation result submit ticket {}: {detail}",
+            ticket.ticket_id
+        ))),
+        Err(submit_error @ ActivationSubmitError::PossiblySubmitted { .. }) => {
             // The submit may have committed before the acknowledgement was
             // lost. Retain the exact ticket/result identity and reconcile
             // from Kernel retention before any second Governor read. Do not
             // recompute a different result here.
-            let submit_detail = submit_error.to_string();
+            let submit_detail = submit_error.detail().to_owned();
             let query = retained_reconcile_query(ticket, &result)?;
             let ack = kernel
                 .reconcile_agent_activation_result(&query)

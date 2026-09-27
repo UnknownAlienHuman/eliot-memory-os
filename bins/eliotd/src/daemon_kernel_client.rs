@@ -115,6 +115,62 @@ struct ActivationSubmitResponse {
     ack: Option<AgentActivationResultAck>,
 }
 
+/// Typed failure of one `agent_activation_submit`, preserving *why* the submit
+/// did not produce an acknowledgement instead of erasing that provenance into
+/// one opaque string (issue #839, W14/A3).
+///
+/// The issue requires that "not attempted" stay distinct from "possibly
+/// submitted / unknown": only the latter obliges the daemon to reconcile the
+/// retained ticket/result identity before any other semantic resolution, and a
+/// failure that never reached the transport must not be reported as an
+/// ambiguous commit. Each variant names the exact point at which the attempt
+/// stopped, so the dispatcher classifies a real transport fact rather than
+/// guessing from a diagnostic message. A raw transport error is never recovered
+/// by parsing its text.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationSubmitError {
+    /// Kernel linearized a result-less deadline expiry. The daemon retires
+    /// this ticket without retry and without reconciliation: no result was
+    /// accepted and no Apply progress exists.
+    Expired,
+    /// The daemon refused or failed to build the request, so no frame was
+    /// written and Kernel provably holds nothing for this ticket. There is
+    /// nothing to reconcile; the failure is reported as-is and fails closed.
+    NotAttempted {
+        /// Bounded diagnostic detail. Carries no protected field and no whole
+        /// payload or error dump.
+        detail: String,
+    },
+    /// The request reached the transport and Kernel answered that it did not
+    /// accept the result. The attempt is recorded and definitively not
+    /// committed, so reconciliation is not required for this failure.
+    Rejected {
+        /// Bounded diagnostic detail.
+        detail: String,
+    },
+    /// The request reached the transport and its commit is unknown. Kernel may
+    /// already hold this exact result, so the retained ticket/result identity
+    /// must be reconciled before any other semantic resolution.
+    PossiblySubmitted {
+        /// Bounded diagnostic detail.
+        detail: String,
+    },
+}
+
+#[cfg(windows)]
+impl ActivationSubmitError {
+    /// The bounded diagnostic detail of this failure, whatever its provenance.
+    pub fn detail(&self) -> &str {
+        match self {
+            ActivationSubmitError::Expired => "Kernel expired the activation result deadline",
+            ActivationSubmitError::NotAttempted { detail }
+            | ActivationSubmitError::Rejected { detail }
+            | ActivationSubmitError::PossiblySubmitted { detail } => detail,
+        }
+    }
+}
+
 #[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1030,12 +1086,25 @@ impl DaemonKernelClient {
         }
     }
 
+    /// Submits one already-resolved v2 result through the existing authenticated
+    /// transport. Every valid disposition is submitted; no disposition is
+    /// coerced to success and none is silently discarded.
+    ///
+    /// #839 (W14/A3): each failure below is reported with its real transport
+    /// provenance instead of one erased string. The two pre-send failures are
+    /// [`ActivationSubmitError::NotAttempted`] because no frame was written; a
+    /// definitive non-acceptance is [`ActivationSubmitError::Rejected`]; and
+    /// every failure observed at or after the exchange — a transport error, an
+    /// undecodable response, a missing acknowledgement or an ack that does not
+    /// bind the submitted result — is
+    /// [`ActivationSubmitError::PossiblySubmitted`], because Kernel may already
+    /// hold this exact result. The transport itself is unchanged.
     #[cfg(windows)]
     pub async fn submit_agent_activation_result(
         &self,
         result: &AgentActivationResolutionResult,
         owner_readback: Option<AgentActivationOwnerReadback>,
-    ) -> Result<AgentActivationResultAck, super::DaemonError> {
+    ) -> Result<AgentActivationResultAck, ActivationSubmitError> {
         if matches!(
             result.disposition,
             eliot_protocol::AgentActivationResolutionDisposition::Resolved { .. }
@@ -1044,36 +1113,49 @@ impl DaemonKernelClient {
             .and_then(|readback| readback.kernel_owner.as_ref())
             .is_none()
         {
-            return Err(super::DaemonError::Kernel(
-                "Resolved activation submission requires the current Kernel owner readback"
+            return Err(ActivationSubmitError::NotAttempted {
+                detail: "Resolved activation submission requires the current Kernel owner readback"
                     .to_owned(),
-            ));
+            });
         }
         let submit =
             AgentActivationResultSubmit::new_with_owner_readback(result.clone(), owner_readback)
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                .map_err(|error| ActivationSubmitError::NotAttempted {
+                    detail: format!("activation result submit does not bind: {error}"),
+                })?;
         let value = self
             .transact_async(
                 "agent_activation_submit",
                 serde_json::json!({ "result": submit }),
             )
             .await
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let response: ActivationSubmitResponse = serde_json::from_value(value)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+            .map_err(|error| ActivationSubmitError::PossiblySubmitted {
+                detail: format!("Kernel activation result submit: {error}"),
+            })?;
+        let response: ActivationSubmitResponse =
+            serde_json::from_value(value).map_err(|error| {
+                ActivationSubmitError::PossiblySubmitted {
+                    detail: format!("Kernel activation submit response does not decode: {error}"),
+                }
+            })?;
         if response.expired {
-            return Err(super::DaemonError::ActivationExpired);
+            return Err(ActivationSubmitError::Expired);
         }
         if !response.accepted {
-            return Err(super::DaemonError::Kernel(
-                "Kernel submit response was not accepted".to_owned(),
-            ));
+            return Err(ActivationSubmitError::Rejected {
+                detail: "Kernel submit response was not accepted".to_owned(),
+            });
         }
-        let ack = response.ack.ok_or_else(|| {
-            super::DaemonError::Kernel("Kernel submit response omitted acknowledgement".to_owned())
+        let ack = response
+            .ack
+            .ok_or_else(|| ActivationSubmitError::PossiblySubmitted {
+                detail: "Kernel submit response omitted acknowledgement".to_owned(),
+            })?;
+        ack.validate_against_result(result).map_err(|error| {
+            ActivationSubmitError::PossiblySubmitted {
+                detail: format!("Kernel activation result ack payload mismatch: {error}"),
+            }
         })?;
-        ack.validate_against_result(result)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         Ok(ack)
     }
 
