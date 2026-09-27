@@ -3923,6 +3923,7 @@ mod admitted_read_tests {
             &[Some(authority)],
             &[],
             &[],
+            &crate::plan::OrderingChainTips::new(),
             commit_sequence,
             1,
         )

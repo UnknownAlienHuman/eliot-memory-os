@@ -100,8 +100,9 @@ use request_dispatch::{map_composition_error, map_genesis_dispatch_result};
 mod canonical_event;
 pub use canonical_event::{
     CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority,
-    FencedProjectionPublication, OrderingLink, ProjectionRebuildPlan, SemanticWritePath,
-    ordering_link_hash, request_projection_rebuild, request_rebuild_from_semantic_write,
+    FencedProjectionPublication, ORDERING_LINK_GENESIS_HASH, OrderingLink, ProjectionRebuildPlan,
+    SemanticWritePath, ordering_link_hash, request_projection_rebuild,
+    request_rebuild_from_semantic_write,
 };
 mod connection_manager;
 pub use connection_manager::{

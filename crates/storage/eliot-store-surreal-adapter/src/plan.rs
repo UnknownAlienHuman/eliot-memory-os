@@ -9,15 +9,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_store_api::{
-    CanonicalRequestView, CommitId, EventId, EventProjectionRelationIntents, ExactJsonBytes,
-    NamedMutationOperation, OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId,
-    OutboxIntent, OutboxState, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource,
-    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
-    ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, canonical_request_hash, issue_store_receipt_envelope, sha256_hex,
-    validate_store_receipt_envelope, verify_canonical_request_hash, verify_ordering_scope_binding,
+    CanonicalEvent, CanonicalRequestView, CommitId, EventId, EventProjectionRelationIntents,
+    ExactJsonBytes, NamedMutationOperation, ORDERING_LINK_GENESIS_HASH, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, PreparedTransition, ProjectionMode,
+    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
+    Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, SplitView,
+    StoreError, WriteReceipt, WriteReceiptStatus, canonical_json_bytes, canonical_request_hash,
+    issue_store_receipt_envelope, sha256_hex, validate_store_receipt_envelope,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::AdapterError;
@@ -65,6 +67,12 @@ pub(crate) struct EvidenceRecord {
     pub(crate) named_operation_count: usize,
 }
 
+/// Per-scope chain tips observed before planning, keyed by Ordering Scope.
+///
+/// Value is the scope's current `ordering_head.event_hash` sibling, or
+/// [`ORDERING_LINK_GENESIS_HASH`] when the scope has no row yet. Issue #1931.
+pub(crate) type OrderingChainTips = BTreeMap<String, String>;
+
 /// Planned durable effects of one committed transition.
 #[derive(Clone, Debug)]
 pub(crate) struct ApplyPlan {
@@ -75,6 +83,14 @@ pub(crate) struct ApplyPlan {
     pub(crate) next_revision_heads: Vec<RevisionHead>,
     pub(crate) next_ordering_heads: Vec<OrderingHead>,
     pub(crate) event_ids: Vec<EventId>,
+    /// The one semantic event identity this transition commits, with one
+    /// immutable hash-chain link per declared Ordering Scope (issue #1931,
+    /// `I5.8`). Written into the `canonical_event` row by the single
+    /// transaction; never optional and never per-scope duplicated.
+    pub(crate) canonical_event: CanonicalEvent,
+    /// Digest over the durable audit material this transaction commits
+    /// (issue #1931). See [`audit_chain_digest`] for exactly what it covers.
+    pub(crate) audit_chain_digest: String,
     pub(crate) command_ids: Vec<String>,
     pub(crate) projection_records: Vec<ProjectionPublicationRecord>,
     pub(crate) outbox_records: Vec<OutboxIntent>,
@@ -98,10 +114,36 @@ pub(crate) struct ApplyPlan {
 /// plan carries no authority records and all digests keep their historical
 /// values. Authority-carrying callers use
 /// [`plan_apply_with_payload_authority`].
+///
+/// This arity is retained for the existing in-crate plan suite only: it plans
+/// every scope against the genesis prior. The production apply path carries
+/// the observed per-scope chain tips through
+/// [`select_apply_plan_with_chain_tips`].
+#[cfg(test)]
 pub(crate) fn plan_apply(
     transition: &PreparedTransition,
     current_revision_heads: &[RevisionHead],
     current_ordering_heads: &[OrderingHead],
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+) -> Result<ApplyPlan, StoreError> {
+    plan_apply_with_chain_tips(
+        transition,
+        current_revision_heads,
+        current_ordering_heads,
+        &OrderingChainTips::new(),
+        next_commit_sequence,
+        next_outbox_sequence,
+    )
+}
+
+/// Legacy no-authority planning against the observed per-scope chain tips
+/// (issue #1931).
+pub(crate) fn plan_apply_with_chain_tips(
+    transition: &PreparedTransition,
+    current_revision_heads: &[RevisionHead],
+    current_ordering_heads: &[OrderingHead],
+    current_chain_tips: &OrderingChainTips,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
@@ -111,6 +153,7 @@ pub(crate) fn plan_apply(
         &authorities,
         current_revision_heads,
         current_ordering_heads,
+        current_chain_tips,
         next_commit_sequence,
         next_outbox_sequence,
     )
@@ -118,18 +161,46 @@ pub(crate) fn plan_apply(
 
 /// Routes one transition to the legacy or the authority-carrying plan.
 ///
-/// Slice C2 (issue #19): when at least one operation claims a payload
-/// authority, the transaction plans through
-/// [`plan_apply_with_payload_authority`] with the original authority values
-/// (never re-parsed from a re-serialized `Value`); otherwise it keeps the
-/// exact legacy [`plan_apply`] path. Authority alignment is enforced in both
-/// directions: a length mismatch against the transition's named operations
-/// fails closed instead of silently dropping or inventing authorities.
+/// This arity is retained for the existing in-crate plan suite only: it plans
+/// every scope against the genesis prior. The production apply path uses
+/// [`select_apply_plan_with_chain_tips`].
+#[cfg(test)]
 pub(crate) fn select_apply_plan(
     transition: &PreparedTransition,
     authorities: &[Option<ExactJsonBytes>],
     current_revision_heads: &[RevisionHead],
     current_ordering_heads: &[OrderingHead],
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+) -> Result<ApplyPlan, StoreError> {
+    select_apply_plan_with_chain_tips(
+        transition,
+        authorities,
+        current_revision_heads,
+        current_ordering_heads,
+        &OrderingChainTips::new(),
+        next_commit_sequence,
+        next_outbox_sequence,
+    )
+}
+
+/// Sole production planner entry: routes the transition and threads the
+/// observed per-scope chain tips into every canonical-event chain link.
+///
+/// Slice C2 (issue #19): when at least one operation claims a payload
+/// authority, the transaction plans through
+/// [`plan_apply_with_payload_authority`] with the original authority values
+/// (never re-parsed from a re-serialized `Value`); otherwise it keeps the
+/// exact legacy [`plan_apply_with_chain_tips`] path. Authority alignment is
+/// enforced in both directions: a length mismatch against the transition's
+/// named operations fails closed instead of silently dropping or inventing
+/// authorities.
+pub(crate) fn select_apply_plan_with_chain_tips(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+    current_revision_heads: &[RevisionHead],
+    current_ordering_heads: &[OrderingHead],
+    current_chain_tips: &OrderingChainTips,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
@@ -145,14 +216,16 @@ pub(crate) fn select_apply_plan(
             authorities,
             current_revision_heads,
             current_ordering_heads,
+            current_chain_tips,
             next_commit_sequence,
             next_outbox_sequence,
         )
     } else {
-        plan_apply(
+        plan_apply_with_chain_tips(
             transition,
             current_revision_heads,
             current_ordering_heads,
+            current_chain_tips,
             next_commit_sequence,
             next_outbox_sequence,
         )
@@ -173,6 +246,7 @@ pub(crate) fn plan_apply_with_payload_authority(
     authorities: &[Option<ExactJsonBytes>],
     current_revision_heads: &[RevisionHead],
     current_ordering_heads: &[OrderingHead],
+    current_chain_tips: &OrderingChainTips,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
@@ -240,6 +314,15 @@ pub(crate) fn plan_apply_with_payload_authority(
         next_outbox_sequence,
     )?;
     let evidence_records = evidence_records(transition, authorities, commit_sequence)?;
+    let canonical_event = canonical_event(
+        transition,
+        &event_ids,
+        &next_ordering_heads,
+        current_chain_tips,
+        &payload_digest,
+        commit_sequence,
+    )?;
+    let audit_chain_digest = audit_chain_digest(&canonical_event, &evidence_records)?;
 
     Ok(ApplyPlan {
         commit_sequence,
@@ -249,6 +332,8 @@ pub(crate) fn plan_apply_with_payload_authority(
         next_revision_heads,
         next_ordering_heads,
         event_ids,
+        canonical_event,
+        audit_chain_digest,
         command_ids,
         projection_records,
         outbox_records,
@@ -257,6 +342,99 @@ pub(crate) fn plan_apply_with_payload_authority(
         payload_authority: records,
         evidence_records,
     })
+}
+
+/// Issues the one canonical event this transition commits (issue #1931).
+///
+/// One event identity for the whole transition — even across several Ordering
+/// Scopes (`I5.8`) — with exactly one [`eliot_store_api::OrderingLink`] per
+/// declared scope. Each link takes its OWN reserved sequence from
+/// `next_ordering_heads` and its OWN prior chain tip from `current_chain_tips`
+/// (genesis [`ORDERING_LINK_GENESIS_HASH`] for a scope with no prior tip), and
+/// the link hash is computed by the single contract algorithm
+/// [`eliot_store_api::ordering_link_hash`]. `event_ordinal` is the monotonic
+/// commit sequence this transaction's fence compare-and-set already reserved,
+/// and `payload_digest` is the exact digest the same plan writes into the
+/// outbox intents, never a second derivation.
+fn canonical_event(
+    transition: &PreparedTransition,
+    event_ids: &[EventId],
+    next_ordering_heads: &[OrderingHead],
+    current_chain_tips: &OrderingChainTips,
+    payload_digest: &str,
+    commit_sequence: u64,
+) -> Result<CanonicalEvent, StoreError> {
+    let event_id = event_ids.first().ok_or(StoreError::InvalidField {
+        field: "event_projection_relation_intents.event_ids",
+        reason: "one transition resolves to exactly one event identity",
+    })?;
+    let mut scopes = Vec::with_capacity(next_ordering_heads.len());
+    for head in next_ordering_heads {
+        let previous_event_hash = current_chain_tips
+            .get(head.scope.as_str())
+            .cloned()
+            .unwrap_or_else(|| ORDERING_LINK_GENESIS_HASH.to_owned());
+        scopes.push((head.scope.clone(), head.sequence, previous_event_hash));
+    }
+    CanonicalEvent::issue(
+        event_id.clone(),
+        transition.identity.operation_id.clone(),
+        transition_event_type(transition)?,
+        payload_digest.to_owned(),
+        scopes,
+        commit_sequence,
+        transition.state_fence.clone(),
+    )
+}
+
+/// Renders the closed catalogue event type for one transition class.
+///
+/// `TransitionClass` already owns the canonical `snake_case` name of the class
+/// (its serde representation), so the event type is that exact admitted name
+/// under the closed `store.apply.` prefix — never a free-form label.
+fn transition_event_type(transition: &PreparedTransition) -> Result<String, StoreError> {
+    let rendered = serde_json::to_value(transition.transition_class)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let class = rendered.as_str().ok_or(StoreError::InvalidField {
+        field: "canonical_event.event_type",
+        reason: "transition class does not render a canonical name",
+    })?;
+    Ok(format!("store.apply.{class}"))
+}
+
+/// Canonical preimage of the durable audit material of one transition.
+#[derive(Serialize)]
+struct AuditChainPreimage<'a> {
+    event_id: &'a str,
+    evidence_record_digests: Vec<&'a str>,
+}
+
+/// Binds the transition's audit-chain digest over what the transaction really
+/// commits (issue #1931).
+///
+/// Honest scope, stated exactly: this store has no separate audit journal,
+/// table, or chain-head column, so there is no wider audit chain to hash. The
+/// digest covers the durable audit material the one canonical transaction
+/// writes beside the receipt — the committed capture-evidence records on the
+/// `write_receipt` row — bound to the transition's one canonical event
+/// identity. It is committed on the `canonical_event` row in the same
+/// transaction, so a later reader can detect a rewritten evidence set or a
+/// substituted event identity. It does not claim a full append-only audit
+/// history; building that is a separate canonical-audit-surface decision.
+fn audit_chain_digest(
+    event: &CanonicalEvent,
+    evidence_records: &[EvidenceRecord],
+) -> Result<String, StoreError> {
+    let preimage = AuditChainPreimage {
+        event_id: event.event_id.as_str(),
+        evidence_record_digests: evidence_records
+            .iter()
+            .map(|record| record.digest_hex.as_str())
+            .collect(),
+    };
+    let bytes = canonical_json_bytes(&preimage)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Renders the commit instant bound to one allocated commit sequence.
@@ -272,7 +450,8 @@ fn committed_at_for(next_commit_sequence: u64) -> String {
 /// semantic plan (S-CONC-TX, issue #989).
 ///
 /// Sole owner of every allocative field: `commit_sequence`, the derived
-/// `committed_at` instant, `next_commit_sequence`, the outbox record
+/// `committed_at` instant, the canonical event's monotonic `event_ordinal`,
+/// `next_commit_sequence`, the outbox record
 /// sequences plus `next_outbox_sequence`, and the evidence capture order.
 /// The caller's [`build_receipt_with_expected_heads`] then rebinds the
 /// receipt fields that carry those allocation values. Every semantic field — event and
@@ -282,6 +461,11 @@ fn committed_at_for(next_commit_sequence: u64) -> String {
 /// bounded allocation retry loop re-enters through here and never through
 /// the full planner, so retry planning cannot duplicate or drift from
 /// full-plan logic by construction.
+///
+/// `event_ordinal` is the one canonical-event field that moves here: the
+/// ordinal is the commit sequence this attempt actually reserves, and it is
+/// not part of any chain-link preimage, so every link hash stays byte-for-byte
+/// identical across allocation retries.
 pub(crate) fn recompute_allocation(
     semantic_plan: &ApplyPlan,
     next_commit_sequence: u64,
@@ -290,6 +474,7 @@ pub(crate) fn recompute_allocation(
     let mut plan = semantic_plan.clone();
     plan.commit_sequence = next_commit_sequence;
     plan.committed_at = committed_at_for(next_commit_sequence);
+    plan.canonical_event.event_ordinal = next_commit_sequence;
     plan.next_commit_sequence =
         checked_increment(next_commit_sequence, "commit.sequence", "sequence overflow")?;
     let mut outbox_cursor = next_outbox_sequence;
@@ -716,12 +901,27 @@ fn revision_keys(transition: &PreparedTransition) -> Result<Vec<RevisionKey>, St
     Ok(keys.into_iter().collect())
 }
 
+/// Derives the transition's one event identity.
+///
+/// `I5.8`/`I5.4` (issue #1931): one atomic transition resolves to ONE
+/// immutable semantic event identity, whatever number of Ordering Scopes it
+/// touches. An intent that declares no event id gets the operation-derived
+/// default; an intent that declares more than one now fails closed instead of
+/// committing several unlinked event rows, because `CommittedCanonicalTransition`
+/// requires exactly one emitted event id per committed transition. No current
+/// producer declares more than one.
 fn event_ids(
     intents: &EventProjectionRelationIntents,
     operation_key: &str,
 ) -> Result<Vec<EventId>, StoreError> {
     if intents.event_ids.is_empty() {
         return Ok(vec![EventId::new(format!("event-{operation_key}"))?]);
+    }
+    if intents.event_ids.len() != 1 {
+        return Err(StoreError::InvalidField {
+            field: "event_projection_relation_intents.event_ids",
+            reason: "one transition resolves to exactly one event identity",
+        });
     }
     Ok(intents.event_ids.clone())
 }

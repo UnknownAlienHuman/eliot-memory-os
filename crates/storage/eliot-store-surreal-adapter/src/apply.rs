@@ -22,13 +22,15 @@ use crate::{client, schema, schema_inventory};
 #[cfg(test)]
 use eliot_store_api::{CONTRACT_VERSION, validate_genesis_receipt_envelope};
 use eliot_store_api::{
-    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ExactJsonBytes,
-    NamedMutationOperation, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    RecoveryRecord, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
-    StoreRecoverySnapshot, TransitionClass, WriteReceipt, decode_erasure_surfaces,
-    generated_operation_manifests, operation_manifest_set_digest,
+    CommittedCanonicalTransition, ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT,
+    ERASURE_PARAM_SURFACES, ExactJsonBytes, NamedMutationOperation, ORDERING_LINK_GENESIS_HASH,
+    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
+    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
+    TransitionClass, WriteReceipt, decode_erasure_surfaces, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
@@ -977,6 +979,10 @@ struct VerifiedAttemptState {
     fence: Option<FenceRecord>,
     current_revisions: Vec<RevisionHead>,
     current_orderings: Vec<OrderingHead>,
+    /// Per-scope prior link hashes for the canonical event's chain links
+    /// (issue #1931). Read beside the heads so a link can never claim a
+    /// genesis prior for a scope that already advanced.
+    current_chain_tips: plan::OrderingChainTips,
 }
 
 impl VerifiedAttemptState {
@@ -1067,6 +1073,8 @@ async fn load_verified_attempt_state(
     let current_revisions = read_revision_heads_inner(db, &adapter.config, &revision_keys).await?;
     let current_orderings =
         read_ordering_heads_inner(db, &adapter.config, &ordering_scopes).await?;
+    let current_chain_tips =
+        read_ordering_chain_tips_inner(db, &adapter.config, &ordering_scopes).await?;
     check_expected_revisions(
         &current_revisions,
         expected_revision_heads,
@@ -1081,6 +1089,7 @@ async fn load_verified_attempt_state(
         fence,
         current_revisions,
         current_orderings,
+        current_chain_tips,
     })
 }
 
@@ -1218,11 +1227,12 @@ async fn apply_with_retry(
         let plan = if let Some(semantic) = &semantic_plan {
             plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?
         } else {
-            let full = plan::select_apply_plan(
+            let full = plan::select_apply_plan_with_chain_tips(
                 &transition,
                 authorities,
                 &verified.current_revisions,
                 &verified.current_orderings,
+                &verified.current_chain_tips,
                 next_commit_sequence,
                 next_outbox_sequence,
             )?;
@@ -1282,6 +1292,7 @@ async fn apply_with_retry(
                     &expected_revision_heads,
                     &expected_ordering_heads,
                 )?;
+                validate_committed_canonical_transition(&plan, &receipt)?;
                 return Ok(receipt);
             }
             Err(AdapterError::AllocationContention { .. }) if retries < MAX_ALLOCATION_RETRIES => {
@@ -1290,6 +1301,38 @@ async fn apply_with_retry(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Post-commit atomicity gate for one canonical transition (issue #1931).
+///
+/// `I5.4` requires the semantic event, the projection/relation/outbox changes,
+/// the scope revisions, the receipt, and the audit-chain fields to be ONE
+/// atomic unit. Before this gate the adapter only proved the receipt's own
+/// identity; nothing proved the event could not commit without its outbox
+/// coverage, its per-scope chain links, or its audit digest. This closes that
+/// hole on the live `Ok(())` arm of [`apply_with_retry`], so a partial commit
+/// fails closed with a typed `StoreError` instead of returning a receipt.
+///
+/// Every member is the value the single `TX_BEGIN`/`TX_COMMIT` transaction
+/// actually bound: the canonical event (with one chain link per declared
+/// Ordering Scope, the payload digest, the monotonic ordinal, and the fence),
+/// the outbox intents, the audit-chain digest committed on the same
+/// `canonical_event` row, and the committed receipt itself. The check is pure
+/// and needs no second provider round trip; what it proves is that the
+/// committed bundle is whole and cross-bound, while durability stays the
+/// provider's acknowledged `COMMIT` plus the receipt readback.
+fn validate_committed_canonical_transition(
+    plan: &plan::ApplyPlan,
+    receipt: &WriteReceipt,
+) -> Result<(), AdapterError> {
+    CommittedCanonicalTransition {
+        event: plan.canonical_event.clone(),
+        receipt: receipt.clone(),
+        outbox: plan.outbox_records.clone(),
+        audit_chain_digest: plan.audit_chain_digest.clone(),
+    }
+    .validate_atomic()
+    .map_err(AdapterError::Store)
 }
 
 /// 688-B: the adapter's apply-path erasure execution.
@@ -1594,6 +1637,60 @@ async fn read_ordering_heads_inner(
     let heads = take_vec::<OrderingHead>(&mut response, 0)?;
     plan::validate_ordering_heads(&heads)?;
     Ok(heads)
+}
+
+/// One Ordering Scope's own chain tip, read beside its ordering head.
+#[derive(Deserialize)]
+struct OrderingChainTipRow {
+    ordering_scope: String,
+    /// Null for a row written before per-scope chain links existed; such a
+    /// scope has no prior link and links against the genesis prior.
+    event_hash: Option<String>,
+}
+
+/// Reads each requested Ordering Scope's current chain tip (issue #1931).
+///
+/// The prior link hash is a sibling field on the schemaless `ordering_head`
+/// record, so the closed `SELECT VALUE body` head read cannot see it; this is
+/// the one read that does. A scope with no row, or a pre-chain-link row, maps
+/// to [`ORDERING_LINK_GENESIS_HASH`]. A present-but-malformed tip is not
+/// validated here: [`eliot_store_api::CanonicalEvent::issue`] is the single
+/// digest validator and refuses the plan — before any provider write — if a
+/// tip is not a lowercase SHA-256.
+async fn read_ordering_chain_tips_inner(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    scopes: &[OrderingScopeId],
+) -> Result<plan::OrderingChainTips, AdapterError> {
+    let mut tips = plan::OrderingChainTips::new();
+    if scopes.is_empty() {
+        return Ok(tips);
+    }
+    let mut bindings = Map::new();
+    bindings.insert(
+        "scopes".to_owned(),
+        to_value(&scopes.iter().map(ToString::to_string).collect::<Vec<_>>())?,
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "read.ordering_chain_tips",
+        schema::READ_ORDERING_CHAIN_TIPS_BY_SCOPES,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<OrderingChainTipRow>(&mut response, 0)?;
+    for row in rows {
+        let tip = row
+            .event_hash
+            .unwrap_or_else(|| ORDERING_LINK_GENESIS_HASH.to_owned());
+        if tips.insert(row.ordering_scope.clone(), tip).is_some() {
+            return Err(AdapterError::Store(StoreError::Duplicate {
+                field: "ordering_chain_tips",
+            }));
+        }
+    }
+    Ok(tips)
 }
 
 fn union_revision_keys(
