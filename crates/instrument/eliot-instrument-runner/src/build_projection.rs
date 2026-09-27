@@ -32,12 +32,13 @@
 //!   with no override, because the projected route is the only admitted one
 //!   ([`restrict_agent_argv`], [`CargoOrigin`]);
 //! * **lineage separation and rebuild-on-unknown-identity**, both *derived*:
-//!   the target root and the single-flight key are
-//!   [`BuildFingerprint::digest`], so a different toolchain, feature set,
+//!   the lineage is [`BuildFingerprint::digest`] and the producer slot is one
+//!   registry per governed target root keyed by that digest, so a different
+//!   worktree is already a different slot, a different toolchain, feature set,
 //!   environment class, or candidate is already a different lineage, and
 //!   unknown cache identity is the existing `CacheLookup::Miss`
-//!   ([`BuildCacheDecision`]). No second fingerprint, digest, or cache exists
-//!   here;
+//!   ([`BuildCacheDecision`], [`TargetRootBuildCoordinator`]). No second
+//!   fingerprint, digest, or cache exists here;
 //! * **cancellation evidence and quarantine** (line 36), plus a lineage- and
 //!   lease-aware disk cleanup (line 37) ([`BuildCancellation`],
 //!   [`BuildCleanupPass`]);
@@ -57,8 +58,9 @@
 //! concurrency", and no such evidence type exists anywhere in the codebase, so
 //! one producer per target root is the rule with no escape hatch.
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use eliot_build_test_graph::{
     BuildFingerprint, BuildFlight, BuildTestGraph, CacheLookup, ChangeImpactDirective, ChangeSet,
@@ -457,8 +459,8 @@ impl BuildCacheDecision {
 /// A waiter learns which producer to await; it never learns a verdict.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProducerClaim {
-    /// Normalized [`BuildFingerprint::digest`]: the lineage that both the
-    /// target root and the single-flight key are derived from.
+    /// Normalized [`BuildFingerprint::digest`]: the lineage carried as the
+    /// last target-root segment and as the single-flight key within that root.
     pub lineage: String,
     /// The work item that owns the producer slot.
     pub producer: String,
@@ -769,27 +771,66 @@ impl BuildCleanupPass {
 /// per (target root, fingerprint), and the refusal of unrestricted agent Cargo
 /// invocations. It creates no scheduler, no job, no queue, no budget, and no
 /// pre-emption engine; I18.26 line 63 keeps those elsewhere.
+///
+/// The slot namespace is one [`SingleFlightBuildRegistry`] per governed target
+/// root. Two work items in different worktrees resolve to different roots
+/// (I2.22 places the worktree id in the path) and therefore never share a
+/// producer slot, even when their [`BuildFingerprint`] digests are identical.
+/// Within one root the slot key stays the existing digest, so the registry
+/// contract is unchanged.
+#[derive(Default)]
 pub struct TargetRootBuildCoordinator {
-    registry: SingleFlightBuildRegistry,
+    registries: Mutex<BTreeMap<PathBuf, SingleFlightBuildRegistry>>,
 }
 
 impl TargetRootBuildCoordinator {
-    /// Creates a coordinator over the existing single-flight registry.
+    /// Creates a coordinator holding one single-flight registry per target root.
     #[must_use]
-    pub const fn new(registry: SingleFlightBuildRegistry) -> Self {
-        Self { registry }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The single-flight registry for one governed target root, created on the
+    /// first claim in that root.
+    fn registry_for(
+        &self,
+        target_root: &Path,
+    ) -> Result<SingleFlightBuildRegistry, BuildProjectionError> {
+        let mut registries = self
+            .registries
+            .lock()
+            .map_err(|_| GraphError::LockPoisoned)?;
+        Ok(registries
+            .entry(target_root.to_path_buf())
+            .or_default()
+            .clone())
+    }
+
+    /// The single-flight registry for one governed target root, when this
+    /// coordinator has ever claimed in that root.
+    fn registry_of(
+        &self,
+        target_root: &Path,
+    ) -> Result<Option<SingleFlightBuildRegistry>, BuildProjectionError> {
+        let registries = self
+            .registries
+            .lock()
+            .map_err(|_| GraphError::LockPoisoned)?;
+        Ok(registries.get(target_root).cloned())
     }
 
     /// Claims the producer slot for one work item, or returns the waiter's view
     /// of the existing producer.
     ///
-    /// The claim is the existing `SingleFlightBuildRegistry`, keyed by
-    /// [`BuildFingerprint::digest`]. Because I2.22 already places that digest in
-    /// the target-root path, the single-flight key and the target root are the
-    /// same lineage identity: two work items that differ in toolchain, feature
-    /// set, environment class, or candidate are different lineages with
-    /// different producer slots (I18.26 lines 15-16 and 21-22), while identical
-    /// fingerprints share one producer and many waiters (line 15).
+    /// The claim is the existing `SingleFlightBuildRegistry`, resolved per
+    /// governed target root and keyed within that root by
+    /// [`BuildFingerprint::digest`]. The root is derived first (I2.22 places
+    /// the worktree id in the path), so two work items in different worktrees
+    /// never share a slot even with identical fingerprints, while identical
+    /// fingerprints within one root share one producer and many waiters
+    /// (I18.26 line 15). Different toolchains, feature sets, environment
+    /// classes, or candidates are still different digests and therefore
+    /// different slots (I18.26 lines 15-16 and 21-22).
     ///
     /// # Errors
     ///
@@ -807,7 +848,7 @@ impl TargetRootBuildCoordinator {
             }
         })?;
         let flight = self
-            .registry
+            .registry_for(&target_root)?
             .claim(&item.envelope.fingerprint, item.work_item_id.clone())?;
         Ok(ProducerClaim {
             lineage,
@@ -836,14 +877,19 @@ impl TargetRootBuildCoordinator {
         outcome: ProducerOutcome,
     ) -> Result<ProducerCompletion, BuildProjectionError> {
         item.validate()?;
+        let target_root = item.target_root()?;
         let lineage = item.envelope.fingerprint.digest().map_err(|source| {
             BuildProjectionError::InvalidDigest {
                 field: "build_fingerprint",
                 source,
             }
         })?;
-        let released = self
-            .registry
+        let Some(registry) = self.registry_of(&target_root)? else {
+            return Err(BuildProjectionError::NotTheProducer {
+                work_item_id: item.work_item_id.clone(),
+            });
+        };
+        let released = registry
             .release(&item.envelope.fingerprint, &item.work_item_id)
             .map_err(BuildProjectionError::SingleFlight)?;
         if !released {
