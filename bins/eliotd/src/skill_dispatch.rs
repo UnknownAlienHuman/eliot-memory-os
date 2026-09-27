@@ -33,7 +33,7 @@ use thiserror::Error;
 
 use super::DaemonComposition;
 use super::daemon_kernel_client::DaemonKernelClient;
-use super::skill_acceptance_read::{AcceptanceRecord, AcceptanceVerdict};
+use super::skill_acceptance_read::{AcceptanceRecord, AcceptanceResolution, AcceptanceVerdict};
 ///
 /// Driver refusals (stale, drift, unavailable, fence) are NOT errors here —
 /// they persist as typed refusal outcomes through [`SkillResultEnvelope`],
@@ -89,6 +89,10 @@ enum PlannedSkillPair {
         payload: Box<eliot_agent_bridge_core::SkillIntakePayload>,
         /// Exact accepted canonical lifecycle row used by the read plan.
         record: AcceptanceRecord,
+        /// The exact canonical read the verdict was resolved from, retained so
+        /// the commit step hydrates the daemon-held capability admission view
+        /// from the same read (issue #1957, I3.4) without a second round trip.
+        resolution: Box<AcceptanceResolution>,
     },
 }
 
@@ -214,27 +218,43 @@ async fn plan_accepted_inject(
     )
     .await
     {
-        Ok(AcceptanceVerdict::Accepted(record)) => {
+        Ok(AcceptanceResolution {
+            verdict: AcceptanceVerdict::Accepted(record),
+            request,
+            response,
+        }) => {
             if let Err(error) = bind_accepted_intake(&payload, &record) {
                 return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(&error));
             }
+            let resolution = AcceptanceResolution {
+                verdict: AcceptanceVerdict::Accepted(record.clone()),
+                request,
+                response,
+            };
             PlannedSkillPair::AcceptedIntake {
                 payload: Box::new(payload),
                 record,
+                resolution: Box::new(resolution),
             }
         }
-        Ok(AcceptanceVerdict::Unknown) => PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+        Ok(AcceptanceResolution {
+            verdict: AcceptanceVerdict::Unknown,
+            ..
+        }) => PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
             &eliot_skill::SkillError::InvalidField {
                 field: "procedure.acceptance",
                 reason: "no committed lifecycle row backs this package digest at the current revision; the intake remains a reversible candidate until governed promotion",
             },
         )),
-        Ok(AcceptanceVerdict::Revoked(_)) => PlannedSkillPair::Resolved(
-            SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+        Ok(AcceptanceResolution {
+            verdict: AcceptanceVerdict::Revoked(_),
+            ..
+        }) => PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::InvalidField {
                 field: "procedure.acceptance",
                 reason: "canonical lifecycle revoked this package revision",
-            }),
-        ),
+            },
+        )),
         Err(error) => PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
             &eliot_skill::SkillError::Surface(error.to_string()),
         )),
@@ -243,8 +263,17 @@ async fn plan_accepted_inject(
 
 /// Commits the accepted intake against the current composition owner, then
 /// binds the final outcome to the exact local-read attempt.
+///
+/// The commit step is also where the daemon-held Governor capability admission
+/// view is hydrated (issue #1957, I3.4): the same canonical
+/// `GetCapabilityEvidenceState` response that decided this intake is applied to
+/// the held registry, so the admission view stops being permanently empty.
+/// A hydration failure is a `warn` diagnostic naming the exact reason, never a
+/// silent pass and never a rewritten verdict — the held view keeps its
+/// previous contents, and a production route that view cannot evidence stays
+/// refused, because `declared` / `imported_legacy` records never admit.
 pub fn commit_skill_pair(
-    composition: &DaemonComposition,
+    composition: &mut DaemonComposition,
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
     plan: SkillPairPlan,
@@ -282,8 +311,43 @@ pub fn commit_skill_pair(
                     SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
                 }
             }
-            PlannedSkillPair::AcceptedIntake { payload, record } => {
+            PlannedSkillPair::AcceptedIntake {
+                payload,
+                record,
+                resolution,
+            } => {
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
+                    let hydration = composition
+                        .capability_admission_mut()
+                        .map_err(|error| error.to_string())
+                        .and_then(|view| {
+                            view.hydrate_from_evidence_response(
+                                &resolution.request,
+                                &resolution.response,
+                            )
+                            .map_err(|error| error.to_string())
+                        });
+                    match hydration {
+                        Ok(hydrated) => {
+                            tracing::info!(
+                                target: "eliotd::capability_evidence",
+                                event = "eliotd.capability_evidence_hydrated",
+                                skill_id = %hydrated.summary.skill_id,
+                                matched_lifecycle_rows = hydrated.summary.matched_total,
+                                declared_records = hydrated.declared_records,
+                                retained_records = hydrated.retained,
+                            );
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                target: "eliotd::capability_evidence",
+                                event = "eliotd.capability_evidence_hydration_unavailable",
+                                skill_id = %record.skill_id,
+                                reason = %reason,
+                                "canonical capability evidence did not refresh the admission view; the held view keeps its previous contents and any production route it cannot evidence stays refused"
+                            );
+                        }
+                    }
                     match composition.skill_ingest_accepted_intake(&payload, &record) {
                         Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
                         Err(error) => SkillResultEnvelope::refused(&error),

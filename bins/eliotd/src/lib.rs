@@ -2548,18 +2548,31 @@ impl DaemonComposition {
     /// composition invents no port implementation beyond the closed ports
     /// above and reimplements no owner.
     ///
+    /// #1957 (I3.4): the constructed fabric is not returned until the required
+    /// model route passes [`Self::require_admitted_model_route`] — the observed
+    /// route scope is applied as a scope change, and every competence item must
+    /// hold fresh exact-fingerprint production admission in the daemon-held
+    /// view. A refusal is the typed [`FabricError::NoRoute`] residual and no
+    /// fabric is returned, so an unevidenced route can never reach an executor.
+    ///
     /// # Errors
     ///
-    /// Returns the [`Self::production_fabric_ports`] readiness rejection or
-    /// the [`Self::agent_fabric_new_verified`] rejection unchanged.
+    /// Returns the [`Self::production_fabric_ports`] readiness rejection, the
+    /// [`Self::agent_fabric_new_verified`] rejection, or the route-gate
+    /// rejection, each unchanged.
     pub fn drive_verified_agent_fabric(
-        &self,
+        &mut self,
         kernel: &Arc<DaemonKernelClient>,
         material: VerifiedProviderMaterial,
+        requirements: &RouteRequirements,
+        observed_scope: &eliot_governor::RouteScopeFingerprint,
+        now: u64,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_drive_verified").entered();
         let ports = self.production_fabric_ports()?;
-        self.agent_fabric_new_verified(kernel, ports, material)
+        let mut fabric = self.agent_fabric_new_verified(kernel, ports, material)?;
+        self.require_admitted_model_route(&mut fabric, requirements, observed_scope, now)?;
+        Ok(fabric)
     }
 
     /// Resolves the session-observed owner half of one verified provider
@@ -2656,6 +2669,58 @@ impl DaemonComposition {
         Ok(self
             .capability_admission()?
             .admit_production_route(skill_id, scope, now))
+    }
+
+    /// Requires one production model route through the daemon route gate
+    /// (#1957, I3.4).
+    ///
+    /// This is the daemon's production call into
+    /// [`AgentFabric::require_model_route`]. Order is load-bearing: the
+    /// caller-observed route scope is first applied as an I3.4 scope change, so
+    /// a runtime, adapter, provider, or serializer change stops authorizing the
+    /// production work it used to authorize; only then does the gate require
+    /// every competence item of `requirements` to hold fresh exact-fingerprint
+    /// `probe_passed` or `observed` evidence in the held view at `now`.
+    ///
+    /// The observed scope is the same observation the gate gates on, never one
+    /// re-derived from the resolved route.
+    /// [`ScopeDependencySelector::all`](eliot_governor::ScopeDependencySelector::all)
+    /// is its own documented coarse whole-scope selection for a caller that
+    /// observes one scope and cannot attribute the move to a narrower dimension;
+    /// the comparison still runs dimension by dimension, so an exactly matching
+    /// retained record is never staled.
+    ///
+    /// Absence of evidence refuses. An empty held view, a `declared` /
+    /// `imported_legacy` record, and a stale or expired record all fail closed
+    /// to the typed [`FabricError::NoRoute`] the gate raises, which crosses
+    /// unchanged as [`DaemonError::ProviderAdmission`]. There is no local
+    /// fallback route and no swallowed refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Composition`] when the composition is not ready,
+    /// or the gate's rejection unchanged.
+    pub fn require_admitted_model_route(
+        &mut self,
+        fabric: &mut AgentFabric,
+        requirements: &RouteRequirements,
+        observed_scope: &eliot_governor::RouteScopeFingerprint,
+        now: u64,
+    ) -> Result<eliot_agent_api::RouteFingerprint, DaemonError> {
+        let view = self.capability_admission_mut()?;
+        let staled = view.apply_scope_change(
+            observed_scope,
+            eliot_governor::ScopeDependencySelector::all(),
+        );
+        if staled > 0 {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_staled",
+                staled_records = staled,
+                "an observed runtime/adapter/provider/serializer change staled dependent capability evidence; the exact route must requalify before production work"
+            );
+        }
+        Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)
     }
 
     /// Admits one explicit workspace instance as an attach to the retained

@@ -115,6 +115,26 @@ pub enum AcceptanceVerdict {
     Unknown,
 }
 
+/// One resolved acceptance decision together with the exact canonical read that
+/// produced it (issue #1957, I3.4).
+///
+/// The verdict drives the intake; the read travels with it so the same
+/// response can hydrate the daemon-held Governor capability admission view
+/// without a second store round trip. What that read carries is the committed
+/// `ApplyLifecyclePolicy` governance rows — no probe status, no evidence
+/// source, and no route-scope fingerprint — which is why hydration through it
+/// can only add non-admitting declared records
+/// (see `capability_evidence_wiring::GovernorCapabilityAdmission::hydrate_from_evidence_response`).
+#[derive(Clone, Debug)]
+pub struct AcceptanceResolution {
+    /// Verdict the presented digest resolved to.
+    pub verdict: AcceptanceVerdict,
+    /// The exact planned read the verdict was resolved from.
+    pub request: NamedReadRequest,
+    /// The exact store response that read was answered with.
+    pub response: NamedReadResponse,
+}
+
 /// Plans the closed canonical acceptance read for one skill.
 ///
 /// The request carries the exact `skill_id` + `max_records` selectors the
@@ -157,7 +177,9 @@ pub fn plan_acceptance_read(
 /// lifecycle-policy rows over the authenticated Kernel route.
 ///
 /// Plans the closed read under the caller-observed admitted fence, executes
-/// it through the Kernel client, and resolves the verdict. Transport,
+/// it through the Kernel client, and resolves the verdict. The exact request
+/// and response travel back with the verdict so the caller can hydrate the
+/// daemon-held capability admission view from the same read. Transport,
 /// contract, fence, operation, shape, and truncation failures refuse as
 /// errors: the caller settles the pair without installing. Absence of rows
 /// resolves Unknown (provisional policy only); only committed rows decide
@@ -167,13 +189,18 @@ pub async fn resolve_intake_acceptance(
     admitted_fence: &StateFence,
     skill_id: &str,
     package_digest: &str,
-) -> Result<AcceptanceVerdict, AcceptanceReadError> {
+) -> Result<AcceptanceResolution, AcceptanceReadError> {
     let request = plan_acceptance_read(skill_id, admitted_fence.clone())?;
     let response = kernel
         .store_named_async(request.clone())
         .await
         .map_err(|error| AcceptanceReadError::Transport(error.to_string()))?;
-    resolve_acceptance(&request, &response, package_digest)
+    let verdict = resolve_acceptance(&request, &response, package_digest)?;
+    Ok(AcceptanceResolution {
+        verdict,
+        request,
+        response,
+    })
 }
 
 /// Latest committed rows for one skill: the overall owner position plus the
