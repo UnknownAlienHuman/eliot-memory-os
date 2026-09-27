@@ -234,8 +234,17 @@ struct ConsumedFrontierOffer {
     window_key: Option<String>,
     disposition: ConsumedOfferDisposition,
     /// Identity of the immediately preceding resolved offer, if any: the
-    /// bounded predecessor/replay relation. Retained evidence, read by
-    /// debuggers.
+    /// bounded predecessor/replay relation required by audit 5856972160
+    /// item 2.
+    ///
+    /// Write-once diagnostic evidence by design, hence the explicit allow:
+    /// custody logic must never branch on history (confirmation reads only
+    /// the live binding, the exact offered legs, and identity-proven acked
+    /// cursors), while the successor-install handoff writes this link for
+    /// offline custody-chain review. `rustc` intentionally ignores derived
+    /// impls during dead-code analysis, so no derive can serve as the
+    /// reader; the allow marks spec-mandated evidence, not unfinished
+    /// code, and no new `allow(dead_code)` is added for any other item.
     #[allow(dead_code)]
     predecessor: Option<String>,
 }
@@ -2243,9 +2252,13 @@ impl KernelMcpForwardingPort {
     /// Retires the retained offer only when this joint-import result proves
     /// it: the result must echo the exact offered legs (it answers the
     /// request that carried them — continuation answers carry no echo and
-    /// retire nothing), and every offered leg must show an owner-confirmed
-    /// acknowledged cursor at or beyond the offered frontier. A lower reply
-    /// leaves the offer unresolved; already-advanced bases stay advanced.
+    /// retire nothing), the window must carry this offer's own
+    /// connection/generation binding (a lower or foreign reply retires
+    /// nothing), and every offered leg must show an owner-confirmed
+    /// acknowledged cursor at or beyond the offered frontier from a stream
+    /// fact proving the locally adopted (producer, incarnation) identity —
+    /// a same-named successor fact confirms nothing. A lower reply leaves
+    /// the offer unresolved; already-advanced bases stay advanced.
     fn retire_consumed_offer_if_proven(&mut self, result: &ReconciliationPortResult) {
         let echo = result.consumed_frontiers();
         if echo.is_empty() {
@@ -2254,6 +2267,9 @@ impl KernelMcpForwardingPort {
         let Ok(mut owner) = self.shared.try_borrow_mut() else {
             return;
         };
+        // Plain reborrow so the offer mutation and the adopted-identity
+        // read below borrow disjoint fields, not the whole guard.
+        let owner = &mut *owner;
         let Some(offer) = owner.consumed_offer.as_mut() else {
             return;
         };
@@ -2268,12 +2284,30 @@ impl KernelMcpForwardingPort {
         let Some(window) = result.window() else {
             return;
         };
+        if offer.connection_id != window.presenting_connection().as_str()
+            || offer.generation != window.live_generation().get()
+        {
+            return;
+        }
+        let adopted = &owner.owner_identity;
         let proven = offer.frontiers.iter().all(|(stream_id, frontier)| {
             window
                 .stream_facts()
                 .iter()
                 .find(|facts| facts.stream_id() == stream_id)
-                .is_some_and(|facts| facts.acked_cursor() >= *frontier)
+                .is_some_and(|facts| {
+                    facts.acked_cursor() >= *frontier
+                        && facts
+                            .owner_identity()
+                            .is_some_and(|(producer, incarnation)| {
+                                adopted.get(stream_id).is_some_and(
+                                    |(known_producer, known_incarnation)| {
+                                        known_producer == producer
+                                            && *known_incarnation == incarnation
+                                    },
+                                )
+                            })
+                })
         });
         if proven {
             offer.disposition = ConsumedOfferDisposition::OwnerConfirmed;
@@ -2558,9 +2592,11 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// directive. Ack bases stay keyed by stream text here (BLOCKED-BY
     /// #2798: owner/window/revision/incarnation namespacing must land
     /// before a same-named replacement stream stops inheriting the
-    /// predecessor cursor), and no outstanding-offer state exists to retire
-    /// (BLOCKED-BY #2800: prepared/outstanding/confirmed consumed
-    /// frontiers must land before this commit can retire them jointly).
+    /// predecessor cursor). The retained consumed-frontier offer, when one
+    /// is outstanding, retires jointly below through
+    /// `retire_consumed_offer_if_proven` (issue #2800): only on the exact
+    /// offered legs, this offer's binding, and identity-proven acked
+    /// cursors at or beyond the offered prefix.
     fn reconciliation_imported(
         &mut self,
         binding: &AttachBinding,
