@@ -1,11 +1,12 @@
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, LowercaseSha256, ProviderExecutionBinding,
+    RouteFingerprint,
 };
 use eliot_agent_opencode::{
     AdmittedAttemptCandidate, AdmittedAttemptOutcome, AdmittedOpenCodeAttempt, BasicAuth,
     LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient, OpenCodeRunError,
     OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus, classify_sealed_candidate,
-    redact_route_diagnostics,
+    opencode_adapter_contract, redact_route_diagnostics, validate_opencode_adapter_contract,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use secrecy::SecretString;
@@ -280,6 +281,20 @@ fn model_selection() -> Result<ModelSelection, CliError> {
         .map_err(|error| CliError::Model(sanitize_error(&error.to_string(), "")))
 }
 
+/// I6.5 bridge-contract gate (issue #1797), run before the underlying call.
+///
+/// The declaration is built from the exact route the admitted execution
+/// binding carries and re-validated against that same route, so a declaration
+/// built for another route can never be presented as this run's contract. A
+/// refusal is a typed `CliError::Run`; no request, no run, nothing sealed.
+fn gate_bridge_contract(route: &RouteFingerprint, password: &str) -> Result<(), CliError> {
+    let contract = opencode_adapter_contract(route)
+        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), password)))?;
+    validate_opencode_adapter_contract(&contract, route)
+        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), password)))?;
+    Ok(())
+}
+
 async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
     let password = std::env::var("OPENCODE_SERVER_PASSWORD")
         .map_err(|_| CliError::Environment("OPENCODE_SERVER_PASSWORD"))?;
@@ -349,6 +364,7 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
     // plan-agent read-only ceiling, and returns a candidate-only seal.
     let admitted_attempt_id = envelope.attempt.id.clone();
     let admitted_route_digest = envelope.admission.self_digest.clone();
+    gate_bridge_contract(&envelope.binding.route, &password)?;
     let admitted = AdmittedOpenCodeAttempt::new(
         Some(envelope.admission),
         envelope.binding,

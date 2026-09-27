@@ -7,8 +7,20 @@
 //! issuance. Task meaning, policy decisions and promotion remain with the
 //! Governor and Dreamer owners.
 //!
-//! The contract is bound to the broker's own protocol version and operation
-//! set, not to a mutable README or a self-reported version alone.
+//! The contract is bound to the broker's own protocol version and service
+//! identity, not to a mutable README or a self-reported version alone.
+//!
+//! Route binding disposition (issue #1797): `admitted_binding_digest` is
+//! `None` here and that is the honest answer, not a weakened guarantee. The
+//! User Broker is a complete credential/session/launch service, not a
+//! route-admitted agent adapter: it is admitted by its own broker protocol
+//! version, service identity, per-launch binding digest, and session/launch
+//! fence, and it holds no `RouteFingerprint` to digest. The mechanical
+//! interface facet declared here therefore stays distinct from that credential
+//! ownership - the Kernel retains authority issuance, and the broker retains
+//! registration, heartbeat, launch authorization and fencing. Declaring a
+//! route digest here would be exactly the invented value the contract exists
+//! to prevent.
 
 use eliot_contracts::{
     BRIDGE_CONTRACT_REVISION, BridgeCapability, BridgeContract, BridgeId, CredentialsBoundary,
@@ -18,12 +30,41 @@ use eliot_contracts::{
 
 use crate::{PROTOCOL_VERSION, SERVICE_NAME};
 
+/// The broker's mechanical interface facet, one entry per operation the
+/// broker translates for the Kernel.
+///
+/// These are the broker's four mechanical operations, not the broker's
+/// credential or session responsibilities: the broker retains registration,
+/// heartbeat, launch authorization and fencing as a credential/session owner,
+/// and the Kernel retains authority issuance.
+fn broker_capabilities() -> Vec<BridgeCapability> {
+    vec![
+        BridgeCapability {
+            capability: "user.registration".to_owned(),
+            protocol_mapping: "register -> kernel.register".to_owned(),
+        },
+        BridgeCapability {
+            capability: "user.heartbeat".to_owned(),
+            protocol_mapping: "heartbeat -> kernel.heartbeat".to_owned(),
+        },
+        BridgeCapability {
+            capability: "user.launch-authorization".to_owned(),
+            protocol_mapping: "authorize-launch -> kernel.authorize-launch".to_owned(),
+        },
+        BridgeCapability {
+            capability: "user.fencing".to_owned(),
+            protocol_mapping: "fence -> kernel.fence".to_owned(),
+        },
+    ]
+}
+
 /// Builds the user-broker contract from the broker's own protocol version and
 /// service identity.
 pub fn user_broker_contract() -> Result<BridgeContract, BridgeContractError> {
     Ok(BridgeContract {
         contract_revision: BRIDGE_CONTRACT_REVISION,
         bridge_id: BridgeId::new(SERVICE_NAME)?,
+        admitted_binding_digest: None,
         upstream_project_and_license: UpstreamProject {
             name: "ELIOT Kernel".to_owned(),
             license: "ELIOT".to_owned(),
@@ -32,24 +73,7 @@ pub fn user_broker_contract() -> Result<BridgeContract, BridgeContractError> {
             version: PROTOCOL_VERSION.to_owned(),
             artifact: SERVICE_NAME.to_owned(),
         },
-        eliot_capabilities: vec![
-            BridgeCapability {
-                capability: "user.registration".to_owned(),
-                protocol_mapping: "register -> kernel.register".to_owned(),
-            },
-            BridgeCapability {
-                capability: "user.heartbeat".to_owned(),
-                protocol_mapping: "heartbeat -> kernel.heartbeat".to_owned(),
-            },
-            BridgeCapability {
-                capability: "user.launch-authorization".to_owned(),
-                protocol_mapping: "authorize-launch -> kernel.authorize-launch".to_owned(),
-            },
-            BridgeCapability {
-                capability: "user.fencing".to_owned(),
-                protocol_mapping: "fence -> kernel.fence".to_owned(),
-            },
-        ],
+        eliot_capabilities: broker_capabilities(),
         data_classes: vec![
             DataClass::new("user.registration.receipt")?,
             DataClass::new("user.launch.grant")?,
@@ -125,12 +149,23 @@ pub fn user_broker_contract() -> Result<BridgeContract, BridgeContractError> {
 }
 
 /// Validates the user-broker contract.
+///
+/// The bridge identity must be the broker service name, and the declaration
+/// must carry no route binding: the broker is not route-admitted, so a
+/// contract presenting another bridge's admitted generation digest is a
+/// binding failure rather than a tolerated extra.
 pub fn validate_user_broker_contract(contract: &BridgeContract) -> Result<(), BridgeContractError> {
     contract.validate().map_err(BridgeContractError::Contract)?;
     if contract.bridge_id.as_str() != SERVICE_NAME {
         return Err(BridgeContractError::Binding {
             field: "bridge_id",
             detail: "contract bridge id does not match the broker service name",
+        });
+    }
+    if contract.admitted_binding_digest.is_some() {
+        return Err(BridgeContractError::Binding {
+            field: "admitted_binding_digest",
+            detail: "the user broker mechanical interface is not route-admitted",
         });
     }
     Ok(())

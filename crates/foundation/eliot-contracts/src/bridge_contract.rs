@@ -9,13 +9,17 @@
 //!
 //! The contract is bound to the admitted artifact/config/route generation by
 //! the consuming bridge crate, never to a mutable README or a self-reported
-//! version alone. Unknown required metadata remains a qualification gap:
-//! `validate` refuses an incomplete declaration instead of filling it in.
+//! version alone: [`BridgeContract::admitted_binding_digest`] carries the
+//! owner-recomputed content digest of that generation and
+//! [`BridgeContract::binds_admitted_generation`] content-compares it, so a
+//! declaration built for one admitted generation can never validate as the
+//! declaration for another. Unknown required metadata remains a qualification
+//! gap: `validate` refuses an incomplete declaration instead of filling it in.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ContractError, validate_text};
+use crate::{ContractError, LowercaseSha256, validate_text};
 
 /// Current wire revision of the bridge contract declaration.
 pub const BRIDGE_CONTRACT_REVISION: u64 = 1;
@@ -413,6 +417,27 @@ pub struct BridgeContract {
     pub contract_revision: u64,
     /// Stable bridge identity.
     pub bridge_id: BridgeId,
+    /// The content digest of the admitted artifact/config/route generation
+    /// this declaration is bound to.
+    ///
+    /// This is the I6.5 binding "to the admitted artifact/config/route
+    /// generation, not a mutable README or self-reported version alone". The
+    /// bridge owner computes it with its own existing owner digest over the
+    /// admitted value (the `sha256_hex(canonical_json_bytes(..))` recipe:
+    /// `eliot_agent_api::route_fingerprint_digest_for` for a route-admitted
+    /// adapter, `AgentBridgeClientDeclaration::compute_digest` for the agent
+    /// bridge's admitted client declaration). A contract built for one
+    /// admitted generation therefore cannot be presented as the contract for
+    /// another: the consuming `validate_*_contract` recomputes this digest
+    /// from the admitted generation it is validating against and refuses on
+    /// any difference.
+    ///
+    /// `None` is admitted only where the admitting owner publishes no
+    /// content-addressable generation identity at all - the User Broker's
+    /// mechanical interface facet, whose admission owner is the broker's own
+    /// session/credential/launch-binding owner rather than a route. Every
+    /// route-admitted bridge sets it, and its validator refuses `None`.
+    pub admitted_binding_digest: Option<LowercaseSha256>,
     /// Upstream project name and license.
     pub upstream_project_and_license: UpstreamProject,
     /// Exact upstream version and artifact.
@@ -521,5 +546,17 @@ impl BridgeContract {
         self.export_removal_path.validate()?;
         validate_text(&self.owner_resume, "bridge_contract.owner_resume")?;
         Ok(())
+    }
+
+    /// Content-compares the declared admitted binding against the digest its
+    /// owner recomputed from the admitted generation.
+    ///
+    /// Returns false when the declaration carries no binding at all, so a
+    /// contract built for a different (or unbound) generation is never
+    /// accepted for the presented one. This is an exact digest comparison,
+    /// not a shape check: a well-formed contract is not a binding.
+    #[must_use]
+    pub fn binds_admitted_generation(&self, recomputed: &LowercaseSha256) -> bool {
+        self.admitted_binding_digest.as_ref() == Some(recomputed)
     }
 }

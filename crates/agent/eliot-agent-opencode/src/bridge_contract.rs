@@ -1,35 +1,41 @@
-//! I6.5 bridge contract declaration for the OpenCode HTTP/SSE adapter.
+//! I6.5 bridge contract declaration for the `OpenCode` HTTP/SSE adapter.
 //!
-//! The OpenCode adapter translates, isolates and observes between the
-//! OpenCode HTTP/SSE protocol and the provider-neutral A-01 contracts. Task
+//! The `OpenCode` adapter translates, isolates and observes between the
+//! `OpenCode` HTTP/SSE protocol and the provider-neutral A-01 contracts. Task
 //! meaning, policy decisions and promotion remain with the Governor and
 //! Dreamer owners; the adapter never starts a child, owns canonical state, or
 //! treats a provider terminal message as task finish.
 //!
-//! The contract is bound to the adapter's exact route identity (host family,
-//! adapter id, protocol transport), not to a mutable README or a self-reported
-//! version alone.
+//! The contract is bound to the admitted route generation through the route
+//! owner's own fingerprint digest
+//! ([`eliot_agent_api::route_fingerprint_digest_for`]), not to a mutable
+//! README or a self-reported version alone.
+//! `validate_opencode_adapter_contract` recomputes that digest from the route
+//! it validates against and refuses a contract built for a different route.
 
-use eliot_agent_api::RouteFingerprint;
+use eliot_agent_api::{RouteFingerprint, route_fingerprint_digest_for};
 use eliot_contracts::{
     BRIDGE_CONTRACT_REVISION, BridgeCapability, BridgeContract, BridgeId, CredentialsBoundary,
-    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, ProcessExecutorProfile,
-    SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject, UpstreamVersion,
+    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, LowercaseSha256,
+    ProcessExecutorProfile, SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject,
+    UpstreamVersion,
 };
 
 use crate::{OPENCODE_ADAPTER_ID, OPENCODE_HOST_FAMILY, OPENCODE_PROTOCOL_TRANSPORT};
 
-/// Builds the OpenCode adapter contract from the admitted route.
+/// Builds the `OpenCode` adapter contract from the admitted route.
 ///
 /// The route's host family, adapter id, and protocol transport supply the
-/// exact upstream identity; the contract is derived from the admitted route,
-/// never self-reported.
+/// exact upstream identity, and the route's owner digest binds the admitted
+/// route generation into the contract; the contract is derived from the
+/// admitted route, never self-reported.
 pub fn opencode_adapter_contract(
     route: &RouteFingerprint,
 ) -> Result<BridgeContract, BridgeContractError> {
     Ok(BridgeContract {
         contract_revision: BRIDGE_CONTRACT_REVISION,
         bridge_id: BridgeId::new(OPENCODE_ADAPTER_ID)?,
+        admitted_binding_digest: Some(admitted_route_digest(route)?),
         upstream_project_and_license: UpstreamProject {
             name: "OpenCode".to_owned(),
             license: "OpenCode".to_owned(),
@@ -119,11 +125,12 @@ pub fn opencode_adapter_contract(
     })
 }
 
-/// Validates the OpenCode adapter contract against the admitted route.
+/// Validates the `OpenCode` adapter contract against the admitted route.
 ///
-/// The contract's bridge identity must match the adapter id, and the route
-/// must be the exact OpenCode route. Any mismatch is a contract-binding
-/// failure.
+/// The contract's bridge identity must match the adapter id, the route must
+/// be the exact `OpenCode` route, and the contract's admitted binding digest
+/// must equal the digest recomputed from that exact route. A well-formed
+/// contract for a different route is a binding failure, not a pass.
 pub fn validate_opencode_adapter_contract(
     contract: &BridgeContract,
     route: &RouteFingerprint,
@@ -144,15 +151,41 @@ pub fn validate_opencode_adapter_contract(
             detail: "route is not the exact OpenCode HTTP/SSE route",
         });
     }
+    let admitted = admitted_route_digest(route)?;
+    if !contract.binds_admitted_generation(&admitted) {
+        return Err(BridgeContractError::Binding {
+            field: "admitted_binding_digest",
+            detail: "contract does not bind the admitted route generation",
+        });
+    }
     Ok(())
 }
 
-/// Typed failure for OpenCode adapter contract construction and validation.
+/// Recomputes the admitted route's owner digest.
+///
+/// Reuses the route owner's existing identity function
+/// ([`route_fingerprint_digest_for`], `sha256_hex(canonical_json_bytes(..))`
+/// over the complete [`RouteFingerprint`]) so the value cannot be free text or
+/// a self-reported label, and so the bootstrap gate and every validator
+/// recompute it the same way.
+fn admitted_route_digest(route: &RouteFingerprint) -> Result<LowercaseSha256, BridgeContractError> {
+    route_fingerprint_digest_for(route).map_err(|error| BridgeContractError::Route {
+        detail: error.to_string(),
+    })
+}
+
+/// Typed failure for `OpenCode` adapter contract construction and validation.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BridgeContractError {
     /// The neutral contract failed validation.
     #[error("bridge contract invalid: {0}")]
     Contract(#[from] eliot_contracts::ContractError),
+    /// The admitted route identity could not be recomputed.
+    #[error("admitted route invalid: {detail}")]
+    Route {
+        /// Bounded detail.
+        detail: String,
+    },
     /// The contract does not bind to the admitted route.
     #[error("bridge contract binding failed for {field}: {detail}")]
     Binding {

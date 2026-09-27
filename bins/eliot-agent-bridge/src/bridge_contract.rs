@@ -8,20 +8,51 @@
 //!
 //! The contract is bound to the admitted [`AgentBridgeClientDeclaration`]
 //! (which carries the immutable `ModuleContract` and `ModuleGeneration`), not
-//! to a mutable README or a self-reported version alone.
+//! to a mutable README or a self-reported version alone. The binding is the
+//! declaration's own recomputed content digest
+//! ([`AgentBridgeClientDeclaration::compute_digest`],
+//! `sha256_hex(canonical_json_bytes(..))` over every declaration field), which
+//! [`AgentBridgeClientDeclaration::validate`] already enforces field by field,
+//! so a declaration edited after admission cannot present the old contract.
 
 use eliot_contracts::{
     BRIDGE_CONTRACT_REVISION, BridgeCapability, BridgeContract, BridgeId, CredentialsBoundary,
-    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, ProcessExecutorProfile,
-    SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject, UpstreamVersion,
+    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, LowercaseSha256,
+    ProcessExecutorProfile, SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject,
+    UpstreamVersion,
 };
 use eliot_protocol::AgentBridgeClientDeclaration;
+
+/// Recomputes the admitted declaration's content digest as the neutral typed
+/// digest the contract carries.
+///
+/// `AgentBridgeClientDeclaration::validate` already recomputes and compares
+/// `declaration_sha256`; this is the same value, retyped. A checked copy never
+/// reaches the contract because the digest is recomputed from the admitted
+/// declaration on every construction and every validation.
+fn admitted_declaration_digest(
+    declaration: &AgentBridgeClientDeclaration,
+) -> Result<LowercaseSha256, BridgeContractError> {
+    let hex = declaration
+        .compute_digest()
+        .map_err(|_| BridgeContractError::Binding {
+            field: "admitted_binding_digest",
+            detail: "admitted declaration digest could not be recomputed",
+        })?;
+    serde_json::from_value(serde_json::Value::String(hex)).map_err(|_| {
+        BridgeContractError::Binding {
+            field: "admitted_binding_digest",
+            detail: "admitted declaration digest is not a canonical SHA-256 value",
+        }
+    })
+}
 
 /// Builds the agent-bridge contract from the admitted declaration.
 ///
 /// The declaration's `ModuleContract` and `ModuleGeneration` supply the exact
-/// upstream version and artifact; the contract is derived from the admitted
-/// generation, never self-reported.
+/// upstream version and artifact, and the recomputed declaration digest binds
+/// the admitted artifact/config/generation; the contract is derived from the
+/// admitted generation, never self-reported.
 pub fn agent_bridge_contract(
     declaration: &AgentBridgeClientDeclaration,
 ) -> Result<BridgeContract, BridgeContractError> {
@@ -39,6 +70,7 @@ pub fn agent_bridge_contract(
     Ok(BridgeContract {
         contract_revision: BRIDGE_CONTRACT_REVISION,
         bridge_id: BridgeId::new(module_id)?,
+        admitted_binding_digest: Some(admitted_declaration_digest(declaration)?),
         upstream_project_and_license: UpstreamProject {
             name: "ELIOT Kernel".to_owned(),
             license: "ELIOT".to_owned(),
@@ -126,9 +158,12 @@ pub fn agent_bridge_contract(
 
 /// Validates the agent-bridge contract against the admitted declaration.
 ///
-/// The contract's bridge identity must match the declaration's module id, and
-/// the upstream version/artifact must match the declaration's module contract
-/// and generation. Any mismatch is a contract-binding failure.
+/// The contract's bridge identity must match the declaration's module id, the
+/// upstream version/artifact must match the declaration's module contract and
+/// generation, and the contract's admitted binding digest must equal the digest
+/// recomputed from the admitted declaration. Any mismatch is a
+/// contract-binding failure: a well-formed contract for a different admitted
+/// declaration is not a pass.
 pub fn validate_agent_bridge_contract(
     contract: &BridgeContract,
     declaration: &AgentBridgeClientDeclaration,
@@ -144,6 +179,13 @@ pub fn validate_agent_bridge_contract(
         return Err(BridgeContractError::Binding {
             field: "upstream_version.artifact",
             detail: "contract artifact does not match the admitted module contract artifact",
+        });
+    }
+    let admitted = admitted_declaration_digest(declaration)?;
+    if !contract.binds_admitted_generation(&admitted) {
+        return Err(BridgeContractError::Binding {
+            field: "admitted_binding_digest",
+            detail: "contract does not bind the admitted declaration generation",
         });
     }
     Ok(())

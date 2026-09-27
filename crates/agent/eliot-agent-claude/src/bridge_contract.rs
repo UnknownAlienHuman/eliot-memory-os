@@ -7,26 +7,31 @@
 //! acquires task authority.
 //!
 //! The contract is bound to the admitted [`ClaudeAdapterDescriptor`] (adapter
-//! id, factory revision, and exact route), not to a mutable README or a
-//! self-reported version alone.
+//! id, factory revision, and exact route) plus the route owner's own
+//! fingerprint digest for that admitted route
+//! ([`eliot_agent_api::route_fingerprint_digest_for`]), not to a mutable README
+//! or a self-reported version alone.
 
-use eliot_agent_api::RouteFingerprint;
+use eliot_agent_api::{RouteFingerprint, route_fingerprint_digest_for};
 use eliot_contracts::{
     BRIDGE_CONTRACT_REVISION, BridgeCapability, BridgeContract, BridgeId, CredentialsBoundary,
-    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, ProcessExecutorProfile,
-    SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject, UpstreamVersion,
+    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, LowercaseSha256,
+    ProcessExecutorProfile, SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject,
+    UpstreamVersion,
 };
 
-use crate::execution::{
-    CLAUDE_SIDECAR_ADAPTER_ID, CLAUDE_SIDECAR_FACTORY_REVISION, CLAUDE_SIDECAR_HOST_FAMILY,
-    CLAUDE_SIDECAR_PROTOCOL_VERSION, CLAUDE_SIDECAR_TRANSPORT, ClaudeAdapterDescriptor,
+use crate::execution::{CLAUDE_SIDECAR_FACTORY_REVISION, ClaudeAdapterDescriptor};
+use crate::{
+    CLAUDE_SIDECAR_ADAPTER_ID, CLAUDE_SIDECAR_HOST_FAMILY, CLAUDE_SIDECAR_PROTOCOL_VERSION,
+    CLAUDE_SIDECAR_TRANSPORT,
 };
 
 /// Builds the Claude adapter contract from the admitted descriptor and route.
 ///
 /// The descriptor's adapter id, factory revision, and route supply the exact
-/// upstream identity; the contract is derived from the admitted descriptor,
-/// never self-reported.
+/// upstream identity, and the route's owner digest binds the admitted route
+/// generation into the contract; the contract is derived from the admitted
+/// descriptor, never self-reported.
 pub fn claude_adapter_contract(
     descriptor: &ClaudeAdapterDescriptor,
     route: &RouteFingerprint,
@@ -34,6 +39,7 @@ pub fn claude_adapter_contract(
     Ok(BridgeContract {
         contract_revision: BRIDGE_CONTRACT_REVISION,
         bridge_id: BridgeId::new(descriptor.adapter_id.as_str())?,
+        admitted_binding_digest: Some(admitted_route_digest(route)?),
         upstream_project_and_license: UpstreamProject {
             name: "Claude Agent SDK".to_owned(),
             license: "Anthropic".to_owned(),
@@ -131,9 +137,12 @@ pub fn claude_adapter_contract(
 /// Validates the Claude adapter contract against the admitted descriptor and
 /// route.
 ///
-/// The contract's bridge identity must match the descriptor's adapter id, and
-/// the descriptor must be the current factory revision for the exact route.
-/// Any mismatch is a contract-binding failure.
+/// The contract's bridge identity must match the descriptor's adapter id, the
+/// descriptor must be the current factory revision for the exact route, the
+/// descriptor route must equal the presented route, and the contract's
+/// admitted binding digest must equal the digest recomputed from that exact
+/// route. Any mismatch is a contract-binding failure: a well-formed contract
+/// for a different route is not a pass.
 pub fn validate_claude_adapter_contract(
     contract: &BridgeContract,
     descriptor: &ClaudeAdapterDescriptor,
@@ -164,7 +173,27 @@ pub fn validate_claude_adapter_contract(
             detail: "descriptor route differs from the admitted route",
         });
     }
+    let admitted = admitted_route_digest(route)?;
+    if !contract.binds_admitted_generation(&admitted) {
+        return Err(BridgeContractError::Binding {
+            field: "admitted_binding_digest",
+            detail: "contract does not bind the admitted route generation",
+        });
+    }
     Ok(())
+}
+
+/// Recomputes the admitted route's owner digest.
+///
+/// Reuses the route owner's existing identity function
+/// ([`route_fingerprint_digest_for`], `sha256_hex(canonical_json_bytes(..))`
+/// over the complete [`RouteFingerprint`]) so the value cannot be free text or
+/// a self-reported label, and so construction and validation recompute it the
+/// same way.
+fn admitted_route_digest(route: &RouteFingerprint) -> Result<LowercaseSha256, BridgeContractError> {
+    route_fingerprint_digest_for(route).map_err(|error| BridgeContractError::Route {
+        detail: error.to_string(),
+    })
 }
 
 /// Typed failure for Claude adapter contract construction and validation.
@@ -173,7 +202,13 @@ pub enum BridgeContractError {
     /// The neutral contract failed validation.
     #[error("bridge contract invalid: {0}")]
     Contract(#[from] eliot_contracts::ContractError),
-    /// The contract does not bind to the admitted descriptor.
+    /// The admitted route identity could not be recomputed.
+    #[error("admitted route invalid: {detail}")]
+    Route {
+        /// Bounded detail.
+        detail: String,
+    },
+    /// The contract does not bind to the admitted descriptor and route.
     #[error("bridge contract binding failed for {field}: {detail}")]
     Binding {
         /// The failing field.

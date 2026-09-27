@@ -6,14 +6,19 @@
 //! Dreamer owners; the adapter never spawns a process, opens a socket, or
 //! creates authority.
 //!
-//! The contract is bound to the adapter's exact protocol version and route
-//! identity, not to a mutable README or a self-reported version alone.
+//! The contract is bound to the admitted route generation through the route
+//! owner's own fingerprint digest
+//! ([`eliot_agent_api::route_fingerprint_digest_for`]), not to a mutable
+//! README or a self-reported version alone. `validate_acp_adapter_contract`
+//! recomputes that digest from the route it validates against and refuses a
+//! contract built for a different route.
 
-use eliot_agent_api::RouteFingerprint;
+use eliot_agent_api::{RouteFingerprint, route_fingerprint_digest_for};
 use eliot_contracts::{
     BRIDGE_CONTRACT_REVISION, BridgeCapability, BridgeContract, BridgeId, CredentialsBoundary,
-    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, ProcessExecutorProfile,
-    SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject, UpstreamVersion,
+    DataClass, ExportRemovalPath, FailureTranslation, HealthProbe, LowercaseSha256,
+    ProcessExecutorProfile, SideEffect, SuiteRevision, TimeoutsAndCancellation, UpstreamProject,
+    UpstreamVersion,
 };
 
 use crate::{ACP_PROTOCOL_VERSION, ACP_SCHEMA_VERSION};
@@ -21,14 +26,15 @@ use crate::{ACP_PROTOCOL_VERSION, ACP_SCHEMA_VERSION};
 /// Builds the ACP adapter contract from the admitted route.
 ///
 /// The route and the adapter's protocol version supply the exact upstream
-/// identity; the contract is derived from the admitted protocol version,
-/// never self-reported.
+/// identity; the contract is derived from the admitted protocol version and
+/// the admitted route's owner digest, never self-reported.
 pub fn acp_adapter_contract(
     route: &RouteFingerprint,
 ) -> Result<BridgeContract, BridgeContractError> {
     Ok(BridgeContract {
         contract_revision: BRIDGE_CONTRACT_REVISION,
         bridge_id: BridgeId::new("eliot-agent-acp")?,
+        admitted_binding_digest: Some(admitted_route_digest(route)?),
         upstream_project_and_license: UpstreamProject {
             name: "ACP v1".to_owned(),
             license: "Zed".to_owned(),
@@ -118,8 +124,10 @@ pub fn acp_adapter_contract(
 
 /// Validates the ACP adapter contract against the admitted route.
 ///
-/// The contract's bridge identity must match the adapter id, and the route
-/// must be present. Any mismatch is a contract-binding failure.
+/// The contract's bridge identity must match the adapter id, the route must
+/// be valid, and the contract's admitted binding digest must equal the digest
+/// recomputed from the exact route it is validated against. A well-formed
+/// contract for a different route is a binding failure, not a pass.
 pub fn validate_acp_adapter_contract(
     contract: &BridgeContract,
     route: &RouteFingerprint,
@@ -131,12 +139,31 @@ pub fn validate_acp_adapter_contract(
             detail: "contract bridge id does not match the ACP adapter id",
         });
     }
+    let admitted = admitted_route_digest(route)?;
+    if !contract.binds_admitted_generation(&admitted) {
+        return Err(BridgeContractError::Binding {
+            field: "admitted_binding_digest",
+            detail: "contract does not bind the admitted route generation",
+        });
+    }
+    Ok(())
+}
+
+/// Recomputes the admitted route's owner digest.
+///
+/// Reuses the route owner's existing identity function
+/// ([`route_fingerprint_digest_for`], `sha256_hex(canonical_json_bytes(..))`
+/// over the complete [`RouteFingerprint`]) so the value cannot be free text or
+/// a self-reported label, and so every validator recomputes it the same way.
+fn admitted_route_digest(route: &RouteFingerprint) -> Result<LowercaseSha256, BridgeContractError> {
     route
         .validate()
         .map_err(|error| BridgeContractError::Route {
             detail: error.to_string(),
         })?;
-    Ok(())
+    route_fingerprint_digest_for(route).map_err(|error| BridgeContractError::Route {
+        detail: error.to_string(),
+    })
 }
 
 /// Typed failure for ACP adapter contract construction and validation.
