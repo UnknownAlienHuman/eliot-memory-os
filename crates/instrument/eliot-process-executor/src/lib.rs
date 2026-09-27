@@ -2010,8 +2010,18 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 sequence
             ))
             .map_err(unavailable)?;
-            let child = SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits)
-                .map_err(unavailable)?;
+            // Issue #1888: the per-attempt Job Object is a *nested* Job Object
+            // inside the Host-owned Kernel outer kill domain, never a second
+            // outer kill domain of its own. The nested entry point creates the
+            // child only after this build's launch probe has observed
+            // assignment, permitted nesting, and outer kill-on-close, so a
+            // build that cannot establish the containment fails visibly here
+            // instead of degrading the limits or the kill domain. The limits
+            // above stay exactly the admitted `ResourceLimits`; this call adds
+            // no default, cap, or fallback ceiling.
+            let child =
+                SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(spec, job_name, limits)
+                    .map_err(unavailable)?;
 
             // Issue-84 start state machine: `SuspendedLaunch` (above) →
             // `AuthorityValidation` (below) → `Resumed` → `CaptureSetup` →
