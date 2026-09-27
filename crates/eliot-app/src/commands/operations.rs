@@ -1756,12 +1756,18 @@ async fn execute_adapter_test(config_path: &Path, adapter: &str) -> Result<Adapt
         Some(result.trace_id.clone()),
     ))?;
     let operation_status = match result.status {
-        AdapterResultStatus::Succeeded => OperationStatus::OperationCompleted,
+        AdapterResultStatus::Succeeded | AdapterResultStatus::NoResults => {
+            OperationStatus::OperationCompleted
+        }
         AdapterResultStatus::Rejected
         | AdapterResultStatus::CircuitOpen
-        | AdapterResultStatus::Unavailable => OperationStatus::Blocked,
+        | AdapterResultStatus::Unavailable
+        | AdapterResultStatus::StaleIndex
+        | AdapterResultStatus::UnsupportedCapability => OperationStatus::Blocked,
         AdapterResultStatus::Failed
         | AdapterResultStatus::Timeout
+        | AdapterResultStatus::TransportFailure
+        | AdapterResultStatus::IntegrityFailure
         | AdapterResultStatus::OutputTooLarge => OperationStatus::Failed,
     };
     Ok(AdapterExecutionReport {
