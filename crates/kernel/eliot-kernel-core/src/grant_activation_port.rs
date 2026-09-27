@@ -3531,7 +3531,8 @@ impl GrantActivationPort {
         active_epoch: &EpochId,
         boundary: &DurableRootGrantBoundary,
     ) -> Result<AuthorityActivationReceipt, eliot_authority::P07PortError> {
-        check_binding(&request.binding, active_epoch).map_err(|error| map_thin_error(&error))?;
+        check_binding(&request.binding, active_epoch)
+            .map_err(|error| map_p07_binding_error(&error, &request.binding))?;
         let hydration = boundary
             .hydration
             .hydrate_grant_member(request.grant_id.as_str())
@@ -3639,7 +3640,8 @@ impl GrantActivationPort {
         boundary: &DurableRootGrantBoundary,
         enumeration: &GrantClosureEnumeration,
     ) -> Result<AuthorityRevocationReceipt, eliot_authority::P07PortError> {
-        check_binding(&request.binding, active_epoch).map_err(|error| map_thin_error(&error))?;
+        check_binding(&request.binding, active_epoch)
+            .map_err(|error| map_p07_binding_error(&error, &request.binding))?;
         let rich = GrantClosureRevocationIntent {
             operation_id: thin_operation_id(
                 "revoke-grant",
@@ -6063,9 +6065,12 @@ fn check_exact_epoch_lineage(
 
 fn map_ors_error(error: &eliot_ors::OrsError) -> eliot_authority::P07PortError {
     match error {
-        eliot_ors::OrsError::InvalidTransition
-        | eliot_ors::OrsError::InvalidEpochLineage
-        | eliot_ors::OrsError::FenceMismatch => eliot_authority::P07PortError::NotAdmitted,
+        eliot_ors::OrsError::InvalidTransition | eliot_ors::OrsError::InvalidEpochLineage => {
+            eliot_authority::P07PortError::NotAdmitted
+        }
+        eliot_ors::OrsError::FenceMismatch => eliot_authority::P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::AuthorityEpochDisagreesWithFence,
+        },
         eliot_ors::OrsError::DuplicateConflict => eliot_authority::P07PortError::IdentityConflict,
         _ => eliot_authority::P07PortError::Unavailable,
     }
@@ -6128,9 +6133,17 @@ fn map_introduction_transition_error(
 fn map_thin_error(error: &KernelError) -> eliot_authority::P07PortError {
     use eliot_authority::P07PortError;
     match error {
+        KernelError::StaleEpoch { .. } => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::StaleAuthorityEpoch,
+        },
+        KernelError::StaleEpochTuple { observed, active } => P07PortError::Refused {
+            cause: if observed.lineage_id == active.lineage_id {
+                eliot_authority::P07RefusalCause::StaleAuthorityEpoch
+            } else {
+                eliot_authority::P07RefusalCause::CrossLineageAuthorityEpoch
+            },
+        },
         KernelError::FenceMismatch
-        | KernelError::StaleEpoch { .. }
-        | KernelError::StaleEpochTuple { .. }
         | KernelError::Expired { .. }
         | KernelError::ControlReserveExhausted
         | KernelError::NormalCapacityExhausted { .. }
@@ -6141,7 +6154,49 @@ fn map_thin_error(error: &KernelError) -> eliot_authority::P07PortError {
         | KernelError::RecoveryUnavailable(_)
         | KernelError::RecoveryState(_) => P07PortError::Unavailable,
         KernelError::IdempotencyConflict => P07PortError::IdentityConflict,
+        KernelError::InvalidField {
+            field: "binding.authority_owner",
+            ..
+        } => P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::InvalidOwnerField,
+        },
         _ => P07PortError::InvalidBinding,
+    }
+}
+
+/// Classifies only failures from the P-07 caller-binding validation site.
+///
+/// The P-07 thin method supplies the active epoch copied from the request, so
+/// this call can prove a malformed State Fence or an epoch/fence contradiction
+/// but cannot establish that the tuple is stale against a live owner epoch.
+/// Live epoch comparisons are classified only when their typed error carries
+/// both exact tuples.
+fn map_p07_binding_error(
+    error: &KernelError,
+    binding: &AuthorityBinding,
+) -> eliot_authority::P07PortError {
+    use eliot_authority::{P07PortError, P07RefusalCause};
+
+    match error {
+        KernelError::InvalidField {
+            field: "binding.authority_owner",
+            ..
+        } => P07PortError::Refused {
+            cause: P07RefusalCause::InvalidOwnerField,
+        },
+        KernelError::Foundation(_) => P07PortError::Refused {
+            cause: P07RefusalCause::StateFenceUnvalidated,
+        },
+        KernelError::FenceMismatch
+            if !binding
+                .authority_epoch
+                .is_same_authority(&binding.state_fence.authority_epoch) =>
+        {
+            P07PortError::Refused {
+                cause: P07RefusalCause::AuthorityEpochDisagreesWithFence,
+            }
+        }
+        _ => map_thin_error(error),
     }
 }
 
@@ -6157,13 +6212,15 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
             // inconsistent or stale against the presented epoch. No owner
             // repairs caller material; the caller re-presents through a
             // current Governor snapshot.
-            return Err(map_thin_error(&error));
+            return Err(map_p07_binding_error(&error, &request.binding));
         }
         if let Some(boundary) = self.durable_boundary() {
             return self.activate_root_grant_durable(request, &active_epoch, boundary);
         }
         #[cfg(not(test))]
-        return Err(P07PortError::Unavailable);
+        return Err(P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::P07OwnerUnavailable,
+        });
         #[cfg(test)]
         {
             let ledger = self.lock_ledger();
@@ -6195,7 +6252,7 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         // malformed, split-epoch or stale-epoch binding never reaches the
         // closure enumeration, the intent ledger, or ORS.
         if let Err(error) = check_binding(&request.binding, &active_epoch) {
-            return Err(map_thin_error(&error));
+            return Err(map_p07_binding_error(&error, &request.binding));
         }
         if let Some(boundary) = self.durable_boundary() {
             // Owner-governed dispatch (`#2100`): the Governor enumeration
@@ -6218,7 +6275,9 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
             );
         }
         #[cfg(not(test))]
-        return Err(P07PortError::Unavailable);
+        return Err(P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::P07OwnerUnavailable,
+        });
         #[cfg(test)]
         let rich = {
             let ledger = self.lock_ledger();
@@ -6291,7 +6350,7 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
             // inconsistent or stale against the presented epoch. No owner
             // repairs caller material; the caller re-presents through a
             // current Governor snapshot.
-            return Err(map_thin_error(&error));
+            return Err(map_p07_binding_error(&error, &request.binding));
         }
         // Owner-hydrated durable activation (`#2100`/`#1110`): the Governor
         // introduction-hydration owner resolves the thin request to the
@@ -6303,6 +6362,11 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         // supporting grants, facet, holder, or revision, and I6.15 forbids
         // this port from creating lineage.
         let Some(boundary) = self.durable_boundary() else {
+            #[cfg(not(test))]
+            return Err(P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::P07OwnerUnavailable,
+            });
+            #[cfg(test)]
             return Err(P07PortError::Unavailable);
         };
         let hydration = boundary
@@ -6319,7 +6383,13 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
     ) -> Result<AuthorityRevocationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
         let active_epoch = request.binding.authority_epoch.clone();
-        check_binding(&request.binding, &active_epoch).map_err(|error| map_thin_error(&error))?;
+        check_binding(&request.binding, &active_epoch)
+            .map_err(|error| map_p07_binding_error(&error, &request.binding))?;
+        #[cfg(not(test))]
+        let boundary = self.durable_boundary().ok_or(P07PortError::Refused {
+            cause: eliot_authority::P07RefusalCause::P07OwnerUnavailable,
+        })?;
+        #[cfg(test)]
         let boundary = self.durable_boundary().ok_or(P07PortError::Unavailable)?;
         let hydration_request = eliot_authority::IntroductionActivationRequest {
             introduction_id: request.introduction_id.clone(),

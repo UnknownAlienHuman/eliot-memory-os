@@ -55,6 +55,9 @@ pub enum P07RefusalDirective {
     /// The presented fence is not the current Kernel fence: fail closed and do
     /// not reuse it.
     StaleFenceFailClosed,
+    /// The presented authority epoch does not match the current Kernel epoch;
+    /// fail closed and re-present under the current epoch and lineage.
+    RefreshAuthorityEpoch,
     /// The presented operation identity already committed different content;
     /// re-serve fresh state instead of retrying the same operation.
     ResubmitFromCurrentState,
@@ -73,6 +76,7 @@ impl P07RefusalDirective {
         match self {
             Self::RepairPresentedBinding => "repair-presented-binding",
             Self::StaleFenceFailClosed => "stale-fence-fail-closed",
+            Self::RefreshAuthorityEpoch => "refresh-authority-epoch",
             Self::ResubmitFromCurrentState => "resubmit-from-current-state",
             Self::ReconcileExactSnapshot => "reconcile-exact-snapshot",
             Self::OwnerEscalation => "owner-escalation",
@@ -86,6 +90,7 @@ impl P07RefusalDirective {
         match value {
             "repair-presented-binding" => Some(Self::RepairPresentedBinding),
             "stale-fence-fail-closed" => Some(Self::StaleFenceFailClosed),
+            "refresh-authority-epoch" => Some(Self::RefreshAuthorityEpoch),
             "resubmit-from-current-state" => Some(Self::ResubmitFromCurrentState),
             "reconcile-exact-snapshot" => Some(Self::ReconcileExactSnapshot),
             "owner-escalation" => Some(Self::OwnerEscalation),
@@ -110,6 +115,14 @@ pub enum P07RefusalCause {
     /// The presented authority epoch disagrees with the presented fence it
     /// carries, so the presentation contradicts itself.
     AuthorityEpochDisagreesWithFence,
+    /// The presented authority epoch is from the active lineage but does not
+    /// match the current Kernel epoch.
+    StaleAuthorityEpoch,
+    /// The presented authority epoch belongs to a different lineage from the
+    /// current Kernel epoch; the tuples are unrelated and must not be ordered.
+    CrossLineageAuthorityEpoch,
+    /// The presented authority-owner field failed its typed validation.
+    InvalidOwnerField,
     /// The proven session facts could not be bound into the presented
     /// principal/session/scope subject.
     SessionSubjectUnbindable,
@@ -126,6 +139,9 @@ pub enum P07RefusalCause {
     OperationIdentityAlreadyCommitted,
     /// The commit outcome could not be established at the boundary.
     CommitOutcomeUnproven,
+    /// The P-07 owner boundary required for grant or introduction lifecycle
+    /// operations is not bound.
+    P07OwnerUnavailable,
 }
 
 impl P07RefusalCause {
@@ -135,12 +151,16 @@ impl P07RefusalCause {
         match self {
             Self::StateFenceUnvalidated => "state-fence-unvalidated",
             Self::AuthorityEpochDisagreesWithFence => "authority-epoch-disagrees-with-fence",
+            Self::StaleAuthorityEpoch => "stale-authority-epoch",
+            Self::CrossLineageAuthorityEpoch => "cross-lineage-authority-epoch",
+            Self::InvalidOwnerField => "invalid-owner-field",
             Self::SessionSubjectUnbindable => "session-subject-unbindable",
             Self::StaleStateFence => "stale-state-fence",
             Self::ResponseRouteMismatch => "response-route-mismatch",
             Self::RefusalFrameIncompatible => "refusal-frame-incompatible",
             Self::OperationIdentityAlreadyCommitted => "operation-identity-already-committed",
             Self::CommitOutcomeUnproven => "commit-outcome-unproven",
+            Self::P07OwnerUnavailable => "p07-owner-unavailable",
         }
     }
 
@@ -151,12 +171,16 @@ impl P07RefusalCause {
         match value {
             "state-fence-unvalidated" => Some(Self::StateFenceUnvalidated),
             "authority-epoch-disagrees-with-fence" => Some(Self::AuthorityEpochDisagreesWithFence),
+            "stale-authority-epoch" => Some(Self::StaleAuthorityEpoch),
+            "cross-lineage-authority-epoch" => Some(Self::CrossLineageAuthorityEpoch),
+            "invalid-owner-field" => Some(Self::InvalidOwnerField),
             "session-subject-unbindable" => Some(Self::SessionSubjectUnbindable),
             "stale-state-fence" => Some(Self::StaleStateFence),
             "response-route-mismatch" => Some(Self::ResponseRouteMismatch),
             "refusal-frame-incompatible" => Some(Self::RefusalFrameIncompatible),
             "operation-identity-already-committed" => Some(Self::OperationIdentityAlreadyCommitted),
             "commit-outcome-unproven" => Some(Self::CommitOutcomeUnproven),
+            "p07-owner-unavailable" => Some(Self::P07OwnerUnavailable),
             _ => None,
         }
     }
