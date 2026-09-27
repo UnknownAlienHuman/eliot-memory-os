@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod control_reserve;
+mod hot_path;
 mod i14_backpressure;
 mod installation_activation;
 mod runtime_live;
@@ -29,6 +30,12 @@ pub use control_reserve::{
     BottleneckCapacityProfile, BottleneckCoverageState, BottleneckOwnerBinding, CapacityBottleneck,
     CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
     ControlReserveProfile, EmergencyOperationClass, NormalWorkClass, frozen_bottleneck_owner_map,
+};
+pub use hot_path::{
+    HOT_PATH_CONTRACT_NAME, HOT_PATH_CONTRACT_VERSION, HOT_PATH_MANIFEST_VERSION,
+    HotPathDegradation, HotPathExternalCall, HotPathManifest, HotPathManifestSetV1,
+    HotPathProfileRef, HotPathQueueBounds, HotPathQueueDeclaration, HotPathSnapshotDependency,
+    HotPathUnsupportedOperation, hot_path_contract_identity, hot_spine_membership,
 };
 pub use i14_backpressure::{
     AffectedOperationClass, BottleneckAvailability, BottleneckObservationV1,
