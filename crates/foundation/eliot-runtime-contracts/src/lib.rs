@@ -640,6 +640,14 @@ impl GenerationCandidateReceipt {
 }
 
 /// Durable ORS cutover record and its linearization state.
+///
+/// The two epoch fields are lineage-aware [`EpochId`] tuples, never bare
+/// counters (I6.10 "Epoch identity": "Every authority-bearing generation uses a
+/// typed epoch, not a bare counter"). A durable row written before this
+/// migration carries scalar `old_epoch`/`new_epoch` numbers; it no longer
+/// decodes, so it can never be read back as current authority. Nothing here
+/// re-attaches a lineage to such a legacy number, and unknown schema or lost
+/// lineage is never treated as genesis.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationCutoverRecord {
@@ -651,16 +659,26 @@ pub struct GenerationCutoverRecord {
     pub old_generation: Option<ResourceGeneration>,
     /// Candidate generation becoming active.
     pub new_generation: ResourceGeneration,
-    /// Epoch before the switch.
-    pub old_epoch: AuthorityEpoch,
-    /// New epoch reserved for the switch.
-    pub new_epoch: AuthorityEpoch,
+    /// Exact epoch tuple before the switch.
+    pub old_epoch: EpochId,
+    /// Exact epoch tuple issued by the switch.
+    pub new_epoch: EpochId,
     /// Current ORS cutover state.
     pub state: GenerationCutoverState,
 }
 
 impl GenerationCutoverRecord {
-    /// Validates the cutover identity and monotonic epoch boundary.
+    /// Validates the cutover identity and the explicit one-step epoch
+    /// transition.
+    ///
+    /// The advancement rule is the owner's, not a numeric shortcut: the new
+    /// epoch must be the exact direct child of the old one
+    /// ([`EpochId::is_direct_child_of`], the same one-step lineage rule
+    /// `eliot_contracts::EpochTransition` validates). Two lineages are
+    /// unrelated and are never ordered, so a foreign-lineage new epoch is
+    /// refused before any sequence is read; inside one lineage only the exact
+    /// one step is admitted, and the step is computed with `checked_add`, so a
+    /// cutover from `u64::MAX` is refused rather than wrapped.
     pub fn validate(&self) -> Result<(), RuntimeContractError> {
         text(&self.cutover_id, "cutover_id")?;
         text(&self.route_scope, "route_scope")?;
@@ -670,10 +688,16 @@ impl GenerationCutoverRecord {
                 reason: "cutover must select a distinct generation",
             });
         }
-        if self.new_epoch <= self.old_epoch {
+        if self.old_epoch.lineage_id != self.new_epoch.lineage_id {
             return Err(RuntimeContractError::InvalidField {
                 field: "new_epoch",
-                reason: "cutover must raise the authority epoch",
+                reason: "cutover must stay inside one epoch lineage",
+            });
+        }
+        if !self.new_epoch.is_direct_child_of(&self.old_epoch) {
+            return Err(RuntimeContractError::InvalidField {
+                field: "new_epoch",
+                reason: "cutover must advance by the exact one-step direct child of the old epoch",
             });
         }
         Ok(())
@@ -681,6 +705,11 @@ impl GenerationCutoverRecord {
 }
 
 /// Durable proof emitted after the ORS cutover linearization point.
+///
+/// `authority_epoch` is the complete lineage-aware tuple of the epoch this
+/// cutover issued. A consumer that admits an effect under it must compare the
+/// whole tuple with its own currently active tuple; the sequence alone is a
+/// locator and never authority (I6.10 "Epoch identity").
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationCutoverReceipt {
@@ -690,8 +719,8 @@ pub struct GenerationCutoverReceipt {
     pub old_generation: Option<ResourceGeneration>,
     /// New active generation.
     pub new_generation: ResourceGeneration,
-    /// Epoch after cutover.
-    pub authority_epoch: AuthorityEpoch,
+    /// Exact epoch tuple after cutover.
+    pub authority_epoch: EpochId,
     /// Final cutover state.
     pub state: GenerationCutoverState,
     /// Unresolved operation scopes retained for reconciliation.
@@ -722,8 +751,8 @@ impl GenerationCutoverReceipt {
 pub struct KernelAuthoritySnapshot {
     /// Snapshot revision.
     pub snapshot_id: String,
-    /// Current authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    /// Exact current authority epoch tuple.
+    pub authority_epoch: EpochId,
     /// Active generation routes.
     pub active_generations: Vec<ModuleGeneration>,
     /// Snapshot state fence.
@@ -731,10 +760,28 @@ pub struct KernelAuthoritySnapshot {
 }
 
 impl KernelAuthoritySnapshot {
-    /// Validates the snapshot's identity and all generation records.
+    /// Validates the snapshot's identity, all generation records, and the
+    /// coherence of the aggregate.
+    ///
+    /// I6.10 "Kernel authority projection" lists the State Fence and the
+    /// Authority Epoch in the same compiled projection, so a snapshot whose
+    /// epoch and fence disagree is not a projection at all. The reconciliation
+    /// is exact tuple equality ([`EpochId::is_same_authority`]):
+    /// [`StateFence::is_compatible_with`] admits one-way revision wildcards and
+    /// is deliberately not used as an authority equality test, and
+    /// `is_same_authority` keeps two lineages at the same sequence unrelated.
     pub fn validate(&self) -> Result<(), RuntimeContractError> {
         text(&self.snapshot_id, "snapshot_id")?;
         self.state_fence.validate()?;
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
+            return Err(RuntimeContractError::InvalidField {
+                field: "authority_epoch",
+                reason: "snapshot epoch must equal its embedded state fence epoch tuple",
+            });
+        }
         for generation in &self.active_generations {
             generation.validate()?;
             if generation.state != ModuleGenerationState::Active {

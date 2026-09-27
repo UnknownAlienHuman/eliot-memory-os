@@ -431,14 +431,16 @@ impl KernelComposition {
     /// authenticated daemon generation and epoch. An empty, stale, unrelated,
     /// or unreadable projection remains explicitly Preparing.
     ///
-    /// A durable `GenerationCutoverRecord` carries only a bare epoch sequence,
-    /// so it can never establish the lineage of the presented
-    /// `EpochId`. The Kernel's own route table is the lineage-bearing owner of
-    /// a cutover, so it gates first: the record may only corroborate a cutover
-    /// for the exact `(lineage_id, sequence)` tuple the route table currently
-    /// holds. Two lineages at the same sequence are unrelated, and a record
-    /// from a superseded lineage stays historical instead of completing a
-    /// restore that minted a new one.
+    /// A durable `GenerationCutoverRecord` carries the complete
+    /// `(lineage_id, sequence)` tuple, and it is still only a corroborating
+    /// record: the Kernel's own route table is the lineage-bearing owner of a
+    /// cutover, so it gates first. The record may then corroborate a cutover
+    /// only for the exact tuple the route table currently holds. A larger
+    /// same-lineage sequence is a different tuple and is not authority; two
+    /// lineages at the same sequence are unrelated; and a record from a
+    /// superseded lineage stays historical instead of completing a restore
+    /// that minted a new one. A row written before the typed migration no
+    /// longer decodes, so it can never reach this read at all.
     ///
     /// The state is read FROM the matched cutover record itself and is never
     /// inferred from the process state or the generation state. The newest
@@ -480,7 +482,7 @@ impl KernelComposition {
                 let record = snapshot.record();
                 record.route_scope == RUNTIME_HEALTH_ROUTE_SCOPE
                     && record.new_generation == generation
-                    && record.new_epoch.value() == authority_epoch.sequence.get()
+                    && record.new_epoch.is_same_authority(authority_epoch)
             })
             .max_by_key(|snapshot| snapshot.operation_order())
         {

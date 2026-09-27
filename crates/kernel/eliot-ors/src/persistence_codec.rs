@@ -630,6 +630,17 @@ impl PersistedValue for ReservationRecord {
     }
 }
 
+/// The persisted fence must carry the cutover record's exact typed epoch
+/// tuple, so a row whose input epoch is a bare sequence, or whose lineage
+/// disagrees with the record, is refused on read-back rather than being
+/// returned as current authority.
+fn fence_carries_cutover_epoch(
+    state_fence: &crate::model::StateFenceSnapshot,
+    old_epoch: &eliot_contracts::EpochId,
+) -> bool {
+    state_fence.validate_against_epoch(old_epoch).is_ok()
+}
+
 impl PersistedValue for DurableOperationalRecord {
     const RECORD_TYPE: &'static str = "operational_record";
 
@@ -686,7 +697,7 @@ impl PersistedValue for DurableOperationalRecord {
                 OperationalKind::GenerationTransition | OperationalKind::GenerationCutover
             ) || self.input.record_id != expected_record_id
                 || self.input.subject_id != expected_subject
-                || self.input.authority_epoch.current.epoch != record.old_epoch.value()
+                || !fence_carries_cutover_epoch(&self.input.state_fence, &record.old_epoch)
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: Self::RECORD_TYPE,
