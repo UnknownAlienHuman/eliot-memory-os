@@ -442,9 +442,6 @@ pub fn parse_task_controller_submit_outcome(
 pub fn parse_local_read_claimed_pair(
     value: &serde_json::Value,
 ) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
-    // #740: receipt span. Records pair presence/absence by identity; the
-    // tool payload value never enters the sink.
-    let _span = tracing::info_span!("eliotd.request_receipt").entered();
     let pair = value
         .get("pair")
         .ok_or_else(|| "Kernel local_read_claim answer omits the pair".to_owned())?;
@@ -582,9 +579,6 @@ pub enum ObserveDeferOutcome {
 pub fn parse_observe_claimed_pair(
     value: &serde_json::Value,
 ) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
-    // #740: receipt span. Records pair presence/absence by identity; the
-    // tool payload value never enters the sink.
-    let _span = tracing::info_span!("eliotd.request_receipt").entered();
     let pair = value
         .get("pair")
         .ok_or_else(|| "Kernel semantic_observe_claim answer omits the pair".to_owned())?;
@@ -1585,6 +1579,13 @@ impl DaemonKernelClient {
                 "Kernel local_read_claim returned a non-query pair".to_owned(),
             ));
         }
+        if let Some((envelope, _, attempt)) = pair.as_ref() {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                envelope.identity.request_id.as_str(),
+                &attempt.operation_id,
+            )
+            .emit();
+        }
         Ok(pair)
     }
 
@@ -1612,6 +1613,13 @@ impl DaemonKernelClient {
             return Err(super::DaemonError::Kernel(
                 "Kernel campaign_packet_claim returned a non-packet pair".to_owned(),
             ));
+        }
+        if let Some((envelope, _, attempt)) = pair.as_ref() {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                envelope.identity.request_id.as_str(),
+                &attempt.operation_id,
+            )
+            .emit();
         }
         Ok(pair)
     }
@@ -1680,7 +1688,15 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        parse_observe_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+        let pair = parse_observe_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if let Some((envelope, _, attempt)) = pair.as_ref() {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                envelope.identity.request_id.as_str(),
+                &attempt.operation_id,
+            )
+            .emit();
+        }
+        Ok(pair)
     }
 
     /// Submits one daemon-produced observe result body for its waiting host

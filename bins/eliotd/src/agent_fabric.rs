@@ -2629,6 +2629,10 @@ impl AgentFabric {
         let outcome = self.require_finish_checked(attempt_id);
         if let Err(error) = &outcome {
             let (reason, owner) = crate::diagnostics::fabric_rejection_of(error);
+            let _ = crate::diagnostics::emit_finish_evaluation(
+                attempt_id.as_str(),
+                crate::diagnostics::strict_finish_completed(false),
+            );
             let _ = crate::diagnostics::emit_finish_refusal(attempt_id.as_str(), reason, owner);
         }
         outcome
