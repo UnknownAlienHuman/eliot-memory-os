@@ -23,6 +23,11 @@
 //! - Discovery outputs candidate (unverified) profiles only; exact
 //!   active-fingerprint production observation is required before claims
 //!   become verified.
+//! - Production observation is never a caller-asserted verdict:
+//!   [`IntegrationCoverageProfile::verify`] drives the
+//!   [`LiveCoverageObservation`] owner and derives the observation from that
+//!   owner's recorded [`LiveCoverageReadback`], so the active fingerprint
+//!   compared here is the value the owner recorded for this exact operation.
 
 #![forbid(unsafe_code)]
 
@@ -39,8 +44,12 @@ pub enum CoverageError {
     InvalidField(&'static str),
     #[error("profile fingerprint does not match the active fingerprint")]
     FingerprintMismatch,
-    #[error("verified claims require exact active-fingerprint production observation")]
-    ProductionObservationRequired,
+    #[error("live readback is unavailable: {0}")]
+    LiveReadbackUnavailable(&'static str),
+    #[error("live readback is missing, partial, or unreadable")]
+    LiveReadbackIncomplete,
+    #[error("live readback does not observe the pre-action event claimed as enforced: {0:?}")]
+    PreActionNotReadBack(LogicalEvent),
     #[error("candidate profile is not verified for production claims")]
     CandidateNotVerified,
     #[error("duplicate capability: {0}")]
@@ -168,11 +177,162 @@ impl EventCoverage {
     }
 }
 
+/// One live dispatch observation of one logical event, recorded by the owner
+/// that read it back from the live runtime.
+///
+/// [`DispatchOrdering::Unknown`] is not an observation: an event the owner
+/// could not place before or after dispatch is missing, and
+/// [`LiveEventReadback::observed`] refuses it so it can never be recorded.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LiveEventReadback {
+    /// The logical event this observation belongs to.
+    pub event: LogicalEvent,
+    /// Pre/post dispatch ordering the live runtime actually produced.
+    pub ordering: DispatchOrdering,
+    /// Nonsecret readback source that produced this observation.
+    pub source: String,
+}
+
+impl LiveEventReadback {
+    /// Records one observed dispatch ordering for one logical event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoverageError::InvalidField`] when the readback source is
+    /// empty or carries control characters, and
+    /// [`CoverageError::LiveReadbackIncomplete`] when the ordering is
+    /// [`DispatchOrdering::Unknown`].
+    pub fn observed(
+        event: LogicalEvent,
+        ordering: DispatchOrdering,
+        source: impl Into<String>,
+    ) -> Result<Self, CoverageError> {
+        let source = source.into();
+        validate_text(&source, "readback.event.source")?;
+        if ordering == DispatchOrdering::Unknown {
+            return Err(CoverageError::LiveReadbackIncomplete);
+        }
+        Ok(Self {
+            event,
+            ordering,
+            source,
+        })
+    }
+}
+
+/// The recorded result of one live readback, produced by the owner that
+/// performed it.
+///
+/// The fields are private, so an observation cannot be assembled by a bridge,
+/// model, configuration file, or cached record: only the owner's own
+/// [`Self::recorded`] call or deserialization of owner-produced bytes creates
+/// one, and [`Self::validate`] runs inside
+/// [`IntegrationCoverageProfile::verify`] so a readback that crossed a
+/// boundary cannot skip the complete-event requirement either.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LiveCoverageReadback {
+    owner: String,
+    active_fingerprint: String,
+    events: Vec<LiveEventReadback>,
+}
+
+impl LiveCoverageReadback {
+    /// Records the owner's live readback for the exact active
+    /// runtime/adapter fingerprint the owner observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoverageError::InvalidField`] for an empty owner,
+    /// fingerprint, source, or a duplicate event, and
+    /// [`CoverageError::LiveReadbackIncomplete`] when a recorded ordering is
+    /// [`DispatchOrdering::Unknown`] or any of the [`ALL_EVENTS`] is missing.
+    /// A partial readback is refused, never truncated to an observation.
+    pub fn recorded(
+        owner: impl Into<String>,
+        active_fingerprint: impl Into<String>,
+        events: impl IntoIterator<Item = LiveEventReadback>,
+    ) -> Result<Self, CoverageError> {
+        let readback = Self {
+            owner: owner.into(),
+            active_fingerprint: active_fingerprint.into(),
+            events: events.into_iter().collect(),
+        };
+        readback.validate()?;
+        Ok(readback)
+    }
+
+    /// Returns the identity of the owner that performed this readback.
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// Returns the active runtime/adapter fingerprint this owner recorded for
+    /// this readback.
+    #[must_use]
+    pub fn active_fingerprint(&self) -> &str {
+        &self.active_fingerprint
+    }
+
+    /// Returns the ordering this owner observed for one logical event.
+    #[must_use]
+    pub fn ordering(&self, event: LogicalEvent) -> Option<DispatchOrdering> {
+        self.events
+            .iter()
+            .find(|readback| readback.event == event)
+            .map(|readback| readback.ordering)
+    }
+
+    /// Validates the owner's identity, the recorded active fingerprint, and
+    /// the complete, duplicate-free [`ALL_EVENTS`] observation set.
+    pub fn validate(&self) -> Result<(), CoverageError> {
+        validate_text(&self.owner, "readback.owner")?;
+        validate_text(&self.active_fingerprint, "readback.active_fingerprint")?;
+        let mut seen = BTreeSet::new();
+        for event in &self.events {
+            validate_text(&event.source, "readback.event.source")?;
+            if event.ordering == DispatchOrdering::Unknown {
+                return Err(CoverageError::LiveReadbackIncomplete);
+            }
+            if !seen.insert(event.event) {
+                return Err(CoverageError::InvalidField("readback.events.duplicate"));
+            }
+        }
+        for required in ALL_EVENTS {
+            if !seen.contains(&required) {
+                return Err(CoverageError::LiveReadbackIncomplete);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The owner that actually performs a live integration readback.
+///
+/// [`IntegrationCoverageProfile::verify`] drives this owner instead of
+/// accepting an observation verdict: the production-observation fact is
+/// derived from the owner's recorded [`LiveCoverageReadback`], never supplied
+/// by the caller asking for verification.
+pub trait LiveCoverageObservation {
+    /// Performs one live readback for the exact active runtime/adapter
+    /// fingerprint this owner is bound to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoverageError::LiveReadbackUnavailable`] when the owner
+    /// cannot read the live path at all, and
+    /// [`CoverageError::LiveReadbackIncomplete`] when what it read is partial
+    /// or unreadable. Neither outcome is an observation.
+    fn observe_live_coverage(&self) -> Result<LiveCoverageReadback, CoverageError>;
+}
+
 /// Runtime coverage for one exact host/adapter fingerprint.
 ///
 /// A profile built by discovery is a candidate (`verified == false`). Only
-/// [`Self::verify`] against the exact active fingerprint with production
-/// observation promotes it to verified.
+/// [`Self::verify`], driving the [`LiveCoverageObservation`] owner that
+/// performed the live readback, promotes it to verified.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IntegrationCoverageProfile {
@@ -208,21 +368,40 @@ impl IntegrationCoverageProfile {
         Ok(profile)
     }
 
-    /// Promotes a candidate to verified after exact active-fingerprint
-    /// production observation. Discovery output alone is never sufficient.
-    /// The candidate is re-validated so a mutated profile cannot be
-    /// promoted with contradictory or missing evidence.
-    pub fn verify(
-        mut self,
-        active_fingerprint: &str,
-        production_observed: bool,
-    ) -> Result<Self, CoverageError> {
+    /// Promotes a candidate to verified from the owner's recorded live
+    /// readback.
+    ///
+    /// The caller cannot assert the observation: it supplies the owner that
+    /// performed it, and both the production-observation fact and the active
+    /// fingerprint are taken from that owner's recorded result. A profile
+    /// bound to another runtime/adapter therefore cannot be promoted by naming
+    /// the active one. A missing, unreadable, or partial readback is refused
+    /// and never defaults to observed. The candidate is re-validated so a
+    /// mutated profile cannot be promoted with contradictory or missing
+    /// evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate is invalid, when the owner cannot
+    /// read the live path, when the owner's recorded active fingerprint is not
+    /// this profile's fingerprint, or when the readback does not observe a
+    /// pre-dispatch event for a disposition this profile claims as `ENFORCED`.
+    pub fn verify(mut self, owner: &dyn LiveCoverageObservation) -> Result<Self, CoverageError> {
         self.validate()?;
-        if self.fingerprint != active_fingerprint {
+        let readback = owner.observe_live_coverage()?;
+        readback.validate()?;
+        if readback.active_fingerprint() != self.fingerprint {
             return Err(CoverageError::FingerprintMismatch);
         }
-        if !production_observed {
-            return Err(CoverageError::ProductionObservationRequired);
+        for event in &self.events {
+            if event.disposition != EventDisposition::Enforced {
+                continue;
+            }
+            match readback.ordering(event.event) {
+                Some(DispatchOrdering::PreDispatch) => {}
+                Some(_) => return Err(CoverageError::PreActionNotReadBack(event.event)),
+                None => return Err(CoverageError::LiveReadbackIncomplete),
+            }
         }
         self.verified = true;
         Ok(self)

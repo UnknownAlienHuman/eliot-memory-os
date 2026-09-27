@@ -230,12 +230,45 @@ mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_integration_coverage::{
-        ALL_EVENTS, DispatchOrdering, EventCoverage, EventDisposition, GovernorCoverageDerivation,
-        IntegrationCoverageProfile, TraceFreshness, WatchdogEvidence,
+        ALL_EVENTS, CoverageError, DispatchOrdering, EventCoverage, EventDisposition,
+        GovernorCoverageDerivation, IntegrationCoverageProfile, LiveCoverageObservation,
+        LiveCoverageReadback, LiveEventReadback, TraceFreshness, WatchdogEvidence,
     };
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// Owner whose recorded live readback — not a caller Boolean — establishes
+    /// production observation for the profile under verification.
+    struct StaticLiveCoverageOwner {
+        readback: LiveCoverageReadback,
+    }
+
+    impl StaticLiveCoverageOwner {
+        fn pre_dispatch(fingerprint: &str) -> Self {
+            Self {
+                readback: LiveCoverageReadback::recorded(
+                    "test-owner",
+                    fingerprint,
+                    ALL_EVENTS.iter().map(|event| {
+                        LiveEventReadback::observed(
+                            *event,
+                            DispatchOrdering::PreDispatch,
+                            "test-source",
+                        )
+                        .expect("readback")
+                    }),
+                )
+                .expect("recorded readback"),
+            }
+        }
+    }
+
+    impl LiveCoverageObservation for StaticLiveCoverageOwner {
+        fn observe_live_coverage(&self) -> Result<LiveCoverageReadback, CoverageError> {
+            Ok(self.readback.clone())
+        }
+    }
 
     fn test_fence() -> StateFence {
         StateFence::new(
@@ -296,7 +329,7 @@ mod tests {
             Vec::new(),
         )
         .expect("candidate")
-        .verify("fingerprint-1", true)
+        .verify(&StaticLiveCoverageOwner::pre_dispatch("fingerprint-1"))
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         let profile = derivation
@@ -343,7 +376,7 @@ mod tests {
             Vec::new(),
         )
         .expect("candidate")
-        .verify("fingerprint-2", true)
+        .verify(&StaticLiveCoverageOwner::pre_dispatch("fingerprint-2"))
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         derivation
@@ -377,7 +410,7 @@ mod tests {
             Vec::new(),
         )
         .expect("candidate")
-        .verify("fingerprint-3", true)
+        .verify(&StaticLiveCoverageOwner::pre_dispatch("fingerprint-3"))
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         derivation
@@ -412,7 +445,7 @@ mod tests {
             vec!["blind-interval-9".to_owned()],
         )
         .expect("candidate")
-        .verify("fingerprint-4", true)
+        .verify(&StaticLiveCoverageOwner::pre_dispatch("fingerprint-4"))
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         derivation

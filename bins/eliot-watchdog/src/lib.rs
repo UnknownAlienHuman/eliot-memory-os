@@ -60,6 +60,7 @@ const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 mod backup_control;
 mod diagnostics;
 mod heartbeat_transport;
+pub mod hook_chain;
 mod host_identity_observation;
 mod runtime_manifest_selection;
 mod scm_launch;
@@ -77,6 +78,7 @@ mod watchdog_spool;
 pub use diagnostics::install_subscriber;
 
 pub use eliot_watchdog_core::{WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch};
+pub use hook_chain::{ChainHealth, IntegrationChain, LiveHookChainSource};
 #[cfg(test)]
 use host_identity_observation::classify_host_error;
 use host_identity_observation::read_host_registration_runtime;

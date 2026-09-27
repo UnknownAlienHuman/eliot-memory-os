@@ -448,15 +448,48 @@ mod tests {
     };
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_integration_coverage::{
-        ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
-        GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent, TraceFreshness,
-        WatchdogEvidence,
+        ALL_EVENTS, CoverageError, DispatchOrdering, EventCompleteness, EventCoverage,
+        EventDisposition, GovernorCoverageDerivation, IntegrationCoverageProfile,
+        LiveCoverageObservation, LiveCoverageReadback, LiveEventReadback, LogicalEvent,
+        TraceFreshness, WatchdogEvidence,
     };
     use eliot_reactive_context_plan::{BridgeAdmissionDelivery, MAX_BRIDGE_RELATIONS};
     use eliot_receipts::WorkScopeId;
     use std::num::NonZeroU64;
 
     use super::super::{ConnectionId, Profile};
+
+    /// Owner whose recorded live readback, not a caller Boolean, establishes
+    /// production observation for the profile under verification.
+    struct StaticLiveCoverageOwner {
+        readback: LiveCoverageReadback,
+    }
+
+    impl StaticLiveCoverageOwner {
+        fn pre_dispatch(fingerprint: &str) -> Self {
+            Self {
+                readback: LiveCoverageReadback::recorded(
+                    "test-owner",
+                    fingerprint,
+                    ALL_EVENTS.iter().map(|event| {
+                        LiveEventReadback::observed(
+                            *event,
+                            DispatchOrdering::PreDispatch,
+                            "test-source",
+                        )
+                        .expect("readback")
+                    }),
+                )
+                .expect("recorded readback"),
+            }
+        }
+    }
+
+    impl LiveCoverageObservation for StaticLiveCoverageOwner {
+        fn observe_live_coverage(&self) -> Result<LiveCoverageReadback, CoverageError> {
+            Ok(self.readback.clone())
+        }
+    }
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const TEST_SESSION: &str = "session-transport-1";
@@ -621,7 +654,7 @@ mod tests {
             Vec::new(),
         )
         .expect("candidate")
-        .verify("fingerprint-1", true)
+        .verify(&StaticLiveCoverageOwner::pre_dispatch("fingerprint-1"))
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         derivation

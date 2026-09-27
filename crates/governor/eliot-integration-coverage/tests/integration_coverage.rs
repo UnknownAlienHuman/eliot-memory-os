@@ -9,14 +9,43 @@
 
 use eliot_integration_coverage::{
     ALL_EVENTS, CoverageError, DispatchOrdering, EventCompleteness, EventCoverage,
-    EventDisposition, GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent,
-    TraceFreshness, WatchdogEvidence,
+    EventDisposition, GovernorCoverageDerivation, IntegrationCoverageProfile,
+    LiveCoverageObservation, LiveCoverageReadback, LiveEventReadback, LogicalEvent, TraceFreshness,
+    WatchdogEvidence,
 };
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
     match result {
         Ok(value) => value,
         Err(error) => panic!("expected Ok, got {error:?}"),
+    }
+}
+
+/// The observing owner: the readback is the owner's recorded result, not a
+/// verdict any caller may pass to `verify`.
+struct RecordingOwner {
+    readback: Result<LiveCoverageReadback, CoverageError>,
+}
+
+impl LiveCoverageObservation for RecordingOwner {
+    fn observe_live_coverage(&self) -> Result<LiveCoverageReadback, CoverageError> {
+        self.readback.clone()
+    }
+}
+
+fn pre_dispatch_owner(fingerprint: &str) -> RecordingOwner {
+    RecordingOwner {
+        readback: must(LiveCoverageReadback::recorded(
+            "watchdog:hook-chain",
+            fingerprint,
+            ALL_EVENTS.iter().copied().map(|event| {
+                must(LiveEventReadback::observed(
+                    event,
+                    DispatchOrdering::PreDispatch,
+                    "host-event-envelope",
+                ))
+            }),
+        )),
     }
 }
 
@@ -69,7 +98,7 @@ fn observed_lifecycle_without_enforcement_denies_enforcement_ops() {
         Err(CoverageError::CandidateNotVerified)
     );
     // Exact active-fingerprint production observation verifies the profile.
-    let coverage = must(candidate.verify("host:adapter:fingerprint-a", true));
+    let coverage = must(candidate.verify(&pre_dispatch_owner("host:adapter:fingerprint-a")));
     assert_eq!(
         coverage.disposition(LogicalEvent::PreToolUse),
         Some(EventDisposition::Observed)
@@ -194,7 +223,11 @@ fn invalid_coverage_is_rejected_fail_closed() {
         Vec::new(),
     ));
     profile.events.pop();
-    assert!(profile.verify("host:adapter:fingerprint-a", true).is_err());
+    assert!(
+        profile
+            .verify(&pre_dispatch_owner("host:adapter:fingerprint-a"))
+            .is_err()
+    );
 }
 
 #[test]
@@ -217,7 +250,7 @@ fn coverage_loss_emits_new_revision_and_rejects_prior_capability() {
             "host-event-envelope",
             Vec::new(),
         ))
-        .verify("host:adapter:fingerprint-a", true),
+        .verify(&pre_dispatch_owner("host:adapter:fingerprint-a")),
     );
     let mut governor = GovernorCoverageDerivation::new();
     let before = must(governor.derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh));
@@ -248,7 +281,7 @@ fn coverage_loss_emits_new_revision_and_rejects_prior_capability() {
             "host-event-envelope",
             vec!["blind interval 12:00-12:07".to_owned()],
         ))
-        .verify("host:adapter:fingerprint-a", true),
+        .verify(&pre_dispatch_owner("host:adapter:fingerprint-a")),
     );
     let after = must(governor.derive(&degraded, &fresh_watchdog(), TraceFreshness::Fresh));
     assert!(after.revision > before.revision);

@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     HostObservationState, SERVICE_NAME, SpoolError, WatchdogRuntimeReadback, WatchdogRuntimeState,
-    WatchdogSelfAdmissionError,
+    WatchdogSelfAdmissionError, hook_chain::ChainHealth,
 };
 
 /// Target for every event emitted by this facade.
@@ -417,6 +417,39 @@ pub fn observe_publication(observation: PublicationObservation, detail: &str) {
         detail_bytes = bounded.original_bytes(),
         detail_truncated = bounded.truncated(),
         "watchdog publication observed"
+    );
+}
+
+/// Records one installation-chain health observation.
+///
+/// Observation only: the verdict was already derived by the chain owner from the
+/// facts its own owners recorded, never from a matching configuration file or a
+/// caller-supplied hash. No recorded path, digest, generation, or process value
+/// is passed here (I15.4), so `installed_unobserved` stays a distinct state
+/// instead of collapsing into `observed` or a version mismatch.
+pub fn observe_integration_chain(health: ChainHealth) {
+    tracing::debug!(
+        target: WATCHDOG_DIAGNOSTICS_TARGET,
+        event = "watchdog.integration_chain_observed",
+        observation = health.as_str(),
+        "watchdog installation chain observed"
+    );
+}
+
+/// Records that one installation-chain owner could not be read at all.
+///
+/// The typed owner failure is preserved on the event so a registry, approval, or
+/// receipt readback stays distinguishable instead of collapsing into a single
+/// "unavailable" verdict.
+pub fn observe_integration_chain_owner_unavailable(owner: &str, error: &dyn std::error::Error) {
+    let bounded = bound_field(owner);
+    tracing::debug!(
+        target: WATCHDOG_DIAGNOSTICS_TARGET,
+        event = "watchdog.integration_chain_unavailable",
+        observation = "unavailable",
+        owner = bounded.text(),
+        error = error.to_string(),
+        "watchdog installation chain owner readback unavailable"
     );
 }
 

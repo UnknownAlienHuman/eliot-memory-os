@@ -27,9 +27,9 @@ use eliot_platform_windows::WindowsPlatform;
 use eliot_runtime::ShutdownDisposition;
 use eliot_watchdog::{
     FileWatchdogAdmission, GovernorIntentAdmissionSource, HeartbeatTransport,
-    INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor, LiveHostObservationSource,
-    SERVICE_NAME, SpoolError, WatchdogAdmissionSource, WatchdogComposition, WatchdogConfig,
-    WatchdogReadiness, inspect_approved_host_registration,
+    INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor, LiveHookChainSource,
+    LiveHostObservationSource, SERVICE_NAME, SpoolError, WatchdogAdmissionSource,
+    WatchdogComposition, WatchdogConfig, WatchdogReadiness, inspect_approved_host_registration,
 };
 
 #[cfg(windows)]
@@ -66,6 +66,11 @@ pub(super) fn run_watchdog(
         bootstrap.transaction_plan_generation(),
         WatchdogConfig::default().tick_interval,
     ));
+    // The installation-chain observer is bound to the installer-approved
+    // bootstrap this process's own SCM registration delivered, so it reads only
+    // the registered installation scope and cannot be pointed at another one.
+    // It reads and records only; it mutates nothing and claims no coverage.
+    let integration_coverage = LiveHookChainSource::new(bootstrap.clone());
     // The lease is issued by the Host/Kernel contour.  There is deliberately
     // no genesis/default lease in this process.  A stale or missing lease
     // starts a gap-only sensor so the Watchdog can remain alive and record a
@@ -156,13 +161,17 @@ pub(super) fn run_watchdog(
         admission_source,
         sensor.clone(),
     ));
-    let composition = WatchdogComposition::start_with_shutdown_and_host_and_heartbeat(
+    // The supervision tick reads the installation chain on every pass and
+    // records the bounded health observation; it never turns that observation
+    // into authority, a restart decision, or readiness.
+    let composition = WatchdogComposition::start_with_integration_coverage_and_heartbeat(
         WatchdogConfig::default(),
         admission_source,
         sensor,
         Arc::new(LiveHostObservationSource::from_binding(&binding)),
         stop_signal,
         Some(heartbeat),
+        Some(integration_coverage),
     )
     .map_err(|error| error.to_string())?;
     #[cfg(windows)]

@@ -3461,6 +3461,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-integration-coverage",
  "eliot-notify-core",
  "eliot-ors",
  "eliot-platform",

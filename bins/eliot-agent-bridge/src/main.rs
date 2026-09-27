@@ -5170,9 +5170,10 @@ mod tests {
         };
         use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
         use eliot_integration_coverage::{
-            ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
-            GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent, TraceFreshness,
-            WatchdogEvidence,
+            ALL_EVENTS, CoverageError, DispatchOrdering, EventCompleteness, EventCoverage,
+            EventDisposition, GovernorCoverageDerivation, IntegrationCoverageProfile,
+            LiveCoverageObservation, LiveCoverageReadback, LiveEventReadback, LogicalEvent,
+            TraceFreshness, WatchdogEvidence,
         };
         use eliot_reactive_context_plan::{
             BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionInstruction,
@@ -5182,6 +5183,39 @@ mod tests {
 
         const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
         const TEST_SESSION: &str = "session-consumer-1";
+
+        /// Owner whose recorded live readback — not a caller Boolean —
+        /// establishes production observation for the profile under
+        /// verification.
+        struct StaticLiveCoverageOwner {
+            readback: LiveCoverageReadback,
+        }
+
+        impl StaticLiveCoverageOwner {
+            fn pre_dispatch(fingerprint: &str) -> Self {
+                Self {
+                    readback: LiveCoverageReadback::recorded(
+                        "test-owner",
+                        fingerprint,
+                        ALL_EVENTS.iter().map(|event| {
+                            LiveEventReadback::observed(
+                                *event,
+                                DispatchOrdering::PreDispatch,
+                                "test-source",
+                            )
+                            .expect("readback")
+                        }),
+                    )
+                    .expect("recorded readback"),
+                }
+            }
+        }
+
+        impl LiveCoverageObservation for StaticLiveCoverageOwner {
+            fn observe_live_coverage(&self) -> Result<LiveCoverageReadback, CoverageError> {
+                Ok(self.readback.clone())
+            }
+        }
         const TEST_DIGEST: &str =
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -5418,7 +5452,7 @@ mod tests {
                 Vec::new(),
             )
             .expect("candidate")
-            .verify("fingerprint-1", true)
+            .verify(&StaticLiveCoverageOwner::pre_dispatch("fingerprint-1"))
             .expect("verified");
             let mut derivation = GovernorCoverageDerivation::new();
             derivation
