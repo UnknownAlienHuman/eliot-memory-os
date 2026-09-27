@@ -1024,6 +1024,40 @@ impl CriticalAttention {
         Ok(())
     }
 
+    /// Creates a durable obligation in `Active` state with pending delivery.
+    ///
+    /// Creation is the first append-only transition: the record starts at
+    /// revision 1 carrying the caller's owner, scope, evidence, review
+    /// condition, escalation route and State Fence. No later transition
+    /// erases the obligation or its evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        attention_id: AttentionId,
+        obligation: String,
+        affected_scope_actions: Vec<String>,
+        evidence_refs: Vec<ArtifactId>,
+        owner: OwnerRef,
+        review_condition: String,
+        escalation_route: String,
+        state_fence: StateFence,
+    ) -> Result<Self, ProblemError> {
+        let value = Self {
+            attention_id,
+            obligation,
+            affected_scope_actions,
+            evidence_refs,
+            owner,
+            delivery_state: DeliveryState::Pending,
+            state: AttentionState::Active,
+            review_condition,
+            escalation_route,
+            state_fence,
+            revision: 1,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     /// Acknowledges receipt while retaining an active obligation.
     pub fn acknowledge(
         &mut self,
@@ -1106,6 +1140,78 @@ impl CriticalAttention {
         self.owner = owner;
         self.state_fence = new_fence;
         self.delivery_state = DeliveryState::Pending;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records an authorized waiver: only the current owner principal may
+    /// waive, and the obligation with its evidence is retained as terminal.
+    pub fn waive(
+        &mut self,
+        expected_fence: &StateFence,
+        principal: &str,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        owner_name(principal)?;
+        if principal != self.owner.principal {
+            return Err(ProblemError::OwnerMismatch);
+        }
+        match self.state {
+            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
+                return Err(ProblemError::ImmutableState);
+            }
+            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        }
+        self.state = AttentionState::Waived;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records supersession: the obligation is retained with its evidence and
+    /// marked as recorded supersession rather than erased.
+    pub fn supersede(
+        &mut self,
+        expected_fence: &StateFence,
+        principal: &str,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        owner_name(principal)?;
+        if principal != self.owner.principal {
+            return Err(ProblemError::OwnerMismatch);
+        }
+        match self.state {
+            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
+                return Err(ProblemError::ImmutableState);
+            }
+            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        }
+        self.state = AttentionState::Superseded;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
+    /// Applies review-condition expiry: the obligation escalates via the
+    /// recorded route to a new owner and fence, retaining the prior obligation
+    /// and evidence. The record remains inspectable; expiry never deletes it.
+    pub fn expire(
+        &mut self,
+        expected_fence: &StateFence,
+        owner: OwnerRef,
+        new_fence: StateFence,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        owner.validate()?;
+        fence(&new_fence)?;
+        match self.state {
+            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
+                return Err(ProblemError::ImmutableState);
+            }
+            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        }
+        self.owner = owner;
+        self.state_fence = new_fence;
+        self.delivery_state = DeliveryState::Pending;
+        self.state = AttentionState::Escalated;
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
