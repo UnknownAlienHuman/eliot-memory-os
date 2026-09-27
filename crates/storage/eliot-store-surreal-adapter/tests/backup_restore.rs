@@ -37,8 +37,8 @@ use eliot_store_api::{
     CanonicalRestoreBatch, DestinationClass, IsolatedDestination, IsolatedRestorePort,
     IsolationEvidence, MAX_RESTORE_MEMBERS, OperationIdentity, OrderingHeadExpectation,
     OrderingScopeId, ReconciliationOutcome, RequestMeta, RestoreValidationReceipt,
-    RevisionHeadExpectation, RevisionKey, SnapshotCompleteness, SnapshotSourceIdentity, StoreError,
-    StoreMutationDisposition, reconcile_same_operation,
+    RevisionHeadExpectation, RevisionKey, SnapshotCompleteness, SnapshotMember, SnapshotMemberType,
+    SnapshotSourceIdentity, StoreError, StoreMutationDisposition, reconcile_same_operation,
 };
 use eliot_store_surreal_adapter::backup_restore::{
     MAX_ADMISSION_AGE_MS, MAX_RESTORE_BATCH_MEMBERS, MAX_RESTORE_BYTES, MAX_RESTORE_DURATION_MS,
@@ -114,6 +114,35 @@ fn valid_operation(id: &str, hash: &str) -> OperationIdentity {
     }
 }
 
+/// Builds the closed canonical member list for a declared member count.
+///
+/// One record per declared member; the last one is a `Reference` closing over
+/// the first, so a valid batch carries a real reference closure rather than a
+/// member set with no references in it at all.
+fn members_for(member_count: u64) -> Vec<SnapshotMember> {
+    (0..member_count)
+        .map(|index| SnapshotMember {
+            member_id: format!("member-952-{index}"),
+            member_type: if index + 1 == member_count && member_count > 1 {
+                SnapshotMemberType::Reference
+            } else {
+                SnapshotMemberType::Record
+            },
+            content_digest: hex(char::from_digit(
+                u32::try_from(index).expect("member index") + 1,
+                16,
+            )
+            .expect("hex digit")),
+            residency: BlobResidency {
+                domain: BlobResidencyDomain::InlineCanonical,
+                residency_digest: hex('d'),
+                byte_count: 8,
+            },
+            reference_digest: (index + 1 == member_count && member_count > 1).then(|| hex('1')),
+        })
+        .collect()
+}
+
 fn valid_batch() -> CanonicalRestoreBatch {
     CanonicalRestoreBatch {
         contract_version: CONTRACT_VERSION,
@@ -133,6 +162,7 @@ fn valid_batch() -> CanonicalRestoreBatch {
             expected_sequence: 5,
             state_fence: fence(),
         }],
+        members: members_for(2),
         member_count: 2,
     }
 }
@@ -146,6 +176,7 @@ fn batch_for(
     let mut batch = valid_batch();
     batch.operation = valid_operation(operation_id, request_hash);
     batch.archive_member_digest = archive_digest.to_owned();
+    batch.members = members_for(member_count);
     batch.member_count = member_count;
     batch
 }
@@ -1457,6 +1488,7 @@ fn pinned_isolated_capture_restore_readback_with_cleanup() {
         let mut batch = valid_batch();
         batch.operation = valid_operation(&operation_id, &hex('a'));
         batch.archive_member_digest.clone_from(&archive_digest);
+        batch.members = members_for(member_count);
         batch.member_count = member_count;
         validate_restore_batch(
             &batch,

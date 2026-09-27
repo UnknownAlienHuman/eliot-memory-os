@@ -309,6 +309,7 @@ fn batch() -> CanonicalRestoreBatch {
             expected_sequence: 4,
             state_fence: fence(),
         }],
+        members: denominator().members,
         member_count: 3,
     }
 }
