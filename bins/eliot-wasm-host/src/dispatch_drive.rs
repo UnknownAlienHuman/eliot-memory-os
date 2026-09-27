@@ -37,6 +37,7 @@ use std::path::Path;
 use eliot_runtime_contracts::{HealthDimension, HealthVector};
 use eliot_security_contracts::PrivacyClass;
 use eliot_wasm_runtime::lifecycle::InFlightDisposition;
+use eliot_wasm_runtime::promotion_receipt::{ComponentContourEvidence, ComponentPromotionReceipt};
 use eliot_wasm_runtime::{
     ArtifactAccessLimits, CancellationPolicy, CapabilityId, EpochPolicy, ExecutionContour,
     InvocationDisposition, InvocationId, InvocationLimits, InvocationRequest, InvocationResult,
@@ -521,6 +522,12 @@ pub struct OwnerRecords {
     pub expected_effect_digest: Sha256Digest,
     /// Oracle state-delta digest.
     pub expected_state_delta_digest: Sha256Digest,
+    /// The owner-published component promotion receipt whose evidence decides
+    /// the four lifecycle verdicts bound into the promotion receipt digest
+    /// (issue #1919; I18.42). Promotion cannot be gated on a permanently
+    /// un-evaluated verdict quadruple, so the evidence travels with the
+    /// admitted owner records rather than being re-derived at the gate.
+    pub component_promotion: ComponentPromotionReceipt,
     /// Canonical live-authority-epoch JSON (derivation input, never
     /// interpreted here).
     pub authority_epoch_json: String,
@@ -627,6 +634,7 @@ pub fn assemble_owner_records(
         expected_result_digest: material.promotion.expected_result_digest.clone(),
         expected_effect_digest: material.promotion.expected_effect_digest.clone(),
         expected_state_delta_digest: material.promotion.expected_state_delta_digest.clone(),
+        component_promotion: material.promotion.component_promotion.clone(),
         authority_epoch_json: material.authority_epoch_json.clone(),
         grant_digest: material.grant.grant_digest.clone(),
         grant_fence_generation: material.grant.fence_generation,
@@ -833,6 +841,12 @@ mod tests {
                 expected_result_digest: "1".repeat(64),
                 expected_effect_digest: "2".repeat(64),
                 expected_state_delta_digest: "3".repeat(64),
+                component_promotion: ComponentPromotionReceipt {
+                    component_id: "component-1956".to_owned(),
+                    interface_digest: Sha256Digest::of_bytes(b"component-1956"),
+                    host_engine_compatibility: None,
+                    evidence: ComponentContourEvidence::SingleContour,
+                },
             },
             snapshot: ValidatedSnapshotInput {
                 service: "eliot-kernel".to_owned(),
