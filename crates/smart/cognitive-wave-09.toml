@@ -4,6 +4,9 @@ status = "PROTOTYPE_ASSIGNMENT_GATED"
 base_commit = "03b04bc57fd7b22c16f6366fa292b96a91034d5a"
 normative_pair = "ELIOT Architecture 4.5-draft + Implementation 0.29-draft; English edition 2026-08-28"
 pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+pair_key_receipt = "docs/normative-pair.toml"
+pair_key_status = "ISSUE_DECLARED_PAIR_SUPERSEDED_NOT_REPAIRED_HERE"
+pair_key_note = "Issue #259 declares the accepted pair key sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b and that text is preserved verbatim above as the issue's own authority statement. The repository's accepted authority is docs/normative-pair.toml, whose current pair_key is sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea under pair_key_algorithm sha256-domain-separated-v1. This catalogue is W2-owned and carries the W9 rows, so it records the divergence here instead of rewriting its own header; the repair stays with the catalogue owner named by the open row CC-W2-NORMATIVE-PAIR-KEY, and no W9 field contract depends on which of the two keys is current."
 purpose = "Freeze owner-neutral field-complete public contracts for W9 meta-quality and understanding cells 76-86 without implementation, admission, or runtime authority."
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
@@ -15,6 +18,7 @@ authority_rule = "No prototype owns canonical state, runtime scheduling, evaluat
 dependency_rule = "Assignment depends_on lists logical contract prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
 supersession_rule = "The stale cognitive-crates-prototypes-01 branch is not an assignment source."
 scope_rule = "Cells 76-86 are TO-BE-CREATED static assignments grounded in I12-21/I12-19/I07-25/I09-16/I16-23/I06-16/A00-07/A06-07/I12-34; orders 1-43 are never renumbered or reused."
+contract_placement_rule = "Issue #259 measured the four physical crates and found zero [[field_contract]], [[field_contract_index]], [[ownership]], [[crate_manifest]], [[validation_gate]], [[assignment]] and [[agent_brief]] tables in all four module.toml files: the wave tables existed only in this catalogue. Each field contract is therefore also written into the owning crate's own module.toml, where the implementation agent receives the manifest. The crate copy is the owner-located copy and this catalogue is the wave-level index of the same contract id; neither is a second owner, and the two are required to stay byte-identical on id, owner_crate, fields, denominator, denominator_rule, complete_rule, fence, omission_semantics and invariants. Every catalogue row that names a manifest points at the crate file that now carries the contract."
 disjointness_rule = "This catalogue does not modify bins/, 233 memory-curation/dreamer-cycle files, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, or generated indexes."
 
 [[stage]]
@@ -157,10 +161,16 @@ package_action = "create_prototype_crate"
 [assignment_output]
 required = ["implementation in declared scope", "package/module proof", "affected Edge proof", "named Product Pulse when applicable", "donor trace", "ContractChallenges", "merge/remove recommendation"]
 
+[[assignment_output_binding]]
+table = "the per-crate field contract written into the owning crate's own module.toml under Issue #259"
+owner_crate_copies = ["crates/smart/eliot-memory-quality/module.toml", "crates/smart/eliot-dreamer-memory-revision/module.toml", "crates/smart/eliot-cognitive-quality/module.toml", "crates/smart/eliot-understanding-assessment/module.toml"]
+rule = "Every implementation agent reads the frozen fields, denominator, denominator_rule, complete_rule, fence, omission_semantics and invariants from its own crate's module.toml, not from this catalogue. The crate copy and this catalogue's [[field_contract]] of the same id must agree; disagreement between them is itself a ContractChallenge."
+
 [[agent_brief]]
 order = 76
 crate = "eliot-memory-quality"
 functional_cell = "smart.memory.ecology"
+field_contract_ref = "crates/smart/eliot-memory-quality/module.toml::MemoryEcologyAssessment"
 objective = "Assess memory ecology per item and cluster from immutable owner-produced projections only; emit MemoryEcologyAssessment with exact denominator."
 write_scope = ["crates/smart/eliot-memory-quality/**"]
 inputs = ["immutable MemoryProjectionRecord read set by handle (CC-008)", "admitted task/continuity/safety projections by handle (CC-004)"]
@@ -175,6 +185,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 77
 crate = "eliot-memory-quality"
 functional_cell = "smart.memory.gravity"
+field_contract_ref = "crates/smart/eliot-memory-quality/module.toml::MemoryEcologyAssessment"
 objective = "Assess context-dominance/gravity and maintenance/storage/curation cost as observed influence-ladder position with exact denominator; never infer support from low use."
 write_scope = ["crates/smart/eliot-memory-quality/**"]
 inputs = ["immutable MemoryProjectionRecord read set by handle (CC-008)", "HarnessActivationReceipt candidates by handle"]
@@ -189,6 +200,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 78
 crate = "eliot-memory-quality"
 functional_cell = "smart.memory.lifecycle_economics"
+field_contract_ref = "crates/smart/eliot-memory-quality/module.toml::MemoryEcologyAssessment"
 objective = "Project whole-trajectory lifecycle economics and maintenance aggregates as candidate evidence with exact amortization horizon and exclusions."
 write_scope = ["crates/smart/eliot-memory-quality/**"]
 inputs = ["immutable curation/cost/attempt projections by handle"]
@@ -203,6 +215,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 79
 crate = "eliot-dreamer-memory-revision"
 functional_cell = "smart.dreamer.memory_revision"
+field_contract_ref = "crates/smart/eliot-dreamer-memory-revision/module.toml::NegativeMemoryExtinctionCandidate"
 objective = "Propose one advisory negative-memory extinction candidate narrowing activation/influence only; preserve original failure history verbatim."
 write_scope = ["crates/smart/eliot-dreamer-memory-revision/**"]
 inputs = ["immutable FailureObservation by handle (CC-FAILURE-OBSERVATION-SCHEMA)", "MemoryRevisionEvidence refs by handle", "admitted task/safety projections by handle (CC-004)"]
@@ -217,6 +230,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 80
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.skill.lifecycle"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
 objective = "Maintain one derived SkillLifecycleView per Skill revision from execution evidence; lifecycle changes remain reversible candidates."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable Skill execution evidence by handle", "HarnessActivationReceipt candidates by handle"]
@@ -231,6 +245,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 81
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.tool.surface"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
 objective = "Assess tool-surface fit from exact tool-definition versions, eligibility/activation/adherence checkpoints, and false-activation history; mark stale before material use on definition change."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable tool-definition versions by handle", "HarnessActivationReceipt candidates by handle"]
@@ -245,6 +260,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 82
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.dreamer.job_economics"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
 objective = "Project Dreamer job/family economics from durable job, route-usage, curation, and outcome receipts; promotion requires declared downstream utility exceeding full cost plus measured harms."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable Durable Job receipts by handle", "route-usage/curation/outcome receipts by handle"]
@@ -259,6 +275,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 83
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.self.quality_view"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
 objective = "Project one problem-oriented EliotSelfQualityView with counter-metrics and learning-bottleneck diagnosis; identify failing contours, never emit a global score."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt projections by handle", "product/runtime evidence by handle"]
@@ -273,6 +290,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 84
 crate = "eliot-cognitive-quality"
 functional_cell = "smart.self.intervention_candidate"
+field_contract_ref = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
 objective = "Propose one advisory SelfQualityInterventionReceipt with causal hypothesis, rivals, discriminator, authority refs, rollback, and terminal disposition; recurring same-hypothesis failure yields Mechanism Review."
 write_scope = ["crates/smart/eliot-cognitive-quality/**"]
 inputs = ["immutable Problem/ImprovementCandidate refs by handle", "applicable verifier/Product Pulse refs by handle"]
@@ -287,6 +305,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 85
 crate = "eliot-understanding-assessment"
 functional_cell = "smart.understanding.common_ground"
+field_contract_ref = "crates/smart/eliot-understanding-assessment/module.toml::UnderstandingAssessment"
 objective = "Check Common Ground as public causal inheritance survival across model/harness change; tacit competence requires requalification."
 write_scope = ["crates/smart/eliot-understanding-assessment/**"]
 inputs = ["immutable ActiveUnderstandingView by handle (contract_only)", "accepted-source projection by handle (CC-006)"]
@@ -301,6 +320,7 @@ evidence_execution_status = "NOT_EXECUTED"
 order = 86
 crate = "eliot-understanding-assessment"
 functional_cell = "smart.understanding.scoped_assessment"
+field_contract_ref = "crates/smart/eliot-understanding-assessment/module.toml::UnderstandingAssessment"
 objective = "Emit one ScopedUnderstandingAssessment per question/task family at one State Fence with rival-aware prediction-before-observation and applicable held-out discipline."
 write_scope = ["crates/smart/eliot-understanding-assessment/**"]
 inputs = ["immutable ActiveUnderstandingView by handle (contract_only)", "outcome/verifier evidence by handle"]
@@ -314,6 +334,7 @@ evidence_execution_status = "NOT_EXECUTED"
 [[field_contract]]
 id = "MemoryEcologyAssessment"
 owner_crate = "eliot-memory-quality"
+owner_manifest = "crates/smart/eliot-memory-quality/module.toml"
 family = "memory ecology and memory gravity"
 source_handles = ["I12-21", "I12-34"]
 status = "FROZEN_STATIC_FIELD_CONTRACT"
@@ -326,11 +347,12 @@ denominator_rule = "RECHECK: count evaluated items from retained evidence refs; 
 complete_rule = "Every Complete state requires the exact independently recheckable denominator above; omission list and fence must be present or the assessment is INCONCLUSIVE."
 fence = "StateFence revisions plus horizon/checkpoint; historical-recall and current-state outcomes recorded separately."
 omission_semantics = "Missing evidence is listed per field as unknown with reason; low use never reduces support; retrieval/repetition/agreement never reinforce support."
-invariants = ["low use never reduces epistemic support", "negative memory and invariants are not suppressed only because they rarely changed an action", "minority evidence stays addressable until discriminator or applicability resolves", "no aggregate intelligence/confidence/utility score", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish utility or support"]
+invariants = ["low use never reduces factual support and frequent retrieval does not strengthen a record", "popularity does not delete minority evidence", "delivery, citation and confident rationale do not demonstrate contribution without downstream outcome or counterfactual evidence", "negative memory and invariants are not suppressed only because they rarely changed an action", "minority evidence stays addressable until discriminator or applicability resolves", "consume immutable owner-produced projections only", "no aggregate intelligence/confidence/utility score", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish utility or support", "every Complete state requires the exact independently recheckable denominator", "this crate owns no canonical state, lifecycle transition, scheduler, effect, authority or task finish"]
 
 [[field_contract]]
 id = "NegativeMemoryExtinctionCandidate"
 owner_crate = "eliot-dreamer-memory-revision"
+owner_manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
 family = "negative-memory extinction candidate"
 source_handles = ["I12-19", "I12-21"]
 status = "FROZEN_STATIC_FIELD_CONTRACT"
@@ -342,12 +364,13 @@ denominator = "enumerated_affected_procedures_views_and_dependency_closure over 
 denominator_rule = "RECHECK: re-enumerate affected procedures/views/dependency closure from retained refs at the named fence; verify false-activation history and valid-near-match positive controls are present; recompute false-delete/false-retain/false-block/reopen counts from the same inputs. Extinction Completeness without this closure is invalid."
 complete_rule = "Every Complete state requires the exact independently recheckable closure denominator above; without adequate adjudication only reversible suppress/quarantine/archive is allowed."
 fence = "Task scope plus StateFence revisions; exact deterministic trigger scope for block/probe."
-omission_semantics = "Missing closure members block completeness; similarity only warns, exact trigger blocks or requires probe."
-invariants = ["extinction narrows influence after new evidence and history remains", "raw episodes and source observations remain immutable", "revision changes current support/applicability/accessibility/influence through forward transitions only", "no second memory system", "recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry"]
+omission_semantics = "Missing closure members block completeness; semantic similarity only warns, while an exact deterministic trigger blocks or requires a probe within matching scope."
+invariants = ["extinction narrows influence after new evidence and history remains", "the original failure episode is never rewritten or purged and every history field is preserved verbatim", "raw episodes and source observations remain immutable", "an exact deterministic trigger may block or require a probe within matching scope; semantic similarity only creates a warning or inquiry obligation", "extinction is never justified by the rarity of an action change alone, and never by retrieval, popularity or repetition frequency", "revision changes current support/applicability/accessibility/influence through forward transitions only", "no second memory system", "recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry", "consume immutable owner-produced projections only", "no aggregate intelligence/confidence/utility score", "every Complete state requires the exact independently recheckable denominator", "this crate owns no canonical state, lifecycle transition, scheduler, effect, authority or task finish"]
 
 [[field_contract]]
 id = "CognitiveQualityAssessment"
 owner_crate = "eliot-cognitive-quality"
+owner_manifest = "crates/smart/eliot-cognitive-quality/module.toml"
 family = "skill lifecycle, tool-surface, Dreamer economics, EliotSelfQualityView, bottleneck, advisory intervention"
 source_handles = ["I07-25", "I09-16", "I16-23", "I12-34"]
 status = "FROZEN_STATIC_FIELD_CONTRACT"
@@ -359,12 +382,14 @@ denominator = "per_sub_assessment_denominators: skill_counts_over_task_host_rout
 denominator_rule = "RECHECK: for Skill/tool-surface recompute delivered/expanded/executed and eligibility/activation/adherence from per-attempt HarnessActivationReceipt refs at the named scope; for Dreamer economics re-resolve the declared job/job-family window and full compute/storage/context/Human cost ledger plus held-out/live outcome refs; for SelfQuality compare observations against the ObservationObligationProfile; for intervention re-enumerate the affected capability closure. Each Complete sub-assessment requires its own exact denominator; aggregate counts never substitute for per-attempt receipts."
 complete_rule = "Every Complete state requires the exact independently recheckable per-sub-assessment denominator above; installed != delivered != executed != useful; acknowledgement is not use; use is not adherence; adherence is not benefit."
 fence = "Task/host/route/governance scope plus StateFence; tool-definition versions pin staleness."
-omission_semantics = "Silence about adherence is unknown, not compliance; shared success may remain distributed or uncertain; missing observability stays unknown."
-invariants = ["no aggregate intelligence/confidence/utility score and no aggregate learning score", "retrieval/repetition/model-agreement do not reinforce a Skill", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "recurring failure without changed hypothesis or discriminator opens Mechanism Review", "one model's delete recommendation is never its own oracle", "proof depth follows effect per I12-21 lifecycle rules"]
+omission_semantics = "Silence about adherence is unknown, not compliance; shared success may remain distributed or uncertain; missing observability stays unknown; each owner projection is consumed as a whole with its own coverage, so per-role input digests never collide in one flat digest list."
+invariants = ["no aggregate intelligence/confidence/utility score and no aggregate learning score", "installed != delivered != executed != useful, and acknowledgement is not use, use is not adherence, adherence is not benefit", "retrieval/repetition/model-agreement do not reinforce a Skill", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish utility, support or understanding", "tool availability is not utility proof and a tool-definition change marks the surface stale before material use", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "one model's delete recommendation is never its own oracle", "EliotSelfQualityView is a problem-oriented projection: no global intelligence score, no second projection owner, no self-certification, no self-promotion, no silent system rewrite", "learning-bottleneck diagnosis is a table lookup over observed combinations, never a single aggregate self-learning score", "recurring failure without a changed hypothesis or discriminator opens Mechanism Review rather than another equivalent retry", "consume immutable owner-produced projections only", "no Skill, tool, configuration or route mutation, no scheduler, effect, authority or task finish", "every Complete state requires the exact independently recheckable denominator", "this crate owns no canonical state or lifecycle transition"]
+proof_depth_rule = "Transport/Retrieval/Use/DecisionDelta/OutcomeBenefit/Retention/Transfer ceilings per I12-34 apply; proof depth follows effect per I12-21 lifecycle rules."
 
 [[field_contract]]
 id = "UnderstandingAssessment"
 owner_crate = "eliot-understanding-assessment"
+owner_manifest = "crates/smart/eliot-understanding-assessment/module.toml"
 family = "Common Ground and scoped understanding"
 source_handles = ["I06-16", "A00-07", "A06-07", "I12-34"]
 status = "FROZEN_STATIC_FIELD_CONTRACT"
@@ -376,12 +401,13 @@ denominator = "declared_question_task_family_times_state_fence_with_onboarding_s
 denominator_rule = "RECHECK: re-resolve the declared question/task family, product/State Fence, onboarding slice, and missing inputs; verify a public rival-aware model, a prediction fixed before observation, a discriminative probe/action, applicable outcome/verifier evidence, and revision on failure; for product claims verify held-out or leakage-controlled evidence. Any LOCALLY_ADEQUATE without this exact closure is invalid."
 complete_rule = "Every Complete state and every LOCALLY_ADEQUATE requires the exact independently recheckable denominator above; NOT_ONBOARDED forbids LOCALLY_ADEQUATE until missing inputs resolve."
 fence = "Product and State Fence binding per assessment; transfer requires explicit boundary and requalification."
-omission_semantics = "Graphs, prose quality, self-report, delivery receipts, or correlated-agent agreement cannot set LOCALLY_ADEQUATE; fixed graph/edge/context thresholds cannot establish understanding."
-invariants = ["no global understands flag and no single understanding score", "Common Ground is public causal inheritance, not summary similarity or native continuation state", "LOCALLY_ADEQUATE requires rival-aware model plus prediction before observation plus discriminator plus applicable outcome/verifier plus revision discipline", "product claims additionally require held-out or leakage-controlled evaluation", "no second ContextCompiler invocation, no mutable UnderstandingState, no second admission pass"]
+omission_semantics = "Graphs, prose quality, self-report, delivery receipts, or correlated-agent agreement cannot set LOCALLY_ADEQUATE; fixed graph/edge/context thresholds cannot establish understanding. Outcome and discriminator cites require owner-verified roles."
+invariants = ["no global understands flag and no single understanding score", "Common Ground is public causal inheritance, not summary similarity or native continuation state", "Common Ground compatibility is measured on terminology, reference, commitment and action-consequence grounds and survives model and harness change only as public inheritance", "tacit competence is not inherited publicly and requires requalification", "LOCALLY_ADEQUATE requires rival-aware model plus prediction before observation plus discriminator plus applicable outcome/verifier plus revision discipline", "product claims additionally require held-out or leakage-controlled evaluation", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish understanding", "no second ContextCompiler invocation, no mutable UnderstandingState, no second admission pass", "consume immutable owner-produced projections only", "every Complete state and every LOCALLY_ADEQUATE requires the exact independently recheckable denominator", "this crate owns no canonical state, lifecycle transition, scheduler, effect, authority or task finish"]
 
 [[ownership]]
 public_type = "MemoryEcologyAssessment"
 owner_crate = "eliot-memory-quality"
+defining_owner = "crates/smart/eliot-memory-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.memory.ecology", "smart.memory.gravity", "smart.memory.lifecycle_economics"]
 manifest = "crates/smart/eliot-memory-quality/module.toml"
 contract_index = "MemoryEcologyAssessment"
@@ -390,6 +416,7 @@ consumers = ["eliot-dreamer-accessibility (inputs)", "Governor disposition path 
 [[ownership]]
 public_type = "MemoryLifecycleEconomicsProfile"
 owner_crate = "eliot-memory-quality"
+defining_owner = "crates/smart/eliot-memory-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.memory.lifecycle_economics"]
 manifest = "crates/smart/eliot-memory-quality/module.toml"
 contract_index = "MemoryEcologyAssessment"
@@ -398,6 +425,7 @@ consumers = ["Governor disposition path (candidate only)"]
 [[ownership]]
 public_type = "NegativeMemoryExtinctionCandidate"
 owner_crate = "eliot-dreamer-memory-revision"
+defining_owner = "crates/smart/eliot-dreamer-memory-revision/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.dreamer.memory_revision"]
 manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
 contract_index = "NegativeMemoryExtinctionCandidate"
@@ -406,14 +434,27 @@ consumers = ["Governor transition path (advisory only)"]
 [[ownership]]
 public_type = "SkillLifecycleView"
 owner_crate = "eliot-cognitive-quality"
+defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.skill.lifecycle"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
 contract_index = "CognitiveQualityAssessment"
 consumers = ["Dreamer/Curator review surface (candidate only)"]
 
 [[ownership]]
+public_type = "ToolSurfaceAssessment"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
+functional_cells = ["smart.tool.surface"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer/Curator review surface (candidate only)"]
+coverage_state = "INCONCLUSIVE"
+coverage_state_rule = "Order 81 has no measured per-attempt tool-eligibility/activation/adherence denominator in this static freeze, so no Complete coverage state is claimed. The ToolSurfaceAssessment rows of CognitiveQualityAssessment (eligibility, retrieval, delivery, activation and adherence per attempt against an exact tool-definition version, plus where-not-apply/stop/escalation) are frozen; the recheckable denominator stays NOT_EXECUTED until per-attempt receipt fixtures exist."
+
+[[ownership]]
 public_type = "DreamerJobEconomics"
 owner_crate = "eliot-cognitive-quality"
+defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.dreamer.job_economics"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
 contract_index = "CognitiveQualityAssessment"
@@ -422,14 +463,27 @@ consumers = ["Dreamer route/curation review surface (projection only)"]
 [[ownership]]
 public_type = "EliotSelfQualityView"
 owner_crate = "eliot-cognitive-quality"
+defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.self.quality_view"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
 contract_index = "CognitiveQualityAssessment"
 consumers = ["Governor/Diagnostic Compiler projection owner (this crate supplies candidates only)"]
 
 [[ownership]]
+public_type = "LearningBottleneckDiagnosis"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
+functional_cells = ["smart.self.quality_view"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer/Doctor diagnosis review surface (candidate only)"]
+coverage_state = "INCONCLUSIVE"
+coverage_state_rule = "Order 83 names LearningBottleneckDiagnosis as an output and I16-23 prohibits one aggregate self-learning score, so the diagnosis is frozen as a table lookup over the observed update-quality/activation/adherence/decision-delta/outcome/retention combination and names the intervention. No Complete coverage state is claimed: the denominator is the actual observation set compared against the ObservationObligationProfile, and that comparison is NOT_EXECUTED here."
+
+[[ownership]]
 public_type = "SelfQualityInterventionReceipt"
 owner_crate = "eliot-cognitive-quality"
+defining_owner = "crates/smart/eliot-cognitive-quality/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.self.intervention_candidate"]
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
 contract_index = "CognitiveQualityAssessment"
@@ -438,6 +492,7 @@ consumers = ["Human/Main Agent/Governor decision owner (candidate only)"]
 [[ownership]]
 public_type = "CommonGroundAssessment"
 owner_crate = "eliot-understanding-assessment"
+defining_owner = "crates/smart/eliot-understanding-assessment/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.understanding.common_ground"]
 manifest = "crates/smart/eliot-understanding-assessment/module.toml"
 contract_index = "UnderstandingAssessment"
@@ -446,6 +501,7 @@ consumers = ["model/harness-change review path (candidate only)"]
 [[ownership]]
 public_type = "ScopedUnderstandingAssessment"
 owner_crate = "eliot-understanding-assessment"
+defining_owner = "crates/smart/eliot-understanding-assessment/module.toml (owner-located copy); this catalogue row is the wave index, not a second owner"
 functional_cells = ["smart.understanding.scoped_assessment"]
 manifest = "crates/smart/eliot-understanding-assessment/module.toml"
 contract_index = "UnderstandingAssessment"
@@ -455,39 +511,75 @@ consumers = ["product acceptance path (candidate only, held-out where applicable
 contract_id = "MemoryEcologyAssessment"
 owner_crate = "eliot-memory-quality"
 manifest = "crates/smart/eliot-memory-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-memory-quality/module.toml::MemoryEcologyAssessment"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::MemoryEcologyAssessment"
 denominator_ref = "evaluated_memory_items over declared_corpus_scope_at_named_horizon_with_workload_exposure_denominator_and_explicit_exclusions"
 source_handles = ["I12-21", "I12-34"]
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for this contract at STATIC_FIELD_CONTRACT_ONLY. The denominator above is frozen and recheckable in form, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_MEMORY_QUALITY_PULSE_01 are all NOT_EXECUTED, so the denominator is declared, not observed."
 
 [[field_contract_index]]
 contract_id = "NegativeMemoryExtinctionCandidate"
 owner_crate = "eliot-dreamer-memory-revision"
 manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+owner_located_copy = "crates/smart/eliot-dreamer-memory-revision/module.toml::NegativeMemoryExtinctionCandidate"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::NegativeMemoryExtinctionCandidate"
 denominator_ref = "enumerated_affected_procedures_views_and_dependency_closure over independently_re-enumerated_closure_at_named_fence_with_exclusions"
 source_handles = ["I12-19", "I12-21"]
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete coverage state is claimed for this contract at STATIC_FIELD_CONTRACT_ONLY. The closure denominator is frozen and recheckable in form, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_MEMORY_QUALITY_PULSE_01 are all NOT_EXECUTED, so the denominator is declared, not observed."
 
 [[field_contract_index]]
 contract_id = "CognitiveQualityAssessment"
 owner_crate = "eliot-cognitive-quality"
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+owner_located_copy = "crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::CognitiveQualityAssessment"
 denominator_ref = "per_sub_assessment_denominators (skill counts; job window with cost ledger; observations over obligation profile; intervention closure)"
 source_handles = ["I07-25", "I09-16", "I16-23", "I12-34"]
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete sub-assessment is claimed for this contract at STATIC_FIELD_CONTRACT_ONLY. Each of the six sub-assessments carries its own recheckable-in-form denominator, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_COGNITIVE_QUALITY_PULSE_01 are all NOT_EXECUTED, so the per-sub-assessment denominators are declared, not observed."
 
 [[field_contract_index]]
 contract_id = "UnderstandingAssessment"
 owner_crate = "eliot-understanding-assessment"
 manifest = "crates/smart/eliot-understanding-assessment/module.toml"
+owner_located_copy = "crates/smart/eliot-understanding-assessment/module.toml::UnderstandingAssessment"
+catalogue_row = "crates/smart/cognitive-wave-09.toml::UnderstandingAssessment"
 denominator_ref = "declared_question_task_family_times_state_fence_with_onboarding_slice_plus_discriminator_plus_outcome_verifier_closure"
 source_handles = ["I06-16", "A00-07", "A06-07", "I12-34"]
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+denominator_observed = "NO"
+denominator_observed_rule = "No Complete state and no LOCALLY_ADEQUATE is claimed for this contract at STATIC_FIELD_CONTRACT_ONLY. The closure denominator is frozen and recheckable in form, but Rust implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_UNDERSTANDING_PULSE_01 are all NOT_EXECUTED, so the denominator is declared, not observed."
 
 [[crate_manifest]]
 crate = "eliot-memory-quality"
 manifest = "crates/smart/eliot-memory-quality/module.toml"
 status = "PROTOTYPE"
 functional_cells = ["smart.memory.ecology", "smart.memory.gravity", "smart.memory.lifecycle_economics"]
+field_contract_ids = ["MemoryEcologyAssessment"]
+owner_located_copies = ["crates/smart/eliot-memory-quality/module.toml::MemoryEcologyAssessment"]
+owned_public_types = ["MemoryEcologyAssessment", "MemoryLifecycleEconomicsProfile"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+product_pulse_status = "NOT_EXECUTED"
 workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
 
 [[crate_manifest]]
@@ -495,6 +587,14 @@ crate = "eliot-dreamer-memory-revision"
 manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
 status = "PROTOTYPE"
 functional_cells = ["smart.dreamer.memory_revision"]
+field_contract_ids = ["NegativeMemoryExtinctionCandidate"]
+owner_located_copies = ["crates/smart/eliot-dreamer-memory-revision/module.toml::NegativeMemoryExtinctionCandidate"]
+owned_public_types = ["NegativeMemoryExtinctionCandidate"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+product_pulse_status = "NOT_EXECUTED"
 workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
 
 [[crate_manifest]]
@@ -502,6 +602,14 @@ crate = "eliot-cognitive-quality"
 manifest = "crates/smart/eliot-cognitive-quality/module.toml"
 status = "PROTOTYPE"
 functional_cells = ["smart.skill.lifecycle", "smart.tool.surface", "smart.dreamer.job_economics", "smart.self.quality_view", "smart.self.intervention_candidate"]
+field_contract_ids = ["CognitiveQualityAssessment"]
+owner_located_copies = ["crates/smart/eliot-cognitive-quality/module.toml::CognitiveQualityAssessment"]
+owned_public_types = ["SkillLifecycleView", "ToolSurfaceAssessment", "DreamerJobEconomics", "EliotSelfQualityView", "LearningBottleneckDiagnosis", "SelfQualityInterventionReceipt"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+product_pulse_status = "NOT_EXECUTED"
 workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
 
 [[crate_manifest]]
@@ -509,6 +617,14 @@ crate = "eliot-understanding-assessment"
 manifest = "crates/smart/eliot-understanding-assessment/module.toml"
 status = "PROTOTYPE"
 functional_cells = ["smart.understanding.common_ground", "smart.understanding.scoped_assessment"]
+field_contract_ids = ["UnderstandingAssessment"]
+owner_located_copies = ["crates/smart/eliot-understanding-assessment/module.toml::UnderstandingAssessment"]
+owned_public_types = ["CommonGroundAssessment", "ScopedUnderstandingAssessment"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+product_pulse = "W9_UNDERSTANDING_PULSE_01"
+product_pulse_status = "NOT_EXECUTED"
 workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
 
 [[validation_gate]]
@@ -538,6 +654,18 @@ evidence_execution_status = "NOT_EXECUTED"
 [[validation_gate]]
 id = "W9-PROOF-LADDER-CEILING"
 rule = "Transport/Retrieval/Use/DecisionDelta/OutcomeBenefit/Retention/Transfer ceilings per I12-34 apply; per-attempt HarnessActivationReceipt never substitutes for DecisionDelta or benefit; activation without first_qualifying_observable_use_ref proves only delivery."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-OWNER-LOCATED-CONTRACT-COPY"
+rule = "Every W9 field contract exists in two places under Issue #259: this catalogue row and the owning crate's own module.toml. The two must agree on id, owner_crate, fields, denominator, denominator_rule, complete_rule, fence, omission_semantics and invariants, and every [[agent_brief]] must name a field_contract_ref pointing at the crate copy. A crate that carries no [[field_contract]] for its own crate name, or a catalogue row whose manifest does not carry it, is a ContractChallenge, not a passing state."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-HARD-BOUNDARIES-FROZEN"
+rule = "All nine Issue #259 hard boundaries are frozen as binding invariants or omission rules in the contracts: immutable owner-produced projections only; no canonical state, lifecycle transition, Skill/tool/config/route mutation, scheduler, effect, authority, task finish or self-promotion; no aggregate intelligence/confidence/utility score; retrieval, popularity, completion, delivery, tool availability and model agreement never establish utility, support or understanding; negative-memory extinction changes only an advisory activation/influence candidate and preserves the original failure history; LOCALLY_ADEQUATE stays scoped and requires rival-aware model, prediction before observation, discriminator, applicable outcome/verifier and revision discipline; Common Ground is public causal inheritance, not summary similarity or native continuation state; every Complete coverage state requires an exact independently recheckable denominator; recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 

@@ -69,3 +69,88 @@ forbid_unsafe = true
 required_exports = []
 required_tests = []
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
+
+# ---------------------------------------------------------------------------
+# Field contract. Same table shape as the W9 catalogue
+# crates/smart/cognitive-wave-09.toml [[field_contract]]; this file is the
+# owning crate's own copy, so the implementation agent reads the contract from
+# the crate it is asked to implement instead of from a remote catalogue.
+# Frozen here under Issue #259; the catalogue row is the wave-level index of
+# the same contract id and is not a second owner of it.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+id = "NegativeMemoryExtinctionCandidate"
+owner_crate = "eliot-dreamer-memory-revision"
+family = "negative-memory extinction candidate"
+source_handles = ["I12-19", "I12-21"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["failure_fingerprint_trigger", "failure_fingerprint_failed_action", "failure_fingerprint_affected_scope_resources", "failure_fingerprint_violated_invariant", "failure_fingerprint_evidence", "failure_fingerprint_causal_status", "failure_fingerprint_do_not_repeat_until", "failure_fingerprint_reopen_condition", "failure_fingerprint_discriminative_check", "failure_fingerprint_false_activation_history", "revision_prior_and_new_record_or_model_refs", "revision_reactivation_trigger_and_task_scope", "revision_new_observation_outcome_or_prediction_error", "revision_old_and_new_epistemic_accessibility_and_influence_state", "revision_retained_narrowed_and_lost_distinctions", "revision_retrieval_downstream_use_interference_and_false_recall_checks", "revision_affected_procedures_views_and_dependency_closure", "revision_rollback_reopen_or_no_return_boundary", "revision_verifier_or_review_disposition", "extinction_proposed_activation_influence_narrowing_only", "extinction_evaluation_operation_equals_extinguish_with_evaluator_kind_ground_truth_scope_cohorts_false_delete_retain_block_reopen_counts_abstention_coverage_delayed_ood_noninferiority_replica_restore_uncertainty_terminal_disposition"]
+denominator = "enumerated_affected_procedures_views_and_dependency_closure over independently_re-enumerated_closure_at_named_fence_with_exclusions"
+denominator_rule = "RECHECK: re-enumerate affected procedures/views/dependency closure from retained refs at the named fence; verify false-activation history and valid-near-match positive controls are present; recompute false-delete/false-retain/false-block/reopen counts from the same inputs. Extinction Completeness without this closure is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable closure denominator above; without adequate adjudication only reversible suppress/quarantine/archive is allowed."
+fence = "Task scope plus StateFence revisions; exact deterministic trigger scope for block/probe."
+omission_semantics = "Missing closure members block completeness; semantic similarity only warns, while an exact deterministic trigger blocks or requires a probe within matching scope."
+invariants = ["extinction narrows influence after new evidence and history remains", "the original failure episode is never rewritten or purged and every history field is preserved verbatim", "raw episodes and source observations remain immutable", "an exact deterministic trigger may block or require a probe within matching scope; semantic similarity only creates a warning or inquiry obligation", "extinction is never justified by the rarity of an action change alone, and never by retrieval, popularity or repetition frequency", "revision changes current support/applicability/accessibility/influence through forward transitions only", "no second memory system", "recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry", "consume immutable owner-produced projections only", "no aggregate intelligence/confidence/utility score", "every Complete state requires the exact independently recheckable denominator", "this crate owns no canonical state, lifecycle transition, scheduler, effect, authority or task finish"]
+
+[[field_contract_index]]
+contract_id = "NegativeMemoryExtinctionCandidate"
+owner_crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+catalogue = "crates/smart/cognitive-wave-09.toml"
+denominator_ref = "enumerated_affected_procedures_views_and_dependency_closure over independently_re-enumerated_closure_at_named_fence_with_exclusions"
+source_handles = ["I12-19", "I12-21"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+coverage_state_rule = "No Complete coverage state is claimed by this manifest. Implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_MEMORY_QUALITY_PULSE_01 are all NOT_EXECUTED, so no rechecked denominator is claimed as observed; INCONCLUSIVE is the only state this file supports at STATIC_FIELD_CONTRACT_ONLY."
+
+[[ownership]]
+public_type = "NegativeMemoryExtinctionCandidate"
+owner_crate = "eliot-dreamer-memory-revision"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.dreamer.memory_revision"]
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+contract_index = "NegativeMemoryExtinctionCandidate"
+consumers = ["Governor transition path (advisory only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[crate_manifest]]
+crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+catalogue = "crates/smart/cognitive-wave-09.toml"
+status = "PROTOTYPE"
+functional_cells = ["smart.dreamer.memory_revision"]
+field_contract_ids = ["NegativeMemoryExtinctionCandidate"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+product_pulse_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+[[validation_gate]]
+id = "W9-MR-COMPLETE-REQUIRES-CLOSURE-DENOMINATOR"
+rule = "A Complete extinction state requires the exact independently recheckable affected procedures/views/dependency-closure denominator declared in this file. Without adequate adjudication only reversible suppress, quarantine or archive is allowed; an irreversible extinction request is refused."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-MR-ADVISORY-ONLY-HISTORY-PRESERVED"
+rule = "The candidate narrows only the advisory activation and influence fields. The original failure history is preserved verbatim: there is no purge, no narrative rewrite and no deletion, and raw episodes and source observations stay immutable."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-MR-EXACT-TRIGGER-VERSUS-SIMILARITY"
+rule = "An exact deterministic trigger may block or require a probe within matching scope; semantic similarity only warns or creates an inquiry obligation and never authorizes an automatic hard block. Suppression is never justified by rare action change alone."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-MR-RECURRING-FAILURE-OPENS-MECHANISM-REVIEW"
+rule = "Recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry, and no canonical write, effect or authority is taken by this crate."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
