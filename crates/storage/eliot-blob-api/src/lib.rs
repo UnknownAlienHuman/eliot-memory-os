@@ -2996,12 +2996,52 @@ pub enum BlobCapacityStage {
     JournalWrite,
     PayloadWrite,
     MetadataWrite,
+    /// The provider's own `fsync` of a written file's bytes failed. I5.12's
+    /// algorithm makes this a durability boundary distinct from the write that
+    /// produced the bytes ("flush and fsync ciphertext plus metadata"), and
+    /// issue #864 requires file flush, directory flush and publication
+    /// durability to stay distinct, so this row exists only because a create
+    /// that failed and a flush that failed are not the same observation.
+    ///
+    /// Only a platform-port implementor can report this: the service knows
+    /// which object it asked the port to write, not which durability boundary
+    /// the port reached inside that write. (The port trait itself belongs to
+    /// the `eliot-blob` service crate, which depends on this one, so it is
+    /// named here in prose rather than as an intra-doc link.)
+    FileFlush,
+    /// The provider's own `fsync` of a containing directory failed, so a name
+    /// that is already visible in the directory is not yet durably installed.
+    /// Distinct from [`BlobCapacityStage::FileFlush`] (the file's own bytes)
+    /// and from the publication stages (the rename itself), per issue #864's
+    /// "directory flush and publication durability remain distinct".
+    DirectoryFlush,
     PayloadPublication,
     MetadataPublication,
     CommitWrite,
     Cleanup,
     CasJournal,
     GcCleanup,
+}
+
+impl BlobCapacityStage {
+    /// Whether this stage names a *durability boundary* rather than the object
+    /// whose bytes or record were being written.
+    ///
+    /// Only [`BlobCapacityStage::FileFlush`] and
+    /// [`BlobCapacityStage::DirectoryFlush`] do, and both are the two halves of
+    /// the flush boundary I5.12 orders before the atomic rename. The service
+    /// layer uses this to decide whose stage statement is authoritative when a
+    /// wrapped port and the caller disagree: see issue #864's "Wrapped ports
+    /// must preserve typed cause/code and stage before conversion to text."
+    ///
+    /// A caller reporting one of these stages for its own call is not a
+    /// contradiction, because the caller cannot observe them; this predicate
+    /// exists to let a port's more precise report survive rather than to
+    /// constrain callers.
+    #[must_use]
+    pub const fn reports_durability_boundary(self) -> bool {
+        matches!(self, Self::FileFlush | Self::DirectoryFlush)
+    }
 }
 
 /// Platform-qualified capacity evidence.  Numeric codes are retained only
@@ -3108,6 +3148,17 @@ impl BlobPublicationObligation {
                 reason: "an unresolved publication retains its destination identity",
             });
         }
+        // The allow-list is deliberately NOT widened to the two durability
+        // boundary rows. An obligation names the publication boundary the
+        // *service* is settling and must re-verify, and the service builds it
+        // from its own object-level stage (the publication, commit or cleanup
+        // target), never from a stage a port reported inside one write call.
+        // A port's file-flush/directory-flush refinement travels inside the
+        // retained `BlobError` and the fence, which is where issue #864's
+        // "file flush, directory flush and publication durability remain
+        // distinct" boundary is recorded. Admitting the boundary rows here
+        // would instead let an obligation claim a boundary the service never
+        // settled.
         if !matches!(
             self.stage,
             BlobCapacityStage::PayloadPublication
@@ -3305,6 +3356,17 @@ fn validate_capacity_cause(cause: BlobCapacityCause) -> Result<(), BlobError> {
 /// stages is meaningless without the storage identity it settled, so a
 /// `None` locator is rejected instead of being reported as an anonymous
 /// exhaustion.
+///
+/// Deliberately excludes [`BlobCapacityStage::FileFlush`] and
+/// [`BlobCapacityStage::DirectoryFlush`]. Those two rows report *which
+/// durability boundary* the provider reached; they do not report *which object*
+/// it was reached for. The object is named by the caller's own stage (a
+/// `PayloadWrite` flush settles the payload locator, a `JournalWrite` flush
+/// settles a transaction journal that has no blob locator at all), and
+/// requiring a locator for the boundary row would reject the legitimate
+/// journal-durability case at validation time and destroy the typed capacity
+/// evidence. Locator applicability therefore stays a property of the
+/// object-level stage. See issue #864.
 fn capacity_stage_requires_locator(stage: BlobCapacityStage) -> bool {
     matches!(
         stage,
