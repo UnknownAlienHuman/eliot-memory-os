@@ -104,7 +104,7 @@ impl EmbeddedSchemaBody {
 /// order: the executable graph first (v1 baseline, the v1-to-v2 additive
 /// delta, the v2 fresh-database baseline), then the bodies this owner
 /// declares but does not admit.
-pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 9] = [
+pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 10] = [
     EmbeddedSchemaBody {
         const_name: "SCHEMA_DDL",
         migration_id: Some(schema::MIGRATION_ID_V1),
@@ -193,6 +193,16 @@ pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 9] = [
         ddl: schema::EXPERIENCE_TABLES_DDL,
         disposition: BodyDisposition::DeclaredNotAdmitted,
         note: "experience body; the experience_bank and experience_feedback tables are created by the closed experience ensure-tables operation, so this body is declared but has no migration identity",
+        pinned_sha256: None,
+    },
+    EmbeddedSchemaBody {
+        const_name: "LEARNING_TABLES_DDL",
+        migration_id: None,
+        generation: None,
+        predecessor_generation: None,
+        ddl: schema::LEARNING_TABLES_DDL,
+        disposition: BodyDisposition::DeclaredNotAdmitted,
+        note: "learning body; the learning_record table is created by the closed learning ensure-tables operation, so this body is declared but has no migration identity",
         pinned_sha256: None,
     },
 ];

@@ -569,6 +569,9 @@ pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::EXPERIENCE_FEEDBACK,
     },
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::LEARNING_RECORD,
+    },
 ];
 
 /// The capture-point reads, in the exact order the pinned batches issue them:
