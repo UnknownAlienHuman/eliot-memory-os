@@ -38,10 +38,14 @@
 //!
 //! A [`QualityAssessmentCandidate`] freezes exactly what was assessed (which
 //! frozen inputs, which scope and fence, which denominators were available)
-//! for Governor/Human review. It carries no findings, no verdict, no score,
-//! and no completeness posture. Equivalent-retry intervention input fails
-//! closed with [`QualityError::MechanismReviewRequired`] instead of opening
-//! another identical assessment.
+//! for Governor/Human review. Echoed input digests travel by role in
+//! [`RoleDigests`]: content and coverage digests are unique independently, so
+//! distinct owner projections that legitimately share a coverage digest are
+//! both consumable while a repeated digest inside one role is refused. The
+//! candidate carries no findings, no verdict, no score, and no completeness
+//! posture. Equivalent-retry intervention input fails closed with
+//! [`QualityError::MechanismReviewRequired`] instead of opening another
+//! identical assessment.
 //!
 //! This crate performs no retrieval, ranking, promotion, admission,
 //! compilation, model work, or reactive-path work. Fences are carried, not
@@ -409,6 +413,40 @@ pub enum AssessmentSection {
     InterventionCandidate,
 }
 
+/// Frozen input digests of one closure, projected by role.
+///
+/// Uniqueness is per role, never across roles: a repeated digest inside one
+/// role is refused by [`QualityAssessmentCandidate::validate`] with
+/// [`QualityError::InvalidField`], while two owner projections that share a
+/// coverage digest are both consumable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleDigests {
+    /// Digests over the assessed owner bodies, in assessment order.
+    pub content: Vec<String>,
+    /// Digests over the assessed owner bodies' coverage envelopes, in
+    /// assessment order.
+    pub coverage: Vec<String>,
+}
+
+/// Require one role's echoed digests to be well-formed and unique.
+///
+/// A duplicate within one role is a genuine repeated owner input and fails
+/// closed; the same value in the other role is a different input and passes.
+fn unique_role_digests(role: &[String], field: &'static str) -> Result<(), QualityError> {
+    let mut seen = BTreeSet::new();
+    for echoed in role {
+        digest(echoed, field)?;
+        if !seen.insert(echoed) {
+            return Err(QualityError::InvalidField {
+                field,
+                reason: "duplicate digest",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Candidate-only quality assessment: a frozen input closure for review.
 ///
 /// The candidate binds one section, one scope, and one fence to the exact
@@ -434,8 +472,9 @@ pub struct QualityAssessmentCandidate {
     pub scope: WorkScopeId,
     /// Fence this candidate was assessed under, carried for edge gating.
     pub fence: StateFence,
-    /// Frozen digests echoed from assessed inputs, in assessment order.
-    pub input_digests: Vec<String>,
+    /// Frozen digests echoed from assessed inputs, by role, in assessment
+    /// order.
+    pub input_digests: RoleDigests,
     /// Frozen per-sub-assessment denominators echoed from assessed inputs.
     pub denominators: Vec<SourceDenominator>,
     /// Owner-held bodies cited by handle only.
@@ -449,7 +488,9 @@ pub struct QualityAssessmentCandidate {
 impl QualityAssessmentCandidate {
     /// Compute the frozen digest over the candidate shape.
     pub fn compute_digest(&self) -> Result<String, QualityError> {
-        if self.input_digests.len() > MAX_CANDIDATE_DIGESTS {
+        if self.input_digests.content.len() + self.input_digests.coverage.len()
+            > MAX_CANDIDATE_DIGESTS
+        {
             return Err(QualityError::Bounds {
                 field: "candidate.input_digests",
             });
@@ -486,21 +527,24 @@ impl QualityAssessmentCandidate {
         }
         scope_shape(&self.scope, "candidate.scope")?;
         fence_shape(&self.fence, "candidate.fence")?;
-        if self.input_digests.len() > MAX_CANDIDATE_DIGESTS {
+        if self.input_digests.content.len() + self.input_digests.coverage.len()
+            > MAX_CANDIDATE_DIGESTS
+        {
             return Err(QualityError::Bounds {
                 field: "candidate.input_digests",
             });
         }
-        let mut seen_digests = BTreeSet::new();
-        for echoed in &self.input_digests {
-            digest(echoed, "candidate.input_digests")?;
-            if !seen_digests.insert(echoed.clone()) {
-                return Err(QualityError::InvalidField {
-                    field: "candidate.input_digests",
-                    reason: "duplicate digest",
-                });
-            }
-        }
+        // Uniqueness is per role: two owner projections that legitimately
+        // share a coverage digest are both consumable, while a repeated
+        // digest inside one role is a genuinely re-cited owner input.
+        unique_role_digests(
+            &self.input_digests.content,
+            "candidate.input_digests.content",
+        )?;
+        unique_role_digests(
+            &self.input_digests.coverage,
+            "candidate.input_digests.coverage",
+        )?;
         if self.denominators.len() > MAX_CANDIDATE_DENOMINATORS {
             return Err(QualityError::Bounds {
                 field: "candidate.denominators",
@@ -527,7 +571,8 @@ impl QualityAssessmentCandidate {
         // denominator, or a cited owner handle. A candidate citing nothing
         // assesses nothing. Intervention closures enumerate by handle only,
         // so handles alone suffice there.
-        if self.input_digests.is_empty()
+        if self.input_digests.content.is_empty()
+            && self.input_digests.coverage.is_empty()
             && self.denominators.is_empty()
             && self.evidence_handles.is_empty()
         {
@@ -549,7 +594,7 @@ fn finalize(
     assessment_id: ArtifactId,
     scope: WorkScopeId,
     fence: StateFence,
-    input_digests: Vec<String>,
+    input_digests: RoleDigests,
     denominators: Vec<SourceDenominator>,
     evidence_handles: Vec<ArtifactId>,
     omissions: Vec<ProjectionOmission>,
@@ -620,13 +665,13 @@ pub fn assess_skill_lifecycle(
     if receipts.len() > MAX_ASSESSMENT_RECEIPTS {
         return Err(QualityError::Bounds { field: "receipts" });
     }
-    let mut input_digests = Vec::with_capacity(receipts.len() + 1);
-    input_digests.push(status.digest.clone());
+    let mut content_digests = Vec::with_capacity(receipts.len() + 1);
+    content_digests.push(status.digest.clone());
     let mut denominators = Vec::with_capacity(receipts.len() + 1);
     denominators.push(status.denominator);
     for receipt in receipts {
         check_receipt_scope_fence(receipt, &status.scope, &status.fence)?;
-        input_digests.push(receipt.canonical_digest.clone());
+        content_digests.push(receipt.canonical_digest.clone());
         denominators.push(receipt.member_denominator);
     }
     finalize(
@@ -634,7 +679,10 @@ pub fn assess_skill_lifecycle(
         assessment_id,
         status.scope.clone(),
         status.fence.clone(),
-        input_digests,
+        RoleDigests {
+            content: content_digests,
+            coverage: Vec::new(),
+        },
         denominators,
         Vec::new(),
         // Status-level named gaps travel into the candidate: a candidate
@@ -710,11 +758,11 @@ pub fn assess_dreamer_economics(
         });
     }
     unique_handles(job_handles, "job_handles")?;
-    let mut input_digests = Vec::with_capacity(receipts.len());
+    let mut content_digests = Vec::with_capacity(receipts.len());
     let mut denominators = Vec::with_capacity(receipts.len());
     for receipt in receipts {
         check_receipt_scope_fence(receipt, &scope, &fence)?;
-        input_digests.push(receipt.canonical_digest.clone());
+        content_digests.push(receipt.canonical_digest.clone());
         denominators.push(receipt.member_denominator);
     }
     finalize(
@@ -722,7 +770,10 @@ pub fn assess_dreamer_economics(
         assessment_id,
         scope,
         fence,
-        input_digests,
+        RoleDigests {
+            content: content_digests,
+            coverage: Vec::new(),
+        },
         denominators,
         job_handles.to_vec(),
         // No droppable omission sets exist on this leg: per-attempt receipts
@@ -782,7 +833,8 @@ pub fn assess_self_quality(
             reason: "self quality needs at least one experience projection",
         });
     }
-    let mut input_digests = Vec::new();
+    let mut content_digests = Vec::new();
+    let mut coverage_digests = Vec::new();
     let mut evidence_handles = Vec::new();
     let mut omissions = Vec::new();
     if let Some(journal) = projections.journal {
@@ -799,8 +851,8 @@ pub fn assess_self_quality(
                 reason: "journal fence is not compatible with assessment fence",
             });
         }
-        input_digests.push(journal.digest.clone());
-        input_digests.push(journal.coverage.coverage_digest.clone());
+        content_digests.push(journal.digest.clone());
+        coverage_digests.push(journal.coverage.coverage_digest.clone());
         evidence_handles.push(journal.projection_id.clone());
         omissions.extend(journal.omissions.iter().cloned());
     }
@@ -818,8 +870,8 @@ pub fn assess_self_quality(
                 reason: "bank fence is not compatible with assessment fence",
             });
         }
-        input_digests.push(bank.digest.clone());
-        input_digests.push(bank.coverage.coverage_digest.clone());
+        content_digests.push(bank.digest.clone());
+        coverage_digests.push(bank.coverage.coverage_digest.clone());
         evidence_handles.push(bank.projection_id.clone());
         omissions.extend(bank.omissions.iter().cloned());
     }
@@ -837,12 +889,12 @@ pub fn assess_self_quality(
                 reason: "feedback fence is not compatible with assessment fence",
             });
         }
-        input_digests.push(feedback.digest.clone());
-        input_digests.push(feedback.coverage.coverage_digest.clone());
+        content_digests.push(feedback.digest.clone());
+        coverage_digests.push(feedback.coverage.coverage_digest.clone());
         evidence_handles.push(feedback.projection_id.clone());
         omissions.extend(feedback.omissions.iter().cloned());
     }
-    input_digests.push(position.digest.clone());
+    content_digests.push(position.digest.clone());
     if receipts.is_empty() {
         return Err(QualityError::IncompleteDenominator {
             reason: "self quality needs at least one per-attempt receipt",
@@ -854,7 +906,7 @@ pub fn assess_self_quality(
     let mut denominators = Vec::with_capacity(receipts.len());
     for receipt in receipts {
         check_receipt_scope_fence(receipt, &scope, &fence)?;
-        input_digests.push(receipt.canonical_digest.clone());
+        content_digests.push(receipt.canonical_digest.clone());
         denominators.push(receipt.member_denominator);
     }
     if obligation_handles.is_empty() {
@@ -874,7 +926,13 @@ pub fn assess_self_quality(
         assessment_id,
         scope,
         fence,
-        input_digests,
+        // Each owner projection contributes one content digest and one
+        // coverage digest, kept in separate roles: two projections may share
+        // a coverage digest, and one flat list would refuse the owner's own.
+        RoleDigests {
+            content: content_digests,
+            coverage: coverage_digests,
+        },
         denominators,
         evidence_handles,
         // Owner-named gaps from every cited envelope travel into the
@@ -950,7 +1008,10 @@ pub fn assess_intervention(
         assessment_id,
         scope,
         fence,
-        Vec::new(),
+        RoleDigests {
+            content: Vec::new(),
+            coverage: Vec::new(),
+        },
         Vec::new(),
         evidence_handles,
         // No droppable omission sets exist on this leg: problem, improvement,
@@ -1006,7 +1067,8 @@ fn collect_projection(
     coverage_digest: &str,
     member_handles: &[&ArtifactId],
     candidate: &QualityAssessmentCandidate,
-    known_digests: &mut BTreeSet<String>,
+    known_content: &mut BTreeSet<String>,
+    known_coverage: &mut BTreeSet<String>,
     owner_held: &mut BTreeSet<String>,
 ) -> Result<(), QualityError> {
     if scope.work_scope != candidate.scope {
@@ -1021,8 +1083,8 @@ fn collect_projection(
             reason: "projection fence is not compatible with candidate fence",
         });
     }
-    known_digests.insert(digest.to_owned());
-    known_digests.insert(coverage_digest.to_owned());
+    known_content.insert(digest.to_owned());
+    known_coverage.insert(coverage_digest.to_owned());
     owner_held.insert(projection_id.as_str().to_owned());
     for handle in member_handles {
         owner_held.insert(handle.as_str().to_owned());
@@ -1045,12 +1107,19 @@ fn collect_projection(
 /// liveness stay edge-gated. Drifted, uncited, or unattested material fails
 /// closed. No score, verdict, or completeness is adjudicated: a passing
 /// recheck states that the frozen closure still resolves, nothing more.
+///
+/// Owner digests are known per role, exactly as `assess_self_quality` echoes
+/// them: a content digest resolves only against supplied owner bodies, a
+/// coverage digest only against supplied coverage envelopes. Folding both
+/// roles into one set would let a coverage digest stand in for a content
+/// digest that no supplied owner actually carries.
 pub fn recheck_candidate(
     candidate: &QualityAssessmentCandidate,
     snapshot: &OwnerSnapshot<'_>,
 ) -> Result<(), QualityError> {
     candidate.validate()?;
-    let mut known_digests: BTreeSet<String> = BTreeSet::new();
+    let mut known_content: BTreeSet<String> = BTreeSet::new();
+    let mut known_coverage: BTreeSet<String> = BTreeSet::new();
     let mut known_denominators: BTreeSet<(u32, u32)> = BTreeSet::new();
     let mut owner_held: BTreeSet<String> = BTreeSet::new();
     for status in &snapshot.statuses {
@@ -1067,7 +1136,7 @@ pub fn recheck_candidate(
                 reason: "status fence is not compatible with candidate fence",
             });
         }
-        known_digests.insert(status.digest.clone());
+        known_content.insert(status.digest.clone());
         known_denominators.insert((status.denominator.declared, status.denominator.observed));
         owner_held.insert(status.status_id.as_str().to_owned());
         owner_held.insert(status.skill_ref.as_str().to_owned());
@@ -1080,7 +1149,7 @@ pub fn recheck_candidate(
     }
     for receipt in &snapshot.receipts {
         check_receipt_scope_fence(receipt, &candidate.scope, &candidate.fence)?;
-        known_digests.insert(receipt.canonical_digest.clone());
+        known_content.insert(receipt.canonical_digest.clone());
         known_denominators.insert((
             receipt.member_denominator.declared,
             receipt.member_denominator.observed,
@@ -1099,7 +1168,8 @@ pub fn recheck_candidate(
             &journal.coverage.coverage_digest,
             &[],
             candidate,
-            &mut known_digests,
+            &mut known_content,
+            &mut known_coverage,
             &mut owner_held,
         )?;
     }
@@ -1118,7 +1188,8 @@ pub fn recheck_candidate(
             &bank.coverage.coverage_digest,
             &members,
             candidate,
-            &mut known_digests,
+            &mut known_content,
+            &mut known_coverage,
             &mut owner_held,
         )?;
     }
@@ -1137,7 +1208,8 @@ pub fn recheck_candidate(
             &feedback.coverage.coverage_digest,
             &members,
             candidate,
-            &mut known_digests,
+            &mut known_content,
+            &mut known_coverage,
             &mut owner_held,
         )?;
     }
@@ -1149,7 +1221,7 @@ pub fn recheck_candidate(
                 reason: "position is superseded",
             });
         }
-        known_digests.insert(position.digest.clone());
+        known_content.insert(position.digest.clone());
     }
     let mut attested: BTreeSet<String> = BTreeSet::new();
     for handle in &snapshot.attested_handles {
@@ -1160,12 +1232,17 @@ pub fn recheck_candidate(
             });
         }
     }
-    for echoed in &candidate.input_digests {
-        if !known_digests.contains(echoed) {
-            return Err(QualityError::InvalidField {
-                field: "recheck.input_digests",
-                reason: "echoed digest resolves to no supplied owner input",
-            });
+    for (echoed, known) in [
+        (&candidate.input_digests.content, &known_content),
+        (&candidate.input_digests.coverage, &known_coverage),
+    ] {
+        for digest_value in echoed {
+            if !known.contains(digest_value) {
+                return Err(QualityError::InvalidField {
+                    field: "recheck.input_digests",
+                    reason: "echoed digest resolves to no supplied owner input",
+                });
+            }
         }
     }
     for denominator in &candidate.denominators {

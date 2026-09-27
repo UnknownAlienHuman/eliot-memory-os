@@ -401,7 +401,7 @@ fn skill_lifecycle_assesses_valid_closure() {
         made.section,
         eliot_cognitive_quality::AssessmentSection::SkillLifecycle
     );
-    assert_eq!(made.input_digests.len(), 2);
+    assert_eq!(made.input_digests.content.len(), 2);
     assert_eq!(made.denominators.len(), 2);
 }
 
@@ -505,7 +505,7 @@ fn self_quality_assesses_owner_projections() {
         made.section,
         eliot_cognitive_quality::AssessmentSection::SelfQualityView
     );
-    assert!(made.input_digests.len() >= 7);
+    assert!(made.input_digests.content.len() + made.input_digests.coverage.len() >= 7);
     assert_eq!(made.evidence_handles.len(), 4);
 }
 
@@ -564,7 +564,8 @@ fn intervention_freezes_handle_closure() {
         made.section,
         eliot_cognitive_quality::AssessmentSection::InterventionCandidate
     );
-    assert!(made.input_digests.is_empty());
+    assert!(made.input_digests.content.is_empty());
+    assert!(made.input_digests.coverage.is_empty());
     assert!(made.denominators.is_empty());
     assert_eq!(made.evidence_handles.len(), 3);
 }
@@ -641,7 +642,7 @@ fn unknown_wire_fields_are_rejected() {
             "policy_revision": null,
             "integration_revision": null
         },
-        "input_digests": [],
+        "input_digests": {"content": [], "coverage": []},
         "denominators": [],
         "evidence_handles": [],
         "omissions": [],
