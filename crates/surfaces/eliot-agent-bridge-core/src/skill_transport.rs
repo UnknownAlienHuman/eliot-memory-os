@@ -16,7 +16,10 @@
 //! payload byte. A new Tool Definition or payload shape gets a NEW contract
 //! revision — v1 is frozen and rejected; v2 adds the accepted candidate to
 //! the intake payload, while v3 carries typed `WorkScope` guard-withholding
-//! evidence in result outcomes.
+//! evidence in result outcomes, and v4 carries the owner-qualified
+//! [`SkillUsefulness`](eliot_skill::SkillUsefulness) vocabulary plus the
+//! owner-resolved outcome evidence backing a usefulness claim, so `useful` is
+//! no longer a plain boolean that unverified wire strings can set.
 
 #![forbid(unsafe_code)]
 
@@ -29,9 +32,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Versioned Skill transport contract identity.
-pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v3";
+pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v4";
 /// Payload contract revision. Decode rejects any other revision.
-pub const SKILL_TRANSPORT_VERSION: u32 = 3;
+pub const SKILL_TRANSPORT_VERSION: u32 = 4;
 /// Maximum encoded intake bytes (I7.2 default frame max). Larger material
 /// must arrive by Blob or handle reference (future extension), never as
 /// giant inline frames; oversize fails closed here.
@@ -223,7 +226,7 @@ impl SkillIntakePayload {
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum SkillTransportError {
     /// Payload contract revision is unsupported.
-    #[error("skill transport version mismatch: expected v3")]
+    #[error("skill transport version mismatch: expected v4")]
     BadVersion,
     /// Encoded payload exceeds its I7.2 bound.
     #[error("skill transport payload exceeds its bound")]
@@ -394,10 +397,14 @@ pub enum SkillResultOutcome {
     /// `Box` is serde-transparent, so the wire shape is unchanged.
     Display(Box<ActivatedSkillDisplay>),
     /// Activation receipt folded: the per-attempt stage summary derived from
-    /// the exact presented harness receipt. Delivered, retrieved, activated,
-    /// adhered and useful stay distinct; a packet-included but never
-    /// activated Skill is never marked successful.
-    Attempt(eliot_skill::AttemptLifecycleSummary),
+    /// the exact presented harness receipt. Delivered, retrieved, activated
+    /// and adhered stay distinct; a packet-included but never activated Skill
+    /// is never marked successful. `useful` is the owner-qualified
+    /// [`SkillUsefulness`](eliot_skill::SkillUsefulness) vocabulary, not a
+    /// boolean: only `owner_backed` (backed by `qualified_outcomes` below)
+    /// is a positive claim, and it is reached only after the ingest compared
+    /// the presented outcome references against real owner records.
+    Attempt(Box<eliot_skill::AttemptLifecycleSummary>),
     /// Execution evidence reconciled: exact presented outcome counts with the
     /// still-uncertain remainder. Retry is permitted only when
     /// `uncertain_pending` is zero; uncertain effects block retry until
@@ -409,6 +416,18 @@ pub enum SkillResultOutcome {
         failed: u64,
         /// Presented executions whose effects are still unknown.
         uncertain_pending: u64,
+    },
+    /// The owner records that established (or failed to establish) the
+    /// usefulness claim carried by an `Attempt` outcome above, each with the
+    /// owner revision it was read at.
+    ///
+    /// This is the evidence half of the qualification: an `Attempt` carrying
+    /// `useful: OwnerBacked` is only substantiated when this leg is present
+    /// and names the same resolved references. An empty list is the honest
+    /// "nothing resolved" case and never accompanies a positive claim.
+    QualifiedOutcomes {
+        /// Presented outcome references matched to canonical owner records.
+        resolved: Vec<eliot_skill::ResolvedOutcome>,
     },
     /// The pair was understood but refused: stable code plus detail.
     Refused {
@@ -445,14 +464,32 @@ impl SkillResultEnvelope {
 
     /// Builds an attempt-summary outcome from one validated harness receipt.
     ///
-    /// The summary keeps delivered, retrieved, activated, adhered and useful
-    /// distinct; absent adherence evidence stays unassessed or unknown, never
-    /// compliance, and usefulness additionally requires verifier-backed
-    /// outcome refs — never installation, retrieval, repetition or agreement.
+    /// The summary keeps delivered, retrieved, activated and adhered distinct;
+    /// absent adherence evidence stays unassessed or unknown, never
+    /// compliance. `useful` arrives already qualified by the ingest: this
+    /// constructor never computes it, so a plain boolean from unverified wire
+    /// strings can never be smuggled in here. Usefulness is established only
+    /// from owner-resolved outcome records — never installation, retrieval,
+    /// repetition or agreement.
     pub fn attempt(summary: eliot_skill::AttemptLifecycleSummary) -> Self {
         Self {
             contract_version: SKILL_TRANSPORT_VERSION,
-            outcome: SkillResultOutcome::Attempt(summary),
+            outcome: SkillResultOutcome::Attempt(Box::new(summary)),
+        }
+    }
+
+    /// Builds the owner-evidence leg that substantiates (or fails to
+    /// substantiate) an `Attempt` usefulness claim.
+    ///
+    /// Carries the exact owner records the ingest resolved, each with the
+    /// owner revision it was read at, so a receiver can re-verify the
+    /// qualification instead of trusting a bare flag. An empty list reports
+    /// that nothing resolved and is the honest state whenever the claim is
+    /// not `owner_backed`.
+    pub fn qualified_outcomes(resolved: Vec<eliot_skill::ResolvedOutcome>) -> Self {
+        Self {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            outcome: SkillResultOutcome::QualifiedOutcomes { resolved },
         }
     }
 

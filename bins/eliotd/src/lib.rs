@@ -91,6 +91,7 @@ mod route_receipts;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
+mod skill_evidence_read;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
@@ -2071,6 +2072,57 @@ impl DaemonComposition {
             }
         }
         self.governor.owners().skill.admit_material_attempt(receipt)
+    }
+
+    /// Publishes one window of execution evidence through the existing
+    /// Skill lifecycle/observation owner (issue #2663, I7.25).
+    ///
+    /// The daemon previously persisted only the outer host-response body and
+    /// returned "accepted" on that basis, discarding the very
+    /// [`SkillExecutionEvidence`](eliot_skill::SkillExecutionEvidence) slice
+    /// the ingest was admitted to carry. This seam binds the evidence to the
+    /// exact Skill identity the retained catalogue entry names and hands the
+    /// updated view back, so the caller returns the OWNER's result verbatim: a
+    /// claim never outruns persistence.
+    ///
+    /// Evidence is historical. It keeps the Skill revision, package digest and
+    /// attempt it was observed at, so ingesting it now never reactivates a
+    /// superseded Skill: the owner binds it to the stored view's exact
+    /// revision and package and refuses a mismatch.
+    ///
+    /// The crate error travels by value here like every neighboring
+    /// composition seam feeding the Governor lifecycle API, so the size
+    /// lint is allowed for this seam.
+    #[allow(clippy::result_large_err)]
+    pub fn skill_publish_execution_evidence(
+        &self,
+        payload: &eliot_agent_bridge_core::SkillExecutionPayload,
+    ) -> Result<eliot_skill::SkillLifecycleView, eliot_skill::SkillError> {
+        self.skill_reconcile_tool_basis()?;
+        let entry = {
+            let catalogue = self
+                .skill_catalogue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = catalogue
+                .get(&payload.skill_id)
+                .ok_or(eliot_skill::SkillError::NotFound)?;
+            entry.validate()?;
+            // The evidence is bound to the exact identity the retained
+            // catalogue entry names, so a substituted revision or package
+            // cannot be filed under the stored view's identity.
+            if entry.body.body_version != payload.skill_revision {
+                return Err(eliot_skill::SkillError::IdentityMismatch);
+            }
+            entry.clone()
+        };
+        self.governor.owners().skill.record_execution_evidence(
+            &payload.skill_id,
+            &payload.skill_revision,
+            &payload.package_digest,
+            &entry,
+            &payload.executions,
+        )
     }
 
     /// Carries the receiver ack back to the display boundary under a fresh

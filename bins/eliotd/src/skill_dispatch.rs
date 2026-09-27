@@ -82,7 +82,18 @@ enum PlannedSkillPair {
     Display(eliot_agent_bridge_core::SkillDisplayPayload),
     /// Material-use evidence is admitted against the live catalogue and
     /// Governor standing only after the plan's fence is rechecked.
-    Activation(Box<eliot_skill::SkillHarnessActivationReceipt>),
+    ///
+    /// The candidate carries the owner binding the plan resolved without the
+    /// composition lock: the subject's Skill revision/package, the
+    /// load-bearing owner revisions read, the outcome records that actually
+    /// resolved, and the coverage those reads achieved. `useful` is already
+    /// owner-qualified here — the bare wire receipt is not.
+    Activation(ActivationCandidate),
+    /// Execution evidence is reconciled and published through the lifecycle
+    /// owner, then committed against a fresh fence recheck. The decoded
+    /// payload and its reconciliation verdict travel together so the commit
+    /// publishes the SAME evidence the plan reconciled.
+    Execution(Box<ExecutionCandidate>),
     /// The acceptance read returned an owner-backed record at this fence.
     AcceptedIntake {
         /// Decoded candidate the Skill owner will validate and ingest.
@@ -94,6 +105,48 @@ enum PlannedSkillPair {
         /// from the same read (issue #1957, I3.4) without a second round trip.
         resolution: Box<AcceptanceResolution>,
     },
+}
+
+/// Activation ingest plan: the presented harness receipt kept DISTINCT from
+/// the authenticated ingest that carried it, plus the owner binding resolved
+/// for it without the composition lock.
+///
+/// The two identities are separate fields on purpose. `ingest_attempt_id` is
+/// this daemon's own authenticated `LocalReadAttempt` — what the daemon may do
+/// now. `receipt.attempt_ref` is the historical agent attempt the receipt
+/// observes — what happened then. Neither is derived from the other, and a
+/// receipt field never stands in for the ingest identity (I15.2: principal
+/// identity is issued by Kernel, never self-declared).
+pub struct ActivationCandidate {
+    /// The presented per-attempt receipt, unverified on its own.
+    receipt: Box<eliot_skill::SkillHarnessActivationReceipt>,
+    /// This ingest's own authenticated attempt id, from the Kernel route.
+    ingest_attempt_id: String,
+    /// Owner-revision binding the Skill owner resolved for the subject.
+    source_revisions: Vec<eliot_skill::SourceRevision>,
+    /// Owner records that resolved the receipt's presented outcome refs.
+    resolved_outcomes: Vec<eliot_skill::ResolvedOutcome>,
+    /// How completely the backing reads were served.
+    coverage: eliot_skill::EvidenceCoverage,
+}
+
+impl ActivationCandidate {
+    /// Owner-qualified summary for this attempt: the presented receipt's stage
+    /// claims, with usefulness resolved only from `resolved_outcomes`.
+    fn qualified_summary(&self) -> eliot_skill::AttemptLifecycleSummary {
+        eliot_skill::qualify_useful_outcomes(&self.receipt, &self.resolved_outcomes)
+    }
+}
+
+/// Execution ingest plan: the decoded evidence window plus the reconciliation
+/// verdict the plan computed without the composition lock.
+pub struct ExecutionCandidate {
+    /// The presented evidence window, bound to its Skill identity.
+    payload: Box<eliot_agent_bridge_core::SkillExecutionPayload>,
+    /// Unknown-effects verdict over the exact presented records.
+    verdict: Box<eliot_skill::UnknownEffectsVerdict>,
+    /// This ingest's own authenticated attempt id, from the Kernel route.
+    ingest_attempt_id: String,
 }
 
 /// Plans one claimed Skill pair, completing canonical acceptance reads without
@@ -157,15 +210,31 @@ pub async fn plan_skill_pair(
                 error.as_ref(),
             ))),
         },
-        SkillToolKind::Activate => match decode_activation(&arguments) {
-            Ok(receipt) => plan(PlannedSkillPair::Activation(Box::new(receipt))),
+        SkillToolKind::Activate => {
+            // Both arms yield a PlannedSkillPair; `plan` binds the claim
+            // legs onto whichever one the branch produced.
+            let action = match decode_activation(&arguments) {
+                Ok(receipt) => {
+                    plan_qualified_activation(
+                        kernel,
+                        admitted_fence.clone(),
+                        receipt,
+                        attempt.attempt_id.clone(),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    PlannedSkillPair::Resolved(SkillResultEnvelope::refused(error.as_ref()))
+                }
+            };
+            plan(action)
+        }
+        SkillToolKind::Execute => match decode_execution(&arguments, attempt.attempt_id.clone()) {
+            Ok(candidate) => plan(PlannedSkillPair::Execution(Box::new(candidate))),
             Err(error) => plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
                 error.as_ref(),
             ))),
         },
-        SkillToolKind::Execute => plan(PlannedSkillPair::Resolved(drive_execution_evidence(
-            &arguments,
-        ))),
     }
 }
 
@@ -261,17 +330,67 @@ async fn plan_accepted_inject(
     }
 }
 
-/// Commits the accepted intake against the current composition owner, then
-/// binds the final outcome to the exact local-read attempt.
+/// Publishes one owner-qualified activation candidate under a fresh
+/// composition borrow (issue #2663, I7.25 / I12.24).
 ///
-/// The commit step is also where the daemon-held Governor capability admission
-/// view is hydrated (issue #1957, I3.4): the same canonical
-/// `GetCapabilityEvidenceState` response that decided this intake is applied to
-/// the held registry, so the admission view stops being permanently empty.
-/// A hydration failure is a `warn` diagnostic naming the exact reason, never a
-/// silent pass and never a rewritten verdict — the held view keeps its
-/// previous contents, and a production route that view cannot evidence stays
-/// refused, because `declared` / `imported_legacy` records never admit.
+/// Revalidates every load-bearing owner binding before publishing: the plan's
+/// reads ran WITHOUT the composition lock, so a Skill row or lifecycle
+/// position that moved in between is caught here rather than published from a
+/// stale observation. The admission re-validates the receipt against its
+/// ORIGINAL recorded value and binds it to the stored view's exact revision
+/// and package.
+///
+/// A candidate whose backing reads were partial, truncated or blocked never
+/// publishes a settled claim: it reports the unresolved coverage instead, so
+/// absence of evidence is never read as a finding. A candidate that cannot
+/// name the ingest it arrived on, or that carries a broken owner revision
+/// binding, is refused outright.
+fn commit_activation_candidate(
+    composition: &mut DaemonComposition,
+    candidate: &ActivationCandidate,
+) -> SkillResultEnvelope {
+    let unpublished = if candidate.ingest_attempt_id.trim().is_empty() {
+        Some(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::InvalidField {
+                field: "ingest_attempt_id",
+                reason: "activation evidence must name the authenticated ingest attempt",
+            },
+        ))
+    } else if candidate
+        .source_revisions
+        .iter()
+        .any(|revision| revision.validate().is_err())
+    {
+        Some(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::InvalidField {
+                field: "source_revisions",
+                reason: "activation evidence must bind every load-bearing owner revision to a named source",
+            },
+        ))
+    } else if !candidate.coverage.is_settled() {
+        Some(SkillResultEnvelope::attempt(
+            eliot_skill::derive_attempt_summary(&candidate.receipt),
+        ))
+    } else {
+        None
+    };
+    match unpublished {
+        Some(outcome) => outcome,
+        None => match composition.skill_admit_material_attempt(&candidate.receipt) {
+            Ok(_) => {
+                // The stage claims come from the admitted summary; usefulness
+                // is re-decided here from the owner records the plan actually
+                // resolved, never from the admission result and never from the
+                // presented string set. The resolved records stay in the
+                // private candidate, so a receiver sees the qualified verdict
+                // rather than a raw flag.
+                SkillResultEnvelope::attempt(candidate.qualified_summary())
+            }
+            Err(error) => SkillResultEnvelope::refused(&error),
+        },
+    }
+}
+
 pub fn commit_skill_pair(
     composition: &mut DaemonComposition,
     envelope: &HostRequestEnvelope,
@@ -301,11 +420,36 @@ pub fn commit_skill_pair(
                     SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
                 }
             }
-            PlannedSkillPair::Activation(receipt) => {
+            PlannedSkillPair::Activation(candidate) => {
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
-                    match composition.skill_admit_material_attempt(&receipt) {
-                        Ok(summary) => SkillResultEnvelope::attempt(summary),
-                        Err(error) => SkillResultEnvelope::refused(&error),
+                    commit_activation_candidate(composition, &candidate)
+                } else {
+                    SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
+                }
+            }
+            PlannedSkillPair::Execution(candidate) => {
+                // Execute gets the fence recheck it previously lacked: the
+                // plan's reconciliation ran without the composition lock, so
+                // the verdict may only be published while the admitted fence
+                // still holds.
+                if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
+                    // This ingest's own attempt identity is a separate leg from
+                    // the historical executions being observed; evidence that
+                    // cannot name the ingest it arrived on is not a claim about
+                    // anything.
+                    if candidate.ingest_attempt_id.trim().is_empty() {
+                        SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+                            field: "ingest_attempt_id",
+                            reason: "execution evidence must name the authenticated ingest attempt",
+                        })
+                    } else {
+                        match composition.skill_publish_execution_evidence(&candidate.payload) {
+                            // The owner accepted the evidence: the reconciliation
+                            // verdict is only reported after the owner took it, so
+                            // a claim never outruns persistence.
+                            Ok(_published) => execution_verdict_outcome(&candidate.verdict),
+                            Err(error) => SkillResultEnvelope::refused(&error),
+                        }
                     }
                 } else {
                     SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
@@ -316,6 +460,16 @@ pub fn commit_skill_pair(
                 record,
                 resolution,
             } => {
+                // The commit step is also where the daemon-held Governor
+                // capability admission view is hydrated (issue #1957, I3.4):
+                // the same canonical `GetCapabilityEvidenceState` response that
+                // decided this intake is applied to the held registry, so the
+                // admission view stops being permanently empty. A hydration
+                // failure is a `warn` diagnostic naming the exact reason, never
+                // a silent pass and never a rewritten verdict — the held view
+                // keeps its previous contents, and a production route that
+                // view cannot evidence stays refused, because `declared` /
+                // `imported_legacy` records never admit.
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
                     let hydration = composition
                         .capability_admission_mut()
@@ -410,11 +564,12 @@ fn bind_accepted_intake(
 ///
 /// The wire receipt is validated on decode (eligibility↔retrieval,
 /// delivery↔retrieval, activation↔delivery, adherence↔activation bindings);
-/// the fold keeps delivered, retrieved, activated, adhered and useful
-/// distinct, so a packet-included but never activated Skill is never marked
-/// successful and usefulness still requires verifier-backed outcome refs.
+/// the fold keeps delivered, retrieved, activated and adhered distinct, so a
+/// packet-included but never activated Skill is never marked successful.
 /// Decoding alone cannot admit Material use: the commit leg checks the live
-/// catalogue and Governor standing before returning an attempt summary.
+/// catalogue and Governor standing before returning an attempt summary, and
+/// usefulness is resolved separately against owner records
+/// ([`plan_qualified_activation`]).
 fn decode_activation(
     arguments: &Value,
 ) -> Result<eliot_skill::SkillHarnessActivationReceipt, Box<eliot_skill::SkillError>> {
@@ -434,17 +589,114 @@ fn decode_activation(
     Ok(payload.receipt)
 }
 
-/// Drives one decoded execution-evidence ingest through unknown-effects
-/// reconciliation.
+/// Qualifies one decoded activation receipt against real owner records
+/// without holding the composition lock (issue #2663, I7.25 / I12.24).
+///
+/// Three identities stay distinct here and are never interchanged: this
+/// ingest's authenticated `LocalReadAttempt`, the receipt's historical
+/// `attempt_ref`, and the Kernel `operation_id`. The receipt is a *candidate*
+/// until the owner reads below bind it:
+///
+/// 1. the Skill owner (`GetCapabilityEvidenceState`, exact `skill_id`,
+///    `ExactFence`) resolves whether the subject Skill identity currently has
+///    a committed lifecycle row — the Skill revision/package binding. An
+///    unresolved Skill leaves the candidate unqualified, never positively
+///    useful and never negatively so;
+/// 2. the evidence owner (`GetLearningRecordRange`, closed
+///    `activation_receipt` kind, `ExactFence`) is read for the durable
+///    activation-receipt rows, and the receipt's presented
+///    `verified_outcome_refs` are resolved by CONTENT against those rows.
+///
+/// The result is a private plan: nothing is published here, and no
+/// composition state is borrowed. A refused or failed read is an error the
+/// caller turns into a typed refusal — never a silent pass.
+async fn plan_qualified_activation(
+    kernel: &DaemonKernelClient,
+    admitted_fence: StateFence,
+    receipt: eliot_skill::SkillHarnessActivationReceipt,
+    ingest_attempt_id: String,
+) -> PlannedSkillPair {
+    // 1. Skill-owner read: does a committed lifecycle row back this Skill at
+    //    the current revision? This binds the Skill revision/package, nothing
+    //    more — it is not a substitute for historical execution evidence.
+    let acceptance = match super::skill_acceptance_read::resolve_intake_acceptance(
+        kernel,
+        &admitted_fence,
+        &receipt.skill_id,
+        &receipt.package_digest,
+    )
+    .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                &eliot_skill::SkillError::Surface(error.to_string()),
+            ));
+        }
+    };
+    let subject =
+        super::skill_evidence_read::subject_binding_from_acceptance(&acceptance, &receipt.skill_id);
+    let super::skill_evidence_read::SubjectBinding::Resolved { revisions, .. } = subject else {
+        // No committed row binds this Skill. Absence of a row proves nothing:
+        // the candidate stays unqualified and is reported as such, never as a
+        // positive usefulness claim and never as a revocation.
+        return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::InvalidField {
+                field: "receipt.skill_id",
+                reason: "no committed lifecycle row backs this Skill at the current revision; the activation candidate remains unqualified",
+            },
+        ));
+    };
+
+    // 2. Evidence-owner read: resolve the presented outcome references against
+    //    durable owner records. There is no activated verifier-run producer
+    //    today, so this legitimately resolves nothing and usefulness stays
+    //    unestablished — the honest state, not a success port.
+    let (rows, coverage) = match super::skill_evidence_read::read_evidence_owner_records(
+        kernel,
+        &admitted_fence,
+        eliot_store_api::LearningRecordKind::ActivationReceipt,
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(error) => {
+            return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                &eliot_skill::SkillError::Surface(error.to_string()),
+            ));
+        }
+    };
+    let resolved_outcomes =
+        match super::skill_evidence_read::resolve_outcome_records(&receipt, &rows) {
+            super::skill_evidence_read::OutcomeResolution::Resolved { records } => records,
+            super::skill_evidence_read::OutcomeResolution::NoOwnerRecord => Vec::new(),
+        };
+    let mut source_revisions = revisions;
+    source_revisions.push(super::skill_evidence_read::activation_receipt_revision());
+    PlannedSkillPair::Activation(ActivationCandidate {
+        receipt: Box::new(receipt),
+        ingest_attempt_id,
+        source_revisions,
+        resolved_outcomes,
+        coverage,
+    })
+}
+
+/// Decodes one execution-evidence ingest into its own candidate plan
+/// (issue #2663).
 ///
 /// Every presented record is validated (observed executions require exact
-/// step refs; causal credit stays denied) and folded by outcome. A clean
-/// window carries its exact counts back; any still-uncertain execution
-/// refuses retry with the pending refs named, so unknown effects are
-/// reconciled by exact evidence before the next attempt. Absent records
-/// prove nothing — only presented evidence folds, and uninstrumented
-/// executions stay unknown instead of proving success.
-fn drive_execution_evidence(arguments: &Value) -> SkillResultEnvelope {
+/// step refs; causal credit stays denied) and folded by outcome. The
+/// reconciliation verdict travels WITH the payload so the commit publishes
+/// exactly the evidence that was reconciled, rather than re-deriving counts
+/// and dropping the slice (which previously discarded the very evidence the
+/// ingest was admitted to carry). Absent records prove nothing: only
+/// presented evidence folds, and uninstrumented executions stay unknown
+/// instead of proving success.
+fn decode_execution(
+    arguments: &Value,
+    ingest_attempt_id: String,
+) -> Result<ExecutionCandidate, Box<eliot_skill::SkillError>> {
     let payload = match canonical_json_bytes(&arguments)
         .map_err(|error| error.to_string())
         .and_then(|bytes| {
@@ -453,29 +705,42 @@ fn drive_execution_evidence(arguments: &Value) -> SkillResultEnvelope {
         }) {
         Ok(payload) => payload,
         Err(detail) => {
-            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+            return Err(Box::new(eliot_skill::SkillError::Surface(format!(
                 "execution arguments fail their shape: {detail}"
-            )));
+            ))));
         }
     };
-    match eliot_skill::reconcile_unknown_effects(&payload.executions) {
-        Ok(verdict) => {
-            if verdict.retry_permitted() {
-                SkillResultEnvelope::evidence(verdict.observed, verdict.failed, 0)
-            } else {
-                SkillResultEnvelope {
-                    contract_version: eliot_agent_bridge_core::SKILL_TRANSPORT_VERSION,
-                    outcome: eliot_agent_bridge_core::SkillResultOutcome::Refused {
-                        code: "UNCERTAIN_EFFECTS".to_owned(),
-                        detail: format!(
-                            "{} execution(s) have unknown effects; reconcile with exact evidence before retry",
-                            verdict.uncertain_pending_refs.len()
-                        ),
-                    },
-                }
-            }
+    let verdict = eliot_skill::reconcile_unknown_effects(&payload.executions).map_err(Box::new)?;
+    // The ingest's own identity is the Kernel-admitted `LocalReadAttempt`,
+    // which the caller supplies; it is not the Skill's historical attempt and
+    // is never taken from a payload field.
+    Ok(ExecutionCandidate {
+        payload: Box::new(payload),
+        verdict: Box::new(verdict),
+        ingest_attempt_id,
+    })
+}
+
+/// Projects a reconciled execution verdict into its result envelope.
+///
+/// Retry stays permitted only when nothing is uncertain: an uncertain
+/// execution has unknown effects, and an unknown effect must be reconciled
+/// before the next attempt. This is the ONLY place the execute verdict turns
+/// into a wire outcome, so the counts and the refusal reason cannot diverge.
+fn execution_verdict_outcome(verdict: &eliot_skill::UnknownEffectsVerdict) -> SkillResultEnvelope {
+    if verdict.retry_permitted() {
+        SkillResultEnvelope::evidence(verdict.observed, verdict.failed, 0)
+    } else {
+        SkillResultEnvelope {
+            contract_version: eliot_agent_bridge_core::SKILL_TRANSPORT_VERSION,
+            outcome: eliot_agent_bridge_core::SkillResultOutcome::Refused {
+                code: "UNCERTAIN_EFFECTS".to_owned(),
+                detail: format!(
+                    "{} execution(s) have unknown effects; reconcile with exact evidence before retry",
+                    verdict.uncertain_pending_refs.len()
+                ),
+            },
         }
-        Err(error) => SkillResultEnvelope::refused(&error),
     }
 }
 
