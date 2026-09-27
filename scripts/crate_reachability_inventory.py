@@ -26,12 +26,19 @@ import time
 import tomllib
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import date, datetime as datetime_now, timezone
 from pathlib import Path
 from typing import Any, Final, Protocol
 
 SCHEMA: Final = "eliot.crate-reachability-inventory.v1"
-TOOL_VERSION: Final = "0.1.0"
+TOOL_VERSION: Final = "0.2.0"
 OUTPUT_ROOT: Final = ".eliot"
+
+# Issue #1720 extends the #1133 inventory with a checked CrateExtractionDecision
+# classification layer. The dispositions are POLICY, so they are never inferred from
+# source statistics; they are read from a declared, versioned, checked-in data file.
+DECISION_SCHEMA: Final = "eliot.crate-extraction-decision.v1"
+DECISION_DATA_RELPATH: Final = "scripts/testdata/crate-reachability/crate_extraction_decisions.toml"
 
 
 class InventoryError(RuntimeError):
@@ -83,6 +90,37 @@ class SourceScope(str, enum.Enum):
     EXAMPLE = "EXAMPLE"
     BENCH = "BENCH"
     UNKNOWN = "UNKNOWN"
+
+
+class CrateExtractionDecision(str, enum.Enum):
+    """The only four admitted dispositions for an unreachable package (#1720)."""
+
+    CONNECT = "Connect"
+    CONTRACT_ONLY = "ContractOnly"
+    MIGRATION_FACADE = "MigrationFacade"
+    OPTIONAL_CONTOUR = "OptionalContour"
+
+
+class AdmissionDefect(str, enum.Enum):
+    """Reasons a package is not legitimately admitted.
+
+    ``UNCLASSIFIED`` is the issue's "treat any remaining unclassified package as an
+    admission defect" rule. The other codes are the machine-checkable ways a
+    recorded disposition fails to hold against the computed graph.
+    """
+
+    UNCLASSIFIED = "UNCLASSIFIED"
+    FACADE_OWNER_MISSING = "FACADE_OWNER_MISSING"
+    FACADE_EXPIRY_MISSING = "FACADE_EXPIRY_MISSING"
+    FACADE_EXPIRED = "FACADE_EXPIRED"
+    FACADE_REMOVAL_CONDITION_MISSING = "FACADE_REMOVAL_CONDITION_MISSING"
+    FACADE_SUCCESSOR_MISSING = "FACADE_SUCCESSOR_MISSING"
+    DISPOSITION_CONTRADICTS_REACHABILITY = "DISPOSITION_CONTRADICTS_REACHABILITY"
+    DECLARED_CONSUMER_ABSENT = "DECLARED_CONSUMER_ABSENT"
+    DECLARED_BUNDLE_ABSENT = "DECLARED_BUNDLE_ABSENT"
+    DECLARED_CONTOUR_ABSENT = "DECLARED_CONTOUR_ABSENT"
+    DUPLICATE_DECISION_IDENTITY = "DUPLICATE_DECISION_IDENTITY"
+    DECISION_FOR_UNKNOWN_PACKAGE = "DECISION_FOR_UNKNOWN_PACKAGE"
 
 
 class Runner(Protocol):
@@ -170,6 +208,28 @@ class SourceFileEvidence:
     public_items: int
     test_attributes: int
     identifiers: tuple[str, ...]
+    # Identifiers including comment/``doc``/string bodies. A token present here but
+    # absent from ``identifiers`` is referenced by documentation or a string only and
+    # is therefore not a source-level construction of the capability.
+    raw_identifiers: tuple[str, ...] = ()
+
+    def to_json(self) -> dict[str, Any]:
+        """Project evidence for the report.
+
+        ``raw_identifiers`` stays internal: it exists only to separate documentation
+        references from code constructions and would otherwise dominate the output.
+        """
+        return {
+            "package_key": self.package_key,
+            "package_name": self.package_name,
+            "path": self.path,
+            "scope": self.scope,
+            "sha256": self.sha256,
+            "nonblank_loc": self.nonblank_loc,
+            "public_items": self.public_items,
+            "test_attributes": self.test_attributes,
+            "identifiers": list(self.identifiers),
+        }
 
 
 TEXT_INDICATORS: Final[tuple[tuple[str, str], ...]] = (
@@ -199,6 +259,7 @@ PUBLIC_ITEM_RE: Final = re.compile(
 )
 TEST_ATTRIBUTE_RE: Final = re.compile(r"#\s*\[\s*(?:tokio\s*::\s*)?test(?:\s*\([^]]*\))?\s*\]")
 IDENTIFIER_RE: Final = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+ISO_DATE_RE: Final = re.compile(r"\d{4}-\d{2}-\d{2}")
 _CHAR_PATTERN: Final = re.compile(
     r"^(?:b)?'(?:\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F_]{1,6}\}|\\[\\'\"0ntre]|[^\\'\n\r])'"
 )
@@ -275,6 +336,141 @@ def _json_object(raw: bytes, *, source: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise InventoryError("MALFORMED_JSON", f"expected JSON object from {source}")
     return value
+
+
+@dataclasses.dataclass(frozen=True)
+class DecisionRecord:
+    """One checked, policy-declared CrateExtractionDecision disposition."""
+
+    package: str
+    disposition: CrateExtractionDecision
+    rationale: str
+    owner: str | None
+    expires: str | None
+    successor: str | None
+    removal_condition: str | None
+    declared_consumer: str | None
+    declared_bundle: str | None
+    declared_contour: str | None
+    contour_excluded_from_default_path: bool | None
+    proof_entrypoint: str | None
+    review_owner: str | None
+    source_ref: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "package": self.package,
+            "disposition": self.disposition.value,
+            "rationale": self.rationale,
+            "owner": self.owner,
+            "expires": self.expires,
+            "successor": self.successor,
+            "removal_condition": self.removal_condition,
+            "declared_consumer": self.declared_consumer,
+            "declared_bundle": self.declared_bundle,
+            "declared_contour": self.declared_contour,
+            "contour_excluded_from_default_path": self.contour_excluded_from_default_path,
+            "proof_entrypoint": self.proof_entrypoint,
+            "review_owner": self.review_owner,
+            "source_ref": self.source_ref,
+        }
+
+
+def _require_str(value: Any, field: str, package: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{package}: field '{field}' must be a non-empty string")
+    return value.strip()
+
+
+def _optional_str(value: Any, field: str, package: str) -> str | None:
+    if value is None:
+        return None
+    return _require_str(value, field, package)
+
+
+def _require_bool(value: Any, field: str, package: str) -> bool:
+    if not isinstance(value, bool):
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{package}: field '{field}' must be a boolean")
+    return value
+
+
+def _parse_iso_date(value: str, field: str, package: str) -> date:
+    if not ISO_DATE_RE.fullmatch(value):
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{package}: field '{field}' must be an ISO-8601 date, got {value!r}")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{package}: field '{field}' is not a real date: {value!r}") from exc
+
+
+def load_decision_records(root: Path) -> tuple[str, str, tuple[DecisionRecord, ...]]:
+    """Read the declared CrateExtractionDecision registry.
+
+    The registry is the explicit record required by #1720. It is never synthesized
+    from source statistics: absent records simply stay unclassified and are reported
+    as admission defects. Malformed data fails closed.
+    """
+    data_path = _inside(root, root / DECISION_DATA_RELPATH)
+    raw = _read_bytes(root, data_path, max_bytes=BOUNDS.max_source_file_bytes)
+    try:
+        document = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{DECISION_DATA_RELPATH} is not valid UTF-8 TOML") from exc
+    schema = document.get("schema")
+    if schema != DECISION_SCHEMA:
+        raise InventoryError(
+            "MALFORMED_DECISION_DATA",
+            f"{DECISION_DATA_RELPATH}: expected schema {DECISION_SCHEMA!r}, got {schema!r}",
+        )
+    revision = _require_str(document.get("revision"), "revision", DECISION_DATA_RELPATH)
+    entries = document.get("decision")
+    if not isinstance(entries, list):
+        raise InventoryError("MALFORMED_DECISION_DATA", f"{DECISION_DATA_RELPATH}: 'decision' must be an array")
+    records: list[DecisionRecord] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise InventoryError("MALFORMED_DECISION_DATA", "each 'decision' entry must be a table")
+        package = _require_str(entry.get("package"), "package", "<entry>")
+        if package in seen:
+            raise InventoryError("DUPLICATE_DECISION_IDENTITY", f"{DECISION_DATA_RELPATH}: duplicate decision for {package!r}")
+        seen.add(package)
+        raw_disposition = _require_str(entry.get("disposition"), "disposition", package)
+        try:
+            disposition = CrateExtractionDecision(raw_disposition)
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in CrateExtractionDecision)
+            raise InventoryError(
+                "MALFORMED_DECISION_DATA",
+                f"{package}: disposition must be one of [{allowed}], got {raw_disposition!r}",
+            ) from exc
+        owner = _optional_str(entry.get("owner"), "owner", package)
+        expires = _optional_str(entry.get("expires"), "expires", package)
+        if expires is not None:
+            _parse_iso_date(expires, "expires", package)
+        records.append(
+            DecisionRecord(
+                package=package,
+                disposition=disposition,
+                rationale=_require_str(entry.get("rationale"), "rationale", package),
+                owner=owner,
+                expires=expires,
+                successor=_optional_str(entry.get("successor"), "successor", package),
+                removal_condition=_optional_str(entry.get("removal_condition"), "removal_condition", package),
+                declared_consumer=_optional_str(entry.get("declared_consumer"), "declared_consumer", package),
+                declared_bundle=_optional_str(entry.get("declared_bundle"), "declared_bundle", package),
+                declared_contour=_optional_str(entry.get("declared_contour"), "declared_contour", package),
+                contour_excluded_from_default_path=(
+                    _require_bool(entry["contour_excluded_from_default_path"], "contour_excluded_from_default_path", package)
+                    if "contour_excluded_from_default_path" in entry
+                    else None
+                ),
+                proof_entrypoint=_optional_str(entry.get("proof_entrypoint"), "proof_entrypoint", package),
+                review_owner=_optional_str(entry.get("review_owner"), "review_owner", package),
+                source_ref=_require_str(entry.get("source_ref"), "source_ref", package),
+            )
+        )
+    return _sha256(raw), revision, tuple(sorted(records, key=lambda item: item.package))
 
 
 def _tracked_manifests(root: Path, runner: Runner) -> tuple[str, ...]:
@@ -633,6 +829,7 @@ def _scan_sources(
                 public_items=len(PUBLIC_ITEM_RE.findall(masked)),
                 test_attributes=len(TEST_ATTRIBUTE_RE.findall(masked)),
                 identifiers=identifiers,
+                raw_identifiers=tuple(sorted(set(IDENTIFIER_RE.findall(text)))),
             )
         )
         for token, category in TEXT_INDICATORS:
@@ -741,6 +938,7 @@ def _package_rows(
         forward_edges[edge["from_package"]].append(edge)
 
     token_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    doc_only_consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     source_by_package: dict[str, list[SourceFileEvidence]] = defaultdict(list)
     findings_by_package: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
@@ -753,9 +951,14 @@ def _package_rows(
         source_by_package[key].extend(evidence)
         findings_by_package[key].extend(package_findings)
         for file in evidence:
+            code_only = set(file.identifiers)
+            # Documentation/string-only references are tracked separately and must
+            # never be promoted to a production construction of the capability.
+            for identifier in set(file.raw_identifiers) - code_only:
+                doc_only_consumers[identifier].add((key, file.scope))
             if file.scope not in {SourceScope.PRODUCTION.value, SourceScope.BUILD.value}:
                 continue
-            for identifier in file.identifiers:
+            for identifier in code_only:
                 token_consumers[identifier].add((key, file.scope))
 
     for key, package in sorted(package_by_key.items()):
@@ -764,6 +967,7 @@ def _package_rows(
         package_name = str(package.get("name", ""))
         crate_identifier = package_name.replace("-", "_")
         source_consumers: list[dict[str, str]] = []
+        documentation_only_consumers: list[dict[str, str]] = []
         for consumer_key, scope in sorted(token_consumers.get(crate_identifier, set())):
             if consumer_key == key:
                 continue
@@ -773,6 +977,10 @@ def _package_rows(
                     "SOURCE_CONSUMER_LIMIT",
                     f"source consumer count exceeds {BOUNDS.max_source_consumers_per_package}: {package_name}",
                 )
+        for consumer_key, scope in sorted(doc_only_consumers.get(crate_identifier, set())):
+            if consumer_key == key:
+                continue
+            documentation_only_consumers.append({"package_key": consumer_key, "scope": scope})
         rev = sorted(
             reverse_edges.get(key, []),
             key=lambda item: (item["from_package"], item["kind"], item["target"] or ""),
@@ -852,6 +1060,27 @@ def _package_rows(
             ),
             "reverse_dependency_edges": rev,
             "source_consumers": source_consumers,
+            "documentation_only_consumers": documentation_only_consumers,
+            "capability_construction": (
+                # The crate identifier appearing as a *code* identifier is the only
+                # signal that the public capability is constructed/called. A bare
+                # dependency edge never reaches this state.
+                "PRODUCTION_CONSTRUCTED"
+                if source_prod_consumers
+                else (
+                    "BUILD_CONSTRUCTED"
+                    if source_build_consumers
+                    else (
+                        "TEST_ONLY"
+                        if any(item["scope"] == SourceScope.TEST.value for item in source_consumers)
+                        else (
+                            "DOCUMENTATION_ONLY"
+                            if documentation_only_consumers
+                            else "NOWHERE"
+                        )
+                    )
+                )
+            ),
             "reachability": reachability.value,
             "source_summary": {
                 "files": len(files),
@@ -911,7 +1140,201 @@ def _package_rows(
     )
 
 
-def build_inventory(root: Path, runner: Runner | None = None) -> dict[str, Any]:
+def _package_names_by_key(packages: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    return {str(item["package_key"]): str(item["name"]) for item in packages}
+
+
+def _workspace_package_names(packages: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                str(item["name"])
+                for item in packages
+                if item.get("workspace_member") and item.get("source") is None
+            }
+        )
+    )
+
+
+def _record_defects(record: DecisionRecord, as_of: date) -> list[str]:
+    """Facade obligations are machine-checkable, not prose."""
+    if record.disposition is not CrateExtractionDecision.MIGRATION_FACADE:
+        return []
+    defects: list[str] = []
+    if record.owner is None:
+        defects.append(AdmissionDefect.FACADE_OWNER_MISSING.value)
+    if record.expires is None:
+        defects.append(AdmissionDefect.FACADE_EXPIRY_MISSING.value)
+    else:
+        try:
+            expiry = _parse_iso_date(record.expires, "expires", record.package)
+        except InventoryError:
+            defects.append(AdmissionDefect.FACADE_EXPIRY_MISSING.value)
+        else:
+            if expiry < as_of:
+                defects.append(AdmissionDefect.FACADE_EXPIRED.value)
+    if record.removal_condition is None:
+        defects.append(AdmissionDefect.FACADE_REMOVAL_CONDITION_MISSING.value)
+    if record.successor is None:
+        defects.append(AdmissionDefect.FACADE_SUCCESSOR_MISSING.value)
+    return sorted(defects)
+
+
+def _name_set(values: Iterable[str | None]) -> set[str]:
+    return {value for value in values if isinstance(value, str) and value}
+
+
+def classify_unreachable_packages(
+    packages: Sequence[dict[str, Any]],
+    records: Sequence[DecisionRecord],
+    *,
+    as_of: date,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Classify every production-admitted, binary-unreachable workspace package.
+
+    Returns ``(classifications, admission_defects, orphan_decisions)``. A package
+    that is both production-admitted and unreachable from every binary/service
+    consumer and has no valid, non-expired disposition is an admission defect.
+    """
+    name_by_key = _package_names_by_key(packages)
+    workspace_names = set(_workspace_package_names(packages))
+    packages_by_name: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for item in packages:
+        packages_by_name[str(item["name"])].append(item)
+    known_names = set(packages_by_name)
+
+    unreachable_names = {
+        str(item["name"])
+        for item in packages
+        if item.get("workspace_member")
+        and item.get("source") is None
+        and item["reachability"]
+        in {Reachability.NO_CONSUMER.value, Reachability.UNRESOLVED_DYNAMIC.value, Reachability.TEST_ONLY.value}
+    }
+
+    record_by_package: dict[str, DecisionRecord] = {}
+    for record in records:
+        if record.package in record_by_package:
+            raise InventoryError("DUPLICATE_DECISION_IDENTITY", f"duplicate decision for {record.package!r}")
+        if not isinstance(record.disposition, CrateExtractionDecision):
+            try:
+                record = dataclasses.replace(record, disposition=CrateExtractionDecision(record.disposition))
+            except ValueError as exc:
+                raise InventoryError(
+                    "MALFORMED_DECISION_DATA",
+                    f"{record.package}: disposition must be one of "
+                    f"{[item.value for item in CrateExtractionDecision]}, got {record.disposition!r}",
+                ) from exc
+        record_by_package[record.package] = record
+
+    orphan_decisions = [
+        {
+            "package": record.package,
+            "disposition": record.disposition.value,
+            "defect": AdmissionDefect.DECISION_FOR_UNKNOWN_PACKAGE.value,
+        }
+        for record in record_by_package.values()
+        if record.package not in known_names
+    ]
+
+    classifications: list[dict[str, Any]] = []
+    admission_defects: list[dict[str, Any]] = []
+
+    for name in sorted(unreachable_names):
+        candidates = [
+            item
+            for item in packages_by_name[name]
+            if item["reachability"]
+            in {Reachability.NO_CONSUMER.value, Reachability.UNRESOLVED_DYNAMIC.value, Reachability.TEST_ONLY.value}
+        ]
+        # Duplicate package identity across metadata graphs is already a fail-closed
+        # error upstream; here the same name may appear in several graphs.
+        row = min(candidates, key=lambda item: str(item["package_key"]))
+        record = record_by_package.get(name)
+        defects: list[str] = []
+        declared_consumer = record.declared_consumer if record is not None else None
+
+        if record is None:
+            defects.append(AdmissionDefect.UNCLASSIFIED.value)
+        else:
+            defects.extend(_record_defects(record, as_of))
+            if record.disposition is CrateExtractionDecision.CONNECT:
+                # A Connect disposition names the owning bundle/binary the package
+                # will be wired into. An unnamed target is an unowned promise.
+                if record.declared_bundle is None:
+                    defects.append(AdmissionDefect.DECLARED_BUNDLE_ABSENT.value)
+                elif record.declared_bundle not in known_names:
+                    defects.append(AdmissionDefect.DECLARED_BUNDLE_ABSENT.value)
+                elif declared_consumer is None and not row["source_consumers"]:
+                    # The bundle exists but nothing constructs the capability yet:
+                    # the promised edge is still unwired.
+                    defects.append(AdmissionDefect.DECLARED_CONSUMER_ABSENT.value)
+            elif record.disposition is CrateExtractionDecision.CONTRACT_ONLY:
+                if record.declared_consumer is None:
+                    defects.append(AdmissionDefect.DECLARED_CONSUMER_ABSENT.value)
+                elif record.declared_consumer not in known_names:
+                    defects.append(AdmissionDefect.DECLARED_CONSUMER_ABSENT.value)
+            elif record.disposition is CrateExtractionDecision.OPTIONAL_CONTOUR:
+                if record.declared_contour is None:
+                    defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
+                if record.proof_entrypoint is None:
+                    defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
+                if row.get("workspace_default_member"):
+                    # The disposition claims exclusion from the root daily path, but
+                    # declared workspace metadata puts the package on it.
+                    defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
+                if record.contour_excluded_from_default_path is False:
+                    defects.append(AdmissionDefect.DECLARED_CONTOUR_ABSENT.value)
+            elif record.disposition is CrateExtractionDecision.MIGRATION_FACADE:
+                # A facade is admitted only while it is still unexpired; an expired
+                # facade is exactly the admission defect the issue describes.
+                pass
+
+        if record is not None:
+            classification = {
+                "package": name,
+                "package_key": str(row["package_key"]),
+                "manifest_path": str(row["manifest_path"]),
+                "reachability": str(row["reachability"]),
+                "capability_construction": str(row["capability_construction"]),
+                "classification": record.disposition.value,
+                "admitted": not defects,
+                "defects": sorted(set(defects)),
+                "record": record.to_json(),
+            }
+        else:
+            classification = {
+                "package": name,
+                "package_key": str(row["package_key"]),
+                "manifest_path": str(row["manifest_path"]),
+                "reachability": str(row["reachability"]),
+                "capability_construction": str(row["capability_construction"]),
+                "classification": None,
+                "admitted": False,
+                "defects": sorted(set(defects)),
+                "record": None,
+            }
+        classifications.append(classification)
+        if classification["defects"]:
+            admission_defects.append(
+                {
+                    "package": name,
+                    "manifest_path": classification["manifest_path"],
+                    "reachability": classification["reachability"],
+                    "capability_construction": classification["capability_construction"],
+                    "classification": classification["classification"],
+                    "defects": classification["defects"],
+                }
+            )
+
+    return (
+        sorted(classifications, key=lambda item: item["package"]),
+        sorted(admission_defects, key=lambda item: item["package"]),
+        sorted(orphan_decisions, key=lambda item: item["package"]),
+    )
+
+
+def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | None = None) -> dict[str, Any]:
     root = _root(root)
     runner = runner or SubprocessRunner()
     started = time.monotonic()
@@ -932,6 +1355,17 @@ def build_inventory(root: Path, runner: Runner | None = None) -> dict[str, Any]:
         raise InventoryError("INVALID_SOURCE_IDENTITY", "git HEAD is not a full commit identity")
     lock_path = root / "Cargo.lock"
     lock_sha = _sha256(_read_bytes(root, lock_path, max_bytes=128 * 1024 * 1024)) if lock_path.is_file() else None
+    # The decision registry is part of the evidence surface: binding its hash into
+    # the aggregate means any edit to a disposition invalidates every row.
+    decision_path = _inside(root, root / DECISION_DATA_RELPATH)
+    decision_sha = _sha256(_read_bytes(root, decision_path, max_bytes=BOUNDS.max_source_file_bytes))
+    _, decision_revision, records = load_decision_records(root)
+    as_of = as_of or datetime_now(timezone.utc).date()
+    classifications, admission_defects, orphan_decisions = classify_unreachable_packages(
+        packages,
+        records,
+        as_of=as_of,
+    )
     semantic = {
         "schema": SCHEMA,
         "tool_version": TOOL_VERSION,
@@ -955,7 +1389,21 @@ def build_inventory(root: Path, runner: Runner | None = None) -> dict[str, Any]:
             for graph in sorted(graphs, key=lambda item: (item.manifest_path, item.graph_id))
         ],
         "packages": packages,
-        "source_files": [dataclasses.asdict(item) for item in source_files],
+        "extraction_classification": {
+            "schema": DECISION_SCHEMA,
+            "decision_data_path": DECISION_DATA_RELPATH,
+            "decision_data_sha256": decision_sha,
+            "revision": decision_revision,
+            "as_of": as_of.isoformat(),
+            "classifications": classifications,
+            "admission_defects": admission_defects,
+            "orphan_decisions": orphan_decisions,
+            "count_by_disposition": {
+                disposition.value: sum(item["classification"] == disposition.value for item in classifications)
+                for disposition in CrateExtractionDecision
+            },
+        },
+        "source_files": [item.to_json() for item in source_files],
         "findings": findings,
         "summary": {
             "tracked_manifests": len(manifests),
@@ -967,7 +1415,12 @@ def build_inventory(root: Path, runner: Runner | None = None) -> dict[str, Any]:
             "packages_with_binary_entrypoint": sum(item["reachability"] == Reachability.BINARY_ENTRYPOINT.value for item in packages),
             "packages_requiring_review": sum(item["review_state"] == "REVIEW_REQUIRED" for item in packages),
             "complete_denominator": True,
-            "proof_ceiling": "CRATE_REACHABILITY_AND_SOURCE_SHAPE_EVIDENCE_ONLY",
+            "unreachable_classified": sum(item["admitted"] for item in classifications),
+            "admission_defects": len(admission_defects),
+            "unclassified_unreachable": sum(
+                AdmissionDefect.UNCLASSIFIED.value in item["defects"] for item in classifications
+            ),
+            "proof_ceiling": "CRATE_REACHABILITY_CLASSIFICATION_AND_SOURCE_SHAPE_EVIDENCE_ONLY",
         },
     }
     semantic["aggregate_sha256"] = _sha256(_canonical_bytes(semantic))
@@ -1051,6 +1504,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true", help="allow overwriting existing output")
     parser.add_argument("--self-test", action="store_true", help="run internal self-tests")
+    parser.add_argument(
+        "--as-of",
+        type=str,
+        default=None,
+        help="evaluate disposition expiry as of this ISO-8601 date (default: today, UTC)",
+    )
+    parser.add_argument(
+        "--allow-admission-defects",
+        action="store_true",
+        help="exit 0 even when unclassified unreachable packages remain",
+    )
     return parser
 
 
@@ -1068,9 +1532,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
     try:
+        as_of = _parse_iso_date(args.as_of, "--as-of", "<argv>") if args.as_of is not None else None
         root = _root(args.repo_root)
         output = _safe_output(root, args.output, overwrite=args.overwrite)
-        inventory = build_inventory(root)
+        inventory = build_inventory(root, as_of=as_of)
         output.parent.mkdir(parents=True, exist_ok=True)
         if args.overwrite and output.exists():
             output.unlink()
@@ -1086,20 +1551,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    summary = inventory["summary"]
     print(
         json.dumps(
             {
-                "status": "ok",
+                "status": "ok" if not summary["admission_defects"] else "admission_defects",
                 "output": str(output),
-                "packages": inventory["summary"]["packages"],
-                "manifests": inventory["summary"]["tracked_manifests"],
-                "findings": inventory["summary"]["findings"],
+                "packages": summary["packages"],
+                "manifests": summary["tracked_manifests"],
+                "findings": summary["findings"],
+                "unreachable_classified": summary["unreachable_classified"],
+                "admission_defects": summary["admission_defects"],
+                "unclassified_unreachable": summary["unclassified_unreachable"],
+                "count_by_disposition": inventory["extraction_classification"]["count_by_disposition"],
+                "admission_defect_packages": [
+                    {"package": item["package"], "defects": item["defects"]}
+                    for item in inventory["extraction_classification"]["admission_defects"]
+                ],
                 "aggregate_sha256": inventory["aggregate_sha256"],
-                "proof_ceiling": inventory["summary"]["proof_ceiling"],
+                "proof_ceiling": summary["proof_ceiling"],
             },
             sort_keys=True,
         )
     )
+    if summary["admission_defects"] and not args.allow_admission_defects:
+        return 3
     return 0
 
 
