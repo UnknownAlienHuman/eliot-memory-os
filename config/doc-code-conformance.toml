@@ -223,6 +223,7 @@ ignore_globs = [
   "scripts/docs_shards.py",
   "scripts/verify-doc-code-conformance.py",
   "scripts/doc_code_conformance_core.py",
+  "scripts/work_unit_gate/doc_read_evidence.py",
   "config/doc-code-conformance.toml",
   ".github/workflows/repository-policy.yml",
 ]

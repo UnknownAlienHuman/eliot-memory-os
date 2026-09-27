@@ -53,6 +53,11 @@ committed as repository authority.
 | `audit_cue_kind_retirement.py` | Cross-package `CueKind` retirement oracle library over the static source/wire/caller denominator (#835); exercised by `scripts/tests/test_cue_kind_retirement.py` | Static source denominator evidence only |
 | `verify-excluded-dispositions-1811.py` | Fail-closed excluded/standalone disposition gate over standalone packages and root exclude entries with consumption evidence checks (#1811) | Static source and packaging evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
+| `audit_host_diagnostic_coverage.py` | Bounded Host diagnostic coverage and identity validator (#985) | Static host diagnostic coverage evidence only |
+| `documentation_evidence_check.py` | Frozen outer documentation evidence package verifier (I18.31 W4) | Documentation evidence package re-extraction evidence only |
+| `gen_operator_schedule_contract.py` | Generate C# mirror of Kernel UserAutomation schedule contract (#2865) | Generated C# schedule contract mirror only |
+| `gen_user_automation_zone_table.py` | Generate pinned IANA zone table for Kernel UserAutomation occurrence validator (#2805) | Pinned IANA zone table generation only |
+| `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 
 The three public documentation entrypoints are intentionally small front doors.
