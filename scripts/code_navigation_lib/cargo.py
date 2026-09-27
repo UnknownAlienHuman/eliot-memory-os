@@ -119,7 +119,7 @@ def inferred_targets(
         return value
 
     targets: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: dict[tuple[str, str], str] = {}
 
     def add(
         kind: str,
@@ -134,16 +134,22 @@ def inferred_targets(
             if required and strict:
                 raise NavigationError(f"Cargo {kind} target does not exist: {relative}")
             return
+        features = ",".join(required_features or ())
         key = (kind, relative)
         if key in seen:
+            if required_features is not None and seen[key] != features:
+                raise NavigationError(
+                    f"Cargo {kind} target is declared more than once with different "
+                    f"required-features: {relative}"
+                )
             return
-        seen.add(key)
+        seen[key] = features
         targets.append(
             {
                 "kind": kind,
                 "name": str(name).strip() if name is not None else Path(relative).stem,
                 "path": relative,
-                "required_features": ",".join(required_features or ()),
+                "required_features": features,
             }
         )
 
