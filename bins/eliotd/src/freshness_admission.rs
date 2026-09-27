@@ -22,7 +22,7 @@
 //! - `INCOMPLETE` rejects promotion for unresolved provenance or task
 //!   mismatch; the safe raw observation may remain cold/quarantined;
 //! - `PROJECTION_PENDING` marks a durably committed candidate whose hot
-//!   projection has no matching [`ProjectionPublicationRecord`] with status
+//!   projection has no matching `ProjectionPublicationRecord` with status
 //!   `CURRENT`.
 //!
 //! `WriteReceipt.status=committed` proves durable transport only. It does not
@@ -42,6 +42,40 @@
 //! - quarantine, recovery, and re-publication directives stay with their
 //!   owners; this cell only names the disposition, it never executes recovery.
 //!
+//! Canonical publication record (delegate, never re-declare):
+//!
+//! The durable `ProjectionPublicationRecord` and the fenced publication that
+//! carries its projection definition digest and its atomic commit reference
+//! are owned by the neutral store contract
+//! (`eliot_store_api::canonical_event`, "A composition binary may only
+//! re-export this contract; a binary name never creates store or
+//! canonical-write ownership"). This cell therefore re-declares no
+//! publication mode, publication status, or publication record: it consumes
+//! [`FencedProjectionPublication`] and delegates the whole currency decision
+//! to the one store predicate [`FencedProjectionPublication::check_current`].
+//! That predicate enforces exactly the clauses I5.8 requires of a
+//! readable-as-current publication — `CURRENT` status, no split view, the
+//! expected source generation, an exact fence-pinned source-head match, a
+//! well-formed provenance manifest, the projection definition digest, and the
+//! atomic data/provenance commit coupling — so candidate data and provenance
+//! become visible atomically or the projection stays unreadable as current.
+//! The `I5.8` record vocabulary is exactly the store's own vocabulary:
+//! `ProjectionStatus` and `ProjectionMode` serialize as `SCREAMING_SNAKE_CASE`
+//! (`PENDING`/`CURRENT`/`STALE`/`FAILED`/`INCONCLUSIVE` and
+//! `FULL`/`DELTA`/`REFERENCE_FALLBACK`), so this cell publishes no second
+//! spelling of a status or a mode.
+//!
+//! Residuals of the `I5.8` record block with no field and no producer
+//! anywhere in the workspace, reported rather than invented here:
+//! `dependency_definition_digest`,
+//! `selection_basis_and_whole_DAG_cost`, `full_cost_estimate_and_observed_cost`,
+//! `delta_cost_estimate_and_observed_cost`, `semantic_equality_oracle_ref`,
+//! `sink_acceptance_and_readback_refs`, `arrival_and_claim_fences`, and
+//! `assurance_ceiling`. The dependency definition digest is the only one this
+//! gate compares, and it is threaded as a caller-observed value beside the
+//! fenced record because the record itself carries no dependency identity; no
+//! default, empty string, or recomputed digest stands in for it.
+//!
 //! Caller integration (exact owner handoff; no runtime path yet):
 //!
 //! - `evaluate_freshness_admission` is owned for the `eliotd` semantic
@@ -51,19 +85,36 @@
 //!   `reusable_promotion_allowed`; any other disposition refuses promotion
 //!   while the permitted safe raw observation stays cold.
 //! - `fetch_committed_candidate` is owned for the exact-handle fetch path and
-//!   its hot-path / Material-decision gates. The owning caller must thread
-//!   the known committed identities plus the observed
-//!   [`ProjectionPublicationRecord`] values and refuse hot firing and
-//!   Material support unless the outcome is `CommittedCurrent`.
-//! - No such callers exist in `eliotd` yet. Until the owning admission/fetch
-//!   paths thread these values, this cell proves the gate logic only and
-//!   claims no runtime admission, persistence, or publication behavior.
+//!   its hot-path / Material-decision gates. The owning caller must thread the
+//!   known committed identities plus the observed publications built by
+//!   `observed_publication` from the store owner's fenced record, and refuse
+//!   hot firing and Material support unless the outcome is `CommittedCurrent`.
+//! - Neither function has a production caller in `eliotd`, and this cell adds
+//!   none, because no owner produces their required inputs. For
+//!   `evaluate_freshness_admission` the live `eliotd` admission edge
+//!   (`eliotd::kernel_transition_client::check_identity_binding`) holds no
+//!   predicate normal form, no predicate pinned scopes, no expected
+//!   post-commit revision heads, no observed source heads, and no resolved
+//!   provenance or task-selection standing, and no owner maps a transition
+//!   effect ceiling onto [`RequestedEffect`]; evaluation there would be
+//!   `INCOMPLETE` for every real request. For `fetch_committed_candidate` the
+//!   closed `eliot_store_api::NamedReadOperation` catalogue exposes no
+//!   projection-publication read and no candidate-by-handle read, and the one
+//!   production `eliot_store_api::CanonicalReadClient` in `eliotd`
+//!   (`KernelContextReadClient`) activates only `GetRevisionHeads`, so no
+//!   observed publication can reach this cell at runtime. Until those
+//!   producers exist, this cell proves the gate logic only and claims no
+//!   runtime admission, persistence, or publication behavior.
 //!
 //! Like the neighboring admission joins, this helper never mints admission:
 //! it evaluates presented values and returns a disposition.
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+
+use eliot_store_api::{
+    FencedProjectionPublication, RevisionHead as ObservedStoreRevisionHead, StoreError,
+};
 
 /// Wire outcome returned after durable commit when the hot projection is not
 /// current (I5.6).
@@ -296,20 +347,27 @@ fn heads_by_scope(heads: &[RevisionHead]) -> BTreeMap<&str, &str> {
     map
 }
 
-/// Builds a scope map that refuses conflicting revisions.
+/// Requires one scope-free, unambiguous view of observed store heads.
 ///
-/// Normalized inputs (see [`normalize_heads`]) never conflict; this checked
-/// form guards boolean currency decisions taken over raw threaded slices, so
-/// a conflict fails closed to "not current" instead of silently overwriting.
-fn heads_by_scope_checked(heads: &[RevisionHead]) -> Option<BTreeMap<&str, &str>> {
-    let mut map = BTreeMap::new();
+/// Mirrors [`normalize_heads`] over the store head shape: identical records
+/// collapse, and one key carrying two different revisions is ambiguous
+/// evidence that fails closed instead of silently overwriting.
+fn observed_store_heads_unambiguous(
+    heads: &[ObservedStoreRevisionHead],
+) -> Result<(), FreshnessError> {
+    let mut by_key: BTreeMap<&str, &ObservedStoreRevisionHead> = BTreeMap::new();
     for head in heads {
-        match map.insert(head.scope.as_str(), head.revision.as_str()) {
-            Some(prior) if prior != head.revision.as_str() => return None,
+        match by_key.insert(head.key.as_str(), head) {
+            Some(prior) if prior != head => {
+                return Err(invalid(format!(
+                    "conflicting revisions for revision key '{}'",
+                    head.key
+                )));
+            }
             _ => {}
         }
     }
-    Some(map)
+    Ok(())
 }
 
 /// Evaluates normalized freshness admission for one reusable candidate.
@@ -398,171 +456,122 @@ pub fn evaluate_freshness_admission(
     })
 }
 
-/// Projection publication mode (I5.8 exact set).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PublicationMode {
-    /// Whole-projection publish from measured whole-dependency cost.
-    Full,
-    /// Incremental publish against the same-fence equality oracle.
-    Delta,
-    /// Exact/reference fallback with a deterministic rollback plan.
-    ReferenceFallback,
-}
-
-impl PublicationMode {
-    /// Contract vocabulary for diagnostics and receipts.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "FULL",
-            Self::Delta => "DELTA",
-            Self::ReferenceFallback => "REFERENCE_FALLBACK",
-        }
-    }
-}
-
-/// Projection publication status (I5.8 exact set).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProjectionPublicationStatus {
-    /// Published but not yet verified current at its source fence.
-    Pending,
-    /// Verified current: atomic data plus provenance at the source fence.
-    Current,
-    /// Superseded or diverged from its source fence.
-    Stale,
-    /// Publication failed closed; never serves reads as current.
-    Failed,
-    /// Equality oracle could not decide; never serves reads as current.
-    Inconclusive,
-}
-
-impl ProjectionPublicationStatus {
-    /// Contract vocabulary for diagnostics and receipts.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "PENDING",
-            Self::Current => "CURRENT",
-            Self::Stale => "STALE",
-            Self::Failed => "FAILED",
-            Self::Inconclusive => "INCONCLUSIVE",
-        }
-    }
-}
-
-/// Fenced projection publication record (I5.8).
+/// One already-observed projection publication presented to this gate.
 ///
-/// The projection owner persists this record; this shape is the
-/// already-observed value the caller threads per fetch, so a refresh
-/// surfaces as an exact mismatch instead of silent divergence.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProjectionPublicationRecord {
-    /// Projection kind and generation under evaluation.
-    pub projection_kind: String,
-    /// Digest of the projection definition that produced the data.
-    pub projection_definition_digest: String,
-    /// Digest of the dependency definitions the projection was built from.
-    pub dependency_definition_digest: String,
-    /// Source fence and cursor the publication was taken at.
-    pub source_fence: String,
-    /// Normalized source revision heads covered by the publication.
-    pub source_revision_heads: Vec<RevisionHead>,
-    /// Atomic data-plus-provenance commit reference; both landed together.
-    pub atomic_data_provenance_receipt: String,
-    /// Publication status; only `CURRENT` serves hot/proof-bearing reads.
-    pub status: ProjectionPublicationStatus,
-    /// How the projection was published.
-    pub publication_mode: PublicationMode,
+/// This is an observed view, never a contract: it borrows the canonical
+/// fenced publication the store owner already read, so a refresh surfaces as
+/// an exact mismatch instead of silent divergence and no field is copied,
+/// defaulted, or recomputed here. The dependency definition digest is a
+/// separate observed value because the canonical record carries no dependency
+/// identity; it is supplied by the owner that observed it, and no stand-in
+/// value is ever minted for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservedPublication<'a> {
+    /// Canonical fenced publication, including its durable
+    /// `ProjectionPublicationRecord`.
+    pub fenced: &'a FencedProjectionPublication,
+    /// Dependency-definition digest observed for that same publication.
+    pub dependency_definition_digest: &'a str,
 }
 
-impl ProjectionPublicationRecord {
-    /// Validates the record shape; malformed records never serve reads.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FreshnessError`] when any identity, digest, fence, receipt,
-    /// or head is malformed.
-    pub fn validate(&self) -> Result<(), FreshnessError> {
-        check_identity("projection kind", &self.projection_kind, 256)?;
-        check_identity(
-            "projection definition digest",
-            &self.projection_definition_digest,
-            512,
-        )?;
-        check_identity(
-            "dependency definition digest",
-            &self.dependency_definition_digest,
-            512,
-        )?;
-        check_identity("source fence", &self.source_fence, 512)?;
-        check_identity(
-            "atomic data/provenance receipt",
-            &self.atomic_data_provenance_receipt,
-            512,
-        )?;
-        normalize_heads(&self.source_revision_heads)?;
-        Ok(())
-    }
+/// Validates one observed publication before any of its fields is used.
+///
+/// Runs the store's own validator on the ORIGINAL fenced publication, which
+/// validates the durable record, the projection definition digest, and the
+/// atomic coupling between the fence's commit reference and the record's
+/// atomic data commit. A refusal is never repaired here and never downgraded
+/// to "not current": malformed input fails closed.
+///
+/// # Errors
+///
+/// Returns [`FreshnessError`] when the store refuses the fenced publication or
+/// when the observed dependency definition digest is malformed.
+fn validate_observed_publication(
+    publication: &ObservedPublication<'_>,
+) -> Result<(), FreshnessError> {
+    publication.fenced.validate().map_err(|error: StoreError| {
+        invalid(format!("projection publication is invalid: {error}"))
+    })?;
+    check_identity(
+        "dependency definition digest",
+        publication.dependency_definition_digest,
+        512,
+    )
+}
 
-    /// True when this record makes the candidate's projection current.
-    ///
-    /// Currency requires all of: status `CURRENT`, exact projection kind,
-    /// exact projection definition digest, exact dependency definition digest,
-    /// exact source fence, a non-empty candidate head set with no conflicting
-    /// revisions, coverage of every candidate source head at the same
-    /// revision, and a non-blank atomic data/provenance receipt. Partial
-    /// provenance, a stale definition, rebuilt dependencies, a mismatched
-    /// fence, or an empty/conflicting head set leaves the projection
-    /// pending/stale. An empty head set never counts as coverage.
-    #[must_use]
-    pub fn is_current_for(
-        &self,
-        candidate_kind: &str,
-        candidate_definition_digest: &str,
-        candidate_dependency_digest: &str,
-        candidate_source_fence: &str,
-        candidate_source_heads: &[RevisionHead],
-    ) -> bool {
-        if self.status != ProjectionPublicationStatus::Current {
-            return false;
-        }
-        if self.projection_kind != candidate_kind {
-            return false;
-        }
-        if self.projection_definition_digest != candidate_definition_digest {
-            return false;
-        }
-        if self.dependency_definition_digest != candidate_dependency_digest {
-            return false;
-        }
-        if self.source_fence != candidate_source_fence {
-            return false;
-        }
-        if self.atomic_data_provenance_receipt.trim().is_empty() {
-            return false;
-        }
-        if candidate_source_heads.is_empty() {
-            return false;
-        }
-        let Some(published) = heads_by_scope_checked(&self.source_revision_heads) else {
-            return false;
-        };
-        if heads_by_scope_checked(candidate_source_heads).is_none() {
-            return false;
-        }
-        candidate_source_heads.iter().all(|head| {
-            published
-                .get(head.scope.as_str())
-                .is_some_and(|revision| *revision == head.revision.as_str())
-        })
+/// Converts one already-observed store publication into this gate's
+/// comparison input.
+///
+/// This is the only conversion between the canonical durable publication and
+/// this cell: it validates the ORIGINAL record through the store's own
+/// validator and adds no second schema, no second validator, and no derived
+/// digest. The store's fence already carries the projection definition digest
+/// and the atomic data/provenance commit the record committed under, which is
+/// what makes candidate data and its provenance one atomic commit; the
+/// dependency definition digest is threaded beside it because the record has
+/// no such field.
+///
+/// # Errors
+///
+/// Returns [`FreshnessError`] when the store refuses the fenced publication or
+/// when the observed dependency definition digest is malformed.
+pub fn observed_publication<'a>(
+    fenced: &'a FencedProjectionPublication,
+    dependency_definition_digest: &'a str,
+) -> Result<ObservedPublication<'a>, FreshnessError> {
+    let publication = ObservedPublication {
+        fenced,
+        dependency_definition_digest,
+    };
+    validate_observed_publication(&publication)?;
+    Ok(publication)
+}
+
+/// True when the observed publication makes the candidate's projection current.
+///
+/// Currency is the store's decision, not this cell's: every clause the durable
+/// record can prove is decided by
+/// [`FencedProjectionPublication::check_current`], which refuses a non-`CURRENT`
+/// status, a split view, a mismatched source generation, a source head that is
+/// not fence-pinned to the record, a malformed provenance manifest, a changed
+/// projection definition, and an atomic commit that is not the one whose data
+/// is being served. This function adds exactly the three clauses the record
+/// cannot decide alone: an empty candidate head set is never coverage, the
+/// projection kind must match exactly, and the observed dependency definition
+/// digest must match exactly, because a bare definition match is not enough
+/// (I5.8).
+#[must_use]
+pub fn publication_serves_candidate(
+    publication: &ObservedPublication<'_>,
+    candidate: &CommittedCandidate,
+) -> bool {
+    if candidate.source_revision_heads.is_empty() {
+        return false;
     }
+    if publication.fenced.record.projection_kind != candidate.projection_kind {
+        return false;
+    }
+    if publication.dependency_definition_digest != candidate.dependency_definition_digest {
+        return false;
+    }
+    publication
+        .fenced
+        .check_current(
+            &candidate.source_revision_heads,
+            candidate.source_generation,
+            &candidate.projection_definition_digest,
+        )
+        .is_ok()
 }
 
 /// Durably committed candidate awaiting (or covered by) projection
 /// publication.
 ///
 /// The store owns the commit; this shape is the already-observed durable
-/// identity the caller threads per fetch.
+/// identity the caller threads per fetch. Its source heads and source
+/// generation are the store's own neutral shapes, so the currency decision
+/// runs over the same identities the durable record and the store's
+/// readability predicate use instead of a second normalized copy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedCandidate {
     /// Exact handle the record is fetched by.
@@ -577,10 +586,11 @@ pub struct CommittedCandidate {
     /// against. Currency requires the publication to be built from the same
     /// dependencies (I5.8); a bare definition match is not enough.
     pub dependency_definition_digest: String,
-    /// Source fence the candidate was committed at.
-    pub source_fence: String,
-    /// Source revision heads the candidate was committed at.
-    pub source_revision_heads: Vec<RevisionHead>,
+    /// Source generation the candidate was committed at.
+    pub source_generation: u64,
+    /// Source revision heads the candidate was committed at, each fence-pinned
+    /// to the source fence it was observed at.
+    pub source_revision_heads: Vec<ObservedStoreRevisionHead>,
 }
 
 impl CommittedCandidate {
@@ -589,7 +599,8 @@ impl CommittedCandidate {
     /// # Errors
     ///
     /// Returns [`FreshnessError`] when the handle, receipt, kind, digests,
-    /// fence, or any head is malformed.
+    /// source generation, or any head is malformed, and when one revision key
+    /// carries two different observed heads.
     pub fn validate(&self) -> Result<(), FreshnessError> {
         check_identity("candidate handle", &self.handle, 512)?;
         check_identity("durability receipt", &self.durability_receipt, 512)?;
@@ -604,9 +615,17 @@ impl CommittedCandidate {
             &self.dependency_definition_digest,
             512,
         )?;
-        check_identity("source fence", &self.source_fence, 512)?;
-        normalize_heads(&self.source_revision_heads)?;
-        Ok(())
+        if self.source_generation == 0 {
+            return Err(invalid("source generation must be non-zero"));
+        }
+        for head in &self.source_revision_heads {
+            head.validate().map_err(|error: StoreError| {
+                invalid(format!(
+                    "committed candidate source head is invalid: {error}"
+                ))
+            })?;
+        }
+        observed_store_heads_unambiguous(&self.source_revision_heads)
     }
 }
 
@@ -651,7 +670,9 @@ impl CandidateFetchOutcome {
 /// A known handle with no matching current publication resolves to
 /// `CANDIDATE_COMMITTED_PROJECTION_PENDING`: the record exists and is
 /// fetchable, but the owning hot-path and Material gates must refuse it
-/// until a current publication record exists.
+/// until a current publication record exists. Every presented publication is
+/// validated through the store's own validator first, so a malformed record
+/// fails closed instead of being skipped as if it were absent.
 ///
 /// # Errors
 ///
@@ -660,7 +681,7 @@ impl CandidateFetchOutcome {
 pub fn fetch_committed_candidate(
     handle: &str,
     committed: &[CommittedCandidate],
-    publications: &[ProjectionPublicationRecord],
+    publications: &[ObservedPublication<'_>],
 ) -> Result<CandidateFetchOutcome, FreshnessError> {
     check_identity("candidate handle", handle, 512)?;
     let candidate = committed
@@ -669,17 +690,11 @@ pub fn fetch_committed_candidate(
         .ok_or_else(|| invalid("unknown candidate handle"))?;
     candidate.validate()?;
     for publication in publications {
-        publication.validate()?;
+        validate_observed_publication(publication)?;
     }
-    let current = publications.iter().any(|publication| {
-        publication.is_current_for(
-            &candidate.projection_kind,
-            &candidate.projection_definition_digest,
-            &candidate.dependency_definition_digest,
-            &candidate.source_fence,
-            &candidate.source_revision_heads,
-        )
-    });
+    let current = publications
+        .iter()
+        .any(|publication| publication_serves_candidate(publication, candidate));
     Ok(if current {
         CandidateFetchOutcome::CommittedCurrent
     } else {
@@ -689,12 +704,45 @@ pub fn fetch_committed_candidate(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_store_api::{
+        CommitId, FencedProjectionPublication, ProjectionMode, ProjectionPublicationId,
+        ProjectionStatus, RevisionKey, SplitView,
+    };
+
     use super::*;
+
+    const TEST_LINEAGE: &str = "9f0d1c62-0a3b-4c9e-9d61-2a5f2b8c7e40";
+    const DEFINITION_DIGEST: &str =
+        "1f0d1c620a3b4c9e9d612a5f2b8c7e401f0d1c620a3b4c9e9d612a5f2b8c7e40";
+    const DEPENDENCY_DIGEST: &str =
+        "2b8c7e401f0d1c620a3b4c9e9d612a5f2b8c7e401f0d1c620a3b4c9e9d612a5f";
+    const REBUILT_DEPENDENCY_DIGEST: &str =
+        "9d612a5f2b8c7e401f0d1c620a3b4c9e9d612a5f2b8c7e401f0d1c620a3b4c9e";
 
     fn head(scope: &str, revision: &str) -> RevisionHead {
         RevisionHead {
             scope: scope.to_owned(),
             revision: revision.to_owned(),
+        }
+    }
+
+    fn test_fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn store_head(key: &str, revision: u64) -> ObservedStoreRevisionHead {
+        ObservedStoreRevisionHead {
+            key: RevisionKey::new(key).expect("valid revision key"),
+            revision,
+            state_fence: test_fence(),
         }
     }
 
@@ -721,24 +769,43 @@ mod tests {
             handle: "candidate-1".to_owned(),
             durability_receipt: "receipt-commit-1".to_owned(),
             projection_kind: "cue-index".to_owned(),
-            projection_definition_digest: "def-digest-1".to_owned(),
-            dependency_definition_digest: "dep-digest-1".to_owned(),
-            source_fence: "fence-epoch-1/gen-1".to_owned(),
-            source_revision_heads: vec![head("cue-index", "rev-7")],
+            projection_definition_digest: DEFINITION_DIGEST.to_owned(),
+            dependency_definition_digest: DEPENDENCY_DIGEST.to_owned(),
+            source_generation: 4,
+            source_revision_heads: vec![store_head("cue-index", 4)],
         }
     }
 
-    fn current_publication() -> ProjectionPublicationRecord {
-        ProjectionPublicationRecord {
-            projection_kind: "cue-index".to_owned(),
-            projection_definition_digest: "def-digest-1".to_owned(),
-            dependency_definition_digest: "dep-digest-1".to_owned(),
-            source_fence: "fence-epoch-1/gen-1".to_owned(),
-            source_revision_heads: vec![head("cue-index", "rev-7")],
-            atomic_data_provenance_receipt: "atomic-receipt-1".to_owned(),
-            status: ProjectionPublicationStatus::Current,
-            publication_mode: PublicationMode::Full,
+    fn current_publication() -> FencedProjectionPublication {
+        let atomic_data_commit = CommitId::new("commit-atomic-1").expect("valid commit id");
+        FencedProjectionPublication {
+            record: eliot_store_api::ProjectionPublicationRecord {
+                publication_id: ProjectionPublicationId::new("publication-1")
+                    .expect("valid publication id"),
+                projection_kind: "cue-index".to_owned(),
+                projection_generation: 2,
+                source_generation: 4,
+                source_cursor: 9,
+                state_fence: test_fence(),
+                mode: ProjectionMode::Full,
+                source_revision_heads: vec![store_head("cue-index", 4)],
+                atomic_data_commit: atomic_data_commit.clone(),
+                provenance_manifest_ref: "manifest-1".to_owned(),
+                visible_lag_checkpoint: None,
+                split_view: SplitView::None,
+                status: ProjectionStatus::Current,
+            },
+            projection_definition_digest: DEFINITION_DIGEST.to_owned(),
+            atomic_commit_ref: atomic_data_commit,
         }
+    }
+
+    fn observed<'a>(
+        fenced: &'a FencedProjectionPublication,
+        dependency_definition_digest: &'a str,
+    ) -> ObservedPublication<'a> {
+        observed_publication(fenced, dependency_definition_digest)
+            .expect("valid observed publication")
     }
 
     #[test]
@@ -842,9 +909,12 @@ mod tests {
         // Definition matches but dependencies were rebuilt: no current or
         // Material support through a bare definition match.
         let committed = vec![committed_candidate()];
-        let mut publication = current_publication();
-        publication.dependency_definition_digest = "dep-digest-2".to_owned();
-        let outcome = fetch_committed_candidate("candidate-1", &committed, &[publication])?;
+        let fenced = current_publication();
+        let outcome = fetch_committed_candidate(
+            "candidate-1",
+            &committed,
+            &[observed(&fenced, REBUILT_DEPENDENCY_DIGEST)],
+        )?;
         assert_eq!(outcome, CandidateFetchOutcome::CommittedProjectionPending);
         assert_eq!(outcome.as_str(), CANDIDATE_COMMITTED_PROJECTION_PENDING);
         assert!(!outcome.supports_material_decision());
@@ -854,7 +924,8 @@ mod tests {
 
     #[test]
     fn empty_or_conflicting_candidate_heads_never_current() -> Result<(), FreshnessError> {
-        let publications = vec![current_publication()];
+        let fenced = current_publication();
+        let publications = vec![observed(&fenced, DEPENDENCY_DIGEST)];
         // Empty head set is not coverage: vacuous all() must not promote.
         let mut candidate = committed_candidate();
         candidate.source_revision_heads = Vec::new();
@@ -867,7 +938,7 @@ mod tests {
         // Material support.
         let mut candidate = committed_candidate();
         candidate.source_revision_heads =
-            vec![head("cue-index", "rev-7"), head("cue-index", "rev-8")];
+            vec![store_head("cue-index", 4), store_head("cue-index", 5)];
         assert!(fetch_committed_candidate("candidate-1", &[candidate], &publications).is_err());
         Ok(())
     }
@@ -881,7 +952,8 @@ mod tests {
         assert!(!outcome.supports_material_decision());
         assert!(!outcome.hot_path_activatable());
 
-        let publications = vec![current_publication()];
+        let fenced = current_publication();
+        let publications = vec![observed(&fenced, DEPENDENCY_DIGEST)];
         let outcome = fetch_committed_candidate("candidate-1", &committed, &publications)?;
         assert_eq!(outcome, CandidateFetchOutcome::CommittedCurrent);
         assert!(outcome.supports_material_decision());

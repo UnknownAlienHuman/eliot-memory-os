@@ -207,9 +207,9 @@ pub use first_run_wiring::{
 pub use freshness_admission::{
     CANDIDATE_COMMITTED_PROJECTION_PENDING, CandidateFetchOutcome, CommittedCandidate,
     FreshnessAdmission, FreshnessDisposition, FreshnessError, FreshnessEvaluation,
-    ProjectionPublicationRecord, ProjectionPublicationStatus, ProvenanceStanding, PublicationMode,
-    RequestedEffect, ReusableCandidateView, RevisionHead, TaskCompatibility,
-    evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
+    ObservedPublication, ProvenanceStanding, RequestedEffect, ReusableCandidateView, RevisionHead,
+    TaskCompatibility, evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
+    observed_publication, publication_serves_candidate,
 };
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
