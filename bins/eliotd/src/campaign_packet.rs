@@ -4,6 +4,15 @@
 //! material handles only. The task, scope and fence are derived from the
 //! Kernel-admitted envelope and rechecked against the retained Kernel
 //! snapshot before any named owner read is made.
+//!
+//! The packet's product is one immutable campaign learning-state view, and
+//! the current owner pipeline decides whether it may be used:
+//! `eliot_learning_state_view::validate_campaign_learning_state_view_current`
+//! owns the load-bearing revision and State Fence checks against a fresh
+//! authenticated owner-read set. The `#40`-frozen
+//! `eliot_context::ContextCompiler` is deliberately not called here: the
+//! frozen donor surface takes no new caller, and no legacy-only helper may
+//! accept a view the current owner refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,11 +120,23 @@ struct ResolvedCampaignSources {
     current_records: Vec<CampaignSourceRecord>,
 }
 
+/// Terminal disposition of one `eliot.packet` attempt.
+///
+/// The packet's product is the immutable campaign learning-state view. There
+/// is no second, legacy-compiled product on this route: the frozen
+/// `eliot_context::ContextCompiler` takes no new caller, so nothing may claim
+/// a compiled result that the current owner pipeline did not accept.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum CampaignPacketOutcome {
+    /// The immutable view was compiled, or an exact current prior view was
+    /// reused, and the current owner accepted it against the fresh
+    /// authenticated owner reads and the packet State Fence.
     Compiled,
+    /// The view exists but is explicitly marked stale against the current
+    /// owner revisions; it is published for diagnosis and never used.
     Stale,
+    /// No usable view could be produced or the current owner refused it.
     Blocked,
 }
 
@@ -129,7 +150,10 @@ enum CampaignPacketGapCode {
     RequiredSourceUnavailable,
     ContextRecipeUnavailable,
     ContextDeliveryUnavailable,
-    ContextCompilationRejected,
+    /// The current learning-state owner refused the view for this attempt:
+    /// stale, missing, invalidated, or partial across a load-bearing slot,
+    /// owner revision, State Fence, or `RetrievalPlan` history.
+    CampaignViewNotCurrent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -146,7 +170,6 @@ struct CampaignPacketResponse {
     completeness: Completeness,
     #[serde(rename = "campaign_learning_state_view")]
     view: Option<CampaignLearningStateViewPublication>,
-    compiled_context: Option<eliot_context::CampaignCompiledContext>,
     gaps: Vec<CampaignPacketGap>,
     missing_roles: Vec<CampaignSourceRole>,
     stale_roles: Vec<CampaignSourceRole>,
@@ -288,21 +311,8 @@ pub async fn serve_campaign_packet_pair(
 #[allow(
     clippy::manual_let_else,
     clippy::too_many_lines,
-    reason = "the production compiler keeps read admission, source binding, and view publication in one branch"
+    reason = "the production packet keeps read admission, source binding, and view publication in one branch"
 )]
-// `eliot_context::ContextCompiler` is #40-frozen (see that crate's
-// `facade::FACADE_DISPOSITIONS`: "DEPRECATED; owner pipeline is
-// candidates/admission/assembly"). Its disposition also states the frozen
-// legacy surface takes no NEW callers, so this is recorded rather than hidden:
-// #1862's Work makes the Context Compiler the named subject ("Have Context
-// Compiler reject use unless all required revisions and State Fence bindings
-// validate"), and `compile_with_campaign_learning_state` is the only public
-// entry point that performs that check against a campaign learning-state view
-// — its input type `CampaignLearningStateCompileInput` is itself current and
-// not deprecated, and the check is the exact one this issue requires. Migrating
-// the edge to the candidates/admission/assembly cells is the owner's #40
-// removal step, not a change this issue may make.
-#[allow(deprecated)]
 async fn resolve_compile_and_bind_result(
     kernel: &DaemonKernelClient,
     envelope: &HostRequestEnvelope,
@@ -321,7 +331,6 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
-                        compiled_context: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::TaskPlanUnavailable,
                             role: Some(CampaignSourceRole::TaskPlan),
@@ -346,7 +355,6 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
-                        compiled_context: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::PriorViewUnavailable,
                             role: None,
@@ -381,7 +389,6 @@ async fn resolve_compile_and_bind_result(
                     outcome: CampaignPacketOutcome::Blocked,
                     completeness: Completeness::Blocked,
                     view: None,
-                    compiled_context: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::OwnerReadUnavailable,
                         role: None,
@@ -406,7 +413,6 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
-                        compiled_context: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::HistoryPlanUnavailable,
                             role: None,
@@ -460,7 +466,6 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
-                        compiled_context: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -484,7 +489,6 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
-                        compiled_context: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -523,7 +527,6 @@ async fn resolve_compile_and_bind_result(
                     outcome: CampaignPacketOutcome::Blocked,
                     completeness: Completeness::Blocked,
                     view: None,
-                    compiled_context: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::RequiredSourceUnavailable,
                         role: Some(CampaignSourceRole::FrozenAnchor),
@@ -585,7 +588,6 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
-                        compiled_context: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -613,7 +615,6 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
-                        compiled_context: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -639,7 +640,6 @@ async fn resolve_compile_and_bind_result(
                 },
                 completeness,
                 view: Some(publication),
-                compiled_context: None,
                 gaps: source_gaps(&resolved.resolutions),
                 missing_roles: missing_roles(&resolved.resolutions),
                 stale_roles: stale_roles(&resolved.resolutions),
@@ -651,10 +651,42 @@ async fn resolve_compile_and_bind_result(
     }
 
     // A stale prior view is never reused. The new immutable projection is
-    // validated against a fresh owner-read set before it can influence the
-    // decision-local context compiler.
-    let publication = make_view_publication(&binding, view.clone())
+    // published only after the current owner pipeline re-verified it against
+    // the fresh owner-read set and the packet State Fence.
+    let publication = make_view_publication(&binding, view)
         .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
+
+    // The current owner pipeline, not a legacy-only helper, decides whether
+    // this immutable view may be used at all, and it decides first. The
+    // learning-state owner re-verifies the exact load-bearing owner revisions,
+    // the packet State Fence and the `RetrievalPlan`-bounded history against
+    // the fresh authenticated owner-read set, and refuses a stale, missing,
+    // invalidated or load-bearing-partial view. This runs for a reused exact
+    // prior view and for a freshly compiled one, so no path reaches an
+    // accepted result through a check the legacy compiler used to own, and no
+    // Context owner row is consumed for a view the owner refused.
+    if validate_campaign_learning_state_view_current(
+        &publication.view,
+        &recipe,
+        &binding.state_fence,
+        &resolved.resolutions,
+        &current_history_plans,
+        observed_at_ms,
+    )
+    .is_err()
+    {
+        return campaign_packet_result_body(
+            envelope,
+            attempt,
+            context_blocked_response(
+                publication,
+                CampaignPacketGapCode::CampaignViewNotCurrent,
+                None,
+                &resolved.resolutions,
+                prior.is_some() && !prior_is_current,
+            ),
+        );
+    }
     let context_recipe_record = match current_record(&resolved, CampaignSourceRole::ContextRecipe) {
         Ok(record) => record,
         Err(_) => {
@@ -748,10 +780,11 @@ async fn resolve_compile_and_bind_result(
         );
     }
 
-    // Re-run the Context owner's publication validators at the consumption
-    // edge. The packet then consumes the exact compiled result through the
-    // downstream delivery adapter; neither step can substitute a transcript or
-    // a detached Context row.
+    // Re-run the Context owner's own publication validators at the
+    // consumption edge. The exact typed recipe/delivery bodies this attempt
+    // decoded from the fresh named owner reads are re-derived by their owner
+    // and re-bound to the packet State Fence here; neither a transcript nor a
+    // detached Context row can satisfy this step.
     if crate::campaign_context_owner::validate_context_owner_bodies(
         &context_recipe_body,
         prior.as_ref().map(|_| &prior_delivery),
@@ -771,52 +804,6 @@ async fn resolve_compile_and_bind_result(
             ),
         );
     }
-    let compiled = match eliot_context::ContextCompiler::compile_with_campaign_learning_state(
-        eliot_context::CampaignLearningStateCompileInput {
-            recipe_body: &context_recipe_body,
-            prior_delivery: &prior_delivery,
-            learning_view: &view,
-            learning_recipe: &recipe,
-            current_state_fence: &binding.state_fence,
-            current_source_resolutions: &resolved.resolutions,
-            current_history_plans: &current_history_plans,
-            observed_at_ms,
-        },
-    ) {
-        Ok(compiled) => compiled,
-        Err(_) => {
-            return campaign_packet_result_body(
-                envelope,
-                attempt,
-                context_blocked_response(
-                    publication,
-                    CampaignPacketGapCode::ContextCompilationRejected,
-                    None,
-                    &resolved.resolutions,
-                    prior.is_some() && !prior_is_current,
-                ),
-            );
-        }
-    };
-    if crate::campaign_context_owner::consume_compiled_context(
-        &compiled,
-        &publication.view.view_id,
-        &publication.view.canonical_digest,
-    )
-    .is_err()
-    {
-        return campaign_packet_result_body(
-            envelope,
-            attempt,
-            context_blocked_response(
-                publication,
-                CampaignPacketGapCode::ContextCompilationRejected,
-                None,
-                &resolved.resolutions,
-                prior.is_some() && !prior_is_current,
-            ),
-        );
-    }
     campaign_packet_result_body(
         envelope,
         attempt,
@@ -824,7 +811,6 @@ async fn resolve_compile_and_bind_result(
             outcome: CampaignPacketOutcome::Compiled,
             completeness: publication.view.completeness,
             view: Some(publication),
-            compiled_context: Some(compiled),
             gaps: source_gaps(&resolved.resolutions),
             missing_roles: missing_roles(&resolved.resolutions),
             stale_roles: stale_roles(&resolved.resolutions),
@@ -1437,7 +1423,6 @@ fn context_blocked_response(
         outcome: CampaignPacketOutcome::Blocked,
         completeness: Completeness::Blocked,
         view: Some(view),
-        compiled_context: None,
         gaps,
         missing_roles: missing_roles(resolutions),
         stale_roles: stale_roles(resolutions),

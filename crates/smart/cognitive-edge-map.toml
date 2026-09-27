@@ -102,6 +102,16 @@ from = "any Smart cognitive crate"
 to = "storage adapter, kernel/daemon implementation, provider SDK, scheduler or effect executor"
 reason = "Smart handlers are deterministic/stateless or rebuildable projections and have no operational authority"
 
+# #1862: the campaign packet route is a Host/composition consumer of Context, so
+# it must link the owner cells (A-16a/A-17a/A-18) and the A-15 contracts, never
+# the #40-frozen donor algorithm in `eliot-context`. The production call and its
+# `#[allow(deprecated)]` were removed rather than suppressed; a new binary
+# caller of the frozen legacy compiler is a forbidden compile edge.
+[[forbidden_compile_edge]]
+from = "bins/eliotd campaign packet route (eliot.packet)"
+to = "eliot-context legacy ContextCompiler / CampaignCompiledContext"
+reason = "the frozen donor surface takes no new caller; the current candidate -> admission -> assembly cells own candidate construction, membership and rendering"
+
 # Issue #816 uses consumer -> dependency notation for compile edges.  Runtime
 # value flow is recorded separately below so a producer does not become an
 # accidental Cargo prerequisite and later runtime stages do not become
