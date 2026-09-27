@@ -17,8 +17,9 @@ use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
 
 use super::{
     BackupBundle, BackupClass, BackupError, BackupInput, IsolatedRoot, RestoreContext,
-    RestoreEvidenceLevel, RestoreObligationState, WrappedKeyManifest, execute_isolated_restore,
-    issue_full_recovery, issue_restoration_receipts, text, verify_key_coverage,
+    RestoreEvidenceLevel, RestoreObligationState, WrappedKeyManifest, bytes_sha256,
+    execute_isolated_restore, issue_full_recovery, issue_restoration_receipts, text,
+    verify_key_coverage,
 };
 
 /// How the restore target epoch is determined: an explicit caller triple, or
@@ -93,6 +94,44 @@ fn write_file(path: &Path, bytes: &[u8], what: &'static str) -> Result<(), Backu
     })
 }
 
+/// Persists `bytes` and returns the digest an independent readback observed at
+/// `path`.
+///
+/// The returned value is computed over the bytes re-read from the filesystem,
+/// never over the in-memory value that produced them, so a reported digest is
+/// provably the hash of the file that landed. The write is refused when the
+/// artifact cannot be read back, and refused again when the readback bytes
+/// disagree with the bytes handed to the write; neither outcome reports a
+/// digest, and neither repairs the report after the fact.
+///
+/// Mandated by `docs/architecture/I15-09-source-admission-and-executable-supply-chain.md`
+/// (`Executable module supply chain`: a production artifact requires an
+/// "artifact hash/signature") and by
+/// `docs/architecture/I14-24-local-failure-containment-matrix.md`
+/// ("backup/restore verification fails | forbid cutover and retain current
+/// active state").
+fn write_file_readback(
+    path: &Path,
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<String, BackupError> {
+    write_file(path, bytes, what)?;
+    let intended = bytes_sha256(bytes);
+    let observed = std::fs::read(path).map_err(|error| {
+        BackupError::Target(format!(
+            "cannot read back {what} {}: {error}",
+            path.display()
+        ))
+    })?;
+    let readback = bytes_sha256(&observed);
+    if readback != intended {
+        return Err(BackupError::IntegrityMismatch {
+            subject: format!("{what} readback {}", path.display()),
+        });
+    }
+    Ok(readback)
+}
+
 fn decode_input(bytes: &[u8]) -> Result<BackupInput, BackupError> {
     serde_json::from_slice(bytes).map_err(|error| BackupError::Serialization(error.to_string()))
 }
@@ -155,9 +194,12 @@ fn persist_issued(
     requested: BackupClass,
     downgraded: bool,
 ) -> Result<IssueReport, BackupError> {
-    let bundle_sha256 = bundle.bundle_sha256()?;
+    // The reported digest is the hash of the bytes `bundle.json` actually holds,
+    // established by re-reading the file rather than by re-serializing the
+    // in-memory bundle (#1141).
+    let bundle_bytes = bundle.encode()?;
     let bundle_path = out_dir.join("bundle.json");
-    write_file(&bundle_path, &bundle.encode()?, "bundle file")?;
+    let bundle_sha256 = write_file_readback(&bundle_path, &bundle_bytes, "bundle file")?;
     let mut key_manifest_path = None;
     let mut receipts = 0_u64;
     let mut key_coverage = None;
