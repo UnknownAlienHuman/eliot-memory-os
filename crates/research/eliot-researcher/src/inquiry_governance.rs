@@ -153,6 +153,11 @@ pub enum InquiryError {
         /// Failing field path.
         field: &'static str,
     },
+    /// A terminal disposition tries to close after an unsuccessful acquisition.
+    ClosureWithoutSuccessfulAcquisition {
+        /// Failing field path.
+        field: &'static str,
+    },
     /// A terminal disposition is one an open research debt restricts (I21.12).
     ///
     /// The debt is already registered and its restriction already derived, so
@@ -260,6 +265,12 @@ impl std::fmt::Display for InquiryError {
                 write!(
                     formatter,
                     "{field} cannot close without a complete-scope denominator"
+                )
+            }
+            Self::ClosureWithoutSuccessfulAcquisition { field } => {
+                write!(
+                    formatter,
+                    "{field} cannot close after an unsuccessful acquisition"
                 )
             }
             Self::DebtRestrictedDisposition { field } => write!(
@@ -3712,6 +3723,37 @@ pub struct InquiryTerminalRecord {
 }
 
 impl InquiryTerminalRecord {
+    fn validate_preservation(
+        disposition: CompletionDisposition,
+        explicit_unknown: Option<&PreservedUnknown>,
+        narrower_claim: Option<&str>,
+        next_probe: Option<&PreservedNextProbe>,
+    ) -> Result<(), InquiryError> {
+        if let Some(unknown) = explicit_unknown {
+            require_text(&unknown.subject, "terminal.explicit_unknown.subject")?;
+            require_text(&unknown.detail, "terminal.explicit_unknown.detail")?;
+        }
+        if let Some(claim) = narrower_claim {
+            require_text(claim, "terminal.narrower_claim")?;
+        }
+        if let Some(probe) = next_probe {
+            require_text(&probe.required_probe, "terminal.next_probe.required_probe")?;
+            for obligation_ref in &probe.obligation_refs {
+                require_text(obligation_ref, "terminal.next_probe.obligation_refs")?;
+            }
+        }
+        if !disposition.may_close_inquiry()
+            && explicit_unknown.is_none()
+            && narrower_claim.is_none()
+            && next_probe.is_none()
+        {
+            return Err(InquiryError::PreservationRequired {
+                field: "terminal.disposition",
+            });
+        }
+        Ok(())
+    }
+
     /// Binds the terminal disposition to the profile, portfolio, manifest and
     /// State Fence.
     ///
@@ -3720,8 +3762,11 @@ impl InquiryTerminalRecord {
     /// Returns [`InquiryError::PreservationRequired`] when a non-closing
     /// disposition carries no explicit unknown, no narrower claim and no next
     /// probe, [`InquiryError::ClosureWithoutCompleteScope`] when a closing
-    /// disposition rests on a denominator that is not a complete scope, and a
-    /// field error for blank identities or malformed digests.
+    /// disposition rests on a denominator that is not a complete scope,
+    /// [`InquiryError::ClosureWithoutSuccessfulAcquisition`] when a closing
+    /// disposition follows an unsuccessful acquisition, and a field error for
+    /// blank identities or malformed digests. [`InquiryError::Portfolio`] is
+    /// returned when a provided preservation field is blank or control-bearing.
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
         profile: &InquiryProtocolProfile,
@@ -3762,18 +3807,22 @@ impl InquiryTerminalRecord {
             });
         }
         let may_close = disposition.may_close_inquiry();
+        if may_close && !acquisition_outcome.is_successful() {
+            return Err(InquiryError::ClosureWithoutSuccessfulAcquisition {
+                field: "terminal.acquisition_outcome",
+            });
+        }
         if may_close && !denominator_kind.supports_scoped_absence() {
             return Err(InquiryError::ClosureWithoutCompleteScope {
                 field: "terminal.denominator_kind",
             });
         }
-        let preserved =
-            explicit_unknown.is_some() || narrower_claim.is_some() || next_probe.is_some();
-        if !may_close && !preserved {
-            return Err(InquiryError::PreservationRequired {
-                field: "terminal.disposition",
-            });
-        }
+        Self::validate_preservation(
+            disposition,
+            explicit_unknown.as_ref(),
+            narrower_claim.as_deref(),
+            next_probe.as_ref(),
+        )?;
         let mut record = Self {
             inquiry_id: profile.inquiry_id.clone(),
             profile_id: profile.profile_id.clone(),
@@ -3908,8 +3957,13 @@ impl InquiryTerminalRecord {
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
     /// disagrees with the stored one, and
-    /// [`InquiryError::DebtRestrictedDisposition`] when a closing disposition
-    /// coexists with an open debt that refuses it.
+    /// [`InquiryError::PreservationRequired`] when a non-closing disposition
+    /// carries no valid preserved field, or [`InquiryError::Portfolio`] when a
+    /// provided preservation field is blank or control-bearing; it also returns
+    /// [`InquiryError::DebtRestrictedDisposition`] when a disposition coexists
+    /// with an open debt that refuses it, or
+    /// [`InquiryError::ClosureWithoutSuccessfulAcquisition`] when a closing
+    /// disposition follows an unsuccessful acquisition.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
         self.debt_restriction.validate_integrity()?;
         if self.debt_restriction.refuses(self.disposition) {
@@ -3917,6 +3971,17 @@ impl InquiryTerminalRecord {
                 field: "terminal.disposition",
             });
         }
+        if self.may_close() && !self.acquisition_succeeded() {
+            return Err(InquiryError::ClosureWithoutSuccessfulAcquisition {
+                field: "terminal.acquisition_outcome",
+            });
+        }
+        Self::validate_preservation(
+            self.disposition,
+            self.explicit_unknown.as_ref(),
+            self.narrower_claim.as_deref(),
+            self.next_probe.as_ref(),
+        )?;
         if self.compute_digest() != self.digest {
             return Err(InquiryError::IntegrityMismatch {
                 field: "terminal.digest",
