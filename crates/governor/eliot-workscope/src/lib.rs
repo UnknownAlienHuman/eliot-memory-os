@@ -773,8 +773,8 @@ impl GoverningSourceSet {
     ///
     /// # Errors
     ///
-    /// Returns an error when source identity, generation, assurance, or domain
-    /// evidence is invalid or duplicated.
+    /// Returns an error when source identity, generation, assurance, domain
+    /// evidence, or an admitted source's authority basis is invalid or duplicated.
     pub fn new(
         scope_ref: impl Into<String>,
         generation: u64,
@@ -789,8 +789,12 @@ impl GoverningSourceSet {
             text(&source.source_ref, "source_ref")?;
             counter(source.applicable_generation, "applicable_generation")?;
             digest(&source.digest, "source.digest")?;
-            if let Some(basis) = &source.authority_basis {
-                basis.validate()?;
+            match (&source.status, &source.authority_basis) {
+                (SourceStatus::Admitted, None) => {
+                    return Err(WorkScopeError::TaskAuthorityDenied);
+                }
+                (_, Some(basis)) => basis.validate()?,
+                (_, None) => {}
             }
             if source.source_ref != source.assurance.source_ref {
                 return Err(WorkScopeError::SourceIdentityMismatch);
@@ -827,7 +831,8 @@ impl GoverningSourceSet {
     /// # Errors
     ///
     /// Returns an error when the source set is stale, conflicted, outside the
-    /// privacy boundary, or fails provider assurance validation.
+    /// privacy boundary, lacks an admitted authority basis, or fails provider
+    /// assurance validation.
     pub fn validate_for(
         &self,
         scope: &ScopeIdentity,
@@ -850,6 +855,10 @@ impl GoverningSourceSet {
             return Err(WorkScopeError::EmptyCollection { field: "sources" });
         }
         for source in &self.sources {
+            let Some(basis) = &source.authority_basis else {
+                return Err(WorkScopeError::TaskAuthorityDenied);
+            };
+            basis.validate()?;
             if source.applicable_generation != self.generation {
                 return Err(WorkScopeError::SourceSetMismatch);
             }

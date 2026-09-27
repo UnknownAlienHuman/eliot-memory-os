@@ -740,14 +740,15 @@ struct GroupResolution {
 
 /// Resolves one handle group without ever selecting a silent winner.
 ///
-/// One digest admits through its attached applicable authority claim or stays
-/// a candidate; the admitted record is deterministic (lowest role among the
-/// applicable-claimed candidates) instead of first-in-request-order. Several
-/// digests resolve only through a single agreed applicable owner claim or one
-/// applicable project-declared precedence, and the precedence winner carries
-/// the declaration authority as its basis; disagreeing claims, inapplicable
-/// claims, and undeclared clashes stay conflicted or fail the request. No
-/// branch selects a winner from filename, recency, location or model output.
+/// One digest within a single role admits through its attached applicable
+/// authority claim or stays a candidate. When one handle spans multiple roles,
+/// an applicable project-declared precedence is required even if the digests
+/// match; the declaration authority becomes the admitted record's basis.
+/// Several digests resolve only through a single agreed applicable owner claim
+/// or one applicable project-declared precedence. Disagreeing claims,
+/// inapplicable claims, and undeclared clashes stay conflicted or fail the
+/// request. No branch selects a winner from enum order, filename, recency,
+/// location or model output.
 ///
 /// # Errors
 ///
@@ -783,6 +784,11 @@ fn resolve_group(
         digests.insert(candidate.digest.as_str());
     }
     if digests.len() == 1 {
+        let roles: BTreeSet<GoverningSourceRole> =
+            ordered.iter().map(|candidate| candidate.role).collect();
+        if roles.len() > 1 {
+            return Ok(resolve_same_digest_cross_role_group(ordered, context));
+        }
         let mut admitted = Vec::new();
         let mut preserved = Vec::new();
         for candidate in ordered {
@@ -835,9 +841,7 @@ fn resolve_group(
         for candidate in ordered {
             if candidate.digest == winner_digest {
                 let mut record = candidate.into_record(SourceStatus::Admitted);
-                if record.authority_basis.is_none() {
-                    record.authority_basis.clone_from(&winner_authority);
-                }
+                record.authority_basis.clone_from(&winner_authority);
                 admitted.push(record);
             } else {
                 preserved.push(candidate.into_record(SourceStatus::Superseded));
@@ -851,6 +855,39 @@ fn resolve_group(
         });
     }
     Ok(conflicted_group(ordered))
+}
+
+/// Resolves same-digest candidates spanning roles only through scoped
+/// precedence; otherwise preserves the entire group as conflicted.
+fn resolve_same_digest_cross_role_group(
+    ordered: Vec<GoverningSourceCandidate>,
+    context: &AdmissionContext<'_>,
+) -> GroupResolution {
+    let Some((winner, applied)) = precedence_winner(&ordered, context) else {
+        return conflicted_group(ordered);
+    };
+    let winner_authority = applied
+        .first()
+        .map(|declaration| declaration.authority.clone());
+    let mut admitted = Vec::new();
+    let mut preserved = Vec::new();
+    for candidate in ordered {
+        if candidate.role == winner.role && admitted.is_empty() {
+            let mut record = candidate.into_record(SourceStatus::Admitted);
+            record.authority_basis.clone_from(&winner_authority);
+            admitted.push(record);
+        } else if candidate.role == winner.role {
+            preserved.push(candidate.into_record(SourceStatus::Candidate));
+        } else {
+            preserved.push(candidate.into_record(SourceStatus::Superseded));
+        }
+    }
+    GroupResolution {
+        admitted,
+        preserved,
+        conflicted: false,
+        applied,
+    }
 }
 
 /// Preserves every member of an unresolvable group as conflicted.
@@ -985,8 +1022,8 @@ pub fn admit_governing_sources(
 /// Finds the winning digest through project-declared role precedence.
 ///
 /// Returns a winner only when the group spans at least two roles, exactly one
-/// role beats-or-ties every declared comparison it takes part in through an
-/// applicable declaration authority, loses none, carries exactly one digest,
+/// role wins the applicable declared comparisons it takes part in, loses none,
+/// carries exactly one digest,
 /// and at least one applicable declaration names the winner as higher. The
 /// returned declarations are the applicable ones that order the winner above
 /// a present lower role, sorted for determinism. Within-role divergence,
@@ -1021,9 +1058,7 @@ fn precedence_winner(
     for declaration in &applicable {
         let higher = roles.get(&declaration.higher);
         let lower = roles.get(&declaration.lower);
-        if let (Some(higher), Some(lower)) = (higher, lower)
-            && higher != lower
-        {
+        if higher.is_some() && lower.is_some() {
             beaten.insert(declaration.lower);
         }
     }
