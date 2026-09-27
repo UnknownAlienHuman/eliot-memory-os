@@ -31,6 +31,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod claim;
+mod nextest_partition;
 mod resources;
 mod typed_evidence;
 

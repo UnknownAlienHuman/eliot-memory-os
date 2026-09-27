@@ -12,11 +12,16 @@
 //! persists the decision, and the worker executes the leased job.
 //!
 //! [`NextestLanePlan`] is the single derivation from those declarations to
-//! nextest partitioning and filtersets. The same plan object renders the
-//! `nextest.toml` profiles and serial groups and validates a checked-in file,
-//! so a drifted config cannot be regenerated into agreement by accident.
+//! the nextest serial sets that keep two tests claiming one exclusive
+//! resource, or one serial group, from running concurrently. The plan renders
+//! the `nextest.toml` and validates a checked-in file, so a drifted config
+//! cannot be regenerated into agreement by accident, and
+//! [`NextestLanePlan::serial_set_for`] reads the derived set off the
+//! [`SchedulingDecision`] a work item already carries.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use super::nextest_partition;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -96,22 +101,6 @@ impl JobClass {
             Self::Coverage => 30,
             Self::Mutation => 20,
             Self::Dreamer => 10,
-        }
-    }
-
-    /// Stable lane-partition identity used by [`NextestLanePlan`].
-    #[must_use]
-    pub const fn lane(self) -> &'static str {
-        match self {
-            Self::Kernel => "kernel",
-            Self::Watchdog => "watchdog",
-            Self::ControlReserve => "control-reserve",
-            Self::Verification => "verification",
-            Self::Interactive => "interactive",
-            Self::Indexing => "indexing",
-            Self::Coverage => "coverage",
-            Self::Mutation => "mutation",
-            Self::Dreamer => "dreamer",
         }
     }
 }
@@ -290,9 +279,9 @@ impl SchedulingDecision {
     }
 }
 
-/// Typed rejections from resource declaration, lease allocation, and lane
-/// derivation. All are fail-closed: an unknown or conflicting declaration is
-/// refused rather than silently downgraded.
+/// Typed rejections from resource declaration, lease allocation, and nextest
+/// serial-set derivation. All are fail-closed: an unknown or conflicting
+/// declaration is refused rather than silently downgraded.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ResourceError {
     #[error("invalid resource declaration ({field}): {reason}")]
@@ -314,109 +303,88 @@ pub enum ResourceError {
     EmptySerialGroup { group: String },
 }
 
-/// The nextest partitioning and serial-group plan derived from declarations.
+/// The nextest serial sets derived from the declared test resource profiles.
+///
+/// One set is one nextest test group declared with `max-threads = 1`, holding
+/// every declared test that is transitively bound to the same exclusive
+/// resource or serial group. Two tests claiming the same resource, or
+/// declaring the same serial group, are therefore always in one set and
+/// cannot run concurrently; a test that declares neither is in no set and
+/// runs unconstrained. The derivation and the rendering are in
+/// [`nextest_partition`]; this type owns the decision record's view of them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NextestLanePlan {
-    /// Declared classes, in admission order.
-    pub classes: Vec<JobClass>,
-    /// Serial groups, each with the exact test filters that must not overlap.
+    /// Serial sets, each with the exact, sorted test names it serializes.
     pub serial_groups: BTreeMap<String, Vec<String>>,
+    /// Every declared identity to the serial set that holds it. Private:
+    /// callers look a set up through [`Self::serial_set_for`].
+    group_of_identity: BTreeMap<String, String>,
 }
 
 impl NextestLanePlan {
-    /// Builds the plan from every declared class and serial-group filter set.
+    /// Builds the plan from the declared profiles of every test, keyed by the
+    /// nextest test name.
     ///
-    /// Fails closed when a serial group is declared with no member filter: an
-    /// empty group cannot constrain concurrency and would silently permit
-    /// overlapping runs.
-    pub fn build(
-        classes: &BTreeSet<JobClass>,
-        serial_groups: &BTreeMap<String, Vec<String>>,
-    ) -> Result<Self, ResourceError> {
-        for (group, filters) in serial_groups {
-            if filters.is_empty() {
-                return Err(ResourceError::EmptySerialGroup {
-                    group: group.clone(),
-                });
-            }
-        }
+    /// Fails closed on an invalid declaration and on a test name no nextest
+    /// filterset can match, rather than dropping the test from the plan.
+    pub fn build(declared: &BTreeMap<String, TestResourceProfile>) -> Result<Self, ResourceError> {
+        let plan = nextest_partition::exclusivity_plan(declared)?;
         Ok(Self {
-            classes: classes.iter().copied().collect(),
-            serial_groups: serial_groups.clone(),
+            serial_groups: plan.sets,
+            group_of_identity: plan.group_of_identity,
         })
     }
 
-    /// Number of partitioning lanes: one per distinct declared job class, so
-    /// a verification lane and a background lane are never the same partition.
-    #[must_use]
-    pub fn lanes(&self) -> usize {
-        self.classes.len().max(1)
+    /// The serial set holding the tests of one recorded scheduling decision,
+    /// or `None` when that decision declared no exclusive resource and no
+    /// serial group.
+    ///
+    /// The decision is the only input: it already carries the exclusive
+    /// resources it was leased and the serial group it declared, so the
+    /// nextest assignment is read off the execution record itself instead of
+    /// a second declaration channel. Fails closed when a declared identity is
+    /// absent from this plan, because reporting no serial set there would let
+    /// two tests claiming one resource run concurrently.
+    pub fn serial_set_for(
+        &self,
+        decision: &SchedulingDecision,
+    ) -> Result<Option<String>, ResourceError> {
+        let mut serial_set: Option<String> = None;
+        for identity in nextest_partition::recorded_identities(decision) {
+            let Some(group) = self.group_of_identity.get(&identity) else {
+                return Err(ResourceError::InvalidClaim {
+                    field: "nextest serial set",
+                    reason: "declared resource or serial group is absent from the plan",
+                });
+            };
+            if serial_set.is_none() {
+                serial_set = Some(group.clone());
+            }
+        }
+        Ok(serial_set)
     }
 
     /// Renders the deterministic `nextest.toml` for this plan.
     ///
-    /// Partitioning is by declared job class lane, so a verification lane and
-    /// a background lane are distinct partitions and never share a slot. Each
-    /// declared serial group becomes one test-group override in every declared
-    /// lane: nextest runs at most one test per test group per run, so members
-    /// of a serial group can never run concurrently, whichever lane holds them.
-    #[must_use]
-    pub fn render_nextest_toml(&self) -> String {
-        let mut out = String::new();
-        out.push_str(
-            "# Generated from declared test resource profiles by\n\
-             # scripts/nextest_lane_plan_1899.py. Do not edit by hand.\n",
-        );
-        for class in &self.classes {
-            out.push_str(&format!(
-                "\n[profile.{}]\npartition-by = 'test(/^{}$/)'\n",
-                class.lane(),
-                class.lane()
-            ));
-        }
-        for class in &self.classes {
-            for (group, filters) in &self.serial_groups {
-                out.push_str(&format!(
-                    "\n[[profile.{}.overrides]]\nfilter = '{}'\ntest-group = \"{group}\"\n",
-                    class.lane(),
-                    filters.join("|"),
-                ));
-            }
-        }
-        out
+    /// Each serial set becomes one `max-threads = 1` test group plus one
+    /// override whose filter selects exactly its members, so nextest runs at
+    /// most one of them at a time. The same declarations always render the
+    /// same bytes.
+    pub fn render_nextest_toml(&self) -> Result<String, ResourceError> {
+        nextest_partition::render_nextest_toml(&self.serial_groups)
     }
 
     /// Validates a `nextest.toml` against this plan.
     ///
-    /// Fails closed when the checked-in file is missing a declared lane or
-    /// serial group, or names a filter the declarations do not produce. A file
-    /// that drifted from the declarations is a configuration failure, not a
-    /// reason to regenerate the declarations.
+    /// Fails closed on any difference from the rendered plan. A file that
+    /// drifted from the declarations is a configuration failure, not a reason
+    /// to regenerate the declarations.
     pub fn validate_nextest_toml(&self, text: &str) -> Result<(), ResourceError> {
-        for class in &self.classes {
-            let needle = format!("[profile.{}]", class.lane());
-            if !text.contains(&needle) {
-                return Err(ResourceError::InvalidClaim {
-                    field: "nextest.toml",
-                    reason: "missing a declared job-class lane profile",
-                });
-            }
-        }
-        for (group, filters) in &self.serial_groups {
-            if !text.contains(group.as_str()) {
-                return Err(ResourceError::InvalidClaim {
-                    field: "nextest.toml",
-                    reason: "missing a declared serial group",
-                });
-            }
-            for filter in filters {
-                if !text.contains(filter.as_str()) {
-                    return Err(ResourceError::InvalidClaim {
-                        field: "nextest.toml",
-                        reason: "missing a declared serial-group filter",
-                    });
-                }
-            }
+        if text != self.render_nextest_toml()? {
+            return Err(ResourceError::InvalidClaim {
+                field: "nextest.toml",
+                reason: "does not match the serial sets derived from the declared test resource profiles",
+            });
         }
         Ok(())
     }
