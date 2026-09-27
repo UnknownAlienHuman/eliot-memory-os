@@ -534,12 +534,14 @@ pub fn observed_publication<'a>(
 /// [`FencedProjectionPublication::check_current`], which refuses a non-`CURRENT`
 /// status, a split view, a mismatched source generation, a source head that is
 /// not fence-pinned to the record, a malformed provenance manifest, a changed
-/// projection definition, and an atomic commit that is not the one whose data
-/// is being served. This function adds exactly the three clauses the record
-/// cannot decide alone: an empty candidate head set is never coverage, the
-/// projection kind must match exactly, and the observed dependency definition
-/// digest must match exactly, because a bare definition match is not enough
-/// (I5.8).
+/// projection definition, and a fence whose atomic commit reference disagrees
+/// with the record's atomic data commit. The one clause the record cannot
+/// prove against itself — that it is the publication whose data the caller is
+/// about to serve — stays with the caller, as the store documents. This
+/// function adds exactly the three clauses left over: an empty candidate head
+/// set is never coverage, the projection kind must match exactly, and the
+/// observed dependency definition digest must match exactly, because a bare
+/// definition match is not enough (I5.8).
 #[must_use]
 pub fn publication_serves_candidate(
     publication: &ObservedPublication<'_>,
