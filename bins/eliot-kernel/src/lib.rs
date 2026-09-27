@@ -595,6 +595,14 @@ pub struct KernelComposition {
     agent_bridge_peer_set_changed: tokio::sync::Notify,
     #[cfg(windows)]
     agent_bridge_connections: Mutex<BTreeMap<String, AgentBridgeConnectionState>>,
+    /// Application-owned ELIOT session authorities keyed by semantic session
+    /// identity (I7.14). Unlike `agent_bridge_connections`, these survive a
+    /// transport disconnect: a pipe/stdio/HTTP reconnect records a new
+    /// transport-binding continuity observation and the application session
+    /// stays ACTIVE. Only application-level expiry, revocation or explicit
+    /// detach moves the session to a terminal state.
+    #[cfg(windows)]
+    agent_application_sessions: Mutex<BTreeMap<String, eliot_ipc::ApplicationSession>>,
     #[cfg(windows)]
     agent_activation_pending: Mutex<AgentActivationPendingState>,
     #[cfg(windows)]
