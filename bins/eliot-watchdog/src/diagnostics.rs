@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    HostObservationState, SpoolError, WatchdogRuntimeReadback, WatchdogRuntimeState,
+    HostObservationState, SERVICE_NAME, SpoolError, WatchdogRuntimeReadback, WatchdogRuntimeState,
     WatchdogSelfAdmissionError,
 };
 
@@ -49,10 +49,23 @@ static SUBSCRIBER_INSTALLED: OnceLock<bool> = OnceLock::new();
 pub fn install_subscriber() {
     let _ = SUBSCRIBER_INSTALLED.get_or_init(|| {
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let _ = tracing_subscriber::fmt()
+        if tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
-            .try_init();
+            .try_init()
+            .is_err()
+        {
+            // Allowed fallback only: a second global owner or a broken sink
+            // must not panic, retry, or log recursively. One fixed stderr
+            // line; startup continues with whatever subscriber (if any) owns
+            // the process default. The write itself is best-effort.
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!(
+                    "{SERVICE_NAME}: diagnostic subscriber unavailable; continuing with stderr fallback\n"
+                ),
+            );
+        }
         true
     });
 }

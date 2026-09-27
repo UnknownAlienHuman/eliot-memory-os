@@ -82,6 +82,11 @@ pub struct HostIdentityMonitor {
     expected_image_lease: Option<ProtectedPathLease>,
     require_image_lease: bool,
     require_registration_readback: bool,
+    /// Installer-approved generation governing the observed Host target, from
+    /// the retained runtime binding. Diagnostic identity only: it is echoed in
+    /// liveness observations and never influences the observation verdict.
+    /// `None` (test-constructed monitors) is reported explicitly unavailable.
+    observed_generation: Option<String>,
 }
 
 impl HostIdentityMonitor {
@@ -94,6 +99,7 @@ impl HostIdentityMonitor {
             expected_image_lease: None,
             require_image_lease: false,
             require_registration_readback: false,
+            observed_generation: None,
         }
     }
 
@@ -109,6 +115,7 @@ impl HostIdentityMonitor {
             expected_image_lease: Some(lease),
             require_image_lease: true,
             require_registration_readback: true,
+            observed_generation: None,
         }
     }
 
@@ -123,6 +130,7 @@ impl HostIdentityMonitor {
             expected_image_lease: None,
             require_image_lease: true,
             require_registration_readback: true,
+            observed_generation: None,
         }
     }
 
@@ -145,6 +153,21 @@ impl HostIdentityMonitor {
     #[must_use]
     pub fn observe(&mut self) -> HostObservation {
         let _span = tracing::debug_span!("watchdog.host_observe").entered();
+        // Exact available liveness identities: the approved Host service name
+        // is the observed target, and the retained binding generation governs
+        // it. Both are validated nonsecret coordination identities; observed
+        // process values (PID, start time, image bytes) are still never
+        // emitted. Missing identities stay explicitly unavailable.
+        let target = self
+            .expected_registration
+            .as_ref()
+            .map_or("unavailable".to_owned(), |registration| {
+                registration.request.service_name().to_owned()
+            });
+        let generation = self
+            .observed_generation
+            .clone()
+            .unwrap_or_else(|| "unavailable".to_owned());
         if self.require_image_lease
             && self.expected_image_lease.is_none()
             && let Some(expected_image) = self.expected_image.as_deref()
@@ -161,6 +184,8 @@ impl HostIdentityMonitor {
             tracing::debug!(
                 event = "watchdog.host_observed",
                 observation = "unknown",
+                target = target.as_str(),
+                generation = generation.as_str(),
                 "host image lease unavailable; observation stays unknown"
             );
             crate::diagnostics::observe_host_observation(HostObservationState::Unknown, false);
@@ -178,6 +203,8 @@ impl HostIdentityMonitor {
             tracing::debug!(
                 event = "watchdog.host_observed",
                 observation = crate::diagnostics::host_observation_diagnostic(observation.state),
+                target = target.as_str(),
+                generation = generation.as_str(),
                 "host observation reconciled without lifecycle authority"
             );
             return observation;
@@ -185,6 +212,8 @@ impl HostIdentityMonitor {
         tracing::debug!(
             event = "watchdog.host_observed",
             observation = "unknown",
+            target = target.as_str(),
+            generation = generation.as_str(),
             "no registration readback required; observation stays unknown"
         );
         crate::diagnostics::observe_host_observation(HostObservationState::Unknown, false);
@@ -325,10 +354,19 @@ impl LiveHostObservationSource {
     /// binding. The caller cannot provide or replace the SCM request.
     #[must_use]
     pub fn from_binding(binding: &WatchdogRuntimeBinding) -> Self {
-        Self::try_new(
+        let source = Self::try_new(
             binding.approved_host_image.clone(),
             binding.approved_host_registration.clone(),
-        )
+        );
+        // Bind the exact approved generation governing the observed Host
+        // target for liveness-observation identity. The observation verdict
+        // never reads this value; a lock failure only leaves the generation
+        // explicitly unavailable in later records.
+        if let Ok(mut monitor) = source.monitor.lock() {
+            monitor.observed_generation =
+                Some(binding.selected_manifest.generation.as_str().to_owned());
+        }
+        source
     }
 
     /// Opens the approved Host image through the protected no-follow adapter

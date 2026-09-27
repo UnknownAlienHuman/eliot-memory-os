@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use eliot_runtime::{ChildClass, Runtime, ShutdownOutcome, SupervisionStrategy, TaskFailure};
+use eliot_runtime::{
+    ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
+};
 
 use crate::CompositionError;
 use crate::HostObservationSource;
@@ -271,8 +273,23 @@ impl WatchdogComposition {
                 }
             },
         ) {
-            eliot_runtime::SpawnDisposition::Admitted(task) => task,
+            eliot_runtime::SpawnDisposition::Admitted(task) => {
+                tracing::info!(
+                    event = "watchdog.composition_admitted",
+                    observation = "admitted",
+                    "watchdog supervision task admitted"
+                );
+                task
+            }
             eliot_runtime::SpawnDisposition::DeniedShuttingDown => {
+                // Refusal, not failed execution: the runtime is already
+                // shutting down, so no supervision task was admitted.
+                tracing::warn!(
+                    event = "watchdog.composition_refused",
+                    observation = "refused",
+                    reason_code = "ADMISSION_CLOSED",
+                    "watchdog composition refused: runtime is shutting down"
+                );
                 return Err(CompositionError::AdmissionClosed);
             }
         };
@@ -357,6 +374,7 @@ impl WatchdogComposition {
         tokio::select! {
             result = &mut task_result => {
                 let shutdown = runtime.shutdown().await;
+                report_restart_budget_exhaustion(&result);
                 result.map(|_| shutdown)
             }
             signal = tokio::signal::ctrl_c() => {
@@ -366,6 +384,7 @@ impl WatchdogComposition {
                 runtime.shutdown_handle().request();
                 let result = task_result.await;
                 let shutdown = runtime.shutdown().await;
+                report_restart_budget_exhaustion(&result);
                 complete_requested_shutdown(result, shutdown)
             }
             result = wait_for_shutdown(shutdown_requested) => {
@@ -373,6 +392,7 @@ impl WatchdogComposition {
                     runtime.shutdown_handle().request();
                     let result = task_result.await;
                     let shutdown = runtime.shutdown().await;
+                    report_restart_budget_exhaustion(&result);
                     complete_requested_shutdown(result, shutdown)
                 } else {
                     Err(TaskFailure::Failed("watchdog shutdown signal failed".to_owned()))
@@ -435,6 +455,27 @@ impl WatchdogComposition {
         // waits on backup wiring.
         self.backup_control_registration.close();
         self.shutdown_requested.store(true, Ordering::Release);
+    }
+}
+
+/// Records a restart-budget-exhausted supervision terminal, if that is what
+/// the supervised task reached.
+///
+/// Observation only: [`SupervisionOutcome::Quarantined`] is the exact typed
+/// restart-budget-exhaustion signal from the runtime supervisor (I1.4
+/// quarantine), and without this record it would be indistinguishable from a
+/// completed supervision. Every other terminal keeps its existing downstream
+/// record: task failures surface through the runtime-failure boundary and
+/// cancellation through shutdown. The return value is untouched: logging never
+/// changes supervision, recovery, or shutdown behavior.
+fn report_restart_budget_exhaustion(result: &Result<SupervisionOutcome, TaskFailure>) {
+    if matches!(result, Ok(SupervisionOutcome::Quarantined)) {
+        tracing::error!(
+            event = "watchdog.restart_budget_exhausted",
+            supervision_outcome = "quarantined",
+            failure_code = "RESTART_BUDGET_EXHAUSTED",
+            "watchdog supervision task quarantined after restart-budget exhaustion"
+        );
     }
 }
 
