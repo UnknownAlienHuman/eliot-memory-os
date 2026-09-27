@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use eliot_process::OperationId;
 use eliot_user_broker::{
-    BrokerComposition, BrokerConfig, canonical_root, request_names_notify_image,
+    BrokerComposition, BrokerConfig, HumanStateAuthority, OperatorClientBinding, canonical_root,
+    request_names_notify_image,
 };
 use eliot_user_broker_core::{
     LaunchRequest, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
@@ -27,20 +28,33 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 // The line protocol mirrors the existing launch contract without a second boxed wire shape.
 #[allow(clippy::large_enum_variant)]
 enum Request {
+    /// Admitted launch on a Kernel-authorized grant. The explicit
+    /// authenticated Human authority is admitted before anything is
+    /// dispatched: a missing principal, stale session token, cross-session
+    /// identity, ungranted capability, or missing approval hash is refused
+    /// before any state change.
     Launch {
         request: LaunchRequest,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
     },
     /// Per-notification spawn of the canonical installed `eliot-notify.exe` on
     /// a Kernel-authorized grant. This is the ONLY operation that can start the
     /// notification adapter: the generic `Launch` operation refuses that image.
     NotifyLaunch {
         request: LaunchRequest,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
     },
     Cancel {
         operation_id: OperationId,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
     },
     Reconcile {
         operation_id: OperationId,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
     },
     /// Initial or reconnect handoff for the one-shot Operator child. The broker
     /// mints the nonce, the endpoint generation, and the expiry; this request
@@ -49,11 +63,14 @@ enum Request {
     OperatorHandoff {
         request: OperatorHandoffRequest,
     },
-    /// Redemption of one issued handoff, exactly once. A consumed nonce, a
-    /// stale endpoint generation, or an expired window is refused with its own
-    /// stable code.
+    /// Redemption of one issued handoff, exactly once, against the
+    /// OS-observed redeeming client binding. A consumed nonce, a stale
+    /// endpoint generation, an expired window, a stale Kernel session token,
+    /// a foreign SID/session, or a foreign client process image is refused
+    /// with its own stable code.
     RedeemOperatorHandoff {
         endpoint: OperatorEndpoint,
+        client: OperatorClientBinding,
     },
     Status,
     Stop,
@@ -299,7 +316,7 @@ fn dispatch(
         }
     };
     match request {
-        Request::Launch { request } => {
+        Request::Launch { request, authority } => {
             // I11.6:3: normal `eliot-notify` delivery is launched through the
             // authorized User Broker's notify-specific admitted path. A generic
             // launch naming the canonical notify image is refused here, so no
@@ -311,31 +328,59 @@ fn dispatch(
                         .to_owned(),
                 };
             }
-            dispatch_launch(composition.launch(request))
+            let operation_key = request.approved.idempotency_key.clone();
+            match composition.admit_human_state_change(authority.as_ref(), &operation_key) {
+                Err(error) => composition_rejection(&error),
+                Ok(()) => dispatch_launch(composition.launch(request)),
+            }
         }
-        Request::NotifyLaunch { request } => dispatch_launch(composition.launch_notify(request)),
-        Request::Cancel { operation_id } => composition.cancel(&operation_id).map_or_else(
-            |error| composition_rejection(&error),
-            |receipt| Message::Cancelled {
-                receipt: serde_json::to_value(receipt)
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-            },
-        ),
-        Request::Reconcile { operation_id } => composition.reconcile(&operation_id).map_or_else(
-            |error| composition_rejection(&error),
-            |view| Message::Reconciled {
-                view: serde_json::to_value(view)
-                    .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
-            },
-        ),
+        Request::NotifyLaunch { request, authority } => {
+            let operation_key = request.approved.idempotency_key.clone();
+            match composition.admit_human_state_change(authority.as_ref(), &operation_key) {
+                Err(error) => composition_rejection(&error),
+                Ok(()) => dispatch_launch(composition.launch_notify(request)),
+            }
+        }
+        Request::Cancel {
+            operation_id,
+            authority,
+        } => {
+            match composition.admit_human_state_change(authority.as_ref(), operation_id.as_str()) {
+                Err(error) => composition_rejection(&error),
+                Ok(()) => composition.cancel(&operation_id).map_or_else(
+                    |error| composition_rejection(&error),
+                    |receipt| Message::Cancelled {
+                        receipt: serde_json::to_value(receipt).unwrap_or_else(
+                            |error| serde_json::json!({"error": error.to_string()}),
+                        ),
+                    },
+                ),
+            }
+        }
+        Request::Reconcile {
+            operation_id,
+            authority,
+        } => {
+            match composition.admit_human_state_change(authority.as_ref(), operation_id.as_str()) {
+                Err(error) => composition_rejection(&error),
+                Ok(()) => composition.reconcile(&operation_id).map_or_else(
+                    |error| composition_rejection(&error),
+                    |view| Message::Reconciled {
+                        view: serde_json::to_value(view).unwrap_or_else(
+                            |error| serde_json::json!({"error": error.to_string()}),
+                        ),
+                    },
+                ),
+            }
+        }
         Request::OperatorHandoff { request } => dispatch_admitted_handoff(
             composition
                 .admit_operator_handoff(&request)
                 .map(HandoffOutcome::Issued),
         ),
-        Request::RedeemOperatorHandoff { endpoint } => dispatch_admitted_handoff(
+        Request::RedeemOperatorHandoff { endpoint, client } => dispatch_admitted_handoff(
             composition
-                .redeem_operator_handoff(&endpoint)
+                .redeem_operator_handoff(&endpoint, &client)
                 .map(HandoffOutcome::Redeemed),
         ),
         Request::Status => {

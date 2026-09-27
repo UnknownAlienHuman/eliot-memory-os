@@ -37,8 +37,8 @@ use crate::operation_identity::{
 fn kernel_port_error(error: eliot_cli::kernel_client::KernelClientError) -> PortError {
     match error {
         eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(_) => PortError::Unavailable,
-        eliot_cli::kernel_client::KernelClientError::UnknownOutcome(_) => PortError::Unknown,
-        eliot_cli::kernel_client::KernelClientError::RestartRequired(_) => PortError::Unknown,
+        eliot_cli::kernel_client::KernelClientError::UnknownOutcome(_)
+        | eliot_cli::kernel_client::KernelClientError::RestartRequired(_) => PortError::Unknown,
         eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity => {
             PortError::Invalid("missing authenticated RequestIdentity".to_owned())
         }
