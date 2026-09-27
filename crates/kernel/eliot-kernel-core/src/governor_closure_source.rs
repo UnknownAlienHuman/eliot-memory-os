@@ -1365,7 +1365,7 @@ mod tests {
         epoch: &eliot_contracts::EpochId,
         binding: &AuthorityBinding,
     ) -> Result<RootGrantHydration, KernelError> {
-        let intent = GrantActivationIntent {
+        let mut intent = GrantActivationIntent {
             operation_id: "op-test-root".to_owned(),
             grant_id: "grant-test-root".to_owned(),
             parent_grant_id: None,
@@ -1375,13 +1375,16 @@ mod tests {
             holder_principal: "holder-1".to_owned(),
             session_id: "session-1".to_owned(),
             scope_id: "scope-1".to_owned(),
+            token_id: "token-grant-test-root".to_owned(),
             binding: binding.clone(),
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::ScopedVerification,
             issued_at_ms: 1_000,
             expires_at_ms: Some(10_000),
             receipt_obligations: vec!["obligation-1".to_owned()],
+            ..crate::grant_activation_port::tests::unbound_intent(binding)
         };
+        crate::grant_activation_port::tests::bind_fixture_mechanical_subset(&mut intent);
         let authority_epoch = eliot_ors::EpochLineage {
             current: eliot_ors::EpochIdentity {
                 lineage_id: eliot_ors::OpaqueLabel::new(epoch.lineage_id.as_str())

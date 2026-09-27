@@ -1171,10 +1171,19 @@ impl KernelComposition {
 
     /// Confirms that the exact grant or introduction and snapshot are present
     /// in the current, internally consistent owner revision before mutation.
+    ///
+    /// `restrictive` selects the W4 revocation rule: a restriction must bind
+    /// the EXACT committed target. When the target already carries a committed
+    /// mechanical activation, the presented snapshot and the grant-graph
+    /// revision the activation committed at must both be the committed ones, so
+    /// a revocation presented against an obsolete revision cannot reach an
+    /// unrelated replacement. A target that was never activated has no
+    /// committed activation to bind and keeps the existing reconciling path.
     fn admit_p07_target_against_current_grant_graph(
         &self,
         target: P07LifecycleTarget<'_>,
         snapshot_id: &str,
+        restrictive: bool,
     ) -> Result<(), eliot_authority::P07PortError> {
         use eliot_kernel_core::RootGrantHydrationSource as _;
 
@@ -1221,6 +1230,16 @@ impl KernelComposition {
             return Err(eliot_authority::P07PortError::NotAdmitted);
         };
         if admitted_snapshot_id != snapshot_id || admitted_revision != current_revision {
+            return Err(eliot_authority::P07PortError::IdentityConflict);
+        }
+        if restrictive
+            && let P07LifecycleTarget::Grant(grant_id) = target
+            && let Some((committed, _subset)) = bound.port().committed_activation(grant_id)
+            && (committed.receipt.snapshot_id != snapshot_id
+                || committed.grant_graph_revision != current_revision)
+        {
+            // The restriction does not name the committed activation, so it is
+            // aimed at a revision that is no longer the effective one.
             return Err(eliot_authority::P07PortError::IdentityConflict);
         }
         Ok(())
@@ -2949,6 +2968,7 @@ impl KernelComposition {
                 if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
                     P07LifecycleTarget::Grant(&operation.grant_id),
                     &operation.snapshot_id,
+                    false,
                 ) {
                     return p07_refusal_frame(
                         session,
@@ -2998,6 +3018,7 @@ impl KernelComposition {
                 if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
                     P07LifecycleTarget::Grant(&operation.grant_id),
                     &operation.snapshot_id,
+                    true,
                 ) {
                     return p07_refusal_frame(
                         session,
@@ -3044,6 +3065,7 @@ impl KernelComposition {
                 if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
                     P07LifecycleTarget::Introduction(&operation.introduction_id),
                     &operation.snapshot_id,
+                    false,
                 ) {
                     return p07_refusal_frame(
                         session,
@@ -3100,6 +3122,7 @@ impl KernelComposition {
                 if let Err(refusal) = self.admit_p07_target_against_current_grant_graph(
                     P07LifecycleTarget::Introduction(&operation.introduction_id),
                     &operation.snapshot_id,
+                    true,
                 ) {
                     return p07_refusal_frame(
                         session,
