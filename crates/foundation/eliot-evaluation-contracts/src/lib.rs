@@ -21,6 +21,8 @@ use thiserror::Error;
 
 mod coverage_traces;
 pub use coverage_traces::*;
+mod human_attention;
+pub use human_attention::*;
 
 /// Stable wire name for the C0-13 surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.evaluation-contracts";
