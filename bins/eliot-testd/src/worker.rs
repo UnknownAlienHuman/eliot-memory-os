@@ -205,6 +205,18 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
     clippy::too_many_arguments,
     reason = "DISPATCH-LIVE residual: one admitted-shot context (composition, store, job, lease, presented material, executor, owner, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
 )]
+fn receipt_or_corrupt(
+    store: &TestdStore,
+    job: &TestJob,
+    context: &'static str,
+) -> Result<TestReceipt, TestdError> {
+    Ok(crate::receipt(
+        &store
+            .get(&job.job_id)?
+            .ok_or_else(|| TestdError::Corrupt(context.to_owned()))?,
+    ))
+}
+
 fn drive_claimed<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
@@ -222,15 +234,11 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             &EvidenceCollector::default(),
             format!("refused foreign or stale presentation without executing: {binding}"),
         )?;
-        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-            || TestdError::Corrupt("job disappeared after refusal".to_owned()),
-        )?));
+        return receipt_or_corrupt(store, job, "job disappeared after refusal");
     }
     if presented.cancelled {
         store.cancel(&job.job_id, Some(lease), owner, current_clock_ms())?;
-        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-            || TestdError::Corrupt("job disappeared after cancellation".to_owned()),
-        )?));
+        return receipt_or_corrupt(store, job, "job disappeared after cancellation");
     }
     // Fresh bound admission: rebuild the Kernel request from the CLAIMED
     // durable job and seal it with the single-use replay of the presented
@@ -267,14 +275,11 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                 &EvidenceCollector::default(),
                 format!("fresh admission refused without executing: {error}"),
             )?;
-            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
-            )?));
+            return receipt_or_corrupt(store, job, "job disappeared after admission refusal");
         }
     };
-    // The collector is constructed internally from this exact attempt
-    // (issue #456, Wave B): it admits only records carrying the presented
-    // operation, and the start path below refuses any other sink.
+    // Internally built from this exact attempt (#456 Wave B): admits only
+    // records carrying the presented operation; start refuses other sinks.
     let collector = Arc::new(EvidenceCollector::for_operation(operation_id.clone()));
     if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
         let observation = match observe_tool_identity(permit.request()) {
@@ -289,9 +294,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                         "productive tool identity was not owner-observed; no process started: {error}"
                     ),
                 )?;
-                return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                    || TestdError::Corrupt("job disappeared after tool observation".to_owned()),
-                )?));
+                return receipt_or_corrupt(store, job, "job disappeared after tool observation");
             }
         };
         collector.record_tool_observation(observation)?;
