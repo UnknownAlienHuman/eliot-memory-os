@@ -101,6 +101,43 @@
 //! family's disposition delegates to [`RowFamilyKind::disposition`], which routes
 //! it to `ForensicOnly` alongside the `UnknownCommitRecovery` sibling, so an
 //! exported row lands as forensics and never as an importable answer.
+//!
+//! Issue #953 makes the capture coherent and the page binding self-proving:
+//! - ONE `ReadTransaction` is opened per capture and threaded through the
+//!   store-wide fence observation, the pre witness and EVERY page
+//!   (`export_page_in`). Before, each page opened and dropped its own
+//!   transaction, so the page loop was N+2 transactions and pages from different
+//!   moments shared one fence and one token.
+//! - The composite post witness is then taken from a SECOND read transaction
+//!   opened only after the capture transaction is released, so the two ends of
+//!   the pre/post freeze check are genuinely different moments. Coherence of the
+//!   pages and detection of a writer that committed during the capture are two
+//!   different properties with two different mechanisms; the first comes from the
+//!   single transaction, the second from the post-release observation. Neither
+//!   substitutes for the other, and no witness on either path compares a snapshot
+//!   against itself.
+//! - The owner-observed fence is COMPARED against the request, not transcribed
+//!   from it: `capture_store_fence` reads the ordering high-water mark and the
+//!   family revision inside the capture transaction, and `check_export_fence`
+//!   refuses a request the store cannot confirm.
+//! - Every page is self-describing: it carries the owner-derived fence token and
+//!   a bounded capture window, and its digest is re-derived from its own bytes by
+//!   the one derivation in the contract module, so the import triage path can
+//!   refuse a page assembled from more than one source.
+//!
+//! ASSUMPTION: I05-13 names `OrsSnapshotFence` as the coherent logical ORS
+//! export a `full_recovery` backup must carry, and describes what it records
+//! ("Host/Kernel authority lineage, last reconciled canonical receipt/event/
+//! outbox cursors, pending-operation identities and hashes, job checkpoints,
+//! generation cutovers and snapshot time"). There is NO `OrsSnapshotFence` type
+//! anywhere in this repository, and no document defines how ORS self-consistency
+//! is established or which of those fields ORS is able to produce. The contract
+//! for this work therefore exists only in the issue text. What is implemented here
+//! is the part ORS can actually establish and prove on its own: one read snapshot,
+//! a compared ordering high-water mark, a compared family revision, and a per-page
+//! token re-derived from page content. The lineage, canonical cursor and
+//! pending-operation-hash fields I05-13 describes are cross-store material this
+//! crate does not hold, and are NOT approximated by a lookalike struct.
 
 use std::fmt::Write as _;
 use std::ops::Bound;
@@ -112,11 +149,12 @@ use super::persistence_codec::{decode, decode_named, encode};
 use super::persistence_models::DurableOperationalRecord;
 use super::storage;
 use crate::backup_snapshot::{
-    BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_PAGE_ENTRIES, OrsBackupEntry,
-    OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage, OrsBackupRequest,
-    OrsBackupSnapshot, OrsFamilyContinuation, OrsFamilyCursor, OrsFamilyRowChain,
-    OrsFamilySnapshotIdentity, PerEntryOutcome, RowDisposition, RowFamilyDisposition,
-    RowFamilyKind, StoredEffectClass, check_canonical_frozen, validate_import_binding,
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_PAGE_ENTRIES,
+    MAX_BACKUP_PAGE_LIFETIME_MS, OrsBackupEntry, OrsBackupImportReceipt, OrsBackupImportRequest,
+    OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot, OrsFamilyContinuation, OrsFamilyCursor,
+    OrsFamilyRowChain, OrsFamilySnapshotIdentity, PerEntryOutcome, RowDisposition,
+    RowFamilyDisposition, RowFamilyKind, StoredEffectClass, check_canonical_frozen,
+    validate_import_binding,
 };
 use crate::{
     OperationalPhase, OrsError, ProcessStreamRecoveryProjection, StreamRecoveryActivation,
@@ -419,6 +457,115 @@ fn check_family_revision_frozen(
     })
 }
 
+/// Store-wide fence values the owner can establish at a capture's consistency
+/// point (issue #953).
+///
+/// Read once through the ONE `ReadTransaction` that also produces every page, so
+/// the observed fence and the exported rows are the same moment by construction.
+/// This is the same shape as [`check_family_revision_frozen`]: a comparison
+/// against live owner state inside the caller's read transaction, never a
+/// re-derivation from anything the caller supplied.
+struct StoreFenceObservation {
+    /// `next_global_order` out of `ors_meta_v1`: the store's canonical ordering
+    /// high-water mark. Monotone, advanced by every operation-order allocation
+    /// and by `ensure_grant_closure_order_floor`, absent (read as `0`) on a store
+    /// that never allocated one.
+    high_water_order: u64,
+    /// Durable monotone revision of the process-stream recovery family.
+    family_revision: u64,
+}
+
+/// Observes the store-wide fence through the caller's capture transaction
+/// (issue #953).
+///
+/// Both reads are meta reads taken under the SAME transaction the pages are read
+/// under, so the observation cannot be a later moment than the rows it fences.
+/// An unparseable counter is [`OrsError::IntegrityProblem`] on the meta table's
+/// own `record_type`, exactly as the writer that advances these counters reports
+/// a corrupt value; it is never defaulted to a value that would then look like a
+/// matching fence.
+fn capture_store_fence(read: &ReadTransaction) -> Result<StoreFenceObservation, OrsError> {
+    let meta = read.open_table(super::META).map_err(storage)?;
+    let high_water_order = meta
+        .get(super::NEXT_GLOBAL_ORDER)
+        .map_err(storage)?
+        .map(|value| value.value().parse::<u64>())
+        .transpose()
+        .map_err(|error| OrsError::IntegrityProblem {
+            record_type: "ors_meta_v1",
+            reason: error.to_string(),
+        })?
+        .unwrap_or(0);
+    drop(meta);
+    let family_revision = super::RedbRecoveryStore::process_stream_recovery_family_revision(read)?;
+    Ok(StoreFenceObservation {
+        high_water_order,
+        family_revision,
+    })
+}
+
+/// Refuses a request whose declared fence the owner cannot confirm (issue #953).
+///
+/// The issue requires the capture to bind "source installation/ORS
+/// generation/schema, canonical dependency fence, high-water/order", and this is
+/// the step that makes the binding a comparison instead of a transcription. The
+/// store establishes two of those four against durable state and refuses when the
+/// request disagrees:
+///
+/// - `schema_version` against [`BACKUP_SNAPSHOT_SCHEMA_VERSION`], with
+///   [`OrsError::MigrationRequired`] — the crate's existing refusal for a
+///   snapshot whose wire contract is not the one this build speaks. Re-asserted
+///   here because the store is the boundary an unvalidated request crosses, not
+///   only the constructor that first built it.
+/// - `fence.high_water_order` against the observed `next_global_order`, with
+///   [`OrsError::OrderingHeadMismatch`] — the crate's existing typed refusal for
+///   a canonical head that does not match durable ORS state, and the exact state
+///   this check exists to prevent: a request that asserts a fence the store has
+///   already moved past, whose pages would then silently contain rows the fence
+///   excluded.
+///
+/// The family revision is compared separately, by
+/// [`check_family_revision_frozen`], which reports the richer
+/// [`OrsError::ProcessStreamRecoveryFamilyMoved`] with the observed content root.
+///
+/// ASSUMPTION: the issue names a "canonical dependency fence" as something the
+/// capture binds, but no ORS type and no governing document defines one. The only
+/// `canonical_fence` in this repository belongs to a different owner
+/// (`eliot-store-surreal-adapter` / `eliot-doctor-core`), and I05-13 explicitly
+/// declines cross-store atomicity ("The ORS and canonical export are not claimed
+/// to be one cross-store transaction"). There is therefore no ORS-side referent to
+/// compare against, and this check binds the two fence facts the store can
+/// actually establish — its own ordering high-water mark and its own family
+/// revision. A real cross-owner dependency fence is not approximated here.
+///
+/// ASSUMPTION: `installation_id` and `ors_generation` in
+/// [`crate::OrsBackupSourceIdentity`] cannot be compared. ORS has no durable
+/// installation-identity record and no store-wide generation counter, so the
+/// store has no owner-established counterpart to compare either against, and
+/// `BackupVerificationResultRecord::record_key` says normatively that "within one
+/// installation" is STRUCTURAL — a row is only ever read out of the file that
+/// owns it — not an in-band field. Inventing such a record would be new durable
+/// schema, which this issue does not authorise. Those two fields therefore remain
+/// caller-asserted and are disclosed rather than compared; the page token binds
+/// what the store observed, not what the caller claimed about its installation.
+fn check_export_fence(
+    request: &OrsBackupRequest,
+    observation: &StoreFenceObservation,
+) -> Result<(), OrsError> {
+    if request.source.schema_version != BACKUP_SNAPSHOT_SCHEMA_VERSION {
+        return Err(OrsError::MigrationRequired {
+            reason: format!(
+                "backup schema {} unsupported, expected {BACKUP_SNAPSHOT_SCHEMA_VERSION}",
+                request.source.schema_version
+            ),
+        });
+    }
+    if observation.high_water_order != request.fence.high_water_order {
+        return Err(OrsError::OrderingHeadMismatch);
+    }
+    Ok(())
+}
+
 /// Proves that a presented family cursor names exactly the durable-key prefix
 /// the owner already emitted.
 ///
@@ -645,12 +792,22 @@ fn operational_state_digest(read: &ReadTransaction) -> Result<String, OrsError> 
 /// The family axis is a streaming hash chain, so this stays O(1) in the number
 /// of retained family rows; only the pre-existing operational-history half
 /// collects its rows.
-fn composite_state_digest(database: &Database) -> Result<String, OrsError> {
-    let read = database.begin_read().map_err(storage)?;
-    let operational = operational_state_digest(&read)?;
-    let family_revision = super::RedbRecoveryStore::process_stream_recovery_family_revision(&read)?;
-    let family = process_stream_recovery_family_identity(&read)?;
-    drop(read);
+///
+/// Issue #953 takes the `read: &ReadTransaction` parameter instead of opening its
+/// own. Opening its own made the witness a moment the caller did not choose: the
+/// digest was taken at whatever instant this function happened to run, which on
+/// the export path could be after the pages and on the import path after the
+/// triage. The caller now owns the transaction and therefore states exactly which
+/// moment each observation speaks for. Both call sites deliberately take their two
+/// observations from DIFFERENT snapshots, because a witness whose ends come from
+/// one snapshot cannot disagree: the export takes its pre observation inside the
+/// capture transaction and its post observation from a fresh transaction opened
+/// after that one is released, and the import triage takes the two transactions
+/// that straddle its work.
+fn composite_state_digest(read: &ReadTransaction) -> Result<String, OrsError> {
+    let operational = operational_state_digest(read)?;
+    let family_revision = super::RedbRecoveryStore::process_stream_recovery_family_revision(read)?;
+    let family = process_stream_recovery_family_identity(read)?;
     let mut material = String::new();
     let _ = write!(
         material,
@@ -697,7 +854,17 @@ fn stream_recovery_family_page(
     Ok((entries, Some(continuation)))
 }
 
-/// Exports one coherent backup page under a single read transaction.
+/// Exports one coherent backup page under a single read transaction (issue
+/// #953).
+///
+/// The single-page entrypoint: it opens ONE `redb::ReadTransaction`, observes the
+/// store-wide fence through it, refuses a request the owner cannot confirm, and
+/// builds the page under that same transaction, so the page, the fence it names
+/// and the rows it carries are one moment. A caller that wants a snapshot must
+/// use [`export_snapshot`], which holds ONE transaction across the WHOLE page
+/// loop; pages taken from repeated calls to this function are pages from
+/// repeated read transactions and are therefore not one snapshot, whatever
+/// timestamp they carry.
 ///
 /// `page_index` selects a legacy count-stride window beginning at
 /// `after_order + page_entries * page_index`. Operation orders may be sparse,
@@ -705,12 +872,47 @@ fn stream_recovery_family_page(
 /// Callers building a snapshot must reuse the same request (same fence token)
 /// across pages; [`export_snapshot`] applies a bounded refusal when its page
 /// budget ends on a non-final page without an exact family continuation. This
-/// does not make multi-page operational coverage exact. Pages exported from
-/// independent calls with different fence tokens are not one snapshot. Any
-/// row decode failure returns [`OrsError::IntegrityProblem`]; a page is never
-/// fabricated from reference counts alone. Accumulated entry bytes are bounded
-/// by `request.max_bytes` (already `1..=MAX_BACKUP_BYTES` by the request
+/// does not make multi-page operational coverage exact. Any row decode failure
+/// returns [`OrsError::IntegrityProblem`]; a page is never fabricated from
+/// reference counts alone. Accumulated entry bytes are bounded by
+/// `request.max_bytes` (already `1..=MAX_BACKUP_BYTES` by the request
 /// constructor).
+pub(super) fn export_page(
+    database: &Database,
+    request: &OrsBackupRequest,
+    page_index: u32,
+) -> Result<OrsBackupPage, OrsError> {
+    let read = database.begin_read().map_err(storage)?;
+    let observation = capture_store_fence(&read)?;
+    check_export_fence(request, &observation)?;
+    let page = export_page_in(&read, request, page_index, &observation)?;
+    drop(read);
+    Ok(page)
+}
+
+/// Builds one backup page under the caller's capture transaction (issue #953).
+///
+/// Split out of [`export_page`] so the whole page loop of a snapshot can run
+/// under ONE read transaction, which is the issue's "one owner-established read
+/// consistency point": "Independent per-page read transactions with a reused
+/// timestamp are not one snapshot", so a page function that opens its own
+/// transaction cannot be reused inside a page loop. Two callers: the single-page
+/// entrypoint and [`export_snapshot`].
+///
+/// `observation` is the store-wide fence already read through `read` by
+/// [`capture_store_fence`]. It is threaded in rather than re-read per page on
+/// purpose: it is the same transaction, so the value would be identical, and
+/// passing one observation is what makes every page of a snapshot carry the same
+/// owner-observed values in its token.
+///
+/// No deadlock is possible from holding `read` across the loop. redb is MVCC: a
+/// read transaction observes the last committed snapshot and does not block
+/// writers, so a concurrent commit proceeds while this runs and simply becomes
+/// invisible to it. The only cost is that pages the writer committed meanwhile are
+/// not in this snapshot, and that is bounded: the page, byte and page-count
+/// budgets already cap the retained pages at [`MAX_BACKUP_PAGES`] and
+/// [`MAX_BACKUP_BYTES`], so the transaction's lifetime is bounded work, not
+/// unbounded wait (A13.9: no unbounded wait may be held).
 ///
 /// The operational-history window is unchanged. The process-stream recovery
 /// family (#269) is not paged on that window: it has no canonical operation
@@ -719,10 +921,11 @@ fn stream_recovery_family_page(
 /// per-page ceiling is unchanged. `is_last` is the conjunction of the
 /// operational window being exhausted and the family having no continuation
 /// left, so a page that still owes family rows is never final.
-pub(super) fn export_page(
-    database: &Database,
+fn export_page_in(
+    read: &ReadTransaction,
     request: &OrsBackupRequest,
     page_index: u32,
+    observation: &StoreFenceObservation,
 ) -> Result<OrsBackupPage, OrsError> {
     if request.page_entries == 0 {
         return Err(OrsError::InvalidField {
@@ -739,7 +942,11 @@ pub(super) fn export_page(
             reason: "byte budget must be within 1 and MAX_BACKUP_BYTES",
         });
     }
-    let fence_token = request.page_fence_token();
+    // The token binds the owner-observed fence, not only the caller's claim
+    // about it, and the page's digest is derived from the finished page by the
+    // ONE derivation in the contract module.
+    let fence_token =
+        request.observed_fence_token(observation.high_water_order, observation.family_revision);
     let stride = u64::from(request.page_entries)
         .checked_mul(u64::from(page_index))
         .ok_or(OrsError::InvalidField {
@@ -753,10 +960,6 @@ pub(super) fn export_page(
             field: "backup.page_index",
             reason: "page window overflows the operation order",
         })?;
-    // ONE read transaction: the page is coherent by construction, and the
-    // family segment below observes the same snapshot as the operational
-    // window it shares a page with.
-    let read = database.begin_read().map_err(storage)?;
     let table = read
         .open_table(super::OPERATIONAL_HISTORY)
         .map_err(storage)?;
@@ -796,48 +999,112 @@ pub(super) fn export_page(
         });
     }
     let (family_segment, family_continuation) =
-        stream_recovery_family_page(&read, request, entries.len(), total_bytes)?;
+        stream_recovery_family_page(read, request, entries.len(), total_bytes)?;
     entries.extend(family_segment);
-    drop(read);
     let family_open = family_continuation
         .as_ref()
         .is_some_and(OrsFamilyContinuation::family_open);
     let is_last = operational_exhausted && !family_open;
-    let mut digest_material = String::new();
-    for entry in &entries {
-        digest_material.push_str(&entry.payload_digest);
-    }
-    digest_material.push_str(&fence_token);
-    // The frozen family snapshot identity and the exact next family cursor are
-    // bound into the page token, so a family page can be neither replayed under
-    // a different family snapshot nor continued at a different boundary.
-    if let Some(continuation) = &family_continuation {
-        digest_material.push_str(&continuation.cursor.fence_token());
-        if let Some(next) = &continuation.next {
-            digest_material.push('|');
-            digest_material.push_str(&next.fence_token());
-        }
-    }
-    let page_digest = crate::model::sha256_hex(digest_material.as_bytes());
-    Ok(OrsBackupPage {
+    // Stamped by the store's own clock at capture, never by the caller, and
+    // bounded by the ceiling the contract module enforces on validation. The
+    // ordered-positive pair is validated by `validate_binding`, so a page whose
+    // window does not close after it opens is refused rather than exported.
+    let created_at_ms = super::current_unix_ms()?;
+    let expires_at_ms = created_at_ms
+        .checked_add(MAX_BACKUP_PAGE_LIFETIME_MS)
+        .ok_or(OrsError::InvalidExpiry)?;
+    let mut page = OrsBackupPage {
         page_index,
         entries,
-        page_digest,
+        fence_token,
+        created_at_ms,
+        expires_at_ms,
+        page_digest: String::new(),
         is_last,
         family_continuation,
-    })
+    };
+    page.page_digest = page.expected_page_digest();
+    page.validate_binding()?;
+    Ok(page)
 }
 
 /// Exports a snapshot by paging with one request until a page is final or the
 /// page budget is exhausted.
 ///
+/// The whole page loop runs under ONE `redb::ReadTransaction` (issue #953). This
+/// is the issue's "one owner-established read consistency point": before, every
+/// page opened and dropped its own transaction, so the page loop was N+2
+/// transactions and "Independent per-page read transactions with a reused
+/// timestamp are not one snapshot" — a writer committing between two pages put
+/// row 1 of the snapshot at one moment and row 2 at another, under one fence and
+/// one token. Now the pages, the observed fence and the PRE witness all speak for
+/// the same committed snapshot, and "Changes after the fence cannot silently enter
+/// later pages" holds by construction rather than by comparison. The composite
+/// POST witness deliberately does NOT speak for that snapshot; see the two
+/// properties below. Holding the transaction cannot deadlock: redb is MVCC, read
+/// transactions do not block writers, and the loop is already bounded by
+/// `max_pages`, `page_entries` and `max_bytes`.
+///
+/// The request's declared fence is compared against live owner state BEFORE any
+/// page is read, by [`check_export_fence`], and a declared family cursor is
+/// compared by [`check_family_revision_frozen`]; both refuse with existing typed
+/// errors.
+///
+/// TWO properties, from two different mechanisms, and they must not be confused:
+///
+/// 1. PAGES ARE ONE MOMENT. Guaranteed by holding ONE transaction across the
+///    whole loop. "Changes after the fence cannot silently enter later pages"
+///    holds by construction: a write committing after the capture began is not
+///    merely excluded from the pages, it is excluded from every page, because
+///    there is only one snapshot to read them from. Nothing compares anything to
+///    achieve this; it is a property of reading all pages under one transaction.
+///
+/// 2. MOVEMENT DURING THE CAPTURE IS DETECTED. Guaranteed by the
+///    [`composite_state_digest`] pre/post pair, whose two ends are deliberately
+///    DIFFERENT moments: `frozen_pre` is computed INSIDE the capture transaction,
+///    before the page loop, and `frozen_post` is computed from a NEW read
+///    transaction opened only AFTER the capture transaction has been released. A
+///    writer that commits during the capture therefore moves the composite digest
+///    and the export refuses with [`OrsError::OrderingHeadMismatch`].
+///
+/// Property 1 on its own would leave that writer undetected: the pages would be
+/// perfectly coherent and simply stale relative to a store that moved on. The
+/// post-release observation is what turns coherence into evidence. The
+/// post-release read is a genuinely NEW snapshot precisely because the capture
+/// transaction has been dropped - reading it again inside the capture transaction
+/// would compare a snapshot with itself, which can never disagree and would be a
+/// call that reads like a safety net while being structurally incapable of
+/// firing. The two ends are therefore never taken from one snapshot on this path,
+/// and the import triage path keeps the same two-separate-transactions form.
+///
+/// SCOPE OF PROPERTY 2, stated so this is not read as broader than it is:
+/// `composite_state_digest` binds the operational history and the
+/// process-stream recovery family root. It does **not** bind every physical ORS
+/// table. A commit that moves some other table during the capture - a grant
+/// closure row, a replay event, a doctor budget, an activation lifecycle, a
+/// campaign record, a bridge-event record, or the meta counters themselves -
+/// does not move this digest and will not trip the witness. That limit is
+/// pre-existing and unchanged by this issue; the two-transaction witness that
+/// existed before behaved identically. It is recorded here because a witness
+/// described without its scope is the same defect as a witness that cannot fire.
+/// The rows with no row-family disposition at all (see the A5 gap: `RowFamilyKind`
+/// enumerates 41 families while roughly 20 physical tables have none) are
+/// consequently outside BOTH the denominator and this witness, which is a
+/// compounding gap that neither property above closes.
+///
+/// ASSUMPTION: the capture's wall-clock stamp comes from the store's own
+/// `current_unix_ms()` (a `SystemTime` read). I05-16 lists `created_at`,
+/// `observed_at`, `valid_time`, `known_time` and `transaction_time` as distinct
+/// durable fields and no governing document says which one a backup capture
+/// window is. The page's window is stamped with the store's single clock at
+/// capture and the page's `order` values remain the durable observation times;
+/// the window is a triage-eligibility horizon, not a claim about any of the five
+/// durable time fields, and it certifies nothing about the rows' times.
+///
 /// The operational request (fence token, `after_order`, page size) is reused
 /// for every page, but its count-stride windows are not an exact continuation
 /// in the sparse operation-order domain. Only the typed family cursor advances,
-/// by exactly the owner-issued cursor the previous page ended with. A
-/// pre/post [`composite_state_digest`] freeze check rejects any canonical
-/// advance or process-stream recovery family movement during export with
-/// [`OrsError::OrderingHeadMismatch`].
+/// by exactly the owner-issued cursor the previous page ended with.
 ///
 /// When the page budget ends on a non-final page, the exact family cursor is
 /// retained as a `Partial` disposition when one exists. If no family cursor
@@ -862,13 +1129,24 @@ pub(super) fn export_snapshot(
             reason: "page budget must be non-zero",
         });
     }
-    let frozen_pre = composite_state_digest(database)?;
+    // THE consistency point: one read transaction, opened once, threaded through
+    // the fence observation, the PRE witness and every page. Nothing in the loop
+    // opens a second transaction, so all pages are one moment.
+    let read = database.begin_read().map_err(storage)?;
+    let observation = capture_store_fence(&read)?;
+    check_export_fence(request, &observation)?;
+    if let Some(cursor) = &request.process_stream_recovery_cursor {
+        check_family_revision_frozen(&read, cursor)?;
+    }
+    // PRE witness, INSIDE the capture snapshot: the composite state as it stood
+    // when the capture began.
+    let frozen_pre = composite_state_digest(&read)?;
     let mut continuing = request.clone();
     let mut pages: Vec<OrsBackupPage> = Vec::new();
     let mut entry_count: u64 = 0;
     let mut last_page_was_final = false;
     for index in 0..u32::from(request.max_pages) {
-        let page = export_page(database, &continuing, index)?;
+        let page = export_page_in(&read, &continuing, index, &observation)?;
         entry_count = entry_count
             .checked_add(page.entries.len() as u64)
             .ok_or(OrsError::ProjectionLimitExceeded)?;
@@ -898,7 +1176,16 @@ pub(super) fn export_snapshot(
         .last()
         .and_then(|page| page.family_continuation.as_ref())
         .and_then(|continuation| continuation.next.clone());
-    let frozen_post = composite_state_digest(database)?;
+    // Release the capture transaction BEFORE observing again. This ordering is
+    // the whole point: `frozen_pre` was taken inside that transaction, and the
+    // observation below is taken from a NEW snapshot that can include commits the
+    // capture could not see. Reading it from the still-open capture transaction
+    // would compare a snapshot with itself and could never disagree, so the
+    // witness would be decorative rather than a witness.
+    drop(read);
+    let post_read = database.begin_read().map_err(storage)?;
+    let frozen_post = composite_state_digest(&post_read)?;
+    drop(post_read);
     check_canonical_frozen(&frozen_pre, &frozen_post)?;
     if !last_page_was_final && outstanding_family.is_none() {
         // Operational pagination has no exact continuation yet. Refuse this
@@ -961,17 +1248,33 @@ pub(super) fn export_snapshot(
 
 /// Triages one backup page into quarantine without any durable write.
 ///
-/// Verifies the import binding, then classifies each entry: non-restorable
-/// or forensic-only families land `Forensic` and are never activated;
-/// malformed digests land `Blocked`; a stored row with the same digest
-/// replays as `Rejected` (duplicate) while the same key with a different
-/// hash lands `Blocked` with `IDENTITY_CONFLICT`; anything else lands
-/// `Unresolved`, quarantined for the canonical owner. A pre/post
-/// [`composite_state_digest`] freeze check rejects concurrent canonical advance
-/// *or* a moved process-stream recovery family across the page, because
-/// digesting one table cannot certify the composite state this page is triaged
-/// against. Per-entry canonical evidence calls are deliberately skipped: there
-/// is no signed inbox item here to verify, so verification is deferred to
+/// Verifies the import binding, then re-derives the page's own digest and
+/// refuses the page when it does not match (issue #953). That is the whole point
+/// of the change: triage used to accept any 64-hex `page_digest` on shape, so a
+/// page assembled from two different exports — or a page whose entries were
+/// altered after export — was triaged as if it were one capture. The re-derivation
+/// is [`OrsBackupPage::validate_binding`], the SAME function the snapshot
+/// validator uses, so the two paths cannot disagree about what a page binds.
+///
+/// The capture window is then compared against the store's own clock, which
+/// `validate_binding` cannot do because it is pure: a page whose window has
+/// elapsed is [`OrsError::InvalidExpiry`] rather than triageable evidence. This is
+/// a refusal horizon, never a deletion (I05-2).
+///
+/// Then each entry is classified: non-restorable or forensic-only families land
+/// `Forensic` and are never activated; malformed digests land `Blocked`; a stored
+/// row with the same digest replays as `Rejected` (duplicate) while the same key
+/// with a different hash lands `Blocked` with `IDENTITY_CONFLICT`; anything else
+/// lands `Unresolved`, quarantined for the canonical owner. The whole entry loop
+/// runs under ONE read transaction (issue #953), for the same reason the export
+/// page loop does: per-entry transactions meant the duplicate/identity comparison
+/// of entry 1 and of entry N could disagree about the state they were compared
+/// against, and the resulting outcome vector described no single moment. A
+/// pre/post [`composite_state_digest`] freeze check brackets that work with two
+/// SEPARATE transactions and so remains a genuine cross-moment witness, rejecting
+/// concurrent canonical advance *or* a moved process-stream recovery family.
+/// Per-entry canonical evidence calls are deliberately skipped: there is no signed
+/// inbox item here to verify, so verification is deferred to
 /// `import_recovery_inbox`, which owns durable quarantine. Unknown stays
 /// quarantined with no blind retry. Page-to-review snapshot binding is
 /// re-established by the canonical owner from `import.snapshot_digest` at
@@ -991,30 +1294,41 @@ pub(super) fn import_page_quarantined(
 ) -> Result<Vec<(String, PerEntryOutcome)>, OrsError> {
     let _ = evidence;
     validate_import_binding(&import.source, &import.destination)?;
-    if !is_digest_shape(&page.page_digest) {
+    // Re-derive the page digest and every self-binding field. Replaces the shape
+    // check this path used to do, and the duplicated entry-bound and family
+    // continuation checks: `validate_binding` is now the single judgement of
+    // whether a presented page is the page its token and digest claim, and it
+    // reports the same `InvalidCursorLimit` the snapshot validator already
+    // reported for an oversized page.
+    page.validate_binding()?;
+    if page.is_last
+        && page
+            .family_continuation
+            .as_ref()
+            .is_some_and(OrsFamilyContinuation::family_open)
+    {
         return Err(OrsError::InvalidField {
-            field: "backup.page_digest",
-            reason: "page digest must be 64 lowercase hex characters",
+            field: "backup_page_is_last",
+            reason: "a final page must not leave an open family continuation",
         });
     }
-    if page.entries.len() > usize::from(MAX_BACKUP_PAGE_ENTRIES) {
-        return Err(OrsError::ProjectionLimitExceeded);
+    if page.expires_at_ms <= super::current_unix_ms()? {
+        return Err(OrsError::InvalidExpiry);
     }
-    if let Some(continuation) = &page.family_continuation {
-        continuation.validate()?;
-        if page.is_last && continuation.family_open() {
-            return Err(OrsError::InvalidField {
-                field: "backup_page_is_last",
-                reason: "a final page must not leave an open family continuation",
-            });
-        }
-    }
-    let frozen_pre = composite_state_digest(database)?;
+    let pre_read = database.begin_read().map_err(storage)?;
+    let frozen_pre = composite_state_digest(&pre_read)?;
+    drop(pre_read);
+    // ONE read transaction for the whole entry loop: every entry is triaged
+    // against the same durable state, so the outcome vector describes one moment.
+    let read = database.begin_read().map_err(storage)?;
     let mut outcomes: Vec<(String, PerEntryOutcome)> = Vec::with_capacity(page.entries.len());
     for entry in &page.entries {
-        outcomes.push((entry.record_id.clone(), triage_entry(database, entry)?));
+        outcomes.push((entry.record_id.clone(), triage_entry(&read, entry)?));
     }
-    let frozen_post = composite_state_digest(database)?;
+    drop(read);
+    let post_read = database.begin_read().map_err(storage)?;
+    let frozen_post = composite_state_digest(&post_read)?;
+    drop(post_read);
     check_canonical_frozen(&frozen_pre, &frozen_post)?;
     Ok(outcomes)
 }
@@ -1025,7 +1339,15 @@ pub(super) fn import_page_quarantined(
 /// first (forensic families never reach identity comparison), digest shape
 /// second, then a bounded identity scan for `IDENTITY_CONFLICT` versus
 /// duplicate replay. Returns the outcome; never activates, never writes.
-fn triage_entry(database: &Database, entry: &OrsBackupEntry) -> Result<PerEntryOutcome, OrsError> {
+///
+/// Takes the caller's read transaction rather than opening one per entry
+/// (issue #953), so the identity comparison for every entry in a page observes
+/// the same durable state and no writer can make two entries of one page disagree
+/// about the row they collided with.
+fn triage_entry(
+    read: &ReadTransaction,
+    entry: &OrsBackupEntry,
+) -> Result<PerEntryOutcome, OrsError> {
     match entry.family.disposition() {
         RowDisposition::NonrestorableHistorical => {
             return Ok(PerEntryOutcome::Forensic {
@@ -1044,7 +1366,6 @@ fn triage_entry(database: &Database, entry: &OrsBackupEntry) -> Result<PerEntryO
             reason: "entry payload digest must be 64 lowercase hex characters".to_owned(),
         });
     }
-    let read = database.begin_read().map_err(storage)?;
     let table = read
         .open_table(super::OPERATIONAL_HISTORY)
         .map_err(storage)?;
@@ -1075,7 +1396,6 @@ fn triage_entry(database: &Database, entry: &OrsBackupEntry) -> Result<PerEntryO
         break;
     }
     drop(table);
-    drop(read);
     Ok(conflict.unwrap_or(PerEntryOutcome::Unresolved {
         reason: "quarantined for the canonical owner; no authority conferred".to_owned(),
     }))
