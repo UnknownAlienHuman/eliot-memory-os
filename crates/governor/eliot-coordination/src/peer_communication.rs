@@ -3087,6 +3087,9 @@ pub struct AnchoredReview {
     pub completeness: ReviewCompleteness,
     pub standing: PeerReviewStanding,
     pub lifecycle: PeerReviewLifecycle,
+    /// The reason retained when this review is rejected.
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
     pub expires_at: Option<u64>,
     pub conflict_id: Option<String>,
     pub authority_epoch: EpochId,
@@ -3405,6 +3408,7 @@ impl CoordinationOwner {
             completeness: draft.completeness,
             standing,
             lifecycle,
+            rejection_reason: None,
             expires_at: draft.expires_at,
             conflict_id: None,
             authority_epoch: draft.authority_epoch.clone(),
@@ -3520,6 +3524,7 @@ impl CoordinationOwner {
                 holder: stored.reviewer_session_id.clone(),
             });
         }
+        let mut recorded_rejection_reason = None;
         let next = match (stored.lifecycle, advance) {
             (PeerReviewLifecycle::PendingDelivery, PeerReviewAdvance::Deliver) => {
                 PeerReviewLifecycle::Delivered
@@ -3538,6 +3543,7 @@ impl CoordinationOwner {
                     .filter(|text| !text.trim().is_empty())
                     .ok_or(CoordinationError::InvalidField("rejection_reason"))?;
                 peer_text(reason, "rejection_reason")?;
+                recorded_rejection_reason = Some(reason.to_owned());
                 PeerReviewLifecycle::RejectedWithReason
             }
             (
@@ -3553,6 +3559,9 @@ impl CoordinationOwner {
             .get_mut(review_id)
             .ok_or(CoordinationError::InvalidState)?;
         stored.lifecycle = next;
+        if let Some(reason) = recorded_rejection_reason {
+            stored.rejection_reason = Some(reason);
+        }
         Ok(stored.clone())
     }
 
