@@ -90,8 +90,9 @@ use watchdog_publication_readback::{
 };
 pub use watchdog_spool::export_driver::{
     WatchdogEntryView, WatchdogExportSink, WatchdogIntentAcknowledgement,
-    WatchdogIntentReconciliation, WatchdogIntentSink, export_once, reconcile_watchdog_intents,
-    watchdog_entry_views, watchog_entry_views,
+    WatchdogIntentExportBatch, WatchdogIntentReconciliation, WatchdogIntentSink,
+    WatchdogIntentWindowBlock, export_once, reconcile_watchdog_intents, watchdog_entry_views,
+    watchog_entry_views,
 };
 pub(crate) use watchdog_spool::intent::{
     GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
