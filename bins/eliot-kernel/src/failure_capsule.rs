@@ -354,54 +354,54 @@ impl fmt::Display for RawEvidenceRef {
 /// lifecycle state the owner still owes).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WaitForDependency {
-    blocked_owner: WriterReservationToken,
-    blocked_resource: ReservedScope,
-    blocked_transition: ReservationState,
+    owner: WriterReservationToken,
+    resource: ReservedScope,
+    transition: ReservationState,
 }
 
 impl WaitForDependency {
     /// Names the blocked owner, resource, and awaited transition.
     #[must_use]
     pub fn new(
-        blocked_owner: WriterReservationToken,
-        blocked_resource: ReservedScope,
-        blocked_transition: ReservationState,
+        owner: WriterReservationToken,
+        resource: ReservedScope,
+        transition: ReservationState,
     ) -> Self {
         Self {
-            blocked_owner,
-            blocked_resource,
-            blocked_transition,
+            owner,
+            resource,
+            transition,
         }
     }
 
     /// Returns the reservation token of the blocked owner.
     #[must_use]
     pub fn blocked_owner(&self) -> &WriterReservationToken {
-        &self.blocked_owner
+        &self.owner
     }
 
     /// Returns the reserved ordering scope that is blocked.
     #[must_use]
     pub fn blocked_resource(&self) -> &ReservedScope {
-        &self.blocked_resource
+        &self.resource
     }
 
     /// Returns the reservation lifecycle transition the owner still owes.
     #[must_use]
     pub fn blocked_transition(&self) -> ReservationState {
-        self.blocked_transition
+        self.transition
     }
 
     /// Returns the blocked owner's reservation identity.
     #[must_use]
     pub fn blocked_owner_id(&self) -> &str {
-        self.blocked_owner.reservation_id.as_str()
+        self.owner.reservation_id.as_str()
     }
 
     /// Returns the blocked ordering scope.
     #[must_use]
     pub fn blocked_scope(&self) -> &str {
-        self.blocked_resource.scope.as_str()
+        self.resource.scope.as_str()
     }
 }
 
@@ -615,28 +615,28 @@ pub struct DiagnosticBrief {
 /// The one-line blocked dependency carried by a [`DiagnosticBrief`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WaitForSummary {
-    blocked_owner: String,
-    blocked_resource: String,
-    blocked_transition: String,
+    owner: String,
+    resource: String,
+    transition: String,
 }
 
 impl WaitForSummary {
     /// Returns the blocked owner's identity.
     #[must_use]
     pub fn blocked_owner(&self) -> &str {
-        &self.blocked_owner
+        &self.owner
     }
 
     /// Returns the blocked ordering scope.
     #[must_use]
     pub fn blocked_resource(&self) -> &str {
-        &self.blocked_resource
+        &self.resource
     }
 
     /// Returns the lifecycle transition the blocked owner still owes.
     #[must_use]
     pub fn blocked_transition(&self) -> &str {
-        &self.blocked_transition
+        &self.transition
     }
 }
 
@@ -719,9 +719,9 @@ impl DiagnosticBrief {
 impl WaitForSummary {
     fn from_dependency(dependency: &WaitForDependency) -> Self {
         Self {
-            blocked_owner: dependency.blocked_owner_id().to_owned(),
-            blocked_resource: dependency.blocked_scope().to_owned(),
-            blocked_transition: format!("{:?}", dependency.blocked_transition()),
+            owner: dependency.blocked_owner_id().to_owned(),
+            resource: dependency.blocked_scope().to_owned(),
+            transition: format!("{:?}", dependency.blocked_transition()),
         }
     }
 }
