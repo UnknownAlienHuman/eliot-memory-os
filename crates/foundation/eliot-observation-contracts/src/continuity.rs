@@ -21,7 +21,10 @@
 //! property unknown or degraded, and rejects prose proof for properties the
 //! prose did not measure, binding that refusal to the source modality as well
 //! as to the claim's own self-declared modality so neither can be relabelled
-//! past the gate.
+//! past the gate. Both measurement strengths are earned the same way: a
+//! [`ModalityPropertyStatus::Degraded`] claim on a modality that needs a
+//! modality-competent evaluator is refused without one, so a description is
+//! never the thing that raises an absent property to a partial measurement.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
@@ -95,6 +98,10 @@ pub enum ContinuityError {
     /// modality-competent, including a model-generated derived source.
     #[error("measured property requires a modality-competent evaluator")]
     UnevaluatedMeasurement,
+    /// A partial measurement is claimed for a source whose modality needs a
+    /// modality-competent evaluator and no such evaluator was offered.
+    #[error("degraded status requires a modality-competent evaluator for the source modality")]
+    UnevaluatedDegradation,
     /// Derived prose claims a property it did not measure.
     #[error("derived prose cannot prove an unmeasured modality property")]
     ProseProof,
@@ -640,37 +647,78 @@ pub fn assess_modality_property(
     ModalityPropertyStatus::Measured
 }
 
+/// Refuses a status the record's own evidence does not support, so a property
+/// whose modality-competent evaluator is absent stays explicitly `Unknown`.
+///
+/// `Unknown` is the status I12.35 names for absent modality evidence, and it
+/// asserts that no competent measurement exists, so there is nothing in it to
+/// earn; `check_loss_warnings` separately requires the loss warning that goes
+/// with it. `Measured` and `Degraded` are both *measurement claims* — the
+/// admitted-status enum documents `Degraded` as a competent measurement that
+/// is partial or lossy — so each must be backed by an evaluator competent in
+/// the source modality whenever that modality needs one. Refusing an unearned
+/// `Degraded` is what stops absent modality evidence from being raised to a
+/// partial measurement: before it, a producer could settle a visual or
+/// acoustic property as `Degraded` with no evaluator at all and nothing but a
+/// model-generated description behind it, which is prose proof of exactly the
+/// property the description did not measure.
+///
+/// The one state deliberately left admissible is `Degraded` on a source whose
+/// modality needs no specialist evaluator (code, a document, or prose derived
+/// from either). I12.35 offers `Degraded` there as the honest statement of a
+/// lossy capture, and no instrument was ever involved, so requiring an
+/// evaluator would refuse a record the canon admits. `Measured` keeps its
+/// existing derivation through [`assess_modality_property`], and both statuses
+/// keep the refusal of an `Unknown` or `TextDerived` source: prose and an
+/// unestablished modality measure nothing, so they cannot claim either
+/// measurement strength.
 fn check_modality_status(observation: &ContinuityObservation) -> Result<(), ContinuityError> {
-    if !matches!(
-        observation.property_status,
-        ModalityPropertyStatus::Measured
-    ) {
-        // Degraded and unknown are honest by construction; loss warnings are
-        // enforced separately by `check_loss_warnings`.
+    if matches!(observation.property_status, ModalityPropertyStatus::Unknown) {
         return Ok(());
     }
-    // A source that measured nothing cannot have measured anything. `Unknown`
-    // is a modality never established at capture, and `TextDerived` is
-    // model-generated prose: prose is a derived candidate, not a measuring
-    // instrument, so nothing is modality-competent in it. Refusing the
-    // derived source here is what closes the escape in which a visual or
-    // acoustic claim is filed as `TextDerived` precisely so that
-    // `check_prose_proof` will not bind to it.
     if matches!(
         observation.source_modality,
         SourceModality::Unknown | SourceModality::TextDerived
     ) {
         return Err(ContinuityError::UnevaluatedMeasurement);
     }
-    let evaluator_present = observation
-        .modality_evaluators
-        .iter()
-        .any(|evaluator| evaluator.modality == observation.source_modality);
-    let honest = assess_modality_property(observation.source_modality, evaluator_present, false);
+    if matches!(
+        observation.property_status,
+        ModalityPropertyStatus::Degraded
+    ) {
+        if !observation
+            .source_modality
+            .requires_modality_competent_evaluator()
+        {
+            return Ok(());
+        }
+        if !has_competent_evaluator(observation) {
+            return Err(ContinuityError::UnevaluatedDegradation);
+        }
+        return Ok(());
+    }
+    let honest = assess_modality_property(
+        observation.source_modality,
+        has_competent_evaluator(observation),
+        false,
+    );
     if honest != ModalityPropertyStatus::Measured {
         return Err(ContinuityError::UnevaluatedMeasurement);
     }
     Ok(())
+}
+
+/// Returns whether the observation names an evaluator competent in its own
+/// source modality.
+///
+/// Competence is read off the source modality rather than the observation's
+/// topic, so naming an evaluator competent elsewhere never earns a measurement
+/// of the observed modality.
+fn has_competent_evaluator(observation: &ContinuityObservation) -> bool {
+    observation
+        .modality_evaluators
+        .iter()
+        .any(|evaluator| evaluator.modality == observation.source_modality)
 }
 
 /// Rejects prose proof: a derived textual description is a derived
@@ -686,6 +734,13 @@ fn check_modality_status(observation: &ContinuityObservation) -> Result<(), Cont
 /// is prose proof of that property whatever the claim calls itself. Refusing
 /// on either signal is a superset of refusing on the claim's declaration
 /// alone.
+///
+/// `Measured` is the only status this gate binds, because it is the only one
+/// that is unconditionally a full measurement claim. `Degraded` is guarded
+/// instead by [`check_modality_status`], which refuses a degraded claim on a
+/// competence-requiring modality unless a competent evaluator exists — so
+/// prose cannot reach a partial measurement either, it can only sit behind a
+/// real evaluator or behind `Unknown`, which proves nothing.
 fn check_prose_proof(observation: &ContinuityObservation) -> Result<(), ContinuityError> {
     let measured = matches!(
         observation.property_status,
