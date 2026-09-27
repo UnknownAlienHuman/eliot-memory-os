@@ -11,7 +11,7 @@
   "canonical_skill_manifest": "integrations/agent-skills/skill-pack.manifest.json",
   "skill_pack": {
     "manifest": "integrations/agent-skills/skill-pack.manifest.json",
-    "manifest_sha256": "e94c10969d0a13b7d7ae76255b4bb44d587b4afd3c152842357ad8d90490e76b",
+    "manifest_sha256": "84d4087dbc39938e6f05999337d383d8c19c889df2717a118bb5e4f90bd47556",
     "pack_hash": "6721836121fc0106670037725d821656179ec562af3514af04adbdac00d24c60",
     "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
     "order": ["eliot-work", "eliot-remember", "eliot-recover", "eliot-finish"],
@@ -186,6 +186,7 @@
           "destination": "rules",
           "kind": "tree",
           "mode": "verbatim_tree_copy",
+          "tree_digest_recipe": "sha256-canonical-json-tree-members-v1",
           "tree_digest_sha256": "79ec42a353207985dbe2820c7ea6796e273567dfc513ec6cbe68ffe427b11dba",
           "tree_file_count": 2,
           "tree_files": [

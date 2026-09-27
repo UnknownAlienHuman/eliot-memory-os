@@ -15,6 +15,7 @@ from agent_host_bundle import (
     INDEX_VERSION,
     IDENTITY_VERSION,
     MANIFEST_PATH,
+    TREE_DIGEST_RECIPE,
     _blake3_hex,
     _canonical_skill_content_hash,
     _require_hex_digest,
@@ -65,17 +66,33 @@ def _load_expected_inputs(root: Path, host: str) -> dict[str, Any]:
     skill_root_relative = _safe_relative(str(manifest["canonical_skill_root"]), "canonical_skill_root")
     skill_root = root.joinpath(*skill_root_relative.parts)
     material: list[str] = []
-    body_digests: dict[str, str] = {}
+    skill_file_digests: dict[str, str] = {}
     for name in skill_pack["order"]:
-        body = skill_root / name / "SKILL.md"
+        skill_dir = skill_root / name
+        body = skill_dir / "SKILL.md"
         if not body.is_file():
             raise AssertionError(f"{host}: expected Skill body is missing: {name!r}")
-        body_text = body.read_text(encoding="utf-8")
+        declared_assets = skill_pack["reference_assets"][name]
+        observed_members: set[str] = set()
+        for member in skill_dir.rglob("*"):
+            if member.is_symlink():
+                raise AssertionError(f"{host}: unsafe Skill asset: {name!r}")
+            if member.is_file():
+                observed_members.add(member.relative_to(skill_dir).as_posix())
+        if observed_members != {"SKILL.md", *declared_assets}:
+            raise AssertionError(f"{host}: source Skill files differ from declared assets: {name!r}")
+        body_bytes = body.read_bytes()
+        body_text = body_bytes.decode("utf-8")
         observed = _canonical_skill_content_hash(body_text)
         if observed != skill_pack["pins"][name]:
             raise AssertionError(f"{host}: expected Skill pin mismatch: {name!r}")
         material.append(f"{name}:{observed}\n")
-        body_digests[name] = sha256_bytes(body.read_bytes())
+        skill_file_digests[f"{name}/SKILL.md"] = sha256_bytes(body_bytes)
+        for relative, expected_digest in declared_assets.items():
+            source = skill_dir.joinpath(*_safe_relative(relative, "reference asset").parts)
+            if sha256_bytes(source.read_bytes()) != expected_digest:
+                raise AssertionError(f"{host}: expected Skill asset pin mismatch: {name}/{relative}")
+            skill_file_digests[f"{name}/{relative}"] = expected_digest
     pack_hash = _blake3_hex("".join(material).encode("utf-8"))
     if pack_hash != manifest["skill_pack"]["pack_hash"]:
         raise AssertionError(f"{host}: expected Skill pack hash mismatch")
@@ -117,7 +134,7 @@ def _load_expected_inputs(root: Path, host: str) -> dict[str, Any]:
     return {
         "skill_order": skill_pack["order"],
         "skill_pack_hash": pack_hash,
-        "body_digests": body_digests,
+        "skill_file_digests": skill_file_digests,
         "route_pin": route_pin,
         "host_config": host_config,
     }
@@ -204,10 +221,13 @@ def _assert_bundle(path: Path, host: str, receipt: dict[str, Any], expected: dic
         raise AssertionError(f"{host}: staged Skill index order does not match the declared pack")
     host_config = expected["host_config"]
     skill_destination = str(host_config.get("skill_destination", ""))
-    staged_skill_names = set()
+    expected_skill_files = {
+        f"host/{skill_destination}/{relative}": digest
+        for relative, digest in expected["skill_file_digests"].items()
+    }
     for entry in entries:
         staged_body = path / entry["relative_body"]
-        expected_body_digest = expected["body_digests"].get(entry["name"])
+        expected_body_digest = expected_skill_files.get(entry["relative_body"])
         if expected_body_digest is None:
             raise AssertionError(f"{host}: staged Skill is not declared: {entry['name']!r}")
         if sha256_bytes(staged_body.read_bytes()) != expected_body_digest:
@@ -216,8 +236,9 @@ def _assert_bundle(path: Path, host: str, receipt: dict[str, Any], expected: dic
             relative = Path(entry["relative_body"]).relative_to(f"host/{skill_destination}")
         except ValueError as error:
             raise AssertionError(f"{host}: staged Skill body escaped its destination") from error
-        staged_skill_names.add(relative.parts[0])
-    if staged_skill_names != set(expected["skill_order"]):
+        if relative.parts[0] != entry["name"] or relative.as_posix() != f"{entry['name']}/SKILL.md":
+            raise AssertionError(f"{host}: staged Skill body path does not match its name")
+    if {entry["name"] for entry in entries} != set(expected["skill_order"]):
         raise AssertionError(f"{host}: staged Skill membership does not match the declared pack")
     payload = host_config.get("payload", [])
     declared_destinations: dict[str, str] = {}
@@ -231,7 +252,10 @@ def _assert_bundle(path: Path, host: str, receipt: dict[str, Any], expected: dic
             for item in mapping.get("tree_files", []):
                 if isinstance(item, dict) and isinstance(item.get("path"), str):
                     declared_destinations[f"host/{destination}/{item['path']}"] = item["sha256"]
-    for staged_key, expected_digest in declared_destinations.items():
+    expected_host_files = {**declared_destinations, **expected_skill_files}
+    if len(expected_host_files) != len(declared_destinations) + len(expected_skill_files):
+        raise AssertionError(f"{host}: declared host destinations collide")
+    for staged_key, expected_digest in expected_host_files.items():
         staged = path / staged_key
         if not staged.is_file():
             raise AssertionError(f"{host}: staged payload is missing: {staged_key}")
@@ -248,6 +272,12 @@ def _assert_bundle(path: Path, host: str, receipt: dict[str, Any], expected: dic
         raise AssertionError(f"{host}: receipt file list is missing")
     if [entry.get("path") for entry in files] != sorted(entry.get("path") for entry in files):
         raise AssertionError(f"{host}: receipt file list is not deterministically ordered")
+    receipt_paths = [entry["path"] for entry in files]
+    expected_receipt_paths = set(expected_host_files) | {
+        "operator/skill-index.json", "operator/route-profile.json"
+    }
+    if len(receipt_paths) != len(set(receipt_paths)) or set(receipt_paths) != expected_receipt_paths:
+        raise AssertionError(f"{host}: staged payload set differs from declared inputs")
     for entry in files:
         if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "bytes"}:
             raise AssertionError(f"{host}: malformed receipt file entry")
@@ -257,17 +287,17 @@ def _assert_bundle(path: Path, host: str, receipt: dict[str, Any], expected: dic
         staged_bytes = staged.read_bytes()
         if len(staged_bytes) != entry["bytes"] or sha256_bytes(staged_bytes) != entry["sha256"]:
             raise AssertionError(f"{host}: staged bundle file drifted: {entry['path']}")
-    for entry in files:
-        staged_key = entry["path"]
-        if staged_key.startswith("operator/"):
-            continue
-        if staged_key in declared_destinations:
-            continue
-        if staged_key.startswith(f"host/{skill_destination}/"):
-            remainder = staged_key[len(f"host/{skill_destination}/"):]
-            if "/" in remainder and remainder.split("/", 1)[0] in expected["skill_order"]:
-                continue
-        raise AssertionError(f"{host}: staged payload is not declared: {staged_key}")
+    if any(candidate.is_symlink() for candidate in path.rglob("*")):
+        raise AssertionError(f"{host}: bundle contains a symlink")
+    actual_files = {
+        candidate.relative_to(path).as_posix()
+        for candidate in path.rglob("*")
+        if candidate.is_file()
+    }
+    if actual_files != expected_receipt_paths | {
+        "operator/bundle-receipt.json", "operator/install-plan.json"
+    }:
+        raise AssertionError(f"{host}: bundle contains an unreceipted or missing file")
     if sha256_bytes(canonical_json_bytes(files)) != receipt["bundle_sha256"]:
         raise AssertionError(f"{host}: bundle digest does not match file entries")
     expected_identity = compute_bundle_identity(
@@ -364,11 +394,16 @@ def _synthetic_root() -> Path:
             {
                 "schema_version": "eliot-agent-skill-pack-v1",
                 "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
+                "reference_assets_schema": "sha256-path-list-v1",
                 "pack_hash": "085980d3da535214408d09de0fcb1925b8a68c444f9491385cbbcd77fcf41fcc",
                 "skills": [
                     {
                         "name": "eliot-work",
                         "content_blake3": "df19ab6cdfcacc4644905930ad4984271e081c0dfbccced250d91c6d2f82c3c6",
+                        "reference_assets": [{
+                            "path": "references/contract.md",
+                            "sha256": sha256_bytes((root / "integrations/agent-skills/eliot-work/references/contract.md").read_bytes()),
+                        }],
                     }
                 ],
             }
@@ -670,6 +705,7 @@ def self_test() -> None:
                 {
                     "name": "eliot-second",
                     "content_blake3": "6e7c00e13f6a3d9f95880317786b5c5a4906bf5c570815226189b16b7e8b8347",
+                    "reference_assets": [],
                 }
             )
             two_pack["skills"] = list(reversed(two_pack["skills"]))
@@ -729,6 +765,7 @@ def self_test() -> None:
                     "destination": "treedir",
                     "kind": "tree",
                     "mode": "verbatim_tree_copy",
+                    "tree_digest_recipe": TREE_DIGEST_RECIPE,
                     "tree_digest_sha256": tree_digest,
                     "tree_file_count": 1,
                     "tree_files": [{"path": "a.json", "sha256": member_sha}],

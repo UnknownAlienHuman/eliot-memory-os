@@ -1,24 +1,29 @@
 {
   "schema_version": "eliot-agent-skill-pack-v1",
   "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
+  "reference_assets_schema": "sha256-path-list-v1",
   "pack_hash": "6721836121fc0106670037725d821656179ec562af3514af04adbdac00d24c60",
   "listing_characters": 182,
   "skills": [
     {
       "name": "eliot-work",
-      "content_blake3": "ebe2d2ffc5b1e9dff4b7309919160c3aa4120df61d24aa21dd5ffc8284cd2093"
+      "content_blake3": "ebe2d2ffc5b1e9dff4b7309919160c3aa4120df61d24aa21dd5ffc8284cd2093",
+      "reference_assets": []
     },
     {
       "name": "eliot-remember",
-      "content_blake3": "5608cefb9acc0719c3f57e921a6a782df1852f6c2ae83da7dc30d5acabce8904"
+      "content_blake3": "5608cefb9acc0719c3f57e921a6a782df1852f6c2ae83da7dc30d5acabce8904",
+      "reference_assets": []
     },
     {
       "name": "eliot-recover",
-      "content_blake3": "44ae44ec20743acf6172c08f9409151da91d112dec4fd0401d6e2c9e162cada0"
+      "content_blake3": "44ae44ec20743acf6172c08f9409151da91d112dec4fd0401d6e2c9e162cada0",
+      "reference_assets": []
     },
     {
       "name": "eliot-finish",
-      "content_blake3": "a4c86b951671585b83cbc9c67d4360f416368f835203965ebd74ae2e606e5388"
+      "content_blake3": "a4c86b951671585b83cbc9c67d4360f416368f835203965ebd74ae2e606e5388",
+      "reference_assets": []
     }
   ],
   "derived_packages": [
