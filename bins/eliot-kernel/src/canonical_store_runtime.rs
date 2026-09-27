@@ -76,6 +76,15 @@ where
         .lock()
         .map_err(|_| KernelBuildError::Service("store gateway lock poisoned".to_owned()))?;
     if retained.is_some() {
+        // #1861 hard boundary 3 (canonical control records, one online writer
+        // composition): a second canonical Store writer composition is the
+        // multiple-writer survivor. The single retained gateway is the only
+        // online writer; record the rejected second composition attempt so the
+        // one-writer boundary is durably observable, then refuse it.
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.attach_rejected:second_writer",
+        );
         return Err(KernelBuildError::StoreAlreadyConnected);
     }
     *retained = Some(gateway);
