@@ -44,6 +44,7 @@ mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
 pub mod experience_store;
+mod named_mutation_receipt;
 mod notification_state;
 mod payload_authority;
 mod reactive_state;
@@ -168,6 +169,13 @@ pub use store_failure::{
     StoreFailureDisposition, StoreFailureIdentityContext, StoreFailureRequestContext,
     StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreRetryDirective,
     decode_legacy_store_failure_v1, erasure_store_failure,
+};
+
+pub use named_mutation_receipt::{
+    DurableRecordHandle, ElapsedMillis, MutationAuditLineage, MutationAuditRecord,
+    MutationEventSequence, MutationMetricLabel, MutationMetricSample, MutationOutcome,
+    MutationReconciliation, MutationReconciliationRequest, MutationReconciliationResponse,
+    MutationResolution, NamedMutationReceipt, ReconciliationReceipt,
 };
 
 pub use swarm_owner_revisions::{
