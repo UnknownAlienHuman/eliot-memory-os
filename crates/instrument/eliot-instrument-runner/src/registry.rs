@@ -34,6 +34,7 @@ use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use eliot_instrument_scip::{MAX_SCIP_BYTES, SCIP_INSTRUMENT};
+use eliot_verifier::CONTRACT_NAME as VERIFIER_CONTRACT_NAME;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -43,11 +44,6 @@ use thiserror::Error;
 /// takes no dependency on that crate here; the value is recorded, and live
 /// dispatch proof remains follow-up work.
 const DIAGNOSTIC_CONTRACT: &str = "eliot.instrument.diagnostic";
-/// Recorded verifier authority for every ready entry.
-///
-/// Read from `eliot-verifier` (`CONTRACT_NAME`, version 1.0.0). Recording the
-/// identity grants no verification authority to this crate.
-const VERIFIER_CONTRACT: &str = "eliot.instrument.verifier";
 /// Target scope recorded for process adapters.
 ///
 /// Every process adapter command shape (`RustcCommand`, `RustfmtCommand`,
@@ -938,9 +934,14 @@ fn diagnostic_id() -> Result<ContractId, ContractError> {
     contract_id(DIAGNOSTIC_CONTRACT)
 }
 
-/// Recorded verifier contract identity (see [`VERIFIER_CONTRACT`]).
+/// Verifier contract identity bound from the owner crate.
+///
+/// Reads [`VERIFIER_CONTRACT_NAME`] from `eliot-verifier` instead of
+/// duplicating the literal, so the recorded binding cannot drift from the
+/// published verifier contract. Recording the identity grants no
+/// verification authority to this crate.
 fn verifier_id() -> Result<ContractId, ContractError> {
-    contract_id(VERIFIER_CONTRACT)
+    contract_id(VERIFIER_CONTRACT_NAME)
 }
 
 /// Single admitted-worktree target scope shared by process adapters.
