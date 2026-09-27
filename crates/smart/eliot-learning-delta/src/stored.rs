@@ -62,6 +62,25 @@ impl AttemptCloseDisposition {
     }
 }
 
+impl StoredDeltaDisposition {
+    /// Whether this disposition records a proposed next-behaviour change.
+    ///
+    /// The contract splits the six dispositions into the three a delta may
+    /// propose a behavioural change under and the three honest closes that
+    /// propose none (I12.24 line 175). Every disposition is a durable attempt
+    /// record, so a subsequent attempt may always reference one as lineage; but
+    /// only the first group carries a `next_behavior_delta` that could alter
+    /// route, context, tool use, search, verifier order or overlay state, so
+    /// only that group is withheld until the Governor admits it (I12.24
+    /// line 179).
+    pub const fn carries_behavioural_proposal(self) -> bool {
+        matches!(
+            self,
+            Self::LocalUpdateAdmitted | Self::NextProbeChanged | Self::ReusableCandidateOpened
+        )
+    }
+}
+
 /// Whether a stored record's attempt is materially equivalent to the prior
 /// attempt of the same campaign.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -312,6 +331,17 @@ impl StoredLearningDelta {
     /// Report whether this record carries an admitted local update.
     pub fn is_admitted(&self) -> bool {
         self.disposition == StoredDeltaDisposition::LocalUpdateAdmitted
+    }
+
+    /// Report whether this record proposes a next-behaviour change that a
+    /// later attempt could act on.
+    ///
+    /// A record that does not is still a durable attempt record and may be
+    /// referenced as retry lineage without admission; a record that does is
+    /// withheld from the subsequent attempt until the Governor admits it. See
+    /// [`StoredDeltaDisposition::carries_behavioural_proposal`].
+    pub const fn carries_behavioural_proposal(&self) -> bool {
+        self.disposition.carries_behavioural_proposal()
     }
 }
 

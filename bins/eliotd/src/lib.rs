@@ -1369,6 +1369,13 @@ impl DaemonComposition {
     /// [`eliot_governor::PromotionBoundaryInput::absent`], and the committed
     /// receipt records the withheld verdict with its exact reason.
     ///
+    /// `admissions` are the admission receipts this process holds for the
+    /// campaign's already-committed learning records. The prior attempt of the
+    /// campaign is the one proposed behavioural change that could reach this
+    /// attempt, and the Governor admits it only through one of these receipts;
+    /// an unadmitted one is not delivered, and the committed receipt records
+    /// the typed refusal.
+    ///
     /// The edge is non-blocking by construction: it reads retained owner
     /// images, performs no transport, and its result is returned to the caller
     /// instead of being propagated into the finish decision (I12.24 line 293).
@@ -1378,6 +1385,7 @@ impl DaemonComposition {
         decision: &eliot_governor::FinishDecisionReceipt,
         activity_name: &str,
         receipt: Option<&eliot_governor::AdmissionReceipt>,
+        admissions: &[eliot_governor::AdmissionReceipt],
         promotion: eliot_governor::PromotionBoundaryInput<'_>,
     ) -> Result<eliot_governor::LearningClosureOutcome, eliot_governor::LearningClosureError> {
         self.governor.close_attempt_learning(
@@ -1387,6 +1395,7 @@ impl DaemonComposition {
             activity_name,
             None,
             receipt,
+            admissions,
             promotion,
         )
     }
