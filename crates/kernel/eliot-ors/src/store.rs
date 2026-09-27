@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -3576,32 +3577,58 @@ impl RedbRecoveryStore {
     /// Returns one bounded page of store-rebind replay rows in durable key
     /// order, bounded by [`crate::MAX_RECOVERY_PAGE`].
     ///
-    /// The second tuple element reports that the family continues past this
-    /// page, so a caller can never mistake a bounded page for a complete
+    /// The page resumes strictly after `after_key`; `None` starts at the first
+    /// durable key. The second tuple element is the continuation: `Some(key)`
+    /// proves the family continues past this page and names the durable key the
+    /// next page resumes after, so a caller walks a family larger than one page
+    /// without ever reading a row twice or loading the whole table. The
+    /// continuation is absent only when the enumeration reached the end of the
+    /// family, so a caller can never mistake a bounded page for a complete
     /// snapshot: an unbounded full-table read inside an async caller stays
-    /// unavailable, and a caller that needs a complete family must report the
+    /// unavailable, and a caller whose own deadline stops the walk reports the
     /// truncated coverage instead of treating absence as resolution.
     pub fn load_store_rebind_page(
         &self,
+        after_key: Option<&str>,
         limit: u16,
-    ) -> Result<(Vec<crate::StoreRebindReplayRecord>, bool), OrsError> {
+    ) -> Result<(Vec<crate::StoreRebindReplayRecord>, Option<String>), OrsError> {
         if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
             return Err(OrsError::InvalidCursorLimit);
         }
         let read = self.database.begin_read().map_err(storage)?;
         let table = read.open_table(STORE_REBIND_REPLAY).map_err(storage)?;
         let page = usize::from(limit);
+        // The exclusive bound seeks to the continuation instead of walking the
+        // rows an earlier page already returned, so a walk costs the rows it
+        // still owes rather than the rows it already covered.
+        let rows = match after_key {
+            Some(after_key) => table
+                .range::<&str>((Bound::Excluded(after_key), Bound::Unbounded))
+                .map_err(storage)?,
+            None => table.range::<&str>(..).map_err(storage)?,
+        };
         let mut records = Vec::new();
-        // One extra row proves that the family continues past this page.
-        for entry in table.iter().map_err(storage)?.take(page + 1) {
-            let (_, value) = entry.map_err(storage)?;
+        let mut last_key = None;
+        let mut family_continues = false;
+        // One extra key is enumerated only to prove the family continues past
+        // this page. It is not read, because it belongs to the next page.
+        for (offset, entry) in rows.take(page + 1).enumerate() {
+            if offset == page {
+                family_continues = true;
+                break;
+            }
+            let (key, value) = entry.map_err(storage)?;
             let record: crate::StoreRebindReplayRecord = decode(value.value())?;
             record.validate()?;
+            last_key = Some(key.value().to_owned());
             records.push(record);
         }
-        let has_more = records.len() > page;
-        records.truncate(page);
-        Ok((records, has_more))
+        // The continuation is the last durable key this page actually returned,
+        // and it is absent only when the enumeration reached the end of the
+        // family: a page that exactly fills the budget still reports `None` when
+        // no further durable key exists.
+        let continuation = if family_continues { last_key } else { None };
+        Ok((records, continuation))
     }
 
     /// Retains one closed typed Store failure bound to its exact admitted
