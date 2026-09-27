@@ -235,8 +235,8 @@ pub use runtime_root_contract::{
 };
 pub use scm_approval::{InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval};
 pub use setup_binding::{
-    SETUP_BINDING_WIRE_VERSION, SetupAdvanceInput, SetupBinding, SetupEffectObservation,
-    SetupKeyReference, SetupMilestone, SetupStatus, VerifiedSetupBinding,
+    SETUP_BINDING_WIRE_VERSION, SetupAdmissionError, SetupAdvanceInput, SetupBinding,
+    SetupEffectObservation, SetupKeyReference, SetupMilestone, SetupStatus, VerifiedSetupBinding,
     validate_setup_binding_json, verify_setup_binding,
 };
 #[cfg(test)]

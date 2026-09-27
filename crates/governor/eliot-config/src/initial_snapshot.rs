@@ -18,9 +18,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use eliot_contracts::{ContractVersion, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
 
-use crate::{ConfigPolicySnapshot, PolicyRevision, Setting};
+use crate::first_run::FirstRunDecision;
+use crate::{ConfigPolicySnapshot, HumanOwner, PolicyFence, PolicyRevision, SourceCompleteness};
 
 /// Stable schema marker for the signed initial configuration snapshot.
 pub const INITIAL_SNAPSHOT_SCHEMA: &str = "eliot.initial-config-snapshot.v1";
@@ -79,13 +80,133 @@ impl PrivacyChoice {
 
     /// Projects this privacy mode as one immutable configuration setting.
     #[must_use]
-    pub fn to_setting(self, owner_ref: &str) -> Setting {
-        Setting {
+    pub fn to_setting(self, owner_ref: &str) -> crate::Setting {
+        crate::Setting {
             key: PRIVACY_MODE_KEY.to_owned(),
             value_ref: format!("literal:{}", self.as_str()),
             owner_ref: owner_ref.to_owned(),
         }
     }
+}
+
+/// The confirmed setup identity bound into the initial configuration payload.
+///
+/// Every value is an observed or user-confirmed fact from the installation
+/// owner; this type never invents an identity, a root, or a key.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialSnapshotIdentity {
+    /// Identity of the immutable configuration snapshot being prepared.
+    pub snapshot_id: String,
+    /// Installation identity confirmed at setup milestone 1.
+    pub installation_id: String,
+    /// Selected profile reference (provider-neutral text).
+    pub profile_ref: String,
+    /// Confirmed System Owner reference and settings owner.
+    pub owner_ref: String,
+    /// Active key identity bound to the established trust root.
+    pub key_identity: String,
+    /// Machine identity the snapshot applies to.
+    pub machine_id: String,
+    /// Scope identity the snapshot applies to.
+    pub scope_id: String,
+    /// Digest of the exact profile-bound runtime root topology.
+    pub runtime_state_roots_digest: String,
+    /// Setup binding revision at milestone 7.
+    pub setup_revision: u64,
+    /// Observed state fence carried by the genesis configuration generation.
+    pub state_fence: StateFence,
+}
+
+impl InitialSnapshotIdentity {
+    fn validate(&self) -> Result<(), InitialSnapshotError> {
+        non_empty_text(&self.snapshot_id, "identity.snapshot_id")?;
+        non_empty_text(&self.installation_id, "identity.installation_id")?;
+        non_empty_text(&self.profile_ref, "identity.profile_ref")?;
+        non_empty_text(&self.owner_ref, "identity.owner_ref")?;
+        non_empty_text(&self.key_identity, "identity.key_identity")?;
+        non_empty_text(&self.machine_id, "identity.machine_id")?;
+        non_empty_text(&self.scope_id, "identity.scope_id")?;
+        validate_sha256(
+            &self.runtime_state_roots_digest,
+            "identity.runtime_state_roots_digest",
+        )?;
+        if self.setup_revision == 0 {
+            return Err(invalid_field("identity.setup_revision", "must be non-zero"));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| invalid_field("identity.state_fence", error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Builds the deterministic first signed configuration payload from the
+/// confirmed setup choices.
+///
+/// The confirmed privacy mode and the first-run per-role decisions are fed
+/// into the existing [`ConfigPolicySnapshot`] payload at the genesis policy
+/// revision, so the immutable configuration carries exactly what the user
+/// confirmed. Omitted model roles stay `UNASSIGNED`: no model subscription is
+/// required and no model is executed to prepare the payload.
+///
+/// A `LocalOnly` privacy selection combined with any paid model route is
+/// refused: a provider route must never silently expand privacy or cost
+/// beyond the confirmed choice.
+///
+/// # Errors
+/// Returns [`InitialSnapshotError`] when the identity is incomplete, the
+/// choices contradict each other, or the resulting payload is invalid.
+pub fn prepare_initial_snapshot_payload(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    identity.validate()?;
+    if matches!(privacy, PrivacyChoice::LocalOnly) && first_run.has_paid_route() {
+        return Err(InitialSnapshotError::PrivacyChoiceConflict {
+            reason: "LOCAL_ONLY selects no remote model route".to_owned(),
+        });
+    }
+    let revision = PolicyRevision::genesis();
+    let mut settings = crate::first_run::to_settings(first_run, &identity.owner_ref);
+    settings.push(privacy.to_setting(&identity.owner_ref));
+    let snapshot = ConfigPolicySnapshot {
+        snapshot_id: identity.snapshot_id.clone(),
+        machine_id: identity.machine_id.clone(),
+        scope_id: identity.scope_id.clone(),
+        revision,
+        source_completeness: SourceCompleteness::Complete,
+        settings,
+        policy_owner: HumanOwner {
+            owner_ref: identity.owner_ref.clone(),
+        },
+        policy_fence: PolicyFence {
+            policy_snapshot_id: identity.snapshot_id.clone(),
+            state_fence: identity.state_fence.clone(),
+        },
+        state_fence: identity.state_fence.clone(),
+        parent_snapshot_id: None,
+        rollback_of: None,
+    };
+    snapshot
+        .validate()
+        .map_err(|error| invalid_field("snapshot", error.to_string()))?;
+    let canonical = canonical_json_bytes(&snapshot)
+        .map_err(|error| InitialSnapshotError::Canonicalization(error.to_string()))?;
+    let payload = InitialSnapshotPayload {
+        snapshot_id: identity.snapshot_id.clone(),
+        snapshot_canonical_sha256: sha256_hex(&canonical),
+        snapshot,
+        installation_id: identity.installation_id.clone(),
+        profile_ref: identity.profile_ref.clone(),
+        owner_ref: identity.owner_ref.clone(),
+        key_identity: identity.key_identity.clone(),
+        runtime_state_roots_digest: identity.runtime_state_roots_digest.clone(),
+        setup_revision: identity.setup_revision,
+    };
+    payload.validate()?;
+    Ok(payload)
 }
 
 /// The complete unsigned initial snapshot payload admitted by the config owner.
@@ -747,14 +868,26 @@ pub enum InitialSnapshotError {
     #[error("initial snapshot trust-anchor mismatch for {0}")]
     TrustAnchorMismatch(&'static str),
     /// Installation identity did not match the anchor or context.
-    #[error("initial snapshot installation identity mismatch")]
+    #[error(
+        "initial snapshot installation identity mismatch; recovery: re-run deterministic setup for this installation through the installation owner and do not admit an agent"
+    )]
     InstallationIdentityMismatch,
     /// Profile, root, key identity, or setup revision did not match context.
-    #[error("initial snapshot binding mismatch")]
+    #[error(
+        "initial snapshot binding mismatch; recovery: re-sign the initial configuration through the installation owner for the observed profile, runtime root, active key identity and setup revision, then re-read it before admitting an agent"
+    )]
     BindingMismatch,
     /// Detached signature failed strict Ed25519 verification.
-    #[error("invalid initial snapshot signature: {0}")]
+    #[error(
+        "invalid initial snapshot signature: {0}; recovery: restore the published initial configuration from the installation owner's protected journal and verify it against the installation-pinned trust anchor before admitting an agent"
+    )]
     SignatureInvalid(String),
+    /// The confirmed privacy choice contradicts the confirmed model routes.
+    #[error("initial snapshot privacy choice conflict: {reason}")]
+    PrivacyChoiceConflict {
+        /// Why the two confirmed choices cannot hold together.
+        reason: String,
+    },
 }
 
 fn invalid_field(field: impl Into<String>, reason: impl Into<String>) -> InitialSnapshotError {

@@ -21,8 +21,9 @@ pub use initial_snapshot::{
     Ed25519InitialSnapshotSigner, INITIAL_SNAPSHOT_PUBLIC_KEY_BYTES, INITIAL_SNAPSHOT_SCHEMA,
     INITIAL_SNAPSHOT_SIGNATURE_ALGORITHM, INITIAL_SNAPSHOT_SIGNATURE_BYTES,
     INITIAL_SNAPSHOT_WIRE_VERSION, InitialConfigSnapshotTrustAnchor, InitialSnapshotError,
-    InitialSnapshotPayload, InitialSnapshotSigner, InitialSnapshotVerificationContext,
-    PRIVACY_MODE_KEY, PrivacyChoice, SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot,
+    InitialSnapshotIdentity, InitialSnapshotPayload, InitialSnapshotSigner,
+    InitialSnapshotVerificationContext, PRIVACY_MODE_KEY, PrivacyChoice,
+    SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot, prepare_initial_snapshot_payload,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.config";

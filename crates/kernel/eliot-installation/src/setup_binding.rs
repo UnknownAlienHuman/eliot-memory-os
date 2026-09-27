@@ -18,8 +18,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use eliot_config::initial_snapshot::{
-    InitialConfigSnapshotTrustAnchor, InitialSnapshotVerificationContext, PrivacyChoice,
-    SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot,
+    InitialConfigSnapshotTrustAnchor, InitialSnapshotError, InitialSnapshotVerificationContext,
+    PrivacyChoice, SignedInitialConfigSnapshot,
 };
 
 use super::{
@@ -93,7 +93,7 @@ impl SetupMilestone {
 
     /// Returns the next milestone, or `None` when the binding is complete.
     #[must_use]
-    pub const fn next(self) -> Option<Self> {
+    pub fn next(self) -> Option<Self> {
         Self::all().get(self.position() + 1).copied()
     }
 
@@ -170,12 +170,20 @@ impl SetupEffectObservation {
 
 /// Inputs for advancing the setup binding by exactly one milestone.
 ///
+/// The caller declares the milestone it completed. The closed transition
+/// table admits it only when it is the immediately following milestone of the
+/// recorded state, so an out-of-order, repeated or rolled-back milestone is
+/// refused with the exact recovery action instead of being silently reordered.
+///
 /// Each milestone admits only its own inputs: key references are bound only
 /// when entering [`SetupMilestone::ServiceKeysGenerated`] and the privacy
 /// choice only when entering [`SetupMilestone::PrivacyModeSelected`].
-#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetupAdvanceInput {
+    /// Milestone this input completes. It must be the immediate successor of
+    /// the recorded milestone.
+    pub milestone: SetupMilestone,
     /// Exact observed effect for the milestone being entered.
     pub observation: SetupEffectObservation,
     /// Non-secret references to the generated service keys/tokens.
@@ -344,11 +352,19 @@ impl SetupBinding {
                 }
             })?,
         };
-        binding.validate()
+        binding.validate()?;
+        Ok(binding)
     }
 
     /// Advances the binding by exactly one milestone with its required
     /// observation, incrementing the revision.
+    ///
+    /// The input declares the milestone it completed. The closed transition
+    /// table admits it only when it is the immediate successor of the recorded
+    /// milestone, and the supplied observation must carry that milestone's
+    /// stable effect identity — an observation of a different operation cannot
+    /// be presented as the milestone it claims to record. A refusal names the
+    /// exact recovery action.
     ///
     /// Key references are bound only when entering
     /// [`SetupMilestone::ServiceKeysGenerated`], the privacy choice only when
@@ -367,16 +383,24 @@ impl SetupBinding {
                 "setup binding is already complete at the initial snapshot milestone".to_owned(),
             )
         })?;
-        if !self.state.can_advance(next) {
-            return Err(InstallationError::IllegalTransition {
-                from: self.state,
-                to: next,
-            });
+        if !self.state.can_advance(input.milestone) {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "setup advance refused: transaction {} is recorded at {} and {} is not its ordered successor; recovery: resume the same setup transaction and complete the pending milestone {} first",
+                self.transaction_id.as_str(),
+                self.state.effect_identity(),
+                input.milestone.effect_identity(),
+                next.effect_identity(),
+            )));
         }
         if input.observation.effect_id.as_str() != next.effect_identity() {
             return Err(InstallationError::InvalidField {
                 field: "setup.observation.effect_id".to_owned(),
-                reason: format!("must equal {}", next.effect_identity()),
+                reason: format!(
+                    "observation of {} was supplied for milestone {}; recovery: observe the exact effect of {} before advancing",
+                    input.observation.effect_id.as_str(),
+                    next.effect_identity(),
+                    next.effect_identity(),
+                ),
             });
         }
         input.observation.validate()?;
@@ -463,7 +487,7 @@ impl SetupBinding {
 
     /// Returns the read-only setup status for authenticated recovery queries.
     #[must_use]
-    pub const fn status(&self) -> SetupStatus {
+    pub fn status(&self) -> SetupStatus {
         if self.state == SetupMilestone::InitialSnapshotCreated {
             SetupStatus::Complete {
                 revision: self.revision,
@@ -587,7 +611,7 @@ impl SetupBinding {
                 "setup binding requires the confirmed privacy mode selection".to_owned(),
             ));
         }
-        match self.configuration_snapshot_ref {
+        match self.configuration_snapshot_ref.as_ref() {
             Some(snapshot_ref) if self.state == SetupMilestone::InitialSnapshotCreated => {
                 runtime_sha256_handle(snapshot_ref, "setup_binding.configuration_snapshot_ref")?;
                 let last = self.observed_effects.last().ok_or_else(|| {
@@ -595,7 +619,7 @@ impl SetupBinding {
                         "setup binding requires the initial snapshot observation".to_owned(),
                     )
                 })?;
-                if last.observed_digest != *snapshot_ref {
+                if last.observed_digest.as_str() != snapshot_ref.as_str() {
                     return Err(InstallationError::IdentityConflict);
                 }
             }
@@ -701,14 +725,18 @@ fn canonical_binding_bytes(
 /// modified snapshot, changed root, or stale revision refuses here rather
 /// than admitting an agent.
 ///
+/// Neither refusal is collapsed into a string: the durable binding's own typed
+/// failure and the snapshot owner's typed failure are both preserved, and each
+/// carries the exact recovery action.
+///
 /// # Errors
-/// Returns [`InstallationError`] when the binding is incomplete, the snapshot
-/// fails verification, or the bindings disagree.
+/// Returns [`SetupAdmissionError`] when the binding is incomplete, the
+/// snapshot fails verification, or the bindings disagree.
 pub fn verify_setup_binding(
     binding: &SetupBinding,
     snapshot: &SignedInitialConfigSnapshot,
     anchor: &InitialConfigSnapshotTrustAnchor,
-) -> Result<VerifiedSetupBinding, InstallationError> {
+) -> Result<VerifiedSetupBinding, SetupAdmissionError> {
     binding.require_complete()?;
     let context = InitialSnapshotVerificationContext {
         installation_id: binding.installation_id.as_str().to_owned(),
@@ -717,31 +745,22 @@ pub fn verify_setup_binding(
         key_identity: binding.confirmed_owner.as_str().to_owned(),
         setup_revision: binding.revision,
     };
-    let verified =
-        anchor
-            .verify(snapshot, &context)
-            .map_err(|error| InstallationError::InvalidField {
-                field: "signed_initial_snapshot".to_owned(),
-                reason: error.to_string(),
-            })?;
+    let verified = anchor.verify(snapshot, &context)?;
     let snapshot_ref = binding.configuration_snapshot_ref.as_ref().ok_or_else(|| {
         InstallationError::IncompleteObservation(
             "setup binding is missing its final configuration reference".to_owned(),
         )
     })?;
     if snapshot_ref.as_str() != verified.envelope_digest() {
-        return Err(InstallationError::IdentityConflict);
+        return Err(SetupAdmissionError::Snapshot(
+            InitialSnapshotError::BindingMismatch,
+        ));
     }
-    let snapshot_privacy =
-        verified
-            .payload()
-            .privacy_choice()
-            .map_err(|error| InstallationError::InvalidField {
-                field: "signed_initial_snapshot.privacy_choice".to_owned(),
-                reason: error.to_string(),
-            })?;
+    let snapshot_privacy = verified.payload().privacy_choice()?;
     if Some(snapshot_privacy) != binding.privacy_choice {
-        return Err(InstallationError::IdentityConflict);
+        return Err(SetupAdmissionError::Snapshot(
+            InitialSnapshotError::BindingMismatch,
+        ));
     }
     Ok(VerifiedSetupBinding::new(
         binding.installation_id.as_str().to_owned(),
@@ -758,6 +777,23 @@ pub fn verify_setup_binding(
         binding.revision,
         verified.payload().snapshot_id.clone(),
     ))
+}
+
+/// Typed setup admission failure.
+///
+/// The durable binding owner's [`InstallationError`] and the configuration
+/// owner's [`InitialSnapshotError`] are both preserved, so a wrong owner, key,
+/// root or generation is never flattened into a generic code between layers.
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub enum SetupAdmissionError {
+    /// The durable setup binding is incomplete, stale or internally invalid.
+    #[error(
+        "setup binding is not admitted: {0}; recovery: resume the same installation transaction and complete its recorded milestone before admitting an agent"
+    )]
+    Binding(#[from] InstallationError),
+    /// The signed initial configuration snapshot is not admitted.
+    #[error("signed initial configuration snapshot is not admitted: {0}")]
+    Snapshot(#[from] InitialSnapshotError),
 }
 
 /// Sealed, trust-anchor-verified setup binding admitted for authority entry.
@@ -806,7 +842,7 @@ impl VerifiedSetupBinding {
 
     /// Returns the verified installation identity.
     #[must_use]
-    pub const fn installation_id(&self) -> &str {
+    pub fn installation_id(&self) -> &str {
         &self.installation_id
     }
 
@@ -854,7 +890,7 @@ impl VerifiedSetupBinding {
 
     /// Returns the verified initial snapshot identity.
     #[must_use]
-    pub const fn snapshot_id(&self) -> &str {
+    pub fn snapshot_id(&self) -> &str {
         &self.snapshot_id
     }
 }
@@ -902,7 +938,8 @@ pub(crate) fn decode_setup_binding_json(bytes: &[u8]) -> Result<SetupBinding, In
             ),
         });
     }
-    envelope.binding.validate()
+    envelope.binding.validate()?;
+    Ok(envelope.binding)
 }
 
 #[derive(Deserialize)]
