@@ -159,7 +159,7 @@ def check_workflows(root: Path) -> list[Finding]:
         findings.append(Finding("GWF-000", ".github/workflows", 0, "workflows directory missing"))
         return findings
 
-    workflow_files = sorted([*workflows_dir.glob("*.yml"), *workflows_dir.glob("*.yaml")])
+    workflow_files = iter_workflow_files(root)
     if not workflow_files:
         findings.append(Finding("GWF-000", ".github/workflows", 0, "no workflow files found"))
         return findings
