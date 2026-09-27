@@ -1322,9 +1322,19 @@ pub fn enforce_capture_mode(
 /// I16.11 keeps the resolution visible: a route that cannot justify its
 /// collection is refused with a typed [`ObservabilityError`] instead of
 /// receiving a configuration that quietly drops a boundary. The configuration
-/// therefore exists only for a still-justified collection, which is what keeps
-/// the [`QualificationExpiry`] kill condition reachable from the route rather
-/// than from a declaration nobody consults.
+/// therefore exists only for a still-justified collection, because
+/// [`enforce_capture_mode`] refuses a family past its [`QualificationExpiry`]
+/// before the value is built.
+///
+/// That refusal is the ONLY consultation of the expiry in this cell, and it
+/// happens once, at construction. It is not a periodic re-justification:
+/// [`RouteTelemetryConfiguration::is_expired`] reports a later instant than the
+/// one the value was built at, and nothing re-consults it, because no caller
+/// reaches this type yet. The [`TelemetryKillCondition`] each profile declares
+/// is likewise read by no code in the repository — it is a declared string and
+/// nothing more. Both belong to the stitching phase that gives this type a
+/// production caller; until then this cell re-justifies a route once, on
+/// construction, and says so rather than claiming a loop it does not run.
 ///
 /// It is resolved rather than configured: the constructor is the only way to
 /// obtain one, so the value is serializable for inspection but not
