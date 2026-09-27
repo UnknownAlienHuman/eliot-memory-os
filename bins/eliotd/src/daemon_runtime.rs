@@ -2757,8 +2757,11 @@ async fn run_local_read_poll(
         ))
         .await;
         let body = {
-            let guard = composition.lock().await;
-            eliotd::skill_dispatch::commit_skill_pair(&guard, &envelope, &attempt, plan)
+            // #1957: the commit step also hydrates the daemon-held Governor
+            // capability admission view from the canonical evidence read this
+            // intake already performed, so the guard is taken mutably here.
+            let mut guard = composition.lock().await;
+            eliotd::skill_dispatch::commit_skill_pair(&mut guard, &envelope, &attempt, plan)
         };
         let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
