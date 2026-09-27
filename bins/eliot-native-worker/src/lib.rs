@@ -262,11 +262,17 @@ where
     pub async fn serve_stdio_governed(
         &mut self,
         carriers: &[ActionEnvelopeCarrier],
+        admitted_work_scope_id: &str,
         state_fence: &serde_json::Value,
         authority_epoch: &serde_json::Value,
     ) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
-        let actions =
-            admit_product_envelopes(&[GOVERNED_SERVE_OP], carriers, state_fence, authority_epoch)?;
+        let actions = admit_product_envelopes(
+            &[GOVERNED_SERVE_OP],
+            carriers,
+            admitted_work_scope_id,
+            state_fence,
+            authority_epoch,
+        )?;
         self.serve_stdio().await?;
         Ok(actions)
     }
@@ -281,11 +287,17 @@ where
         reader: &mut Reader,
         writer: &mut Writer,
         carriers: &[ActionEnvelopeCarrier],
+        admitted_work_scope_id: &str,
         state_fence: &serde_json::Value,
         authority_epoch: &serde_json::Value,
     ) -> Result<(Vec<governed_action::ValidatedAction>, bool), NativeWorkerError> {
-        let actions =
-            admit_product_envelopes(&[GOVERNED_SERVE_OP], carriers, state_fence, authority_epoch)?;
+        let actions = admit_product_envelopes(
+            &[GOVERNED_SERVE_OP],
+            carriers,
+            admitted_work_scope_id,
+            state_fence,
+            authority_epoch,
+        )?;
         let shutdown = self.serve_one_frame(reader, writer).await?;
         Ok((actions, shutdown))
     }
@@ -563,7 +575,8 @@ pub const GOVERNED_SERVE_OP: &str = "serve_stdio";
 ///
 /// For every required operation, in order: a carrier must be presented
 /// (missing), its bytes must decode to the closed envelope (malformed), the
-/// decoded operation must name the required operation (mismatched), and the
+/// decoded operation must name the required operation (mismatched), the
+/// decoded `WorkScope` must equal the admitted claim's `WorkScope`, and the
 /// decoded State Fence plus Authority Epoch must equal the admitted
 /// material's fence and epoch (stale). The full governed gate
 /// ([`governed_action::require_governed_op`]) then admits each envelope. The
@@ -573,6 +586,7 @@ pub const GOVERNED_SERVE_OP: &str = "serve_stdio";
 pub fn admit_product_envelopes(
     operations: &[&str],
     carriers: &[ActionEnvelopeCarrier],
+    admitted_work_scope_id: &str,
     state_fence: &serde_json::Value,
     authority_epoch: &serde_json::Value,
 ) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
@@ -591,7 +605,8 @@ pub fn admit_product_envelopes(
                     "authority-bound action envelope for '{operation}' (WorkScope, State Fence, Authority Epoch, applicable authority)"
                 ),
                 required_repair:
-                    "attach a carrier per driven operation with matching fence/epoch".to_owned(),
+                    "attach a carrier per driven operation with matching WorkScope/fence/epoch"
+                        .to_owned(),
                 allowed_next_action: format!(
                     "submit the drive with a valid envelope for '{operation}'"
                 ),
@@ -631,6 +646,14 @@ pub fn admit_product_envelopes(
                 format!(
                     "carried envelope binds '{}' but '{operation}' was required",
                     envelope.operation
+                ),
+            ));
+        }
+        if envelope.scope_ref != admitted_work_scope_id {
+            return Err(refuse(
+                operation,
+                format!(
+                    "carried envelope for '{operation}' has a WorkScope that does not match the admitted claim"
                 ),
             ));
         }
@@ -693,6 +716,7 @@ where
     let actions = admit_product_envelopes(
         &GOVERNED_DRIVE_OPS,
         &material.action_envelopes,
+        &material.admission.claim().work_scope_id,
         &fence,
         &epoch,
     )?;
@@ -2616,6 +2640,7 @@ mod tests {
         let actions = admit_product_envelopes(
             &GOVERNED_DRIVE_OPS,
             &drive_carriers(&fence, &epoch),
+            "scope-1",
             &fence,
             &epoch,
         )
@@ -2634,6 +2659,7 @@ mod tests {
                 &fence,
                 &epoch,
             )],
+            "scope-1",
             &fence,
             &epoch,
         )
@@ -2648,7 +2674,7 @@ mod tests {
         let epoch = action_epoch();
         // Missing: no carrier for the first driven op.
         let detail = expect_denial(
-            admit_product_envelopes(&GOVERNED_DRIVE_OPS, &[], &fence, &epoch),
+            admit_product_envelopes(&GOVERNED_DRIVE_OPS, &[], "scope-1", &fence, &epoch),
             "empty carriers",
         );
         assert!(
@@ -2660,6 +2686,7 @@ mod tests {
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
                 &[action_carrier("register", "claim", &fence, &epoch)],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2675,6 +2702,7 @@ mod tests {
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
                 &[action_carrier("register", "register", &stale_fence, &epoch)],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2693,6 +2721,7 @@ mod tests {
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
                 &[action_carrier("register", "register", &fence, &stale_epoch)],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2712,6 +2741,7 @@ mod tests {
                     operation: "register".to_owned(),
                     envelope_json: String::new(),
                 }],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2729,6 +2759,7 @@ mod tests {
                     operation: "register".to_owned(),
                     envelope_json: "not json".to_owned(),
                 }],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
