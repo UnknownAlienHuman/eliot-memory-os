@@ -25,9 +25,14 @@
 //! record owns lifecycle state; audit is its evidence projection. An append
 //! failure is never silent: it emits the stable
 //! `KERNEL_AUDIT_APPEND_FAILED` terminal through the #895 diagnostics
-//! facade. Residual: the I16.11 ORS/Watchdog-spool cascade and last-resort
-//! slot are not implemented; a failed append stays visible only through
-//! that terminal until the next successful append. Anchor auto-export runs
+//! facade. The I16.11 cascade holds the two result legs durably: the submit
+//! path spools both drafts fsync-sealed before the ORS completion, and
+//! `audit_chain_records` reconciles that spool against the validated ORS
+//! record before reading, so a completed result always yields its full
+//! ordered chain. Residual: the Watchdog-domain spool leg and the
+//! last-resort control slot are not implemented; other legs stay visible
+//! only through that terminal until the next successful append. Anchor
+//! auto-export runs
 //! every [`KERNEL_AUDIT_ANCHOR_INTERVAL_RECORDS`] records plus on explicit
 //! export; a failed auto-export likewise stays visible through
 //! `KERNEL_AUDIT_ANCHOR_FAILED` without failing the append, so the Kernel
@@ -47,7 +52,7 @@ use eliot_contracts::{EpochId, StateFence, canonical_json_bytes};
 use eliot_ipc::Session;
 use eliot_kernel_core::CutoverDecision;
 use eliot_kernel_service::EliotdLaunchDescriptor;
-use eliot_ors::{HostRequestRecord, SupervisionLeaseSnapshot};
+use eliot_ors::{HostRequestRecord, HostRequestState, OperationIdentity, SupervisionLeaseSnapshot};
 use eliot_process::ProcessStartReceipt;
 use eliot_protocol::{
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
@@ -65,6 +70,8 @@ pub const KERNEL_AUDIT_CHAIN_FILE_NAME: &str = "audit-events.jsonl";
 pub const KERNEL_AUDIT_ANCHOR_DIR_NAME: &str = "anchors";
 /// Stable `latest` anchor pointer file name inside the anchor sink.
 pub const KERNEL_AUDIT_LATEST_ANCHOR_FILE_NAME: &str = "latest-anchor.json";
+/// Spool directory name below the audit directory for pending result bindings.
+pub const KERNEL_AUDIT_PENDING_DIR_NAME: &str = "pending-bindings";
 /// Records between automatic periodic anchor exports.
 pub const KERNEL_AUDIT_ANCHOR_INTERVAL_RECORDS: u64 = 64;
 /// Previous-hash of the genesis record: 64 zero hex digits.
@@ -1349,6 +1356,88 @@ impl AuditEventDraft {
     }
 }
 
+/// One spooled not-yet-sequenced audit event: the serializable shadow of an
+/// [`AuditEventDraft`] (I16.11 result-leg spool).
+///
+/// The spool stores the draft exactly as built pre-persist (closed kind,
+/// full lineage, digest/identity-only body). [`PendingResultBinding`]
+/// explains the reconcile contract.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpooledAuditDraft {
+    /// Closed canonical event kind (mapped back to its `&'static` const).
+    kind: String,
+    /// Composite run trace context as built at spool time.
+    lineage: AuditLineage,
+    /// Digest/identity-only event detail.
+    body: serde_json::Value,
+}
+
+impl SpooledAuditDraft {
+    /// Snapshots one live draft for the durable spool.
+    fn of(draft: &AuditEventDraft) -> Self {
+        Self {
+            kind: draft.kind.to_owned(),
+            lineage: draft.lineage.clone(),
+            body: draft.body.clone(),
+        }
+    }
+
+    /// Rebuilds the live draft, mapping the stored kind to its closed const.
+    ///
+    /// Returns `None` for a kind outside the two result legs, so a tampered
+    /// or corrupt spool entry can never append an ad-hoc event.
+    fn into_draft(self) -> Option<AuditEventDraft> {
+        let kind = match self.kind.as_str() {
+            AuditEventKind::RESULT_DAEMON_SUBMITTED => AuditEventKind::RESULT_DAEMON_SUBMITTED,
+            AuditEventKind::RESULT_KERNEL_BOUND => AuditEventKind::RESULT_KERNEL_BOUND,
+            _ => return None,
+        };
+        Some(AuditEventDraft {
+            kind,
+            lineage: self.lineage,
+            body: self.body,
+        })
+    }
+}
+
+/// Durable pre-persist evidence for the two result legs of one operation.
+///
+/// Written fsync-sealed before the ORS completion it anticipates, cleared
+/// once both legs append to the chain. Reconcile replays a surviving entry
+/// only against a validated ORS original in `ResultReceived` with matching
+/// request/result digests; anything else (no record, no completion, digest
+/// mismatch) drops the entry without appending, so the chain never carries
+/// a binding the ORS record does not prove.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingResultBinding {
+    /// Canonical format version.
+    format_version: u16,
+    /// Spooled operation identity (validated again at reconcile).
+    operation_id: String,
+    /// Request digest the ORS original must carry.
+    request_digest: String,
+    /// Result digest the ORS completion must carry.
+    result_digest: String,
+    /// `result.daemon_submitted` evidence, appended first when missing.
+    submitted: SpooledAuditDraft,
+    /// `result.kernel_bound` evidence; `durable_state` refreshes from ORS.
+    bound: SpooledAuditDraft,
+}
+
+impl PendingResultBinding {
+    /// Returns whether the entry carries this format and both result legs.
+    fn is_well_formed(&self) -> bool {
+        self.format_version == KERNEL_AUDIT_FORMAT_VERSION
+            && !self.operation_id.trim().is_empty()
+            && !self.request_digest.trim().is_empty()
+            && !self.result_digest.trim().is_empty()
+            && self.submitted.kind == AuditEventKind::RESULT_DAEMON_SUBMITTED
+            && self.bound.kind == AuditEventKind::RESULT_KERNEL_BOUND
+    }
+}
+
 /// One sequenced durable audit record: closed kind, full I16.3 lineage,
 /// BLAKE3 previous/current link, and full-capture assurance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1538,7 +1627,8 @@ impl KernelAuditChain {
         let audit_dir = kernel_audit_dir(work_root);
         let chain_path = kernel_audit_chain_path(work_root);
         let anchor_dir = kernel_audit_anchor_dir(work_root);
-        for dir in [&audit_dir, &anchor_dir] {
+        let pending_dir = audit_dir.join(KERNEL_AUDIT_PENDING_DIR_NAME);
+        for dir in [&audit_dir, &anchor_dir, &pending_dir] {
             std::fs::create_dir_all(dir).map_err(|error| KernelAuditError::Io {
                 path: dir.clone(),
                 reason: error.to_string(),
@@ -1830,6 +1920,110 @@ impl KernelAuditChain {
         Ok(anchor)
     }
 
+    /// Returns the durable spool directory for pending result bindings.
+    fn pending_dir(&self) -> PathBuf {
+        let mut dir = self.chain_path.clone();
+        dir.pop();
+        dir.join(KERNEL_AUDIT_PENDING_DIR_NAME)
+    }
+
+    /// Returns the deterministic spool path for one operation.
+    ///
+    /// The name is a BLAKE3 of the operation identity: operation identities
+    /// carry builder-chosen separators that are not filename-safe.
+    fn pending_binding_path(&self, operation_id: &str) -> PathBuf {
+        self.pending_dir().join(format!(
+            "pending-{}.json",
+            blake3_hex(operation_id.as_bytes())
+        ))
+    }
+
+    /// Spools one pending binding durably (staging write, fsync, rename).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelAuditError`] when the spool directory or file cannot
+    /// be written durably.
+    fn spool_pending_binding(&self, entry: &PendingResultBinding) -> Result<(), KernelAuditError> {
+        let dir = self.pending_dir();
+        std::fs::create_dir_all(&dir).map_err(|error| KernelAuditError::Io {
+            path: dir.clone(),
+            reason: error.to_string(),
+        })?;
+        let bytes = canonical_json_bytes(entry)
+            .map_err(|error| KernelAuditError::Serialization(error.to_string()))?;
+        let path = self.pending_binding_path(&entry.operation_id);
+        let staging = path.with_extension("json.staging");
+        Self::write_sync(&staging, &bytes)?;
+        // The spool name is deterministic per operation, and Windows rename
+        // fails over an existing destination, so a retry removes its own
+        // prior entry before publishing the replacement.
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&staging, &path).map_err(|error| KernelAuditError::Io {
+            path: path.clone(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Drops the pending spool entry for one operation, if any.
+    ///
+    /// Best-effort: a surviving entry is harmless because reconcile
+    /// re-checks the chain before appending anything.
+    fn clear_pending_binding(&self, operation_id: &str) {
+        let _ = std::fs::remove_file(self.pending_binding_path(operation_id));
+    }
+
+    /// Loads every pending binding entry, keeping per-entry failures.
+    ///
+    /// Staging files carry no `.json` suffix and are skipped: they are
+    /// either mid-write or orphaned by a crash, and the next spool for
+    /// their operation overwrites them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelAuditError`] when the spool directory cannot be read.
+    fn load_pending_bindings(
+        &self,
+    ) -> Result<Vec<Result<PendingResultBinding, KernelAuditError>>, KernelAuditError> {
+        let dir = self.pending_dir();
+        let entries = std::fs::read_dir(&dir).map_err(|error| KernelAuditError::Io {
+            path: dir.clone(),
+            reason: error.to_string(),
+        })?;
+        let mut pending = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| KernelAuditError::Io {
+                path: dir.clone(),
+                reason: error.to_string(),
+            })?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_spool_entry =
+                name.starts_with("pending-") && path.extension().is_some_and(|ext| ext == "json");
+            if !is_spool_entry {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    pending.push(Err(KernelAuditError::Io {
+                        path,
+                        reason: error.to_string(),
+                    }));
+                    continue;
+                }
+            };
+            match serde_json::from_slice(&bytes) {
+                Ok(entry) => pending.push(Ok(entry)),
+                Err(error) => pending.push(Err(KernelAuditError::Io {
+                    path,
+                    reason: error.to_string(),
+                })),
+            }
+        }
+        Ok(pending)
+    }
+
     fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), KernelAuditError> {
         let mut file = OpenOptions::new()
             .create(true)
@@ -1963,6 +2157,54 @@ impl KernelAuditChain {
     }
 }
 
+/// Returns whether the chain already carries one result-leg record.
+///
+/// Compares by content: closed kind, operation identity, and result digest.
+fn chain_has_result_record(
+    records: &[AuditRecord],
+    kind: &str,
+    operation_id: &str,
+    result_digest: &str,
+) -> bool {
+    records.iter().any(|record| {
+        record.kind == kind
+            && record.lineage.operation_id.as_deref() == Some(operation_id)
+            && record
+                .event_body
+                .get("result_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(result_digest)
+    })
+}
+
+/// Appends one spooled leg unless the chain already carries it.
+///
+/// Returns `true` when the leg is present afterwards. Returns `false` —
+/// after emitting the stable `KERNEL_AUDIT_APPEND_FAILED` terminal — when
+/// the leg can neither be rebuilt nor appended; the caller keeps the spool
+/// for the next pass.
+fn append_missing_result_leg(
+    chain: &mut KernelAuditChain,
+    records: &[AuditRecord],
+    spooled: SpooledAuditDraft,
+    operation_id: &str,
+    result_digest: &str,
+    now: u64,
+) -> bool {
+    let Some(draft) = spooled.into_draft() else {
+        crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+        return false;
+    };
+    if chain_has_result_record(records, draft.kind, operation_id, result_digest) {
+        return true;
+    }
+    if chain.append(draft, now).is_err() {
+        crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+        return false;
+    }
+    true
+}
+
 impl crate::KernelComposition {
     /// Appends one audit event through the composition's single chain.
     ///
@@ -1984,13 +2226,186 @@ impl crate::KernelComposition {
         }
     }
 
+    /// Spools both result-leg drafts durably ahead of the ORS completion.
+    ///
+    /// I16.11 cascade, second leg: the binding record can only append after
+    /// the completion it evidences, so its evidence (plus the submission
+    /// leg's) is fsync-sealed first. Best-effort like every observation: a
+    /// failed spool emits the stable `KERNEL_AUDIT_APPEND_FAILED` terminal
+    /// without changing the submit decision.
+    pub(crate) fn spool_pending_result_binding(
+        &self,
+        submitted: &AuditEventDraft,
+        bound: &AuditEventDraft,
+        operation_id: &str,
+        request_digest: &str,
+        result_digest: &str,
+    ) {
+        let entry = PendingResultBinding {
+            format_version: KERNEL_AUDIT_FORMAT_VERSION,
+            operation_id: operation_id.to_owned(),
+            request_digest: request_digest.to_owned(),
+            result_digest: result_digest.to_owned(),
+            submitted: SpooledAuditDraft::of(submitted),
+            bound: SpooledAuditDraft::of(bound),
+        };
+        let Ok(chain) = self.kernel_audit.lock() else {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+            return;
+        };
+        if chain.spool_pending_binding(&entry).is_err() {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+        }
+    }
+
+    /// Drops the pending spool entry once both result legs are sealed.
+    ///
+    /// Best-effort: a surviving entry is harmless because reconcile
+    /// re-checks the chain before appending anything.
+    pub(crate) fn clear_pending_result_binding(&self, operation_id: &str) {
+        if let Ok(chain) = self.kernel_audit.lock() {
+            chain.clear_pending_binding(operation_id);
+        }
+    }
+
+    /// Reconciles the pending-result spool against validated ORS state.
+    ///
+    /// I16.11 cascade, healing leg: every surviving spool entry replays
+    /// only against its validated ORS original (see
+    /// `reconcile_pending_entry`). Never fails: healing must not break
+    /// chain reads.
+    fn reconcile_pending_result_bindings(&self) {
+        let pending = {
+            let Ok(chain) = self.kernel_audit.lock() else {
+                return;
+            };
+            let Ok(pending) = chain.load_pending_bindings() else {
+                crate::kernel_diagnostics::observe_terminal_error(
+                    KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+                );
+                return;
+            };
+            pending
+        };
+        for entry in pending {
+            self.reconcile_pending_entry(entry);
+        }
+    }
+
+    /// Reconciles one spool entry against its validated ORS original.
+    ///
+    /// Compares receipts by content: a completed (`ResultReceived`) record
+    /// with matching request/result digests completes the chain with the
+    /// legs it still lacks, in causal order (submission before binding);
+    /// the binding `durable_state` refreshes from the ORS original. No
+    /// record, no completion, or a digest mismatch drops the entry without
+    /// appending — the chain never carries a binding the ORS record does
+    /// not prove. Corrupt entries and failed appends stay visible through
+    /// the stable `KERNEL_AUDIT_APPEND_FAILED` terminal and keep their
+    /// spool file for the next pass.
+    fn reconcile_pending_entry(&self, entry: Result<PendingResultBinding, KernelAuditError>) {
+        let entry = match entry {
+            Ok(entry) if entry.is_well_formed() => entry,
+            _ => {
+                crate::kernel_diagnostics::observe_terminal_error(
+                    KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+                );
+                return;
+            }
+        };
+        let Ok(operation_id) = OperationIdentity::new(entry.operation_id.as_str()) else {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+            return;
+        };
+        // The audit lock is never held across ORS IO: load and compare the
+        // validated original first, then take the lock only for the
+        // duplicate check and the ordered appends.
+        let Ok(stored) = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &entry.request_digest)
+        else {
+            return;
+        };
+        let Some(stored) = stored else {
+            self.clear_pending_result_binding(&entry.operation_id);
+            return;
+        };
+        if stored.request_digest != entry.request_digest {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+            self.clear_pending_result_binding(&entry.operation_id);
+            return;
+        }
+        if stored.state != HostRequestState::ResultReceived {
+            self.clear_pending_result_binding(&entry.operation_id);
+            return;
+        }
+        if stored.result_digest.as_deref() != Some(entry.result_digest.as_str()) {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+            self.clear_pending_result_binding(&entry.operation_id);
+            return;
+        }
+        let PendingResultBinding {
+            operation_id,
+            result_digest,
+            submitted,
+            mut bound,
+            ..
+        } = entry;
+        let Some(body) = bound.body.as_object_mut() else {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+            return;
+        };
+        body.insert(
+            "durable_state".to_owned(),
+            serde_json::Value::String(format!("{:?}", stored.state)),
+        );
+        let Ok(mut chain) = self.kernel_audit.lock() else {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+            return;
+        };
+        let Ok(records) = chain.records() else {
+            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
+            return;
+        };
+        let now = crate::unix_ms();
+        if !append_missing_result_leg(
+            &mut chain,
+            &records,
+            submitted,
+            &operation_id,
+            &result_digest,
+            now,
+        ) {
+            return;
+        }
+        if !append_missing_result_leg(
+            &mut chain,
+            &records,
+            bound,
+            &operation_id,
+            &result_digest,
+            now,
+        ) {
+            return;
+        }
+        drop(chain);
+        self.clear_pending_result_binding(&operation_id);
+    }
+
     /// Reads and verifies the full retained audit chain in order.
+    ///
+    /// Reconciles the I16.11 pending-result spool first: a completed result
+    /// always yields its full ordered chain here, even when a crash or a
+    /// failed append orphaned its spool entry. Healing is best-effort and
+    /// never fails the read.
     ///
     /// # Errors
     ///
     /// Returns [`KernelAuditError`] when the lock is poisoned or the
     /// retained chain does not verify.
     pub fn audit_chain_records(&self) -> Result<Vec<AuditRecord>, KernelAuditError> {
+        self.reconcile_pending_result_bindings();
         self.kernel_audit
             .lock()
             .map_err(|_| KernelAuditError::LockPoisoned)?
