@@ -395,6 +395,39 @@ impl BlobStoreController {
         }
     }
 
+    /// Captures one payload and raises the explicit first demand when the
+    /// payload is non-inline (I1.11 step 4).
+    ///
+    /// A payload at or below the approved inline threshold is handled inline
+    /// and returns before any demand is signalled, so inline work can never
+    /// start the blob generation. A non-inline payload *is* the
+    /// [`BlobDemand::NonInlineCapture`] signal: the first one starts or reuses
+    /// the approved generation through `start_and_probe` and records the
+    /// outcome through [`Self::on_demand`], and the payload is then classified
+    /// by the same approved-threshold rule [`Self::capture`] uses. A failed
+    /// probe therefore yields [`BlobCaptureOutcome::DegradedLargePayload`] and
+    /// never a canonical [`BlobRef`].
+    ///
+    /// `start_and_probe` is not invoked for an inline payload.
+    pub fn capture_on_demand(
+        &mut self,
+        length: u64,
+        receipt: Option<&BlobReadyReceipt>,
+        start_and_probe: impl FnOnce() -> Result<BlobProbeSuccess, String>,
+    ) -> BlobCaptureOutcome {
+        // One classification rule, shared with `capture`: the approved
+        // manifest threshold. Inline returns before the demand, which is what
+        // keeps the start gated on the first *non-inline* capture.
+        if length <= self.manifest.inline_threshold_bytes {
+            return BlobCaptureOutcome::Inline { length };
+        }
+        // The recorded `BlobProbeStatus` is read back by `capture` from the
+        // state `on_demand` just wrote, so the probe result decides the
+        // outcome rather than being discarded.
+        self.on_demand(BlobDemand::NonInlineCapture, start_and_probe);
+        self.capture(length, receipt)
+    }
+
     /// Captures one payload. Payloads at or below the inline threshold are
     /// handled inline and stay available even while degraded. Larger payloads
     /// require the Ready generation plus a durable receipt; otherwise a typed
@@ -566,6 +599,34 @@ impl super::KernelComposition {
             .unwrap_or(BlobCaptureOutcome::DegradedLargePayload {
                 reason: "no approved blob manifest was validated at startup".to_owned(),
             })
+    }
+
+    /// Captures one payload through the I1.11 step 4 first-demand trigger.
+    ///
+    /// This is the composition-reachable demand trigger for a non-inline
+    /// capture: it reaches the existing [`Self::demand_blob_store`] signal and
+    /// the existing [`Self::capture_blob_payload`] classification through the
+    /// one approved manifest threshold, and the recorded probe result is the
+    /// [`BlobProbeStatus`] that decides the outcome. An inline payload returns
+    /// before any demand, so the blob generation is still started only on the
+    /// first non-inline capture, recovery, or GC demand. Returns `Err` only
+    /// when no approved manifest was validated at startup — the same closed
+    /// reason [`Self::demand_blob_store`] reports — because with no approved
+    /// manifest there is no approved threshold and no generation to demand.
+    pub fn capture_blob_payload_with_demand(
+        &self,
+        length: u64,
+        receipt: Option<&BlobReadyReceipt>,
+        start_and_probe: impl FnOnce() -> Result<BlobProbeSuccess, String>,
+    ) -> Result<BlobCaptureOutcome, String> {
+        let mut guard = self
+            .blob_store
+            .lock()
+            .map_err(|_| "blob controller lock poisoned".to_owned())?;
+        let Some(controller) = guard.as_mut() else {
+            return Err("no approved blob manifest was validated at startup".to_owned());
+        };
+        Ok(controller.capture_on_demand(length, receipt, start_and_probe))
     }
 
     /// Mints a canonical [`BlobRef`] only after the validated Ready
