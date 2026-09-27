@@ -2383,8 +2383,12 @@ impl KernelStoreGateway {
                     .validate_for(publication)
                     .map_err(|error| error.to_string())?;
                 let answer = UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+                    publication_request: Some(Box::new(publication.clone())),
                     acknowledgement: Box::new(acknowledgement.clone()),
                 };
+                answer
+                    .validate_horizon_for(publication)
+                    .map_err(|error| error.to_string())?;
                 settled.disposition =
                     match self.retain_user_automation_obligation_answer(obligation, &answer) {
                         Ok(()) => UserAutomationRuntimeObligationDisposition::Answered {
@@ -3616,6 +3620,8 @@ enum RetainedHorizonPublication {
     /// The publication is already answered by the owner's retained
     /// acknowledgement, which is served verbatim instead of publishing again.
     Answered {
+        /// Exact request kept beside the answer in the durable outbox.
+        publication_request: Box<UserAutomationWakeHorizonPublication>,
         /// The owner's own acknowledgement, re-validated against this request.
         acknowledgement: Box<UserAutomationWakePublication>,
     },
@@ -3657,7 +3663,10 @@ fn classify_retained_horizon_publication(
             publication,
             &obligation.owner_operation_id,
         ) {
-            Ok(acknowledgement) => RetainedHorizonPublication::Answered { acknowledgement },
+            Ok((publication_request, acknowledgement)) => RetainedHorizonPublication::Answered {
+                publication_request,
+                acknowledgement,
+            },
             Err(reason) => RetainedHorizonPublication::Unresolved { reason },
         },
     }
@@ -3674,10 +3683,14 @@ fn retained_horizon_phase(
 ) -> Option<UserAutomationHorizonPhase> {
     match classification {
         RetainedHorizonPublication::Issue => None,
-        RetainedHorizonPublication::Answered { acknowledgement } => {
+        RetainedHorizonPublication::Answered {
+            publication_request,
+            acknowledgement,
+        } => {
             obligation.disposition = UserAutomationRuntimeObligationDisposition::Answered {
                 answer: Box::new(
                     UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+                        publication_request: Some(publication_request),
                         acknowledgement: acknowledgement.clone(),
                     },
                 ),
@@ -3781,8 +3794,14 @@ fn decode_retained_horizon_answer(
     result_response: serde_json::Value,
     publication: &UserAutomationWakeHorizonPublication,
     owner_operation_id: &str,
-) -> Result<Box<UserAutomationWakePublication>, String> {
-    let Ok(UserAutomationRuntimeObligationAnswer::WakeHorizonPublication { acknowledgement }) =
+) -> Result<
+    (
+        Box<UserAutomationWakeHorizonPublication>,
+        Box<UserAutomationWakePublication>,
+    ),
+    String,
+> {
+    let Ok(answer) =
         serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response)
     else {
         return Err(unretained_horizon_answer_reason(
@@ -3790,10 +3809,20 @@ fn decode_retained_horizon_answer(
             owner_operation_id,
         ));
     };
-    acknowledgement
-        .validate_for(publication)
+    let UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+        publication_request: Some(publication_request),
+        acknowledgement,
+    } = &answer
+    else {
+        return Err(unretained_horizon_answer_reason(
+            &publication.automation_revision,
+            owner_operation_id,
+        ));
+    };
+    answer
+        .validate_horizon_for(publication)
         .map_err(|error| error.to_string())?;
-    Ok(acknowledgement)
+    Ok((publication_request.clone(), acknowledgement.clone()))
 }
 
 /// Projects the schedule owner's acknowledgement into the bounded horizon phase
