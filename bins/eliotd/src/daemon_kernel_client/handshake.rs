@@ -128,17 +128,42 @@ pub(super) fn client_hello(
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
     let artifact_id = ArtifactId::new(binding.daemon_artifact_sha256.as_str())
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+    // `module_contract.required_capabilities` carries runtime dependency edges
+    // onto other hot modules. The `daemon` capability the daemon needs from the
+    // Kernel is a handshake-requested capability (carried by
+    // `ClientHello.capabilities` below), not a runtime module-graph edge, so it
+    // is deliberately absent here: the two lists are never conflated.
     let contract = ModuleContract {
         module_id: module_id.clone(),
         version: ContractVersion::new(1, 0, 0),
         artifact_id: artifact_id.clone(),
         protocols: vec![PROTOCOL_VERSION.to_owned()],
-        required_capabilities: vec!["daemon".to_owned()],
+        capabilities: Vec::new(),
+        required_capabilities: Vec::new(),
         optional_capabilities: Vec::new(),
         advisory_capabilities: Vec::new(),
         state_owner: SERVICE_NAME.to_owned(),
         failure_domain: "daemon".to_owned(),
+        owner: SERVICE_NAME.to_owned(),
         hot_replace: true,
+        startup_after: Vec::new(),
+        drain_before: Vec::new(),
+        invalidation_triggers: Vec::new(),
+        supervision_plan: "one_for_one".to_owned(),
+        child_restart: "transient".to_owned(),
+        restart_intensity: "3/10m".to_owned(),
+        resource_profile: "background-medium".to_owned(),
+        privacy_classes: vec!["PUBLIC".to_owned()],
+        permissions: Vec::new(),
+        health_contract: "health/eliotd-v1".to_owned(),
+        checkpoint_contract: "checkpoint/daemon-v1".to_owned(),
+        compatibility_state: "rebuildable".to_owned(),
+        independent_test_profile: "module/eliotd".to_owned(),
+        contract_fixture_set: "eliot.daemon.v1/daemon".to_owned(),
+        affected_test_tags: vec!["eliotd".to_owned(), "daemon".to_owned()],
+        architecture: Vec::new(),
+        telemetry: "telemetry/eliotd-v1".to_owned(),
+        removal_boundary: "eliotd".to_owned(),
     };
     let generation = ModuleGeneration {
         module_id,

@@ -82,6 +82,10 @@ pub use module::control_reserve_front_door::{
     PermitOperation,
 };
 pub use module::epoch_and_fence::{EpochActivation, LineageChange, RouteFence, RouteScope};
+pub use module::generation_readiness::{
+    GenerationReadiness, GenerationReadinessProjection, evaluate_generation_readiness,
+    evaluate_module_set_readiness,
+};
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
 pub use module::notification_state::{
     Acknowledgement, DeadlineOrReview, DeliveryChannel, DeliveryState, Notification,

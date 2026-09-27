@@ -22,6 +22,7 @@ mod hot_path;
 mod hot_path_profile;
 mod i14_backpressure;
 mod installation_activation;
+mod module_graph;
 mod restart_policy;
 mod runtime_live;
 mod supervision_authority;
@@ -79,6 +80,10 @@ pub use installation_activation::{
     InstallationDigestBinding, InstallationScmReadback, InstallationScmRole,
     SignedInstallationActivation, SignedInstallationActivationApproval,
     VerifiedInstallationActivationApproval,
+};
+pub use module_graph::{
+    CapabilityRole, ExternalCapabilityBinding, RequiredCapabilityEdge, RequiredCapabilityGraph,
+    UnresolvedCapability, resolve_required_capability_graph,
 };
 pub use restart_policy::{
     AutomaticRestartDecision, RestartClass, RestartDependency, RestartDependencyKind,
@@ -164,6 +169,30 @@ pub enum RuntimeContractError {
         receipt: &'static str,
         state: String,
     },
+    /// A required capability has no resolved provider among the admitted modules.
+    #[error("module '{consumer}' requires capability '{capability}' with no resolved provider")]
+    UnresolvedRequiredCapability {
+        consumer: String,
+        capability: String,
+    },
+    /// A required capability resolves to more than one provider module.
+    #[error(
+        "module '{consumer}' requires capability '{capability}' provided by multiple modules: {providers}"
+    )]
+    AmbiguousRequiredCapability {
+        consumer: String,
+        capability: String,
+        providers: String,
+    },
+    /// A module requires a capability that only it provides itself.
+    #[error("module '{module}' requires capability '{capability}' it provides itself")]
+    SelfCapabilityDependency { module: String, capability: String },
+    /// The required-capability graph contains a dependency cycle.
+    #[error("required capability dependency cycle: {path}")]
+    RequiredCapabilityCycle { path: String },
+    /// A capability is declared with conflicting dependency roles.
+    #[error("module '{module}' declares capability '{capability}' with conflicting roles")]
+    CapabilityRoleConflict { module: String, capability: String },
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), RuntimeContractError> {
@@ -529,6 +558,13 @@ impl ServiceProcessRecord {
 }
 
 /// A module contract surface consumed by generation registration.
+///
+/// The contract is the complete immutable I6.4 declaration for one hot module.
+/// It declares the owner, provided/required capabilities, startup/drain order,
+/// invalidation triggers, failure domain, supervision, health/readiness,
+/// compatibility/rebuild state, test entrypoints, fixture revisions and removal
+/// boundary. A contract is a declaration only: it is never observed readiness,
+/// health, test success or activation authority.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleContract {
@@ -540,6 +576,8 @@ pub struct ModuleContract {
     pub artifact_id: ArtifactId,
     /// Protocol names supported by this module.
     pub protocols: Vec<String>,
+    /// Capabilities this module provides to other modules.
+    pub capabilities: Vec<String>,
     /// Required capability dependencies.
     pub required_capabilities: Vec<String>,
     /// Optional capability dependencies.
@@ -550,26 +588,152 @@ pub struct ModuleContract {
     pub state_owner: String,
     /// Failure domain identifier.
     pub failure_domain: String,
+    /// Accountable owner of the module declaration.
+    pub owner: String,
     /// Whether side-by-side replacement is admitted.
     pub hot_replace: bool,
+    /// Capabilities that must be ready before this module starts.
+    pub startup_after: Vec<String>,
+    /// Capabilities drained only after this module quiesces.
+    pub drain_before: Vec<String>,
+    /// Events that invalidate this module's derived state.
+    pub invalidation_triggers: Vec<String>,
+    /// Eligible supervision strategy.
+    pub supervision_plan: String,
+    /// Restart class applied to this module's failures.
+    pub child_restart: String,
+    /// Restart-intensity window and cooldown declaration.
+    pub restart_intensity: String,
+    /// Resource budget class.
+    pub resource_profile: String,
+    /// Privacy classes this module may handle.
+    pub privacy_classes: Vec<String>,
+    /// Effects/permissions this module is admitted to exercise.
+    pub permissions: Vec<String>,
+    /// Health/readiness/freshness contract reference.
+    pub health_contract: String,
+    /// Checkpoint and state-migration contract reference.
+    pub checkpoint_contract: String,
+    /// Restart/rebuild/quarantine compatibility state.
+    pub compatibility_state: String,
+    /// Independent module/contract/fault test entrypoint.
+    pub independent_test_profile: String,
+    /// Consumer/provider fixture revision set.
+    pub contract_fixture_set: String,
+    /// Test tags affected by this module.
+    pub affected_test_tags: Vec<String>,
+    /// Architecture decision references.
+    pub architecture: Vec<String>,
+    /// Telemetry declaration.
+    pub telemetry: String,
+    /// Removal boundary for this module.
+    pub removal_boundary: String,
+}
+
+/// Returns the blank/control-character-checked set of a capability list.
+fn capability_list(
+    values: &[String],
+    field: &'static str,
+) -> Result<std::collections::BTreeSet<String>, RuntimeContractError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        text(value, field)?;
+        if !seen.insert(value.clone()) {
+            return Err(RuntimeContractError::InvalidField {
+                field,
+                reason: "must not contain duplicates",
+            });
+        }
+    }
+    Ok(seen)
 }
 
 impl ModuleContract {
-    /// Validates the contract surface without probing or starting the module.
+    /// Validates the complete I6.4 contract surface without probing or starting
+    /// the module.
+    ///
+    /// Every mandatory field is checked: identities, owner, protocol names,
+    /// provided/required/optional/advisory capabilities, startup/drain order,
+    /// invalidation triggers, failure domain, supervision, resource/privacy/
+    /// permissions, health/checkpoint/compatibility state, test entrypoints,
+    /// fixture revisions, architecture, telemetry and removal boundary. A
+    /// capability list must be duplicate-free, a module must not declare a
+    /// capability as both provided and required, required/optional/advisory
+    /// roles must not overlap, and startup/drain order must stay consistent
+    /// with the required graph.
     pub fn validate(&self) -> Result<(), RuntimeContractError> {
         text(self.module_id.as_str(), "module_id")?;
         text(self.artifact_id.as_str(), "artifact_id")?;
         text(&self.state_owner, "state_owner")?;
         text(&self.failure_domain, "failure_domain")?;
+        text(&self.owner, "owner")?;
         if self.protocols.is_empty() {
             return Err(RuntimeContractError::InvalidField {
                 field: "protocols",
                 reason: "at least one protocol is required",
             });
         }
-        for protocol in &self.protocols {
-            text(protocol, "protocols")?;
+        capability_list(&self.protocols, "protocols")?;
+        let provided = capability_list(&self.capabilities, "capabilities")?;
+        let required = capability_list(&self.required_capabilities, "required_capabilities")?;
+        let optional = capability_list(&self.optional_capabilities, "optional_capabilities")?;
+        let advisory = capability_list(&self.advisory_capabilities, "advisory_capabilities")?;
+        if provided.intersection(&required).next().is_some() {
+            return Err(RuntimeContractError::SelfCapabilityDependency {
+                module: self.module_id.to_string(),
+                capability: provided
+                    .intersection(&required)
+                    .next()
+                    .expect("non-empty intersection")
+                    .clone(),
+            });
         }
+        if let Some(capability) = required.intersection(&optional).next() {
+            return Err(RuntimeContractError::CapabilityRoleConflict {
+                module: self.module_id.to_string(),
+                capability: capability.clone(),
+            });
+        }
+        if let Some(capability) = required.intersection(&advisory).next() {
+            return Err(RuntimeContractError::CapabilityRoleConflict {
+                module: self.module_id.to_string(),
+                capability: capability.clone(),
+            });
+        }
+        capability_list(&self.startup_after, "startup_after")?;
+        capability_list(&self.drain_before, "drain_before")?;
+        for capability in &self.startup_after {
+            if !required.contains(capability) {
+                return Err(RuntimeContractError::InvalidField {
+                    field: "startup_after",
+                    reason: "must be a required capability of this module",
+                });
+            }
+        }
+        for capability in &self.drain_before {
+            if !required.contains(capability) {
+                return Err(RuntimeContractError::InvalidField {
+                    field: "drain_before",
+                    reason: "must be a required capability of this module",
+                });
+            }
+        }
+        capability_list(&self.invalidation_triggers, "invalidation_triggers")?;
+        text(&self.supervision_plan, "supervision_plan")?;
+        text(&self.child_restart, "child_restart")?;
+        text(&self.restart_intensity, "restart_intensity")?;
+        text(&self.resource_profile, "resource_profile")?;
+        capability_list(&self.privacy_classes, "privacy_classes")?;
+        capability_list(&self.permissions, "permissions")?;
+        text(&self.health_contract, "health_contract")?;
+        text(&self.checkpoint_contract, "checkpoint_contract")?;
+        text(&self.compatibility_state, "compatibility_state")?;
+        text(&self.independent_test_profile, "independent_test_profile")?;
+        text(&self.contract_fixture_set, "contract_fixture_set")?;
+        capability_list(&self.affected_test_tags, "affected_test_tags")?;
+        capability_list(&self.architecture, "architecture")?;
+        text(&self.telemetry, "telemetry")?;
+        text(&self.removal_boundary, "removal_boundary")?;
         Ok(())
     }
 }

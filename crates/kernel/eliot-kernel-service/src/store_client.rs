@@ -2554,6 +2554,7 @@ fn client_hello(
         version: ContractVersion::new(1, 0, 0),
         artifact_id: artifact_id.clone(),
         protocols: vec!["eliot.s03.ebp.v1".to_owned()],
+        capabilities: Vec::new(),
         required_capabilities: vec![
             "store.readiness".to_owned(),
             "store.apply".to_owned(),
@@ -2563,7 +2564,34 @@ fn client_hello(
         advisory_capabilities: Vec::new(),
         state_owner: "eliot-kernel".to_owned(),
         failure_domain: "canonical-store".to_owned(),
+        owner: STORE_MODULE_IDENTITY.to_owned(),
         hot_replace: false,
+        startup_after: vec![
+            "store.readiness".to_owned(),
+            "store.apply".to_owned(),
+            "store.validation_snapshot".to_owned(),
+        ],
+        drain_before: vec![
+            "store.readiness".to_owned(),
+            "store.apply".to_owned(),
+            "store.validation_snapshot".to_owned(),
+        ],
+        invalidation_triggers: Vec::new(),
+        supervision_plan: "one_for_one".to_owned(),
+        child_restart: "transient".to_owned(),
+        restart_intensity: "3/10m".to_owned(),
+        resource_profile: "background-medium".to_owned(),
+        privacy_classes: vec!["PUBLIC".to_owned()],
+        permissions: Vec::new(),
+        health_contract: "health/store-v1".to_owned(),
+        checkpoint_contract: "checkpoint/store-v1".to_owned(),
+        compatibility_state: "rebuildable".to_owned(),
+        independent_test_profile: "module/store".to_owned(),
+        contract_fixture_set: "eliot.s03.ebp.v1/store.readiness".to_owned(),
+        affected_test_tags: vec!["store".to_owned(), "process".to_owned()],
+        architecture: Vec::new(),
+        telemetry: "telemetry/store-v1".to_owned(),
+        removal_boundary: "canonical-store".to_owned(),
     };
     Ok(ClientHello {
         protocol_range: ProtocolRange {
