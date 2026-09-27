@@ -21,7 +21,7 @@ use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
 use eliot_process::{
-    EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
+    EnvironmentInheritance, EnvironmentProjection, OperationId, ProcessRequest, ResourceLimits,
 };
 use eliot_protocol::RequestIdentity;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -3031,20 +3031,28 @@ impl VerificationReceipt {
         if artifacts.len() != referenced.len() {
             return Err(TestdError::InvalidBinding);
         }
-        // Typed bundles revalidate structurally only: each bundle rechecks
-        // its own record coherence. Cross-job/cross-operation rejection needs
-        // the job-bound collector (issue #456, Wave B); an empty bundle list
-        // keeps legacy receipts validating exactly as before.
+        // Typed bundles revalidate structurally and against this job's
+        // process identity (issue #456, Wave B): a bundle from another
+        // operation, tree, generation, or authority epoch cannot ride on this
+        // receipt. An empty bundle list keeps legacy receipts validating
+        // exactly as before.
         for bundle in &self.typed_evidence {
             bundle
                 .validate()
                 .map_err(|error| TestdError::Contract(error.to_string()))?;
+            validate_typed_bundle_binding(job, bundle)?;
         }
         Ok(())
     }
 }
 
 /// A bounded evidence sink for one testd operation.
+///
+/// A collector built with [`EvidenceCollector::for_operation`] admits only
+/// evidence from that exact attempt: foreign records are refused at the sink
+/// boundary, and bytes can never be recorded under a legacy reference already
+/// cited by an admitted record. The default collector keeps the legacy
+/// unbound behavior for refusal paths that never start a process.
 #[derive(Clone, Default)]
 pub struct EvidenceCollector {
     records: Arc<Mutex<Vec<eliot_process::ProcessEvidence>>>,
@@ -3052,9 +3060,60 @@ pub struct EvidenceCollector {
     next_capture_sequence: Arc<AtomicU64>,
     tool_observation: Arc<Mutex<Option<TestdToolObservation>>>,
     typed: Arc<Mutex<Vec<TestdProcessEvidenceBundle>>>,
+    expected_operation: Option<OperationId>,
 }
 
 impl EvidenceCollector {
+    /// Builds a collector bound to one exact attempt operation (issue #456,
+    /// Wave B). The production worker constructs this internally from the
+    /// presented attempt before the consuming start; the start path refuses
+    /// any collector bound to another operation or bound to none.
+    #[must_use]
+    pub fn for_operation(operation_id: OperationId) -> Self {
+        Self {
+            expected_operation: Some(operation_id),
+            ..Self::default()
+        }
+    }
+
+    /// Reports whether this collector serves exactly the given attempt.
+    ///
+    /// Only a collector bound to this operation qualifies for the production
+    /// start path; an unbound collector never does.
+    #[must_use]
+    pub fn accepts_operation(&self, operation_id: &OperationId) -> bool {
+        self.expected_operation.as_ref() == Some(operation_id)
+    }
+
+    /// Rebuilds a bound collector from persisted bundles after a daemon
+    /// restart (issue #456, Wave D).
+    ///
+    /// Every bundle must revalidate structurally and belong to this same
+    /// operation identity; history from a superseded attempt is refused
+    /// rather than merged, so a restarted attempt can only ever reconcile
+    /// its own evidence. Resolution itself still runs through the injected
+    /// readback port by the bundle's original identity.
+    pub fn reconstruct_persisted(
+        operation_id: OperationId,
+        bundles: &[TestdProcessEvidenceBundle],
+    ) -> Result<Self, TestdError> {
+        for bundle in bundles {
+            bundle
+                .validate()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            if bundle.binding.operation_id() != &operation_id {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        let collector = Self::for_operation(operation_id);
+        collector
+            .typed
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?
+            .extend(bundles.iter().cloned());
+        Ok(collector)
+    }
+
     /// Returns a stable snapshot for receipt composition.
     pub fn snapshot(&self) -> Vec<eliot_process::ProcessEvidence> {
         self.records
@@ -3171,14 +3230,24 @@ impl EvidenceCollector {
         Ok(())
     }
 
+    /// Reports whether an admitted record already cites this handle as a
+    /// quarantined legacy reference.
+    fn cites_legacy_handle(&self, handle: &str) -> bool {
+        self.records.lock().is_ok_and(|records| {
+            records.iter().any(|record| {
+                record.stdout_ref() == Some(handle) || record.stderr_ref() == Some(handle)
+            })
+        })
+    }
+
     fn insert_raw_artifact(&self, artifact: RawArtifact) -> Result<(), TestdError> {
         let mut artifact = artifact;
         // Attempt-bound production evidence has no raw-byte write path: a
         // caller-selected handle/byte pair cannot be associated with this
         // process attempt, even if it happens to match a stream preview or a
-        // quarantined legacy reference. Typed source admission is the only
-        // production evidence authority.
-        if self.expected_operation.is_some() {
+        // quarantined legacy reference. Independently, no collector may
+        // upgrade a cited legacy reference by attaching matching bytes.
+        if self.expected_operation.is_some() || self.cites_legacy_handle(&artifact.handle) {
             return Err(TestdError::InvalidBinding);
         }
         let mut artifacts = self
@@ -3312,6 +3381,16 @@ impl eliot_process::ProcessEvidenceSink for EvidenceCollector {
         &self,
         evidence: eliot_process::ProcessEvidence,
     ) -> Result<(), eliot_process::EvidenceSinkError> {
+        // An operation-bound collector refuses foreign records before any
+        // admission: evidence from another attempt can never enter this
+        // attempt's records, typed bundles, or receipt.
+        if let Some(expected) = &self.expected_operation
+            && evidence.operation_id() != expected
+        {
+            return Err(eliot_process::EvidenceSinkError {
+                message: "process evidence carries a foreign operation identity".to_owned(),
+            });
+        }
         // Typed admission runs on every arrival: the bundle consumes only the
         // typed stdout()/stderr() values with an explicit disposition per
         // requested stream. Incoherent evidence fails closed here instead of
@@ -5626,6 +5705,32 @@ fn validate_receipt_binding(job: &TestJob, receipt: &ReceiptBinding) -> Result<(
 
 fn receipt_invocation_matches(receipt: &ReceiptBinding, invocation_id: &str) -> bool {
     receipt.invocation_id == invocation_id
+}
+
+/// Rejects a typed bundle admitted from another attempt's process identity.
+///
+/// The bundle binding must agree with the durable job's process projection on
+/// operation, tree, generation (via the authenticated fence), and authority
+/// epoch. The job id itself is intentionally not compared: the current
+/// dispatch path re-proves operation/tree/generation/epoch end to end while
+/// the intent job id arrives with the dispatch material, so comparing it here
+/// would bind this check to an identity this path does not re-prove.
+fn validate_typed_bundle_binding(
+    job: &TestJob,
+    bundle: &TestdProcessEvidenceBundle,
+) -> Result<(), TestdError> {
+    let binding = &bundle.binding;
+    let matches = binding.operation_id().as_str() == job.process.operation_id.as_str()
+        && binding.process_tree_id().as_str() == job.process.process_tree_id.as_str()
+        && binding.state_fence().generation().get() == job.process.generation
+        && binding
+            .authority_epoch()
+            .is_same_authority(&job.process.authority_epoch);
+    if matches {
+        Ok(())
+    } else {
+        Err(TestdError::InvalidBinding)
+    }
 }
 
 fn lease_matches(job: &TestJob, lease: &Lease, now: u64) -> bool {
