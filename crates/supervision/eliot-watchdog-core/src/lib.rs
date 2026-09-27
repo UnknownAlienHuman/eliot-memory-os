@@ -388,8 +388,24 @@ pub fn unix_timestamp(now: SystemTime) -> u64 {
 
 mod health_detectors;
 mod reconciliation;
+mod risk;
 mod rules;
 mod signals;
+
+pub use risk::{
+    DamageRepairEntry, DamageRepairHistory, EvidenceConfidenceCoverage, ImpactEffectClass,
+    PersistenceCompromise, PropagationEvidence, RISK_ACCUMULATOR_SCHEMA_VERSION,
+    RecurrenceEvidence, ReversibilityResidualEffects, RiskAccumulatorError, RiskAccumulatorInput,
+    RiskAccumulatorMember, RiskAccumulatorProfile, RiskAccumulatorView, RiskAssessment,
+    RiskAttribution, RiskClockContinuity, RiskCoverageGap, RiskCoverageGapReason,
+    RiskCoverageManifest, RiskCoverageState, RiskEvidenceClaim, RiskEvidenceVector, RiskExclusion,
+    RiskExclusionReason, RiskLineageGroup, RiskLineageGroupId, RiskLineageKind,
+    RiskLineageRelation, RiskMemberId, RiskObservation, RiskObservationWindow, RiskOccurrence,
+    RiskOccurrenceKind, RiskPressureUnavailableReason, RiskPressureView, RiskPropagationPath,
+    RiskProvenance, RiskRoute, RiskRouteSelection, RiskSignalRevisionRef, RiskSourceIdentity,
+    RiskSourceLineage, RiskSubject, RiskTimeReading, RiskWindowMembership,
+    UncertaintyCommonLineage, evaluate_risk_accumulator,
+};
 
 pub use signals::{
     AcknowledgementFact, ClockDomain, CoverageRef, EvidenceRef, ExpectedRevision, ObservedTime,
