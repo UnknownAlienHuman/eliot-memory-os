@@ -830,7 +830,10 @@ impl IsolatedDestination {
 /// Bounded canonical restore batch into an isolated destination.
 ///
 /// Structural only; archive content is referenced solely as an opaque member
-/// digest, never as a second archive format.
+/// digest, never as a second archive format. [`Self::members`] reuses the
+/// neutral capture vocabulary so the same canonical records the capture counted
+/// are named here: a declared [`Self::member_count`] with no members behind it
+/// is not a restore obligation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalRestoreBatch {
@@ -843,6 +846,13 @@ pub struct CanonicalRestoreBatch {
     pub purge_policy_revision: u64,
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
     pub expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    /// The exact canonical records this batch restores, in admitted order.
+    ///
+    /// This is the batch's real member denominator, and its
+    /// domain-qualified [`SnapshotMember::logical_identity`] is what a retry, a
+    /// resume or a later readback re-derives: equal bytes under different
+    /// residency domains stay distinct logical objects.
+    pub members: Vec<SnapshotMember>,
     pub member_count: u64,
 }
 
@@ -912,6 +922,44 @@ impl CanonicalRestoreBatch {
         }
         if self.member_count > MAX_RESTORE_MEMBERS as u64 {
             return Err(StoreError::PayloadTooLarge);
+        }
+        self.validate_members()
+    }
+
+    /// Validates the batch's real member denominator.
+    ///
+    /// These are the closure rules [`SnapshotDenominator::validate`] already
+    /// encodes for a capture — member ceiling, unique `member_id`, per-member
+    /// shape, reference ceiling — applied to the same records a restore
+    /// rebuilds, plus the count cross-check: both the list and
+    /// [`Self::member_count`] must agree, so a declared count can never stand
+    /// without the canonical records behind it. The I5.13 "cannot be completed by
+    /// row counts alone" rule is read as the stricter of the two: no list, no
+    /// admission.
+    fn validate_members(&self) -> Result<(), StoreError> {
+        if self.members.len() > MAX_RESTORE_MEMBERS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        unique(
+            self.members.iter().map(|member| member.member_id.clone()),
+            "restore.members",
+        )?;
+        for member in &self.members {
+            member.validate()?;
+        }
+        let references = self
+            .members
+            .iter()
+            .filter(|member| member.member_type == SnapshotMemberType::Reference)
+            .count();
+        if references > MAX_DENOMINATOR_REFERENCES {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        if self.members.len() as u64 != self.member_count {
+            return Err(StoreError::InvalidField {
+                field: "restore.member_count",
+                reason: "must equal the admitted canonical member list",
+            });
         }
         Ok(())
     }

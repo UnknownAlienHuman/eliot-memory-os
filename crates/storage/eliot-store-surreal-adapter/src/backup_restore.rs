@@ -44,8 +44,8 @@ use eliot_store_api::{
     BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, IsolatedDestination,
     IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS, OperationId, OperationIdentity,
     ReconciliationOutcome, RecoveryRecord, RequestMeta, RestoreValidationReceipt,
-    SnapshotCompleteness, SnapshotSourceIdentity, StateFence, StoreError, StoreMutationDisposition,
-    canonical_json_bytes, reconcile_same_operation, sha256_hex,
+    SnapshotCompleteness, SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreError,
+    StoreMutationDisposition, canonical_json_bytes, reconcile_same_operation, sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -119,11 +119,12 @@ enum MemberDisposition {
 #[serde(deny_unknown_fields)]
 struct RestoreMemberRecord {
     /// Deterministic logical identity of this member inside the destination.
-    /// It binds only the admitted archive member digest and the member index,
-    /// so a retry, a resume or a later readback reuses the *original* member
-    /// identity instead of minting a new one.
+    /// It binds only the admitted archive member digest and the member's own
+    /// domain-qualified canonical logical identity, so a retry, a resume or a
+    /// later readback reuses the *original* member identity instead of minting
+    /// a new one.
     member_ref: String,
-    /// Zero-based position of the member inside the admitted member set.
+    /// Zero-based position of the member inside the admitted member list.
     member_index: u64,
     /// Observed disposition for this member.
     disposition: MemberDisposition,
@@ -1019,9 +1020,13 @@ pub fn validate_restore_batch(
 /// Validates the canonical reference/ordering closure of one restore batch.
 ///
 /// Requires a non-empty, duplicate-free revision-head set with every head
-/// validated, a duplicate-free validated ordering-head set, and a bounded
-/// non-zero member count. Unverified derived data can never grant completion:
-/// closure failure refuses the batch outright.
+/// validated, a duplicate-free validated ordering-head set, a bounded non-zero
+/// member count whose length matches the batch's real canonical member list, and
+/// — the restore analogue of
+/// `crate::backup_snapshot::validate_reference_closure` — that every
+/// `SnapshotMemberType::Reference` member names the exact `content_digest` of
+/// another member in the same batch. Unverified derived data can never grant
+/// completion: closure failure refuses the batch outright.
 pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), StoreError> {
     batch.operation.validate()?;
     if batch.expected_revision_heads.is_empty() {
@@ -1057,6 +1062,36 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
     }
     if batch.member_count > MAX_RESTORE_BATCH_MEMBERS as u64 {
         return Err(StoreError::PayloadTooLarge);
+    }
+    // The declared count is only a restore obligation when the canonical records
+    // behind it are named, so the two must agree before any closure is claimed.
+    if batch.members.len() as u64 != batch.member_count {
+        return Err(StoreError::InvalidField {
+            field: "restore.member_count",
+            reason: "must equal the admitted canonical member list",
+        });
+    }
+    // Independent re-proof over the batch's own member set: a member that lost
+    // its target inside this batch still fails closed, whatever the caller
+    // claimed for the archive it came from.
+    let present: BTreeSet<&str> = batch
+        .members
+        .iter()
+        .map(|member| member.content_digest.as_str())
+        .collect();
+    for member in &batch.members {
+        if member.member_type != SnapshotMemberType::Reference {
+            continue;
+        }
+        let Some(reference) = member.reference_digest.as_deref() else {
+            return Err(StoreError::InvalidField {
+                field: "restore.reference_digest",
+                reason: "reference member requires a reference digest",
+            });
+        };
+        if !present.contains(reference) || reference == member.content_digest {
+            return Err(StoreError::IdentityConflict);
+        }
     }
     Ok(())
 }
@@ -1206,16 +1241,17 @@ fn prepare_operation_identity(
 /// Derives the deterministic member identity of one archive member inside a
 /// destination.
 ///
-/// The identity binds only the admitted archive member digest and the member
-/// index, so a retry, a resume or a later readback reuses the *original* member
-/// identity instead of minting a new one.
-fn member_reference(archive_member_digest: &str, member_index: u64) -> String {
-    let shape = ("restore-member-v1", archive_member_digest, member_index);
+/// The identity binds only the admitted archive member digest and the member's
+/// own domain-qualified canonical logical identity, so a retry, a resume or a
+/// later readback reuses the *original* member identity instead of minting a new
+/// one.
+fn member_reference(archive_member_digest: &str, member_identity: &str) -> String {
+    let shape = ("restore-member-v1", archive_member_digest, member_identity);
     let bytes = canonical_json_bytes(&shape).unwrap_or_else(|_| {
         let mut fallback = Vec::with_capacity(128);
         fallback.extend_from_slice(b"restore-member-v1");
         fallback.extend_from_slice(archive_member_digest.as_bytes());
-        fallback.extend_from_slice(member_index.to_string().as_bytes());
+        fallback.extend_from_slice(member_identity.as_bytes());
         fallback
     });
     sha256_hex(&bytes)
@@ -1882,27 +1918,31 @@ fn check_destination_fence(
 }
 
 /// Builds the per-member durable dispositions for one member set.
+///
+/// One record per real canonical member of the batch, never per positional
+/// index: the record's identity is derived from the member's own
+/// domain-qualified logical identity, so a member that a retry, a resume or a
+/// later readback re-observes keeps the identity it was first given. The list
+/// length is the declared denominator, cross-checked by
+/// `validate_reference_closure` before this runs.
 fn member_records(
     batch: &CanonicalRestoreBatch,
     domains: &RestoreDomains,
     disposition: MemberDisposition,
     purge_revision: u64,
 ) -> Vec<RestoreMemberRecord> {
-    // `member_count` is bounded by `validate_reference_closure`, so the
-    // conversion cannot lose members; the fallback is the global ceiling.
-    let count = usize::try_from(batch.member_count).unwrap_or(MAX_RESTORE_BATCH_MEMBERS);
-    (0..count)
-        .map(|index| {
-            let member_index = u64::try_from(index).unwrap_or(u64::MAX);
-            RestoreMemberRecord {
-                member_ref: member_reference(&batch.archive_member_digest, member_index),
-                member_index,
-                disposition,
-                residency_domain: domains.residency.clone(),
-                privacy_domain: domains.privacy.clone(),
-                retention_domain: domains.retention.clone(),
-                purge_policy_revision: purge_revision,
-            }
+    batch
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| RestoreMemberRecord {
+            member_ref: member_reference(&batch.archive_member_digest, &member.logical_identity()),
+            member_index: u64::try_from(index).unwrap_or(u64::MAX),
+            disposition,
+            residency_domain: domains.residency.clone(),
+            privacy_domain: domains.privacy.clone(),
+            retention_domain: domains.retention.clone(),
+            purge_policy_revision: purge_revision,
         })
         .collect()
 }
