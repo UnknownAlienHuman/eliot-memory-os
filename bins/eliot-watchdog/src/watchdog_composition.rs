@@ -64,6 +64,22 @@ pub struct WatchdogComposition {
     backup_control_registration: BackupControlRegistration,
 }
 
+/// Installation-chain health is an independent sibling observation on the
+/// watchdog tick. It is read alongside the Host readback and never feeds
+/// authority, a restart decision, or a coverage claim: `installed` is
+/// reported separately from `healthy`, so a chain with no retained live event
+/// readback stays `INSTALLED_UNOBSERVED`.
+///
+/// The chain is returned for the Governor derivation that consumes the
+/// retained readback over the #1756 publication path; this tick has no
+/// in-process consumer for it, so the durable effect of the call is the
+/// bounded observation record it emits, exactly as for the admitted gap
+/// report. It never becomes a coverage claim, a restart decision, or a
+/// readiness change, and a source that is absent simply has nothing to read.
+fn observe_installation_chain(source: Option<&crate::hook_chain::LiveHookChainSource>) {
+    let _ = source.map(crate::hook_chain::LiveHookChainSource::observe_chain);
+}
+
 impl WatchdogComposition {
     /// Builds and admits the watchdog loop against an injected kernel port.
     ///
@@ -185,6 +201,10 @@ impl WatchdogComposition {
         clippy::too_many_arguments,
         reason = "the bounded supervision task keeps admission, host, integration-coverage, heartbeat, and shutdown wiring in one reviewable contour"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded supervision task keeps admission, observation, heartbeat emission, and gap reporting in one reviewable contour"
+    )]
     pub fn start_with_integration_coverage_and_heartbeat(
         config: WatchdogConfig,
         admission: Arc<dyn WatchdogAdmissionSource>,
@@ -204,7 +224,7 @@ impl WatchdogComposition {
         let runtime = config.runtime()?;
         let task_admission = admission.clone();
         let task_host = host;
-        let task_integration_coverage = integration_coverage;
+        let task_integration_coverage = integration_coverage.map(Arc::new);
         let authority_state = WatchdogAuthorityStateCell::new();
         let task_authority_state = authority_state.clone();
         let task_heartbeat = heartbeat.clone();
@@ -219,7 +239,7 @@ impl WatchdogComposition {
                 let host = task_host.clone();
                 let authority_state = task_authority_state.clone();
                 let heartbeat = task_heartbeat.clone();
-                let integration_coverage = task_integration_coverage;
+                let integration_coverage = task_integration_coverage.clone();
                 async move {
                     loop {
                         tokio::select! {
@@ -231,24 +251,9 @@ impl WatchdogComposition {
                         // otherwise unavailable during first install/recovery.
                         let host_observation = host.observe();
                         let host_gap = host_observation.gap_reason();
-                        // Installation-chain health is another independent
-                        // sibling observation. It is read on the same tick as
-                        // the Host readback and never feeds authority, a
-                        // restart decision, or a coverage claim: `installed` is
-                        // reported separately from `healthy`, so a chain with
-                        // no retained live event readback stays
-                        // `INSTALLED_UNOBSERVED`.
-                        if let Some(integration_coverage) = integration_coverage.as_ref() {
-                            // The chain is returned for the Governor
-                            // derivation that consumes the retained readback
-                            // over the #1756 publication path; this tick has
-                            // no in-process consumer for it, so the durable
-                            // effect of the call is the bounded observation
-                            // record it emits, exactly as for the admitted gap
-                            // report. It never becomes a coverage claim, a
-                            // restart decision, or a readiness change.
-                            let _ = integration_coverage.observe_chain();
-                        }
+                        // Installation-chain health is an independent sibling
+                        // observation on the same tick as the Host readback.
+                        observe_installation_chain(integration_coverage.as_deref());
                         let admission = match admission.reload() {
                             Ok(admission) => admission,
                             Err(error) => {
