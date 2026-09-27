@@ -41,10 +41,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, JobObjectLimits, RunningJobChild, RunningJobObservation, SuspendedJobChild,
-    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError, TerminatedJobChild,
-    cancel_capture_thread_io,
+    JobObjectIdentity, JobObjectLimits, RecoverableJobBinding, RunningJobChild,
+    RunningJobObservation, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
+    SuspendedValidationError, TerminatedJobChild, cancel_capture_thread_io,
 };
+
+#[cfg(windows)]
+type KernelOuterJobBinding = RecoverableJobBinding;
+#[cfg(not(windows))]
+type KernelOuterJobBinding = ();
 
 /// WASM P-03 process adapter: the owner-blessed A-12 port implementation.
 /// See [`wasm_p03_adapter`] for the authority stance and proof entrypoint.
@@ -1397,6 +1402,7 @@ pub struct ExecutorHealthSummary {
 pub struct WindowsProcessExecutor {
     authority: Arc<dyn DispatchValidationPort>,
     launch_admission: Option<Arc<dyn ProcessLaunchAdmission>>,
+    kernel_outer_binding_required: bool,
     stream_sink: Option<Arc<dyn ProcessStreamSinkClient>>,
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
@@ -1417,12 +1423,28 @@ impl Drop for OperationReservation<'_> {
 }
 
 impl WindowsProcessExecutor {
+    /// Starts one Kernel child with the exact current Host Kernel Job binding.
+    ///
+    /// The binding is per-call and is reopened by the Windows platform layer
+    /// before the suspended child is created; no process-wide authority cache
+    /// is consulted.
+    #[cfg(windows)]
+    pub fn start_with_kernel_outer_job_binding(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: RecoverableJobBinding,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_inner(request, sink, Some(outer_binding))
+    }
+
     /// Creates one executor around the P-07 authority composition.
     #[must_use]
     pub fn new(authority: Arc<dyn DispatchValidationPort>) -> Self {
         Self {
             authority,
             launch_admission: None,
+            kernel_outer_binding_required: false,
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
@@ -1446,6 +1468,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
+            kernel_outer_binding_required: false,
             stream_sink: Some(stream_sink),
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
@@ -1453,7 +1476,11 @@ impl WindowsProcessExecutor {
         }
     }
 
-    /// Creates one executor with a Kernel-owned retained launch-proof seam.
+    /// Creates one Kernel executor with a retained launch-proof seam.
+    ///
+    /// Every start on this executor requires a per-call Host Kernel Job
+    /// binding through [`Self::start_with_kernel_outer_job_binding`]; the
+    /// generic [`ProcessExecutor::start`] path refuses to launch without it.
     #[must_use]
     pub fn new_with_launch_admission(
         authority: Arc<dyn DispatchValidationPort>,
@@ -1462,6 +1489,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: Some(launch_admission),
+            kernel_outer_binding_required: true,
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
@@ -1478,6 +1506,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
+            kernel_outer_binding_required: false,
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
@@ -1938,23 +1967,29 @@ impl Drop for WindowsProcessExecutor {
     }
 }
 
-impl ProcessExecutor for WindowsProcessExecutor {
+impl WindowsProcessExecutor {
     #[allow(
         clippy::too_many_lines,
         reason = "the suspend, validate-and-consume, resume, capture, and registration order is security-critical"
     )]
-    async fn start(
+    fn start_inner(
         &self,
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: Option<KernelOuterJobBinding>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         request.validate()?;
+        if self.kernel_outer_binding_required && outer_binding.is_none() {
+            return Err(unavailable(
+                "Kernel process start requires the current Host Kernel Job binding",
+            ));
+        }
         let operation_id = request.operation_id().clone();
         let _reservation = self.reserve_operation(operation_id.clone())?;
 
         #[cfg(not(windows))]
         {
-            let _ = (request, sink);
+            let _ = (request, sink, outer_binding);
             return Err(unavailable(
                 "Windows ProcessExecutor is unavailable on this target",
             ));
@@ -2010,18 +2045,23 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 sequence
             ))
             .map_err(unavailable)?;
-            // Issue #1888: the per-attempt Job Object is a *nested* Job Object
-            // inside the Host-owned Kernel outer kill domain, never a second
-            // outer kill domain of its own. The nested entry point creates the
-            // child only after this build's launch probe has observed
-            // assignment, permitted nesting, and outer kill-on-close, so a
-            // build that cannot establish the containment fails visibly here
-            // instead of degrading the limits or the kill domain. The limits
-            // above stay exactly the admitted `ResourceLimits`; this call adds
-            // no default, cap, or fallback ceiling.
-            let child =
-                SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(spec, job_name, limits)
-                    .map_err(unavailable)?;
+            // Issue #1888: the per-attempt Job Object is nested inside the
+            // exact Host-owned Kernel outer Job carried for this call, never a
+            // second outer kill domain. The platform reopens that binding and
+            // proves both outer and fresh-job membership while the actual
+            // child is still suspended. Its build probe must also have
+            // observed assignment, permitted nesting, and outer kill-on-close
+            // before launch. The limits above stay exactly the admitted
+            // `ResourceLimits`; this call adds no default, cap, or fallback.
+            let child = if let Some(binding) = outer_binding {
+                SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(
+                    spec, job_name, limits, binding,
+                )
+                .map_err(unavailable)?
+            } else {
+                SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits)
+                    .map_err(unavailable)?
+            };
 
             // Issue-84 start state machine: `SuspendedLaunch` (above) →
             // `AuthorityValidation` (below) → `Resumed` → `CaptureSetup` →
@@ -2469,19 +2509,19 @@ impl ProcessExecutor for WindowsProcessExecutor {
         }
     }
 
-    async fn inspect(
+    fn inspect_inner(
         &self,
-        operation_id: OperationId,
+        operation_id: &OperationId,
     ) -> Result<ProcessExecutionView, ProcessExecutionError> {
         #[cfg(windows)]
         {
-            let operation = self.operation(&operation_id)?;
+            let operation = self.operation(operation_id)?;
             // Per-operation lock only: a poisoned Mutex for another operation
             // never surfaces here. Lock loss maps to this operation's typed
             // `Unavailable`, never to shared executor state.
             let mut guard = operation
                 .lock()
-                .map_err(|_| operation_unavailable(&operation_id, "operation lock"))?;
+                .map_err(|_| operation_unavailable(operation_id, "operation lock"))?;
             if let Err(error) = refresh_operation(&mut guard) {
                 quarantine_operation(&mut guard);
                 // A fenced op already surfaces its honest typed outcome; a
@@ -2503,13 +2543,13 @@ impl ProcessExecutor for WindowsProcessExecutor {
         }
     }
 
-    async fn cancel(
+    fn cancel_inner(
         &self,
-        operation_id: OperationId,
+        operation_id: &OperationId,
     ) -> Result<CancellationReceipt, ProcessExecutionError> {
         #[cfg(windows)]
         {
-            let operation = self.operation(&operation_id)?;
+            let operation = self.operation(operation_id)?;
             // Cancel is the protected control path: it must stay available
             // for this operation even while another operation is fenced as
             // unknown. Only this operation's lock is touched; a poisoned
@@ -2517,7 +2557,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // never surface as a failure for operation B.
             let mut guard = operation
                 .lock()
-                .map_err(|_| operation_unavailable(&operation_id, "operation lock"))?;
+                .map_err(|_| operation_unavailable(operation_id, "operation lock"))?;
             let binding = guard.state.view().binding().clone();
             if let Err(error) = guard
                 .state
@@ -2580,13 +2620,13 @@ impl ProcessExecutor for WindowsProcessExecutor {
         }
     }
 
-    async fn reconcile(
+    fn reconcile_inner(
         &self,
-        operation_id: OperationId,
+        operation_id: &OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
         #[cfg(windows)]
         {
-            let operation = self.operation(&operation_id)?;
+            let operation = self.operation(operation_id)?;
             // Reconcile fences only this operation: a refresh or typed
             // stream-evidence gap quarantines this op and returns its typed
             // `UnknownOutcome`, never a shared executor state. The op stays
@@ -2594,7 +2634,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // fabricated.
             let mut guard = operation
                 .lock()
-                .map_err(|_| operation_unavailable(&operation_id, "operation lock"))?;
+                .map_err(|_| operation_unavailable(operation_id, "operation lock"))?;
             if let Err(error) = refresh_operation(&mut guard) {
                 quarantine_operation(&mut guard);
                 // Same redundant-fence mapping as `inspect` (see above): a
@@ -2666,6 +2706,37 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 "Windows ProcessExecutor is unavailable on this target",
             ))
         }
+    }
+}
+
+impl ProcessExecutor for WindowsProcessExecutor {
+    async fn start(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_inner(request, sink, None)
+    }
+
+    async fn inspect(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<ProcessExecutionView, ProcessExecutionError> {
+        self.inspect_inner(&operation_id)
+    }
+
+    async fn cancel(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<CancellationReceipt, ProcessExecutionError> {
+        self.cancel_inner(&operation_id)
+    }
+
+    async fn reconcile(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<ProcessEvidence, ProcessExecutionError> {
+        self.reconcile_inner(&operation_id)
     }
 }
 

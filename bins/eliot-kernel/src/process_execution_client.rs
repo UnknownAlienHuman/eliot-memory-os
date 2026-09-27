@@ -87,15 +87,18 @@ impl ProcessStarter for GatewayProcessStarter {
             // had (see `ProcessExecutionRejection::from_error`, which recovers
             // that code from the bounded detail prefix). The guard owns the
             // single `kernel.process.request_rejected` observation.
-            let rejection = kernel.reject_process_start_without_material_coverage(&admission);
-            if let Some(rejection) = rejection {
-                return Err(eliot_process::ProcessExecutionError::Unavailable(format!(
-                    "{}: {}",
-                    rejection.code, rejection.detail
-                )));
-            }
+            let outer_binding =
+                match kernel.reject_process_start_without_material_coverage(&admission) {
+                    Ok(outer_binding) => outer_binding,
+                    Err(rejection) => {
+                        return Err(eliot_process::ProcessExecutionError::Unavailable(format!(
+                            "{}: {}",
+                            rejection.code, rejection.detail
+                        )));
+                    }
+                };
             let proof = kernel.retain_process_path_proof(&admission)?;
-            gateway.start(&owner, admission, proof).await
+            gateway.start(&owner, admission, proof, outer_binding).await
         })
     }
 }

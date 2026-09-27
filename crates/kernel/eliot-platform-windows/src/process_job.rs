@@ -2484,7 +2484,7 @@ impl SuspendedJobChild {
         job_identity: JobObjectIdentity,
         resource_limits: JobObjectLimits,
     ) -> Result<Self, WindowsAdapterError> {
-        Self::spawn_named_job_child(spec, job_identity, resource_limits, None)
+        Self::spawn_named_job_child(spec, job_identity, resource_limits, None, None)
     }
 
     /// Creates a child suspended in one exact fresh Host-owned outer Job
@@ -2517,7 +2517,13 @@ impl SuspendedJobChild {
         let outer_kill_domain = outer_kill_domain_of_job_name(job_identity.name())
             .ok_or(WindowsAdapterError::IdentityMismatch)?;
         require_probed_outer_kill_domain(outer_kill_domain)?;
-        Self::spawn_named_job_child(spec, job_identity, resource_limits, Some(outer_kill_domain))
+        Self::spawn_named_job_child(
+            spec,
+            job_identity,
+            resource_limits,
+            Some(outer_kill_domain),
+            None,
+        )
     }
 
     /// Creates a child suspended in a fresh per-generation/per-attempt Job
@@ -2530,9 +2536,12 @@ impl SuspendedJobChild {
     /// caller's already-admitted value; this entry point never adds a default,
     /// cap, or fallback ceiling.
     ///
-    /// The child is created only after this build's containment probe for the
-    /// Kernel kill domain has observed that a nested Job Object is permitted
-    /// and that the outer kill-on-close still governs.
+    /// The exact retained Host Kernel Job binding is reopened and its root is
+    /// revalidated before launch. The current launcher and the still-suspended
+    /// child must both be members of that exact outer Job, and the child must
+    /// also be in its fresh per-attempt Job. This build's containment probe
+    /// must observe that nesting is permitted and outer kill-on-close still
+    /// governs before the child is created.
     ///
     /// # Errors
     /// Returns `Unavailable` when this build cannot establish the required
@@ -2541,9 +2550,22 @@ impl SuspendedJobChild {
         spec: SuspendedLaunchSpec,
         job_identity: JobObjectIdentity,
         resource_limits: JobObjectLimits,
+        outer_binding: RecoverableJobBinding,
     ) -> Result<Self, WindowsAdapterError> {
         require_probed_outer_kill_domain(OuterKillDomain::Kernel)?;
-        Self::spawn_named_job_child(spec, job_identity, resource_limits, None)
+        if !OuterKillDomain::Kernel.owns_host_job_name(outer_binding.job_identity().name()) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let outer_job = RecoverableJobObject::open(outer_binding)?;
+        let current_process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        let current_identity = inspect_process_handle(std::process::id(), current_process)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if outer_job.binding().root().process() != &current_identity
+            || !is_process_in_job(current_process, outer_job.handle.0)?
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Self::spawn_named_job_child(spec, job_identity, resource_limits, None, Some(&outer_job))
     }
 
     #[allow(
@@ -2555,6 +2577,7 @@ impl SuspendedJobChild {
         job_identity: JobObjectIdentity,
         resource_limits: JobObjectLimits,
         outer_kill_domain: Option<OuterKillDomain>,
+        required_outer_job: Option<&RecoverableJobObject>,
     ) -> Result<Self, WindowsAdapterError> {
         use windows_sys::Win32::System::Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
@@ -2683,6 +2706,12 @@ impl SuspendedJobChild {
         if !inner
             .job
             .contains_process(inner.spawn_identity.process_id)?
+            || !is_process_in_job(inner.process.0, inner.job.handle)?
+        {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        if let Some(outer_job) = required_outer_job
+            && !is_process_in_job(inner.process.0, outer_job.handle.0)?
         {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
