@@ -29,10 +29,10 @@ use super::wasm_runtime_port_grant::{
 };
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
-    GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState, MessageType,
-    PeerIdentity, ProcessExecutionRequest, ProtocolPayload, RequestIdentity, Session,
-    TESTD_ADMISSION_WIRE_ID, TestdAdmissionAttemptRequest, TransportError, caller_binding,
-    probe_ready_state_admitted, route_doctor_repair, route_testd_admission, status_frame, unix_ms,
+    KernelComposition, KernelFrameAction, KernelServiceState, MessageType, PeerIdentity,
+    ProcessExecutionRequest, ProtocolPayload, RequestIdentity, Session, TESTD_ADMISSION_WIRE_ID,
+    TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
+    route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
@@ -1695,8 +1695,7 @@ impl KernelComposition {
             )
             .map_err(|_| TransportError::SessionFenced)?
         } else {
-            self.admit_material_authority_for_fence(
-                GovernanceProfile::full(),
+            self.admit_material_authority_for_governor_issued_fence(
                 &session.module_generation.state_fence,
             )
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2000,8 +1999,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         if !cancellation {
-            self.admit_material_authority_for_fence(
-                GovernanceProfile::full(),
+            self.admit_material_authority_for_governor_issued_fence(
                 &session.module_generation.state_fence,
             )
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2134,11 +2132,8 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
-            &identity.request.state_fence,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        self.admit_material_authority_for_governor_issued_fence(&identity.request.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
         let request =
             super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -2224,8 +2219,7 @@ impl KernelComposition {
         // Material/Critical wasm grant. The fence check also proves the current
         // Ready, unfenced, candidate-bound Kernel generation, so it subsumes a
         // separate service-state read here.
-        self.admit_material_authority_for_fence(
-            GovernanceProfile::full(),
+        self.admit_material_authority_for_governor_issued_fence(
             &session.module_generation.state_fence,
         )
         .map_err(|_| TransportError::SessionFenced)?;

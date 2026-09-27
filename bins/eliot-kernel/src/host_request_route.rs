@@ -54,9 +54,8 @@
 
 use super::kernel_audit::AuditEventDraft;
 use super::{
-    Frame, FrameKind, GovernanceProfile, KernelComposition, KernelFrameAction, MessageType,
-    ProtocolPayload, Session, TransportError, activation_deadline_expired, sha256_json,
-    status_frame, unix_ms,
+    Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
+    TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
 use eliot_contracts::RequestId;
 use eliot_ipc::PeerIdentity;
@@ -562,11 +561,8 @@ impl KernelComposition {
             .as_ref()
             .is_none_or(|record| !record.state.is_terminal());
         if !expired && needs_material_authority {
-            self.admit_material_authority_for_fence(
-                GovernanceProfile::full(),
-                &envelope.state_fence,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+            self.admit_material_authority_for_governor_issued_fence(&envelope.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
         }
 
         let admission_receipt = {

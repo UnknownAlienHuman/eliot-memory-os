@@ -2869,15 +2869,10 @@ impl KernelComposition {
             target_generation,
         );
         let candidate = self.validate_material_target_fence(&target_fence)?;
-        if !matches!(
-            GovernanceProfile::full().ceiling(),
-            AuthorityCeiling::Material | AuthorityCeiling::Critical
-        ) {
-            return Err(KernelServiceError::Platform(
-                "material authority refused: governance profile does not permit Material effects"
-                    .to_owned(),
-            ));
-        }
+        // Issue #1935 AUD1: Material/Critical authority admits only under the live
+        // Governor-derived coverage profile (revision-bound, revokes on loss),
+        // never under a hard-coded GovernanceProfile::full().
+        self.admit_material_authority_for_governor_issued_fence(&target_fence)?;
         self.verify_watchdog_supervision_branch(&candidate, &target_fence)
             .map_err(|reason| {
                 KernelServiceError::Platform(format!(

@@ -515,8 +515,23 @@ impl GovernorCoverageDerivation {
             .capabilities
             .get(capability_id)
             .ok_or_else(|| CoverageError::UnknownCapability(capability_id.to_owned()))?;
+        self.authorize_issued(capability)
+    }
+
+    /// Authorizes one presented capability against the live derivation.
+    ///
+    /// Cross-boundary form of [`Self::authorize`]: the capability crossed the
+    /// authenticated boundary as bytes (deserialized by the admitting side),
+    /// so the check compares its recorded revision/fingerprint binding and
+    /// requirements against the current profile instead of resolving a
+    /// locally registered id. Fails when the presented binding is revoked,
+    /// stale, or no longer authorized — a degraded re-derivation or a route
+    /// mismatch therefore revokes the presented authority.
+    pub fn authorize_issued(&self, capability: &IssuedCapability) -> Result<(), CoverageError> {
         if capability.revoked {
-            return Err(CoverageError::CapabilityRevoked(capability_id.to_owned()));
+            return Err(CoverageError::CapabilityRevoked(
+                capability.capability_id.clone(),
+            ));
         }
         let current = self
             .current
@@ -526,12 +541,12 @@ impl GovernorCoverageDerivation {
             || capability.fingerprint != current.fingerprint
         {
             return Err(CoverageError::StaleCapabilityBinding(
-                capability_id.to_owned(),
+                capability.capability_id.clone(),
             ));
         }
         if !current.authorizes(capability.requires_enforced, capability.requires_complete) {
             return Err(CoverageError::CapabilityNotAuthorized(
-                capability_id.to_owned(),
+                capability.capability_id.clone(),
             ));
         }
         Ok(())
