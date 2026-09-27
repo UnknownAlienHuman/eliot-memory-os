@@ -219,6 +219,8 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::UnknownCommitRecovery),
         // Old cutover ownership never re-owns.
         RowFamilyDisposition::of(RowFamilyKind::CutoverOwnership),
+        // Artifact paths and generations remain installation-bound history.
+        RowFamilyDisposition::of(RowFamilyKind::VersionedArtifacts),
         // Old host routes never re-dispatch.
         RowFamilyDisposition::of(RowFamilyKind::HostRequests),
         // Old activation lifecycles never re-authorize a claim or Session.
