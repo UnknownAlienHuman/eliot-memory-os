@@ -14,7 +14,7 @@ use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
     DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
-    RecoveryProjectionPage, SessionId,
+    RecoveryProjectionPage, ResourceHandle, SessionId,
 };
 use eliot_contracts::{BridgeEventCapacityPressure, BridgeTransportBackpressure, EpochId};
 use eliot_mcp::{
@@ -75,6 +75,10 @@ const STDIO_OUTPUT_PROFILE_ID: &str = "eliot.agent-bridge.stdio-output.v1";
 /// outer-record ceiling: a transport frame, a request line, and a response
 /// frame are separate budgets.
 const MAX_OUTPUT_FRAME_BYTES: usize = 524_288;
+/// Raw bytes per explicit resource expansion page. JSON byte-array encoding
+/// needs at most four bytes per source byte; the 1/8 frame bound leaves room
+/// for the response envelope, handle and framing even at worst case.
+const MAX_RESOURCE_CHUNK_BYTES: usize = MAX_OUTPUT_FRAME_BYTES / 8;
 /// Maximum responses outstanding on the synchronous stdio transport.
 ///
 /// The loop serializes, writes, and flushes exactly one response before the
@@ -209,6 +213,11 @@ enum Request {
         #[serde(default)]
         cursor: Option<String>,
     },
+    /// Explicitly expands one exact immutable handle in bounded binary pages.
+    ResourceRead {
+        handle: ResourceHandle,
+        offset: usize,
+    },
     /// Reads one bounded recovery page inside the declared window (issue
     /// #2732).
     ///
@@ -312,7 +321,10 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
     },
     Invocation {
+        #[serde(skip)]
         result: HostInvocationResult,
+        #[serde(rename = "result")]
+        wire_result: Value,
         completion: HostCorrelationReceipt,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
@@ -415,6 +427,15 @@ enum Response {
         page: RecoveryProjectionPage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// One bounded byte chunk from a previously issued immutable handle.
+    ResourceChunk {
+        handle: ResourceHandle,
+        offset: usize,
+        next_offset: usize,
+        total_bytes: usize,
+        bytes: Vec<u8>,
+        complete: bool,
     },
     Bootstrap {
         bootstrap: UnderstandingBootstrap,
@@ -888,6 +909,9 @@ fn main() {
                     Err(error) => bridge_error(&error),
                 }
             }
+            Ok(Request::ResourceRead { handle, offset }) => {
+                handle_resource_read(&runner, handle, offset)
+            }
             Ok(Request::RecoverNextPage {}) => match runner.recover_next_page() {
                 Ok(_) => match runner.recovery_projection_page(None) {
                     Ok(page) => Response::RecoveryPage {
@@ -1099,6 +1123,7 @@ fn response_bootstrap_slot(response: &mut Response) -> Option<&mut Option<Unders
         | Response::RecoveryProjectionPage { bootstrap, .. }
         | Response::Stopped { bootstrap, .. } => Some(bootstrap),
         Response::Bootstrap { .. }
+        | Response::ResourceChunk { .. }
         | Response::Backpressure { .. }
         | Response::TransportBackpressure { .. }
         | Response::Error { .. }
@@ -1134,36 +1159,163 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     request: &HostInvocationRequest,
 ) -> Response {
     match gateway.invoke_with_receipt(port, request) {
-        Ok((result, completion)) => Response::Invocation {
-            result,
-            completion,
-            bootstrap: None,
-            evidence: None,
-            reactive_receipts: Vec::new(),
+        Ok((result, completion)) => match invocation_wire_result(&result, None) {
+            Ok(wire_result) => Response::Invocation {
+                wire_result,
+                result,
+                completion,
+                bootstrap: None,
+                evidence: None,
+                reactive_receipts: Vec::new(),
+            },
+            Err(()) => invocation_projection_error(),
         },
         Err(error) => host_gateway_error(&error),
     }
 }
 
 /// Records one supported tool-result delivery after gateway return and
-/// projects its handle onto the outgoing Invocation response.
+/// projects its bounded preview and retained handle onto the outgoing response.
 ///
-/// Runs on the normal Invoke path with the exact authenticated outcome the gateway
-/// produced. The gateway-shaped result and completion are never touched: only the
-/// additive `evidence` slot is filled, and only when recording yields a snapshot
-/// (supported kind with content beyond the hot preview bound). Auxiliary only: a
-/// `None` (admission, rejection, gap, unsupported kind, small inline content,
-/// detached runner, or full registry) leaves the response exactly as the gateway
-/// shaped it, with the key absent on the wire.
+/// The typed gateway result and completion remain available in-process. Large
+/// candidate/projection content is serialized only after its wire projection
+/// has been replaced with a bounded preview. If retaining or projecting that
+/// preview fails, the response is replaced with a fixed refusal.
 /// See [`BridgeRunner::record_tool_result_delivery`].
 fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response) {
+    let content_result = match response {
+        Response::Invocation { result, .. } => Some(invocation_content_bytes(result)),
+        _ => None,
+    };
+    let content = match content_result {
+        Some(Ok(Some(bytes))) => bytes,
+        Some(Ok(None)) | None => return,
+        Some(Err(())) => {
+            *response = invocation_projection_error();
+            return;
+        }
+    };
+    if content.len() <= eliot_agent_bridge::MAX_PREVIEW_BYTES {
+        return;
+    }
+    let view = match response {
+        Response::Invocation { result, .. } => runner.record_tool_result_delivery(result.outcome()),
+        _ => None,
+    };
+    let Some(view) = view else {
+        *response = Response::Error {
+            code: "TOOL_RESULT_NOT_RETAINED",
+            detail: format!(
+                "large candidate/projection result ({} bytes) could not be retained for explicit resource expansion",
+                content.len()
+            ),
+        };
+        return;
+    };
+    let projected = match response {
+        Response::Invocation { result, .. } => invocation_wire_result(result, Some(&view)),
+        _ => return,
+    };
+    let Ok(projected) = projected else {
+        *response = invocation_projection_error();
+        return;
+    };
     if let Response::Invocation {
-        result, evidence, ..
+        wire_result,
+        evidence,
+        ..
     } = response
-        && evidence.is_none()
-        && let Some(view) = runner.record_tool_result_delivery(result.outcome())
     {
+        *wire_result = projected;
         *evidence = Some(view);
+    }
+}
+
+fn invocation_projection_error() -> Response {
+    Response::Error {
+        code: "TOOL_RESULT_PROJECTION_FAILED",
+        detail: "invocation result could not be safely projected for the private response"
+            .to_owned(),
+    }
+}
+
+/// Serializes content only for classification and resource persistence. The
+/// typed invocation result remains available to in-process callers but is
+/// never itself serialized on the private stdio response.
+fn invocation_content_bytes(result: &HostInvocationResult) -> Result<Option<Vec<u8>>, ()> {
+    let HostInvocationOutcome::Responded { response, .. } = result.outcome() else {
+        return Ok(None);
+    };
+    if !matches!(
+        response.kind,
+        eliot_mcp::ResponseKind::Candidate | eliot_mcp::ResponseKind::Projection
+    ) {
+        return Ok(None);
+    }
+    serde_json::to_vec(&response.content)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+/// Projects a typed invocation result onto the private hot wire surface.
+/// Small outcomes retain their existing shape. Large candidate/projection
+/// content is replaced with a byte preview, total size and retained handle.
+fn invocation_wire_result(
+    result: &HostInvocationResult,
+    evidence: Option<&HotResourceView>,
+) -> Result<Value, ()> {
+    let mut wire = serde_json::to_value(result).map_err(|_| ())?;
+    let Some(content) = invocation_content_bytes(result)? else {
+        return Ok(wire);
+    };
+    if content.len() <= eliot_agent_bridge::MAX_PREVIEW_BYTES {
+        return Ok(wire);
+    }
+    let preview_len = content.len().min(eliot_agent_bridge::MAX_PREVIEW_BYTES);
+    let response = wire
+        .get_mut("outcome")
+        .and_then(|outcome| outcome.get_mut("response"))
+        .ok_or(())?;
+    let response = response.as_object_mut().ok_or(())?;
+    response.insert(
+        "content".to_owned(),
+        serde_json::json!({
+            "preview_bytes": &content[..preview_len],
+            "total_bytes": content.len(),
+            "truncated": true,
+        }),
+    );
+    let resource = evidence
+        .map(|view| serde_json::to_value(view.handle()).map_err(|_| ()))
+        .transpose()?
+        .unwrap_or(Value::Null);
+    response.insert("resource".to_owned(), resource);
+    Ok(wire)
+}
+
+/// Expands a previously issued immutable resource handle in one response-safe
+/// page. The owning runner verifies attach scope and digest on every read.
+fn handle_resource_read(runner: &BridgeRunner, handle: ResourceHandle, offset: usize) -> Response {
+    let bytes = match runner.expand_resource(&handle) {
+        Ok(bytes) => bytes,
+        Err(error) => return bridge_error(&error),
+    };
+    if offset > bytes.len() {
+        return Response::Error {
+            code: "RESOURCE_OFFSET_INVALID",
+            detail: "resource read offset exceeds the retained content length".to_owned(),
+        };
+    }
+    let end = offset
+        .saturating_add(MAX_RESOURCE_CHUNK_BYTES)
+        .min(bytes.len());
+    Response::ResourceChunk {
+        handle,
+        offset,
+        next_offset: end,
+        total_bytes: bytes.len(),
+        bytes: bytes[offset..end].to_vec(),
+        complete: end == bytes.len(),
     }
 }
 
