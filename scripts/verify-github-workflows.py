@@ -18,15 +18,26 @@ Enforces that:
 4. Python verification dependencies are fully version- and hash-locked with --hash=sha256.
 5. NuGet dependencies for Eliot.Operator and the Eliot.Operator.Tests harness
    are locked with RestorePackagesWithLockFile and checked-in
-   packages.lock.json files, so locked-mode restore fails on drift.
-6. Operator coverage is classified by workflow/profile class (issue #3004):
+   packages.lock.json files, so locked-mode restore fails on drift, and each
+   checked-in lock must already agree with the project graph it covers
+   (docs/DEPENDENCY_POLICY.md binds direct PackageReference entries to the
+   configured lock target and inventory versions), so stale-lock graph drift
+   fails on source evidence alone.
+6. The .NET SDK identity is explicit (issue #1225 step 4): the repository
+   `global.json` pins one SDK band, and that band must equal the band derived
+   from the target frameworks the locked Operator projects declare, so a TFM
+   bump and an SDK bump cannot disagree silently.
+7. Operator coverage is classified by workflow/profile class (issue #3004):
    MergeCompile workflows restore/build both Operator projects through the
    shared profile with zero execution and no execution claim; every other
    workflow that builds Eliot.Operator executes tests/Eliot.Operator.Tests.
-7. Workflow names indicate manual invocation and state bounded proof ceilings.
-8. Referenced local scripts exist on disk.
-9. Workflow pip installs consume only the hash-locked
-   scripts/requirements-verification.txt with --require-hashes.
+8. Workflow names indicate manual invocation and state bounded proof ceilings.
+9. Referenced local scripts exist on disk.
+10. Workflow pip installs consume only the hash-locked
+    scripts/requirements-verification.txt with --require-hashes.
+11. Workflow dotnet restores run with --locked-mode against the checked-in
+    packages.lock.json files, so graph drift or a lock-mutating restore fails
+    instead of silently resolving a new graph.
 """
 
 from __future__ import annotations
@@ -598,6 +609,241 @@ NUGET_LOCKED_PROJECTS = (
     ("apps/Eliot.Operator/Eliot.Operator.csproj", "apps/Eliot.Operator/packages.lock.json"),
     ("tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj", "tests/Eliot.Operator.Tests/packages.lock.json"),
 )
+# Project graph facts the lock must already agree with. A `PackageReference`
+# whose version is an MSBuild expression cannot be checked against a checked-in
+# lock without evaluating the project, so it is reported instead of assumed
+# clean. `TargetFramework` selects the lock's dependency frame; NuGet shortens
+# the platform version, so `net10.0-windows10.0.19041.0` is locked under
+# `net10.0-windows10.0.19041` and the frame is matched on a segment boundary.
+TARGET_FRAMEWORK_RE = re.compile(r"<TargetFramework>([^<]+)</TargetFramework>")
+TFM_BAND_RE = re.compile(r"^net(\d+)\.(\d+)")
+PACKAGE_REFERENCE_RE = re.compile(r"<PackageReference\b[^>]*>")
+INCLUDE_ATTR_RE = re.compile(r'Include="([^"]+)"')
+VERSION_ATTR_RE = re.compile(r'Version="([^"]+)"')
+# `global.json` rollForward is a closed vocabulary defined by the .NET SDK; an
+# open value would let a future SDK band outside the accepted identity resolve
+# silently.
+SDK_ROLL_FORWARD_VALUES = (
+    "patch",
+    "feature",
+    "latestPatch",
+    "minor",
+    "latestFeature",
+    "major",
+    "latestMajor",
+    "disable",
+)
+SDK_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def lock_frame_for_target_framework(frames: dict, target_framework: str) -> str | None:
+    """The lock frame that covers one project's TargetFramework, or None."""
+    for key in sorted(frames):
+        if key == target_framework or target_framework.startswith(f"{key}."):
+            return key
+    return None
+
+
+def check_nuget_lock_graph(rel_csproj: str, rel_lock: str, content: str, lock: Any) -> list[Finding]:
+    """The checked-in lock must already describe the project's current graph.
+
+    `--locked-mode` already fails a restore that would change lock state, but
+    only where a restore actually runs (Windows, with an installed SDK). A
+    `PackageReference` edit that leaves the checked-in lock stale is graph drift
+    that is visible in source today, so it is rejected here instead of waiting
+    for a restore. docs/DEPENDENCY_POLICY.md states the same binding: direct
+    project PackageReference entries are bound to the configured lock target and
+    inventory versions.
+    """
+    findings: list[Finding] = []
+    if not isinstance(lock, dict) or lock.get("version") != 1:
+        findings.append(
+            Finding(
+                "GWF-013",
+                rel_lock,
+                1,
+                f"{rel_lock} is not a version 1 NuGet lock file",
+            )
+        )
+        return findings
+    frames = lock.get("dependencies")
+    if not isinstance(frames, dict):
+        findings.append(Finding("GWF-013", rel_lock, 1, f"{rel_lock} has no dependencies map"))
+        return findings
+
+    target_framework_match = TARGET_FRAMEWORK_RE.search(content)
+    references = PACKAGE_REFERENCE_RE.findall(content)
+    if target_framework_match is None:
+        if references:
+            findings.append(
+                Finding(
+                    "GWF-013",
+                    rel_csproj,
+                    1,
+                    f"{rel_csproj} declares PackageReference entries but no TargetFramework, "
+                    "so its checked-in lock cannot be bound to a project graph",
+                )
+            )
+        return findings
+
+    target_framework = target_framework_match.group(1)
+    frame = lock_frame_for_target_framework(frames, target_framework)
+    if frame is None:
+        findings.append(
+            Finding(
+                "GWF-013",
+                rel_lock,
+                1,
+                f"{rel_lock} has no dependency frame for {rel_csproj} TargetFramework {target_framework}; "
+                "the checked-in lock is stale for this project",
+            )
+        )
+        return findings
+
+    frame_dependencies = frames.get(frame)
+    if not isinstance(frame_dependencies, dict):
+        frame_dependencies = {}
+    for element in references:
+        include = INCLUDE_ATTR_RE.search(element)
+        version = VERSION_ATTR_RE.search(element)
+        if include is None or version is None:
+            findings.append(
+                Finding(
+                    "GWF-013",
+                    rel_csproj,
+                    1,
+                    f"{rel_csproj} has a PackageReference without a literal Include/Version "
+                    f"({element.strip()}), so it cannot be verified against {rel_lock}",
+                )
+            )
+            continue
+        name = include.group(1)
+        declared = version.group(1)
+        entry = frame_dependencies.get(name)
+        if not isinstance(entry, dict):
+            findings.append(
+                Finding(
+                    "GWF-013",
+                    rel_lock,
+                    1,
+                    f"{name} is a direct dependency of {rel_csproj} but absent from the "
+                    f"{frame} frame of {rel_lock}; regenerate the checked-in lock",
+                )
+            )
+            continue
+        if entry.get("resolved") != declared:
+            findings.append(
+                Finding(
+                    "GWF-013",
+                    rel_lock,
+                    1,
+                    f"{name} resolves to {entry.get('resolved')!r} in the {frame} frame of "
+                    f"{rel_lock} but {rel_csproj} declares {declared!r}",
+                )
+            )
+    return findings
+
+
+def check_dotnet_sdk_identity(root: Path) -> list[Finding]:
+    """The .NET SDK must be pinned by a repository global.json, not the runner.
+
+    Without global.json, `dotnet` resolves to whatever SDK the machine or runner
+    image happens to carry, so the .NET toolchain input of both locked Operator
+    projects is unbound. The accepted identity is derived, not asserted: the
+    pinned SDK band must equal the `net<major>.<minor>` band of the target
+    frameworks the locked projects declare, and the exact patch stays per-run
+    evidence (`dotnet --version`, `$(NETCoreSdkVersion)` in the Operator build
+    receipt). No version is hardcoded here.
+    """
+    findings: list[Finding] = []
+    bands: dict[str, str] = {}
+    for rel_csproj, _rel_lock in NUGET_LOCKED_PROJECTS:
+        csproj_path = root.joinpath(*rel_csproj.split("/"))
+        if not csproj_path.is_file():
+            continue
+        target_framework = TARGET_FRAMEWORK_RE.search(csproj_path.read_text(encoding="utf-8"))
+        if target_framework is None:
+            continue
+        band = TFM_BAND_RE.match(target_framework.group(1))
+        if band is None:
+            findings.append(
+                Finding(
+                    "GWF-014",
+                    rel_csproj,
+                    1,
+                    f"unrecognised TargetFramework {target_framework.group(1)!r}; "
+                    "the required .NET SDK band cannot be derived from it",
+                )
+            )
+            continue
+        bands[f"{band.group(1)}.{band.group(2)}"] = rel_csproj
+    if not bands:
+        return findings
+
+    global_json = root / "global.json"
+    if not global_json.is_file():
+        findings.append(
+            Finding(
+                "GWF-014",
+                "global.json",
+                0,
+                "no explicit .NET SDK identity: global.json is missing, so `dotnet` "
+                "resolves to whatever SDK the machine carries",
+            )
+        )
+        return findings
+    try:
+        document = json.loads(global_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        findings.append(Finding("GWF-014", "global.json", 1, f"corrupted global.json: {exc}"))
+        return findings
+    sdk = document.get("sdk") if isinstance(document, dict) else None
+    if not isinstance(sdk, dict):
+        findings.append(Finding("GWF-014", "global.json", 1, "global.json has no sdk object"))
+        return findings
+    version = sdk.get("version")
+    version_match = SDK_VERSION_RE.fullmatch(version) if isinstance(version, str) else None
+    if version_match is None:
+        findings.append(
+            Finding(
+                "GWF-014",
+                "global.json",
+                1,
+                f"global.json sdk.version is not an exact SDK version: {version!r}",
+            )
+        )
+        return findings
+    if sdk.get("rollForward") not in SDK_ROLL_FORWARD_VALUES:
+        findings.append(
+            Finding(
+                "GWF-014",
+                "global.json",
+                1,
+                f"global.json sdk.rollForward {sdk.get('rollForward')!r} is outside the closed "
+                f"SDK vocabulary {list(SDK_ROLL_FORWARD_VALUES)}",
+            )
+        )
+    if sdk.get("allowPrerelease") is not False:
+        findings.append(
+            Finding(
+                "GWF-014",
+                "global.json",
+                1,
+                "global.json sdk.allowPrerelease must be false; a preview SDK is not the accepted identity",
+            )
+        )
+    pinned_band = f"{version_match.group(1)}.{version_match.group(2)}"
+    for band, rel_csproj in sorted(bands.items()):
+        if pinned_band != band:
+            findings.append(
+                Finding(
+                    "GWF-014",
+                    "global.json",
+                    1,
+                    f"global.json pins .NET SDK band {pinned_band} but {rel_csproj} targets net{band}",
+                )
+            )
+    return findings
 
 
 def check_nuget_lock(root: Path) -> list[Finding]:
@@ -626,18 +872,20 @@ def check_nuget_lock(root: Path) -> list[Finding]:
                     f"checked-in NuGet {rel_lock} is missing for locked restore",
                 )
             )
-        else:
-            try:
-                json.loads(lock_file.read_text(encoding="utf-8"))
-            except Exception as exc:
-                findings.append(
-                    Finding(
-                        "GWF-005",
-                        rel_lock,
-                        1,
-                        f"corrupted {rel_lock}: {exc}",
-                    )
+            continue
+        try:
+            lock = json.loads(lock_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            findings.append(
+                Finding(
+                    "GWF-005",
+                    rel_lock,
+                    1,
+                    f"corrupted {rel_lock}: {exc}",
                 )
+            )
+            continue
+        findings.extend(check_nuget_lock_graph(rel_csproj, rel_lock, content, lock))
 
     return findings
 
@@ -669,12 +917,52 @@ def check_pip_install_lock(root: Path) -> list[Finding]:
     return findings
 
 
+def check_dotnet_restore_lock(root: Path) -> list[Finding]:
+    """Every workflow dotnet restore must run in locked mode.
+
+    A restore without --locked-mode may silently resolve a new dependency
+    graph or mutate the checked-in packages.lock.json instead of failing on
+    drift, so it cannot satisfy the NuGet lock contract (issue #1225 step
+    4). Quoted prose and trailing comments are not gate invocations: string
+    literals (for example a checker asserting on the 'dotnet restore'
+    marker) and '#' comments are stripped before matching, so only real
+    restore commands are judged.
+    """
+    findings: list[Finding] = []
+    for wf_path in iter_workflow_files(root):
+        rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
+        try:
+            lines = wf_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line_no, line in enumerate(lines, start=1):
+            if "dotnet restore" not in line:
+                continue
+            code = re.sub(r'"[^"]*"', "", line)
+            code = re.sub(r"'[^']*'", "", code)
+            code = code.split("#", 1)[0]
+            if "dotnet restore" not in code:
+                continue
+            if "--locked-mode" not in code:
+                findings.append(
+                    Finding(
+                        "GWF-012",
+                        rel_path,
+                        line_no,
+                        "dotnet restore must use --locked-mode against the checked-in packages.lock.json",
+                    )
+                )
+    return findings
+
+
 def verify_all(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(check_workflows(root))
     findings.extend(check_action_pin_divergence(root))
     findings.extend(check_python_requirements(root))
     findings.extend(check_nuget_lock(root))
+    findings.extend(check_dotnet_sdk_identity(root))
+    findings.extend(check_dotnet_restore_lock(root))
     findings.extend(check_pip_install_lock(root))
     return findings
 

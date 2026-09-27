@@ -1168,7 +1168,11 @@ impl ManagedDependencyRecord {
     /// an incomplete observation and provider failure are not observations, and
     /// a terminal observed process state is not liveness either. Nothing here
     /// consults `state`, a stop record, or any other dependency's outcome.
-    fn observed_liveness(&self) -> bool {
+    /// Host-side readers use this predicate as the liveness dimension for a
+    /// managed dependency (I1.9); it never answers store-bridge semantic
+    /// readiness, which comes from independent version/schema/transaction
+    /// probes and cannot substitute for this observation.
+    pub fn observed_liveness(&self) -> bool {
         match &self.outcome {
             PortOutcome::Known(process) => {
                 process.health.liveness == HealthDimension::Healthy && !process.state.is_terminal()
@@ -1176,6 +1180,87 @@ impl ManagedDependencyRecord {
             PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => false,
         }
     }
+
+    /// Joins this record's five operational bindings with an independently
+    /// evaluated store-bridge semantic-probe verdict to derive canonical-store
+    /// write readiness.
+    ///
+    /// The caller owns and evaluates the version, schema, and transaction
+    /// probes, and passes their combined verdict here. Process liveness cannot
+    /// satisfy that verdict, and the probe verdict cannot substitute for the
+    /// Host-managed process evidence. The caller also supplies the required
+    /// Job Object/PID lineage references, which must exactly match this record.
+    /// This function starts no process and runs no probe; callers must pass
+    /// `false` until all semantic probes succeed.
+    ///
+    /// Refusal order follows the operational bindings: launch lineage, process
+    /// approval, Job Object/PID lineage, observed liveness, restart budget, then
+    /// semantic readiness. The decision never consults [`Self::state`].
+    pub fn canonical_store_write_readiness(
+        &self,
+        required_process_manifest: &ImmutableProcessManifest,
+        required_process_generation: &EpochTransition,
+        required_artifact_hash: &PlatformHandle,
+        required_config_hash: &PlatformHandle,
+        required_pid_job_lineage_refs: &[PlatformHandle],
+        semantic_probes_ready: bool,
+    ) -> Result<(), CanonicalStoreWriteRefusal> {
+        if self.process_manifest != *required_process_manifest
+            || self.process_generation != *required_process_generation
+        {
+            return Err(CanonicalStoreWriteRefusal::LaunchLineageMismatch);
+        }
+        if self.approved_artifact_hash != *required_artifact_hash
+            || self.approved_config_hash != *required_config_hash
+        {
+            return Err(CanonicalStoreWriteRefusal::ProcessApprovalMismatch);
+        }
+        if self.pid_job_lineage_refs.is_empty()
+            || self.pid_job_lineage_refs.len() != required_pid_job_lineage_refs.len()
+            || self
+                .pid_job_lineage_refs
+                .iter()
+                .any(|reference| !required_pid_job_lineage_refs.contains(reference))
+            || required_pid_job_lineage_refs
+                .iter()
+                .any(|reference| !self.pid_job_lineage_refs.contains(reference))
+        {
+            return Err(CanonicalStoreWriteRefusal::MissingPidJobLineage);
+        }
+        if !self.observed_liveness() {
+            return Err(CanonicalStoreWriteRefusal::NotObservedLive);
+        }
+        if self.lifecycle_budget.restart_attempts_remaining == 0 {
+            return Err(CanonicalStoreWriteRefusal::RestartBudgetExhausted);
+        }
+        if !semantic_probes_ready {
+            return Err(CanonicalStoreWriteRefusal::SemanticallyNotReady);
+        }
+        Ok(())
+    }
+}
+
+/// Why canonical-store writes remain closed for a managed dependency.
+///
+/// This fieldless classification is not serialized into the `HostStateJournal`
+/// and has no ready variant. `SemanticallyNotReady` reports only that the
+/// caller's independent version/schema/transaction probe verdict was false;
+/// it does not identify which probe failed. Probe details remain owned by the
+/// store bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalStoreWriteRefusal {
+    /// The required immutable launch manifest or process generation differs.
+    LaunchLineageMismatch,
+    /// The approved artifact or config hash differs from the required value.
+    ProcessApprovalMismatch,
+    /// Host-managed Job Object/PID lineage is absent or differs from the required lineage.
+    MissingPidJobLineage,
+    /// The carried process observation does not report live liveness.
+    NotObservedLive,
+    /// The current process generation has exhausted its restart allowance.
+    RestartBudgetExhausted,
+    /// The caller's combined semantic-probe verdict is false.
+    SemanticallyNotReady,
 }
 
 /// Compatibility alias for the canonical [`ManagedDependencyRecord`]. Host code
@@ -2438,6 +2523,21 @@ impl HostState {
             applied_operations: Vec::new(),
             epoch_retirements: Vec::new(),
         }
+    }
+
+    /// Returns the managed-dependency record keyed by its exact dependency
+    /// identity, if one is present in this journal projection.
+    ///
+    /// The reducer replaces a dependency entry by that same identity. This
+    /// lookup therefore exposes the Host-owned operational record without
+    /// creating a second index or granting authority.
+    pub fn managed_dependency(
+        &self,
+        dependency: &PlatformHandle,
+    ) -> Option<&ManagedDependencyRecord> {
+        self.dependencies
+            .iter()
+            .find(|record| &record.dependency == dependency)
     }
 }
 

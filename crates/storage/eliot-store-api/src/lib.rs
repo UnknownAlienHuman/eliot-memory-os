@@ -42,10 +42,12 @@ use thiserror::Error;
 mod architecture_self_model;
 mod backup_io;
 mod blackboard;
+pub mod canonical_event;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
 pub mod experience_store;
+pub mod learning_store;
 mod named_mutation_receipt;
 mod notification_state;
 mod payload_authority;
@@ -85,6 +87,13 @@ pub use blackboard::{
     BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
     BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
     blackboard_item_request, decode_blackboard_item,
+};
+
+pub use canonical_event::{
+    CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority,
+    FencedProjectionPublication, ORDERING_LINK_GENESIS_HASH, OrderingLink, ProjectionRebuildPlan,
+    SemanticWritePath, ordering_link_hash, request_projection_rebuild,
+    request_rebuild_from_semantic_write,
 };
 
 pub use dreamer_job::{
@@ -248,6 +257,18 @@ pub use experience_store::{
     experience_feedback_commit_params, experience_feedback_mutation_request,
     experience_feedback_read_request, validate_experience_mutation_params,
     validate_experience_read_params,
+};
+
+pub use learning_store::{
+    DecodedLearningMutation, DecodedLearningRead, LEARNING_PARAM_CURSOR,
+    LEARNING_PARAM_FENCE_DIGEST, LEARNING_PARAM_HANDLE, LEARNING_PARAM_IDEMPOTENCY_KEY,
+    LEARNING_PARAM_MAX_RECORDS, LEARNING_PARAM_RECORD_DIGEST, LEARNING_PARAM_RECORD_JSON,
+    LEARNING_PARAM_RECORD_KIND, LEARNING_PARAM_SCOPE_DIGEST, LEARNING_RECORD_MUTATION_NAME,
+    LEARNING_RECORD_READ_NAME, LEARNING_STORE_SCHEMA_V1, LearningRecordKind,
+    MAX_LEARNING_HANDLE_BYTES, MAX_LEARNING_IDEMPOTENCY_BYTES, MAX_LEARNING_PAGE_RECORDS,
+    MAX_LEARNING_RECORD_JSON_BYTES, decode_learning_mutation, decode_learning_read,
+    learning_record_commit_params, learning_record_mutation_request, learning_record_read_request,
+    reject_direct_learning_write, validate_learning_mutation_params, validate_learning_read_params,
 };
 
 pub use write_admission::{
@@ -3680,6 +3701,13 @@ pub enum NamedReadOperation {
     GetAgentFeedbackRange,
     /// Exact, fenced lookup of one immutable blackboard candidate revision.
     GetBlackboardItem,
+    /// Canonical learning-record range read (issue #1868, I12.24).
+    ///
+    /// Durable same-scope learning rows keyed `(record_kind, handle,
+    /// record_digest)`, driven only through the closed learning leg under
+    /// the held transaction lock. The read projects verbatim record
+    /// documents; admission re-proof stays Governor-owned at the read edge.
+    GetLearningRecordRange,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -3774,13 +3802,29 @@ pub enum NamedMutationOperation {
     /// ceiling; it does not perform decisions, truth promotion, acceptance,
     /// or write-authority changes.
     ApplyBlackboardItem,
+    /// Canonical learning-record commit (issue #1868, I12.24).
+    ///
+    /// Durable learning-record persistence only: the prepared transition
+    /// must carry [`TransitionClass::CaptureCandidate`], the declared
+    /// candidate-only effect ceiling, and the closed learning typed
+    /// parameters (closed record kind, verbatim record document, presented
+    /// digests, handle, idempotency key). The store bridge persists the
+    /// document verbatim, arbitrates `(record_kind, handle, record_digest)`
+    /// keys with convergent replay, and never derives semantics,
+    /// admission, or effectiveness: durability never implies effectiveness.
+    RecordLearningRecord,
 }
 
 impl NamedMutationOperation {
     /// Transition family owned by this named mutation.
     pub const fn transition_class(self) -> TransitionClass {
         match self {
-            Self::CaptureObservation | Self::AppendAuditEvent => TransitionClass::CaptureCandidate,
+            Self::CaptureObservation
+            | Self::AppendAuditEvent
+            | Self::RecordLearningRecord
+            | Self::CommitExperienceBank
+            | Self::CommitAgentFeedback
+            | Self::ApplyBlackboardItem => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState | Self::ApplySwarmOwnerRevisions => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
@@ -3794,9 +3838,6 @@ impl NamedMutationOperation {
                 TransitionClass::ReactiveState
             }
             Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
-            Self::CommitExperienceBank | Self::CommitAgentFeedback | Self::ApplyBlackboardItem => {
-                TransitionClass::CaptureCandidate
-            }
         }
     }
 }

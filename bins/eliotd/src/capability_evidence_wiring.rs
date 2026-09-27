@@ -2,14 +2,50 @@
 //!
 //! The canonical registry and evidence semantics live in `eliot-governor`;
 //! legacy normalization lives in `eliot-config`. This module owns only the
-//! daemon composition root's handle on that view: the single
+//! daemon composition root's handle on that view. The single
 //! [`GovernorCapabilityAdmission`] is constructed empty at
-//! [`DaemonComposition::start`](super::DaemonComposition::start), hydrated
-//! from the canonical evidence read below, and consulted by the daemon route
-//! gate
+//! [`DaemonComposition::start`](super::DaemonComposition::start) and is
+//! mutated in production at exactly two sites, both non-test:
+//!
+//! 1. [`GovernorCapabilityAdmission::hydrate_from_evidence_response`], reached
+//!    from the daemon's live Skill-intake commit step
+//!    ([`commit_skill_pair`](super::skill_dispatch::commit_skill_pair)), which
+//!    applies the canonical `GetCapabilityEvidenceState` response that same
+//!    intake already read;
+//! 2. [`GovernorCapabilityAdmission::apply_scope_change`], reached from
+//!    [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
+//!    with the route scope the caller observed.
+//!
+//! No semantic rule lives here; every admission decision is the Governor
+//! registry's.
+//!
+//! Where the view is consulted, measured on this base: the production model
+//! execution path is
+//! [`GovernedDreamerModelAdapter::invoke`](super::dreamer_model_adapter::GovernedDreamerModelAdapter::invoke)
+//! -> [`invoke_admitted_model`](super::dreamer_model_adapter::invoke_admitted_model)
+//! -> the C1 join `gate_model_capability`, which requires
+//! [`admit_production_route`](GovernorCapabilityAdmission::admit_production_route)
+//! over this held view for every item of the canonical required set, on the
+//! caller-observed route scope, at the caller's observation time, and returns
+//! before the `DreamerModelExecution` port is touched. That adapter is
+//! constructed in production by `daemon_runtime::attach_dreamer_model`
+//! through [`DaemonComposition::dreamer_model`](super::DaemonComposition::dreamer_model).
+//!
+//! The daemon route gate
 //! ([`AgentFabric::require_model_route`](super::agent_fabric::AgentFabric::require_model_route))
-//! before a resolved route may execute. No semantic rule lives here; every
-//! admission decision is the Governor registry's.
+//! is a second, distinct consumer of the same predicate, reached through
+//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
+//! from [`DaemonComposition::drive_verified_agent_fabric`](super::DaemonComposition::drive_verified_agent_fabric).
+//! Its refusal is the typed [`FabricError::NoRoute`](super::agent_fabric::FabricError::NoRoute)
+//! residual; it never falls back to a local route.
+//!
+//! Residual STITCH, measured and not papered over:
+//! `drive_verified_agent_fabric` itself has no in-crate caller, and the
+//! production B-MOD model-registry port (`ProductionModelRegistryPort`) reports
+//! `PortBindingState::Missing`, so a production route resolution cannot succeed
+//! in this crate at all. The gate is therefore reachable only once its
+//! per-operation executor binds that driver; the driver seam lives outside
+//! `bins/eliotd`, and no composition method here invents a caller for it.
 //!
 //! Evidence bridge: `GetCapabilityEvidenceState` is the existing canonical
 //! read for capability evidence (selected by exact `skill_id` +
@@ -17,14 +53,49 @@
 //! `GovernorContextInputs`). [`GovernorCapabilityAdmission::plan_evidence_read`]
 //! builds that closed request for one skill, and
 //! [`GovernorCapabilityAdmission::ingest_evidence_response`] decodes the
-//! versioned store payload. Ingest reports the observed lifecycle records;
-//! it never mints evidence records from lifecycle rows, whose parameters
-//! carry no probe status, source, or scope fingerprint to verify.
+//! versioned store payload.
+//!
+//! What the read actually carries, measured on current store source: the
+//! store answers with committed `ApplyLifecyclePolicy` authority-receipt rows,
+//! each carrying exactly the six declared lifecycle parameters (`action`,
+//! `base_view_digest`, `candidate_digest`, `candidate_package_digest`,
+//! `skill_id`, `verifier_ref`) plus its commit-order `capture_index`. A row
+//! carries no probe status, no evidence source, and no route-scope
+//! fingerprint, so `ingest_evidence_response` mints no verified record from it
+//! and reports observation currency only.
+//!
+//! Hydration therefore admits exactly one shape, and it is deliberately
+//! non-admitting: [`GovernorCapabilityAdmission::hydrate_from_evidence_response`]
+//! imports the read's skill through the legacy importer
+//! ([`GovernorCapabilityAdmission::import_legacy`]), the only construction path
+//! the adopted `CapabilityEvidenceRecord` relation allows for `declared`, and
+//! leaves every scope-fingerprint field `None` (unknown, never inferred)
+//! because the read exposes none. Such a record places the skill in
+//! [`GovernorCapabilityAdmission::required_set`] and evaluates as
+//! [`SkillStanding::Unevaluated`]. It can never satisfy
+//! [`GovernorCapabilityAdmission::admit_production_route`], which requires
+//! `probe_passed` or `observed` evidence from an admissible source on a
+//! matching scope. Absence of canonical evidence therefore REFUSES a
+//! production route; it is never treated as a pass, and never as "nothing to
+//! check".
+//!
+//! Staleness is derived, never persisted, and it is applied on the observed
+//! route. A changed runtime hash, adapter hash, provider/model/auth route,
+//! serializer, or feature-flag scope stops admitting on two independent
+//! grounds: [`admit_production_route`](Self::admit_production_route) compares
+//! the observed scope against each record's fingerprint by exact value, so a
+//! record that no longer matches cannot authorize the changed route; and
+//! [`apply_scope_change`](Self::apply_scope_change), called by
+//! [`DaemonComposition::require_admitted_model_route`](super::DaemonComposition::require_admitted_model_route)
+//! with the caller-observed scope, moves every record that differs from that
+//! observation into the registry's invalidation set. Either way the exact route
+//! must be re-probed before it authorizes production work again.
 
 use std::collections::BTreeMap;
 
 use eliot_config::legacy_capability_import::{
-    LegacyCapabilityDeclaration, LegacyImportError, import_legacy_declaration,
+    LegacyCapabilityDeclaration, LegacyImportError, LegacyScopeFingerprint,
+    import_legacy_declaration,
 };
 use eliot_governor::{
     CapabilityEvidenceRecord, CapabilityRegistry, RouteScopeFingerprint, ScopeDependencySelector,
@@ -154,6 +225,56 @@ impl GovernorCapabilityAdmission {
         changed: ScopeDependencySelector,
     ) -> usize {
         self.registry.apply_scope_change(current, changed)
+    }
+
+    /// Hydrates the held view from one canonical evidence-read response.
+    ///
+    /// Runs the full [`ingest_evidence_response`](Self::ingest_evidence_response)
+    /// identity/shape validation first — a response that answers another
+    /// operation, fence, scope, skill, or payload version never reaches the
+    /// registry — then imports the read's skill through
+    /// [`import_legacy`](Self::import_legacy) when the store holds committed
+    /// governance rows for it.
+    ///
+    /// The imported record is `declared` / `imported_legacy_declaration` on a
+    /// fully unknown route-scope fingerprint, for the two measured reasons
+    /// stated in the module documentation: the served lifecycle row exposes no
+    /// status, no source, and no scope fingerprint, and `declared` is the only
+    /// status the adopted `CapabilityEvidenceRecord` relation admits without
+    /// verified evidence. The record therefore establishes the required
+    /// capability key space and the visible-degradation report, and can never
+    /// satisfy [`admit_production_route`](Self::admit_production_route).
+    ///
+    /// A read that matched no row imports nothing: the view keeps its previous
+    /// contents and no absence is ever promoted into evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceBridgeError`] when the response does not answer the
+    /// planned read, the payload is not the versioned shape, or the read's
+    /// skill identity is not importable.
+    pub fn hydrate_from_evidence_response(
+        &mut self,
+        request: &NamedReadRequest,
+        response: &NamedReadResponse,
+    ) -> Result<CapabilityHydration, EvidenceBridgeError> {
+        let summary = self.ingest_evidence_response(request, response)?;
+        let mut declared_records = 0;
+        if summary.returned > 0 {
+            self.import_legacy(&LegacyCapabilityDeclaration {
+                skill_id: summary.skill_id.clone(),
+                scope: LegacyScopeFingerprint::default(),
+            })
+            // The importer's only rejection is a blank or control-bearing skill
+            // identity, which is exactly the bridge's own identity failure.
+            .map_err(|_| EvidenceBridgeError::BlankSkill)?;
+            declared_records = 1;
+        }
+        Ok(CapabilityHydration {
+            summary,
+            declared_records,
+            retained: self.len(),
+        })
     }
 
     /// Plans the closed canonical evidence read for one skill.
@@ -297,6 +418,21 @@ pub struct ObservedLifecycleSummary {
     pub returned: u64,
     /// Whether the store truncated to the requested bound.
     pub truncated: bool,
+}
+
+/// Result of hydrating the held view from one canonical evidence read.
+///
+/// `declared_records` is the count of `declared` / `imported_legacy`
+/// contributions the read added; a read that matched no committed governance
+/// row adds none and leaves the registry exactly as it was.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityHydration {
+    /// Observation currency decoded from the served payload.
+    pub summary: ObservedLifecycleSummary,
+    /// Declared/imported records this read contributed (0 or 1).
+    pub declared_records: usize,
+    /// Records the held view retains after hydration.
+    pub retained: usize,
 }
 
 #[cfg(test)]

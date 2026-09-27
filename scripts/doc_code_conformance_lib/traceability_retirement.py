@@ -27,7 +27,7 @@ def _strings(value: Any, field: str) -> list[str]:
     return [item.strip() for item in value]
 
 
-def findings(
+def audit(
     root: Path,
     config_relative: Path = DEFAULT_CONFIG,
 ) -> tuple[list[core.Finding], dict[str, int]]:
@@ -178,7 +178,7 @@ def self_test() -> None:
             "pub fn value() {}\n"
         )
         source.write_text(clean, encoding="utf-8", newline="")
-        clean_findings, metrics = findings(root)
+        clean_findings, metrics = audit(root)
         if clean_findings or metrics["traceability_retirement_surfaces"] != 1:
             raise TraceabilityError(f"clean traceability fixture failed: {clean_findings}")
 
@@ -187,7 +187,7 @@ def self_test() -> None:
             encoding="utf-8",
             newline="",
         )
-        if FINDING_ID not in _ids(findings(root)[0]):
+        if FINDING_ID not in _ids(audit(root)[0]):
             raise TraceabilityError("legacy-project fixture did not fail")
 
         source.write_text(
@@ -195,7 +195,7 @@ def self_test() -> None:
             encoding="utf-8",
             newline="",
         )
-        if FINDING_ID not in _ids(findings(root)[0]):
+        if FINDING_ID not in _ids(audit(root)[0]):
             raise TraceabilityError("exact invalid-handle fixture did not fail")
 
         source.write_text(
@@ -203,7 +203,7 @@ def self_test() -> None:
             encoding="utf-8",
             newline="",
         )
-        if FINDING_ID not in _ids(findings(root)[0]):
+        if FINDING_ID not in _ids(audit(root)[0]):
             raise TraceabilityError("missing current token did not fail")
 
         config.write_text(
@@ -217,7 +217,7 @@ def self_test() -> None:
             newline="",
         )
         try:
-            findings(root)
+            audit(root)
         except TraceabilityError:
             pass
         else:

@@ -145,6 +145,7 @@ struct SinkState {
     next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
     terminal_command: Option<ProcessStreamSinkTerminalCommandIdentity>,
+    finalizing: Option<ProcessStreamSinkTerminalCommandIdentity>,
 }
 
 enum FinalizeKind {
@@ -177,6 +178,7 @@ impl SinkState {
             next_offset: 0,
             terminal: None,
             terminal_command: None,
+            finalizing: None,
         }
     }
 
@@ -303,7 +305,11 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             session.session_id().clone(),
             session.source_id().clone(),
             session.terminal_id().clone(),
-            ProcessStreamSinkState::Open,
+            if state.finalizing.is_some() {
+                ProcessStreamSinkState::Finalizing
+            } else {
+                ProcessStreamSinkState::Open
+            },
             state.next_sequence,
             state.next_offset,
             state.next_sequence,
@@ -321,6 +327,9 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         session: &ProcessStreamSinkSession,
         request: &ProcessStreamSinkAppend,
     ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+        if state.finalizing.is_some() {
+            return Err(ProcessStreamSinkError::AppendAfterFinalizing);
+        }
         if let Some(terminal) = &state.terminal {
             return Ok(ProcessStreamSinkAppendDisposition::Terminal {
                 state: terminal.state(),
@@ -405,6 +414,9 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 Err(ProcessStreamSinkError::TerminalIdentityConflict)
             };
         }
+        if state.finalizing.is_some() {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
         existing.validate_abort(&request)?;
         Self::check_sequence_offset(
             state,
@@ -441,7 +453,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
     }
 
     /// Stages the exact admitted bytes, verifies the ready receipt, and reads
-    /// the object back. Any failure leaves no terminal behind.
+    /// the object back. Any failure leaves the reserved command unresolved;
+    /// it must not be blindly staged again.
     async fn publish_complete_source(
         &self,
         staged: Vec<u8>,
@@ -540,11 +553,18 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         session: &ProcessStreamSinkSession,
         request: &ProcessStreamSinkFinalizeRequest,
     ) -> Result<Option<FinalizePlan>, ProcessStreamSinkError> {
-        let state = self.lock();
+        let mut state = self.lock();
         let existing = Self::check_session(&state, session)?;
         let identity = request.command_identity()?;
         if state.terminal.is_some() {
             return if state.terminal_command.as_ref() == Some(&identity) {
+                Ok(None)
+            } else {
+                Err(ProcessStreamSinkError::TerminalIdentityConflict)
+            };
+        }
+        if let Some(finalizing) = &state.finalizing {
+            return if finalizing == &identity {
                 Ok(None)
             } else {
                 Err(ProcessStreamSinkError::TerminalIdentityConflict)
@@ -563,6 +583,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             });
         }
         Self::check_preview(&state, request.preview())?;
+        let reserved_identity = identity.clone();
         let plan = if request.gaps().is_empty()
             && request.transport() == StreamTransportStatus::Complete
         {
@@ -603,6 +624,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 },
             }
         };
+        state.finalizing = Some(reserved_identity);
         Ok(Some(plan))
     }
 
@@ -621,7 +643,15 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 Err(ProcessStreamSinkError::TerminalIdentityConflict)
             };
         }
+        if state
+            .finalizing
+            .as_ref()
+            .is_some_and(|finalizing| finalizing != &identity)
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
         state.terminal_command = Some(identity);
+        state.finalizing = None;
         state.staged = Vec::new();
         state.terminal = Some(terminal.clone());
         Ok(terminal)
@@ -798,9 +828,9 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
                     terminal: terminal.clone(),
                 });
             }
-            // The synchronous provider never records uncertainty: an
-            // unresolved outcome with no terminal stays unavailable until an
-            // exact session result lands. It never becomes a terminal here.
+            // The adapter has no durable provider reconciliation query. An
+            // unresolved external effect remains nonterminal and unavailable;
+            // cleanup or replay cannot convert it into success or restage it.
             Err(ProcessStreamSinkError::ProviderUnavailable)
         });
         Self::ready(result)

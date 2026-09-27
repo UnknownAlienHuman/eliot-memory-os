@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod ecxf_export;
 mod isolated_restore;
 mod owner_adapters;
 mod portable_adapters;
@@ -32,6 +33,10 @@ mod product_command;
 mod product_run;
 mod restore_runner;
 
+pub use ecxf_export::{
+    CoherentSourceExport, EcxfExportReport, EcxfExportRequest, EcxfSourceStore, SealedBlobEntry,
+    WRITE_RECEIPT_RECORD_TYPE, export_ecxf_package,
+};
 pub use isolated_restore::{
     CutoverAuthorization, CutoverReceipt, IsolatedRestorePlan, IsolatedRoot, authorize_cutover,
     plan_isolated_restore,
@@ -2901,6 +2906,29 @@ pub enum BackupError {
     Blob(String),
     #[error("store contract: {0}")]
     Store(StoreError),
+    #[error("ECXF interchange contract: {0}")]
+    Interchange(String),
+    /// The ECXF package for `export_id` exists at `package_path`, but a
+    /// post-publication step did not complete, so the caller must reconcile the
+    /// published package instead of inferring that nothing was written.
+    ///
+    /// Added by issue #1871. The destination is created by the atomic rename
+    /// that precedes the manifest/integrity readback and the retirement of the
+    /// staging claim, so an error from either of those steps is a publication
+    /// outcome about an existing package — never a proof of total failure — and
+    /// it carries the publication identity and the published path so the
+    /// reconciliation target is unambiguous.
+    #[error(
+        "ECXF export {export_id} is published at {package_path} and requires reconciliation: {reason}"
+    )]
+    PublishReconciliationRequired {
+        /// Export identity the published package carries.
+        export_id: String,
+        /// Path of the package that exists on disk.
+        package_path: String,
+        /// The published-but-unfinished step the caller must reconcile.
+        reason: String,
+    },
     #[error("serialization failed: {0}")]
     Serialization(String),
     #[error("restore target failed: {0}")]

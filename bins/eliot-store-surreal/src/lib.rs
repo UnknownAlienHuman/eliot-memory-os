@@ -88,10 +88,15 @@ mod backup_dispatch;
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
+pub use request_dispatch::dispatch_with_log;
 /// Structured bridge diagnostics projection (issue #742). Observability-only:
 /// the module owns vocabulary, redaction, bounded capture, and typed result
 /// projection, and changes no existing bridge behavior or eligibility.
 pub mod diagnostics;
+use diagnostics::{
+    BoundedEventLog, BridgeBoundary, BridgeIdentity, emit_lifecycle, emit_validation_rejected,
+    operation_name, report_events,
+};
 pub mod task_binding_gate;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
@@ -100,8 +105,9 @@ use request_dispatch::{map_composition_error, map_genesis_dispatch_result};
 mod canonical_event;
 pub use canonical_event::{
     CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority,
-    FencedProjectionPublication, OrderingLink, ProjectionRebuildPlan, SemanticWritePath,
-    ordering_link_hash, request_projection_rebuild, request_rebuild_from_semantic_write,
+    FencedProjectionPublication, ORDERING_LINK_GENESIS_HASH, OrderingLink, ProjectionRebuildPlan,
+    SemanticWritePath, ordering_link_hash, request_projection_rebuild,
+    request_rebuild_from_semantic_write,
 };
 mod connection_manager;
 pub use connection_manager::{
@@ -451,6 +457,40 @@ impl StoreComposition {
         &self,
         observed_clock: &ClockObservation,
     ) -> Result<MigrationReceipt, StoreCompositionError> {
+        let outcome = self
+            .apply_initial_schema_migration_inner(observed_clock)
+            .await;
+        let mut events = BoundedEventLog::new();
+        match &outcome {
+            Ok(receipt) => {
+                let identity =
+                    BridgeIdentity::new().with_generation(receipt.generation_after.as_str());
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::SchemaMigration,
+                    "schema_migration",
+                    &identity,
+                    None,
+                );
+            }
+            Err(_) => {
+                emit_validation_rejected(
+                    &mut events,
+                    BridgeBoundary::SchemaMigration,
+                    "schema_migration",
+                    &BridgeIdentity::new(),
+                    None,
+                );
+            }
+        }
+        report_events(&events);
+        outcome
+    }
+
+    async fn apply_initial_schema_migration_inner(
+        &self,
+        observed_clock: &ClockObservation,
+    ) -> Result<MigrationReceipt, StoreCompositionError> {
         if self.schema_bootstrap_binding.profile != InstallationProfile::PortableDev {
             return Err(StoreCompositionError::Store(StoreError::Unavailable));
         }
@@ -586,6 +626,20 @@ impl StoreComposition {
         // closed with the stable TASK_SELECTION_REQUIRED /
         // TASK_SCOPE_INCOMPATIBLE code preserved in the typed reason.
         if let Err(rejection) = crate::task_binding_gate::gate_apply(context, &transition) {
+            let identity = BridgeIdentity::new()
+                .with_request(&context.request_id)
+                .with_operation(&transition.identity.operation_id)
+                .with_idempotency_ref(&transition.identity.idempotency_key)
+                .with_manifest_digest(transition.operation_manifest_digest.as_str());
+            let mut events = BoundedEventLog::new();
+            emit_validation_rejected(
+                &mut events,
+                BridgeBoundary::TaskBindingGate,
+                "apply",
+                &identity,
+                None,
+            );
+            report_events(&events);
             return Err(StoreCompositionError::Store(
                 crate::task_binding_gate::map_rejection(&rejection),
             ));
@@ -1036,6 +1090,38 @@ impl StoreComposition {
         class: ClientClass,
         dial: impl AsyncFnOnce() -> Result<(), StoreError>,
     ) -> Result<u64, String> {
+        let outcome = self.replace_client_generation_inner(class, dial).await;
+        let mut events = BoundedEventLog::new();
+        match &outcome {
+            Ok(generation) => {
+                let identity = BridgeIdentity::new().with_generation(&generation.to_string());
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::ConnectionGeneration,
+                    "connection_generation",
+                    &identity,
+                    None,
+                );
+            }
+            Err(_) => {
+                emit_validation_rejected(
+                    &mut events,
+                    BridgeBoundary::ConnectionGeneration,
+                    "connection_generation",
+                    &BridgeIdentity::new(),
+                    None,
+                );
+            }
+        }
+        report_events(&events);
+        outcome
+    }
+
+    async fn replace_client_generation_inner(
+        &self,
+        class: ClientClass,
+        dial: impl AsyncFnOnce() -> Result<(), StoreError>,
+    ) -> Result<u64, String> {
         let backoff_ms = self.connections.note_reconnect_attempt(class)?;
         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
         dial()
@@ -1377,37 +1463,133 @@ pub fn validate_request_frame(
     session: &mut StoreEbpSession,
     frame: &Frame,
 ) -> Result<Request, String> {
+    let mut events = BoundedEventLog::new();
+    let outcome = validate_request_frame_with_log(session, frame, &mut events);
+    report_events(&events);
+    outcome
+}
+
+/// Validates one request against the admitted session and replay ledger
+/// while recording each rejection into the caller-owned log.
+///
+/// Every rejection arm emits exactly one [`SessionValidation`] event carrying
+/// only the request identity actually present at that arm: the wire-claimed
+/// frame id before decode, the decoded transport id after. The unadmitted
+/// capability name is untrusted input and is never recorded. Catalogue
+/// failures emit at [`CatalogueAdmission`] from the catalogue gate itself.
+/// The returned [`Result`] is identical to [`validate_request_frame`].
+///
+/// [`SessionValidation`]: BridgeBoundary::SessionValidation
+/// [`CatalogueAdmission`]: BridgeBoundary::CatalogueAdmission
+#[allow(clippy::too_many_lines)]
+pub fn validate_request_frame_with_log(
+    session: &mut StoreEbpSession,
+    frame: &Frame,
+    events: &mut BoundedEventLog,
+) -> Result<Request, String> {
+    let mut frame_identity = BridgeIdentity::new();
+    if let Some(request_id) = frame.request_id.as_ref() {
+        frame_identity = frame_identity.with_request(request_id);
+    }
     if frame.protocol_version != session.protocol_version
         || frame.connection_id != session.connection_id
     {
+        emit_validation_rejected(
+            events,
+            BridgeBoundary::SessionValidation,
+            "frame",
+            &frame_identity,
+            None,
+        );
         return Err("request frame is outside the negotiated EBP session".to_owned());
     }
-    let (request_id, identity, request, _) =
-        decode_request_frame_with_authority(frame).map_err(|error| error.to_string())?;
+    let (request_id, identity, request, _) = match decode_request_frame_with_authority(frame) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            emit_validation_rejected(
+                events,
+                BridgeBoundary::SessionValidation,
+                "frame",
+                &frame_identity,
+                None,
+            );
+            return Err(error.to_string());
+        }
+    };
+    let decoded_identity = BridgeIdentity::new().with_request(&request_id);
+    let operation = operation_name(&request);
     if identity.request.state_fence != session.state_fence {
+        emit_validation_rejected(
+            events,
+            BridgeBoundary::SessionValidation,
+            operation,
+            &decoded_identity,
+            None,
+        );
         return Err("request identity state fence does not match the handshake fence".to_owned());
     }
-    let bound = BoundIdentity::new(
+    let bound = match BoundIdentity::new(
         session.connection_id.clone(),
         session.module_generation.clone(),
         request_id.to_string(),
-    )
-    .map_err(|error| format!("invalid request identity binding: {error}"))?;
+    ) {
+        Ok(bound) => bound,
+        Err(error) => {
+            emit_validation_rejected(
+                events,
+                BridgeBoundary::SessionValidation,
+                operation,
+                &decoded_identity,
+                None,
+            );
+            return Err(format!("invalid request identity binding: {error}"));
+        }
+    };
     match session.replay.observe_bound(bound, frame) {
         Ok(ReplayDisposition::New | ReplayDisposition::Duplicate) => {}
         Ok(ReplayDisposition::Conflict) => {
+            emit_validation_rejected(
+                events,
+                BridgeBoundary::SessionValidation,
+                operation,
+                &decoded_identity,
+                None,
+            );
             return Err("request identity conflicts with a prior frame".to_owned());
         }
         Err(TransportError::RegistryFull) => {
+            emit_validation_rejected(
+                events,
+                BridgeBoundary::SessionValidation,
+                operation,
+                &decoded_identity,
+                None,
+            );
             return Err("bounded transport registry is full".to_owned());
         }
-        Err(error) => return Err(error.to_string()),
+        Err(error) => {
+            emit_validation_rejected(
+                events,
+                BridgeBoundary::SessionValidation,
+                operation,
+                &decoded_identity,
+                None,
+            );
+            return Err(error.to_string());
+        }
     }
     let capability = request.capability();
     if !session.capabilities.contains(capability) {
+        emit_validation_rejected(
+            events,
+            BridgeBoundary::SessionValidation,
+            operation,
+            &decoded_identity,
+            None,
+        );
         return Err(format!("capability is not admitted: {capability}"));
     }
-    enforce_admitted_operation(&request)?;
+    enforce_admitted_operation_with_log(&request, events)?;
     Ok(request)
 }
 
@@ -1426,8 +1608,11 @@ pub fn validate_request_frame(
 /// health, readiness, and Dreamer ledger requests keep their own bounded
 /// validation (already run by the wire decode) and perform no canonical
 /// mutation.
-fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
-    match request {
+fn enforce_admitted_operation_with_log(
+    request: &Request,
+    events: &mut BoundedEventLog,
+) -> Result<(), String> {
+    let outcome = match request {
         Request::Named { request } => {
             let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
             request
@@ -1475,7 +1660,17 @@ fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
         | Request::OrderingHeads { .. }
         | Request::ValidationSnapshot
         | Request::DreamerJob { .. } => Ok(()),
+    };
+    if outcome.is_err() {
+        emit_validation_rejected(
+            events,
+            BridgeBoundary::CatalogueAdmission,
+            operation_name(request),
+            &BridgeIdentity::from_request(request),
+            None,
+        );
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -3079,6 +3274,13 @@ mod tests {
             "op-dreamer-gate",
             "idem-dreamer-gate",
         );
-        assert!(enforce_admitted_operation(&Request::DreamerJob { context, request }).is_ok());
+        let mut events = BoundedEventLog::new();
+        assert!(
+            enforce_admitted_operation_with_log(
+                &Request::DreamerJob { context, request },
+                &mut events
+            )
+            .is_ok()
+        );
     }
 }

@@ -202,7 +202,9 @@ fn run() -> i32 {
 /// the contour performs the exact register/claim/reconcile/`start_claimed`/
 /// readiness sequence and then serves the bounded frame loop. The binary
 /// entry composes this shape from the dispatch file plus the canonical
-/// intent rule on every admitted invocation.
+/// intent rule on every admitted invocation. Issue #1912 re-proves the
+/// explicit job envelope at the serve boundary and leaves a visible
+/// coverage-gap record when the serve ends cancelled or unknown.
 fn drive_admitted_material<E, A, R, C, L>(
     lifecycle: &mut L,
     worker: &mut NativeWorker<E, A, R, C>,
@@ -226,6 +228,15 @@ where
         Ok((actions, _ready)) => emit_governed_provenance(&actions),
         Err(error) => return fail_drive(&error),
     }
+    // Issue #1912: re-prove the explicit job envelope at the serve
+    // boundary, so stdio serving binds the same principal/session,
+    // `WorkScope`, epoch, fence, allowed effects, route, task/job budget,
+    // deadline, and cancellation the drive bound. A disagreement denies
+    // before any frame is read.
+    let envelope = match eliot_native_worker::require_job_envelope(material) {
+        Ok(envelope) => envelope,
+        Err(error) => return deny_invalid_material(&error.to_string()),
+    };
     let fence = match serde_json::to_value(&material.hello.state_fence) {
         Ok(fence) => fence,
         Err(error) => {
@@ -238,8 +249,24 @@ where
             return deny_invalid_material(&format!("admitted epoch is not projectable: {error}"));
         }
     };
-    match block_on(worker.serve_stdio_governed(&material.action_envelopes, &fence, &epoch)) {
-        Ok(_) => 0,
+    match block_on(worker.serve_stdio_governed(
+        &material.action_envelopes,
+        &material.admission.claim().work_scope_id,
+        &fence,
+        &epoch,
+    )) {
+        Ok(_) => {
+            // Issue #1912: a serve that ends cancelled or holding an
+            // unknown outcome leaves a visible coverage-gap record naming
+            // the retained claim/task/job and its durable retention, so
+            // verified partial work is never silently lost.
+            if let Some(gap) =
+                eliot_native_worker::CoverageGap::for_job_envelope(&envelope, worker.lifecycle())
+            {
+                emit_coverage_gap(&gap);
+            }
+            0
+        }
         Err(error) => {
             emit(ADMITTED_DRIVE_FAILED, &error.to_string());
             ADMITTED_DRIVE_FAILED_EXIT
@@ -271,6 +298,28 @@ fn emit_governed_provenance(actions: &[eliot_native_worker::governed_action::Val
         "{{\"receipt\":\"GOVERNED_ACTION_PROVENANCE\",\"actions\":{}}}",
         serde_json::Value::Array(items)
     );
+}
+
+/// Emits one visible coverage-gap record for a terminally incomplete serve.
+///
+/// Compact stderr receipt line (never a stdout frame) naming the retained
+/// claim/task/job/attempt/operation, the honest finish word, the durable
+/// retention locator holding verified partial output, and the reason the
+/// gap stays open — so supervision observes the gap instead of losing it.
+fn emit_coverage_gap(gap: &eliot_native_worker::CoverageGap) {
+    let record = serde_json::json!({
+        "receipt": "COVERAGE_GAP",
+        "claim_id": gap.claim_id,
+        "task_id": gap.task_id,
+        "parent_job_id": gap.parent_job_id,
+        "attempt_id": gap.attempt_id,
+        "operation_id": gap.operation_id,
+        "finish": gap.finish.as_str(),
+        "retention_ref": gap.retention_ref,
+        "reason": gap.reason,
+    });
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{record}");
 }
 
 /// Emits one typed drive failure and projects its exit.
@@ -1642,6 +1691,7 @@ mod tests {
                 &mut reader,
                 &mut writer,
                 &[],
+                &material.admission.claim().work_scope_id,
                 &fence_json,
                 &epoch_json,
             )),
@@ -1677,6 +1727,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &serve,
+            &material.admission.claim().work_scope_id,
             &fence_json,
             &epoch_json,
         ))
@@ -2136,6 +2187,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &material.action_envelopes,
+            &material.admission.claim().work_scope_id,
             &fence_json,
             &epoch_json,
         ))

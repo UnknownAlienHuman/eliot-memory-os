@@ -31,11 +31,11 @@ pub use end_of_activity::{
     ActivationScopeReference, AssessmentRecordReference, AssessmentSourceCoverage,
     AssessmentSourceGap, AssessmentSourceRecord, AssessmentSourceSnapshot, ClosedActivityReference,
     END_OF_ACTIVITY_ASSESSMENT_CONTRACT_NAME, END_OF_ACTIVITY_ASSESSMENT_VERSION,
-    EligibleServiceSafeRoute, EndOfActivityAssessmentDecision, EndOfActivityMaintenanceAssessment,
-    EndOfActivityMaintenanceAssessmentOutcome, EndOfActivityMaintenanceAssessmentRequest,
-    EndOfActivityMaintenanceAssessmentValidationError, MaintenanceDebtReference,
-    MaintenanceDuePolicyReference, UserSessionRequiredWorkReference,
-    end_of_activity_assessment_contract_identity,
+    EligibleServiceSafeRoute, EndOfActivityAssessment, EndOfActivityAssessmentDecision,
+    EndOfActivityMaintenanceAssessment, EndOfActivityMaintenanceAssessmentOutcome,
+    EndOfActivityMaintenanceAssessmentRequest, EndOfActivityMaintenanceAssessmentValidationError,
+    MaintenanceDebtReference, MaintenanceDuePolicyReference, UserSessionRequiredWorkReference,
+    assess_end_of_activity, end_of_activity_assessment_contract_identity,
 };
 
 pub use improvement_admission::{
@@ -57,13 +57,13 @@ pub use improvement_pipeline::{
     ImprovementCandidateIngress, ImprovementCurrentProposal, ImprovementEvidenceExecution,
     ImprovementMaterialEquality, ImprovementOperation, ImprovementPipelineInputs,
     ImprovementProposal, ImprovementProposalCommitmentEnvelope, ImprovementReplayAssessment,
-    ImprovementTerminalDisposition, KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT,
-    OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS, OP_EVALUATE, OP_EXECUTE_EXPERIMENT, OP_MEASURE,
-    OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError, ProposalCommitment,
-    RetainedImprovementProposal, RollbackContract, TESTD_OWNER, UnestablishedPriorCause,
-    VERIFIER_OWNER_FAMILY, assess_improvement_replay, compare_improvement_commitments,
-    ingest_improvement_candidate, proposal_digest, reconcile_unknown_activation,
-    run_improvement_candidate_pipeline,
+    ImprovementTerminalDisposition, ImprovementUnknownEffect, KERNEL_CANARY_OWNER,
+    MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS, OP_EVALUATE,
+    OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError,
+    ProposalCommitment, RetainedImprovementProposal, RollbackContract, TESTD_OWNER,
+    UnestablishedPriorCause, VERIFIER_OWNER_FAMILY, assess_improvement_replay,
+    compare_improvement_commitments, improvement_retry_permitted, ingest_improvement_candidate,
+    proposal_digest, reconcile_unknown_activation, run_improvement_candidate_pipeline,
 };
 
 /// Stable wire name for the maintenance governor contract.

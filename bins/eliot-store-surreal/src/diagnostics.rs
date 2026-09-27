@@ -68,6 +68,8 @@
 use std::collections::VecDeque;
 use std::collections::vec_deque::Iter;
 use std::fmt;
+use std::io::Write as _;
+use std::sync::OnceLock;
 
 use eliot_contracts::{OperationId, RequestId};
 use eliot_store_api::{
@@ -77,7 +79,7 @@ use eliot_store_api::{
     WriteReceiptStatus,
 };
 
-use crate::Response;
+use crate::{Request, Response, SERVICE_NAME};
 
 /// Stable contract revision of this diagnostics projection.
 pub const DIAGNOSTICS_CONTRACT_REVISION: &str = "eliot.s03.bridge-diagnostics.v1";
@@ -639,6 +641,95 @@ impl BridgeIdentity {
         self.evidence_ref.as_ref().map(BoundedRef::as_str)
     }
 
+    /// Projects the admitted identity from one closed dispatch request.
+    ///
+    /// Only typed identifiers actually present in the admitted shape travel:
+    /// the transport request id, the operation identity, the idempotency
+    /// key, and the operation-manifest digest. Request shapes without an
+    /// identity (health, readiness, named reads, recovery, head reads,
+    /// snapshots) project to the empty identity; fence presence is
+    /// constant-present in request shapes and carries no digest, so it
+    /// travels only on failure/receipt projections. Payloads, parameters,
+    /// keys, scopes, and fences never travel.
+    #[must_use]
+    pub fn from_request(request: &Request) -> Self {
+        match request {
+            Request::Apply {
+                context,
+                transition,
+                ..
+            } => Self::new()
+                .with_request(&context.request_id)
+                .with_operation(&transition.identity.operation_id)
+                .with_idempotency_ref(&transition.identity.idempotency_key)
+                .with_manifest_digest(transition.operation_manifest_digest.as_str()),
+            Request::ReservedWrite { request } => Self::new()
+                .with_request(&request.context.request_id)
+                .with_operation(&request.transition.identity.operation_id)
+                .with_idempotency_ref(&request.transition.identity.idempotency_key)
+                .with_manifest_digest(request.transition.operation_manifest_digest.as_str()),
+            Request::Backup { request } => Self::new()
+                .with_request(&request.context.request_id)
+                .with_operation(&request.identity.operation_id)
+                .with_idempotency_ref(&request.identity.idempotency_key),
+            Request::InitializeGenesis { context, request } => Self::new()
+                .with_request(&context.request_id)
+                .with_operation(&request.operation_id)
+                .with_idempotency_ref(&request.idempotency_key),
+            Request::DreamerJob { context, request } => Self::new()
+                .with_request(&context.request_id)
+                .with_operation(&request.request_identity.operation.operation_id)
+                .with_idempotency_ref(&request.request_identity.operation.idempotency_key),
+            Request::Receipt { operation_id } => Self::new().with_operation(operation_id),
+            Request::Health
+            | Request::Readiness
+            | Request::Named { .. }
+            | Request::Recovery { .. }
+            | Request::RevisionHeads { .. }
+            | Request::OrderingHeads { .. }
+            | Request::ValidationSnapshot => Self::new(),
+        }
+    }
+
+    /// Projects the admitted identity from one closed dispatch response.
+    ///
+    /// Receipts contribute their operation identity, validated idempotency
+    /// key, fence presence, and operation-manifest digest; typed failures
+    /// contribute their admitted failure identity; the legacy unknown
+    /// variant contributes its typed operation id only and its prose reason
+    /// is never copied. Read-path payloads, backup per-outcome payloads,
+    /// and the legacy string error carry no projectable identity and map
+    /// to the empty identity; backup correlation travels on the request
+    /// envelope identity instead.
+    #[must_use]
+    pub fn from_response(response: &Response) -> Self {
+        match response {
+            Response::Transaction { receipt } | Response::Genesis { receipt } => {
+                Self::from_receipt(receipt)
+                    .with_manifest_digest(receipt.operation_manifest_digest.as_str())
+            }
+            Response::Receipt { receipt } => receipt
+                .as_ref()
+                .map(|entry| {
+                    Self::from_receipt(entry)
+                        .with_manifest_digest(entry.operation_manifest_digest.as_str())
+                })
+                .unwrap_or_default(),
+            Response::Failure { failure } => Self::from_failure(failure),
+            Response::Unknown { operation_id, .. } => Self::new().with_operation(operation_id),
+            Response::Health { .. }
+            | Response::Readiness { .. }
+            | Response::Named { .. }
+            | Response::RevisionHeads { .. }
+            | Response::OrderingHeads { .. }
+            | Response::ValidationSnapshot { .. }
+            | Response::Recovery { .. }
+            | Response::DreamerJob { .. }
+            | Response::Backup { .. }
+            | Response::Error { .. } => Self::new(),
+        }
+    }
+
     fn render(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(request_id) = self.request_id.as_ref() {
             write!(formatter, " request={}", request_id.as_str())?;
@@ -1086,4 +1177,99 @@ pub fn emit_lifecycle(
     );
     event.reason = reason.cloned();
     log.push(event);
+}
+
+/// Projects one closed dispatch request to its admitted operation name.
+///
+/// The mapping is total over the 13-arm catalogue and typed: every arm maps
+/// to one [`ADMITTED_OPERATIONS`] entry and no caller prose is ever admitted
+/// as an operation name.
+#[must_use]
+pub fn operation_name(request: &Request) -> &'static str {
+    match request {
+        Request::Health => "health",
+        Request::Readiness => "readiness",
+        Request::Named { .. } => "named",
+        Request::Apply { .. } => "apply",
+        Request::Receipt { .. } => "receipt",
+        Request::ReservedWrite { .. } => "reserved_write",
+        Request::Backup { .. } => "backup",
+        Request::RevisionHeads { .. } => "revision_heads",
+        Request::OrderingHeads { .. } => "ordering_heads",
+        Request::ValidationSnapshot => "validation_snapshot",
+        Request::Recovery { .. } => "recovery",
+        Request::InitializeGenesis { .. } => "initialize_genesis",
+        Request::DreamerJob { .. } => "dreamer_job",
+    }
+}
+
+/// Projects one closed dispatch request to its owning result boundary.
+///
+/// Mutation, receipt, backup, recovery, genesis, and ledger arms observe
+/// their dedicated result boundary; read-path arms observe [`Dispatch`].
+/// The projection reads only the request arm discriminant: provider stages
+/// stay unobserved and are never guessed.
+///
+/// [`Dispatch`]: BridgeBoundary::Dispatch
+#[must_use]
+pub fn dispatch_boundary(request: &Request) -> BridgeBoundary {
+    match request {
+        Request::Apply { .. } | Request::ReservedWrite { .. } => BridgeBoundary::MutationResult,
+        Request::Receipt { .. } => BridgeBoundary::ReceiptLookup,
+        Request::Backup { .. } => BridgeBoundary::BackupBoundary,
+        Request::Recovery { .. } => BridgeBoundary::RecoveryBoundary,
+        Request::InitializeGenesis { .. } => BridgeBoundary::GenesisBoundary,
+        Request::DreamerJob { .. } => BridgeBoundary::DreamerLedger,
+        Request::Health
+        | Request::Readiness
+        | Request::Named { .. }
+        | Request::RevisionHeads { .. }
+        | Request::OrderingHeads { .. }
+        | Request::ValidationSnapshot => BridgeBoundary::Dispatch,
+    }
+}
+
+/// Single-owner cell for the process startup subscriber.
+///
+/// The cell carries no data: installation is a pure ownership proof and a
+/// duplicate installation observably fails instead of creating a second
+/// owner. The sink itself is the process standard-error stream rendered
+/// through the validated event projection, so reporting holds no
+/// Store-critical lock and keeps no queue.
+static STARTUP_SUBSCRIBER: OnceLock<()> = OnceLock::new();
+
+/// Installs the process-wide bounded structured subscriber.
+///
+/// The first call installs and returns `true`; every later call observes
+/// the existing owner and returns `false` without creating a second owner.
+/// Only the process entry point calls this: reusable compositions never
+/// install global subscribers, and tests capture through caller-owned
+/// [`BoundedEventLog`] injection instead of this cell.
+pub fn install_startup_subscriber() -> bool {
+    STARTUP_SUBSCRIBER.set(()).is_ok()
+}
+
+/// Reports whether the process installed its startup subscriber.
+#[must_use]
+pub fn startup_subscriber_installed() -> bool {
+    STARTUP_SUBSCRIBER.get().is_some()
+}
+
+/// Reports every retained scoped event to the installed startup sink.
+///
+/// Each event renders as one bounded line on the process standard-error
+/// stream through the validated [`fmt::Display`] projection. The call is
+/// infallible and wait-free from the caller's view: it holds no
+/// Store-critical lock, keeps no queue, performs no retry, and ignores sink
+/// errors, so a failed sink can neither recurse, stall, nor fabricate a
+/// receipt. When the startup subscriber is not installed (reusable
+/// compositions, tests) the call drops every event silently and changes no
+/// behavior.
+pub fn report_events(log: &BoundedEventLog) {
+    if !startup_subscriber_installed() {
+        return;
+    }
+    for event in log {
+        let _ = writeln!(std::io::stderr(), "{SERVICE_NAME}: {event}");
+    }
 }

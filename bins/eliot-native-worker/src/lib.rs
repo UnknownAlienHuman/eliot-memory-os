@@ -34,8 +34,16 @@ pub mod adapter_registry;
 /// contract proof addresses the identical gate the contour drives.
 pub mod governed_action;
 
+/// Explicit job envelope for the production native-worker lifecycle
+/// (issue #1912, I14.1/A12.2/A12.3/A12.6/A14.7).
+pub mod job_envelope;
+
 pub use dispatch_authority::{
     NativeWorkerDispatchAuthority, ValidatedDispatchGrant, now_unix_ms as dispatch_now_unix_ms,
+};
+pub use job_envelope::{
+    ConsumptionAttribution, CoverageGap, JobEnvelope, require_consumption_attribution,
+    require_job_envelope, require_paid_start_eligible,
 };
 pub use kernel_admission_client::{
     KernelCheckpointPort, KernelNativeWorkerClient, KernelReplayPort, KernelReplayTransport,
@@ -262,11 +270,17 @@ where
     pub async fn serve_stdio_governed(
         &mut self,
         carriers: &[ActionEnvelopeCarrier],
+        admitted_work_scope_id: &str,
         state_fence: &serde_json::Value,
         authority_epoch: &serde_json::Value,
     ) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
-        let actions =
-            admit_product_envelopes(&[GOVERNED_SERVE_OP], carriers, state_fence, authority_epoch)?;
+        let actions = admit_product_envelopes(
+            &[GOVERNED_SERVE_OP],
+            carriers,
+            admitted_work_scope_id,
+            state_fence,
+            authority_epoch,
+        )?;
         self.serve_stdio().await?;
         Ok(actions)
     }
@@ -281,11 +295,17 @@ where
         reader: &mut Reader,
         writer: &mut Writer,
         carriers: &[ActionEnvelopeCarrier],
+        admitted_work_scope_id: &str,
         state_fence: &serde_json::Value,
         authority_epoch: &serde_json::Value,
     ) -> Result<(Vec<governed_action::ValidatedAction>, bool), NativeWorkerError> {
-        let actions =
-            admit_product_envelopes(&[GOVERNED_SERVE_OP], carriers, state_fence, authority_epoch)?;
+        let actions = admit_product_envelopes(
+            &[GOVERNED_SERVE_OP],
+            carriers,
+            admitted_work_scope_id,
+            state_fence,
+            authority_epoch,
+        )?;
         let shutdown = self.serve_one_frame(reader, writer).await?;
         Ok((actions, shutdown))
     }
@@ -471,7 +491,8 @@ pub fn require_worker_cell_match(
 /// retained record, never a second process), compose-checked
 /// `start_claimed` through the exact `WorkerCore::demand_start_claimed` gate,
 /// then submit readiness. Invalid admission fails before any factory or
-/// process start is invoked: the artifact/manifest pin refuses first, then
+/// process start is invoked: the owner's ready-or-blocked verdict refuses
+/// paid work first (issue #1912), then the artifact/manifest pin, then
 /// the catalog-revision (W1) and cell-identity (W7) pins, then the lifecycle
 /// transport refuses, and the claimed core gate refuses before
 /// P-03 starts anything. No coordinator
@@ -495,6 +516,10 @@ where
     C: DurableCheckpointPort,
     L: AdmittedLifecycle,
 {
+    // Paid-start eligibility (issue #1912): a `Blocked` owner verdict
+    // refuses before any registration submit, factory effect, or process
+    // start, so no paid work starts against the owner's refusal.
+    require_paid_start_eligible(readiness)?;
     // Artifact/manifest negative (#22): a worker starting from a
     // non-matching artifact/manifest identity is refused before any
     // registration submit, factory effect, or process start. The generation's
@@ -563,7 +588,8 @@ pub const GOVERNED_SERVE_OP: &str = "serve_stdio";
 ///
 /// For every required operation, in order: a carrier must be presented
 /// (missing), its bytes must decode to the closed envelope (malformed), the
-/// decoded operation must name the required operation (mismatched), and the
+/// decoded operation must name the required operation (mismatched), the
+/// decoded `WorkScope` must equal the admitted claim's `WorkScope`, and the
 /// decoded State Fence plus Authority Epoch must equal the admitted
 /// material's fence and epoch (stale). The full governed gate
 /// ([`governed_action::require_governed_op`]) then admits each envelope. The
@@ -573,6 +599,7 @@ pub const GOVERNED_SERVE_OP: &str = "serve_stdio";
 pub fn admit_product_envelopes(
     operations: &[&str],
     carriers: &[ActionEnvelopeCarrier],
+    admitted_work_scope_id: &str,
     state_fence: &serde_json::Value,
     authority_epoch: &serde_json::Value,
 ) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
@@ -591,7 +618,8 @@ pub fn admit_product_envelopes(
                     "authority-bound action envelope for '{operation}' (WorkScope, State Fence, Authority Epoch, applicable authority)"
                 ),
                 required_repair:
-                    "attach a carrier per driven operation with matching fence/epoch".to_owned(),
+                    "attach a carrier per driven operation with matching WorkScope/fence/epoch"
+                        .to_owned(),
                 allowed_next_action: format!(
                     "submit the drive with a valid envelope for '{operation}'"
                 ),
@@ -634,6 +662,14 @@ pub fn admit_product_envelopes(
                 ),
             ));
         }
+        if envelope.scope_ref != admitted_work_scope_id {
+            return Err(refuse(
+                operation,
+                format!(
+                    "carried envelope for '{operation}' has a WorkScope that does not match the admitted claim"
+                ),
+            ));
+        }
         if envelope.state_fence != *state_fence || envelope.authority_epoch != *authority_epoch {
             return Err(refuse(
                 operation,
@@ -656,7 +692,11 @@ fn truncate_text(value: &str, limit: usize) -> String {
 
 /// Drives one admitted generation behind the governed gate (issue #1911).
 ///
-/// Admits every [`GOVERNED_DRIVE_OPS`] envelope against the material's fence
+/// Pins the explicit job envelope first (issue #1912): principal/session,
+/// `WorkScope`, Authority Epoch, State Fence, allowed effects, route
+/// class, task/job budget, deadline, and cancellation must bind across the
+/// admitted halves before anything else runs. Then admits every
+/// [`GOVERNED_DRIVE_OPS`] envelope against the material's fence
 /// and epoch BEFORE the first lifecycle submit, then runs the exact
 /// [`drive_admitted_claimed`] sequence. A missing, malformed, mismatched,
 /// stale, or invalid envelope refuses with zero submits and zero starts.
@@ -680,6 +720,11 @@ where
     C: DurableCheckpointPort,
     L: AdmittedLifecycle,
 {
+    // Explicit job-envelope pin (issue #1912): the admitted halves must
+    // bind every envelope dimension before the governed gate admits any
+    // driven operation. A disagreement refuses with zero submits and zero
+    // starts, ahead of the envelope negatives below.
+    require_job_envelope(material)?;
     let fence = serde_json::to_value(&material.hello.state_fence).map_err(|_| {
         NativeWorkerError::KernelAdmissionRequired(
             "admitted fence is not projectable to the governed gate".to_owned(),
@@ -693,6 +738,7 @@ where
     let actions = admit_product_envelopes(
         &GOVERNED_DRIVE_OPS,
         &material.action_envelopes,
+        &material.admission.claim().work_scope_id,
         &fence,
         &epoch,
     )?;
@@ -2616,6 +2662,7 @@ mod tests {
         let actions = admit_product_envelopes(
             &GOVERNED_DRIVE_OPS,
             &drive_carriers(&fence, &epoch),
+            "scope-1",
             &fence,
             &epoch,
         )
@@ -2634,6 +2681,7 @@ mod tests {
                 &fence,
                 &epoch,
             )],
+            "scope-1",
             &fence,
             &epoch,
         )
@@ -2648,7 +2696,7 @@ mod tests {
         let epoch = action_epoch();
         // Missing: no carrier for the first driven op.
         let detail = expect_denial(
-            admit_product_envelopes(&GOVERNED_DRIVE_OPS, &[], &fence, &epoch),
+            admit_product_envelopes(&GOVERNED_DRIVE_OPS, &[], "scope-1", &fence, &epoch),
             "empty carriers",
         );
         assert!(
@@ -2660,6 +2708,7 @@ mod tests {
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
                 &[action_carrier("register", "claim", &fence, &epoch)],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2675,6 +2724,7 @@ mod tests {
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
                 &[action_carrier("register", "register", &stale_fence, &epoch)],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2693,6 +2743,7 @@ mod tests {
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
                 &[action_carrier("register", "register", &fence, &stale_epoch)],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2712,6 +2763,7 @@ mod tests {
                     operation: "register".to_owned(),
                     envelope_json: String::new(),
                 }],
+                "scope-1",
                 &fence,
                 &epoch,
             ),
@@ -2729,6 +2781,7 @@ mod tests {
                     operation: "register".to_owned(),
                     envelope_json: "not json".to_owned(),
                 }],
+                "scope-1",
                 &fence,
                 &epoch,
             ),

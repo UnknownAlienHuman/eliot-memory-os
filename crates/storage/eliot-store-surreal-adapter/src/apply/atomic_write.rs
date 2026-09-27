@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use super::surreal_automation::{AutomationWrites, automation_write_statements};
 use super::surreal_experience::{ExperienceWrites, experience_write_statements};
+use super::surreal_learning::{LearningWrites, learning_write_statements};
 use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
@@ -112,6 +113,7 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "automation_invocation_conflict",
     "experience_bank_conflict",
     "experience_feedback_conflict",
+    "learning_record_conflict",
 ];
 
 /// Provider markers proving a deterministic semantic conflict: stale
@@ -234,6 +236,7 @@ pub(super) async fn write_transaction(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    learning: &LearningWrites,
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let (sql, bindings) = build_apply_statements(
@@ -249,6 +252,7 @@ pub(super) async fn write_transaction(
         reactive,
         automation,
         experience,
+        learning,
     )?;
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
@@ -310,6 +314,7 @@ fn build_apply_statements(
     reactive: &ReactiveWrites,
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
+    learning: &LearningWrites,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -415,6 +420,13 @@ fn build_apply_statements(
         let template = ordering_write_template(initial_state, ordering_exists);
         sql.push_str(&schema::indexed(template, index));
         let suffix = index.to_string();
+        // Issue #1931: the per-scope chain tip rides the same CAS-guarded
+        // `CREATE`/`UPDATE ... CONTENT` as the neutral `OrderingHead` body, so
+        // the head and its chain tip advance atomically or not at all. The
+        // shipped `OrderingHead` serde boundary is unchanged: both hashes are
+        // sibling fields on the schemaless record, invisible to every
+        // `SELECT VALUE body` reader.
+        let link = chain_link_for_scope(plan, head)?;
         bindings.insert(
             format!("ordering_table{suffix}"),
             json!(schema::table::ORDERING_HEAD),
@@ -428,6 +440,8 @@ fn build_apply_statements(
             json!({
                 "ordering_scope": head.scope.to_string(),
                 "body": to_value(head)?,
+                "previous_event_hash": link.previous_event_hash,
+                "event_hash": link.event_hash,
             }),
         );
         bindings.insert(
@@ -444,11 +458,18 @@ fn build_apply_statements(
             json!(schema::table::CANONICAL_EVENT),
         );
         bindings.insert(format!("event_id{suffix}"), json!(event_id.to_string()));
+        // Issue #1931: the durable event row now carries the whole canonical
+        // event — one identity, the payload digest, the monotonic ordinal, the
+        // fence, and one hash-chain link per declared Ordering Scope — plus the
+        // transition's audit-chain digest, in the same statement and therefore
+        // the same transaction as the receipt and outbox rows below.
         bindings.insert(
             format!("event{suffix}"),
             json!({
                 "event_id": event_id.to_string(),
                 "operation_id": operation_id,
+                "body": to_value(&plan.canonical_event)?,
+                "audit_chain_digest": plan.audit_chain_digest,
             }),
         );
     }
@@ -531,6 +552,9 @@ fn build_apply_statements(
     append_experience_statements(&mut sql, &mut bindings, experience)?;
     append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_blackboard_item_statements(&mut sql, &mut bindings, transition)?;
+    // #1868 learning-record writes commit atomically beside the experience
+    // rows under the same create-or-converge contract.
+    append_learning_statements(&mut sql, &mut bindings, learning)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
@@ -571,6 +595,28 @@ fn build_apply_statements(
 
     sql.push_str(schema::TX_COMMIT);
     Ok((sql, bindings))
+}
+
+/// Binds one ordering head to the canonical event's link for the same scope.
+///
+/// The event is issued from the same `next_ordering_heads`, so every head has
+/// exactly one link; a missing link means the plan and the event disagree and
+/// the transaction is refused before it is sent rather than advancing a head
+/// with no chain link.
+fn chain_link_for_scope<'plan>(
+    plan: &'plan ApplyPlan,
+    head: &OrderingHead,
+) -> Result<&'plan eliot_store_api::OrderingLink, AdapterError> {
+    plan.canonical_event
+        .ordering_links
+        .iter()
+        .find(|link| link.ordering_scope == head.scope)
+        .ok_or_else(|| {
+            AdapterError::Serialization(
+                "prepared transition plan has an ordering head without a canonical event link"
+                    .to_owned(),
+            )
+        })
 }
 
 /// Appends the Governor-produced canonical finish-evidence owner image.
@@ -881,6 +927,29 @@ fn append_blackboard_item_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "blackboard binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends canonical learning-record row writes (issue #1868).
+///
+/// Same atomicity contract as the experience fragment: create-or-converge
+/// rows commit in the same transaction as the receipt and outbox rows.
+/// Binding collisions fail closed instead of silently overwriting a
+/// canonical binding.
+fn append_learning_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    learning: &LearningWrites,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = learning_write_statements(learning);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "learning binding collided with a canonical binding".to_owned(),
             ));
         }
     }
@@ -1872,6 +1941,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("statements assemble");
         assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
@@ -1921,6 +1991,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("create path assembles");
         assert!(
@@ -1948,6 +2019,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("genesis assembles");
         assert!(
@@ -1979,6 +2051,7 @@ mod allocation_classification_tests {
             &ReactiveWrites::default(),
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
+            &LearningWrites::default(),
         )
         .expect("statements assemble");
         assert_eq!(

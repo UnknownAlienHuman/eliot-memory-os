@@ -740,6 +740,8 @@ pub struct CutoverRouteEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CutoverRouteSnapshot {
     entries: BTreeMap<String, CutoverRouteEntry>,
+    /// Exact scope identities that remain blocked across committed cutovers.
+    unresolved_scopes: BTreeSet<String>,
 }
 
 impl CutoverRouteSnapshot {
@@ -750,11 +752,13 @@ impl CutoverRouteSnapshot {
     /// epoch is never reactivated.
     pub fn rebuild(committed: &[GenerationCutoverOwnership]) -> Result<Self, OrsError> {
         let mut entries = BTreeMap::new();
+        let mut unresolved_scopes = BTreeSet::new();
         for record in committed {
             record.validate()?;
             if record.state != GenerationCutoverState::Committed {
                 return Err(OrsError::InvalidTransition);
             }
+            unresolved_scopes.extend(record.unresolved_scopes.iter().cloned());
             let mut allowlist = BTreeMap::new();
             for entry in &record.in_flight {
                 allowlist.insert(entry.operation_id.clone(), entry.kind);
@@ -779,7 +783,10 @@ impl CutoverRouteSnapshot {
             }
             entries.insert(record.scope.route_scope_hash.clone(), entry);
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            unresolved_scopes,
+        })
     }
 
     /// Returns the entry for a route-scope hash, if the snapshot knows it.
@@ -791,7 +798,8 @@ impl CutoverRouteSnapshot {
     /// Admits one request against the snapshot (I14.14 request pinning):
     /// a new request after cutover reaches the candidate generation and new
     /// epoch only; an old-generation request not named in the committed
-    /// in-flight disposition set is rejected as stale.
+    /// in-flight disposition set is rejected as stale. Candidate admission
+    /// remains blocked when the exact route scope has an unresolved outcome.
     #[must_use]
     pub fn admit(
         &self,
@@ -804,6 +812,9 @@ impl CutoverRouteSnapshot {
             return CutoverAdmission::RejectStale;
         };
         if generation == entry.active_generation && epoch == entry.authority_epoch {
+            if self.unresolved_scopes.contains(route_scope_hash) {
+                return CutoverAdmission::BlockUnknownOutcome;
+            }
             return CutoverAdmission::AdmitCandidate;
         }
         if Some(generation) == entry.fenced_generation
@@ -827,6 +838,9 @@ pub enum CutoverAdmission {
         /// The fixed disposition governing the operation.
         kind: InFlightDispositionKind,
     },
+    /// Candidate admission is blocked because this exact route scope still
+    /// has an unresolved external-effect outcome.
+    BlockUnknownOutcome,
     /// Rejected as stale: old generation without an allowlist entry, an old
     /// epoch, or an unknown route scope.
     RejectStale,

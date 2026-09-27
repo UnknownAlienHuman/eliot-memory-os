@@ -1,0 +1,90 @@
+schema_version = 3
+module_id = "meta.improvement"
+crate = "eliot-improvement"
+status = "ADMITTED"
+wave = "cognitive-micromodules-wave-02"
+plane = "Meta"
+runtime_layer = "R7"
+delivery_depth = "D4"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "meta.improvement"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Improvement candidates are declared, bounded and handed to the Governor maintenance admission owner; only the Governor admits one, and this package can never promote its own result."
+causal_property = "advisory improvement candidate declaration, intake bounds and closure, plus the advisory promotion-input preparation the Governor admission owner consumes"
+old_failure_or_missing_capability = "an unbound improvement package could treat source presence or a passing experiment as production self-modification, policy change, capability support, authority expansion or task Finish"
+discriminator = "the package prepares a candidate and an advisory promotion input only; every authority-bearing value (proof ceiling, effect class, permits, promotion receipts) is fixed in the Governor admission owner and read by no API here"
+primary_responsibility = "Declare, bound, deduplicate and close improvement candidates and prepare the advisory promotion input that Governor maintenance admission consumes."
+
+# Package disposition (#1145 W3). Exactly one disposition, recorded in the
+# I2.23 `CrateExtractionDecision` shape, whose verb vocabulary is
+# `keep | split | merge | extract_contract | isolate_dependency | experiment`.
+# The issue offered three readings — live candidate/proposal contract with real
+# consumers, bounded compatibility/reference fixture, or delete — and this is
+# the first, expressed in I2.23's own verb. It is NOT a bounded fixture: the
+# package is on the production admission path, not a test or reference artifact.
+# It is NOT deletion: deletion is only reached when every Cargo, route,
+# documentation, fixture, test and current-cell replacement reference is closed,
+# and the package has real production consumers today.
+disposition = "keep"
+
+# I2.23 `CrateExtractionDecision` fields, filled for this package.
+affected_functional_cells_and_lifecycle_owners = "meta.improvement package owning meta.learning.closure and meta.improvement.promotion_input; admission is owned outside this package by governor maintenance G-19"
+current_source_dependency_and_change_closure = "root workspace member; six production Cargo consumers; changes close over the two cells below and the Governor admission contract that consumes them"
+public_contract_and_independent_test_entrypoint = "src/lib.rs public surface (ImprovementCandidate, CandidateState, ImprovementLifecycle, ReplayPlan, OutcomeEvidence, PromotionInput) plus the two cell modules; package-local proof entrypoints exist under tests/"
+first_real_consumer_or_time_bounded_migration_facade = "real consumers, not a migration facade: bins/eliot-wasm-host/src/governed_admission.rs, bins/eliotd/src/improvement_intake.rs, crates/meta/eliot-self-quality/src/improvement_handoff.rs, crates/smart/eliot-context-admission/src/learning_gate.rs, crates/smart/eliot-context-assembly/src/learning_gate.rs, crates/smart/eliot-context-compiler-wasm/src/host.rs"
+source_maintenance_owner_and_vendor_type_boundary = "cognitive-wave-integrator; no vendor or storage types in the public contract"
+dependency_security_license_and_build_isolation = "own advisory-only boundary; no source, config, policy, artifact, generation or authority effect"
+expected_agent_workset_context_and_reverse_fanout_delta = "package-local workset with six one-hop consumers; the reverse fanout is bounded by the two declared cells"
+expected_compile_test_integration_and_release_cost_delta = "admitted as a root workspace member; build cost is already carried by its real consumers"
+migration_reexport_rollback_removal_and_expiry = "no migration or expiry is pending; removal is a separate decision that must first close every consumer reference"
+counter_risks_merge_or_rejoin_condition = "I2.23 merge conditions are not met (independent consumers, independent test seam, own causal responsibility); rejoin only if every real consumer is replaced and a measured change closure shows the split is no longer beneficial"
+evidence_status_and_review_owner = "source present with real consumers; behavior proof and production activation remain #11 Product proof, not claimed here"
+
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["instrumental signal or outcome", "owner-decision evidence and trace", "campaign outcome and economics evidence", "AttemptLearningDelta refs", "HarnessActivationReceipt refs"]
+outputs = ["ImprovementCandidate", "CampaignLearningClosure candidate", "PromotionInput candidate", "intake and bounds outcome", "open learning debt"]
+depends_on = ["eliot-learning-contracts"]
+providers = ["Dreamer/Watchdog/Concilium suggestion", "replay, holdout, transfer, retention, evaluator-validity and Product Pulse evidence"]
+consumers = ["Governor maintenance admission (governor-maintenance-G-19)", "eliotd self-quality handoff intake", "context admission and assembly learning gates", "wasm-host governed admission"]
+non_goals = ["promotion execution", "active generation activation or cutover", "authority or permit issuance", "source, config or policy mutation", "task Finish", "second scheduler or maintenance owner"]
+invariants = [
+  "advisory_only is always true and direct_promotion is always false",
+  "no API in this package can make a candidate active, admitted or promoted",
+  "self-verification is impossible: the package supplies no evaluator outcome that admits its own candidate",
+  "closure never performs promotion",
+  "one aggregate learning score never becomes a promotion gate",
+]
+failure_behavior = "Return an explicit rejected, narrowed, inconclusive or open-learning-debt outcome with exact missing evidence; never infer promotion readiness from one score and never fabricate a result."
+proof_surface = ["no reusable delta", "deferred outcome", "rollback", "missing closure owner", "missing activation", "transfer without retention", "stale evaluator", "Product Pulse regression", "direct promotion"]
+proof_ceiling = "Module proof only; real provider/consumer edge proof and Product Pulse remain separate"
+product_pulse = "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/cognitive-donor-map.toml"
+disposition = "RETAIN_AND_HARDEN_IN_PLACE donor row for crates/meta/eliot-improvement; this package-level decision is the same reading in I2.23 decision form and does not open a second one"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12.24 ImprovementCandidate and CampaignLearningClosure"
+disposition = "authoritative candidate and closure contract"
+
+[[donor]]
+path = "ELIOT_ARCHITECTURE I2.23 CrateExtractionDecision"
+disposition = "authoritative crate topology and disposition decision shape"
+
+# Acceptance is decided by the owning contract and independent review. This
+# table names the concrete contract and the required exports plus the small
+# behaviour checks a reviewer verifies; it is not a source/test-count goal.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = ["ImprovementCandidate", "PromotionInput", "ImprovementLifecycle"]
+required_tests = []
+forbidden_patterns = ['unimplemented!', 'todo!']

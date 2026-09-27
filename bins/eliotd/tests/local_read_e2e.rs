@@ -103,6 +103,7 @@ fn test_envelope(
         identity: HostRequestIdentity {
             request_id: eliot_contracts::RequestId::new("host-request-1")
                 .map_err(|error| format!("request id: {error}"))?,
+            correlation_projection: None,
             idempotency_key: "host-request-1:invoke".to_owned(),
             cancellation_id: "host-request-1:invoke:cancel".to_owned(),
             parent_operation_id: None,
@@ -336,6 +337,7 @@ fn result_body_for(envelope: &HostRequestEnvelope) -> TestResult<HostRequestResu
         // attempt rides this vehicle. Submissions always carry the current
         // attempt, enforced by the Kernel legs.
         attempt: None,
+        lineage: None,
     };
     body.validate()
         .map_err(|error| format!("result body must validate: {error}"))?;

@@ -147,6 +147,18 @@ pub enum VerificationProfileError {
         /// How the identity and receipt differ.
         detail: String,
     },
+    /// A PASS receipt records a stage run with no retained evidence.
+    #[error("stage '{stage}' has no retained evidence, so the receipt cannot be PASS")]
+    PassWithoutRetainedEvidence {
+        /// Offending stage identity.
+        stage: String,
+    },
+    /// The receipt claims a proof ceiling other than the pinned family ceiling.
+    #[error("receipt proof ceiling is {observed:?}, not the pinned SCOPED_VERIFICATION")]
+    ProofCeilingMismatch {
+        /// Ceiling the receipt claims.
+        observed: ProofCeiling,
+    },
     /// The aggregate records a different profile identity than the admitted
     /// profile it is being receipted against.
     #[error(
@@ -519,6 +531,52 @@ impl VerificationProfileReceipt {
         }
     }
 
+    /// Validates the receipt's internal consistency before issuance or parity.
+    ///
+    /// A deserialized receipt bypassed every check in
+    /// [`build_verification_profile_receipt`], so both issuance and parity
+    /// must run this gate first. The proof ceiling is pinned to
+    /// [`PROFILE_PROOF_CEILING`], and a PASS outcome additionally requires
+    /// every recorded run to carry retained evidence plus a recorded tool
+    /// identity — omission and absence stay explicit and can never become a
+    /// successful outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerificationProfileError::ProofCeilingMismatch`] when the
+    /// receipt claims any other ceiling,
+    /// [`VerificationProfileError::PassWithoutRetainedEvidence`] when a PASS
+    /// receipt records a run with no retained evidence, and
+    /// [`VerificationProfileError::MissingExecutableIdentity`] when a PASS
+    /// receipt records a run with no tool identity.
+    pub fn validate(&self) -> Result<(), VerificationProfileError> {
+        if self.proof_ceiling != PROFILE_PROOF_CEILING {
+            return Err(VerificationProfileError::ProofCeilingMismatch {
+                observed: self.proof_ceiling,
+            });
+        }
+        if !self.outcome.is_pass() {
+            return Ok(());
+        }
+        for run in &self.runs {
+            if !matches!(run.evidence, StageEvidenceRecord::Retained { .. }) {
+                return Err(VerificationProfileError::PassWithoutRetainedEvidence {
+                    stage: run.stage_id.clone(),
+                });
+            }
+            let identified = run.executable_digest.is_some()
+                && self.tool_identities.iter().any(|identity| {
+                    identity.stage_id == run.stage_id && identity.executable_digest.is_some()
+                });
+            if !identified {
+                return Err(VerificationProfileError::MissingExecutableIdentity {
+                    stage: run.stage_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Deterministic identity over the shared receipt schema.
     ///
     /// The digest covers the schema identity and the profile revision
@@ -801,14 +859,19 @@ impl ReceiptBindings {
 /// # Errors
 ///
 /// Returns the transparent [`VerificationProfileError::Receipt`] when a
-/// binding, fence, disposition, or canonical serialization is invalid, and
+/// binding, fence, disposition, or canonical serialization is invalid,
 /// [`VerificationProfileError::Contract`] when a derived identity value is
-/// rejected.
+/// rejected, and the [`VerificationProfileReceipt::validate`] failures
+/// ([`VerificationProfileError::ProofCeilingMismatch`],
+/// [`VerificationProfileError::PassWithoutRetainedEvidence`],
+/// [`VerificationProfileError::MissingExecutableIdentity`]) when the receipt
+/// itself is internally inconsistent.
 pub fn issue_receipt_envelope(
     receipt: &VerificationProfileReceipt,
     bindings: &ReceiptBindings,
 ) -> Result<ReceiptEnvelope, VerificationProfileError> {
     bindings.validated()?;
+    receipt.validate()?;
     validate_digest(&receipt.profile_digest, "profile_digest")?;
     validate_digest(&receipt.dag_digest, "dag_digest")?;
     validate_digest(&receipt.aggregate_digest, "aggregate_digest")?;
@@ -872,7 +935,7 @@ pub fn issue_receipt_envelope(
         verifier: verifier_binding(receipt, &verifier_artifact_ids, state_fence.clone())?,
         problem: None,
         coordination: None,
-        disposition: disposition_for(receipt),
+        disposition: disposition_for(receipt)?,
     };
     Ok(ReceiptEnvelope::issue(core)?)
 }
@@ -909,32 +972,51 @@ fn verifier_binding(
 /// outcome becomes a non-PASS disposition, so `PARTIAL`, `UNKNOWN`,
 /// `MISSING_REQUIRED`, and `FAIL` never become PASS through this mapping. A
 /// partial aggregate that retains no unresolved item is reported as `Unknown`
-/// rather than being rounded up to a success.
-fn disposition_for(receipt: &VerificationProfileReceipt) -> ReceiptDisposition {
+/// rather than being rounded up to a success. A `PASS` aggregate that records
+/// a run with no retained evidence is refused instead of becoming `Success`,
+/// so a deserialized receipt can never smuggle absence into a success.
+///
+/// # Errors
+///
+/// Returns [`VerificationProfileError::PassWithoutRetainedEvidence`] when a
+/// `PASS` receipt records a run with no retained evidence.
+fn disposition_for(
+    receipt: &VerificationProfileReceipt,
+) -> Result<ReceiptDisposition, VerificationProfileError> {
     let proof = receipt.proof_ceiling;
-    let unresolved = receipt
+    let unretained = receipt
         .runs
         .iter()
         .filter(|run| !matches!(run.evidence, StageEvidenceRecord::Retained { .. }))
+        .collect::<Vec<_>>();
+    let unresolved = unretained
+        .iter()
         .map(|run| format!("stage '{}' has no retained evidence", run.stage_id))
         .collect::<Vec<_>>();
     match receipt.outcome {
-        AggregateOutcome::Pass => ReceiptDisposition::Success { proof },
-        AggregateOutcome::Partial if unresolved.is_empty() => ReceiptDisposition::Unknown {
+        AggregateOutcome::Pass if unresolved.is_empty() => {
+            Ok(ReceiptDisposition::Success { proof })
+        }
+        AggregateOutcome::Pass => Err(VerificationProfileError::PassWithoutRetainedEvidence {
+            stage: unretained
+                .first()
+                .map_or_else(|| "unknown".to_owned(), |run| run.stage_id.clone()),
+        }),
+        AggregateOutcome::Partial if unresolved.is_empty() => Ok(ReceiptDisposition::Unknown {
             reason: "an optional stage did not succeed; no required coverage is missing".to_owned(),
-        },
-        AggregateOutcome::Partial => ReceiptDisposition::Partial { proof, unresolved },
-        AggregateOutcome::Fail => ReceiptDisposition::Failure {
+        }),
+        AggregateOutcome::Partial => Ok(ReceiptDisposition::Partial { proof, unresolved }),
+        AggregateOutcome::Fail => Ok(ReceiptDisposition::Failure {
             code: eliot_receipts::ErrorCode::InvalidIdentity,
             proof,
-        },
-        AggregateOutcome::MissingRequired => ReceiptDisposition::Failure {
+        }),
+        AggregateOutcome::MissingRequired => Ok(ReceiptDisposition::Failure {
             code: eliot_receipts::ErrorCode::NotFound,
             proof,
-        },
-        AggregateOutcome::Unknown => ReceiptDisposition::Unknown {
+        }),
+        AggregateOutcome::Unknown => Ok(ReceiptDisposition::Unknown {
             reason: "a required stage has not reached a terminal successful state".to_owned(),
-        },
+        }),
     }
 }
 
@@ -1037,13 +1119,20 @@ impl ParityVerdict {
 /// # Errors
 ///
 /// Returns [`VerificationProfileError::InvalidDigest`] when a recorded
-/// profile or stage-graph identity is malformed. Every divergence is reported
+/// profile or stage-graph identity is malformed, and the
+/// [`VerificationProfileReceipt::validate`] failures
+/// ([`VerificationProfileError::ProofCeilingMismatch`],
+/// [`VerificationProfileError::PassWithoutRetainedEvidence`],
+/// [`VerificationProfileError::MissingExecutableIdentity`]) when either
+/// receipt is internally inconsistent. Every divergence is reported
 /// as [`ParityVerdict::NonPass`] rather than raised, so a caller records the
 /// non-PASS outcome instead of losing the run.
 pub fn verify_profile_parity(
     local: &VerificationProfileReceipt,
     ci: &VerificationProfileReceipt,
 ) -> Result<ParityVerdict, VerificationProfileError> {
+    local.validate()?;
+    ci.validate()?;
     for receipt in [local, ci] {
         validate_digest(&receipt.profile_digest, "profile_digest")?;
         validate_digest(&receipt.dag_digest, "dag_digest")?;

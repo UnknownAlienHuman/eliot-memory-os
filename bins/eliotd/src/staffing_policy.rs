@@ -20,10 +20,26 @@
 //! local-only privacy ceiling closes external lanes fail-closed. Provider
 //! switching mid-attempt is denied unless an explicit receipted
 //! policy-authorized degradation binds the continuation before it proceeds.
-//! The Governor caller persists the returned candidate; [`verify_receipt_digest`]
-//! rebinds the digest at that boundary.
+//!
+//! The Governor caller persists the returned candidate;
+//! [`verify_receipt_digest`] rebinds the digest at that boundary, and
+//! [`enforce_plan_receipt`] re-checks it there.
+//!
+//! [`plan_coordinator_staffing`] is the checked, lossless bridge from the live
+//! `eliotd` coordinator request ([`StaffingPlanRequest`]) onto
+//! [`plan_staffing`]. It is not a second planner: it only translates the live
+//! request's own route candidates, quota/capacity evidence, privacy class and
+//! budgets into the policy planner's inputs, and the receipt it returns is the
+//! single authority on which routes a plan may use.
+//! [`enforce_plan_receipt`] is the matching check on the compiled coordinator
+//! candidate: a lane route the receipt did not authorize — including a
+//! same-family or paid substitute for an unavailable independent audit — is
+//! refused instead of dispatched.
 
 use eliot_agent_api::{BudgetEnvelope, RouteFingerprint};
+use eliot_agent_coordinator::{
+    CoordinatorConfig, RouteCandidateEvidence, StaffingPlanCandidate, StaffingPlanRequest,
+};
 use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -737,5 +753,277 @@ pub fn check_attempt_route_continuity(
     }
     validate_text(&approval.reason, "degradation_reason")?;
     validate_text(&approval.policy_revision, "policy_revision")?;
+    Ok(())
+}
+
+/// Per-job budget ceiling for one coordinator plan: the element-wise union of
+/// the request's lane budgets. Every lane budget of the plan therefore sits
+/// within this ceiling, and no lane can widen it.
+fn coordinator_plan_budget(
+    request: &StaffingPlanRequest,
+) -> Result<BudgetEnvelope, StaffingPolicyError> {
+    let mut ceiling: Option<BudgetEnvelope> = None;
+    for lane in &request.lanes {
+        lane.budget
+            .validate()
+            .map_err(|error| StaffingPolicyError::Contract(format!("lane budget: {error}")))?;
+        ceiling = Some(match ceiling {
+            None => lane.budget.clone(),
+            Some(current) => BudgetEnvelope {
+                context_tokens: current.context_tokens.max(lane.budget.context_tokens),
+                wall_time_ms: current.wall_time_ms.max(lane.budget.wall_time_ms),
+                output_bytes: current.output_bytes.max(lane.budget.output_bytes),
+                cost_microunits: current.cost_microunits.max(lane.budget.cost_microunits),
+                max_depth: current.max_depth.max(lane.budget.max_depth),
+                max_descendants: current.max_descendants.max(lane.budget.max_descendants),
+            },
+        });
+    }
+    let ceiling = ceiling.ok_or_else(|| {
+        StaffingPolicyError::Contract("staffing plan requires at least one lane".to_owned())
+    })?;
+    ceiling
+        .validate()
+        .map_err(|error| StaffingPolicyError::Contract(format!("plan budget: {error}")))?;
+    Ok(ceiling)
+}
+
+/// Task-class `ModelRolePolicy` for one frozen coordinator recipe, plus
+/// whether that recipe asks for an independent review lane.
+///
+/// The live coordinator request carries no human assurance/cost field, so the
+/// recipe's own declared staffing shape selects the preset: a recipe declaring
+/// more than one role profile asks for a writer plus a review lane, which is
+/// the I3.6 `assurance` shape ("one writer plus mandatory blind cross-family
+/// audit"); a single-role recipe is `balanced` ("one writer plus conditional
+/// independent review"). No provider proportion is ever read: the preset is a
+/// decision policy and the per-job budget is the plan ceiling from
+/// [`coordinator_plan_budget`]. Lane and writer counts above the policy
+/// bounds are refused rather than widened.
+fn coordinator_recipe_policy(
+    request: &StaffingPlanRequest,
+) -> Result<(ModelRolePolicy, bool), StaffingPolicyError> {
+    let review_requested = request.recipe.role_profiles.len() > 1;
+    let budget = coordinator_plan_budget(request)?;
+    let policy = if review_requested {
+        ModelRolePolicy::assurance(budget)?
+    } else {
+        ModelRolePolicy::balanced(budget)?
+    };
+    if request.lanes.len() > usize::from(policy.max_active_lanes) {
+        return Err(StaffingPolicyError::Contract(format!(
+            "recipe requests {} lanes above the policy active-lane bound {}",
+            request.lanes.len(),
+            policy.max_active_lanes
+        )));
+    }
+    let mutation_capable = request
+        .recipe
+        .role_profiles
+        .iter()
+        .filter(|profile| profile.mutation_capable)
+        .count();
+    if mutation_capable > usize::from(policy.max_writers_per_deliverable) {
+        return Err(StaffingPolicyError::Contract(format!(
+            "recipe declares {mutation_capable} mutation-capable roles above the policy writer bound {}",
+            policy.max_writers_per_deliverable
+        )));
+    }
+    Ok((policy, review_requested))
+}
+
+/// One live route candidate as the policy consumes it.
+///
+/// Family is the I3.4 host-family identity layer. A candidate whose observed
+/// budget evidence already carries model cost is a paid route, so it can never
+/// silently satisfy an unavailable independent-audit requirement. Quota
+/// admission is the coordinator's own active capacity window: the candidate
+/// must carry the exact `capacity_identity`/`capacity_revision` of the live
+/// [`CoordinatorConfig`]. Route-local privacy admission is not carried by the
+/// live request; the task privacy class is the plan ceiling and the policy's
+/// local-only data classes close external lanes before any candidate is
+/// considered, so a candidate that cannot admit the task class never reaches
+/// the planner.
+fn coordinator_route_candidate(
+    config: &CoordinatorConfig,
+    candidate: &RouteCandidateEvidence,
+) -> Result<RouteCandidate, StaffingPolicyError> {
+    let evidence_ref = candidate
+        .evidence_refs
+        .first()
+        .ok_or_else(|| {
+            StaffingPolicyError::Contract(
+                "route candidate carries no capability evidence reference".to_owned(),
+            )
+        })?
+        .clone();
+    Ok(RouteCandidate {
+        family: candidate.route.host_family.clone(),
+        paid: candidate.budget_evidence.model_cost_micros > 0,
+        route: candidate.route.clone(),
+        eligibility: RouteEligibility {
+            quota_admits: candidate.capacity_identity == config.capacity_identity
+                && candidate.capacity_revision == config.capacity_revision,
+            capacity_admits: candidate.capacity_limit > 0,
+            privacy_admits: true,
+        },
+        evidence_ref,
+    })
+}
+
+/// The live request's route candidates as capability evidence per I3.6 class.
+///
+/// Every class the policy can staff or disposition draws from the same live
+/// candidate pool, so the policy — not the caller — decides which class a
+/// route may serve. The same route offered by several lanes is recorded once,
+/// in lane then candidate order, so the evidence is deterministic.
+fn coordinator_route_evidence(
+    config: &CoordinatorConfig,
+    request: &StaffingPlanRequest,
+    policy: &ModelRolePolicy,
+) -> Result<Vec<RouteClassEvidence>, StaffingPolicyError> {
+    let mut classes: Vec<String> = policy.worker_route_classes.clone();
+    classes.extend(policy.auditor_route_classes.iter().cloned());
+    classes.extend(policy.dreamer_route_classes.iter().cloned());
+    classes.sort();
+    classes.dedup();
+
+    let mut records = Vec::with_capacity(classes.len());
+    for class in classes {
+        let mut candidates: Vec<RouteCandidate> = Vec::new();
+        for lane in &request.lanes {
+            for candidate in &lane.route_candidates {
+                let mapped = coordinator_route_candidate(config, candidate)?;
+                if candidates.iter().any(|seen| seen.route == mapped.route) {
+                    continue;
+                }
+                candidates.push(mapped);
+            }
+        }
+        let mut evidence_refs: Vec<String> = candidates
+            .iter()
+            .map(|item| item.evidence_ref.clone())
+            .collect();
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        records.push(RouteClassEvidence {
+            route_class: class,
+            candidates,
+            evidence_refs,
+        });
+    }
+    Ok(records)
+}
+
+/// Budget/privacy constraints the plan receipt binds, taken verbatim from the
+/// live request: the plan budget ceiling, the request's own privacy class, and
+/// every capability evidence reference the request carries.
+fn coordinator_constraints(
+    request: &StaffingPlanRequest,
+    budget: &BudgetEnvelope,
+) -> StaffingConstraints {
+    let mut evidence_refs = request.launch.evidence_capability_refs.clone();
+    for lane in &request.lanes {
+        for candidate in &lane.route_candidates {
+            evidence_refs.extend(candidate.evidence_refs.iter().cloned());
+        }
+    }
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    StaffingConstraints {
+        budget: budget.clone(),
+        privacy_ceiling: request.privacy_class,
+        evidence_refs,
+    }
+}
+
+/// Plans task-class staffing for the live coordinator request (I3.6).
+///
+/// This is the bridge from `eliot_agent_coordinator::StaffingPlanRequest` onto
+/// [`plan_staffing`], not a second planner and not a second policy type: the
+/// coordinator request keeps its own vocabulary and its own deterministic
+/// ranking, and the returned [`StaffingPlanReceipt`] becomes the single
+/// authority on which routes this task class may use. The receipt identifies
+/// the selected route classes, the selected routes, the budget/privacy
+/// constraints it was computed under, and the evidence inputs used.
+///
+/// # Errors
+///
+/// Returns the planner rejection unchanged, including
+/// [`StaffingPolicyError::NoWriterRoute`] when no writer route clears quota,
+/// capacity and privacy admission under current evidence.
+pub fn plan_coordinator_staffing(
+    config: &CoordinatorConfig,
+    request: &StaffingPlanRequest,
+) -> Result<StaffingPlanReceipt, StaffingPolicyError> {
+    let (policy, review_requested) = coordinator_recipe_policy(request)?;
+    let evidence = coordinator_route_evidence(config, request, &policy)?;
+    let constraints = coordinator_constraints(request, &policy.per_job_budget);
+    plan_staffing(
+        &policy,
+        request.work_class.as_wire_str(),
+        review_requested,
+        &evidence,
+        &constraints,
+    )
+}
+
+/// Enforces one staffing plan receipt against the compiled coordinator
+/// candidate.
+///
+/// The receipt is the only source of authorized routes for the plan, so this
+/// is the structural form of "no silent substitution". Each planned lane is
+/// bound positionally to the receipt lane that staffed the same role, which is
+/// what stops a writer route from being reused as its own review lane: the
+/// audit position accepts only the cross-family, unpaid route the policy
+/// actually staffed, so a same-family or paid stand-in — or the writer's own
+/// route in the audit position — is refused rather than dispatched, and the
+/// receipt's explicit [`UnavailableClassDisposition`] for that class stays the
+/// record of why it is unavailable. The plan's privacy class must equal the
+/// receipt's ceiling, no lane budget may exceed the receipt's per-job budget,
+/// and a plan may staff fewer routes than the receipt only by leaving the
+/// remaining receipted class unstaffed, never by adding one.
+///
+/// The receipt's integrity is re-bound here through [`verify_receipt_digest`],
+/// so a receipt that did not survive its persistence boundary fails closed.
+///
+/// # Errors
+///
+/// Returns the receipt or contract rejection describing the first planned lane
+/// the receipt does not authorize.
+pub fn enforce_plan_receipt(
+    receipt: &StaffingPlanReceipt,
+    candidate: &StaffingPlanCandidate,
+) -> Result<(), StaffingPolicyError> {
+    verify_receipt_digest(receipt)?;
+    if candidate.privacy_class != receipt.privacy_ceiling {
+        return Err(StaffingPolicyError::Contract(
+            "planned privacy class does not match the staffing plan ceiling".to_owned(),
+        ));
+    }
+    if candidate.lanes.len() > receipt.lanes.len() {
+        return Err(StaffingPolicyError::Contract(format!(
+            "plan staffs {} routes above the {} the staffing plan receipt authorized",
+            candidate.lanes.len(),
+            receipt.lanes.len()
+        )));
+    }
+    for (planned, staffed) in candidate.lanes.iter().zip(receipt.lanes.iter()) {
+        let Some(selected) = planned.routing.selected.as_ref() else {
+            return Err(StaffingPolicyError::Contract(
+                "planned lane selected no route; the staffing plan receipt authorizes no substitution"
+                    .to_owned(),
+            ));
+        };
+        if selected != &staffed.route {
+            return Err(StaffingPolicyError::Contract(format!(
+                "planned lane selected a route other than the {} route the staffing plan receipt authorized",
+                staffed.role
+            )));
+        }
+        planned.budget.is_within(&receipt.budget).map_err(|error| {
+            StaffingPolicyError::Contract(format!("planned lane budget: {error}"))
+        })?;
+    }
     Ok(())
 }

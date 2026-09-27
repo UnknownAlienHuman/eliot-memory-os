@@ -441,9 +441,24 @@ impl ContextCompiler {
         resolved_cues: &PacketResolvedCues,
     ) -> Result<PacketCandidateOutcome, EngineError> {
         let (reads, read_audit) = self.read_context(request, resolved_cues).await?;
-        let scope_claims = reads.fetch.claims.clone();
+        let scope_claims = reads
+            .fetch
+            .claims
+            .iter()
+            .filter(|claim| {
+                reads
+                    .admissible_claim_handles
+                    .contains(&claim_handle(claim))
+                    && is_admissible_packet_claim_status(claim.status)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let filters = normalized_filter(&request.candidate_handles);
-        let buckets = bucket_claims(&reads.fetch.claims, &filters);
+        let buckets = bucket_claims(
+            &reads.fetch.claims,
+            &filters,
+            &reads.admissible_claim_handles,
+        );
         let mut packet = assemble_packet(request, reads, buckets);
         if let Some(scope) = current_git_scope {
             resolve_memory_applicability(&mut packet, &scope_claims, scope);
@@ -537,28 +552,17 @@ impl ContextCompiler {
                 })
                 .await?;
             let revision = current_state.memory_revision;
-            let mut handles = request.candidate_handles.clone();
-            handles.extend(
-                current_state
-                    .verified_now
-                    .iter()
-                    .map(|claim| format!("claim:{}", claim.claim_id)),
-            );
+            let admissible_claim_handles = current_state_claim_allowlist(&current_state);
+            let mut handles = request
+                .candidate_handles
+                .iter()
+                .filter(|handle| is_admissible_fetch_handle(handle, &admissible_claim_handles))
+                .cloned()
+                .collect::<Vec<_>>();
+            handles.extend(admissible_claim_handles.iter().cloned());
             // Canonical current_state is authoritative for L3 separation; recall is
             // best-effort ranking and must not be the sole carrier for
             // Supported/Weak handles when candidate_handles is empty.
-            handles.extend(
-                current_state
-                    .supported_now
-                    .iter()
-                    .map(|claim| format!("claim:{}", claim.claim_id)),
-            );
-            handles.extend(
-                current_state
-                    .weak_or_candidate
-                    .iter()
-                    .map(|claim| format!("claim:{}", claim.claim_id)),
-            );
             read_audit.l0_reads += 1;
             let recall = self
                 .read
@@ -574,7 +578,14 @@ impl ContextCompiler {
                     concept_refs: resolved_cues.concept_refs.clone(),
                 })
                 .await?;
-            handles.extend(recall.handles.iter().map(|preview| preview.handle.clone()));
+            handles.extend(
+                recall
+                    .handles
+                    .iter()
+                    .map(|preview| &preview.handle)
+                    .filter(|handle| is_admissible_fetch_handle(handle, &admissible_claim_handles))
+                    .cloned(),
+            );
             handles.sort();
             handles.dedup();
             read_audit.l2_reads += 1;
@@ -606,6 +617,7 @@ impl ContextCompiler {
                         current_state,
                         recall,
                         fetch,
+                        admissible_claim_handles,
                     },
                     read_audit,
                 ));
@@ -1433,6 +1445,7 @@ struct CompilerReads {
     current_state: CurrentStateResponse,
     recall: RecallL0Response,
     fetch: FetchAtomsL2Response,
+    admissible_claim_handles: HashSet<String>,
 }
 
 struct ClaimBuckets {
@@ -1444,7 +1457,11 @@ struct ClaimBuckets {
     open_questions: Vec<String>,
 }
 
-fn bucket_claims(claims: &[ClaimCard], filters: &HashSet<String>) -> ClaimBuckets {
+fn bucket_claims(
+    claims: &[ClaimCard],
+    filters: &HashSet<String>,
+    admissible_claim_handles: &HashSet<String>,
+) -> ClaimBuckets {
     let mut buckets = ClaimBuckets {
         relevant_verified_claims: Vec::new(),
         relevant_supported_claims: Vec::new(),
@@ -1454,10 +1471,12 @@ fn bucket_claims(claims: &[ClaimCard], filters: &HashSet<String>) -> ClaimBucket
         open_questions: Vec::new(),
     };
 
-    for claim in claims
-        .iter()
-        .filter(|claim| filters.is_empty() || filters.contains(&claim_handle(claim)))
-    {
+    for claim in claims.iter().filter(|claim| {
+        let handle = claim_handle(claim);
+        admissible_claim_handles.contains(&handle)
+            && is_admissible_packet_claim_status(claim.status)
+            && (filters.is_empty() || filters.contains(&handle))
+    }) {
         bucket_claim(claim, &mut buckets);
     }
     buckets
@@ -1740,7 +1759,12 @@ fn assemble_packet(
     reads: CompilerReads,
     buckets: ClaimBuckets,
 ) -> ContextPacketL3 {
-    let exact_handles = collect_exact_handles(request, &reads.recall, &buckets);
+    let exact_handles = collect_exact_handles(
+        request,
+        &reads.recall,
+        &buckets,
+        &reads.admissible_claim_handles,
+    );
     let source_receipts = collect_source_receipts(&reads.fetch);
     let at_revision = max_revision(reads.current_state.memory_revision, reads.fetch.at_revision);
     let mut packet = empty_packet(
@@ -2030,12 +2054,14 @@ fn collect_exact_handles(
     request: &CompilePacketL3Request,
     recall: &RecallL0Response,
     buckets: &ClaimBuckets,
+    admissible_claim_handles: &HashSet<String>,
 ) -> Vec<String> {
     let mut exact_handles = BTreeSet::new();
     for handle in request
         .candidate_handles
         .iter()
         .chain(recall.handles.iter().map(|preview| &preview.handle))
+        .filter(|handle| is_admissible_fetch_handle(handle, admissible_claim_handles))
     {
         exact_handles.insert(handle.clone());
     }
@@ -2709,6 +2735,66 @@ fn normalized_filter(handles: &[String]) -> HashSet<String> {
 
 fn claim_handle(claim: &ClaimCard) -> String {
     format!("claim:{}", claim.claim_id)
+}
+
+fn current_state_claim_allowlist(current_state: &CurrentStateResponse) -> HashSet<String> {
+    let excluded = current_state
+        .contested_now
+        .iter()
+        .chain(current_state.do_not_use.iter())
+        .map(|claim| format!("claim:{}", claim.claim_id))
+        .collect::<HashSet<_>>();
+    current_state
+        .verified_now
+        .iter()
+        .chain(current_state.supported_now.iter())
+        .chain(current_state.weak_or_candidate.iter())
+        .filter(|claim| is_admissible_packet_claim_status(claim.status))
+        .map(|claim| format!("claim:{}", claim.claim_id))
+        .filter(|handle| !excluded.contains(handle))
+        .collect()
+}
+
+fn is_admissible_fetch_handle(handle: &str, admissible_claim_handles: &HashSet<String>) -> bool {
+    let Some((kind, identity)) = handle.trim().split_once(':') else {
+        // An untyped L2 selector can match a claim regardless of its status.
+        return false;
+    };
+    if identity.is_empty() {
+        return false;
+    }
+    match kind {
+        "claim" | "claim_card" => admissible_claim_handles.contains(&format!("claim:{identity}")),
+        "memory-segment"
+        | "memory"
+        | "file"
+        | "evidence"
+        | "evidence_atom"
+        | "verification"
+        | "verification_run"
+        | "observation"
+        | "tool_observation"
+        | "failure"
+        | "failure_fingerprint"
+        | "card"
+        | "capsule"
+        | "charter"
+        | "map"
+        | "system-map" => true,
+        // Unknown prefixes are also untyped at the Store boundary.
+        _ => false,
+    }
+}
+
+fn is_admissible_packet_claim_status(status: EpistemicStatus) -> bool {
+    matches!(
+        status,
+        EpistemicStatus::Verified
+            | EpistemicStatus::Supported
+            | EpistemicStatus::Candidate
+            | EpistemicStatus::Observed
+            | EpistemicStatus::Unknown
+    )
 }
 
 fn max_revision(left: MemoryRevision, right: MemoryRevision) -> MemoryRevision {

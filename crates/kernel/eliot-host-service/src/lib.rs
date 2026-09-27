@@ -36,7 +36,8 @@ pub use reactive_context_delivery::{
     ReactiveContextEndpointResolution, ReactiveContextQueryOutcome, ReactiveContextQueryRequest,
     ReactiveContextResolveRequest, ReactiveContextResolvedEndpoint, ReactiveContextSendOutcome,
     ReactiveContextSendRequest, ReactiveContextTransportError, ReactiveContextTransportPort,
-    ReactiveContextTransportReceipt, RestartReconciliation, SystemReactiveContextClock,
+    ReactiveContextTransportReceipt, ReconnectReplayReport, RestartReconciliation,
+    SystemReactiveContextClock,
 };
 
 pub use eliot_kernel_service::{

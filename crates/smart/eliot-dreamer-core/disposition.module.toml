@@ -1,0 +1,499 @@
+# Issue #1143 work item 3 — one disposition per public item of
+# `eliot-dreamer-core`.
+#
+# Companion record for the `SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE` donor row in
+# `crates/smart/cognitive-donor-map.toml` (same `disposition` vocabulary, same
+# `rejected_overgeneralization` field). It is the item-level ledger the donor
+# map does not have room for.
+#
+# This file is deliberately NOT named `module.toml`. A bare `module.toml` is
+# read by `scripts/code_navigation_lib/capsules.py` (`MODULE_MANIFEST`) as the
+# declaration of a `FunctionalCapabilityCell` via its `module_id`. A retiring
+# legacy facade must not mint a cell id, so the record uses the
+# `<name>.module.toml` form already used by
+# `crates/governor/eliot-observation/classifier.module.toml` and
+# `crates/meta/eliot-improvement/{learning-closure,promotion}.module.toml`.
+#
+# Nothing here deletes code. The issue's deletion step is a separate pass.
+
+schema_version = 1
+record_id = "eliot-dreamer-core.aggregate-disposition.1143"
+crate = "eliot-dreamer-core"
+package_path = "crates/smart/eliot-dreamer-core"
+issue = 1143
+recorded_at_base = "a318023b"
+disposition = "split"
+disposition_meaning = "Time-bounded migration facade. It is not a current FunctionalCapabilityCell and holds no cell id, lifecycle ownership, canonical state, authority, durable scheduling, provider execution or Finish role."
+governing_anchors = [
+  "ARCH-DRM-01",
+  "ARCH-DRM-02",
+  "ARCH-DRM-03",
+  "ARCH-MOD-02",
+  "ARCH-MOD-03",
+  "ARCH-GROUND-01",
+  "ARCH-FIN-01",
+]
+proof_ceiling = "METADATA_DISPOSITION_ONLY"
+runtime_completion = false
+product_acceptance = false
+
+[measured_reverse_consumers]
+method = "cargo metadata --locked --format-version 1 reverse-dependency join, plus git grep -n for construction and call sites"
+cargo_reverse_dependents = []
+source_call_sites_outside_package = []
+in_package_consumers = [
+  "crates/smart/eliot-dreamer-core/src/lib.rs:465 #[cfg(test)] mod differential_1143",
+  "crates/smart/eliot-dreamer-core/src/advice_gate.rs:339 #[cfg(test)] mod advice_gate_1924",
+]
+in_package_consumer_note = "Per the issue, the package itself, public type definitions without a call site, in-package unit tests and doc examples are NOT consumers. The two entries above are therefore excluded from the reverse-consumer set."
+conclusion = "Zero identified current consumers. Four items are already owned one-for-one by a verified current cell or are pure re-exports of an owner (migrate); the remainder have no consumer and no owner to preserve them (delete)."
+
+[counts]
+public_items = 37
+migrate = 4
+bounded_fixture = 0
+delete = 33
+denominator_basis = "Exhaustive enumeration of unrestricted `pub` items in crates/smart/eliot-dreamer-core/src/{lib.rs,advice_gate.rs}, excluding `pub(crate)` items, `#[cfg(test)]` modules and the package name itself, per the issue's non-consumer exclusions. The eight `advice_gate` items re-exported by lib.rs are counted once each at their definition site."
+bounded_fixture_zero_reason = "The issue defines a bounded fixture as retained 'only for an identified current consumer'. No current consumer was identified, so no item can honestly qualify. Recording a fixture row would be fabricated retention authority."
+
+[metadata_references_to_close_before_any_delete]
+# Work item 6 owns the actual removal. Measured 2026-09-27 at a318023b.
+root_workspace_member = "Cargo.toml:113"
+lockfile_entry = "Cargo.lock (package eliot-dreamer-core)"
+shipped_serde_boundary_rows = [
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:AdviceCandidate:64",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:AdviceClass:28",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:AdviceGate:142",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:AdviceProposal:100",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:AdviceState:50",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:NegativeMemoryEntry:88",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/advice_gate.rs:OwnerDecision:80",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:CandidateArtifact:303",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:CandidateKind:202",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:DreamBudget:235",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:DreamPacket:321",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:PreservationReport:288",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:PrivacyClass:226",
+  "eliot-dreamer-core:crates/smart/eliot-dreamer-core/src/lib.rs:Requester:191",
+]
+donor_map_rows = [
+  "crates/smart/cognitive-donor-map.toml:41 [[donor]] crates/smart/eliot-dreamer-core",
+]
+owner_donor_anchors = [
+  "crates/smart/eliot-dreamer-contracts/module.toml:40",
+  "crates/smart/eliot-dreamer-bundle/module.toml:40",
+  "crates/smart/eliot-dreamer-candidate-validation/module.toml:40",
+  "crates/smart/eliot-dreamer-claim-grounding/module.toml:32",
+  "crates/smart/eliot-dreamer-clarification/module.toml:40",
+  "crates/smart/eliot-dreamer-curation/module.toml:40",
+  "crates/smart/eliot-dreamer-cycle/module.toml:40",
+  "crates/smart/eliot-dreamer-orientation/module.toml:40",
+  "crates/smart/eliot-dreamer-probe-plan/module.toml:38",
+  "crates/smart/eliot-dreamer-rival-model/module.toml:33",
+]
+in_package_fixtures = [
+  "crates/smart/eliot-dreamer-core/src/lib.rs:465 mod differential_1143 (EDGE-DRM-1143)",
+  "crates/smart/eliot-dreamer-core/src/advice_gate.rs:339 mod advice_gate_1924 (issue #1924 acceptance)",
+]
+generated_doc_indexes = ["docs/code-navigation/PACKAGE_DOCS_INDEX.md", "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"]
+generated_serde_registry = "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
+
+[removal_precondition]
+statement = "No `delete` row may be executed in this pass. Before any future deletion, the EDGE-DRM-1143 differential in `mod differential_1143` must be relocated into the owning cells' own suites, otherwise deletion drops the only live assertion that generation on the canonical shapes stays candidate-only."
+blocking_residue = "Root `Cargo.toml:113` member line, the `Cargo.lock` own-entry and the fourteen shipped-serde-boundary rows. #1100/#11 still cannot run with aggregate fallback disabled."
+separate_issues = "work items 4 (duplicate owners), 5 (consumer-edge migration) and 6 (residue removal) of #1143; #1924 owns the advice change-control gate acceptance."
+
+# ------------------------------------------------- CrateExtractionDecision ---
+
+[extraction_decision]
+affected_functional_cells_and_lifecycle_owners = "None declared by this package. Contract shapes are owned by smart.dreamer.contracts (A-03); assembly by smart.dreamer.bundle (A-04); validation by smart.dreamer.candidate_validation (A-05); the kind families and 13 typed handler cells by smart.dreamer.curation and the A-21..A-31 handlers. The advice change-control gate has no admitted current cell — see blocked_items below."
+current_source_dependency_and_change_closure = "src/lib.rs (739 lines) and src/advice_gate.rs (444 lines). Depends only on eliot-dreamer-contracts, eliot-contracts, blake3, schemars, serde, serde_json, thiserror. Change closure is the package plus the generated serde registry and ten owner donor anchors."
+proposed_package_boundary = "None new. The remaining body is a candidate-only generator, a set of superseded duplicate shapes and an unadmitted advice gate; none is a new capability boundary."
+public_contract_and_independent_test_entrypoint = "mod differential_1143 (EDGE-DRM-1143, three fixtures) and mod advice_gate_1924 (issue #1924 acceptance). Both are in-package fixtures and are explicitly not consumers."
+first_real_consumer_or_time_bounded_migration_facade = "Time-bounded migration facade with no first real consumer. Measured reverse-dependency set is empty. Three items (JobClass, DreamJobInput, ModelDraft) are already re-exports of eliot-dreamer-contracts, so the facade is a re-export surface plus one generator rather than a second contract owner."
+source_maintenance_owner_and_vendor_type_boundary = "No vendor types. Identities, fences and epoch lineage come from eliot-contracts. The model draft is a bounded text projection; no provider SDK, storage type or runtime handle is present."
+dependency_security_license_and_build_isolation = "No new dependency and no optional edge. Removing the package removes one workspace member, one `Cargo.lock` entry and fourteen serde-boundary rows."
+expected_agent_workset_context_and_reverse_fanout_delta = "Removing the package removes ~1183 source lines from the Dreamer workset. Reverse fan-out is currently zero, so the measured delta is workset size, not fan-in."
+expected_compile_test_integration_and_release_cost_delta = "Removes one workspace member, one `Cargo.lock` entry and one build target. No integration or release cost is added."
+migration_reexport_rollback_removal_and_expiry = "Six rows are already migrated (three canonical re-exports plus three one-to-one delegations); the thirty-four `delete` rows require no migration because nothing consumes them. Expiry is the removal of the last `metadata_references_to_close_before_any_delete` entry."
+counter_risks_merge_or_rejoin_condition = "Rejoin is not proposed. Counter-risk: the advice change-control gate is the only implementation of the I18.40 / MAINT-4 negative-procedural-memory rule for repeated topology advice, and it has no admitted current owner. Deleting it before an owner is admitted would silently drop that duty. This is recorded, not acted on."
+evidence_status_and_review_owner = "Evidence is current Cargo metadata and current `git grep` call sites at a318023b, not a runtime observation. Review owner is the #1143 integration owner; I19 legacy owners are retained until a replacement is proved, so removal is deferred past OSP1."
+disposition = "split"
+
+[rejected_overgeneralization]
+text = "One generator that mixes job contracts, bundle construction, validation, self-query authority domains, subtype semantics, scheduling or promotion."
+source = "crates/smart/cognitive-donor-map.toml [[donor]] crates/smart/eliot-dreamer-core"
+additions_from_this_ledger = [
+  "A second requester-binding owner: the flat `Requester` carries no origin or principal/session binding that model text could rewrite, so it can never replace contracts `RequesterOrigin` + `Requester` binding.",
+  "A second wire-vocabulary owner: the SCREAMING_SNAKE_CASE facade enums are never equated with the canonical snake_case owner spellings, even through case folding.",
+  "A second budget-grant owner: `DreamBudget::route_cost_units` is a passthrough, never an authorization; only the 11 independent `BudgetLimits` dimensions grant.",
+  "A second promotion or finish surface: aggregate output cannot acquire Research acquisition, Governor admission, canonical state, authority, durable scheduling, provider execution or VERIFIED_COMPLETE.",
+  "A second negative-memory state owner: the advice gate's in-memory negative map has no admitted current owner and must not be treated as the canonical failure memory of I12.19.",
+]
+
+# ------------------------------------------------------------- item ledger ---
+
+[[item_disposition]]
+item = "CONTRACT_NAME"
+kind = "const"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:189 pub const CONTRACT_NAME: &str = \"eliot.smart.dreamer.contracts\""
+basis = "A second contract-name string for the same capability. The owner spelling already differs (`eliot.smart.dreamer` vs `eliot.smart.dreamer.contracts`) and is never equated with it."
+removal_condition = "Delete with CONTRACT_VERSION once no replay or diagnostic consumer names the facade string. Wire schema identities are never merged."
+
+[[item_disposition]]
+item = "CONTRACT_VERSION"
+kind = "const"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:191 pub const CONTRACT_VERSION: &str = \"1.0.0\"; crates/smart/eliot-dreamer-contracts/src/job.rs:26 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1"
+basis = "Divergence D-DRM-6: a `ContractVersion(1,0,0)` triple is not the same wire identity as the owner `&str \"1.0.0\"` plus the u32 job schema version. No current consumer."
+removal_condition = "With CONTRACT_NAME."
+
+[[item_disposition]]
+item = "MAX_TEXT"
+kind = "const"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "Per-field `check_text` bounds across the owner contract modules (for example crates/smart/eliot-dreamer-contracts/src/curation.rs:75 check_text(h, \"targets\", MAX_TEXT)), plus `check_vec_bound` collection ceilings in bundle.rs and assembly/material.rs"
+basis = "A single coarse ceiling (16384) cannot express per-field or per-collection limits, so it is a duplicate bound, not an owner. No current consumer."
+removal_condition = "After bundle and candidate-validation own every bound the facade claimed."
+
+[[item_disposition]]
+item = "MAX_ITEMS"
+kind = "const"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "Per-collection `MAX_ITEMS` bounds in the owner kind-family contracts, e.g. crates/smart/eliot-dreamer-contracts/src/classification/input.rs:311-312"
+basis = "Duplicate collection ceiling. Owner bounds are per collection; the facade value is global and cannot be enforced across the independent kind families."
+removal_condition = "After candidate-validation owns every bound the facade claimed."
+
+[[item_disposition]]
+item = "MAX_SOURCES"
+kind = "const"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "Lineage and source-width bounds owned by the owner contracts, e.g. crates/smart/eliot-dreamer-contracts/src/candidate.rs:245 check_vec_bound(self.source_handles.len(), 1024, \"source_handles\")"
+basis = "Duplicate lineage ceiling. The generator's own handle-closure check is stricter and derived, never granted from this constant."
+removal_condition = "After candidate-validation owns every bound the facade claimed."
+
+[[item_disposition]]
+item = "DreamerError"
+kind = "enum"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts + smart.dreamer.candidate_validation"
+owner_package = "eliot-dreamer-contracts, eliot-dreamer-candidate-validation"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/error.rs:94 pub enum ContractViolation; crates/smart/eliot-dreamer-contracts/src/validation/error.rs:7 pub enum DreamDraftValidationError; the last two variants of the facade enum already `#[from]` the owner error"
+basis = "Error-mapping layer over two owner error vocabularies. It translates two cases (BindingMismatch on the budget field -> BudgetExhausted, ForbiddenCarry -> UnsupportedPromotion) and passes everything else through verbatim, so it owns no error semantics."
+removal_condition = "After the pipeline reports owner errors directly. It is the error type asserted by mod differential_1143."
+
+[[item_disposition]]
+item = "Requester"
+kind = "enum"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/job.rs:86 pub enum RequesterOrigin; crates/smart/eliot-dreamer-contracts/src/job.rs:107 pub struct Requester (origin + principal/session binding)"
+basis = "Divergence D-DRM-4. A flat four-variant SCREAMING_SNAKE enum carries no binding model text cannot rewrite. Only Human/human is an exact correspondence; the rest is a proposed mapping, never asserted. Canonical `DreamJobInput::requester` is a plain string, so this enum is not even wired into the live path."
+removal_condition = "After intake owns requester binding on the canonical job shape. No current consumer."
+
+[[item_disposition]]
+item = "CandidateKind"
+kind = "enum"
+disposition = "delete"
+current_owner = "smart.dreamer.curation + the A-21..A-31 handler cells"
+owner_package = "eliot-dreamer-contracts, eliot-dreamer-classification, eliot-dreamer-relation, eliot-dreamer-episode, eliot-dreamer-concept, eliot-dreamer-procedure, eliot-dreamer-failure, eliot-dreamer-structure-repair, eliot-dreamer-reconsolidation, eliot-dreamer-accessibility, eliot-dreamer-memory-repair, eliot-dreamer-rival-model, eliot-dreamer-probe-plan, eliot-dreamer-clarification"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/curation.rs:32 pub enum CurationKind (12 closed variants with the frozen snake_case wire spellings); the 14 named handler module.toml files each declare their own module_id"
+basis = "A 17-variant aggregate kind enum that both duplicates the closed owner CurationKind and mixes in non-curation kinds (Probe, Maintenance, WorkPlan). It is the clearest second kind-routing owner in the package. No current consumer; the live generator hardcodes `CandidateKind::Interpretation`."
+removal_condition = "After curation dispatch and the 14 typed handlers admit every kind they own. This row is a primary work-item-4 duplicate-owner target."
+
+[[item_disposition]]
+item = "PrivacyClass"
+kind = "enum"
+disposition = "delete"
+current_owner = "eliot-security-contracts (foundation)"
+owner_package = "eliot-security-contracts"
+owner_evidence = "crates/foundation/eliot-security-contracts/src/surface_types.rs:475 pub enum PrivacyClass; canonical admission lives as a `privacy_profile: String` on the owner job contract (crates/smart/eliot-dreamer-contracts/src/job.rs:167,195,288-294)"
+basis = "Fifth definition of the same two-class privacy vocabulary in the workspace (the others are eliot-coordination, eliot-source-assurance and eliot-context-contracts). It is a duplicate contract, not an owner, and it is not used by the canonical intake shape."
+removal_condition = "With the rest of the superseded shape set. Not a work-item-4 blocker: it is pure duplication, not a second semantic owner."
+
+[[item_disposition]]
+item = "DreamBudget"
+kind = "struct"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/budget.rs:141 pub struct BudgetLimits (11 independent dimensions, each with its own class ceiling and zero rule at lines 172-190)"
+basis = "Divergence D-DRM-5. Four coarse u32 fields cannot express 11 independent limits with no cross-subsidy. The coarse zero-rejection rule it encodes is already preserved by the owner `Some(0)` rejection, and `route_cost_units` is a passthrough, never an authorization."
+removal_condition = "After real jobs carry owner `BudgetLimits`. The migrated generation path asserts budget ceilings from the canonical `budget_units`, not from this struct."
+
+[[item_disposition]]
+item = "DreamBudget::validate"
+kind = "method"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/budget.rs:172 pub fn validate (and require_exact) on BudgetLimits"
+basis = "Coarse three-field zero check, strictly weaker than the owner 11-dimension rule. Not the migrated path: mod differential_1143 asserts the owner budget gate directly, including `budget_units == 0` refusing at generation."
+removal_condition = "With DreamBudget."
+
+[[item_disposition]]
+item = "PreservationReport"
+kind = "struct"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/candidate.rs:89 pub struct PreservationReport — seven independent DimensionVerdicts with no averaging (validated at lines 102-120)"
+basis = "Divergence D-DRM-7. A 6-bool summary with a `source_count`/`counterevidence_count` header cannot represent seven independent verdicts, and averaging is explicitly rejected by the owner. `authority_unchanged` is a candidate-only ceiling bit, never a promotion claim."
+removal_condition = "After the candidate cell owns preservation verdicts on the seven dimensions. A primary work-item-4 duplicate-owner target."
+
+[[item_disposition]]
+item = "CandidateArtifact"
+kind = "struct"
+disposition = "delete"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/candidate.rs:263 pub struct CandidateProposal; crates/smart/eliot-dreamer-contracts/src/candidate.rs:194 pub struct CandidateResult"
+basis = "Superseded candidate shape. It carries the duplicate PreservationReport and the duplicate CandidateKind, so it is a second candidate contract surface rather than a packet-specific projection."
+removal_condition = "After candidate assembly emits the owner proposal/result pair. Primary work-item-4 duplicate-owner target."
+
+[[item_disposition]]
+item = "DreamPacket"
+kind = "struct"
+disposition = "delete"
+current_owner = "smart.dreamer.bundle"
+owner_package = "eliot-dreamer-contracts, eliot-dreamer-bundle"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/bundle.rs:165 pub struct DreamInputBundle; assembly material closure at crates/smart/eliot-dreamer-contracts/src/assembly/material.rs:1055 AssemblyMaterialSet; module_id smart.dreamer.bundle in crates/smart/eliot-dreamer-bundle/module.toml"
+basis = "Aggregate packet envelope. Its handle closure, unknowns, probes and invalidation conditions are bundle-assembly duties; retaining it here keeps one shape that mixes assembly, candidate and synthesis concerns. The migrated generation edge still returns this shape today, so the row is recorded, not removed."
+removal_condition = "After smart.dreamer.bundle owns packet assembly and the migrated generation edge has a first real consumer. This is the migration edge itself, so its removal is coupled to work item 5."
+
+[[item_disposition]]
+item = "CandidateGenerator"
+kind = "unit_struct"
+disposition = "delete"
+current_owner = "smart.dreamer.bundle -> smart.dreamer.claim_grounding -> smart.dreamer.candidate_validation -> the typed handler cells"
+owner_package = "eliot-dreamer-bundle, eliot-dreamer-claim-grounding, eliot-dreamer-candidate-validation"
+owner_evidence = "crates/smart/eliot-dreamer-bundle/module.toml module_id=smart.dreamer.bundle; crates/smart/eliot-dreamer-claim-grounding/src (module_id=smart.dreamer.claim_grounding); crates/smart/eliot-dreamer-candidate-validation/src/input.rs:48 pub fn validate_grounded_dream_draft_at"
+basis = "The exact shape the donor map's rejected_overgeneralization names: one generator that mixes job contracts, bundle construction, validation and subtype semantics. There is deliberately no single owner; the owner pipeline is the composition of the four named cells."
+removal_condition = "After the owner pipeline has a first real runtime consumer. Primary work-item-4 duplicate-owner target."
+
+[[item_disposition]]
+item = "CandidateGenerator::generate"
+kind = "function"
+disposition = "migrate"
+current_owner = "smart.dreamer.bundle + smart.dreamer.candidate_validation"
+owner_package = "eliot-dreamer-bundle, eliot-dreamer-candidate-validation"
+owner_evidence = "crates/smart/eliot-dreamer-candidate-validation/src/input.rs:48 validate_grounded_dream_draft_at; bundle assembly owner crates/smart/eliot-dreamer-bundle; EDGE-DRM-1143 fixtures in crates/smart/eliot-dreamer-core/src/lib.rs:559-738 (mod differential_1143, three tests)"
+basis = "Migrated as a candidate-only ceiling differential, not as runtime authority. The fixtures prove: the 9 canonical job classes serialise to the frozen owner spellings including `architecture_self_query` and first-class `configuration_assistance`; degenerate budgets are refused at validation and at generation; the state fence is carried verbatim; `authority_unchanged` holds; promotion and empty drafts are refused; digests are deterministic; and no `VERIFIED_COMPLETE` marker exists on the wire. Aggregate output acquires no Research acquisition, Governor admission, canonical write, authority, durable scheduling, provider execution or Finish ownership."
+removal_condition = "None for the behaviour. The fixture must be relocated into the owner suites before the containing `delete` rows are removed, otherwise the only live candidate-only proof is lost."
+
+# --- canonical re-exports: the contract-unification turn already completed ---
+
+[[item_disposition]]
+item = "JobClass"
+kind = "type_reexport"
+disposition = "migrate"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:116 pub use job::{..., JobClass, ...}; facade re-export at crates/smart/eliot-dreamer-core/src/lib.rs:159"
+basis = "Migrated. The facade SCREAMING_SNAKE_CASE duplicate was deleted; the canonical closed snake_case enum is re-exported, so there is exactly one job-class vocabulary. Divergences D-DRM-1..3 are closed."
+removal_condition = "Delete the re-export line once every consumer imports smart.dreamer.contracts directly."
+
+[[item_disposition]]
+item = "DreamJobInput"
+kind = "type_reexport"
+disposition = "migrate"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:116 pub use job::{..., DreamJobInput, ...}; facade re-export at crates/smart/eliot-dreamer-core/src/lib.rs:159"
+basis = "Migrated. The facade duplicate and its free-text `ArtifactId` handles, `ArtifactId` job id and `all_handles` dedup were deleted with divergence D-DRM-8. Handle closure belongs to bundle assembly, never to intake."
+removal_condition = "Delete the re-export line once every consumer imports smart.dreamer.contracts directly."
+
+[[item_disposition]]
+item = "ModelDraft"
+kind = "type_reexport"
+disposition = "migrate"
+current_owner = "smart.dreamer.contracts"
+owner_package = "eliot-dreamer-contracts"
+owner_evidence = "crates/smart/eliot-dreamer-contracts/src/lib.rs:98 pub use draft::{..., ModelDraft, ...}; facade re-export at crates/smart/eliot-dreamer-core/src/lib.rs:159"
+basis = "Migrated. The facade multi-item `DraftItem` and its own `ModelDraft::validate` were deleted; the canonical single-hypothesis draft is re-exported and the owner validation runs. No rival displacement is possible in the live path, so the alternatives-preserved bit holds exactly as the old multi-item rule concluded for a rival-free item set."
+removal_condition = "Delete the re-export line once every consumer imports smart.dreamer.contracts directly."
+
+# --- I18.40 / MAINT-4 advice change-control gate (issue #1924) ---
+
+[[item_disposition]]
+item = "advice_gate"
+kind = "module"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:1 cites issue #1924, MAINT-4 / I18.40; `git grep -n advice_gate -- crates bins` returns only this package"
+basis = "The module surface has no admitted current cell and no consumer. Removing it is a first step for the whole block, not an independent decision."
+removal_condition = "Only after the negative-memory duty below has an admitted owner."
+
+[[item_disposition]]
+item = "AdviceClass"
+kind = "enum"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:28"
+basis = "Mechanism/Topology/EvaluationImprovement classification for the advice gate. Only a duplicate-owner decision on the advice block can either keep it or move it."
+removal_condition = "With the advice block."
+
+[[item_disposition]]
+item = "AdviceClass::as_str"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:40"
+basis = "Stable wire rendering of the three advice classes. It is part of the unadmitted advice block and has no owner to move to."
+removal_condition = "With AdviceClass."
+
+[[item_disposition]]
+item = "AdviceState"
+kind = "enum"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:50"
+basis = "Six-state candidate lifecycle for the advice gate; no current owner and no consumer."
+removal_condition = "With the advice block."
+
+[[item_disposition]]
+item = "AdviceCandidate"
+kind = "struct"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:64"
+basis = "Durable candidate record for one advice hypothesis. No current owner and no consumer."
+removal_condition = "With the advice block."
+
+[[item_disposition]]
+item = "OwnerDecision"
+kind = "enum"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:80"
+basis = "Owner approve/reject shape. The actual promotion owner is external (Meta improvement / Governor); this type records the decision, it does not own it."
+removal_condition = "With the advice block."
+
+[[item_disposition]]
+item = "NegativeMemoryEntry"
+kind = "struct"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:88; the canonical failure-memory shape is FailureFingerprint in docs/architecture/I12-19-negative-memory.md"
+basis = "Blocked below. Deleting it before an owner is admitted silently drops the I18.40 rule that repeatedly failed topology advice becomes negative procedural memory and cannot be re-proposed without new discriminating evidence."
+removal_condition = "Only after the I18.40 negative-procedural-memory duty has an admitted current owner."
+
+[[item_disposition]]
+item = "AdviceProposal"
+kind = "struct"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:100"
+basis = "Inbound proposal shape; the gate normalises it into a stable hypothesis key. No current owner and no consumer."
+removal_condition = "With the advice block."
+
+[[item_disposition]]
+item = "AdviceRejected"
+kind = "enum"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:112"
+basis = "Closed refusal vocabulary for the advice gate, including the executable DirectMutationForbidden prohibition."
+removal_condition = "With the advice block."
+
+[[item_disposition]]
+item = "AdviceGate"
+kind = "struct"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:144 — the only mutable state in either package (a private BTreeMap<String, NegativeMemoryEntry>); `git grep -n '&mut self' -- crates/smart/eliot-{cues,dreamer-core}/src` returns exactly three hits, all inside this impl block"
+basis = "The single mutable-state owner across both aggregate packages. It is unadmitted, in-memory, non-durable and never persisted, so it is not a second canonical state owner, but it is the one item whose deletion would remove real behaviour rather than only duplicated shape."
+removal_condition = "Only after the advice change-control duty has an admitted current owner. Recorded, not removed."
+
+[[item_disposition]]
+item = "AdviceGate::new"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:150"
+basis = "Constructor for the unadmitted advice state."
+removal_condition = "With AdviceGate."
+
+[[item_disposition]]
+item = "AdviceGate::negative_memory"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:157"
+basis = "Read accessor for the unadmitted advice state; it cannot claim canonical failure memory."
+removal_condition = "With AdviceGate."
+
+[[item_disposition]]
+item = "AdviceGate::hypothesis_key_for"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:163"
+basis = "Stable `<class>:<normalised statement>` key. It lowercases and whitespace-folds the statement, which is a second normalization path next to the cue comparison-key owner; it must not become one."
+removal_condition = "With AdviceGate."
+
+[[item_disposition]]
+item = "AdviceGate::propose"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:201"
+basis = "Admission of a proposal as a Proposed candidate; refuses blank fields, missing discriminating evidence and a negatively-remembered hypothesis with no new discriminator."
+removal_condition = "With AdviceGate."
+
+[[item_disposition]]
+item = "AdviceGate::record_owner_decision"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:242"
+basis = "Applies the owner decision; approval binds a named verifier and rollback condition, rejection writes negative memory. It records the decision, it never executes promotion."
+removal_condition = "With AdviceGate."
+
+[[item_disposition]]
+item = "AdviceGate::record_failure"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:273"
+basis = "Writes the negative procedural memory entry. This is the behaviour I18.40 names, and it is the reason the block cannot simply be deleted."
+removal_condition = "Only after an admitted owner carries repeated-advice negative memory."
+
+[[item_disposition]]
+item = "AdviceGate::record_verifier_outcome"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:303"
+basis = "Pass retains, failure rolls back and writes negative memory; never produces a VERIFIED_COMPLETE claim."
+removal_condition = "With AdviceGate."
+
+[[item_disposition]]
+item = "AdviceGate::direct_apply"
+kind = "method"
+disposition = "delete"
+current_owner = "none admitted"
+owner_evidence = "crates/smart/eliot-dreamer-core/src/advice_gate.rs:326 — always returns AdviceRejected::DirectMutationForbidden"
+basis = "The executable proposal-only ceiling proof. Its removal condition is the same as the block's: an admitted owner must carry an equally executable prohibition."
+removal_condition = "Only after an admitted owner carries an executable direct-mutation prohibition."
+
+# ------------------------------------------------------------ blocked items --
+
+[[blocked_items]]
+item = "NegativeMemoryEntry, AdviceGate and its negative-memory behaviour"
+decision = "Which current cell admits the I18.40 / MAINT-4 Dreamer advice change-control gate, or whether the rule is satisfied by an existing owner."
+why = "This package is the only implementation of 'repeatedly failed topology advice becomes negative procedural memory' for Dreamer (docs/architecture/I18-40-crate-topology-self-improvement-tests.md:30, docs/architecture/I18-53-activity-cold-start-feedback-maintenance-and-descendant-closure-suite.md:36) and it has zero consumers and no admitted owner. Its canonical negative-memory shape is FailureFingerprint (docs/architecture/I12-19-negative-memory.md), owned by neither this package nor any cell named in the donor map. Meta eliot-improvement owns learning closure and promotion input but not Dreamer topology advice, and the issue explicitly forbids this lane from editing any other crate."
+effect_on_this_ledger = "Recorded as `delete` with an explicit owner precondition. Not acted on."
+assumed_owner_for_planning = "Meta (eliot-improvement family) per I12.19 FailureFingerprint + A14.3 negative memory and extinction; this is an assumption, not a proved cell."

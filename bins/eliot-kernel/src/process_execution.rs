@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::activation_lifecycle::{
+    DescendantClosureReceipt, DescendantRegistry, RegisteredDescendant,
+};
 use super::{KernelComposition, KernelStoreGateway};
 use eliot_ipc::Session;
 use eliot_kernel_core::{
@@ -583,6 +586,8 @@ pub(crate) struct ProcessExecutionGateway {
     #[cfg(windows)]
     pub(crate) canonical_store: Arc<Mutex<Option<Arc<KernelStoreGateway>>>>,
     pub(crate) path_admission: Arc<KernelPathAdmission>,
+    /// Launched-but-not-closed descendants (CHILD-1/CHILD-2).
+    pub(crate) descendants: Arc<Mutex<DescendantRegistry>>,
 }
 
 #[cfg(windows)]
@@ -912,6 +917,7 @@ impl ProcessExecutionGateway {
             #[cfg(windows)]
             canonical_store: Arc::new(Mutex::new(None)),
             path_admission,
+            descendants: Arc::new(Mutex::new(DescendantRegistry::new())),
         }
     }
 
@@ -1248,6 +1254,108 @@ impl ProcessExecutionGateway {
                 Err(error)
             }
         }
+    }
+
+    /// Closes one registered descendant after cancellation, restart, or
+    /// shutdown (CHILD-1/CHILD-2, #1918): authorizes the owner, reads the
+    /// exact current view, and builds the descendant-closure receipt. The
+    /// registration is removed only when the receipt proves closure; an
+    /// open receipt retains it, so no running descendant silently leaves
+    /// the registry.
+    pub(crate) async fn close_registered_descendant(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+    ) -> Result<DescendantClosureReceipt, ProcessExecutionError> {
+        // F-LOG-KERNEL-3 (#901): descendant-close boundary. The receipt is
+        // an observation of the exact current view, never a success claim;
+        // exactly one terminal is emitted per failed close.
+        observe_process("kernel.process.descendant_close_requested", "attempt");
+        if let Err(error) = self.authorize_operation(owner, &operation_id) {
+            observe_process("kernel.process.descendant_close_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
+        }
+        let registration = self
+            .descendants
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("descendant registry lock poisoned".to_owned())
+            })?
+            .get(&operation_id)
+            .cloned()
+            .ok_or(ProcessExecutionError::NotFound)?;
+        let view = match self.inspect(owner, operation_id.clone()).await {
+            Ok(view) => view,
+            Err(error) => {
+                observe_process("kernel.process.descendant_close_failed", "unknown");
+                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                return Err(error);
+            }
+        };
+        let receipt = DescendantClosureReceipt::close(&registration, &view);
+        if let Err(error) = receipt.validate().map_err(ProcessExecutionError::Contract) {
+            observe_process("kernel.process.descendant_close_failed", "unknown");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
+        }
+        if receipt.all_closed() {
+            self.descendants
+                .lock()
+                .map_err(|_| {
+                    ProcessExecutionError::Unavailable(
+                        "descendant registry lock poisoned".to_owned(),
+                    )
+                })?
+                .remove(&operation_id);
+        }
+        observe_process(
+            "kernel.process.descendant_close_observed",
+            if receipt.all_closed() {
+                "closed"
+            } else {
+                "open"
+            },
+        );
+        Ok(receipt)
+    }
+
+    /// Closes every still-registered descendant during shutdown (#1918). Each
+    /// entry closes under the exact owner its replay record names, so the
+    /// shutdown contour authorizes nothing a launch never granted. Outcomes
+    /// are per-operation: one unproven closure never hides the rest.
+    pub(crate) async fn close_all_registered_descendants(
+        &self,
+    ) -> Vec<(
+        eliot_process::OperationId,
+        Result<DescendantClosureReceipt, ProcessExecutionError>,
+    )> {
+        let registered = self.descendants.lock().map_or_else(
+            |_| Vec::new(),
+            |registry| registry.registered_operation_ids(),
+        );
+        let mut outcomes = Vec::with_capacity(registered.len());
+        for operation_id in registered {
+            let owner = match self.replay_store.load_process_start(&operation_id) {
+                Ok(Some(record)) => record.owner,
+                Ok(None) => {
+                    outcomes.push((operation_id, Err(ProcessExecutionError::NotFound)));
+                    continue;
+                }
+                Err(error) => {
+                    outcomes.push((
+                        operation_id,
+                        Err(ProcessExecutionError::Unavailable(error.to_string())),
+                    ));
+                    continue;
+                }
+            };
+            outcomes.push((
+                operation_id.clone(),
+                self.close_registered_descendant(&owner, operation_id).await,
+            ));
+        }
+        outcomes
     }
 
     pub(crate) async fn reconcile(
@@ -1639,7 +1747,26 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         request: Self::Request,
     ) -> Result<Self::Receipt, ProcessExecutionError> {
-        self.executor
+        // CHILD-1 (#1918): register the descendant before the executor
+        // handoff. A poisoned or conflicting registry refuses the launch: an
+        // unregistered child must never start.
+        let operation_id = request.operation_id().clone();
+        let registration = RegisteredDescendant::new(
+            operation_id.clone(),
+            owner.module_id().to_owned(),
+            owner.authority_epoch().clone(),
+            owner.generation(),
+        )
+        .map_err(ProcessExecutionError::Contract)?;
+        self.descendants
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("descendant registry lock poisoned".to_owned())
+            })?
+            .register(registration)
+            .map_err(ProcessExecutionError::Contract)?;
+        let started = self
+            .executor
             .start(
                 request,
                 // Issue #269: the recovery sink wraps the evidence sink, so one
@@ -1654,7 +1781,18 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                     }),
                 }),
             )
-            .await
+            .await;
+        match started {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                // The child never started: drop its registration so a failed
+                // launch leaves no orphan entry behind.
+                if let Ok(mut registry) = self.descendants.lock() {
+                    registry.remove(&operation_id);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn persist_completed(

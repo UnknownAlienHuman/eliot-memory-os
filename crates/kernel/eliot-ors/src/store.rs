@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::canonical_json_bytes;
+use eliot_contracts::{HostCorrelationProjection, HostJsonRpcCorrelationId, canonical_json_bytes};
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
@@ -393,12 +393,12 @@ const MAX_BRIDGE_ACK_BATCH: usize = 1024;
 /// stream position binding that position to exactly one logical event.
 /// Keyed by `{owner_namespace}::{sequence:020}` (zero-padded so the byte
 /// order is the numeric order); the value is the bound `event_id`. Written
-/// atomically in the same ORS transaction as the event row, never updated,
-/// never deleted: a compacted position keeps its binding forever, so one
-/// admitted position identifies exactly one logical event for the life of
-/// the stream incarnation. Only owner-checked rows are indexed; legacy
-/// ownerless rows keep their existing scan-checked invariant and are never
-/// inferred into this index.
+/// atomically in the same ORS transaction as the event row and never updated.
+/// The mapping remains an internal consistency check above the compacted
+/// boundary; once exact replay evidence expires below that boundary, requests
+/// receive the retired disposition without learning or comparing this ID.
+/// Only owner-checked rows are indexed; legacy ownerless rows keep their
+/// existing scan-checked invariant and are never inferred into this index.
 const BRIDGE_EVENT_POSITIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_positions_v1");
 /// Retained bridge-event replay commitments (issue #2730): the original
@@ -1103,9 +1103,10 @@ impl persistence_codec::PersistedValue for BridgeEventReplayCommitment {
 /// One ordered bridge-event position binding (issue #2730, item 1).
 ///
 /// The value names the exactly one logical event admitted at
-/// `{owner_namespace}::{sequence:020}`. Written once with its event row,
-/// never updated, never deleted — including across compaction — so a
-/// position can never be reused by another event.
+/// `{owner_namespace}::{sequence:020}`. Written once with its event row and
+/// never updated. Above the compacted boundary it detects a conflicting or
+/// torn binding; below the boundary, after exact replay evidence expires, the
+/// retired disposition prevents reuse without exposing the old identity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventPosition {
@@ -1710,11 +1711,13 @@ fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u
 /// (`operation_id`, `request_digest`). Written atomically in the same `RedDB`
 /// write transaction as the winning operation row, never updated, never
 /// deleted: an expired or terminal operation keeps its key bound forever, so
-/// an old key can never be reused as a new effect. Rows staged before this
-/// index existed simply have no entry and are never inferred; they stay
-/// reachable only by exact operation/request identity.
+/// an old key can never be reused as a new effect. Historical unmarked rows
+/// are represented only by a separately versioned presence marker; this
+/// primary link never infers or returns their operation identity.
 const HOST_REQUEST_LOGICAL_KEYS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_logical_keys_v1");
+const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY: &str = "host_request_legacy_presence_schema";
+const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1: &str = "eliot.ors.host-request-legacy-presence.v1";
 /// Authenticated owner namespace for every logical host-request key
 /// (issue #2571).
 ///
@@ -1829,6 +1832,22 @@ const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 /// state of a store written before this counter existed; the family's streamed
 /// content root is what additionally binds that state.
 const PROCESS_STREAM_RECOVERY_FAMILY_REVISION: &str = "process_stream_recovery_family_revision";
+/// Durable monotone revision of the versioned-artifact family (issue #1971).
+///
+/// The exact counterpart of [`PROCESS_STREAM_RECOVERY_FAMILY_REVISION`] for the
+/// second cursor-paged row family, with the same three properties and the same
+/// reason for being a SEPARATE key: it is advanced inside the same write
+/// transaction as every durable insert, advance and removal of
+/// `ors_versioned_artifacts_v1` (that is, in `replace_versioned_artifact_rows`,
+/// the family's single write path), so any movement of the family moves this
+/// counter; an in-progress backup compares it against the revision it froze and
+/// refuses a continued export rather than tearing the snapshot; and an absent key
+/// is revision `0`, the legacy state of a store written before this counter
+/// existed, which the family's streamed content root additionally binds. A
+/// separate key rather than a shared one, so a process-stream recovery insert
+/// cannot look like versioned-artifact movement and refuse an unrelated
+/// continuation.
+const VERSIONED_ARTIFACT_FAMILY_REVISION: &str = "versioned_artifact_family_revision";
 
 struct ClosureRowPlan {
     key: String,
@@ -2436,6 +2455,14 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         logical_key: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Checks the owner-maintained, payload-independent presence index for an
+    /// unmarked historical occurrence. A hit never exposes a request row.
+    fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError>;
     /// Durably stages one pending activation ticket before in-memory
     /// publication or daemon claim. A successor is admitted only through the
     /// exact durable `NotReady` predecessor and due-time gate.
@@ -2807,7 +2834,41 @@ impl RedbRecoveryStore {
     pub fn open_backup_process_stream_recovery_family(
         &self,
     ) -> Result<crate::backup_snapshot::OrsFamilyCursor, OrsError> {
-        backup_snapshot::open_process_stream_recovery_family(&self.database)
+        backup_snapshot::open_backup_family(
+            &self.database,
+            crate::backup_snapshot::RowFamilyKind::ProcessStreamRecovery,
+        )
+    }
+
+    /// Opens the typed versioned-artifact family cursor for a backup (issue
+    /// #1971).
+    ///
+    /// The exact mirror of
+    /// [`Self::open_backup_process_stream_recovery_family`], and for the same
+    /// reason it is the ONLY producer of a cursor for this family: it reads the
+    /// durable `versioned_artifact_family_revision` and the family's streamed
+    /// content root under one read transaction, so the frozen snapshot identity
+    /// can never mix two moments. Attach the returned cursor with
+    /// [`crate::backup_snapshot::OrsBackupRequest::with_versioned_artifact_cursor`]
+    /// so the `ors_versioned_artifacts_v1` rows are paged under their own
+    /// generation-addressed total order instead of being dropped from the
+    /// denominator, which is the whole of the W7 remainder for this family.
+    ///
+    /// Opening the cursor is not authority and confers no restore path. The
+    /// family's disposition is `NonrestorableHistorical`, so every exported row
+    /// lands `Forensic` in quarantine triage and no restored installation can
+    /// read a prior installation's generation authority back as its own. I1.6
+    /// ("versioned binaries are never replaced in place while running") and
+    /// I1.12 ("Rollback is allowed only to an artifact compatible with current
+    /// durable formats and epoch lineage") are unaffected: this reads history, it
+    /// does not activate a generation, and it is not a rollback.
+    pub fn open_backup_versioned_artifact_family(
+        &self,
+    ) -> Result<crate::backup_snapshot::OrsFamilyCursor, OrsError> {
+        backup_snapshot::open_backup_family(
+            &self.database,
+            crate::backup_snapshot::RowFamilyKind::VersionedArtifacts,
+        )
     }
 
     /// Triages one backup page as quarantined import outcomes without writing.
@@ -2888,12 +2949,42 @@ impl persistence_codec::PersistedValue for HostRequestRecord {
 /// The link carries identity only: the commitment lives in the operation
 /// row and is re-checked on every resolve and load, so a divergent link can
 /// never silently adopt another operation's result. Links are written once
-/// with their row, never updated, never deleted.
+/// with their row, never updated, never deleted. Historical unmarked rows use
+/// a separate presence-only value in this table without an operation link.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostRequestLogicalLink {
     operation_id: OperationIdentity,
     request_digest: String,
+}
+
+/// A payload-independent presence marker for an untyped historical
+/// occurrence. It intentionally carries no operation identity or handle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostRequestLegacyPresence {
+    kind: crate::HostRequestKind,
+    session: String,
+    occurrence: String,
+}
+
+impl persistence_codec::PersistedValue for HostRequestLegacyPresence {
+    const RECORD_TYPE: &'static str = "host_request_legacy_presence";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        crate::model::validate_text(&self.session, "host_request_legacy_presence_session")?;
+        crate::model::validate_text(&self.occurrence, "host_request_legacy_presence_occurrence")?;
+        if !matches!(
+            self.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_legacy_presence_kind",
+                reason: "legacy presence is limited to invocation and cancellation",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl persistence_codec::PersistedValue for HostRequestLogicalLink {
@@ -4519,6 +4610,18 @@ impl RedbRecoveryStore {
                 reason: "staging requires the requested state",
             });
         }
+        if matches!(
+            record.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) && (record.correlation_projection.is_none()
+            || (record.session_ref.is_none()
+                && !matches!(
+                    record.correlation_projection.as_ref(),
+                    Some(HostCorrelationProjection::KernelOperational { .. })
+                )))
+        {
+            return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+        }
         let write = self.database.begin_write().map_err(storage)?;
         let staged = Self::stage_host_request_in(&write, record)?;
         write.commit().map_err(storage)?;
@@ -4555,6 +4658,100 @@ impl RedbRecoveryStore {
                 .insert(key.as_str(), payload.as_str())
                 .map_err(storage)?;
             Ok(record.clone())
+        }
+    }
+
+    pub fn host_request_legacy_presence_key(
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> String {
+        let kind = match kind {
+            crate::HostRequestKind::Invocation => "INVOCATION",
+            crate::HostRequestKind::Cancellation => "CANCELLATION",
+            _ => "INVALID",
+        };
+        crate::model::sha256_hex(
+            format!(
+                "eliot.host-request.legacy-presence.v1\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}"
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// Refuses a typed request when a prior unmarked row could have used any
+    /// of its historical occurrence spellings. This check shares the owner
+    /// write transaction with logical resolution/admission, so no request can
+    /// be staged in the gap between the check and the claim.
+    fn ensure_no_host_request_legacy_presence_in(
+        write: &redb::WriteTransaction,
+        record: &crate::HostRequestRecord,
+    ) -> Result<(), OrsError> {
+        let Some(session) = record.session_ref.as_ref() else {
+            return Ok(());
+        };
+        let links = write
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        for occurrence in Self::legacy_host_request_occurrences(record) {
+            let presence_key =
+                Self::host_request_legacy_presence_key(record.kind, session.as_str(), &occurrence);
+            if let Some(value) = links.get(presence_key.as_str()).map_err(storage)? {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                if presence.kind != record.kind
+                    || presence.session != session.as_str()
+                    || presence.occurrence != occurrence
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence index diverges from its key".to_owned(),
+                    });
+                }
+                return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads one exact occurrence-presence marker without following it to an
+    /// operation or inferring any wire-ID type.
+    pub fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError> {
+        if !matches!(
+            kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_legacy_presence_kind",
+                reason: "legacy presence is limited to invocation and cancellation",
+            });
+        }
+        crate::model::validate_text(session, "host_request_legacy_presence_session")?;
+        crate::model::validate_text(occurrence, "host_request_legacy_presence_occurrence")?;
+        let key = Self::host_request_legacy_presence_key(kind, session, occurrence);
+        let read = self.database.begin_read().map_err(storage)?;
+        let index = read
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        match index.get(key.as_str()).map_err(storage)? {
+            Some(value) => {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                if presence.kind != kind
+                    || presence.session != session
+                    || presence.occurrence != occurrence
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence key diverges from its occurrence facts".to_owned(),
+                    });
+                }
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -4611,17 +4808,34 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
-        Self::host_request_logical_key(
-            record.kind,
-            session.as_str(),
-            record.request_id.as_str(),
-            record.parent_operation_id.as_ref().map(OpaqueLabel::as_str),
-            record.task_ref.as_ref().map(OpaqueLabel::as_str),
-            record.scope_ref.as_ref().map(OpaqueLabel::as_str),
-            record.capability_ref.as_str(),
-            record.payload_digest.as_str(),
-        )
-        .map(Some)
+        match &record.correlation_projection {
+            None => Ok(Some(Self::host_request_logical_key(
+                record.kind,
+                session.as_str(),
+                record.request_id.as_str(),
+                record.parent_operation_id.as_ref().map(OpaqueLabel::as_str),
+                record.task_ref.as_ref().map(OpaqueLabel::as_str),
+                record.scope_ref.as_ref().map(OpaqueLabel::as_str),
+                record.capability_ref.as_str(),
+                record.payload_digest.as_str(),
+            )?)),
+            Some(projection) => {
+                let kind = match record.kind {
+                    crate::HostRequestKind::Invocation => "INVOCATION",
+                    crate::HostRequestKind::Cancellation => "CANCELLATION",
+                    _ => return Ok(None),
+                };
+                let projection = serde_json::to_string(projection)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                Ok(Some(crate::model::sha256_hex(
+                    format!(
+                        "eliot.host-request.logical.v2\x1fkind={kind}\x1fsession={}\x1fprojection={projection}",
+                        session.as_str()
+                    )
+                    .as_bytes(),
+                )))
+            }
+        }
     }
 
     /// Atomically claims one logical host-request key or returns its durable
@@ -4648,12 +4862,20 @@ impl RedbRecoveryStore {
                 reason: "logical resolution stages the requested state",
             });
         }
+        if matches!(
+            record.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
+        {
+            return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+        }
         let logical_key =
             Self::host_request_logical_key_for_record(record)?.ok_or(OrsError::InvalidField {
                 field: "host_request_logical_key",
                 reason: "only session-bound invocation and cancellation records carry a logical key",
             })?;
         let write = self.database.begin_write().map_err(storage)?;
+        Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let outcome = {
             let mut links = write
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
@@ -4735,8 +4957,16 @@ impl RedbRecoveryStore {
         identity_bindings: &[crate::HostRequestRecord],
     ) -> Result<crate::HostRequestRecord, OrsError> {
         Self::validate_host_request_identity_bindings(record, identity_bindings)?;
+        if matches!(
+            record.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
+        {
+            return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+        }
         let logical_key = Self::host_request_logical_key_for_record(record)?;
         let write = self.database.begin_write().map_err(storage)?;
+        Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let logical_winner =
             Self::host_request_logical_winner_in(&write, logical_key.as_deref(), record)?;
         let missing_bindings = Self::check_host_request_identity_bindings_in(
@@ -5058,6 +5288,54 @@ impl RedbRecoveryStore {
         Ok(staged)
     }
 
+    /// Derives bounded historical occurrence spellings that could represent
+    /// one explicitly typed request. The owner probes payload-independent
+    /// presence keys; no legacy row can be returned as a winner.
+    fn legacy_host_request_occurrences(record: &crate::HostRequestRecord) -> Vec<String> {
+        let Some(projection) = record.correlation_projection.as_ref() else {
+            return Vec::new();
+        };
+        let candidates = match projection {
+            HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                occurrence,
+            } => vec![occurrence.clone()],
+            HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                occurrence,
+            } => vec![occurrence.clone(), format!("cancel:{occurrence}")],
+            HostCorrelationProjection::KernelOperational { .. } => Vec::new(),
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                id: HostJsonRpcCorrelationId::String(value),
+            } => vec![value.clone(), format!("str:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                id: HostJsonRpcCorrelationId::Integer(value),
+            } => vec![value.to_string(), format!("int:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                id: HostJsonRpcCorrelationId::String(value),
+            } => vec![format!("cancel:{value}"), format!("cancel:str:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                id: HostJsonRpcCorrelationId::Integer(value),
+            } => vec![format!("cancel:{value}"), format!("cancel:int:{value}")],
+        };
+        let mut occurrences = Vec::with_capacity(candidates.len());
+        for occurrence in candidates {
+            // A projection candidate longer than the historical opaque-text
+            // contract could never have been retained as a legacy row.
+            if OpaqueLabel::new(occurrence.clone()).is_err() {
+                continue;
+            }
+            if !occurrences.contains(&occurrence) {
+                occurrences.push(occurrence);
+            }
+        }
+        occurrences
+    }
+
     /// Loads one host-request operation by logical key (issue #2571).
     ///
     /// `Ok(None)` is authoritatively absent: no operation was ever staged
@@ -5189,6 +5467,7 @@ impl RedbRecoveryStore {
     ) -> bool {
         left.kind == right.kind
             && left.request_id == right.request_id
+            && left.correlation_projection == right.correlation_projection
             && left.idempotency_key == right.idempotency_key
             && left.cancellation_id == right.cancellation_id
             && left.parent_operation_id == right.parent_operation_id
@@ -5201,12 +5480,10 @@ impl RedbRecoveryStore {
 
     /// Validates every logical link against its operation row (issue #2571).
     ///
-    /// Each index entry must decode, point at an existing validated row, and
-    /// recompute to its own index key. A dangling, divergent, or
-    /// unindexable link fails closed as an integrity problem: links are
-    /// never repaired by choosing a latest row, and pre-index rows without
-    /// links are legacy, not damage, so they are skipped rather than
-    /// backfilled — migration never infers namespace or continuity.
+    /// Every primary link must decode, point at an existing validated row,
+    /// and recompute to its own key. Presence entries are separately checked
+    /// against source rows by the versioned adoption routine below; neither
+    /// index is repaired by selecting an operation winner.
     fn validate_host_request_logical_index(write: &redb::WriteTransaction) -> Result<(), OrsError> {
         let links = write
             .open_table(HOST_REQUEST_LOGICAL_KEYS)
@@ -5214,6 +5491,32 @@ impl RedbRecoveryStore {
         let mut pending = Vec::new();
         for entry in links.iter().map_err(storage)? {
             let (key, value) = entry.map_err(storage)?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(value.value()).map_err(|error| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_index_value",
+                        reason: error.to_string(),
+                    }
+                })?;
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("kind")
+                    && object.contains_key("session")
+                    && object.contains_key("occurrence")
+            }) {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                if Self::host_request_legacy_presence_key(
+                    presence.kind,
+                    &presence.session,
+                    &presence.occurrence,
+                ) != key.value()
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence index key diverges from its stored facts".to_owned(),
+                    });
+                }
+                continue;
+            }
             let link: HostRequestLogicalLink = decode(value.value())?;
             pending.push((key.value().to_owned(), link));
         }
@@ -5246,6 +5549,171 @@ impl RedbRecoveryStore {
             }
         }
         Ok(())
+    }
+
+    /// Adopts and validates the secondary occurrence-presence index in the
+    /// same open transaction. The first adoption derives entries solely from
+    /// durable unmarked rows; after adoption, missing, extra, or divergent
+    /// entries fail closed instead of permitting a fresh operation.
+    fn initialize_host_request_legacy_presence(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let marker = {
+            let meta = write.open_table(META).map_err(storage)?;
+            match meta
+                .get(HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY)
+                .map_err(storage)?
+            {
+                Some(value) if value.value().len() > MAX_ORS_MARKER_BYTES => {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                Some(value) => Some(value.value().to_owned()),
+                None => None,
+            }
+        };
+        if marker
+            .as_deref()
+            .is_some_and(|value| value != HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1)
+        {
+            return Err(OrsError::MigrationRequired {
+                reason: "host-request legacy-presence schema marker is unsupported".to_owned(),
+            });
+        }
+
+        let expected = Self::expected_host_request_legacy_presence(write)?;
+        let actual = Self::read_host_request_legacy_presence_index(write)?;
+        match marker.as_deref() {
+            None if !actual.is_empty() => {
+                return Err(OrsError::MigrationRequired {
+                    reason: "unmarked host-request presence entries lack adoption provenance"
+                        .to_owned(),
+                });
+            }
+            None => {
+                let mut index = write
+                    .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                    .map_err(storage)?;
+                for (key, presence) in &expected {
+                    let payload = encode(presence)?;
+                    if index.get(key.as_str()).map_err(storage)?.is_some() {
+                        return Err(OrsError::MigrationRequired {
+                            reason:
+                                "legacy-presence key overlaps a preexisting logical index value"
+                                    .to_owned(),
+                        });
+                    }
+                    index
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+                let mut meta = write.open_table(META).map_err(storage)?;
+                meta.insert(
+                    HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY,
+                    HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1,
+                )
+                .map_err(storage)?;
+            }
+            Some(HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1) if actual == expected => {}
+            Some(HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_legacy_presence",
+                    reason: "presence index is incomplete or diverges from legacy request rows"
+                        .to_owned(),
+                });
+            }
+            Some(_) => {
+                return Err(OrsError::MigrationRequired {
+                    reason: "host-request legacy-presence schema marker is unsupported".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_host_request_legacy_presence(
+        write: &redb::WriteTransaction,
+    ) -> Result<BTreeMap<String, HostRequestLegacyPresence>, OrsError> {
+        let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+        let mut expected = BTreeMap::new();
+        for entry in operations.iter().map_err(storage)? {
+            let (row_key, value) = entry.map_err(storage)?;
+            let record: crate::HostRequestRecord = decode(value.value())?;
+            if record.record_key() != row_key.value() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_legacy_presence",
+                    reason: "host-request table key diverges from its retained row".to_owned(),
+                });
+            }
+            if record.correlation_projection.is_none()
+                && matches!(
+                    record.kind,
+                    crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+                )
+                && let Some(session) = record.session_ref.as_ref()
+            {
+                let presence = HostRequestLegacyPresence {
+                    kind: record.kind,
+                    session: session.as_str().to_owned(),
+                    occurrence: record.request_id.as_str().to_owned(),
+                };
+                persistence_codec::PersistedValue::validate_persisted(&presence)?;
+                let key = Self::host_request_legacy_presence_key(
+                    presence.kind,
+                    &presence.session,
+                    &presence.occurrence,
+                );
+                if let Some(previous) = expected.insert(key, presence.clone())
+                    && previous != presence
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "distinct legacy occurrences collide in the presence domain"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(expected)
+    }
+
+    fn read_host_request_legacy_presence_index(
+        write: &redb::WriteTransaction,
+    ) -> Result<BTreeMap<String, HostRequestLegacyPresence>, OrsError> {
+        let mut actual = BTreeMap::new();
+        let index = write
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        for entry in index.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(value.value()).map_err(|error| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_index_value",
+                        reason: error.to_string(),
+                    }
+                })?;
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("kind")
+                    && object.contains_key("session")
+                    && object.contains_key("occurrence")
+            }) {
+                let presence: HostRequestLegacyPresence = decode(value.value())?;
+                let stored_key = key.value().to_owned();
+                if Self::host_request_legacy_presence_key(
+                    presence.kind,
+                    &presence.session,
+                    &presence.occurrence,
+                ) != stored_key
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "host_request_legacy_presence",
+                        reason: "presence index key diverges from its stored facts".to_owned(),
+                    });
+                }
+                actual.insert(stored_key, presence);
+            }
+        }
+        Ok(actual)
     }
 
     /// Durably stages one pending activation ticket before it is published in
@@ -10385,13 +10853,13 @@ impl RedbRecoveryStore {
     /// event ID nor its bytes: when the request names a position at or
     /// below the retained compacted boundary with no exact evidence left,
     /// the explicit retired/unverifiable recovery disposition returns with
-    /// `fresh: false`, never a fabricated duplicate or fresh insertion.
-    /// Changed content under a live or committed identity, a position
-    /// admitted under a different event, or a torn position binding with
-    /// no retained evidence fails closed. Returns `Ok(None)` only for a
-    /// genuinely new identity at a free position above the boundary; the
-    /// caller still runs the pending-handoff compatibility check before
-    /// any record/cursor mutation.
+    /// `fresh: false`, without consulting the old position binding. Changed
+    /// content under a live or committed identity, a position admitted under
+    /// a different event above the boundary, or a torn position binding above
+    /// the boundary fails closed. Returns `Ok(None)` only for a genuinely new
+    /// identity at a free position above the boundary; the caller still runs
+    /// the pending-handoff compatibility check before any record/cursor
+    /// mutation.
     fn check_bridge_retained_replay_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -10428,23 +10896,12 @@ impl RedbRecoveryStore {
                 row.last_compacted_sequence,
             )
         });
-        // The admitted position identifies exactly one logical event: a
-        // different occupant rejects this request before any mutation,
-        // even below the compacted boundary. A same-identity occupant
-        // with no retained row or commitment is noted here and resolved
-        // against the boundary below.
-        let torn_position = match Self::position_event_in(write, access, stage.sequence)? {
-            None => false,
-            Some(occupant) if occupant != stage.event_id => {
-                return Err(OrsError::DuplicateConflict);
-            }
-            Some(_) => true,
-        };
         if stage.sequence <= compacted {
             // Below the retained compacted boundary with no exact
             // evidence: retired, never a new event — including when the
-            // position index still names this same identity (its
-            // commitment may have expired under bound pressure).
+            // internal position index retains an event ID whose commitment
+            // may have expired under bounded pressure. Do not consult that
+            // mapping or claim which old event occupied this position.
             let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
             return Ok(Some(Self::bridge_event_retired_outcome(
                 stage,
@@ -10455,9 +10912,19 @@ impl RedbRecoveryStore {
                 handoff.as_deref(),
             )));
         }
+        // Above the compacted boundary, the position mapping remains exact
+        // evidence: reject a different occupant, and retain a same-identity
+        // binding for the torn-row/commitment check below.
+        let torn_position = match Self::position_event_in(write, access, stage.sequence)? {
+            None => false,
+            Some(occupant) if occupant != stage.event_id => {
+                return Err(OrsError::DuplicateConflict);
+            }
+            Some(_) => true,
+        };
         if torn_position {
             // Above the boundary the position must resolve to retained
-            // evidence: a binding with no row and no commitment is a torn
+            // event/commitment evidence: a binding with neither is a torn
             // write — fail closed and preserve it instead of guessing.
             return Err(OrsError::IntegrityProblem {
                 record_type: "bridge_event_position",
@@ -13014,6 +13481,42 @@ impl RedbRecoveryStore {
         Ok((positions, position_bytes))
     }
 
+    /// Counts only the owner namespace's bounded gap rows, rejecting a
+    /// mismatched key or legacy overflow rather than returning a partial
+    /// capacity denominator.
+    fn bridge_gap_accounting_for(
+        read: &redb::ReadTransaction,
+        namespace: &str,
+    ) -> Result<(u64, u64), OrsError> {
+        let stored = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+        let prefix = format!("{namespace}::");
+        let end = format!("{prefix}\u{10ffff}");
+        let mut gaps = 0_u64;
+        let mut gap_bytes = 0_u64;
+        for entry in stored
+            .range(prefix.as_str()..=end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let row: BridgeEventGapRow = decode(value.value())?;
+            row.validate()?;
+            if row.owner_namespace != namespace
+                || key.value() != format!("{namespace}::{}", row.gap_id)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_gap",
+                    reason: "gap key or owner does not match its indexed scope".to_owned(),
+                });
+            }
+            if gaps >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            gaps += 1;
+            gap_bytes += (key.value().len() + value.value().len()) as u64;
+        }
+        Ok((gaps, gap_bytes))
+    }
+
     /// Accounts one namespace's bridge-event capacity under its owner
     /// (issue #2731, item 4): pending live events, handoffs, retained replay
     /// commitments, the #2730 ordered position index, stream/cursor
@@ -13077,20 +13580,7 @@ impl RedbRecoveryStore {
                 }
             }
         }
-        let mut gaps = 0_u64;
-        let mut gap_bytes = 0_u64;
-        {
-            let stored = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
-            for entry in stored.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventGapRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace == namespace {
-                    gaps += 1;
-                    gap_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
+        let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace)?;
         let cursor_bytes = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
             cursors
@@ -16672,6 +17162,7 @@ impl RedbRecoveryStore {
         // #2571: every logical link must resolve to a row that recomputes
         // to its own key. Links are never repaired or backfilled here.
         Self::validate_host_request_logical_index(&write)?;
+        Self::initialize_host_request_legacy_presence(&write)?;
         // #2730: reconcile the bridge position index and replay
         // commitments with the retained owner-bound records under one
         // migration/version contract, then record the contract marker.
@@ -17678,6 +18169,71 @@ impl RedbRecoveryStore {
             })?;
         meta.insert(
             PROCESS_STREAM_RECOVERY_FAMILY_REVISION,
+            next.to_string().as_str(),
+        )
+        .map_err(storage)?;
+        Ok(next)
+    }
+
+    /// Reads the durable monotone revision of the versioned-artifact family
+    /// (issue #1971).
+    ///
+    /// The single owner of that counter: the family's one write path advances it
+    /// and the backup family cursor observes it. A store written before the
+    /// counter existed reads as revision `0`, which is a real frozen value and
+    /// not an error - the family's streamed content root binds that state.
+    pub(super) fn versioned_artifact_family_revision(
+        read: &redb::ReadTransaction,
+    ) -> Result<u64, OrsError> {
+        let meta = read.open_table(META).map_err(storage)?;
+        let revision = meta
+            .get(VERSIONED_ARTIFACT_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        Ok(revision)
+    }
+
+    /// Advances the versioned-artifact family revision in the caller's open
+    /// write transaction (issue #1971).
+    ///
+    /// Called only when a family row was actually inserted, advanced or removed,
+    /// in the same transaction as that change: an exact re-presentation of the
+    /// same registry that changed nothing must not look like movement to an
+    /// in-progress backup. That is what makes repeated recommits of an unchanged
+    /// registry quiescent for the witness, while a staged candidate, a drain mark,
+    /// a retirement or a removal all move it exactly like any other change.
+    ///
+    /// Cannot be called while the caller still holds the family table open, so
+    /// `replace_versioned_artifact_rows` scopes that borrow and reports whether it
+    /// moved before advancing here.
+    fn advance_versioned_artifact_family_revision(
+        write: &redb::WriteTransaction,
+    ) -> Result<u64, OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = meta
+            .get(VERSIONED_ARTIFACT_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        let next = prior
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: "versioned-artifact family revision counter exhausted".to_owned(),
+            })?;
+        meta.insert(
+            VERSIONED_ARTIFACT_FAMILY_REVISION,
             next.to_string().as_str(),
         )
         .map_err(storage)?;
@@ -19338,6 +19894,11 @@ impl RedbRecoveryStore {
     /// tombstone family. The commit is the durable linearization point, so a
     /// crash before it leaves the prior durable set and a crash after it
     /// reconstructs this one.
+    ///
+    /// It is also where this family's durable revision advances (issue #1971),
+    /// which is what lets a backup continuation holding the family frozen detect
+    /// movement. See [`Self::replace_versioned_artifact_rows`] for the
+    /// unchanged-vs-moved discriminator that decides whether it advances.
     pub fn commit_versioned_artifact_registry(
         &self,
         registry: &VersionedArtifactRegistry,
@@ -19357,30 +19918,71 @@ impl RedbRecoveryStore {
     /// hold. A rollback re-staged candidate and the retained generation it was
     /// re-staged from are two rows under two different keys, which is why the
     /// side is part of the key and not a field inside the row.
+    ///
+    /// This is also where the family's durable revision advances (issue #1971),
+    /// in the SAME transaction as the row changes, which is what lets a backup
+    /// continuation that froze this family detect the movement. The
+    /// unchanged-vs-moved discriminator is the whole point of the shape below:
+    ///
+    /// - a presented row advances the family if and only if the durable bytes
+    ///   under its canonical key differ from the bytes this call would write, and
+    ///   an equal row is not rewritten at all;
+    /// - a removal of a durable key outside `rows` advances the family;
+    /// - therefore an exact re-presentation of the registry that is already
+    ///   durable performs NO durable write and does NOT advance the revision.
+    ///
+    /// The counter would otherwise be worthless in the common case: this is a
+    /// whole-registry publish, so a supervisor that recommits the same registry
+    /// on every cycle would make every backup of a quiescent store look like
+    /// family movement, and an in-progress export would be refused for a change
+    /// that never happened. The family table borrow is scoped so the meta table can
+    /// be opened for the advance once the family write is complete; a transaction
+    /// that has already reported "moved" is not left holding the revision back.
     fn replace_versioned_artifact_rows(
         write: &redb::WriteTransaction,
         rows: &[VersionedArtifactEntry],
     ) -> Result<(), OrsError> {
-        let mut table = write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?;
-        let mut durable_keys: BTreeSet<String> = BTreeSet::new();
-        for row in rows {
-            row.validate()?;
-            let key = row.record_key();
-            let payload = encode(row)?;
-            table
-                .insert(key.as_str(), payload.as_str())
-                .map_err(storage)?;
-            durable_keys.insert(key);
-        }
-        let mut obsolete: Vec<String> = Vec::new();
-        for entry in table.iter().map_err(storage)? {
-            let (key, _) = entry.map_err(storage)?;
-            if !durable_keys.contains(key.value()) {
-                obsolete.push(key.value().to_owned());
+        let moved = {
+            let mut table = write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?;
+            let mut durable_keys: BTreeSet<String> = BTreeSet::new();
+            let mut moved = false;
+            for row in rows {
+                row.validate()?;
+                let key = row.record_key();
+                let payload = encode(row)?;
+                // THE discriminator. `encode` is a pure function of the row, so a
+                // row whose canonical key is already durable with these exact
+                // bytes is an exact re-presentation: it is neither inserted nor
+                // advanced, and it does not move the family revision. Any other
+                // outcome - absent key, or a different generation state, artifact
+                // identity or drain mark under the same key - is a real change.
+                let unchanged = table
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .is_some_and(|value| value.value() == payload.as_str());
+                if !unchanged {
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    moved = true;
+                }
+                durable_keys.insert(key);
             }
-        }
-        for key in &obsolete {
-            table.remove(key.as_str()).map_err(storage)?;
+            let mut obsolete: Vec<String> = Vec::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, _) = entry.map_err(storage)?;
+                if !durable_keys.contains(key.value()) {
+                    obsolete.push(key.value().to_owned());
+                }
+            }
+            for key in &obsolete {
+                table.remove(key.as_str()).map_err(storage)?;
+                moved = true;
+            }
+            moved
+        };
+        if moved {
+            Self::advance_versioned_artifact_family_revision(write)?;
         }
         Ok(())
     }
@@ -22121,6 +22723,15 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_host_request_by_logical_key(self, logical_key)
     }
 
+    fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError> {
+        RedbRecoveryStore::has_host_request_legacy_presence(self, kind, session, occurrence)
+    }
+
     fn stage_activation_ticket(
         &self,
         record: &ActivationLifecycleRecord,
@@ -22663,6 +23274,17 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         logical_key: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.load_host_request_by_logical_key(logical_key)
+    }
+
+    /// Checks for an untyped historical occurrence without exposing a row.
+    pub fn has_host_request_legacy_presence(
+        &self,
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+    ) -> Result<bool, OrsError> {
+        self.store
+            .has_host_request_legacy_presence(kind, session, occurrence)
     }
 
     /// Durably stages one pending activation ticket before publication.
@@ -23403,6 +24025,7 @@ mod host_request_result_tests {
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
+            correlation_projection: None,
             idempotency_key: label("req-1:invoke"),
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,

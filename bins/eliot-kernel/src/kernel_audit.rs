@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes};
 use eliot_ipc::Session;
 use eliot_kernel_core::CutoverDecision;
+use eliot_kernel_service::EliotdLaunchDescriptor;
 use eliot_ors::{HostRequestRecord, SupervisionLeaseSnapshot};
 use eliot_process::ProcessStartReceipt;
 use eliot_protocol::{
@@ -81,6 +82,21 @@ pub const KERNEL_AUDIT_ANCHOR_TERMINAL_CODE: &str = "KERNEL_AUDIT_ANCHOR_FAILED"
 #[must_use]
 pub fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+/// Returns a stable nonsecret reference for a physical process binding.
+///
+/// The image comparison at authenticated peer admission is ASCII
+/// case-insensitive on Windows, so normalize that portion identically before
+/// hashing the tuple shared by the peer and process-start receipt.
+fn process_binding_reference(
+    process_id: u32,
+    start_time_100ns: u64,
+    image_path: &str,
+) -> Option<String> {
+    let image_path = image_path.to_ascii_lowercase();
+    let bytes = canonical_json_bytes(&(process_id, start_time_100ns, image_path)).ok()?;
+    Some(format!("process-binding:v1:{}", blake3_hex(&bytes)))
 }
 
 /// Returns the stable `lineage_id:sequence` text for one authority epoch.
@@ -294,6 +310,8 @@ impl AuditEventKind {
     pub const EPOCH_CUTOVER_APPLIED: &'static str = "epoch.cutover_applied";
     /// An authenticated local peer bound a session.
     pub const SESSION_BOUND: &'static str = "session.bound";
+    /// A daemon handshake was refused before session binding.
+    pub const SESSION_REJECTED: &'static str = "session.rejected";
     /// A bridge connection and its session were revoked.
     pub const SESSION_REVOKED: &'static str = "session.revoked";
     /// One queued pair was dispatched to the daemon claimer.
@@ -324,6 +342,8 @@ impl AuditEventKind {
     pub const PROCESS_DEGRADED: &'static str = "process.degraded";
     /// Authenticated daemon failure was recorded.
     pub const PROCESS_FAILED: &'static str = "process.failed";
+    /// The descendant-closure receipt observed for one launched child.
+    pub const PROCESS_DESCENDANT_CLOSED: &'static str = "process.descendant_closed";
     /// Ordered safe shutdown was requested.
     pub const SHUTDOWN_DRAIN_REQUESTED: &'static str = "shutdown.drain_requested";
     /// The drain commit decision linearized.
@@ -346,6 +366,7 @@ impl AuditEventKind {
         Self::LEASE_SUPERVISION_EXPIRED,
         Self::EPOCH_CUTOVER_APPLIED,
         Self::SESSION_BOUND,
+        Self::SESSION_REJECTED,
         Self::SESSION_REVOKED,
         Self::DISPATCH_DAEMON_CLAIM,
         Self::RESULT_DAEMON_SUBMITTED,
@@ -361,6 +382,7 @@ impl AuditEventKind {
         Self::PROCESS_READY_PROVEN,
         Self::PROCESS_DEGRADED,
         Self::PROCESS_FAILED,
+        Self::PROCESS_DESCENDANT_CLOSED,
         Self::SHUTDOWN_DRAIN_REQUESTED,
         Self::SHUTDOWN_DRAIN_COMMITTED,
         Self::SHUTDOWN_TERMINAL_PUBLISHED,
@@ -382,6 +404,7 @@ impl AuditEventKind {
             | Self::LEASE_SUPERVISION_EXPIRED
             | Self::EPOCH_CUTOVER_APPLIED
             | Self::SESSION_BOUND
+            | Self::SESSION_REJECTED
             | Self::SESSION_REVOKED
             | Self::RESULT_KERNEL_BOUND
             | Self::RECEIPT_LIVE_PUBLISHED
@@ -432,6 +455,9 @@ pub struct AuditLineage {
     pub adapter_instance: Option<String>,
     /// Executor-observed process identity.
     pub process_identity: Option<String>,
+    /// Nonsecret digest reference to the exact authenticated PID/start/image tuple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_binding_ref: Option<String>,
     /// Native session/run locator (outside Kernel scope: declared missing).
     pub native_session: Option<String>,
     /// Parent-child agent locators (outside Kernel scope: declared missing).
@@ -474,6 +500,7 @@ impl AuditLineage {
             state_fence: None,
             adapter_instance: None,
             process_identity: None,
+            process_binding_ref: None,
             native_session: None,
             parent_child_locators: None,
             route_receipt_requested: None,
@@ -552,6 +579,15 @@ impl AuditLineage {
     /// Fills transport/session slots from one authenticated session.
     pub fn fill_session(&mut self, session: &Session) {
         Self::fill(&mut self.adapter_instance, &session.connection_id);
+        if let Some(binding) = session.peer.process_binding()
+            && let Some(reference) = process_binding_reference(
+                binding.process_id(),
+                binding.start_time_100ns(),
+                binding.image_path(),
+            )
+        {
+            Self::fill(&mut self.process_binding_ref, &reference);
+        }
         if self.state_fence.is_none() {
             self.state_fence = Some(session.module_generation.state_fence.clone());
         }
@@ -587,6 +623,14 @@ impl AuditLineage {
     pub fn fill_process_receipt(&mut self, receipt: &ProcessStartReceipt) {
         Self::fill(&mut self.operation_id, receipt.operation_id().as_str());
         Self::fill(&mut self.job_id, receipt.identity().job_id().as_str());
+        let physical = receipt.identity().physical();
+        if let Some(reference) = process_binding_reference(
+            physical.process_id(),
+            physical.start_time_100ns(),
+            physical.image_path(),
+        ) {
+            Self::fill(&mut self.process_binding_ref, &reference);
+        }
         Self::fill(
             &mut self.process_identity,
             receipt.identity().process_id().as_str(),
@@ -657,6 +701,7 @@ impl AuditLineage {
             (&self.work_scope, "work_scope"),
             (&self.adapter_instance, "adapter_instance"),
             (&self.process_identity, "process_identity"),
+            (&self.process_binding_ref, "process_binding_ref"),
             (&self.native_session, "native_session"),
             (&self.parent_child_locators, "parent_child_locators"),
             (&self.route_receipt_requested, "route_receipt_requested"),
@@ -1087,6 +1132,74 @@ impl AuditEventDraft {
         }
     }
 
+    /// Returns a daemon-handshake refusal draft for the durable audit chain
+    /// without promoting peer-supplied identity to authenticated process lineage.
+    #[must_use]
+    pub fn session_rejected(
+        connection_id: &str,
+        peer_identity_well_formed: bool,
+        public_transport_error: &'static str,
+        refusal_cause: Option<&'static str>,
+        owner_launch: Option<&EliotdLaunchDescriptor>,
+        owner_process_receipt: Option<&ProcessStartReceipt>,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.adapter_instance = Some(connection_id.to_owned());
+        lineage.controller = Some("kernel".to_owned());
+        let owner_launch = owner_launch.map(|launch| {
+            AuditLineage::fill(
+                &mut lineage.module_generation,
+                &launch.generation.value().to_string(),
+            );
+            AuditLineage::fill(
+                &mut lineage.authority_epoch,
+                &authority_epoch_text(&launch.authority_epoch),
+            );
+            serde_json::json!({
+                "descriptor_sha256": launch.descriptor_sha256,
+                "generation": launch.generation.value(),
+                "authority_epoch": authority_epoch_text(&launch.authority_epoch),
+            })
+        });
+        let owner_process_receipt = owner_process_receipt.map(|receipt| {
+            let physical = receipt.identity().physical();
+            let process_binding_ref = process_binding_reference(
+                physical.process_id(),
+                physical.start_time_100ns(),
+                physical.image_path(),
+            );
+            serde_json::json!({
+                "expected_process_binding_ref": process_binding_ref,
+                "operation_id": receipt.operation_id().as_str(),
+                "generation": receipt.accepted_generation().get(),
+                "authority_epoch": authority_epoch_text(
+                    receipt.binding().state_fence().authority_epoch()
+                ),
+                "validation_revision": receipt.binding().validation_revision(),
+            })
+        });
+        Self {
+            kind: AuditEventKind::SESSION_REJECTED,
+            lineage,
+            body: serde_json::json!({
+                "connection_id": connection_id,
+                "peer_identity_well_formed": peer_identity_well_formed,
+                "transport_authentication": "not_observed_at_binding_boundary",
+                "operation_authorization": "not_assessed",
+                "semantic_result_acceptance": "not_reached",
+                "public_transport_error": public_transport_error,
+                "refusal_detail_status": if refusal_cause.is_none() {
+                    "unclassified"
+                } else {
+                    "classified"
+                },
+                "refusal_cause": refusal_cause,
+                "owner_launch": owner_launch,
+                "owner_process_receipt": owner_process_receipt,
+            }),
+        }
+    }
+
     /// Returns the session-revoked draft for one connection.
     #[must_use]
     pub fn session_revoked(connection_id: &str) -> Self {
@@ -1145,6 +1258,31 @@ impl AuditEventDraft {
             kind: AuditEventKind::PROCESS_LAUNCH_FAILED,
             lineage,
             body: serde_json::json!({"terminal_code": terminal_code}),
+        }
+    }
+
+    /// Returns the descendant-closure draft for one launched child
+    /// (CHILD-1/CHILD-2, #1918): the exact observed lifecycle and tree state,
+    /// never a success claim on its own. Crate-internal: the receipt shape is
+    /// a Kernel-internal projection, not exported audit API.
+    #[must_use]
+    pub(crate) fn descendant_closure(
+        receipt: &super::activation_lifecycle::DescendantClosureReceipt,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.controller = Some("kernel".to_owned());
+        Self {
+            kind: AuditEventKind::PROCESS_DESCENDANT_CLOSED,
+            lineage,
+            body: serde_json::json!({
+                "operation_id": receipt.operation_id().as_str(),
+                "owner_module": receipt.owner_module(),
+                "lifecycle": format!("{:?}", receipt.lifecycle()),
+                "cancellation": format!("{:?}", receipt.cancellation()),
+                "tree_terminated": receipt.tree_terminated(),
+                "all_closed": receipt.all_closed(),
+                "evidence_ref": receipt.evidence_ref(),
+            }),
         }
     }
 

@@ -22,13 +22,15 @@ use crate::{client, schema, schema_inventory};
 #[cfg(test)]
 use eliot_store_api::{CONTRACT_VERSION, validate_genesis_receipt_envelope};
 use eliot_store_api::{
-    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ExactJsonBytes,
-    NamedMutationOperation, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    RecoveryRecord, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
-    StoreRecoverySnapshot, TransitionClass, WriteReceipt, decode_erasure_surfaces,
-    generated_operation_manifests, operation_manifest_set_digest,
+    CommittedCanonicalTransition, ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT,
+    ERASURE_PARAM_SURFACES, ExactJsonBytes, NamedMutationOperation, ORDERING_LINK_GENESIS_HASH,
+    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
+    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
+    TransitionClass, WriteReceipt, decode_erasure_surfaces, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
@@ -44,6 +46,7 @@ mod schema_contract;
 pub(crate) mod surreal_automation;
 pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_experience;
+pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;
@@ -977,6 +980,15 @@ struct VerifiedAttemptState {
     fence: Option<FenceRecord>,
     current_revisions: Vec<RevisionHead>,
     current_orderings: Vec<OrderingHead>,
+    /// Per-scope prior link hashes for the canonical event's chain links
+    /// (issue #1931). Read beside the heads so a link can never claim a
+    /// genesis prior for a scope that already advanced.
+    current_chain_tips: plan::OrderingChainTips,
+    /// Retained publication generations for the transition's declared
+    /// projection kinds (issue #1931, `I5.8`). Read beside the heads so every
+    /// planned publication advances from the store's own state instead of a
+    /// constant.
+    current_projection_generations: plan::ProjectionGenerations,
 }
 
 impl VerifiedAttemptState {
@@ -1004,6 +1016,7 @@ struct AttemptLegWrites {
     reactive: surreal_reactive::ReactiveWrites,
     automation: surreal_automation::AutomationWrites,
     experience: surreal_experience::ExperienceWrites,
+    learning: surreal_learning::LearningWrites,
 }
 
 /// Same-operation reuse check for one apply attempt (issue #63).
@@ -1067,6 +1080,17 @@ async fn load_verified_attempt_state(
     let current_revisions = read_revision_heads_inner(db, &adapter.config, &revision_keys).await?;
     let current_orderings =
         read_ordering_heads_inner(db, &adapter.config, &ordering_scopes).await?;
+    let current_chain_tips =
+        read_ordering_chain_tips_inner(db, &adapter.config, &ordering_scopes).await?;
+    let current_projection_generations = read_projection_generations_inner(
+        db,
+        &adapter.config,
+        &transition
+            .event_projection_relation_intents
+            .projection_kinds
+            .clone(),
+    )
+    .await?;
     check_expected_revisions(
         &current_revisions,
         expected_revision_heads,
@@ -1081,6 +1105,8 @@ async fn load_verified_attempt_state(
         fence,
         current_revisions,
         current_orderings,
+        current_chain_tips,
+        current_projection_generations,
     })
 }
 
@@ -1128,11 +1154,14 @@ async fn prepare_attempt_leg_writes(
         surreal_automation::prepare_automation_writes(db, &adapter.config, transition).await?;
     let experience_writes =
         surreal_experience::prepare_experience_writes(db, &adapter.config, transition).await?;
+    let learning_writes =
+        surreal_learning::prepare_learning_writes(db, &adapter.config, transition).await?;
     Ok(AttemptLegWrites {
         notification: notification_writes,
         reactive: reactive_writes,
         automation: automation_writes,
         experience: experience_writes,
+        learning: learning_writes,
     })
 }
 
@@ -1158,7 +1187,8 @@ async fn prepare_attempt_leg_writes(
 /// exact same-operation receipt reconciliation before replay.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the apply attempt carries the exact admitted contract: context, transition, both head sets, authorities, lane"
+    clippy::too_many_lines,
+    reason = "the apply attempt carries the exact admitted contract: context, transition, both head sets, authorities, lane; each admitted leg computes its row writes inline before receipt planning"
 )]
 async fn apply_with_retry(
     adapter: &SurrealStoreAdapter,
@@ -1216,13 +1246,28 @@ async fn apply_with_retry(
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
-            plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?
+            // Issue #1931: allocation retry re-reads the retained publication
+            // generations, so the publication generation on the attempt that
+            // actually commits is still exactly the retained generation plus
+            // one. Every other semantic value stays byte-for-byte from the
+            // established plan.
+            let mut recomputed =
+                plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?;
+            plan::rebind_publication_generations(
+                &mut recomputed,
+                &verified.current_projection_generations,
+            )?;
+            recomputed
         } else {
-            let full = plan::select_apply_plan(
+            let full = plan::select_apply_plan_with_chain_tips(
                 &transition,
                 authorities,
-                &verified.current_revisions,
-                &verified.current_orderings,
+                &plan::ObservedStoreState {
+                    revision_heads: verified.current_revisions.clone(),
+                    ordering_heads: verified.current_orderings.clone(),
+                    chain_tips: verified.current_chain_tips.clone(),
+                    projection_generations: verified.current_projection_generations.clone(),
+                },
                 next_commit_sequence,
                 next_outbox_sequence,
             )?;
@@ -1271,6 +1316,7 @@ async fn apply_with_retry(
             &legs.reactive,
             &legs.automation,
             &legs.experience,
+            &legs.learning,
         )
         .await
         {
@@ -1282,6 +1328,8 @@ async fn apply_with_retry(
                     &expected_revision_heads,
                     &expected_ordering_heads,
                 )?;
+                validate_committed_canonical_transition(&plan, &receipt)?;
+                validate_committed_projection_publications(&plan, &receipt)?;
                 return Ok(receipt);
             }
             Err(AdapterError::AllocationContention { .. }) if retries < MAX_ALLOCATION_RETRIES => {
@@ -1290,6 +1338,86 @@ async fn apply_with_retry(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Post-commit atomicity gate for one canonical transition (issue #1931).
+///
+/// `I5.4` requires the semantic event, the projection/relation/outbox changes,
+/// the scope revisions, the receipt, and the audit-chain fields to be ONE
+/// atomic unit. Before this gate the adapter only proved the receipt's own
+/// identity; nothing proved the event could not commit without its outbox
+/// coverage, its per-scope chain links, or its audit digest. This closes that
+/// hole on the live `Ok(())` arm of [`apply_with_retry`], so a partial commit
+/// fails closed with a typed `StoreError` instead of returning a receipt.
+///
+/// Every member is the value the single `TX_BEGIN`/`TX_COMMIT` transaction
+/// actually bound: the canonical event (with one chain link per declared
+/// Ordering Scope, the payload digest, the monotonic ordinal, and the fence),
+/// the outbox intents, the audit-chain digest committed on the same
+/// `canonical_event` row, and the committed receipt itself. The check is pure
+/// and needs no second provider round trip; what it proves is that the
+/// committed bundle is whole and cross-bound, while durability stays the
+/// provider's acknowledged `COMMIT` plus the receipt readback.
+fn validate_committed_canonical_transition(
+    plan: &plan::ApplyPlan,
+    receipt: &WriteReceipt,
+) -> Result<(), AdapterError> {
+    CommittedCanonicalTransition {
+        event: plan.canonical_event.clone(),
+        receipt: receipt.clone(),
+        outbox: plan.outbox_records.clone(),
+        audit_chain_digest: plan.audit_chain_digest.clone(),
+    }
+    .validate_atomic()
+    .map_err(AdapterError::Store)
+}
+
+/// Post-commit publication fence for one canonical transition (issue #1931).
+///
+/// `I5.8` requires candidate data and provenance to become visible atomically
+/// at an explicit source fence. This runs on the live `Ok(())` arm beside
+/// [`validate_committed_canonical_transition`] and refuses a commit whose
+/// projection publications are not whole: every publication the transaction
+/// wrote must be named by the very receipt this commit produced, must pin that
+/// receipt's commit as its atomic data/provenance commit, must sit at the
+/// receipt's own fence, and must name exactly the scope-revision heads this
+/// transaction committed as its source heads — read back through the same
+/// [`eliot_store_api::FencedProjectionPublication::check_record_current`]
+/// predicate the reader-side publication gate uses, so the write-side and
+/// read-side fences cannot drift.
+///
+/// It is pure over the values the one transaction bound and needs no second
+/// provider round trip, so it can never refuse a commit whose own plan and
+/// receipt are whole. A transition that declares no projection kind has nothing
+/// to fence and passes trivially.
+fn validate_committed_projection_publications(
+    plan: &plan::ApplyPlan,
+    receipt: &WriteReceipt,
+) -> Result<(), AdapterError> {
+    if plan.projection_records.len() != receipt.projection_refs.len() {
+        return Err(AdapterError::Store(StoreError::InvalidProjection));
+    }
+    let Some(commit_id) = receipt.commit_id.as_ref() else {
+        if plan.projection_records.is_empty() {
+            return Ok(());
+        }
+        return Err(AdapterError::Store(StoreError::InvalidProjection));
+    };
+    for record in &plan.projection_records {
+        if record.state_fence != receipt.state_fence
+            || record.atomic_data_commit != *commit_id
+            || !receipt.projection_refs.contains(&record.publication_id)
+        {
+            return Err(AdapterError::Store(StoreError::InvalidProjection));
+        }
+        eliot_store_api::FencedProjectionPublication::check_record_current(
+            record,
+            &plan.next_revision_heads,
+            record.source_generation,
+        )
+        .map_err(AdapterError::Store)?;
+    }
+    Ok(())
 }
 
 /// 688-B: the adapter's apply-path erasure execution.
@@ -1594,6 +1722,117 @@ async fn read_ordering_heads_inner(
     let heads = take_vec::<OrderingHead>(&mut response, 0)?;
     plan::validate_ordering_heads(&heads)?;
     Ok(heads)
+}
+
+/// One Ordering Scope's own chain tip, read beside its ordering head.
+#[derive(Deserialize)]
+struct OrderingChainTipRow {
+    ordering_scope: String,
+    /// Null for a row written before per-scope chain links existed; such a
+    /// scope has no prior link and links against the genesis prior.
+    event_hash: Option<String>,
+}
+
+/// Reads each requested Ordering Scope's current chain tip (issue #1931).
+///
+/// The prior link hash is a sibling field on the schemaless `ordering_head`
+/// record, so the closed `SELECT VALUE body` head read cannot see it; this is
+/// the one read that does. A scope with no row, or a pre-chain-link row, maps
+/// to [`ORDERING_LINK_GENESIS_HASH`]. A present-but-malformed tip is not
+/// validated here: [`eliot_store_api::CanonicalEvent::issue`] is the single
+/// digest validator and refuses the plan — before any provider write — if a
+/// tip is not a lowercase SHA-256.
+async fn read_ordering_chain_tips_inner(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    scopes: &[OrderingScopeId],
+) -> Result<plan::OrderingChainTips, AdapterError> {
+    let mut tips = plan::OrderingChainTips::new();
+    if scopes.is_empty() {
+        return Ok(tips);
+    }
+    let mut bindings = Map::new();
+    bindings.insert(
+        "scopes".to_owned(),
+        to_value(&scopes.iter().map(ToString::to_string).collect::<Vec<_>>())?,
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "read.ordering_chain_tips",
+        schema::READ_ORDERING_CHAIN_TIPS_BY_SCOPES,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<OrderingChainTipRow>(&mut response, 0)?;
+    for row in rows {
+        let tip = row
+            .event_hash
+            .unwrap_or_else(|| ORDERING_LINK_GENESIS_HASH.to_owned());
+        if tips.insert(row.ordering_scope.clone(), tip).is_some() {
+            return Err(AdapterError::Store(StoreError::Duplicate {
+                field: "ordering_chain_tips",
+            }));
+        }
+    }
+    Ok(tips)
+}
+
+/// One retained projection publication generation, read beside the chain tips.
+#[derive(Deserialize)]
+struct ProjectionGenerationRow {
+    projection_kind: String,
+    projection_generation: u64,
+    source_generation: u64,
+}
+
+/// Reads each declared projection kind's retained publication generations
+/// (issue #1931, `I5.8`).
+///
+/// The generations a publication must advance from are the store's own
+/// retained `projection_record` rows, so the planner never hard-codes a
+/// generation and a publication can never claim one another publication
+/// already holds. This is the same sanctioned pre-transaction readback
+/// mechanism as [`read_ordering_chain_tips_inner`]: one closed `SELECT` beside
+/// the other verified heads, before any provider write, and folding the
+/// maximum observed per kind because publications accumulate one row each.
+/// A kind with no retained publication stays absent and reads as the genesis
+/// cursor, so the first publication of a kind is generation 1.
+///
+/// The publication read gate reuses this one reader rather than a second copy:
+/// the writer advances from the retained maximum and the reader refuses anything
+/// below it, so both sides compare against the same durable state.
+pub(super) async fn read_projection_generations_inner(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    kinds: &[String],
+) -> Result<plan::ProjectionGenerations, AdapterError> {
+    let mut generations = plan::ProjectionGenerations::new();
+    if kinds.is_empty() {
+        return Ok(generations);
+    }
+    let mut bindings = Map::new();
+    bindings.insert("kinds".to_owned(), to_value(&kinds.to_vec())?);
+    let mut response = client::query(
+        db,
+        config,
+        "read.projection_generations",
+        schema::READ_PROJECTION_GENERATIONS_BY_KINDS,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<ProjectionGenerationRow>(&mut response, 0)?;
+    for row in rows {
+        plan::retain_projection_generations(
+            &mut generations,
+            row.projection_kind,
+            plan::RetainedProjectionGeneration {
+                projection_generation: row.projection_generation,
+                source_generation: row.source_generation,
+            },
+        );
+    }
+    Ok(generations)
 }
 
 fn union_revision_keys(
@@ -2384,7 +2623,8 @@ mod concurrent_allocation_tests {
 
         use super::super::{
             apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
-            client, read_fence, surreal_automation, surreal_experience, surreal_reactive,
+            client, read_fence, surreal_automation, surreal_experience, surreal_learning,
+            surreal_reactive,
         };
         use crate::client::session_pool::SessionRole;
         use crate::config::{ClientSetLimits, SurrealAdapterConfig};
@@ -2767,6 +3007,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             .expect("first writer commits");
@@ -2790,6 +3031,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             {
@@ -2836,6 +3078,7 @@ mod concurrent_allocation_tests {
                 &surreal_reactive::ReactiveWrites::default(),
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
+                &surreal_learning::LearningWrites::default(),
             )
             .await
             .expect("bounded retry commits");

@@ -106,6 +106,33 @@ impl JobObjectIdentity {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Reports whether this durable name is a Host-owned outer kill domain Job
+    /// Object name rather than a per-generation/per-attempt nested name.
+    ///
+    /// `I1.6` puts kill-on-close at the outer ownership boundary, so a nested
+    /// Job Object name must never be treated as an outer kill domain.
+    #[must_use]
+    pub fn is_host_outer_kill_domain_name(&self) -> bool {
+        outer_kill_domain_of_job_name(&self.name).is_some()
+    }
+}
+
+/// Resolves the Host-owned outer kill domain that owns `job_name`.
+///
+/// The domain is a total function of the durable Job Object name, so the
+/// owner identity on an outer Job Object record can never disagree with the
+/// name a launcher presented. A per-generation/per-attempt nested Job Object
+/// name resolves to `None`: nesting never mints a second outer kill domain.
+#[cfg(windows)]
+fn outer_kill_domain_of_job_name(job_name: &str) -> Option<OuterKillDomain> {
+    [
+        OuterKillDomain::Kernel,
+        OuterKillDomain::Store,
+        OuterKillDomain::Watchdog,
+    ]
+    .into_iter()
+    .find(|domain| domain.owns_host_job_name(job_name))
 }
 
 #[cfg(windows)]
@@ -155,15 +182,101 @@ impl JobObjectLimits {
     }
 }
 
+/// Owner identity of one Host-owned outer Job Object kill domain.
+///
+/// `I1.6` requires that "Watchdog and Kernel do not share a child-kill
+/// domain", that "Kernel descendants remain inside the Host-owned Kernel Job
+/// Object and MAY additionally enter nested per-Module/per-attempt Job
+/// Objects", and that "the process tree receives kill-on-close at its outer
+/// ownership boundary".
+///
+/// The domain is bound to the object-manager name by
+/// [`OuterKillDomain::owns_host_job_name`]: a launcher must present the
+/// `Local\Eliot-Host-<domain>-<suffix>` Job Object of the domain it claims, so
+/// a Kernel launcher cannot present the Watchdog domain's Job Object and a
+/// Watchdog launcher cannot present the Kernel domain's Job Object.
+#[cfg(windows)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum OuterKillDomain {
+    /// The Host-owned Kernel Job Object; every Kernel descendant stays in it.
+    Kernel,
+    /// The Host-owned canonical-store Job Object, launched as its own branch.
+    Store,
+    /// The independent Watchdog Job Object; it never shares a kill domain with
+    /// the Kernel, so closing the Kernel Job Object cannot kill it.
+    Watchdog,
+}
+
+#[cfg(windows)]
+impl OuterKillDomain {
+    /// Returns the exact name fragment this domain contributes to a Host-owned
+    /// outer Job Object name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Kernel => "Kernel",
+            Self::Store => "Store",
+            Self::Watchdog => "Watchdog",
+        }
+    }
+
+    /// Returns the exact object-manager prefix of this domain's Host-owned
+    /// outer Job Object.
+    #[must_use]
+    pub const fn host_job_name_prefix(self) -> &'static str {
+        match self {
+            Self::Kernel => "Local\\Eliot-Host-Kernel-",
+            Self::Store => "Local\\Eliot-Host-Store-",
+            Self::Watchdog => "Local\\Eliot-Host-Watchdog-",
+        }
+    }
+
+    /// Reports whether `job_name` is exactly the Host-owned outer Job Object
+    /// name of this kill domain.
+    ///
+    /// A per-generation/per-attempt Job Object name is not a Host-owned outer
+    /// name, so this reports `false` for nested Job Objects: nesting never
+    /// mints a second outer kill domain.
+    #[must_use]
+    pub fn owns_host_job_name(self, job_name: &str) -> bool {
+        job_name
+            .strip_prefix(self.host_job_name_prefix())
+            .is_some_and(|suffix| !suffix.is_empty())
+    }
+
+    /// Returns the other Host-owned kill domain a containment probe for this
+    /// domain must contrast with.
+    ///
+    /// The acceptance clause requires that closing one outer Job Object kills
+    /// that domain's descendants and leaves a different domain's descendants
+    /// running, so a probe always needs a second, distinct domain.
+    #[must_use]
+    pub const fn contrasting_domain(self) -> Self {
+        match self {
+            Self::Kernel | Self::Store => Self::Watchdog,
+            Self::Watchdog => Self::Kernel,
+        }
+    }
+}
+
 #[cfg(windows)]
 static JOB_OBJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// RAII wrapper for a named Windows Job Object configured to terminate
 /// assigned processes when the sole owning handle closes.
+///
+/// `outer_kill_domain` is the owner identity carried on the Job Object record.
+/// It is `Some` only for a Host-owned outer kill domain Job Object; a
+/// per-generation/per-attempt nested Job Object carries `None` because
+/// nesting must never mint a second outer kill domain.
 #[cfg(windows)]
 pub struct JobObject {
     handle: windows_sys::Win32::Foundation::HANDLE,
     identity: JobObjectIdentity,
+    outer_kill_domain: Option<OuterKillDomain>,
 }
 
 // SAFETY: a Job Object handle is process-global and uniquely owned here.
@@ -210,6 +323,45 @@ impl JobObject {
     pub fn new_named_kill_on_close_with_limits(
         identity: JobObjectIdentity,
         resource_limits: JobObjectLimits,
+    ) -> Result<Self, WindowsAdapterError> {
+        Self::create_named_kill_on_close(identity, resource_limits, None)
+    }
+
+    /// Creates a fresh named kill-on-close Job Object owned by one Host-owned
+    /// outer kill domain.
+    ///
+    /// The owner identity is admitted only when the durable Job Object name is
+    /// exactly this domain's `Local\Eliot-Host-<domain>-<suffix>` name, so a
+    /// launcher cannot create, reopen, or attach a child to another domain's
+    /// outer kill domain Job Object.
+    ///
+    /// # Errors
+    /// Returns `IdentityMismatch` when the name is not this kill domain's
+    /// outer Job Object name, and otherwise the typed adapter errors of
+    /// [`JobObject::new_named_kill_on_close_with_limits`].
+    pub fn new_named_outer_kill_on_close_with_limits(
+        outer_kill_domain: OuterKillDomain,
+        identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+    ) -> Result<Self, WindowsAdapterError> {
+        if !outer_kill_domain.owns_host_job_name(identity.name()) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Self::create_named_kill_on_close(identity, resource_limits, Some(outer_kill_domain))
+    }
+
+    /// Returns the Host-owned outer kill domain this Job Object is the
+    /// kill-on-close boundary of, or `None` for a per-generation/per-attempt
+    /// nested Job Object that must never mint a second outer kill domain.
+    #[must_use]
+    pub const fn outer_kill_domain(&self) -> Option<OuterKillDomain> {
+        self.outer_kill_domain
+    }
+
+    fn create_named_kill_on_close(
+        identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+        outer_kill_domain: Option<OuterKillDomain>,
     ) -> Result<Self, WindowsAdapterError> {
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -273,7 +425,11 @@ impl JobObject {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
             return Err(last_windows_adapter_error());
         }
-        Ok(Self { handle, identity })
+        Ok(Self {
+            handle,
+            identity,
+            outer_kill_domain,
+        })
     }
 
     /// Returns the durable Job Object identity.
@@ -347,12 +503,340 @@ impl JobObject {
             Ok(())
         }
     }
+
+    /// Closes the sole owning handle exactly once so the kernel evaluates this
+    /// Job Object's `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` limit.
+    ///
+    /// A launch probe has to observe what Windows does when the *last* handle
+    /// to an outer Job Object disappears. A plain `Drop` cannot report that
+    /// observation, so the probe releases the handle explicitly and then
+    /// re-observes the kernel's decision.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the handle was already released, and a
+    /// typed adapter error when Windows rejects the close.
+    fn close_owning_handle(&mut self) -> Result<(), WindowsAdapterError> {
+        if self.handle.is_null() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        // SAFETY: this value owns the handle and never closes it twice.
+        if unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) } == 0 {
+            return Err(last_windows_adapter_error());
+        }
+        self.handle = std::ptr::null_mut();
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
 impl Drop for JobObject {
     fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        if !self.handle.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        }
+    }
+}
+
+/// The observed verdict of one supported-build Job Object launch probe.
+///
+/// `I1.6` requires that "startup probes verify the required nesting and
+/// kill-on-close semantics on the supported Windows build". This value exists
+/// only after a real Windows experiment observed all three properties for
+/// `domain` on the running build; it is never a constant and never a
+/// permissive default.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobLaunchContainment {
+    domain: OuterKillDomain,
+    distinct_domain: OuterKillDomain,
+}
+
+#[cfg(windows)]
+impl JobLaunchContainment {
+    /// Returns the Host-owned outer kill domain this verdict was observed for.
+    #[must_use]
+    pub const fn domain(self) -> OuterKillDomain {
+        self.domain
+    }
+
+    /// Returns the different Host-owned outer kill domain whose descendant was
+    /// observed still running after the probed domain's outer Job Object was
+    /// closed.
+    #[must_use]
+    pub const fn distinct_domain(self) -> OuterKillDomain {
+        self.distinct_domain
+    }
+}
+
+#[cfg(windows)]
+static JOB_LAUNCH_CONTAINMENT_PROBES: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            OuterKillDomain,
+            Result<JobLaunchContainment, WindowsAdapterError>,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Probes this Windows build, once per kill domain, for the three containment
+/// properties `I1.6` requires a startup probe to verify: that a child is
+/// actually assigned to the intended outer Job Object, that a nested
+/// per-generation/per-attempt Job Object is permitted for a process already
+/// inside an outer Job Object, and that the outer Job Object's kill-on-close
+/// limit still governs while a different kill domain is untouched.
+///
+/// The probe is a real Windows experiment, never a constant. It creates one
+/// outer Job Object of `domain` and one of a *different* kill domain, plus one
+/// per-generation Job Object, then launches two suspended children of the
+/// current image, assigns the first child to `domain`'s outer Job Object and
+/// then to the nested Job Object, and assigns the second child to the other
+/// domain's outer Job Object. Neither child is ever resumed, so a child can
+/// only leave that suspended state by being terminated. The probe then closes
+/// the sole owning handle of `domain`'s outer Job Object and re-observes both
+/// children.
+///
+/// A rejected or ineffective nested assignment, or any containment property
+/// that cannot be observed, fails closed with a typed adapter error; the
+/// caller must not assume nesting, and no caller may fall back to a weaker
+/// limit or a shared kill domain.
+///
+/// # Errors
+/// Returns `Unavailable` when this build cannot establish the required
+/// nesting, `IdentityMismatch` when a child was not assigned to the intended
+/// Job Object or a kill domain did not stay separate, and a typed platform
+/// error when the experiment itself cannot be set up.
+#[cfg(windows)]
+pub fn probe_launch_containment(
+    domain: OuterKillDomain,
+) -> Result<JobLaunchContainment, WindowsAdapterError> {
+    let mut probed = JOB_LAUNCH_CONTAINMENT_PROBES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .map_err(|_| WindowsAdapterError::Failed)?;
+    if let Some(observed) = probed.get(&domain) {
+        return *observed;
+    }
+    let observed = observe_launch_containment(domain);
+    probed.insert(domain, observed);
+    observed
+}
+
+/// Requires this build's observed containment verdict for `outer_kill_domain`
+/// before any child process may be created.
+///
+/// The verdict must be the one observed for exactly this domain and must have
+/// contrasted it against a different kill domain. Anything else means the
+/// required containment was not established, so the launch fails closed here
+/// instead of proceeding with a weaker limit or a shared kill domain.
+#[cfg(windows)]
+fn require_probed_outer_kill_domain(
+    outer_kill_domain: OuterKillDomain,
+) -> Result<(), WindowsAdapterError> {
+    let containment = probe_launch_containment(outer_kill_domain)?;
+    if containment.domain() != outer_kill_domain
+        || containment.distinct_domain() == outer_kill_domain
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+/// Runs the real containment experiment for one kill domain.
+#[cfg(windows)]
+fn observe_launch_containment(
+    domain: OuterKillDomain,
+) -> Result<JobLaunchContainment, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let distinct_domain = domain.contrasting_domain();
+    let image = std::env::current_exe().map_err(|error| windows_adapter_from_io(&error))?;
+    let working_directory = image
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(WindowsAdapterError::InvalidInput)?
+        .to_path_buf();
+
+    // The two outer Job Objects are real Host-owned outer kill domain Job
+    // Objects of distinct domains, and the third is a per-generation Job
+    // Object that deliberately carries no outer kill domain.
+    let mut domain_job = JobObject::new_named_outer_kill_on_close_with_limits(
+        domain,
+        probe_outer_job_identity(domain)?,
+        JobObjectLimits::default(),
+    )?;
+    let distinct_job = JobObject::new_named_outer_kill_on_close_with_limits(
+        distinct_domain,
+        probe_outer_job_identity(distinct_domain)?,
+        JobObjectLimits::default(),
+    )?;
+    let nested_job = JobObject::new_named_kill_on_close_with_limits(
+        probe_nested_job_identity()?,
+        JobObjectLimits::default(),
+    )?;
+    if domain_job.outer_kill_domain() != Some(domain)
+        || distinct_job.outer_kill_domain() != Some(distinct_domain)
+        || nested_job.outer_kill_domain().is_some()
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+
+    // Each guard stays armed for the whole experiment and stays bound for its
+    // whole scope: it terminates and reaps its child even when the probe
+    // returns an error early.
+    let (domain_child, _domain_child_guard) =
+        spawn_suspended_probe_child(&image, &working_directory)?;
+    let (distinct_child, _distinct_child_guard) =
+        spawn_suspended_probe_child(&image, &working_directory)?;
+
+    // Assignment: the child has to actually be a member of the intended outer
+    // Job Object before anything else may be claimed.
+    domain_job.assign_process_handle(domain_child.0)?;
+    if !is_process_in_job(domain_child.0, domain_job.handle)? {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    // Permitted nesting: a per-generation/per-attempt Job Object has to accept
+    // a process that is already inside the outer Job Object, and the child has
+    // to remain a member of both. A rejected or ineffective nested assignment
+    // means this build cannot establish the required containment, so it fails
+    // closed instead of silently degrading the limits or kill domain.
+    if nested_job.assign_process_handle(domain_child.0).is_err() {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    if !is_process_in_job(domain_child.0, nested_job.handle)? {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    if !is_process_in_job(domain_child.0, domain_job.handle)? {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    distinct_job.assign_process_handle(distinct_child.0)?;
+    if !is_process_in_job(distinct_child.0, distinct_job.handle)? {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+
+    // Outer kill-on-close has to still govern: releasing the sole owning
+    // handle of the outer Job Object must terminate the nested descendant,
+    // even though the nested Job Object is still open.
+    domain_job.close_owning_handle()?;
+    if unsafe { WaitForSingleObject(domain_child.0, 5_000) } != WAIT_OBJECT_0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    // The other kill domain must be untouched by that close.
+    if unsafe { WaitForSingleObject(distinct_child.0, 0) } != WAIT_TIMEOUT {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(JobLaunchContainment {
+        domain,
+        distinct_domain,
+    })
+}
+
+/// Builds the unique Host-owned outer Job Object name one containment probe
+/// uses for `domain`. The name is process- and sequence-scoped, so a probe can
+/// never collide with the live Host Job Object of the same domain.
+#[cfg(windows)]
+fn probe_outer_job_identity(
+    domain: OuterKillDomain,
+) -> Result<JobObjectIdentity, WindowsAdapterError> {
+    let sequence = JOB_OBJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    JobObjectIdentity::new(format!(
+        "Local\\Eliot-Host-{}-probe-{}-{sequence}",
+        domain.label(),
+        std::process::id()
+    ))
+}
+
+/// Builds the unique per-generation Job Object name one containment probe uses.
+/// It is deliberately not a Host-owned outer name: nesting must never mint a
+/// second outer kill domain.
+#[cfg(windows)]
+fn probe_nested_job_identity() -> Result<JobObjectIdentity, WindowsAdapterError> {
+    let sequence = JOB_OBJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    JobObjectIdentity::new(format!(
+        "Local\\Eliot-P02-probe-nested-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+/// Creates one suspended, never-resumed child of the current image and returns
+/// its owned process handle plus an armed cleanup guard.
+///
+/// The child runs no instruction before the probe terminates it, so it can only
+/// leave the suspended state by being terminated. That is what makes the
+/// kill-on-close observation below unambiguous, and the guard terminates and
+/// reaps the child even when the probe returns early.
+#[cfg(windows)]
+fn spawn_suspended_probe_child(
+    image: &Path,
+    working_directory: &Path,
+) -> Result<(OwnedProcessHandle, SuspendedProcessCleanup), WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    let application =
+        nul_terminated_wide(image.as_os_str()).map_err(|error| windows_adapter_from_io(&error))?;
+    let mut command_line =
+        command_line(image, &[]).map_err(|error| windows_adapter_from_io(&error))?;
+    let current_directory = nul_terminated_wide(working_directory.as_os_str())
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let mut startup = STARTUPINFOW {
+        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        ..Default::default()
+    };
+    let mut information = PROCESS_INFORMATION::default();
+    // SAFETY: every buffer stays live for the call, no handle is inherited, and
+    // the child is created suspended so it executes nothing before the probe
+    // observes or terminates it.
+    if unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            std::ptr::null_mut(),
+            current_directory.as_ptr(),
+            &raw mut startup,
+            &raw mut information,
+        )
+    } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    if !information.hThread.is_null() {
+        // SAFETY: `CreateProcessW` returned a fresh primary thread handle here.
+        unsafe { CloseHandle(information.hThread) };
+    }
+    let process = OwnedProcessHandle::new(information.hProcess)?;
+    let raw_process = process.0;
+    Ok((
+        process,
+        SuspendedProcessCleanup {
+            process: raw_process,
+            armed: true,
+        },
+    ))
+}
+
+/// Reports whether `process` is a member of `job`. A null `job` asks whether
+/// the process is inside any Job Object at all, which is the aggregate the
+/// kernel exposes for a process inside a nested Job chain.
+#[cfg(windows)]
+fn is_process_in_job(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    job: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<bool, WindowsAdapterError> {
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    let mut member = 0;
+    // SAFETY: both handles are live owned handles and `member` is a live out
+    // pointer for the exact documented `BOOL`.
+    if unsafe { IsProcessInJob(process, job, &raw mut member) } == 0 {
+        Err(last_windows_adapter_error())
+    } else {
+        Ok(member != 0)
     }
 }
 
@@ -1985,17 +2469,92 @@ impl SuspendedJobChild {
 
     /// Creates a child suspended in a fresh named Job with resource ceilings.
     ///
+    /// This entry point does not claim a Host-owned outer kill domain. Launchers
+    /// that start a Host-owned outer branch or a per-generation nested Job
+    /// Object use [`SuspendedJobChild::spawn_named_host_outer_kill_domain`] and
+    /// [`SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain`] instead,
+    /// so a Kernel or Host launch cannot reach execution with an unverified
+    /// containment.
+    ///
     /// # Errors
     /// Returns a typed adapter error before resume when any limit, Job, pipe,
     /// process, identity, or assignment operation fails.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "suspended launch and fail-closed cleanup ordering remain contiguous"
-    )]
     pub fn spawn_named_with_limits(
         spec: SuspendedLaunchSpec,
         job_identity: JobObjectIdentity,
         resource_limits: JobObjectLimits,
+    ) -> Result<Self, WindowsAdapterError> {
+        Self::spawn_named_job_child(spec, job_identity, resource_limits, None)
+    }
+
+    /// Creates a child suspended in one exact fresh Host-owned outer Job
+    /// Object.
+    ///
+    /// `job_identity` must be a Host-owned outer kill domain Job Object name;
+    /// a per-generation/per-attempt nested name is refused, because `I1.6` puts
+    /// kill-on-close at the outer ownership boundary. The kill domain owner
+    /// identity carried on the created Job Object record is resolved from that
+    /// one name, so the record can never disagree with the name a launcher
+    /// presented and neither the Kernel nor the Watchdog launcher can present
+    /// the other's outer Job Object. `resource_limits` stays the caller's
+    /// already-admitted value; this entry point never adds a default, cap, or
+    /// fallback ceiling.
+    ///
+    /// The child is created only after this build's containment probe for the
+    /// resolved kill domain has observed assignment, permitted nesting, and
+    /// outer kill-on-close, so a build that cannot establish the containment
+    /// fails visibly instead of degrading silently.
+    ///
+    /// # Errors
+    /// Returns `IdentityMismatch` when the name is not a Host-owned outer kill
+    /// domain name, `Unavailable` when this build cannot establish the required
+    /// containment, and otherwise a typed adapter error before resume.
+    pub fn spawn_named_host_outer_kill_domain(
+        spec: SuspendedLaunchSpec,
+        job_identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+    ) -> Result<Self, WindowsAdapterError> {
+        let outer_kill_domain = outer_kill_domain_of_job_name(job_identity.name())
+            .ok_or(WindowsAdapterError::IdentityMismatch)?;
+        require_probed_outer_kill_domain(outer_kill_domain)?;
+        Self::spawn_named_job_child(spec, job_identity, resource_limits, Some(outer_kill_domain))
+    }
+
+    /// Creates a child suspended in a fresh per-generation/per-attempt Job
+    /// Object nested inside the Host-owned Kernel outer kill domain.
+    ///
+    /// `I1.6` keeps every Kernel descendant inside the Host-owned Kernel Job
+    /// Object while it MAY additionally enter nested per-Module/per-attempt Job
+    /// Objects, so the nested Job Object itself carries no outer kill domain:
+    /// nesting must never mint a second one. `resource_limits` stays the
+    /// caller's already-admitted value; this entry point never adds a default,
+    /// cap, or fallback ceiling.
+    ///
+    /// The child is created only after this build's containment probe for the
+    /// Kernel kill domain has observed that a nested Job Object is permitted
+    /// and that the outer kill-on-close still governs.
+    ///
+    /// # Errors
+    /// Returns `Unavailable` when this build cannot establish the required
+    /// containment, and otherwise a typed adapter error before resume.
+    pub fn spawn_nested_in_kernel_outer_kill_domain(
+        spec: SuspendedLaunchSpec,
+        job_identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+    ) -> Result<Self, WindowsAdapterError> {
+        require_probed_outer_kill_domain(OuterKillDomain::Kernel)?;
+        Self::spawn_named_job_child(spec, job_identity, resource_limits, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "suspended launch and fail-closed cleanup ordering remain contiguous"
+    )]
+    fn spawn_named_job_child(
+        spec: SuspendedLaunchSpec,
+        job_identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+        outer_kill_domain: Option<OuterKillDomain>,
     ) -> Result<Self, WindowsAdapterError> {
         use windows_sys::Win32::System::Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
@@ -2019,7 +2578,14 @@ impl SuspendedJobChild {
         make_non_inheritable(stderr_read.0)?;
         let inherited_handles = [stdin_read.0, stdout_write.0, stderr_write.0];
         let attributes = ProcThreadAttributeList::for_inherited_handles(&inherited_handles)?;
-        let job = JobObject::new_named_kill_on_close_with_limits(job_identity, resource_limits)?;
+        let job = match outer_kill_domain {
+            Some(domain) => JobObject::new_named_outer_kill_on_close_with_limits(
+                domain,
+                job_identity,
+                resource_limits,
+            )?,
+            None => JobObject::new_named_kill_on_close_with_limits(job_identity, resource_limits)?,
+        };
         let observer = JobProcessObserver::attach(job.handle)?;
         let mut startup = STARTUPINFOEXW {
             StartupInfo: windows_sys::Win32::System::Threading::STARTUPINFOW {

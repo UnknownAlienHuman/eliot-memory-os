@@ -475,9 +475,7 @@ pub struct AntigravityCapabilities {
     pub conversation: bool,
     pub json_output: bool,
     pub model_cli_arg: bool,
-    #[serde(default)]
     pub effort_cli_arg: bool,
-    #[serde(default)]
     pub disable_slash_commands: bool,
     pub dangerously_skip_permissions_seen: bool,
     pub text_output_supported: bool,

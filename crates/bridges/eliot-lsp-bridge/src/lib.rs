@@ -747,8 +747,11 @@ impl NormalizedResult {
 /// An empty lookup is `ProvenAbsent` only when the receipt records a
 /// complete run over a complete scope with an exact candidate binding;
 /// every other empty lookup is a typed [`UnknownOutcome`] or
-/// [`LookupOutcome::Contradicted`], never "not found".
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// [`LookupOutcome::Contradicted`], never "not found". The outcome is
+/// serializable so a typed unknown can be returned and persisted as its
+/// contract token instead of collapsing to "not found".
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LookupOutcome {
     /// The lookup returned items. They are observations, never absence
     /// proof, and their receipt still bounds their use.

@@ -94,19 +94,16 @@ jobs:
                   )
           assert inventory['authority']['branch'] == 'main'
 
-          # Validate #13 capability cell registry
+          # The capability-cell contract is a non-normative projection, so it is
+          # validated by its own declared schema and by the inventory source it
+          # names. No historical issue number carries authority here: the
+          # contract is whatever the current workstream routing record produces.
           registry_path = pathlib.Path('workstreams/core-daemons/capability-cell-registry.contract.toml')
           if registry_path.is_file():
               reg = tomllib.loads(registry_path.read_text(encoding='utf-8'))
               assert reg.get('schema') == 'eliot.capability-cell-registry-implementation.v1'
-              assert reg.get('issue') == 13
-
-          # Legacy eliot-app: check metadata only if package exists; retirement under #1189 does not fail policy
-          legacy_app_path = pathlib.Path('crates/eliot-app/Cargo.toml')
-          if legacy_app_path.is_file():
-              legacy_app = tomllib.loads(legacy_app_path.read_text(encoding='utf-8'))
-              assert 'legacy' in legacy_app['package']['description'].lower()
-              assert 'migration' in legacy_app['package']['description'].lower()
+              inventory_source = pathlib.Path(reg['inventory_source']['path'])
+              assert inventory_source.is_file(), inventory_source
 
           required = [
               '.github/README.md',
@@ -118,18 +115,74 @@ jobs:
           for item in required:
               assert pathlib.Path(item).is_file(), item
 
-          # Validate cognitive maps only if present; retirement under #1117 does not fail policy
-          for cog_map in [
-              'crates/smart/cognitive-wave-01.toml',
-              'crates/smart/cognitive-wave-02.toml',
-              'crates/smart/cognitive-edge-map.toml',
-              'crates/smart/cognitive-donor-map.toml',
-              'crates/smart/cognitive-crate-decisions.toml',
-          ]:
-              p = pathlib.Path(cog_map)
-              if p.is_file():
-                  data = tomllib.loads(p.read_text(encoding='utf-8'))
-                  assert isinstance(data, dict)
+          # Declared workstream inputs are derived from the current routing
+          # record, never from a literal filename list here, so an obsolete
+          # cognitive-map name cannot become policy authority and a new one is
+          # covered without editing this workflow. A declared brief or inventory
+          # that is present must be readable, and a declared TOML record must
+          # parse; a retired or not-yet-created one is not a policy failure,
+          # because its own owner disposition owns its removal (I0.8: an
+          # unresolved item blocks its own deletion, not unrelated work).
+          for workstream in active['workstream']:
+              for key in ('briefs', 'inventories'):
+                  for declared in workstream.get(key, []):
+                      declared_path = pathlib.Path(declared)
+                      if not declared_path.is_file():
+                          continue
+                      text = declared_path.read_text(encoding='utf-8')
+                      assert text.strip(), declared
+                      if declared_path.suffix == '.toml':
+                          assert isinstance(tomllib.loads(text), dict), declared
+
+          # Standalone-crate package/owner denominator. The denominator is
+          # discovered from the tree by the accepted rule (the discovery
+          # scripts/verify-standalone-crates.py --list applies: a manifest
+          # carrying both [package] and [workspace] that is neither a root
+          # workspace member nor a root workspace exclude entry), and every
+          # discovered package must carry an explicit owner disposition in the
+          # accepted record. Nothing here is a package list, count or issue
+          # number.
+          dispositions = tomllib.loads(
+              pathlib.Path('workstreams/security/standalone-crate-dispositions.toml').read_text(encoding='utf-8')
+          )
+          allowed_dispositions = set(dispositions['allowed_dispositions'])
+          disposition_rows = {}
+          for row in dispositions.get('crate', []):
+              assert row['path'] not in disposition_rows, f"duplicate disposition path {row['path']}"
+              disposition_rows[row['path']] = row
+          workspace = tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['workspace']
+          members = set(workspace.get('members', []))
+          excluded = set(workspace.get('exclude', []))
+          discovered = set()
+          for manifest in sorted(pathlib.Path('.').rglob('Cargo.toml')):
+              if any(part in ('target', 'testdata', 'fixtures') for part in manifest.parts):
+                  continue
+              text = manifest.read_text(encoding='utf-8')
+              if '[package]' not in text or '[workspace]' not in text:
+                  continue
+              relative = manifest.parent.as_posix()
+              if relative in members or relative in excluded:
+                  continue
+              discovered.add(relative)
+
+          # An unknown or unclassified package is a failure, never a silent pass.
+          unclassified = sorted(discovered - set(disposition_rows))
+          assert not unclassified, f'standalone packages without an owner disposition: {unclassified}'
+          # A recorded package may be absent from the tree only with an accepted
+          # retirement disposition; any other absence is arbitrary source
+          # deletion and stays malformed.
+          for relative in sorted(set(disposition_rows) - discovered):
+              verb = disposition_rows[relative]['disposition']
+              assert verb == 'RETIRE', (
+                  f'{relative} is absent from the tree without an accepted RETIRE '
+                  f'disposition (recorded {verb})'
+              )
+          for relative in sorted(discovered):
+              row = disposition_rows[relative]
+              assert row['disposition'] in allowed_dispositions, (
+                  f"{relative} records undeclared disposition {row['disposition']!r}"
+              )
+              assert str(row.get('owner', '')).strip(), f'{relative} has no owner in the disposition record'
           PY
 
       - name: Reject retired authority and campaign surfaces
@@ -201,7 +254,6 @@ jobs:
             docs/architecture/README.md
             docs/architecture/INDEX.md
             docs/operations/README.md
-            crates/eliot-app/AGENTS.md
             scripts/README.md
             workstreams/README.md
             workstreams/ACTIVE.toml
@@ -459,3 +511,25 @@ jobs:
               raise SystemExit(1)
           print(f'REPOSITORY_POLICY_WIRING: PASS workflows={len(workflows)} candidate=structural')
           PY
+
+      - name: Record repository-policy run manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          workflow_sha="$(sha256sum .github/workflows/repository-policy.yml | cut -d' ' -f1)"
+          pair_sha="$(sha256sum docs/normative-pair.toml | cut -d' ' -f1)"
+          active_sha="$(sha256sum workstreams/ACTIVE.toml | cut -d' ' -f1)"
+          inventory_sha="$(sha256sum workstreams/core-daemons/inventory.json | cut -d' ' -f1)"
+          {
+            echo '### Manual Repository Policy Run Manifest'
+            echo "- Repository: $GITHUB_REPOSITORY event=$GITHUB_EVENT_NAME ref=$GITHUB_REF run=$GITHUB_RUN_ID"
+            echo "- Source SHA: $source_sha"
+            echo "- Workflow: .github/workflows/repository-policy.yml sha256=$workflow_sha"
+            echo '- Actions: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
+            echo "- Policy inputs: normative-pair=$pair_sha ACTIVE=$active_sha inventory=$inventory_sha"
+            echo '- Ordered checks: branch identity, authority receipts, retired-surface rejection, normative identity, stale-link rejection, trigger/profile/privilege/cache/candidate wiring'
+            echo '- Gate states: fail-fast job; this manifest runs only after every prior step passed'
+            echo '- Cache: no cache block; nothing is restored or saved'
+            echo '- Proof ceiling: source/repository policy evidence only; no runtime, Store, release, or Product-Pulse claim'
+          } >> "$GITHUB_STEP_SUMMARY"

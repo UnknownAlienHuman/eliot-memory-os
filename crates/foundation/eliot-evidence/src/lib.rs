@@ -17,6 +17,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod evidentiary_reference;
+
+pub use evidentiary_reference::{
+    EvidenceAnchor, EvidenceInspection, EvidentiaryReference, FaithfulnessEvaluation, FragmentKind,
+    FrozenEvidenceProjection, RevalidationDisposition, RevalidationRoute, SourceCorrection,
+    open_revalidation_route,
+};
+
 /// Stable identity of this contract surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.evidence";
 /// Current wire revision of this contract surface.
@@ -59,14 +67,14 @@ pub enum EvidenceError {
     Canonicalization(String),
 }
 
-fn validate_text(value: &str, field: &'static str) -> Result<(), EvidenceError> {
+pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), EvidenceError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(EvidenceError::InvalidText { field });
     }
     Ok(())
 }
 
-fn validate_digest(value: &str, field: &'static str) -> Result<(), EvidenceError> {
+pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), EvidenceError> {
     if value.len() != 64
         || value
             .bytes()

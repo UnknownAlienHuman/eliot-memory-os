@@ -518,6 +518,21 @@ pub(super) fn run() -> Result<(), String> {
         &launch.executable_sha256,
     )
     .map_err(|error| error.to_string())?;
+    // I3.9: the load above already resolved and enforced the effective canonical
+    // configuration — a script, an untyped document, or a lower-layer expansion
+    // that no higher layer delegated returns `Err` there, so this line is
+    // reachable only with a resolved chain. It publishes the inspection answer
+    // for the one proven setting chain: the winning value and every contributing
+    // layer in canonical precedence order. It gates nothing and grants nothing;
+    // the refusal is the config load, not this record.
+    let canonical = config.canonical_chain();
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.canonical_config_effective",
+        key = canonical.key(),
+        winning_value = canonical.winning_value(),
+        contributing_layers = ?canonical.contributions(),
+    );
     let kernel = DaemonKernelClient::connect(&config).map_err(|error| error.to_string())?;
     let authority_activation = eliotd::kernel_authority_port(&kernel);
     let mut composition = DaemonComposition::start(
@@ -2742,8 +2757,11 @@ async fn run_local_read_poll(
         ))
         .await;
         let body = {
-            let guard = composition.lock().await;
-            eliotd::skill_dispatch::commit_skill_pair(&guard, &envelope, &attempt, plan)
+            // #1957: the commit step also hydrates the daemon-held Governor
+            // capability admission view from the canonical evidence read this
+            // intake already performed, so the guard is taken mutably here.
+            let mut guard = composition.lock().await;
+            eliotd::skill_dispatch::commit_skill_pair(&mut guard, &envelope, &attempt, plan)
         };
         let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
@@ -2764,33 +2782,38 @@ async fn run_local_read_poll(
     // read can never poison the poller or drop a pair. The composition guard is
     // held only around the read; it never crosses the submit leg.
     //
-    // NOT REACHABLE AT RUNTIME (#1187 piece C, re-verified against the current
-    // source of both crates). The predicate below is always false, and closing it
-    // takes FOUR independent gates, not one. Each is cited by symbol rather than
-    // by line, because a line number in a comment is wrong the next time the
-    // file moves:
+    // NOT REACHABLE AT RUNTIME for `operator.command` (#1187 piece C,
+    // re-verified against the current source of both crates). No production
+    // `operator.command` pair can reach the predicate below. The shared local-read carrier
+    // now admits `eliot.query` and the four `skill.*` lifecycle tools; closing
+    // the Operator gap still takes FOUR independent gates, not one. Each is
+    // cited by symbol rather than by line, because a line number in a comment
+    // is wrong the next time the file moves:
     //
     // 1. Queue. `host_request_route::KernelComposition::invoke_read_host_request`
     //    is the only production entry that queues a pair for this poller, and it
     //    queues only what `host_request_route::check_local_read_admission`
     //    resolves. That routes through
     //    `host_request_route::local_read_admission_from_tool`, whose closed
-    //    `match` admits `eliot.packet` and `eliot.query` and refuses every other
-    //    name, and the fallback
+    //    `match` admits `eliot.packet`, `eliot.query`, and the exact-capability
+    //    Skill tools `skill.inject`, `skill.display`, `skill.activate`, and
+    //    `skill.execute`; every other name, including `operator.command`, is
+    //    refused. The fallback
     //    `host_request_route::daemon_claim_queue::check_task_controller_admission`
-    //    refuses it as well, so such a request is admitted with no lane that can
-    //    ever answer it.
+    //    does not route `operator.command` to this poller either.
     // 2. Claim. `host_request_route::KernelComposition::claim_local_read_pair`
-    //    independently skips every candidate whose
-    //    `envelope.identity.capability != "eliot.query"`.
+    //    rechecks the retained pair and only claims `Query` or `Skill`
+    //    admissions. `operator.command` matches neither admission.
     // 3. Claim receipt. `daemon_kernel_client::DaemonKernelClient::claim_local_read_pair_async`
-    //    independently refuses any claimed pair that is not `eliot.query` on
-    //    both the envelope capability and the tool name. That gate is production
+    //    independently allows `eliot.query` or one of the four names returned
+    //    by `skill_tool_kind`, and requires an exact envelope-capability/tool
+    //    name match. It refuses `operator.command`. That gate is production
     //    code inside `bins/eliotd` — not a test — and it sits on the same
     //    `local_read_claim` wire operation as gate 2.
     // 4. Submit. `host_request_route::KernelComposition::submit_local_read_result`
-    //    joins the durable ORS record on `capability_ref == "eliot.query"`, so a
-    //    claimed pair could not settle its own result body either.
+    //    delegates to `submit_claimed_result`, whose local-read queue accepts
+    //    only `eliot.query` or `is_skill_lifecycle_tool(capability)`. A claimed
+    //    `operator.command` pair could not settle its own result body either.
     //
     // A fifth gap sits upstream of all four and is not a gate at all: nothing in
     // this repository presents a host request naming this capability. The only
@@ -2808,12 +2831,12 @@ async fn run_local_read_poll(
     // the absent producer are separate owner acts in files this lane does not
     // own, so this branch stays source-reachable only.
     //
-    // #1882: Skill pairs now have their own closed admission, claim, daemon
-    // validation and submit gates; this ControlBoard analysis does not apply
-    // to the Skill branch above. For `operator.command`, adding a branch
-    // would NOT create a production caller,
-    // and claiming one would be false, because that capability is refused by
-    // every one of those four gates and no producer presents it either.
+    // #1882: the four `skill.*` lifecycle capabilities now pass their own
+    // closed admission, claim, daemon validation and submit gates; this
+    // ControlBoard analysis does not apply to the Skill branch above. For
+    // `operator.command`, adding a branch would NOT create a production caller,
+    // and claiming one would be false: none of the four gates admits that
+    // capability, and no producer presents it either.
     if eliotd::is_controlboard_read_tool(&tool) {
         let body = {
             let guard = composition.lock().await;

@@ -16,18 +16,19 @@ use crate::plan;
 use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
-    CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes, NamedReadOperation,
-    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingScopeId,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, RevisionHead, RevisionKey, ScopeId,
+    CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
+    FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
+    PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey, ScopeId,
     ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
     audit_heads_digest, generated_operation_manifests, named_mutation_operation_name,
 };
 
 use super::{
     FenceRecord, SchemaMetaRecord, ensure_ready, ensure_unique_ordering_scopes,
-    ensure_unique_revision_keys, read_fence, read_ordering_heads_inner, read_receipt_by_operation,
-    read_revision_heads_inner, take_schema_meta, take_vec, to_value, validate_fence_record,
-    validate_schema_meta_record,
+    ensure_unique_revision_keys, read_fence, read_ordering_heads_inner,
+    read_projection_generations_inner, read_receipt_by_operation, read_revision_heads_inner,
+    take_schema_meta, take_vec, to_value, validate_fence_record, validate_schema_meta_record,
 };
 
 pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
@@ -388,6 +389,9 @@ async fn named_read_payload(
         NamedReadOperation::GetBlackboardItem => {
             blackboard_item_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetLearningRecordRange => {
+            learning_record_range_payload(db, &adapter.config, query, state_fence).await
+        }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -472,6 +476,122 @@ WHERE epistemic_position_key = $epistemic_position_key
 ORDER BY epistemic_position_revision DESC LIMIT 1;
 ";
 
+const READ_PROJECTION_PUBLICATIONS_BY_IDS: &str =
+    "SELECT VALUE body FROM projection_record WHERE publication_id IN $publication_ids;";
+
+/// The publication read gate for one served projection row (issue #1931,
+/// `I5.8`).
+///
+/// The served projection data and its publication were committed by the SAME
+/// canonical transition, so the transition's own receipt is what the gate reads
+/// instead of any second lookup by projection name: the receipt carries the
+/// `projection_refs` it published and the `revision_before_after` heads it
+/// committed. Nothing here names a projection kind, so a reader cannot drift
+/// from the writer's spelling, and nothing here is a stand-in for the Doctor
+/// rebuild path — this only decides whether already-published candidate data
+/// may be served as current.
+///
+/// Every clause `I5.8` requires of a readable-as-current publication and that
+/// the durable record can carry is enforced through the one shared predicate
+/// [`FencedProjectionPublication::check_record_current`], plus the two clauses
+/// that need the committing transition beside the record:
+///
+/// * the publication must be pinned to the very commit whose data is being
+///   served (`record.atomic_data_commit` == the receipt's `commit_id`), which
+///   is what makes candidate data and provenance one atomic commit;
+/// * the publication must still hold its kind's current generation under the
+///   store's retained publications, so a superseded publication is never
+///   served as current — observable only because the generation advances.
+///
+/// A transition that published no projection, a missing publication row,
+/// `PENDING`/`STALE`/`FAILED`/`INCONCLUSIVE`, a split view, a source head or
+/// generation that disagrees with the committing transition, and a superseded
+/// publication all fail closed with [`StoreError::InvalidProjection`]: a
+/// projection is never served as current without a publication record that
+/// proves it.
+///
+/// The definition-digest clause of
+/// [`FencedProjectionPublication::check_current`] is NOT enforced here and is
+/// NOT waived: it needs a projection definition identity that
+/// [`ProjectionPublicationRecord`](eliot_store_api::ProjectionPublicationRecord)
+/// does not carry and that no admitted transition declares, so enforcing it
+/// here would refuse every read unconditionally. It stays the last clause of
+/// `check_current` for the surface that can supply one.
+async fn check_publication_fences_projection(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    receipt: &WriteReceipt,
+) -> Result<(), AdapterError> {
+    let commit_id = receipt
+        .commit_id
+        .as_ref()
+        .ok_or(StoreError::InvalidProjection)?;
+    let publication_ids: Vec<String> = receipt
+        .projection_refs
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if publication_ids.is_empty() {
+        return Err(StoreError::InvalidProjection.into());
+    }
+    let mut bindings = Map::new();
+    bindings.insert("publication_ids".to_owned(), to_value(&publication_ids)?);
+    let mut response = client::query(
+        db,
+        config,
+        "read.projection_publications",
+        READ_PROJECTION_PUBLICATIONS_BY_IDS,
+        bindings,
+    )
+    .await?;
+    let records = take_vec::<ProjectionPublicationRecord>(&mut response, 0)?;
+    if records.len() != publication_ids.len() {
+        return Err(StoreError::InvalidProjection.into());
+    }
+    // The source heads this transition committed, which is what a publication
+    // of that transition must name. The receipt and the record carry the same
+    // fence by construction of the one transaction; any disagreement between
+    // them fails inside the shared predicate.
+    let source_heads: Vec<RevisionHead> = receipt
+        .revision_before_after
+        .iter()
+        .map(|delta| RevisionHead {
+            key: delta.key.clone(),
+            revision: delta.after,
+            state_fence: receipt.state_fence.clone(),
+        })
+        .collect();
+    plan::validate_revision_heads(&source_heads)?;
+    let retained = read_projection_generations_inner(
+        db,
+        config,
+        &records
+            .iter()
+            .map(|record| record.projection_kind.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    for record in &records {
+        let current = retained
+            .get(&record.projection_kind)
+            .ok_or(StoreError::InvalidProjection)?;
+        if record.atomic_data_commit != *commit_id
+            || record.source_generation != current.source_generation
+            || record.projection_generation != current.projection_generation
+            || record.state_fence != receipt.state_fence
+        {
+            return Err(StoreError::InvalidProjection.into());
+        }
+        FencedProjectionPublication::check_record_current(
+            record,
+            &source_heads,
+            current.source_generation,
+        )
+        .map_err(AdapterError::Store)?;
+    }
+    Ok(())
+}
+
 async fn read_epistemic_position(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -513,6 +633,12 @@ async fn read_epistemic_position(
     {
         return Err(StoreError::InvalidReceipt.into());
     }
+    // Issue #1931 / `I5.8`: the position is served as current only behind its
+    // fenced publication record. The gate runs before the readback value is
+    // built, so a projection whose publication does not prove its source heads,
+    // generation, atomic data/provenance commit and currency never reaches the
+    // caller.
+    check_publication_fences_projection(db, config, &row.body).await?;
     to_value(&commit.readback(&row.body)?)
 }
 
@@ -2971,6 +3097,111 @@ async fn experience_feedback_range_payload(
     }))
 }
 
+/// Reads learning rows and projects the bounded same-fence, same-scope
+/// record set (issue #1868).
+///
+/// Parameters are re-validated here (membership and shape via the
+/// catalogue gate upstream; value rules here) so a misrouted query fails
+/// closed without touching state. Scope arrives through the typed
+/// `scope_id` request field; an over-bound page request fails closed
+/// through the typed decoder before any row is read. Rows project
+/// verbatim record documents plus presented digests in key order with an
+/// explicit truncation marker. The eligible set is the complete
+/// scope / kind / fence predicate, applied in the query before the page
+/// bound; the optional closed kind filter narrows to one record kind, and
+/// rows outside scope, kind, or the requested fence never enter the page.
+async fn learning_record_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetLearningRecordRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::decode_learning_read(query.operation, &query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "learning range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let kind_filter: Option<String> = decoded
+        .record_kind
+        .as_ref()
+        .map(|kind| kind.as_str().to_owned());
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // The eligible set is the complete scope/kind/fence predicate: it is
+    // applied in the query before page slicing, and the skip window is
+    // served by bounded keyset continuation from the last returned
+    // eligible row. Same ordering as the memory adapter's
+    // `learning_range_payload`, so both providers agree on a mixed-fence
+    // prefix. `truncated` is true only when a further eligible row was
+    // actually observed, and the page is empty only when the eligible set
+    // was traversed to its end.
+    let page = super::surreal_learning::read_learning_for_read(
+        db,
+        config,
+        scope_id.as_str(),
+        kind_filter.as_deref(),
+        state_fence,
+        start.unwrap_or(0),
+        limit,
+    )
+    .await?;
+    let records: Vec<Value> = page
+        .records
+        .into_iter()
+        .map(|row| {
+            json!({
+                "record_kind": row.record_kind,
+                "handle": row.handle,
+                "record_json": row.record_json,
+                "record_digest": row.record_digest,
+            })
+        })
+        .collect();
+    let truncated = page.more;
+    let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+        "state_fence": state_fence,
+    }))
+}
+
 /// Converts a projected row count into the `revision` cardinality
 /// without a lossy cast.
 fn projection_len(len: usize) -> Result<u64, AdapterError> {
@@ -3921,8 +4152,7 @@ mod admitted_read_tests {
         let plan = plan_apply_with_payload_authority(
             transition,
             &[Some(authority)],
-            &[],
-            &[],
+            &crate::plan::ObservedStoreState::default(),
             commit_sequence,
             1,
         )

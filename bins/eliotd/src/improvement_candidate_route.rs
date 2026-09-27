@@ -37,7 +37,7 @@ use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
     ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
     ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
-    reconcile_unknown_activation, run_improvement_candidate_pipeline,
+    improvement_retry_permitted, reconcile_unknown_activation, run_improvement_candidate_pipeline,
 };
 
 /// Borrowed inputs for one production improvement-candidate route call.
@@ -181,14 +181,39 @@ pub fn assess_improvement_repeat(
     compare_improvement_commitments(retained, current)
 }
 
-/// Reconciles an unknown external activation outcome without retrying blindly.
+/// Preserves an unknown external activation outcome without retrying blindly.
 ///
-/// Production caller of [`reconcile_unknown_activation`].
+/// Production caller of [`reconcile_unknown_activation`]. The prior decision,
+/// the checked record this run committed, and the gap-free rollback contract
+/// this run was admitted against are all required: the resulting
+/// [`eliot_maintenance::ImprovementUnknownEffect`] obligation names the exact
+/// candidate, experiment, commitment, owner and forward-repair/invalidation
+/// bindings whose external effect is unresolved. No owner-validated effect
+/// outcome is consumed here, so the obligation remains unresolved and its
+/// retry gate stays closed.
+///
+/// This route records the unresolved disposition and issues no new attempt.
+/// Effect reconciliation and retry stay with the external owners.
 #[must_use]
 pub fn reconcile_improvement_unknown(
     prior: &ImprovementAdmissionDecision,
+    current: &ImprovementCurrentProposal,
+    rollback: &RollbackContract,
 ) -> eliot_maintenance::ImprovementTerminalDisposition {
-    reconcile_unknown_activation(prior)
+    reconcile_unknown_activation(prior, current, rollback)
+}
+
+/// Returns whether one candidate disposition permits a retry attempt.
+///
+/// Production caller of [`eliot_maintenance::improvement_retry_permitted`]. An
+/// unresolved external effect closes this gate because its owner has not
+/// settled what happened. A rejection, an inconclusive, a regression, a block,
+/// and a no-progress decision each carry their own owner and remedy instead.
+#[must_use]
+pub fn improvement_candidate_retry_permitted(
+    disposition: &eliot_maintenance::ImprovementTerminalDisposition,
+) -> bool {
+    improvement_retry_permitted(disposition)
 }
 
 /// Returns the Governor maintenance owner identity for the improvement route.

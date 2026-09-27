@@ -14,6 +14,7 @@ from .common import NavigationError, normalize_repo_path, read_toml, relative_to
 from .handle_destinations import get_resolver, natural_handle_key
 from .package_docs import INDEX_PATH as WORKSPACE_INDEX_PATH
 from .package_docs import PROTOCOL_PATH, family_contract
+from .package_docs import reverse_target_cell, target_cell
 from .registry import build_registry
 
 SCHEMA = "eliot-prototype-doc-index-v1"
@@ -276,7 +277,7 @@ def render(root: Path, registry: dict[str, Any]) -> str:
         manifest_path = str(package["manifest_path"])
         raw_targets = package.get("targets", [])
         sorted_targets = sorted(raw_targets, key=lambda t: (t.get("kind", ""), t.get("name", ""), t.get("path", "")))
-        targets_str = "<br>".join(f"`{t.get('kind', 'target')}: {t.get('path', '')}`" for t in sorted_targets)
+        targets_str = "<br>".join(target_cell(t) for t in sorted_targets)
         blocks_str = "<br>".join(f"`{item}`" for item in package["logical_blocks"])
         package_handles = _handles(package, blocks)
         handle_links = []
@@ -314,7 +315,7 @@ def render(root: Path, registry: dict[str, Any]) -> str:
                 proto_pkgs.append(_md_link(f"`{p_root}`", f"../../{p_manifest}"))
                 raw_targets = package.get("targets", [])
                 for t in sorted(raw_targets, key=lambda x: (x.get("kind", ""), x.get("name", ""), x.get("path", ""))):
-                    target_list.append(f"`{p_root}:{t.get('path', '')}`")
+                    target_list.append(reverse_target_cell(p_root, t))
         lines.append(
             f"| {handle_link} | {dest_link} | {'<br>'.join(proto_pkgs)} | {'<br>'.join(target_list)} |"
         )

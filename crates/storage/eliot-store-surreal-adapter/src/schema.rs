@@ -82,6 +82,13 @@ pub(crate) mod table {
     /// Immutable agent-feedback row per handle + owner revision
     /// (issue #223). Same create-only rule as the bank rows.
     pub(crate) const EXPERIENCE_FEEDBACK: &str = "experience_feedback";
+    /// Immutable learning-record row per record kind + handle + record
+    /// digest (issue #1868). One row per joined
+    /// `(record_kind, handle, record_digest)` key carrying the verbatim
+    /// learning-record document. Create-only; divergent rewrites fail
+    /// closed. The digest IS the immutable revision identity: a new
+    /// digest is a new row, never an in-place rewrite.
+    pub(crate) const LEARNING_RECORD: &str = "learning_record";
 
     /// Every physical table *name* this single owner declares, in declaration
     /// order.
@@ -112,7 +119,7 @@ pub(crate) mod table {
     ///   `automation_continuation` are declared without generation DDL;
     ///   continuations create their schemaless table only during explicit
     ///   truncated-page issuance.
-    pub(crate) const ALL_TABLES: [&str; 24] = [
+    pub(crate) const ALL_TABLES: [&str; 25] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -137,6 +144,7 @@ pub(crate) mod table {
         AUTOMATION_CONTINUATION,
         EXPERIENCE_BANK,
         EXPERIENCE_FEEDBACK,
+        LEARNING_RECORD,
     ];
 }
 
@@ -365,6 +373,23 @@ DEFINE FIELD record_digest ON experience_feedback TYPE string;
 DEFINE FIELD state_fence ON experience_feedback TYPE object;
 DEFINE FIELD scope_id ON experience_feedback TYPE string;
 DEFINE FIELD task_id ON experience_feedback TYPE option<string>;
+";
+
+/// Learning-record table (issue #1868).
+/// Additive delta in the experience style: `learning_record` carries one
+/// immutable row per joined kind/handle/digest key with the verbatim
+/// learning-record document plus presented digests. Applied explicitly
+/// where the owning slice proves it; never executed implicitly by the
+/// adapter.
+pub(crate) const LEARNING_TABLES_DDL: &str = r"
+DEFINE TABLE learning_record SCHEMALESS;
+DEFINE FIELD record_kind ON learning_record TYPE string;
+DEFINE FIELD handle ON learning_record TYPE string;
+DEFINE FIELD record_json ON learning_record TYPE string;
+DEFINE FIELD record_digest ON learning_record TYPE string;
+DEFINE FIELD state_fence ON learning_record TYPE object;
+DEFINE FIELD scope_id ON learning_record TYPE string;
+DEFINE FIELD task_id ON learning_record TYPE option<string>;
 ";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"
@@ -652,6 +677,23 @@ pub(crate) const READ_REVISION_HEADS_BY_KEYS: &str =
 
 pub(crate) const READ_ORDERING_HEADS_BY_SCOPES: &str =
     "SELECT VALUE body FROM ordering_head WHERE ordering_scope IN $scopes;";
+
+/// Reads each Ordering Scope's own chain tip, the `previous_event_hash`/
+/// `event_hash` siblings the closed `SELECT VALUE body` head read cannot see
+/// (issue #1931). `event_hash` is null for a scope whose row predates per-scope
+/// chain links, which the caller reads as the genesis prior.
+pub(crate) const READ_ORDERING_CHAIN_TIPS_BY_SCOPES: &str = "SELECT VALUE { ordering_scope: ordering_scope, event_hash: event_hash } FROM ordering_head WHERE ordering_scope IN $scopes;";
+
+/// Reads each declared projection kind's retained publication generations, the
+/// `projection_generation`/`source_generation` the next publication of that
+/// kind must advance from (issue #1931, `I5.8`).
+///
+/// The two generations live inside the record's `body`, so they are projected
+/// out of it explicitly: a schemaless `SELECT *` would return the provider
+/// `id` as well and fail closed deserialization against a real provider (see
+/// [`READ_SCHEMA_META`]). A kind with no retained publication simply returns
+/// no row, which the caller reads as the genesis cursor.
+pub(crate) const READ_PROJECTION_GENERATIONS_BY_KINDS: &str = "SELECT VALUE { projection_kind: body.projection_kind, projection_generation: body.projection_generation, source_generation: body.source_generation } FROM projection_record WHERE body.projection_kind IN $kinds;";
 
 pub(crate) const READ_ALL_REVISION_HEADS: &str = "SELECT VALUE body FROM revision_head;";
 

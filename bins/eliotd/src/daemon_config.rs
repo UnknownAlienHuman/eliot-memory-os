@@ -2,6 +2,7 @@
 //! Architecture: A2.3 (Governor/N4 composition), A13.2 (Kernel/Governor authenticated IPC boundary).
 //! Implementation: I1.11 (`FunctionalCapabilityCell`), I2.1 (bounded cell), boundary-owner validation, thin binary config.
 //! Boundary owns protected config path/bytes, nonce, runtime identity and binding validation only; no Kernel, Store, SCM, lifecycle, effect, or canonical authority.
+//! It also resolves the effective canonical configuration while loading the launch file and refuses a configuration that does not resolve; that resolution validates typed input and grants no authority of its own.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,16 @@ use eliot_platform_windows::{
     ProtectedRuntimePathLease, current_process_named_pipe_expectation, protected_program_data_path,
 };
 
+use super::canonical_config_precedence::{
+    PolicyDocument, ResolvedChain, resolve_effective_configuration,
+};
 use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES};
+
+/// I3.9 installation config file, relative to the protected `ProgramData` root.
+const INSTALLATION_CONFIG_RELATIVE: &str = r"Eliot\config\installation.toml";
+
+/// I3.9 System Owner policy file, relative to the protected `ProgramData` root.
+const SYSTEM_OWNER_POLICY_RELATIVE: &str = r"Eliot\config\policy.toml";
 
 fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
     let expectation = current_process_named_pipe_expectation()
@@ -20,6 +30,49 @@ fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
         expectation.expected_sid().to_owned(),
         expectation.expected_session_id(),
     ))
+}
+
+/// Resolves the effective canonical configuration from the I3.9 typed
+/// configuration files under the protected `ProgramData` root.
+///
+/// Each file is read through a protected path lease, so the platform owner
+/// refuses a reparse or out-of-root document before it is parsed. A file that
+/// is not present means its layer abstains and the next broader value carries
+/// forward; any other presence failure refuses the load, because an unreadable
+/// policy file must never be read as an absent one. A script, an untyped file,
+/// an unknown or duplicated layer, and a lower-layer expansion that no higher
+/// layer delegated all fail this function.
+fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
+    let mut retained: Vec<(&str, Vec<u8>)> = Vec::new();
+    for relative in [INSTALLATION_CONFIG_RELATIVE, SYSTEM_OWNER_POLICY_RELATIVE] {
+        let path = protected_program_data_path(relative)?;
+        match path.try_exists() {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) => {
+                return Err(DaemonError::LaunchConfig(format!(
+                    "canonical layer document presence is unreadable for {relative}: {error}"
+                )));
+            }
+        }
+        let lease = ProtectedRuntimePathLease::open_existing_absolute(&path)?;
+        if lease.path() != path {
+            return Err(DaemonError::LaunchConfig(
+                "canonical layer document path is not the retained canonical runtime identity"
+                    .to_owned(),
+            ));
+        }
+        retained.push((relative, lease.read_bounded(MAX_CONFIG_BYTES)?));
+    }
+    let documents: Vec<PolicyDocument<'_>> = retained
+        .iter()
+        .map(|(file_name, bytes)| PolicyDocument {
+            file_name,
+            bytes: bytes.as_slice(),
+        })
+        .collect();
+    resolve_effective_configuration(&documents)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))
 }
 
 /// Typed protected launch inputs. Production values are read from the exact
@@ -33,6 +86,7 @@ pub struct DaemonConfig {
     pub(super) state_root: PathBuf,
     pub(super) config_lease: Option<ProtectedRuntimePathLease>,
     pub(super) kernel_binding: KernelLaunchBinding,
+    pub(super) canonical_chain: ResolvedChain,
 }
 
 impl DaemonConfig {
@@ -148,6 +202,7 @@ impl DaemonConfig {
             state_root,
             config_lease: None,
             kernel_binding,
+            canonical_chain: resolve_effective_canonical_config()?,
         })
     }
 
@@ -193,6 +248,7 @@ impl DaemonConfig {
             state_root,
             config_lease: None,
             kernel_binding,
+            canonical_chain: resolve_effective_canonical_config()?,
         })
     }
 
@@ -200,6 +256,14 @@ impl DaemonConfig {
     #[must_use]
     pub const fn launch(&self) -> &GovernorLaunchConfig {
         &self.launch
+    }
+
+    /// Returns the effective canonical configuration: the winning value of the
+    /// resolved setting chain and each contributing layer in canonical
+    /// precedence order.
+    #[must_use]
+    pub const fn canonical_chain(&self) -> &ResolvedChain {
+        &self.canonical_chain
     }
 
     /// Returns the retained protected config identity path.

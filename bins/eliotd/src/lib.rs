@@ -62,6 +62,7 @@ mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
 mod experience_runtime;
+pub mod external_attach_reconciliation;
 pub mod finish_attempt;
 mod first_run_wiring;
 mod freshness_admission;
@@ -133,8 +134,10 @@ pub use capability_evidence_wiring::{
     EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
 };
 pub use capability_outcome::{
-    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
-    FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
+    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
+    DegradationScope, FallbackOutcomeRequest, GenerationChallengeOutcomeRequest,
+    OutcomeDisposition, OutcomeError, SURVIVING_OPERATION_PREFIX, fallback_outcome,
+    generation_challenge_outcome, project_degradation, removed_promise, surviving_operation,
 };
 pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
@@ -180,6 +183,14 @@ pub use experience_runtime::{
     produce_journal_projection, propose_memory_extinction_candidate, read_current_position,
     run_experience_quality_event, run_experience_quality_event_with_revision,
 };
+pub use external_attach_reconciliation::{
+    AutomaticLaunchRefusal, CredentialDisposition, EXTERNAL_ATTACH_RECONCILIATION_REQUIRED,
+    ExternalAttachObservation, ExternalAttachReconciliationReceipt, ExternalEffectDisposition,
+    ImportedPreAttachCoverage, ObservedAttachCandidates, PendingAttachAction,
+    PreAttachBlindInterval, PreAttachStanding, ScopeAuthorityDisposition, UnownedContinuation,
+    WorkspaceArtifactDelta, admit_automatic_agent_launch, admit_material_continuation,
+    reconcile_external_attach,
+};
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
     recommend_for_disabled_automation, resolve_first_run_routes,
@@ -200,8 +211,9 @@ pub use governor_observe_serve::{
     observe_suboperation_owner, serve_admitted_observe,
 };
 pub use improvement_candidate_route::{
-    ImprovementRouteRequest, assess_improvement_repeat, improvement_operation_owners,
-    improvement_route_owner, reconcile_improvement_unknown, route_improvement_candidate,
+    ImprovementRouteRequest, assess_improvement_repeat, improvement_candidate_retry_permitted,
+    improvement_operation_owners, improvement_route_owner, reconcile_improvement_unknown,
+    route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
@@ -562,6 +574,19 @@ pub struct DaemonComposition {
     /// performs no transport, and is never read on the readiness path: closure
     /// must not block or fail the finish ceremony.
     learning_closure: eliot_governor::LearningClosureService,
+    /// Retained reconciliation receipt for an attach of an already-running
+    /// external agent (issue #1782, I11.11 lines 27-42).
+    ///
+    /// `None` until [`Self::record_external_attach_reconciliation`] installs a
+    /// caller-observed receipt, which is what an empty supply honestly means:
+    /// no external agent has attached, so there is nothing to reconcile. It is
+    /// never defaulted to a reconciled attach and never derived from this
+    /// process's own config/state directories, which are not a user
+    /// `WorkScope`. Read by
+    /// [`Self::admit_material_continuation_after_attach`], which is the only
+    /// consumer and refuses a Material effect whenever the retained receipt has
+    /// no attributed continuation.
+    external_attach: Option<Box<ExternalAttachReconciliationReceipt>>,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -830,6 +855,7 @@ impl DaemonComposition {
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
             learning_closure: eliot_governor::LearningClosureService::new(),
+            external_attach: None,
         })
     }
 
@@ -900,6 +926,17 @@ impl DaemonComposition {
         // `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`,
         // which also has zero call sites. See `task_binding_admission`'s
         // "Measured reachability" section for the full measurement.
+        // Issue #1782 (I11.11 line 42): a Material canonical write is refused
+        // while a retained external-attach receipt has no attributed
+        // continuation, so an unreconciled attach of an already-running
+        // external agent cannot be laundered into a write. The refusal keeps
+        // the existing `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED` identity and
+        // changes nothing else: the retained binding, task state, and project
+        // memory are untouched and the write never reaches the store.
+        self.admit_material_continuation_after_attach(
+            eliot_workscope::RequestedEffect::CanonicalWrite,
+        )
+        .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
         let admission = crate::task_binding_admission::admit_canonical_write(
             envelope.operation_id.as_str().to_owned(),
             &identity.request.metadata,
@@ -1077,6 +1114,65 @@ impl DaemonComposition {
             self.view_stale = true;
         }
         Ok(receipt)
+    }
+
+    /// Commits one prebuilt named learning-record request through the
+    /// Governor learning-record commit caller, then publishes the resulting
+    /// owner change.
+    ///
+    /// Outbound-only: this method owns no Store client and opens no second
+    /// durability path. The only write path is the retained neutral Kernel
+    /// port, reached through
+    /// [`eliot_governor::commit_learning_record`](eliot_governor::commit_learning_record).
+    /// Same refresh/stale discipline as
+    /// [`Self::commit_experience_bank_record`]: the receipt is returned
+    /// unmodified and a failed refresh marks the dependent view
+    /// stale/pending instead of hiding divergence. Durability never implies
+    /// effectiveness: the returned flag comes only from
+    /// [`eliot_governor::learning_effective_under_admission`](eliot_governor::learning_effective_under_admission)
+    /// against the live fence, and a durable-but-unadmitted record stays
+    /// non-effective.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_learning_record(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        request: eliot_store_api::NamedMutationRequest,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        permit: Option<&eliot_governor::LearningAdmissionPermit>,
+        admitted: bool,
+        admission_receipt_present: bool,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<(eliot_store_api::WriteReceipt, bool), DaemonError> {
+        eliot_store_api::reject_direct_learning_write(&request).map_err(|error| {
+            DaemonError::Composition(CompositionError::Owner(format!(
+                "learning commit guard: {error}"
+            )))
+        })?;
+        let receipt = eliot_governor::commit_learning_record(
+            &self.governor,
+            identity,
+            request,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        let effective = eliot_governor::learning_effective_under_admission(
+            self.governor.governor(),
+            permit,
+            &live_fence,
+            admitted,
+            admission_receipt_present,
+        );
+        Ok((receipt, effective))
     }
     /// Returns the retained owner receipt for an already-committed
     /// experience record, if this composition committed its idempotency
@@ -2452,18 +2548,31 @@ impl DaemonComposition {
     /// composition invents no port implementation beyond the closed ports
     /// above and reimplements no owner.
     ///
+    /// #1957 (I3.4): the constructed fabric is not returned until the required
+    /// model route passes [`Self::require_admitted_model_route`] — the observed
+    /// route scope is applied as a scope change, and every competence item must
+    /// hold fresh exact-fingerprint production admission in the daemon-held
+    /// view. A refusal is the typed [`FabricError::NoRoute`] residual and no
+    /// fabric is returned, so an unevidenced route can never reach an executor.
+    ///
     /// # Errors
     ///
-    /// Returns the [`Self::production_fabric_ports`] readiness rejection or
-    /// the [`Self::agent_fabric_new_verified`] rejection unchanged.
+    /// Returns the [`Self::production_fabric_ports`] readiness rejection, the
+    /// [`Self::agent_fabric_new_verified`] rejection, or the route-gate
+    /// rejection, each unchanged.
     pub fn drive_verified_agent_fabric(
-        &self,
+        &mut self,
         kernel: &Arc<DaemonKernelClient>,
         material: VerifiedProviderMaterial,
+        requirements: &RouteRequirements,
+        observed_scope: &eliot_governor::RouteScopeFingerprint,
+        now: u64,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_drive_verified").entered();
         let ports = self.production_fabric_ports()?;
-        self.agent_fabric_new_verified(kernel, ports, material)
+        let mut fabric = self.agent_fabric_new_verified(kernel, ports, material)?;
+        self.require_admitted_model_route(&mut fabric, requirements, observed_scope, now)?;
+        Ok(fabric)
     }
 
     /// Resolves the session-observed owner half of one verified provider
@@ -2562,6 +2671,58 @@ impl DaemonComposition {
             .admit_production_route(skill_id, scope, now))
     }
 
+    /// Requires one production model route through the daemon route gate
+    /// (#1957, I3.4).
+    ///
+    /// This is the daemon's production call into
+    /// [`AgentFabric::require_model_route`]. Order is load-bearing: the
+    /// caller-observed route scope is first applied as an I3.4 scope change, so
+    /// a runtime, adapter, provider, or serializer change stops authorizing the
+    /// production work it used to authorize; only then does the gate require
+    /// every competence item of `requirements` to hold fresh exact-fingerprint
+    /// `probe_passed` or `observed` evidence in the held view at `now`.
+    ///
+    /// The observed scope is the same observation the gate gates on, never one
+    /// re-derived from the resolved route.
+    /// [`ScopeDependencySelector::all`](eliot_governor::ScopeDependencySelector::all)
+    /// is its own documented coarse whole-scope selection for a caller that
+    /// observes one scope and cannot attribute the move to a narrower dimension;
+    /// the comparison still runs dimension by dimension, so an exactly matching
+    /// retained record is never staled.
+    ///
+    /// Absence of evidence refuses. An empty held view, a `declared` /
+    /// `imported_legacy` record, and a stale or expired record all fail closed
+    /// to the typed [`FabricError::NoRoute`] the gate raises, which crosses
+    /// unchanged as [`DaemonError::ProviderAdmission`]. There is no local
+    /// fallback route and no swallowed refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Composition`] when the composition is not ready,
+    /// or the gate's rejection unchanged.
+    pub fn require_admitted_model_route(
+        &mut self,
+        fabric: &mut AgentFabric,
+        requirements: &RouteRequirements,
+        observed_scope: &eliot_governor::RouteScopeFingerprint,
+        now: u64,
+    ) -> Result<eliot_agent_api::RouteFingerprint, DaemonError> {
+        let view = self.capability_admission_mut()?;
+        let staled = view.apply_scope_change(
+            observed_scope,
+            eliot_governor::ScopeDependencySelector::all(),
+        );
+        if staled > 0 {
+            tracing::warn!(
+                target: "eliotd::capability_evidence",
+                event = "eliotd.capability_evidence_staled",
+                staled_records = staled,
+                "an observed runtime/adapter/provider/serializer change staled dependent capability evidence; the exact route must requalify before production work"
+            );
+        }
+        Ok(fabric.require_model_route(requirements, view, observed_scope, now)?)
+    }
+
     /// Admits one explicit workspace instance as an attach to the retained
     /// `WorkScope` binding (issue #1929, I04.4 attach trigger).
     ///
@@ -2649,6 +2810,84 @@ impl DaemonComposition {
             .install_admitted_work_scope_owner(owner)
             .map_err(DaemonError::Composition)?;
         Ok((receipt, snapshot))
+    }
+
+    /// Compiles and retains the reconciliation receipt for one attach of an
+    /// already-running external agent (issue #1782, I11.11 lines 27-42).
+    ///
+    /// I11.11 line 27: "Attaching an already-running external agent does not
+    /// retroactively make its earlier activity observed or authorized. ELIOT
+    /// creates an `ExternalAttachReconciliationReceipt`." The composition owns
+    /// only the retention of the already-compiled receipt: it validates it
+    /// through [`ExternalAttachReconciliationReceipt::validate`] and installs
+    /// it as this composition's single retained attach state. It mints no
+    /// receipt, adopts no pre-attach effect, and derives nothing from a process
+    /// name, PID, executable path, current directory or discovery order.
+    ///
+    /// # Not yet reached (issue #1782)
+    ///
+    /// This method currently has zero call sites. The live attach transport for
+    /// an already-running external agent is `eliot-agent-bridge-core`
+    /// (`AttachRequest::external` requires an explicit pre-attach blind
+    /// interval, and `AttachView::reconciliation_required` is what refuses
+    /// forwarding until the bridge's own recovery disposition completes); the
+    /// daemon-side ingress that would report the attach to this composition does
+    /// not exist yet. A startup attach was deliberately not added to manufacture
+    /// a caller, and the daemon's own config/state directories were never used
+    /// as a stand-in `WorkScope`. The receipt is still enforced on the live
+    /// Material paths through
+    /// [`Self::admit_material_continuation_after_attach`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact [`eliot_agent_bridge_core::BridgeError`] from
+    /// [`ExternalAttachReconciliationReceipt::validate`] when the presented
+    /// receipt does not validate, leaving the previously retained receipt
+    /// untouched.
+    pub fn record_external_attach_reconciliation(
+        &mut self,
+        receipt: &ExternalAttachReconciliationReceipt,
+    ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
+        receipt.validate()?;
+        self.external_attach = Some(Box::new(receipt.clone()));
+        Ok(())
+    }
+
+    /// Borrows the retained external-attach reconciliation receipt, if any.
+    ///
+    /// `None` means no external agent has attached: not "reconciled", and never
+    /// a synthesized read-only or attributed disposition.
+    #[must_use]
+    pub fn external_attach_reconciliation(&self) -> Option<&ExternalAttachReconciliationReceipt> {
+        self.external_attach.as_deref()
+    }
+
+    /// Admits one requested effect against the retained external-attach
+    /// disposition (issue #1782, I11.11 line 42).
+    ///
+    /// I11.11 line 42: "Any request to continue Material work before that
+    /// disposition returns `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED`." I14.24
+    /// line 23: "read-only inspection and unrelated tasks continue". A
+    /// non-Material effect is therefore always admitted, and a Material effect
+    /// is admitted only when the retained receipt reached an attributed
+    /// continuation; a read-only attach or a new bounded attempt refuses with
+    /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`].
+    ///
+    /// Live callers: the `eliot.finish` claim path through
+    /// [`serve_finish_claim`](crate::serve_finish_claim), which the daemon
+    /// runtime drives, and [`Self::commit_canonical_and_refresh`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`eliot_agent_bridge_core::BridgeError::InvalidContract`] when
+    /// the retained receipt does not validate, and
+    /// [`eliot_agent_bridge_core::BridgeError::ExternalAttachReconciliationRequired`]
+    /// when a Material effect is requested before an attributed continuation.
+    pub fn admit_material_continuation_after_attach(
+        &self,
+        effect: eliot_workscope::RequestedEffect,
+    ) -> Result<(), Box<eliot_agent_bridge_core::BridgeError>> {
+        admit_material_continuation(effect, self.external_attach.as_deref())
     }
 
     /// Borrows the Governor reconstruction read composition over the retained

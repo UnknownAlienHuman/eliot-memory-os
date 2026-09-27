@@ -25,16 +25,22 @@ Closed classifications (exactly one per candidate row):
 Classification rules (RULE_REVISION 885.1, first match wins, evidence kept):
   1. test-only signals (tests/ path, test file name, cfg(test)) -> test-only
   2. function-local `let` binding (grown or not) -> request-local
-  3. TTL/lease/expiry signal + scheduled bounded cleanup owner in slice -> TTL/lease
-  4. append/segment/rotation signal + retention evidence -> append-only retention
-  5. compaction callsite outside the declaring file -> external compaction
+  3. TTL/lease/expiry signal + production scheduled bounded cleanup owner -> TTL/lease
+  4. append/segment/rotation signal + production retention evidence -> append-only retention
+  5. production compaction callsite outside the declaring file -> external compaction
   6. versioned policy/config bound evidence -> versioned-policy-bounded
-  7. literal with_capacity bound + same-slice removal -> long-lived hard-bounded
-  8. same-slice removal/retain/clear/drain without hard bound -> lifecycle-removal
+  7. literal with_capacity bound + production same-slice removal -> long-lived hard-bounded
+  8. production same-slice removal/retain/clear/drain without hard bound -> lifecycle-removal
   9. static/global item with growth -> unbounded long-lived candidate
   10. long-lived struct field with growth, no bound/removal -> unbounded candidate
   11. collection-typed field with no observable owner/growth -> ownership unknown
   12. otherwise -> unrelated false positive (with evidence, never silent)
+
+Test-only removal proves no production bound; cfg-gated removal has unknown
+production reachability and stays unknown (matrix-14/15). Unbounded/unknown
+rows carry their cardinality driver plus explicit untrusted-key-influence
+status (matrix-19). Absent scan inputs are excluded with source evidence and
+explicit incomplete coverage (matrix-25).
 
 Usage:
   python scripts/long_lived_collection_inventory.py sync --root .
@@ -131,6 +137,7 @@ _FN_RE = re.compile(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:<[^;{}]*>)?\s*\(")
 _IMPL_DROP_RE = re.compile(r"\bimpl\s+Drop\s+for\s+([A-Za-z_][A-Za-z0-9_]*)")
 _DERIVE_SERDE_RE = re.compile(r"#\s*\[\s*derive\s*\([^]]*(?:Serialize|Deserialize)")
 _TEST_ATTR_RE = re.compile(r"#\s*\[\s*(?:cfg\s*\(\s*test\s*\)|test)\s*\]")
+_CFG_RE = re.compile(r"#\s*\[\s*cfg\s*\(")
 
 GROWTH_METHODS = (
     "push",
@@ -326,16 +333,16 @@ def _split_field_type(rest: str) -> str | None:
     return tail or None
 
 
-def _test_regions(masked: str) -> list[tuple[int, int]]:
-    """Line ranges owned by #[cfg(test)]/#[test] items (brace-matched).
+def _attr_regions(masked: str, attr_re: re.Pattern[str]) -> list[tuple[int, int]]:
+    """Line ranges owned by attribute-gated items (brace-matched).
 
-    A bare `mod tests;` declaration (semicolon before any brace) owns no
-    inline region: its code lives in another file. Production items outside
-    these regions must never inherit a test-only label from a distant test
-    module in the same file.
+    A bare declaration (semicolon before any brace) owns no inline region:
+    its code lives in another file. Items outside these regions must never
+    inherit the attribute's label from a distant gated module in the same
+    file.
     """
     regions: list[tuple[int, int]] = []
-    for attr in _TEST_ATTR_RE.finditer(masked):
+    for attr in attr_re.finditer(masked):
         rest = masked[attr.end() :]
         brace = rest.find("{")
         semi = rest.find(";")
@@ -362,6 +369,36 @@ def _test_regions(masked: str) -> list[tuple[int, int]]:
             )
         )
     return regions
+
+
+def _test_regions(masked: str) -> list[tuple[int, int]]:
+    """Line ranges owned by #[cfg(test)]/#[test] items (brace-matched).
+
+    A bare `mod tests;` declaration (semicolon before any brace) owns no
+    inline region: its code lives in another file. Production items outside
+    these regions must never inherit a test-only label from a distant test
+    module in the same file.
+    """
+    return _attr_regions(masked, _TEST_ATTR_RE)
+
+
+def _cfg_regions(masked: str) -> list[tuple[int, int]]:
+    """Line ranges owned by #[cfg(...)]-gated items (brace-matched).
+
+    cfg-gated code may be compiled out of the scanned target/feature set, so
+    removal observed only there has unknown production reachability: it stays
+    inventoried but proves no bound and the row stays unknown (matrix-15).
+    Overlap with test regions resolves to test-only in row evidence.
+    """
+    return _attr_regions(masked, _CFG_RE)
+
+
+def _region_lines(regions: list[tuple[int, int]]) -> frozenset[int]:
+    """Expand inclusive (start, end) line regions into a line set."""
+    lines: set[int] = set()
+    for start, end in regions:
+        lines.update(range(start, end + 1))
+    return frozenset(lines)
 
 
 def _toml_string(value: str) -> str:
@@ -403,6 +440,48 @@ def _callsites_for(
     return ordered
 
 
+def _partition_removal(
+    masked_lines: list[str],
+    ident: str,
+    rel: str,
+    test_lines: frozenset[int],
+    cfg_lines: frozenset[int],
+) -> tuple[list[str], list[str], list[str]]:
+    """Split removal callsites into production / test-only / cfg-unknown.
+
+    Line membership decides the bucket, so no callsite string is re-parsed.
+    Every callsite stays inventoried in the row, but only production
+    callsites may prove a bound: test-only removal proves no production
+    bound (matrix-14) and cfg-gated removal has unknown production
+    reachability (matrix-15). Test membership wins on overlap.
+    """
+    numbered = list(enumerate(masked_lines, start=1))
+    prod_lines = [line if number not in test_lines and number not in cfg_lines else "" for number, line in numbered]
+    test_only_lines = [line if number in test_lines else "" for number, line in numbered]
+    cfg_only_lines = [
+        line if number in cfg_lines and number not in test_lines else ""
+        for number, line in numbered
+    ]
+    return (
+        _callsites_for(prod_lines, ident, REMOVAL_METHODS, rel),
+        _callsites_for(test_only_lines, ident, REMOVAL_METHODS, rel),
+        _callsites_for(cfg_only_lines, ident, REMOVAL_METHODS, rel),
+    )
+
+
+def _excluded_removal_note(test_only: list[str], cfg_unknown: list[str]) -> str:
+    """Disclosure for inventoried removal that proves no production bound."""
+    parts: list[str] = []
+    if test_only:
+        parts.append(f"test-only removal {test_only} proves no production bound")
+    if cfg_unknown:
+        parts.append(
+            f"cfg-gated removal {cfg_unknown} has unknown production reachability"
+            " and stays unknown"
+        )
+    return ("; " + "; ".join(parts)) if parts else ""
+
+
 def _scan_file(root: Path, rel: str) -> tuple[dict[str, object], list[dict[str, object]]]:
     """Scan one Rust file; return (file_record, candidate_dicts)."""
     raw = _read_source(root, root / rel)
@@ -428,6 +507,8 @@ def _scan_file(root: Path, rel: str) -> tuple[dict[str, object], list[dict[str, 
         "_tests.rs"
     )
     regions = _test_regions(masked)
+    test_lines = _region_lines(regions)
+    cfg_lines = _region_lines(_cfg_regions(masked))
     serde_signal = bool(_DERIVE_SERDE_RE.search(text))
 
     candidates: list[dict[str, object]] = []
@@ -444,6 +525,9 @@ def _scan_file(root: Path, rel: str) -> tuple[dict[str, object], list[dict[str, 
     ) -> None:
         growth = _callsites_for(masked_lines, field_name, GROWTH_METHODS, rel)
         removal = _callsites_for(masked_lines, field_name, REMOVAL_METHODS, rel)
+        production_removal, test_only_removal, cfg_unknown_removal = _partition_removal(
+            masked_lines, field_name, rel, test_lines, cfg_lines
+        )
         span_text = "\n".join(lines[span_start - 1 : span_end])
         own_test = path_test_signal or any(
             start <= span_start <= end for start, end in regions
@@ -464,6 +548,11 @@ def _scan_file(root: Path, rel: str) -> tuple[dict[str, object], list[dict[str, 
                 "lifetime": lifetime,
                 "growth_callsites": growth,
                 "removal_callsites": removal,
+                "production_removal": production_removal,
+                "removal_test_only": test_only_removal,
+                "removal_cfg_unknown": cfg_unknown_removal,
+                "test_lines": test_lines,
+                "cfg_lines": cfg_lines,
                 "test_signal": own_test,
                 "serde_signal": serde_signal,
                 "masked_lines": masked_lines,
@@ -565,7 +654,26 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
     assert isinstance(masked_lines, list)
     growth = item["growth_callsites"]
     removal = item["removal_callsites"]
+    production = item["production_removal"]
+    test_only_removal = item["removal_test_only"]
+    cfg_unknown_removal = item["removal_cfg_unknown"]
     assert isinstance(growth, list) and isinstance(removal, list)
+    assert isinstance(production, list)
+    assert isinstance(test_only_removal, list) and isinstance(cfg_unknown_removal, list)
+    test_lines = item["test_lines"]
+    assert isinstance(test_lines, frozenset)
+    cfg_lines = item["cfg_lines"]
+    assert isinstance(cfg_lines, frozenset)
+    excluded_lines = test_lines | cfg_lines
+    prod_lines = [
+        line if number not in excluded_lines else ""
+        for number, line in enumerate(masked_lines, start=1)
+    ]
+    excluded_note = _excluded_removal_note(
+        [str(call) for call in test_only_removal],
+        [str(call) for call in cfg_unknown_removal],
+    )
+    driver = _cardinality_key(field_type)
 
     lowered = (field_type + " " + field_name).lower()
     ttl_signal = bool(re.search(r"\b(ttl|lease|expir|deadline)\b", lowered))
@@ -574,7 +682,7 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
         re.search(r"\b(policy|policies|config|quota|budget|versioned)\b", lowered)
     )
     with_cap = re.search(r"with_capacity\s*\(\s*(\d+)\s*\)", "\n".join(masked_lines))
-    scheduled = _has_scheduled_cleanup(masked_lines)
+    scheduled = _has_scheduled_cleanup(prod_lines)
 
     if bool(item["test_signal"]):
         return (
@@ -606,37 +714,40 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "function-local binding with no growth observed; frame-bounded regardless",
         )
 
-    if ttl_signal and scheduled and removal:
+    if ttl_signal and scheduled and production:
         return (
             "TTL/lease with scheduled bounded cleanup",
             "scheduled cleanup: " + scheduled,
             "configured",
             "in-memory-only unless persistence signal present",
             "none-required",
-            f"ttl/lease signal with scheduled bounded cleanup owner ({scheduled}) and removal {removal}",
+            f"ttl/lease signal with production scheduled bounded cleanup owner ({scheduled})"
+            f" and production removal {production}" + excluded_note,
         )
 
-    if append_signal and removal:
+    if append_signal and production:
         return (
             "append-only durable segmented retention",
             "retention/rotation evidence in slice",
             "configured",
             "durable segments; restart replays retained segments",
             "none-required",
-            f"append/segment signal with retention callsites {removal}",
+            f"append/segment signal with production retention callsites {production}"
+            + excluded_note,
         )
 
-    if removal and any("(cross-file)" in call for call in removal):
+    if production and any("(cross-file)" in call for call in production):
         return (
             "external compaction",
             "compaction owned outside declaring file",
             "configured",
             "owner-slice dependent",
             "none-required",
-            f"removal/compaction callsites outside declaring file: {removal}",
+            f"production removal/compaction callsites outside declaring file: {production}"
+            + excluded_note,
         )
 
-    if policy_signal and (growth or removal):
+    if policy_signal and (growth or production):
         return (
             "versioned-policy-bounded",
             "policy/config bound reference in slice",
@@ -646,7 +757,7 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "versioned policy/config bound signal; empirical status preserved, not proven here",
         )
 
-    if with_cap and removal:
+    if with_cap and production:
         return (
             "long-lived hard-bounded",
             f"with_capacity({with_cap.group(1)})",
@@ -655,10 +766,11 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             if not item["serde_signal"]
             else "persisted/restart-amplified (serde derive signal in slice)",
             "none-required",
-            f"literal with_capacity({with_cap.group(1)}) with same-slice removal {removal}",
+            f"literal with_capacity({with_cap.group(1)}) with production same-slice removal"
+            f" {production}" + excluded_note,
         )
 
-    if removal and growth:
+    if production and growth:
         return (
             "lifecycle-removal",
             "none-observed",
@@ -667,7 +779,8 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             if not item["serde_signal"]
             else "persisted/restart-amplified (serde derive signal in slice)",
             "none-required",
-            f"same-slice removal/retain/clear/drain {removal} bounds growth {growth}; test-only removal alone proves no production bound",
+            f"production same-slice removal/retain/clear/drain {production} bounds growth"
+            f" {growth}" + excluded_note,
         )
 
     if item["kind"] == "static" and growth:
@@ -677,7 +790,9 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "none",
             "process-global; restart amplification unknown from this slice",
             "UNRESOLVED",
-            f"static/global growth {growth} with no bound or removal in scanned slice",
+            f"static/global growth {growth} with no production bound or removal in scanned slice"
+            + excluded_note
+            + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
 
     if growth:
@@ -692,7 +807,10 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "none",
             detail,
             "UNRESOLVED",
-            f"long-lived growth {growth} with no bound, removal, TTL, compaction, or policy evidence in scanned slice",
+            f"long-lived growth {growth} with no production bound, removal, TTL, compaction,"
+            " or policy evidence in scanned slice"
+            + excluded_note
+            + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
 
     if item["kind"] in ("field", "static"):
@@ -703,7 +821,9 @@ def _classify(item: dict[str, object]) -> tuple[str, str, str, str, str, str]:
             "unknown from this slice",
             "UNRESOLVED",
             "collection-typed owner with no growth callsite in scanned slice; "
-            "cross-impl/cross-module growth possible; static uncertainty stays explicit",
+            "cross-impl/cross-module growth possible; static uncertainty stays explicit"
+            + excluded_note
+            + f"; cardinality driver '{driver}'; untrusted key influence unknown from static source",
         )
 
     return (
@@ -747,15 +867,24 @@ def _cross_file_removal(
     removal method call together. Function-local bindings never associate
     across files. The rule favors precision over recall; unassociated
     cross-module activity stays explicit in row evidence via the unknown
-    classifications and successor scopes.
+    classifications and successor scopes. Cross-file hits bucket by the owning
+    file's test/cfg line sets: only production hits may prove a bound.
     """
     by_path: dict[str, list[str]] = {}
+    test_by_path: dict[str, frozenset[int]] = {}
+    cfg_by_path: dict[str, frozenset[int]] = {}
     for item in candidates:
         path = str(item["path"])
         if path not in by_path:
             masked = item["masked_lines"]
             assert isinstance(masked, list)
             by_path[path] = [str(line) for line in masked]
+            test_value = item["test_lines"]
+            assert isinstance(test_value, frozenset)
+            test_by_path[path] = test_value
+            cfg_value = item["cfg_lines"]
+            assert isinstance(cfg_value, frozenset)
+            cfg_by_path[path] = cfg_value
     for item in candidates:
         if item["kind"] == "local":
             continue
@@ -769,6 +898,12 @@ def _cross_file_removal(
         field_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(field_token) + r"(?![A-Za-z0-9_])")
         hits = item["removal_callsites"]
         assert isinstance(hits, list)
+        prod = item["production_removal"]
+        assert isinstance(prod, list)
+        test_only = item["removal_test_only"]
+        assert isinstance(test_only, list)
+        cfg_only = item["removal_cfg_unknown"]
+        assert isinstance(cfg_only, list)
         for other, other_lines in sorted(by_path.items()):
             if other == str(item["path"]):
                 continue
@@ -780,6 +915,14 @@ def _cross_file_removal(
                         hit = f"{other}:{lineno}:{method} (cross-file)"
                         if hit not in hits:
                             hits.append(hit)
+                        if lineno in test_by_path[other]:
+                            bucket = test_only
+                        elif lineno in cfg_by_path[other]:
+                            bucket = cfg_only
+                        else:
+                            bucket = prod
+                        if hit not in bucket:
+                            bucket.append(hit)
 
 
 def _build_rows(
@@ -812,10 +955,13 @@ def _build_rows(
         if unresolved:
             repair_owner = "UNRESOLVED"
             repair_issue = "UNRESOLVED"
+            driver = _cardinality_key(str(item["field_type"]))
             successor = (
                 f"bounded successor scope: give {item['struct_name'] or item['owner']}."
                 f"{item['field_name']} an explicit bound plus a removal/eviction owner "
-                f"with scheduled or lifecycle cleanup; run experiments before policy choice"
+                f"with scheduled or lifecycle cleanup; run experiments before policy choice; "
+                f"experiments must establish untrusted key influence on cardinality driver "
+                f"'{driver}' before policy choice"
             )
         else:
             repair_owner = "none-required" if repair == "none-required" else package
@@ -899,18 +1045,33 @@ def build_inventory(
 ) -> dict[str, object]:
     root = _root(root)
     scan_inputs = list(scans) if scans else list(DEFAULT_SCAN)
-    files = _collect_inputs(root, scan_inputs)
+    files: list[str] = []
+    exclusions: list[str] = []
+    first_gap: InventoryError | None = None
+    for scan in scan_inputs:
+        try:
+            files.extend(_collect_inputs(root, [scan]))
+        except InventoryError as exc:
+            if exc.code not in ("SCAN_INPUT_MISSING", "EMPTY_SCAN"):
+                raise
+            if first_gap is None:
+                first_gap = exc
+            if exc.code == "SCAN_INPUT_MISSING":
+                exclusions.append(f"{scan}: absent at this revision; excluded with source evidence")
+            else:
+                exclusions.append(
+                    f"{scan}: present but selects no Rust files; excluded with source evidence"
+                )
+    files = sorted(set(files))
+    if not files:
+        assert first_gap is not None
+        raise first_gap
     file_records: list[dict[str, object]] = []
     candidates: list[dict[str, object]] = []
-    exclusions: list[str] = []
     for rel in files:
         record, found = _scan_file(root, rel)
         file_records.append(record)
         candidates.extend(found)
-    for scan in scan_inputs:
-        if (root / scan).is_file() or (root / scan).is_dir():
-            continue
-        exclusions.append(f"{scan}: absent at this revision; excluded with source evidence")
 
     source_pairs = sorted(f"{record['path']}:{record['sha256']}" for record in file_records)
     source_sha = _sha256("\n".join(source_pairs).encode("utf-8"))

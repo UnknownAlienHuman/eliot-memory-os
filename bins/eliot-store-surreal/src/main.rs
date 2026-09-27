@@ -6,11 +6,15 @@ use std::time::Duration;
 use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
 use eliot_protocol::MessageType;
+use eliot_store_surreal::diagnostics::{
+    BoundedEventLog, BridgeBoundary, BridgeIdentity, emit_dispatch_outcome, emit_lifecycle,
+    emit_received, emit_validation_rejected, install_startup_subscriber, report_events,
+};
 use eliot_store_surreal::{
-    SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch,
+    SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch_with_log,
     load_compatibility_for_config, load_config, load_evidence_snapshot_verification,
     require_compatibility_for_writer, require_observed_identity_match,
-    require_semantic_ready_for_pipe, store_bootstrap_descriptor, validate_request_frame,
+    require_semantic_ready_for_pipe, store_bootstrap_descriptor, validate_request_frame_with_log,
 };
 
 mod launch_mode;
@@ -21,10 +25,46 @@ use launch_mode::{LaunchMode, control_frame, parse_launch_mode, prepare_launch};
 // stderr is the only fail-closed launch diagnostic available to its supervisor.
 #[allow(clippy::print_stderr)]
 async fn main() {
-    if let Err(error) = Box::pin(run()).await {
+    // One bounded structured subscriber for the process lifetime. Reusable
+    // compositions never install globals; a duplicate install observes the
+    // existing owner instead of creating a second one.
+    install_startup_subscriber();
+    let outcome = Box::pin(run()).await;
+    let mut events = BoundedEventLog::new();
+    emit_lifecycle(
+        &mut events,
+        BridgeBoundary::ProcessExit,
+        "process_exit",
+        &BridgeIdentity::new(),
+        None,
+    );
+    report_events(&events);
+    if let Err(error) = outcome {
         eprintln!("{SERVICE_NAME}: {error}");
         std::process::exit(1);
     }
+}
+
+/// Records one launch-stage outcome at its owning boundary.
+///
+/// Admission emits a lifecycle observation; refusal emits a validation
+/// rejection. Both carry only the identity actually present at the stage and
+/// no reason prose: untyped stage errors stay explicitly unobserved instead
+/// of being guessed from strings. Infallible and bounded.
+#[cfg(windows)]
+fn report_stage_outcome(
+    boundary: BridgeBoundary,
+    operation: &'static str,
+    identity: &BridgeIdentity,
+    admitted: bool,
+) {
+    let mut events = BoundedEventLog::new();
+    if admitted {
+        emit_lifecycle(&mut events, boundary, operation, identity, None);
+    } else {
+        emit_validation_rejected(&mut events, boundary, operation, identity, None);
+    }
+    report_events(&events);
 }
 
 /// Bounded typed defect for a transport/protocol frame rejected before
@@ -105,6 +145,21 @@ fn frame_rejection_defect(
 fn enforce_store_compatibility(
     config: &eliot_store_surreal::StoreLaunchConfig,
 ) -> Result<(), String> {
+    let outcome = enforce_store_compatibility_inner(config);
+    report_stage_outcome(
+        BridgeBoundary::CompatibilityGate,
+        "compatibility_gate",
+        &BridgeIdentity::new(),
+        outcome.is_ok(),
+    );
+    outcome
+}
+
+#[cfg(windows)]
+#[allow(clippy::print_stderr)]
+fn enforce_store_compatibility_inner(
+    config: &eliot_store_surreal::StoreLaunchConfig,
+) -> Result<(), String> {
     let config_path = std::path::Path::new(config.runtime_launch.store_config_path.as_str());
     let file = load_compatibility_for_config(config_path)?;
     // The I0.5 evidence qualification is an observed property of the
@@ -126,6 +181,27 @@ fn enforce_store_compatibility(
 
 #[cfg(windows)]
 fn emit_bootstrap_descriptor(mode: &LaunchMode) -> Result<bool, String> {
+    let outcome = emit_bootstrap_descriptor_inner(mode);
+    match &outcome {
+        Ok(true) => report_stage_outcome(
+            BridgeBoundary::BootstrapDescriptor,
+            "bootstrap_descriptor",
+            &BridgeIdentity::new(),
+            true,
+        ),
+        Ok(false) => {}
+        Err(_) => report_stage_outcome(
+            BridgeBoundary::BootstrapDescriptor,
+            "bootstrap_descriptor",
+            &BridgeIdentity::new(),
+            false,
+        ),
+    }
+    outcome
+}
+
+#[cfg(windows)]
+fn emit_bootstrap_descriptor_inner(mode: &LaunchMode) -> Result<bool, String> {
     if let LaunchMode::EmitBootstrapDescriptor {
         config_path,
         output_path,
@@ -150,6 +226,22 @@ fn bind_observed_identity(
     composition: &StoreComposition,
     config: &eliot_store_surreal::StoreLaunchConfig,
 ) -> Result<(), String> {
+    let outcome = bind_observed_identity_inner(composition, config);
+    report_stage_outcome(
+        BridgeBoundary::ObservedIdentityBinding,
+        "observed_identity_binding",
+        &BridgeIdentity::new(),
+        outcome.is_ok(),
+    );
+    outcome
+}
+
+#[cfg(windows)]
+#[allow(clippy::print_stderr)]
+fn bind_observed_identity_inner(
+    composition: &StoreComposition,
+    config: &eliot_store_surreal::StoreLaunchConfig,
+) -> Result<(), String> {
     let observed = composition
         .observed_provider_identity()
         .ok_or_else(|| "provider identity was not proved by connect".to_owned())?;
@@ -169,29 +261,81 @@ fn bind_observed_identity(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_lines)]
 async fn serve_handshake_loop(
     composition: &StoreComposition,
     config: &eliot_store_surreal::StoreLaunchConfig,
 ) -> Result<(), String> {
     let limits = TransportLimits::default();
-    let expectation = eliot_platform_windows::NamedPipePeerExpectation::new(
+    let expectation = match eliot_platform_windows::NamedPipePeerExpectation::new(
         config.expected_client_sid.clone(),
         config.expected_client_session_id,
     )
-    .map_err(|error| format!("invalid peer expectation: {error}"))?;
-    let mut server = NamedPipeServer::create(&config.store_pipe, &expectation)
-        .map_err(|error| format!("named-pipe creation failed: {error}"))?;
-    server
+    .map_err(|error| format!("invalid peer expectation: {error}"))
+    {
+        Ok(expectation) => expectation,
+        Err(error) => {
+            report_stage_outcome(
+                BridgeBoundary::PipeBind,
+                "pipe_bind",
+                &BridgeIdentity::new(),
+                false,
+            );
+            return Err(error);
+        }
+    };
+    let mut server = match NamedPipeServer::create(&config.store_pipe, &expectation)
+        .map_err(|error| format!("named-pipe creation failed: {error}"))
+    {
+        Ok(server) => server,
+        Err(error) => {
+            report_stage_outcome(
+                BridgeBoundary::PipeBind,
+                "pipe_bind",
+                &BridgeIdentity::new(),
+                false,
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = server
         .wait_for_authenticated_client(
             Duration::from_millis(config.connect_timeout_ms),
             &expectation,
         )
         .await
-        .map_err(|error| format!("authenticated client admission failed: {error}"))?;
-    let hello_frame = server
+        .map_err(|error| format!("authenticated client admission failed: {error}"))
+    {
+        report_stage_outcome(
+            BridgeBoundary::PipeBind,
+            "pipe_bind",
+            &BridgeIdentity::new(),
+            false,
+        );
+        return Err(error);
+    }
+    report_stage_outcome(
+        BridgeBoundary::PipeBind,
+        "pipe_bind",
+        &BridgeIdentity::new(),
+        true,
+    );
+    let hello_frame = match server
         .receive_frame(limits)
         .await
-        .map_err(|error| format!("EBP hello receive failed: {error}"))?;
+        .map_err(|error| format!("EBP hello receive failed: {error}"))
+    {
+        Ok(frame) => frame,
+        Err(error) => {
+            report_stage_outcome(
+                BridgeBoundary::HandshakeAdmit,
+                "handshake",
+                &BridgeIdentity::new(),
+                false,
+            );
+            return Err(error);
+        }
+    };
     let handshake_identity = StoreHandshakeIdentity::new(
         composition.operation_manifest_digest().to_owned(),
         serde_json::json!({
@@ -202,7 +346,28 @@ async fn serve_handshake_loop(
         }),
     );
     let (mut session, server_hello) =
-        admit_handshake(hello_frame, limits, config, &handshake_identity)?;
+        match admit_handshake(hello_frame, limits, config, &handshake_identity) {
+            Ok(admitted) => {
+                let mut events = BoundedEventLog::new();
+                emit_received(
+                    &mut events,
+                    BridgeBoundary::HandshakeAdmit,
+                    "handshake",
+                    &BridgeIdentity::new(),
+                );
+                report_events(&events);
+                admitted
+            }
+            Err(error) => {
+                report_stage_outcome(
+                    BridgeBoundary::HandshakeAdmit,
+                    "handshake",
+                    &BridgeIdentity::new(),
+                    false,
+                );
+                return Err(error);
+            }
+        };
     let mut negotiated_limits = limits;
     negotiated_limits.max_frame_bytes = session.max_frame_bytes();
     let handshake_frame = control_frame(
@@ -212,47 +377,190 @@ async fn serve_handshake_loop(
         serde_json::to_value(server_hello)
             .map_err(|error| format!("serialize ServerHello: {error}"))?,
     );
-    server
+    if let Err(error) = server
         .send_frame(&handshake_frame, negotiated_limits)
         .await
-        .map_err(|error| format!("EBP handshake response failed: {error}"))?;
+        .map_err(|error| format!("EBP handshake response failed: {error}"))
+    {
+        // Transport loss only: a failed send records the loss, never delivery.
+        // A successful send stays silent because transport acceptance proves
+        // no delivery.
+        let mut events = BoundedEventLog::new();
+        emit_lifecycle(
+            &mut events,
+            BridgeBoundary::HandshakeRespond,
+            "handshake",
+            &BridgeIdentity::new(),
+            None,
+        );
+        report_events(&events);
+        return Err(error);
+    }
 
     loop {
-        let frame = server
+        let frame = match server
             .receive_frame(negotiated_limits)
             .await
-            .map_err(|error| format!("EBP frame rejected: {error}"))?;
-        let response = match validate_request_frame(&mut session, &frame) {
-            Ok(request) => Box::pin(dispatch(composition, request)).await,
-            Err(error) => frame_rejection_defect(frame.request_id.clone(), error),
+            .map_err(|error| format!("EBP frame rejected: {error}"))
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                let mut events = BoundedEventLog::new();
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::FrameReceive,
+                    "frame",
+                    &BridgeIdentity::new(),
+                    None,
+                );
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::Shutdown,
+                    "shutdown",
+                    &BridgeIdentity::new(),
+                    None,
+                );
+                report_events(&events);
+                return Err(error);
+            }
         };
-        let response_frame = eliot_store_api::response_frame(
+        let mut round = BoundedEventLog::new();
+        let (request_identity, response) =
+            match validate_request_frame_with_log(&mut session, &frame, &mut round) {
+                Ok(request) => {
+                    let identity = BridgeIdentity::from_request(&request);
+                    let response =
+                        Box::pin(dispatch_with_log(composition, request, &mut round)).await;
+                    (identity, response)
+                }
+                Err(error) => {
+                    let defect = frame_rejection_defect(frame.request_id.clone(), error);
+                    let identity = BridgeIdentity::from_response(&defect);
+                    emit_dispatch_outcome(
+                        &mut round,
+                        BridgeBoundary::FrameRejection,
+                        "frame",
+                        &identity,
+                        &defect,
+                    );
+                    (identity, defect)
+                }
+            };
+        report_events(&round);
+        let identity = request_identity.merge(&BridgeIdentity::from_response(&response));
+        let response_frame = match eliot_store_api::response_frame(
             session.connection_id(),
             session.protocol_version(),
             frame.request_id.clone(),
             response,
         )
-        .map_err(|error| format!("invalid EBP response: {error}"))?;
-        server
+        .map_err(|error| format!("invalid EBP response: {error}"))
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                let mut events = BoundedEventLog::new();
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::ResponseSend,
+                    "response_send",
+                    &identity,
+                    None,
+                );
+                emit_lifecycle(
+                    &mut events,
+                    BridgeBoundary::Shutdown,
+                    "shutdown",
+                    &identity,
+                    None,
+                );
+                report_events(&events);
+                return Err(error);
+            }
+        };
+        if let Err(error) = server
             .send_frame(&response_frame, negotiated_limits)
             .await
-            .map_err(|error| format!("EBP response failed: {error}"))?;
+            .map_err(|error| format!("EBP response failed: {error}"))
+        {
+            // Response loss after mutation: the recorded dispatch outcome
+            // stands with the same operation identity. Delivery and outcome
+            // stay unknown here, never re-decided into commit or rollback.
+            let mut events = BoundedEventLog::new();
+            emit_lifecycle(
+                &mut events,
+                BridgeBoundary::ResponseSend,
+                "response_send",
+                &identity,
+                None,
+            );
+            emit_lifecycle(
+                &mut events,
+                BridgeBoundary::Shutdown,
+                "shutdown",
+                &identity,
+                None,
+            );
+            report_events(&events);
+            return Err(error);
+        }
     }
 }
 
 #[cfg(windows)]
 #[allow(clippy::print_stdout)]
 async fn run() -> Result<(), String> {
-    let mode = parse_launch_mode(std::env::args_os().skip(1))?;
+    let mode = match parse_launch_mode(std::env::args_os().skip(1)) {
+        Ok(mode) => {
+            let mut events = BoundedEventLog::new();
+            emit_received(
+                &mut events,
+                BridgeBoundary::LaunchConfig,
+                "launch_config",
+                &BridgeIdentity::new(),
+            );
+            report_events(&events);
+            mode
+        }
+        Err(error) => {
+            report_stage_outcome(
+                BridgeBoundary::LaunchConfig,
+                "launch_config",
+                &BridgeIdentity::new(),
+                false,
+            );
+            return Err(error);
+        }
+    };
     if emit_bootstrap_descriptor(&mode)? {
         return Ok(());
     }
-    let Some(config) = prepare_launch(mode).await? else {
+    let prepared = prepare_launch(mode).await;
+    report_stage_outcome(
+        BridgeBoundary::LaunchConfig,
+        "launch_config",
+        &BridgeIdentity::new(),
+        prepared.is_ok(),
+    );
+    let Some(config) = prepared? else {
         return Ok(());
     };
     enforce_store_compatibility(&config)?;
-    let composition = StoreComposition::new(&config)?;
-    composition.connect().await?;
+    let composed = StoreComposition::new(&config);
+    report_stage_outcome(
+        BridgeBoundary::Startup,
+        "startup",
+        &BridgeIdentity::new(),
+        composed.is_ok(),
+    );
+    let composition = composed?;
+    let connected = composition.connect().await;
+    report_stage_outcome(
+        BridgeBoundary::Startup,
+        "startup",
+        &BridgeIdentity::new(),
+        connected.is_ok(),
+    );
+    connected?;
     // Post-connect re-verification (issue #1932): the adapter has now proved
     // spawned-artifact identity, listener ownership and server major over its
     // ownership-verified channel. Reload the decision record and require the
@@ -266,11 +574,30 @@ async fn run() -> Result<(), String> {
     // that observation before serving: a rotated binary or drifted record
     // fails closed here, never at the first canonical write.
     bind_observed_identity(&composition, &config)?;
-    let readiness = composition
-        .readiness()
-        .await
-        .map_err(|error| format!("semantic Store readiness failed: {error}"))?;
-    require_semantic_ready_for_pipe(&readiness, &config.schema_generation)?;
+    let readiness = match composition.readiness().await {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            report_stage_outcome(
+                BridgeBoundary::SemanticReadinessGate,
+                "semantic_readiness_gate",
+                &BridgeIdentity::new(),
+                false,
+            );
+            return Err(format!("semantic Store readiness failed: {error}"));
+        }
+    };
+    let mut gate_identity = BridgeIdentity::new();
+    if let Some(generation) = readiness.observed_generation.as_deref() {
+        gate_identity = gate_identity.with_generation(generation);
+    }
+    let gated = require_semantic_ready_for_pipe(&readiness, &config.schema_generation);
+    report_stage_outcome(
+        BridgeBoundary::SemanticReadinessGate,
+        "semantic_readiness_gate",
+        &gate_identity,
+        gated.is_ok(),
+    );
+    gated?;
     serve_handshake_loop(&composition, &config).await
 }
 

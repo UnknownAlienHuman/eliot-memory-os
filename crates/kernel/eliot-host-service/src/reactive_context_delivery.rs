@@ -363,6 +363,8 @@ pub struct ReactiveContextDeliveryLimits {
     pub max_reconciliation_queries: usize,
     /// Maximum active operations inspected by one drain pass.
     pub max_drain_operations: usize,
+    /// Maximum never-sent durable events re-driven by one reconnect replay pass.
+    pub max_reconnect_replays: usize,
     /// Additional control capacity reserved above normal in-flight capacity.
     pub reserved_control_capacity: usize,
 }
@@ -374,6 +376,7 @@ impl Default for ReactiveContextDeliveryLimits {
             max_pending_ack: 64,
             max_reconciliation_queries: 64,
             max_drain_operations: 256,
+            max_reconnect_replays: 64,
             reserved_control_capacity: 4,
         }
     }
@@ -385,6 +388,7 @@ impl ReactiveContextDeliveryLimits {
             || self.max_pending_ack == 0
             || self.max_reconciliation_queries == 0
             || self.max_drain_operations == 0
+            || self.max_reconnect_replays == 0
         {
             return Err(ReactiveContextDeliveryError::invalid(
                 "limits",
@@ -418,6 +422,17 @@ pub struct RestartReconciliation {
     /// Number of entries moved to a known durable result.
     pub reconciled: usize,
     /// Operations that remain delivery-unknown and blocked.
+    pub blocked_unknown: Vec<IdempotencyIdentity>,
+}
+
+/// Result of a reconnect replay pass over durable queued events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconnectReplayReport {
+    /// Number of active entries inspected.
+    pub inspected: usize,
+    /// Number of never-sent durable events re-driven with their stored envelope.
+    pub replayed: usize,
+    /// Attempted-but-unknown operations left for same-operation reconciliation.
     pub blocked_unknown: Vec<IdempotencyIdentity>,
 }
 
@@ -901,6 +916,48 @@ where
             inspected,
             queries,
             reconciled,
+            blocked_unknown,
+        })
+    }
+
+    /// Re-drive every durable-but-never-sent event after a reconnect.
+    ///
+    /// Each replay reuses the entry's stored envelope, so the same `event_id`,
+    /// producer generation, authority epoch, sequence, and payload/blob
+    /// reference travel again and no new logical event ID is issued. Only
+    /// `EnqueuedPersisted` entries are re-driven: the stage machine has no
+    /// redrive edge out of `DeliveryAttempted`/`UnknownDelivery` by design, so
+    /// attempted-but-unknown entries stay reconcile-only until the
+    /// same-operation delivery query owner answers, and ack-pending entries
+    /// await recipient acknowledgement through [`Self::acknowledge`].
+    pub fn replay_unacknowledged_after_reconnect(
+        &mut self,
+    ) -> Result<ReconnectReplayReport, ReactiveContextDeliveryError> {
+        let entries = self.load_active_entries(self.limits.max_drain_operations + 1)?;
+        let inspected = entries.len();
+        let mut replayed = 0;
+        let mut blocked_unknown = Vec::new();
+        for entry in entries {
+            if entry.stage != ReactiveContextStage::EnqueuedPersisted {
+                if matches!(
+                    entry.stage,
+                    ReactiveContextStage::DeliveryAttempted | ReactiveContextStage::UnknownDelivery
+                ) {
+                    blocked_unknown.push(entry.operation.clone());
+                }
+                continue;
+            }
+            replayed += 1;
+            if replayed > self.limits.max_reconnect_replays {
+                return Err(ReactiveContextDeliveryError::Capacity {
+                    dimension: "reconnect_replays",
+                });
+            }
+            self.drive_enqueued(&entry)?;
+        }
+        Ok(ReconnectReplayReport {
+            inspected,
+            replayed,
             blocked_unknown,
         })
     }

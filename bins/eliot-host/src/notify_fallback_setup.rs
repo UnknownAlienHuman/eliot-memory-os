@@ -1,7 +1,7 @@
 //! Host Phase-B per-user Notify fallback setup (issue #1780, I11.6).
 //!
 //! Consumes
-//! [`render_notify_fallback_declaration`](eliot_notify::render_notify_fallback_declaration):
+//! [`render_notify_fallback_declaration`](eliot_notify_core::render_notify_fallback_declaration):
 //! publishes the canonical declaration to protected `ProgramData` through
 //! the existing Phase-B file publisher, verifies readback under lease, then
 //! registers the signed Task Scheduler fallback through the existing notify
@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use eliot_installation::InstallationProfile;
-use eliot_notify::{
+use eliot_notify_core::{
     NotifyDeclarationInputs, RenderedNotifyDeclaration, render_notify_fallback_declaration,
 };
 use eliot_platform::PlatformHandle;

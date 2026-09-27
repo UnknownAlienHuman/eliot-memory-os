@@ -201,7 +201,8 @@ impl ShutdownTerminal {
 /// helper (no cross-binary type import): `generation` feeds
 /// `drain_generation` correlation, `lease_and_pending_snapshot` feeds
 /// `lease_and_pending_operation_snapshot` (empty here — the reconciliation
-/// gate proved it), `authority_epochs_fenced` feeds
+/// gate proved it; commit rejects a decision carrying unreconciled work),
+/// `authority_epochs_fenced` feeds
 /// `authority_epochs_fenced`, `branches_to_stop` feeds
 /// `processes_modules_and_store_branches_to_stop`, `wake_disposition` feeds
 /// `wake_during_drain_disposition`, `irreversible_stage` feeds
@@ -528,6 +529,17 @@ fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
         if durable.terminal.is_none() && !durable.pending.is_empty() {
             return Err("committed shutdown has pending work without a terminal".to_owned());
         }
+    }
+
+    // Pending identities are written only through the registration and
+    // terminal paths, which refuse blank identities; a blank entry on disk
+    // is corruption, never an obligation.
+    if durable
+        .pending
+        .iter()
+        .any(|identity| identity.trim().is_empty())
+    {
+        return Err("shutdown state contains invalid pending identity".to_owned());
     }
 
     if let Some(terminal) = &durable.terminal {
@@ -982,11 +994,19 @@ impl ShutdownDrainCoordinator {
     /// and the branches to stop. Requires every pre-commit phase and an
     /// empty pending registry.
     ///
+    /// Exact replay returns the same result: recommitting the identical
+    /// decision is idempotent. A different decision for an already
+    /// linearized generation conflicts instead of overwriting it. The
+    /// decision's pending snapshot must itself be empty: linearization is
+    /// admitted only on the reconciled-empty registry the receipt gate
+    /// proved, so a decision carrying unreconciled work is rejected.
+    ///
     /// # Errors
     ///
     /// Returns a reason when the drain was cancelled by a pre-linearization
-    /// wake, a pre-commit phase is missing, pending work remains, or the
-    /// decision carries a foreign generation.
+    /// wake, a pre-commit phase is missing, pending work remains, the
+    /// decision carries a foreign generation or an unreconciled snapshot,
+    /// or a different decision is already linearized for this generation.
     pub(crate) fn commit_drain(&self, decision: DrainCommitDecision) -> Result<(), String> {
         let mut state = self.lock();
         if !state.requested {
@@ -998,8 +1018,12 @@ impl ShutdownDrainCoordinator {
         if state.cancelled {
             return Err("drain cancelled by pre-linearization wake".to_owned());
         }
-        if state.committed.is_some() {
-            return Err("drain already linearized".to_owned());
+        if let Some(committed) = state.committed.as_ref() {
+            return if committed == &decision {
+                Ok(())
+            } else {
+                Err("drain decision conflicts with linearized commit".to_owned())
+            };
         }
         for phase in ShutdownPhase::PRE_COMMIT {
             if !state.phases.contains_key(&phase.order()) {
@@ -1017,6 +1041,9 @@ impl ShutdownDrainCoordinator {
         }
         if decision.generation != state.generation {
             return Err("drain decision carries a foreign generation".to_owned());
+        }
+        if !decision.lease_and_pending_snapshot.is_empty() {
+            return Err("drain decision carries unreconciled pending snapshot".to_owned());
         }
         let mut candidate = state.clone();
         candidate.committed = Some(decision);

@@ -62,6 +62,7 @@ mod learning_admission;
 mod learning_closure;
 mod learning_delta_integration;
 mod learning_promotion;
+mod learning_record_commit;
 mod observation_reconciliation;
 mod operator_intent;
 mod operator_reconciliation;
@@ -69,6 +70,7 @@ mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
 mod reactive_admission;
+mod route_registry;
 mod scan_disclosure_owner;
 mod scope_identity_admission;
 mod skill_lifecycle;
@@ -140,6 +142,10 @@ pub use learning_promotion::{
     PromotionBoundaryInput, PromotionEvaluationInput, PromotionRefusal, evaluate_promotion,
     rollback_promotion,
 };
+pub use learning_record_commit::{
+    commit_learning_record, learning_effective_under_admission,
+    learning_record_mutation_request_for_delta,
+};
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
@@ -155,6 +161,7 @@ pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_comma
 pub use owner_closure_feed::{
     OwnerPublishPort, publish_owner_feed, synchronize_owner_feed,
     synchronize_owner_feed_with_canonical_receipts,
+    synchronize_owner_feed_with_quarantine_evidence,
 };
 pub use owner_closure_provider::{
     AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,
@@ -164,6 +171,12 @@ pub use owner_closure_provider::{
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
     assess_reactive_risk, bind_atom_risk,
+};
+pub use route_registry::{
+    ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute, RouteAdmission,
+    RouteAdmissionDecision, RouteBehaviorFingerprint, RouteEvidenceSummary, RouteIdentityLayer,
+    RouteInstallationIdentity, RouteRefusalReason, RouteRegistryError, RuntimeRoute,
+    diverging_scope_layers,
 };
 pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{

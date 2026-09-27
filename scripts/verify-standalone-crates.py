@@ -113,15 +113,28 @@ def standalone_crates(root: Path) -> list[Path]:
 def exclude_crates(root: Path) -> list[Path]:
     # Discovered at runtime from `workspace.exclude` in the root Cargo.toml
     # (scripts/verify-standalone-crates.py:42-44); never a hardcoded list.
+    # Every declared entry must resolve to exactly one readable package
+    # manifest. A missing, malformed, or package-less manifest fails loudly
+    # instead of vanishing from `--list`, so the MergeCompile denominator
+    # receipt (issue #3004 W4) accounts for every declared excluded input.
     _, exclude = workspace_paths(root)
     found: list[Path] = []
     for relative in sorted(exclude):
         manifest = root / relative / "Cargo.toml"
         if not manifest.is_file():
-            continue
-        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            raise SystemExit(
+                f"STANDALONE_CRATES: FAIL declared-but-missing excluded manifest: {relative}/Cargo.toml"
+            )
+        try:
+            data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as exc:
+            raise SystemExit(
+                f"STANDALONE_CRATES: FAIL malformed excluded manifest: {relative}/Cargo.toml ({exc})"
+            ) from exc
         if "package" not in data:
-            continue
+            raise SystemExit(
+                f"STANDALONE_CRATES: FAIL excluded manifest without [package]: {relative}/Cargo.toml"
+            )
         found.append(manifest.parent)
     return found
 

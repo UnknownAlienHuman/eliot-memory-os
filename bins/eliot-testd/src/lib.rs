@@ -30,8 +30,7 @@ use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
     Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, TargetRoots, TestJob,
     TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
-    issue_process_admission, testd_profile_binding, testd_profile_resource_limits,
-    validate_running_lease,
+    issue_process_admission, testd_profile_resource_limits, validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -389,7 +388,7 @@ impl TestdComposition {
                 reason: "profile argument limit exceeded",
             });
         }
-        if request.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+        if eliot_testd_core::is_productive_testd_profile(&request.invocation.profile)
             && request.verifier_dispatch.is_none()
         {
             return Err(TestdError::Invalid {
@@ -742,6 +741,10 @@ pub struct TestdDerivedIntentParams {
     pub process_tree_id: String,
     /// Admitted profile name (exactly one is admitted).
     pub profile: String,
+    /// Validated slot suffix for the slotted list/scoped profiles; empty
+    /// for the fixed-argv probe and productive profiles. The suffix is
+    /// parsed through the registry slot schema before any argv is sealed.
+    pub slot_suffix: Vec<String>,
     /// Admitted activation generation (non-zero).
     pub generation: u64,
     /// Dispatch session nonce; binds the process session identity.
@@ -766,12 +769,13 @@ pub struct TestdDerivedIntentParams {
 /// plus admitted identities.
 ///
 /// The executable digest, argv, environment, and limits come exclusively
-/// from the closed [`eliot_testd_core::TestdExecutableBinding`]: the
-/// caller's invocation arguments are never consulted (registration already
-/// refuses non-empty arguments). The working directory is always the
-/// admitted generation root, never a caller path. Identity scaffolding
-/// (operation, tree, job, image, session, generation) is derived
-/// deterministically from admitted material, never invented.
+/// from the closed [`eliot_testd_core::TestdExecutableBinding`]: fixed-argv
+/// profiles never consult caller arguments (registration already refuses
+/// non-empty arguments), and slotted profiles seal exactly the argv
+/// rendered from the validated slot suffix. The working directory is
+/// always the admitted generation root, never a caller path. Identity
+/// scaffolding (operation, tree, job, image, session, generation) is
+/// derived deterministically from admitted material, never invented.
 pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessIntent, TestdError> {
     for (value, field) in [
         (params.job_id.as_str(), "job_id"),
@@ -792,7 +796,11 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
             reason: "testd admits only the closed cargo-test tool-probe profile",
         });
     }
-    let binding = testd_profile_binding(&params.profile, &params.executable_sha256)?;
+    let binding = eliot_testd_core::testd_profile_binding_with_slots(
+        &params.profile,
+        &params.executable_sha256,
+        &params.slot_suffix,
+    )?;
     let executable = Path::new(&params.executable_absolute);
     if !executable.is_absolute()
         || executable
@@ -837,26 +845,7 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
         TestdError::Contract(truncate_dispatch_detail(&error.to_string()))
     };
     let generation = Generation::new(params.generation).map_err(invalid)?;
-    let environment = if params.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
-        validate_productive_tool_environment(
-            &params.tool_environment,
-            &params.executable_absolute,
-            &params.target_root,
-            &params.cache_root,
-        )?
-    } else {
-        if !params.tool_environment.is_empty() {
-            return Err(TestdError::Invalid {
-                field: "tool_environment",
-                reason: "the probe profile admits no toolchain environment",
-            });
-        }
-        let mut values = BTreeMap::new();
-        values.insert("CARGO_TARGET_DIR".to_owned(), params.target_root.clone());
-        values.insert("CARGO_HOME".to_owned(), params.cache_root.clone());
-        EnvironmentProjection::new(values, Vec::new(), EnvironmentInheritance::None)
-            .map_err(invalid)?
-    };
+    let environment = derive_testd_intent_environment(params)?;
     let intent = ProcessIntent::new(
         OperationId::new(params.operation_id.clone()).map_err(invalid)?,
         ProcessTreeId::new(params.process_tree_id.clone()).map_err(invalid)?,
@@ -873,6 +862,36 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
     )
     .map_err(invalid)?;
     Ok(intent)
+}
+
+/// Resolves the child environment for one derived intent: the probe
+/// receives only the admitted roots, while productive and slotted
+/// profiles run the owner-resolved cargo-nextest toolchain. The libtest
+/// reporter gate rides along unused for discovery; requiring the one
+/// toolchain identity set keeps a single owner-observed tool path.
+fn derive_testd_intent_environment(
+    params: &TestdDerivedIntentParams,
+) -> Result<EnvironmentProjection, TestdError> {
+    if params.profile == eliot_testd_core::TESTD_ADMITTED_PROFILE {
+        if !params.tool_environment.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "the probe profile admits no toolchain environment",
+            });
+        }
+        let mut values = BTreeMap::new();
+        values.insert("CARGO_TARGET_DIR".to_owned(), params.target_root.clone());
+        values.insert("CARGO_HOME".to_owned(), params.cache_root.clone());
+        EnvironmentProjection::new(values, Vec::new(), EnvironmentInheritance::None)
+            .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))
+    } else {
+        validate_productive_tool_environment(
+            &params.tool_environment,
+            &params.executable_absolute,
+            &params.target_root,
+            &params.cache_root,
+        )
+    }
 }
 
 /// Resolved installed tool for the admitted profile: the absolute
@@ -1492,7 +1511,7 @@ fn load_dispatch_job(
             field: "job_id",
             reason: "admitted dispatch has no canonical TestD job row",
         })?;
-    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         job.verifier_dispatch
             .as_ref()
             .ok_or(TestdError::InvalidBinding)?
@@ -1518,6 +1537,7 @@ fn canonicalize_dispatch_roots(
         })?;
     if observed_source != canonical_job_source
         || job.invocation.profile != material.profile
+        || job.invocation.arguments != material.sealed_slot_suffix
         || job.process.generation != material.generation
         || !job
             .process
@@ -1535,7 +1555,7 @@ fn ensure_dispatch_source_observation(
     canonical_job_source: &Path,
     now_unix_ms: u64,
 ) -> Result<TestJob, TestdError> {
-    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         if let Some(observation) = &job.source_observation_before {
             observation.validate()?;
             if std::path::Path::new(&observation.repository_root) != canonical_job_source {
@@ -1558,10 +1578,10 @@ fn derive_dispatch_process_intent(
     material: &crate::testd_material::ValidatedTestdMaterial,
     canonical_job_source: &Path,
 ) -> Result<ProcessIntent, TestdError> {
-    let program_path = if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
-        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
-    } else {
+    let program_path = if job.invocation.profile == eliot_testd_core::TESTD_ADMITTED_PROFILE {
         eliot_testd_core::TESTD_PROFILE_PROGRAM
+    } else {
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     };
     let tool = resolve_testd_tool_at(program_path, canonical_job_source)?;
     let tool_environment = bind_tool_environment_to_roots(
@@ -1570,11 +1590,15 @@ fn derive_dispatch_process_intent(
         &job.target_roots.target_root,
         &job.target_roots.cache_root,
     )?;
+    // The Kernel-admitted slot suffix and the durable job arguments proved
+    // equal at the dispatch agreement gate; the sealed argv derives from
+    // the admitted material.
     let params = TestdDerivedIntentParams {
         job_id: material.job_id.clone(),
         operation_id: job.process.operation_id.clone(),
         process_tree_id: job.process.process_tree_id.clone(),
         profile: job.invocation.profile.clone(),
+        slot_suffix: material.sealed_slot_suffix.clone(),
         generation: material.generation,
         session_nonce: material.nonce.clone(),
         executable_absolute: tool.executable_absolute,
@@ -1704,7 +1728,7 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     let job = store
         .get(job_id)?
         .ok_or_else(|| TestdError::Corrupt("terminal TestD job disappeared".to_owned()))?;
-    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         let binding = job
             .verifier_dispatch
             .as_ref()
@@ -1749,7 +1773,7 @@ fn bind_tool_environment_to_roots(
             });
         }
     }
-    if profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE && !values.is_empty() {
+    if profile == eliot_testd_core::TESTD_ADMITTED_PROFILE && !values.is_empty() {
         return Err(TestdError::Invalid {
             field: "tool_environment",
             reason: "probe profile has unexpected owner environment",
@@ -2355,6 +2379,7 @@ mod tests {
             operation_id: "testd-op-drive-1".to_owned(),
             process_tree_id: "job-testd-drive-1-tree".to_owned(),
             profile: TESTD_ADMITTED_PROFILE.to_owned(),
+            slot_suffix: Vec::new(),
             generation: 1,
             session_nonce: "testd-drive-session-01".to_owned(),
             executable_absolute: tool.executable_absolute.clone(),
@@ -2435,6 +2460,7 @@ mod tests {
             job_id: "job-testd-cancel-1".to_owned(),
             operation_id: "testd-op-1".to_owned(),
             profile: "cargo-test".to_owned(),
+            sealed_slot_suffix: Vec::new(),
             profile_binding_digest: "a".repeat(64),
             environment: Vec::new(),
             request_digest: "b".repeat(64),

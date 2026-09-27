@@ -13,26 +13,31 @@
 //! enforces: rollback switches generation back only if no irreversible
 //! migration/effect occurred; otherwise it uses forward repair.
 //!
-//! `I5.10` names `ECXF/1` as the logical transfer format, so the snapshot
-//! import and the event tail are ECXF exchanges. `I14.14` owns the
-//! `CapabilityRouteScope`, the durable cutover record, the in-flight
-//! disposition set, the rollback boundary and the receipt, and states that the
-//! ORS commit is the durable linearization point while an irreversible state
-//! migration requires forward repair or a separately proven rollback path.
-//! `A13.3` supplies the promotion contour (shadow, bounded canary, active
+//! `I5.10` names `ECXF/1` as the logical transfer format and states that an
+//! export is tied to an `ExportFence`. [`StorageReplacementTransfer`] is the
+//! typed record of one such exchange: the format identity, the digest of the
+//! exact exported bytes, and the digest of the export fence the bytes were
+//! taken at. The two stages that move data — I5.11 stage 2 and stage 5 — cannot
+//! be recorded without it, and the cutover receipt binds it.
+//!
+//! `I14.14` owns the `CapabilityRouteScope`, the durable cutover record, the
+//! in-flight disposition set, the rollback boundary and the receipt, and states
+//! that the ORS commit is the durable linearization point while an irreversible
+//! state migration requires forward repair or a separately proven rollback
+//! path. `A13.3` supplies the promotion contour (shadow, bounded canary, active
 //! generation, drain and retire or forward rollback) this module orders.
 //!
 //! ## Ordered stages
 //!
 //! ```text
 //! install candidate store bridge
-//!   -> import snapshot into candidate
+//!   -> import snapshot into candidate          (records its ECXF transfer)
 //!   -> verify counts, hashes, graph/projection invariants
 //!   -> shadow reads against both stores
-//!   -> tail canonical events into candidate
+//!   -> tail canonical events into candidate    (records its ECXF transfer)
 //!   -> quiesce affected writes
 //!   -> reconcile final sequence
-//!   -> commit the canonical_store CapabilityRouteScope cutover
+//!   -> commit the canonical_store CapabilityRouteScope cutover through ORS
 //!   -> canary reads/writes
 //!   -> keep old store read-only for rollback window
 //!   -> retire only after backup and cutover receipt
@@ -43,43 +48,86 @@
 //! ```text
 //! Owner                           Evidence
 //! ------------------------------- -------------------------------------------
-//! This module (`StorageReplacement`) the I5.11 stage machine, its per-stage
+//! This module (`StorageReplacement`) the I5.11 stage machine, the required
+//!                                 ECXF transfer records, the per-stage
 //!                                 recorded evidence, the irreversible-effect
 //!                                 ledger and the cutover receipt
-//! ORS (`eliot_ors`)               the committed `GenerationCutoverOwnership`,
-//!                                 its `GenerationCutoverOwnershipReceipt`, the
-//!                                 in-flight dispositions, the route snapshot
-//!                                 and the route-scope hash
-//! Store / candidate bridge        the imported snapshot, the verification and
-//!                                 shadow-read comparison, the canary result
-//!                                 and the read-only rollback window
+//! ORS (`eliot_ors`)               the committed `GenerationCutoverOwnership`
+//!                                 row this coordinator re-derives its receipt
+//!                                 from, its `GenerationCutoverOwnershipReceipt`,
+//!                                 the in-flight dispositions, the route
+//!                                 snapshot and the route-scope hash
+//! Store / candidate bridge        the exported bytes and export fence, the
+//!                                 imported snapshot, the verification and
+//!                                 shadow-read comparison, the canary result,
+//!                                 the read-only rollback window and the backup
 //! ```
 //!
-//! ## Negative: the candidate cannot become canonical by configuration
+//! ## Negative: the candidate cannot become canonical except through this
+//! ## coordinator's receipt
 //!
-//! The coordinator is the only writer of a replacement's stage position, and
-//! the cutover receipt is derived exclusively from an ORS-committed
-//! `GenerationCutoverOwnership` for this replacement's own
-//! `canonical_store` route scope and its own two store generations. A
-//! configuration flip, a restart or a direct route selection therefore cannot
-//! name the candidate as canonical: before stage 8 is committed no receipt
-//! exists, and after it the only authority is the committed ORS record that
-//! [`GenerationCutoverOwnershipReceipt::from_committed`] already refuses to
-//! synthesize while the record is still staged. The coordinator grants no
-//! authority of its own and interprets no store payload.
+//! Established by this module:
+//!
+//! - The route scope is pinned. [`canonical_store_route_scope`] is the only
+//!   scope a replacement is ever bound to; it is declared once through
+//!   [`CapabilityRouteScope::declare`] and is never supplied by a caller, so no
+//!   other four-tuple carrying the `canonical_store` capability string is
+//!   reachable.
+//! - The cutover receipt is re-derived from ORS rather than asserted by a
+//!   caller. [`StorageReplacement::commit_canonical_store_route_cutover`] loads
+//!   the `GenerationCutoverOwnership` from the durable [`RedbRecoveryStore`] by
+//!   its cutover identity and refuses anything that is not a committed row, so a
+//!   hand-built record with a synthetic `state` and
+//!   `linearization_record_id` can never reach a receipt.
+//! - The receipt is a serializable, deny-unknown-fields record whose
+//!   [`StorageReplacementCutoverReceipt::validate`] runs on the construction
+//!   path before the coordinator stores it.
+//! - A restart cannot silently reopen a closed rollback path.
+//!   [`StorageReplacement::begin`] refuses a candidate generation that already
+//!   owns the route through a committed cutover, and
+//!   [`StorageReplacement::resume_after_committed_cutover`] reconstructs a
+//!   replacement from the durable cutover receipt plus the ORS-committed record
+//!   that receipt names, restoring the irreversible-effect ledger fixed at the
+//!   cutover.
+//! - The two data-transfer stages cannot be recorded without the transfer
+//!   record that binds the exact exported bytes and their export fence, and the
+//!   cutover receipt binds that transfer, so a cutover cannot be proven against
+//!   bytes the coordinator never saw.
+//!
+//! **Not** established by this module, and stated here so no reader mistakes
+//! this file for a safety net it is not:
+//!
+//! - This coordinator is not the only way a Store gateway comes into being.
+//!   `KernelStoreGateway::new` is reachable from the composition root's initial
+//!   canonical-store connect and from `KernelComposition::rebind_store`, and
+//!   that rebind path mints its own unrelated `StoreRebindReceipt`. The I5.11
+//!   work items "route all Store reads/writes through the active generation"
+//!   (W4) and "make the candidate bridge and any memory/store adapter reachable
+//!   only through this governed workflow" (W5) are therefore **not** met here;
+//!   closing them is a change to a live rebind workflow with real ORS recovery
+//!   semantics in the busiest composition root of the repository, outside this
+//!   increment.
+//! - The read-only rollback window (stage 10) records the evidence that the
+//!   incumbent store is read-only. This module does not itself fence that store.
+//! - A stage's evidence is bounded opaque text, plus the transfer record for the
+//!   two transferring stages. This module orders and records stages; it does not
+//!   perform the import, verification, shadow read, tail, reconciliation, canary
+//!   or backup, and it interprets no store payload.
+//! - The per-stage evidence recorded before a cutover is not durable material
+//!   and is not reconstructed by a resumed replacement; the durable material is
+//!   the ORS-committed record and the cutover receipt.
 //!
 //! ## Typed ORS refusals
 //!
-//! [`GenerationCutoverOwnershipReceipt::from_committed`] and
-//! [`CapabilityRouteScope::validate`] fail with a typed [`OrsError`], and this
-//! module classifies every class of it onto the existing [`KernelServiceError`]
-//! Every class of it is classified onto the existing [`KernelServiceError`]
-//! variants by class. A fence mismatch, an epoch-lineage break, a stale writer
-//! epoch, a duplicate conflict, an invalid transition, a field rejection and an
-//! unavailability therefore stay distinguishable at the Kernel service
-//! boundary; only the classes that are text in the source type reach
-//! [`KernelServiceError::Platform`]. No ORS class is collapsed into a string or
-//! a generic code between the layers.
+//! [`RedbRecoveryStore`], [`GenerationCutoverOwnershipReceipt::from_committed`]
+//! and [`CapabilityRouteScope::validate`] fail with a typed [`OrsError`], and
+//! this module classifies every class of it onto the existing
+//! [`KernelServiceError`] variants by class. A fence mismatch, an epoch-lineage
+//! break, a stale writer epoch, a duplicate conflict, an invalid transition, a
+//! field rejection and an unavailability therefore stay distinguishable at the
+//! Kernel service boundary; only the classes that are text in the source type
+//! reach [`KernelServiceError::Platform`]. No ORS class is collapsed into a
+//! string or a generic code between the layers.
 //!
 //! ## Rollback
 //!
@@ -89,17 +137,23 @@
 //! is admitted (and the route switch itself is another committed cutover with a
 //! newer epoch, never a local flag flip); once one is recorded the request is
 //! refused as [`KernelServiceError::GenerationFenced`] and only the explicit
-//! forward-repair path follows.
+//! forward-repair path follows. The ledger is durable up to the cutover, because
+//! the cutover receipt records it and the ORS-committed record's migration
+//! decision must name forward repair exactly when the ledger was non-empty. An
+//! irreversible effect recorded *after* the cutover is in-memory state only in
+//! this increment and is not durable across a restart.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use eliot_contracts::ResourceGeneration;
 use eliot_ors::{
-    CapabilityRouteScope, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, OrsError,
-    StateMigrationDecision,
+    CapabilityRouteScope, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt,
+    MAX_RECOVERY_PAGE, OrsError, RedbRecoveryStore, StateMigrationDecision,
 };
 use eliot_runtime_contracts::GenerationCutoverState;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::{KernelServiceError, validate_text};
 
@@ -109,9 +163,86 @@ use crate::{KernelServiceError, validate_text};
 /// governs the canonical Store route, not an arbitrary module capability.
 pub const CANONICAL_STORE_CAPABILITY: &str = "canonical_store";
 
+/// The pinned owning module identity of the canonical store capability route.
+///
+/// It names the store bridge whose generation this coordinator switches; it is
+/// one of the four coordinates of [`canonical_store_route_scope`] and is fixed
+/// here rather than chosen by a caller.
+pub const CANONICAL_STORE_MODULE_ID: &str = "mod-store";
+
+/// The pinned work scope of the canonical store capability route.
+///
+/// It is one of the four coordinates of [`canonical_store_route_scope`] and is
+/// fixed here rather than chosen by a caller.
+pub const CANONICAL_STORE_WORK_SCOPE: &str = "work";
+
+/// The pinned effect domain of the canonical store capability route.
+///
+/// It is one of the four coordinates of [`canonical_store_route_scope`] and is
+/// fixed here rather than chosen by a caller.
+pub const CANONICAL_STORE_EFFECT_DOMAIN: &str = "effects";
+
 /// The `I5.10` logical transfer format used for the snapshot import and the
 /// canonical event tail.
+///
+/// It is the format identity every [`StorageReplacementTransfer`] must name.
 pub const STORAGE_REPLACEMENT_TRANSFER_FORMAT: &str = "ECXF/1";
+
+/// Declares the one `canonical_store` `CapabilityRouteScope` this coordinator
+/// is bound to.
+///
+/// The four coordinates are declared here and the stable route-scope hash is
+/// bound by [`CapabilityRouteScope::declare`]; no caller supplies a scope and
+/// no route-scope hash is hand-computed. Every replacement, receipt and
+/// ORS-committed record this module accepts is checked against this hash.
+pub fn canonical_store_route_scope() -> Result<CapabilityRouteScope, KernelServiceError> {
+    CapabilityRouteScope::declare(
+        CANONICAL_STORE_MODULE_ID,
+        CANONICAL_STORE_CAPABILITY,
+        CANONICAL_STORE_WORK_SCOPE,
+        CANONICAL_STORE_EFFECT_DOMAIN,
+    )
+    .map_err(|error| ors_refusal(&error))
+}
+
+/// One recorded `I5.10` exchange into the candidate store.
+///
+/// It is the typed record the coordinator carries in place of the exported
+/// bytes themselves: the Kernel never holds or interprets a transfer payload.
+/// It binds the logical transfer format, the exact exported bytes, and the
+/// export fence those bytes were taken at.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageReplacementTransfer {
+    /// The logical transfer format identity, which is
+    /// [`STORAGE_REPLACEMENT_TRANSFER_FORMAT`].
+    pub format: String,
+    /// Lowercase SHA-256 digest of the exact exported transfer bytes.
+    pub payload_digest: String,
+    /// Lowercase SHA-256 digest over the `I5.10` export fence the bytes were
+    /// taken at.
+    pub export_fence_digest: String,
+}
+
+impl StorageReplacementTransfer {
+    /// Validates the format identity and both bound digests.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.format != STORAGE_REPLACEMENT_TRANSFER_FORMAT {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_transfer_format",
+                reason: "the storage replacement transfer format is the I5.10 ECXF/1 exchange",
+            });
+        }
+        validate_digest(
+            &self.payload_digest,
+            "storage_replacement_transfer_payload_digest",
+        )?;
+        validate_digest(
+            &self.export_fence_digest,
+            "storage_replacement_transfer_export_fence_digest",
+        )
+    }
+}
 
 /// One ordered I5.11 storage-replacement stage.
 ///
@@ -167,6 +298,16 @@ impl StorageReplacementStage {
     #[must_use]
     pub const fn ordinal(self) -> usize {
         self as usize
+    }
+
+    /// Whether this stage moves `I5.10` transfer data into the candidate and
+    /// therefore cannot be recorded without a [`StorageReplacementTransfer`].
+    #[must_use]
+    pub const fn transfers_data(self) -> bool {
+        matches!(
+            self,
+            Self::ImportSnapshotIntoCandidate | Self::TailCanonicalEventsIntoCandidate
+        )
     }
 
     /// The exact stage that must follow this one, or `None` once the old store
@@ -238,7 +379,10 @@ impl fmt::Display for StorageReplacementStage {
 /// migration/effect occurred. These are the two occurrences the issue names;
 /// the coordinator records them as an append-only set and never clears one,
 /// because an observed irreversible effect cannot be un-observed.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum IrreversibleStorageEffect {
     /// The candidate's imported state cannot be reconciled back into the
     /// incumbent store, so a generation switch back would lose canonical data.
@@ -275,14 +419,16 @@ pub enum StorageRollbackDisposition {
 
 /// The durable cutover receipt of one governed storage replacement.
 ///
-/// It names both store generations, the full `canonical_store` route scope, and
-/// the ORS-committed cutover the route cutover was derived from. It is
-/// constructed only by
-/// [`StorageReplacement::commit_canonical_store_route_cutover`], which calls
-/// [`GenerationCutoverOwnershipReceipt::from_committed`] and therefore fails
-/// while the ORS record is still staged: a receipt can never precede the
-/// durable linearization point.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// It names both store generations, the pinned `canonical_store` route scope,
+/// the `I5.10` transfer the cutover is proven against, and the
+/// ORS-committed cutover the route cutover was re-derived from. It is
+/// constructed only by [`StorageReplacement::commit_canonical_store_route_cutover`],
+/// which loads the ORS row rather than accepting one, and by
+/// [`StorageReplacement::resume_after_committed_cutover`], which re-derives it
+/// from that same row. [`Self::validate`] runs before the coordinator stores
+/// the value, so a receipt can never precede the durable linearization point.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageReplacementCutoverReceipt {
     /// The replacement identity this receipt belongs to.
     pub replacement_id: String,
@@ -290,8 +436,12 @@ pub struct StorageReplacementCutoverReceipt {
     pub incumbent_generation: Option<ResourceGeneration>,
     /// The store generation that owns the route after the cutover.
     pub candidate_generation: ResourceGeneration,
-    /// The committed `canonical_store` `CapabilityRouteScope`.
+    /// The pinned `canonical_store` `CapabilityRouteScope`.
     pub route_scope: CapabilityRouteScope,
+    /// The `I5.10` transfer the cutover is proven against: the canonical event
+    /// tail recorded at I5.11 stage 5, the last transfer into the candidate
+    /// before write quiescence and final reconciliation.
+    pub transfer: StorageReplacementTransfer,
     /// The ORS-committed cutover ownership receipt proving the linearization
     /// point.
     pub committed_cutover: GenerationCutoverOwnershipReceipt,
@@ -299,13 +449,68 @@ pub struct StorageReplacementCutoverReceipt {
     pub irreversible_effects: BTreeSet<IrreversibleStorageEffect>,
 }
 
+impl StorageReplacementCutoverReceipt {
+    /// Validates every binding this receipt claims, including the pinned route
+    /// scope, the two store generations, the transfer and the ORS linearization.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        validate_text(&self.replacement_id, "storage_replacement_id")?;
+        if self.incumbent_generation == Some(self.candidate_generation) {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_cutover_receipt_generations",
+                reason: "a cutover receipt must name two distinct store generations",
+            });
+        }
+        self.route_scope
+            .validate()
+            .map_err(|error| ors_refusal(&error))?;
+        if self.route_scope.capability != CANONICAL_STORE_CAPABILITY
+            || self.route_scope.route_scope_hash != canonical_store_route_scope()?.route_scope_hash
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_cutover_receipt_route_scope",
+                reason: "a cutover receipt must name the pinned canonical_store route scope",
+            });
+        }
+        self.transfer.validate()?;
+        let committed = &self.committed_cutover;
+        validate_text(
+            &committed.linearization_record_id,
+            "storage_replacement_cutover_receipt_linearization",
+        )?;
+        if committed.state != GenerationCutoverState::Committed {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_cutover_receipt_state",
+                reason: "a cutover receipt requires a committed ORS cutover state",
+            });
+        }
+        if committed.route_scope_hash != self.route_scope.route_scope_hash
+            || committed.old_generation != self.incumbent_generation
+            || committed.new_generation != self.candidate_generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "storage_replacement_cutover_receipt_binding",
+            });
+        }
+        if (committed.migration == StateMigrationDecision::ForwardRepairRequired)
+            == self.irreversible_effects.is_empty()
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_cutover_receipt_migration",
+                reason: "the committed state migration must name forward repair exactly when an irreversible effect is recorded",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The Kernel-owned coordinator for one I5.11 storage replacement.
 ///
 /// It owns the stage position, the per-stage recorded evidence, the two store
-/// generations, the `canonical_store` route scope, the irreversible-effect
-/// ledger and the cutover receipt. It stores no snapshot bytes, no event tail
-/// and no canary result: those stay with the Store and the candidate bridge and
-/// reach the coordinator only as the evidence a stage records.
+/// generations, the pinned route scope, the two required transfer records, the
+/// irreversible-effect ledger and the cutover receipt. It stores no snapshot
+/// bytes, no event tail and no canary result: those stay with the Store and the
+/// candidate bridge and reach the coordinator only as the evidence a stage
+/// records.
 #[derive(Clone, Debug)]
 pub struct StorageReplacement {
     replacement_id: String,
@@ -314,37 +519,48 @@ pub struct StorageReplacement {
     candidate_generation: ResourceGeneration,
     next_stage: Option<StorageReplacementStage>,
     evidence: BTreeMap<StorageReplacementStage, String>,
+    snapshot_import: Option<StorageReplacementTransfer>,
+    event_tail: Option<StorageReplacementTransfer>,
     irreversible_effects: BTreeSet<IrreversibleStorageEffect>,
     cutover: Option<GenerationCutoverOwnership>,
     receipt: Option<StorageReplacementCutoverReceipt>,
 }
 
 impl StorageReplacement {
-    /// Starts one replacement bound to the `canonical_store` capability route
-    /// scope.
+    /// Starts one replacement bound to the pinned `canonical_store` capability
+    /// route scope.
     ///
     /// The first stage to record is
     /// [`StorageReplacementStage::InstallCandidateStoreBridge`]; nothing about
-    /// the candidate is active before its own evidence is recorded.
+    /// the candidate is active before its own evidence is recorded. A candidate
+    /// generation that already owns the route through a committed cutover is
+    /// refused, so a restarted process cannot reopen a replacement from the top:
+    /// it must resume through [`Self::resume_after_committed_cutover`].
     pub fn begin(
+        ors: &RedbRecoveryStore,
         replacement_id: impl Into<String>,
-        scope: CapabilityRouteScope,
         incumbent_generation: Option<ResourceGeneration>,
         candidate_generation: ResourceGeneration,
     ) -> Result<Self, KernelServiceError> {
         let replacement_id = replacement_id.into();
         validate_text(&replacement_id, "storage_replacement_id")?;
-        scope.validate().map_err(|error| ors_refusal(&error))?;
-        if scope.capability != CANONICAL_STORE_CAPABILITY {
-            return Err(KernelServiceError::InvalidField {
-                field: "storage_replacement_capability",
-                reason: "storage replacement is bound to the canonical_store capability route scope",
-            });
-        }
+        let scope = canonical_store_route_scope()?;
         if incumbent_generation == Some(candidate_generation) {
             return Err(KernelServiceError::InvalidField {
                 field: "storage_replacement_candidate_generation",
                 reason: "a replacement must select a distinct candidate store generation",
+            });
+        }
+        let committed = ors
+            .latest_committed_cutover_ownership(MAX_RECOVERY_PAGE)
+            .map_err(|error| ors_refusal(&error))?;
+        if committed.iter().any(|record| {
+            record.scope.route_scope_hash == scope.route_scope_hash
+                && record.new_generation == candidate_generation
+        }) {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_candidate_generation",
+                reason: "the candidate generation already owns the canonical_store route through a committed cutover, so the replacement must be resumed from its durable cutover receipt",
             });
         }
         Ok(Self {
@@ -354,9 +570,68 @@ impl StorageReplacement {
             candidate_generation,
             next_stage: Some(StorageReplacementStage::InstallCandidateStoreBridge),
             evidence: BTreeMap::new(),
+            snapshot_import: None,
+            event_tail: None,
             irreversible_effects: BTreeSet::new(),
             cutover: None,
             receipt: None,
+        })
+    }
+
+    /// Reconstructs a replacement after a restart from its durable material:
+    /// the cutover receipt and the ORS-committed cutover record it names.
+    ///
+    /// The receipt is validated and then re-derived from ORS, so a receipt that
+    /// does not match the durable row is refused. The reconstructed replacement
+    /// starts at the stage after the committed cutover, carries the
+    /// irreversible-effect ledger the receipt fixed at the cutover, and holds no
+    /// per-stage evidence: evidence recorded before the cutover is not durable
+    /// material.
+    pub fn resume_after_committed_cutover(
+        ors: &RedbRecoveryStore,
+        replacement_id: impl Into<String>,
+        incumbent_generation: Option<ResourceGeneration>,
+        candidate_generation: ResourceGeneration,
+        receipt: &StorageReplacementCutoverReceipt,
+    ) -> Result<Self, KernelServiceError> {
+        let replacement_id = replacement_id.into();
+        validate_text(&replacement_id, "storage_replacement_id")?;
+        receipt.validate()?;
+        if receipt.replacement_id != replacement_id
+            || receipt.incumbent_generation != incumbent_generation
+            || receipt.candidate_generation != candidate_generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "storage_replacement_cutover_receipt_identity",
+            });
+        }
+        let record = ors
+            .load_cutover_ownership(&receipt.committed_cutover.cutover_id)
+            .map_err(|error| ors_refusal(&error))?
+            .ok_or(KernelServiceError::InvalidField {
+                field: "storage_replacement_cutover_record",
+                reason: "a resumed replacement requires its ORS-committed cutover ownership record",
+            })?;
+        if GenerationCutoverOwnershipReceipt::from_committed(&record)
+            .map_err(|error| ors_refusal(&error))?
+            != receipt.committed_cutover
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "storage_replacement_cutover_receipt_binding",
+            });
+        }
+        Ok(Self {
+            replacement_id,
+            scope: receipt.route_scope.clone(),
+            incumbent_generation,
+            candidate_generation,
+            next_stage: StorageReplacementStage::CommitCanonicalStoreRouteCutover.next(),
+            evidence: BTreeMap::new(),
+            snapshot_import: None,
+            event_tail: Some(receipt.transfer.clone()),
+            irreversible_effects: receipt.irreversible_effects.clone(),
+            cutover: Some(record),
+            receipt: Some(receipt.clone()),
         })
     }
 
@@ -366,8 +641,8 @@ impl StorageReplacement {
         &self.replacement_id
     }
 
-    /// The `canonical_store` `CapabilityRouteScope` this replacement is bound
-    /// to.
+    /// The pinned `canonical_store` `CapabilityRouteScope` this replacement is
+    /// bound to.
     #[must_use]
     pub const fn route_scope(&self) -> &CapabilityRouteScope {
         &self.scope
@@ -404,6 +679,20 @@ impl StorageReplacement {
         &self.evidence
     }
 
+    /// The `I5.10` transfer recorded for the snapshot import, if that stage was
+    /// reached.
+    #[must_use]
+    pub const fn snapshot_import_transfer(&self) -> Option<&StorageReplacementTransfer> {
+        self.snapshot_import.as_ref()
+    }
+
+    /// The `I5.10` transfer recorded for the canonical event tail, if that stage
+    /// was reached.
+    #[must_use]
+    pub const fn event_tail_transfer(&self) -> Option<&StorageReplacementTransfer> {
+        self.event_tail.as_ref()
+    }
+
     /// The irreversible effects observed so far.
     #[must_use]
     pub const fn irreversible_effects(&self) -> &BTreeSet<IrreversibleStorageEffect> {
@@ -429,8 +718,10 @@ impl StorageReplacement {
     /// A stage is reached only through its exact predecessor: a repeated,
     /// skipped or out-of-order stage is refused without recording anything, so
     /// the recorded evidence is a faithful account of what was actually done.
-    /// Stage 8 has its own method because it also carries the ORS commit, and
-    /// stage 11 is refused until a cutover receipt exists.
+    /// The two transferring stages are recorded by
+    /// [`Self::record_transfer_stage`], stage 8 is recorded by
+    /// [`Self::commit_canonical_store_route_cutover`], and stage 11 is refused
+    /// until a cutover receipt exists.
     pub fn record_stage(
         &mut self,
         stage: StorageReplacementStage,
@@ -438,10 +729,16 @@ impl StorageReplacement {
     ) -> Result<StorageReplacementStage, KernelServiceError> {
         let evidence = evidence.into();
         validate_text(&evidence, "storage_replacement_evidence")?;
+        if stage.transfers_data() {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_stage",
+                reason: "a stage that transfers data is recorded together with its I5.10 transfer record",
+            });
+        }
         if stage == StorageReplacementStage::CommitCanonicalStoreRouteCutover {
             return Err(KernelServiceError::InvalidField {
                 field: "storage_replacement_stage",
-                reason: "the canonical_store route cutover is recorded by committing its generation cutover record",
+                reason: "the canonical_store route cutover is recorded by re-deriving its committed ORS cutover ownership record",
             });
         }
         self.require_exact_next(stage)?;
@@ -457,26 +754,79 @@ impl StorageReplacement {
         Ok(stage)
     }
 
+    /// Records the exact next data-transfering stage with the `I5.10` transfer
+    /// it was performed with, and advances.
+    ///
+    /// The snapshot import (stage 2) and the canonical event tail (stage 5)
+    /// cannot be recorded without the exact exported bytes' digest and the
+    /// export fence they were taken at, so the transfer is part of reaching the
+    /// stage rather than a note attached to it afterwards.
+    pub fn record_transfer_stage(
+        &mut self,
+        stage: StorageReplacementStage,
+        transfer: &StorageReplacementTransfer,
+        evidence: impl Into<String>,
+    ) -> Result<StorageReplacementStage, KernelServiceError> {
+        let evidence = evidence.into();
+        validate_text(&evidence, "storage_replacement_evidence")?;
+        transfer.validate()?;
+        match stage {
+            StorageReplacementStage::ImportSnapshotIntoCandidate => {
+                self.require_exact_next(stage)?;
+                self.snapshot_import = Some(transfer.clone());
+            }
+            StorageReplacementStage::TailCanonicalEventsIntoCandidate => {
+                self.require_exact_next(stage)?;
+                self.event_tail = Some(transfer.clone());
+            }
+            _ => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "storage_replacement_stage",
+                    reason: "only the snapshot import and the canonical event tail transfer data into the candidate",
+                });
+            }
+        }
+        self.record_evidence(stage, evidence);
+        Ok(stage)
+    }
+
     /// Commits the `canonical_store` `CapabilityRouteScope` cutover through the
     /// Kernel Generation Registry (I5.11 stage 8) and publishes its receipt.
     ///
-    /// The record must be the ORS-committed cutover for this replacement's own
-    /// route scope and its own two store generations; a staged record yields no
-    /// receipt, because
-    /// [`GenerationCutoverOwnershipReceipt::from_committed`] refuses before the
-    /// durable linearization point. The declared state migration must name
-    /// forward repair exactly when an irreversible effect is already recorded,
-    /// so the committed record and the coordinator's own irreversible-effect
-    /// ledger can never disagree about whether a generation rollback is still
-    /// available.
+    /// The cutover record is not accepted from the caller: it is loaded from the
+    /// durable ORS row named by `cutover_id`, so only a committed row can
+    /// produce a receipt and a hand-built record with a synthetic state and
+    /// linearization identity cannot. The row must be for this replacement's own
+    /// pinned route scope and its own two store generations, and its declared
+    /// state migration must name forward repair exactly when an irreversible
+    /// effect is already recorded, so the committed record and the coordinator's
+    /// own irreversible-effect ledger can never disagree about whether a
+    /// generation rollback is still available. The receipt binds the canonical
+    /// event tail transfer, so a cutover cannot be proven against bytes the
+    /// coordinator never saw, and it is validated before it is stored.
     pub fn commit_canonical_store_route_cutover(
         &mut self,
-        record: GenerationCutoverOwnership,
+        ors: &RedbRecoveryStore,
+        cutover_id: &str,
         evidence: impl Into<String>,
     ) -> Result<StorageReplacementCutoverReceipt, KernelServiceError> {
         let evidence = evidence.into();
         validate_text(&evidence, "storage_replacement_evidence")?;
+        validate_text(cutover_id, "storage_replacement_cutover_id")?;
         self.require_exact_next(StorageReplacementStage::CommitCanonicalStoreRouteCutover)?;
+        let Some(transfer) = self.event_tail.clone() else {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_transfer",
+                reason: "the canonical event tail must be transferred into the candidate before the route cutover",
+            });
+        };
+        let record = ors
+            .load_cutover_ownership(cutover_id)
+            .map_err(|error| ors_refusal(&error))?
+            .ok_or(KernelServiceError::InvalidField {
+                field: "storage_replacement_cutover_record",
+                reason: "the canonical_store route cutover must be an ORS-committed cutover ownership record",
+            })?;
         if record.scope.route_scope_hash != self.scope.route_scope_hash {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "storage_replacement_route_scope",
@@ -504,9 +854,11 @@ impl StorageReplacement {
             incumbent_generation: self.incumbent_generation,
             candidate_generation: self.candidate_generation,
             route_scope: self.scope.clone(),
+            transfer,
             committed_cutover,
             irreversible_effects: self.irreversible_effects.clone(),
         };
+        receipt.validate()?;
         self.cutover = Some(record);
         self.record_evidence(
             StorageReplacementStage::CommitCanonicalStoreRouteCutover,
@@ -587,6 +939,21 @@ impl StorageReplacement {
         self.evidence.insert(stage, evidence);
         self.next_stage = stage.next();
     }
+}
+
+/// Refuses anything that is not a lowercase SHA-256 digest.
+fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelServiceError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(KernelServiceError::InvalidField {
+            field,
+            reason: "must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
 }
 
 /// Projects one ORS refusal onto the existing [`KernelServiceError`] variants
@@ -673,6 +1040,9 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::SupervisionLeaseTicketAlreadyCommitted => invalid_field("lease_ticket_committed"),
         OrsError::InvalidSupervisionLeaseHistoryLimit => invalid_field("lease_history_limit"),
         OrsError::HostRequestIdentityConflict { .. } => invalid_field("host_request_identity"),
+        OrsError::HostRequestLegacyCorrelationUnresolved => {
+            invalid_field("host_request_legacy_correlation")
+        }
         OrsError::CampaignLearningStateViewConflict { .. } => {
             invalid_field("campaign_learning_state_view")
         }

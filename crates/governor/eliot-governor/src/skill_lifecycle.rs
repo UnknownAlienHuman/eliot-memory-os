@@ -432,6 +432,10 @@ fn skill_envelope(
     if let Some(approval) = &gate.human_approval_ref {
         proof_refs.insert(approval.clone());
     }
+    // Gate evidence joins the required proof refs so it enters the canonical
+    // request hash: exact replay returns the same receipt while changed gate
+    // evidence under one identity conflicts instead of replaying silently.
+    proof_refs.extend(gate.evidence_refs.iter().cloned());
     let envelope = CanonicalWriteEnvelope {
         operation_id,
         request: identity.request.metadata.clone(),

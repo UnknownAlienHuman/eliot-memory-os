@@ -1504,9 +1504,11 @@ def audit_dependencies(
     manifests: dict[str, Manifest],
     policy: dict[str, Any],
     ambiguous: frozenset[str] = frozenset(),
+    unresolved_manifests: frozenset[str] = frozenset(),
 ) -> list[Finding]:
     findings: list[Finding] = []
     ambiguous = frozenset(ambiguous)
+    unresolved_manifests = frozenset(unresolved_manifests)
 
     # Every non-dev path ends in a normal/build declaration, so scanning each
     # manifest catches transitive routes at their final edge too.
@@ -1540,6 +1542,37 @@ def audit_dependencies(
                     witness=witness,
                 )
             )
+
+    # An uninterpretable dependency table can hide a normal/build edge,
+    # so for the test-support boundary an unresolved configuration is a
+    # hard rejection, never a clean pass.
+    for manifest in sorted(manifests.values(), key=lambda item: item.name):
+        if manifest.path not in unresolved_manifests:
+            continue
+        witness = _dependency_witness(
+            rule="test-support-production-boundary",
+            rule_scope="unresolved-configuration",
+            profile=PROFILE_SOURCE_WIDE,
+            path=None,
+            manifests=manifests,
+            ambiguous=ambiguous,
+            counts=_dependency_counts(manifest, PROFILE_SOURCE_WIDE),
+            violations=1,
+        )
+        findings.append(
+            Finding(
+                "HARD_VIOLATION",
+                "test_support_boundary_unresolved",
+                manifest.path,
+                manifest.name,
+                f"Cargo dependency tables for {manifest.name!r} are not "
+                "interpretable, so a normal/build path to "
+                "'eliot-test-support' cannot be excluded. "
+                f"{_witness_suffix(witness)}",
+                1146,
+                witness=witness,
+            )
+        )
 
     store_table = policy.get("store_vendor", {})
     allowed_store_packages = set(store_table.get("allowed_packages", []))
@@ -2266,7 +2299,14 @@ def audit(root: Path, policy_path: Path) -> list[Finding]:
     manifests, findings, ambiguous = load_manifests(root)
     findings.extend(validate_policy(root, policy))
     findings.extend(_audit_process_lint_config(root))
-    findings.extend(audit_dependencies(manifests, policy, ambiguous))
+    unresolved_manifests = frozenset(
+        finding.path
+        for finding in findings
+        if finding.code == "dependency_resolution_incomplete"
+    )
+    findings.extend(
+        audit_dependencies(manifests, policy, ambiguous, unresolved_manifests)
+    )
     findings.extend(audit_source(root, manifests, policy))
     return sorted(
         findings,

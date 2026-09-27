@@ -9,9 +9,12 @@
 mod bridge_admission;
 pub use bridge_admission::*;
 
+mod handoff_checkpoint;
+pub use handoff_checkpoint::*;
+
 use std::collections::BTreeSet;
 
-use eliot_contracts::{StateFence, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -66,6 +69,7 @@ id_type!(SwarmId);
 id_type!(MessageId);
 id_type!(ReviewItemId);
 id_type!(HandoffId);
+id_type!(HandoffCheckpointId);
 id_type!(TargetId);
 id_type!(AnchorId);
 id_type!(EvidenceId);
@@ -120,6 +124,20 @@ pub enum ContractError {
     BrokenOwnershipLink(&'static str),
     #[error("numeric ceiling is not a positive bound for {0}")]
     InvalidBound(&'static str),
+    #[error("attempt identity evidence does not satisfy the {continuity:?} continuity rule")]
+    HandoffAttemptIdentityMismatch { continuity: HandoffContinuity },
+    #[error("{continuity:?} continuity requires a new ELIOT attempt")]
+    HandoffRequiresNewAttempt { continuity: HandoffContinuity },
+    #[error("{continuity:?} continuity inherits no conversational state and admits no causal link")]
+    HandoffInheritsNoState { continuity: HandoffContinuity },
+    #[error("native resume must continue the source session itself")]
+    HandoffNativeSessionMismatch,
+    #[error("native resume must run on the compatible native source route")]
+    HandoffNativeRouteMismatch,
+    #[error("native resume requires a freshly issued authority epoch in the source lineage")]
+    HandoffNativeAuthorityNotFresh,
+    #[error("handoff continuity does not match the continuity declared by the target route")]
+    HandoffRouteContinuityMismatch,
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), ContractError> {
@@ -240,6 +258,24 @@ pub enum ContinuityKind {
     Replayed,
     Rehydrated,
     Fresh,
+}
+
+impl ContinuityKind {
+    /// Returns the handoff-continuity spelling of this route continuity.
+    ///
+    /// [`ContinuityKind`] and [`HandoffContinuity`] are one closed set under
+    /// two names. A route and a causal link that disagreed would let a replay
+    /// or a rehydration be reported as the same session, so the link validator
+    /// compares them through this single conversion.
+    pub const fn as_handoff_continuity(self) -> HandoffContinuity {
+        match self {
+            Self::NativeResume => HandoffContinuity::NativeResume,
+            Self::NativeFork => HandoffContinuity::NativeFork,
+            Self::Replayed => HandoffContinuity::Replayed,
+            Self::Rehydrated => HandoffContinuity::Rehydrated,
+            Self::Fresh => HandoffContinuity::Fresh,
+        }
+    }
 }
 
 /// Durable attempt lifecycle.  A stale fence invalidates applicability of an
@@ -1032,6 +1068,146 @@ pub enum HandoffContinuity {
     Fresh,
 }
 
+impl HandoffContinuity {
+    /// Returns the attempt-identity rule this mode enforces (I7.15).
+    ///
+    /// The rule is a value, not prose: [`HandoffCausalLink::validate`] branches
+    /// on it, so no mode can be validated by a blanket comparison and no mode
+    /// can silently acquire the identity rule of another.
+    pub const fn attempt_identity_rule(self) -> HandoffAttemptIdentityRule {
+        match self {
+            Self::NativeResume => HandoffAttemptIdentityRule::NativeSessionIdentityPreserved,
+            Self::NativeFork | Self::Replayed | Self::Rehydrated => {
+                HandoffAttemptIdentityRule::NewAttemptRequired
+            }
+            Self::Fresh => HandoffAttemptIdentityRule::NoInheritedState,
+        }
+    }
+
+    /// Returns whether this mode must create a new ELIOT attempt identity.
+    ///
+    /// `NativeFork` remains a child attempt even when the runtime calls it a
+    /// continuation; only `NativeResume` may keep the attempt identity.
+    pub const fn creates_new_attempt(self) -> bool {
+        matches!(
+            self.attempt_identity_rule(),
+            HandoffAttemptIdentityRule::NewAttemptRequired
+        )
+    }
+
+    /// Returns whether a transfer in this mode is bound by one causal link.
+    ///
+    /// Only `Fresh` starts without prior conversational state, so only `Fresh`
+    /// has nothing to link.
+    pub const fn requires_causal_link(self) -> bool {
+        !matches!(self, Self::Fresh)
+    }
+}
+
+/// Attempt-identity rule derived from a continuity mode (I7.15).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HandoffAttemptIdentityRule {
+    /// The native session identity is preserved. An equal source/target
+    /// attempt is admitted, but only together with
+    /// [`HandoffAttemptIdentity::NativeSessionContinued`] evidence.
+    NativeSessionIdentityPreserved,
+    /// A new ELIOT attempt must be created. Equal source and target attempt
+    /// identities are refused.
+    NewAttemptRequired,
+    /// No prior conversational state is transferred, so no causal link is
+    /// admissible for this mode.
+    NoInheritedState,
+}
+
+/// Attempt-identity evidence required by the declared continuity mode (I7.15).
+///
+/// The variant is chosen by [`HandoffContinuity::attempt_identity_rule`]:
+///
+/// - `NativeSessionContinued` is the only evidence that admits an equal
+///   source/target attempt, and it carries the compatible native session, the
+///   compatible native route, a freshly issued authority epoch and the opaque
+///   continuation handle required for exact resume. Without that evidence an
+///   equal attempt is still refused, with
+///   [`ContractError::HandoffAttemptIdentityMismatch`];
+/// - `NewAttemptCreated` states that a new ELIOT attempt was created; equal
+///   attempt identities are then refused with
+///   [`ContractError::HandoffRequiresNewAttempt`];
+/// - `NoInheritedState` states that no conversational state was inherited, and
+///   the link itself is refused with
+///   [`ContractError::HandoffInheritsNoState`].
+///
+/// There is deliberately no "unverified" or legacy arm: a record that cannot
+/// state its attempt identity is refused, not admitted on trust.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "identity",
+    content = "continuation",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum HandoffAttemptIdentity {
+    /// The compatible native session continued under fresh authority.
+    ///
+    /// The evidence is boxed so this enum stays small next to its two unit
+    /// variants. `Box` is transparent to `serde`, so the wire shape is exactly
+    /// the shape of the unboxed evidence.
+    NativeSessionContinued(Box<NativeSessionContinuation>),
+    /// A new ELIOT attempt was created for this transfer.
+    NewAttemptCreated,
+    /// No prior conversational state was transferred.
+    NoInheritedState,
+}
+
+/// Evidence that a native session really continued instead of being relabelled.
+///
+/// Every member is required. Without the session, the compatible route, the
+/// fresh authority epoch or the continuation handle there is no exact resume,
+/// so an equal source/target attempt stays refused.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSessionContinuation {
+    /// The native session the resumed session continues. It must equal the
+    /// link's `source_session_ref`.
+    pub session_ref: PublicReference,
+    /// The route the source attempt ran on. The link's `target_route` must be
+    /// this exact route and must itself declare native-resume continuity.
+    pub source_route: Route,
+    /// Authority epoch freshly issued for the resumed session. It must be a
+    /// direct child of the link's `source_state_fence.authority_epoch`: a
+    /// resumed session never reuses the source epoch and never crosses a
+    /// lineage.
+    pub fresh_authority_epoch: EpochId,
+    /// Opaque Route Continuation State handle required for exact resume. It is
+    /// scoped to the exact route fingerprint and is never evidence, authority
+    /// or rationale.
+    pub continuation_state_ref: PublicReference,
+}
+
+impl NativeSessionContinuation {
+    /// Validates the evidence against the link it claims to continue.
+    fn validate(&self, link: &HandoffCausalLink) -> Result<(), ContractError> {
+        self.session_ref.validate()?;
+        self.source_route.validate()?;
+        self.continuation_state_ref.validate()?;
+        if self.session_ref != link.source_session_ref {
+            return Err(ContractError::HandoffNativeSessionMismatch);
+        }
+        if self.source_route != link.target_route
+            || self.source_route.continuity != ContinuityKind::NativeResume
+        {
+            return Err(ContractError::HandoffNativeRouteMismatch);
+        }
+        if !self
+            .fresh_authority_epoch
+            .is_direct_child_of(&link.source_state_fence.authority_epoch)
+        {
+            return Err(ContractError::HandoffNativeAuthorityNotFresh);
+        }
+        Ok(())
+    }
+}
+
 /// Completeness of a causal handoff link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1063,17 +1239,27 @@ pub struct HandoffCausalLink {
 }
 
 impl HandoffCausalLink {
-    /// Validates the non-secret causal handoff envelope.
-    pub fn validate(&self) -> Result<(), ContractError> {
+    /// Validates the non-secret causal handoff envelope under the
+    /// attempt-identity rule its continuity mode enforces.
+    ///
+    /// The evidence is a required argument rather than an omitted field. The
+    /// envelope carries no source route and no target authority epoch, so
+    /// without that argument an equal source/target attempt could not be
+    /// distinguished from a fabricated new attempt: the validator would have to
+    /// refuse every native resume, or admit one on trust. Historical envelopes
+    /// keep their existing wire shape and stay readable; what changed is that
+    /// the identity rule is now derived from the continuity mode.
+    pub fn validate(&self, attempt_identity: &HandoffAttemptIdentity) -> Result<(), ContractError> {
         validate_text(self.handoff_id.as_str(), "handoff_id")?;
-        if self.source_attempt_id == self.target_attempt_id {
-            return Err(ContractError::InvalidReference);
-        }
+        self.validate_attempt_identity(attempt_identity)?;
         self.source_session_ref.validate()?;
         self.source_state_fence
             .validate()
             .map_err(|_| ContractError::StaleFence)?;
         self.target_route.validate()?;
+        if self.target_route.continuity.as_handoff_continuity() != self.continuity {
+            return Err(ContractError::HandoffRouteContinuityMismatch);
+        }
         self.checkpoint_ref.validate()?;
         validate_text(&self.omission_manifest_digest, "omission_manifest_digest")?;
         if let Some(reference) = &self.replay_bundle_ref {
@@ -1088,6 +1274,38 @@ impl HandoffCausalLink {
             return Err(ContractError::InvalidReference);
         }
         Ok(())
+    }
+
+    /// Applies the per-mode attempt-identity rule derived from `continuity`.
+    fn validate_attempt_identity(
+        &self,
+        attempt_identity: &HandoffAttemptIdentity,
+    ) -> Result<(), ContractError> {
+        match (self.continuity.attempt_identity_rule(), attempt_identity) {
+            (HandoffAttemptIdentityRule::NoInheritedState, _) => {
+                Err(ContractError::HandoffInheritsNoState {
+                    continuity: self.continuity,
+                })
+            }
+            (
+                HandoffAttemptIdentityRule::NewAttemptRequired,
+                HandoffAttemptIdentity::NewAttemptCreated,
+            ) => {
+                if self.source_attempt_id == self.target_attempt_id {
+                    return Err(ContractError::HandoffRequiresNewAttempt {
+                        continuity: self.continuity,
+                    });
+                }
+                Ok(())
+            }
+            (
+                HandoffAttemptIdentityRule::NativeSessionIdentityPreserved,
+                HandoffAttemptIdentity::NativeSessionContinued(continuation),
+            ) => continuation.validate(self),
+            (_, _) => Err(ContractError::HandoffAttemptIdentityMismatch {
+                continuity: self.continuity,
+            }),
+        }
     }
 }
 

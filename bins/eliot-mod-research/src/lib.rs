@@ -24,7 +24,8 @@ use eliot_contracts::StateFence;
 use eliot_process::ExitDisposition;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
 use eliot_research_exchange_api::{
-    CoverageGapKind, DisclosureClass, ResearchQueryRequest, ResearchSourceGapOutcome, SourceClass,
+    CoverageGapKind, DisclosureClass, ExternalKnowledgeFailure, ResearchQueryRequest,
+    ResearchSourceGapOutcome, SourceClass,
 };
 use eliot_researcher::{
     AcquisitionOutcome, CandidateEvidence, InquiryGovernance, InquiryHorizon, InquiryObservation,
@@ -289,6 +290,40 @@ impl ResearchBridge for GovernedResearchBridge {
     fn cancel(&mut self, _job_id: &str) -> Result<(), Self::Error> {
         Err(BridgeError::ProviderUnavailable)
     }
+
+    fn classify(error: &Self::Error) -> ExternalKnowledgeFailure {
+        // Exhaustive by design: a timeout, a crash, an unavailable source and an
+        // unknown provider outcome must stay distinct on the way into the
+        // exchange, so every outcome this error type distinguishes keeps its own
+        // external-knowledge value and no catch-all arm may re-collapse them.
+        match error {
+            // An invalid bridge identity never reached a provider, and this crate
+            // already classifies it as the same source-unavailable gap an absent
+            // provider is, so it folds into that outcome rather than inventing an
+            // external-knowledge meaning it does not have, so the
+            // RESEARCH_SOURCE_UNAVAILABLE disposition is reachable for both.
+            BridgeError::InvalidBridgeIdentity { .. } | BridgeError::ProviderUnavailable => {
+                ExternalKnowledgeFailure::SourceUnavailable
+            }
+            // The retained cancellation receipt stays with this error; only the
+            // outcome is projected.
+            BridgeError::TimedOut { .. } => ExternalKnowledgeFailure::TimedOut,
+            BridgeError::ProviderFailed { reason } => {
+                ExternalKnowledgeFailure::ProviderFailed { reason }
+            }
+            BridgeError::NotAdmitted { reason } => ExternalKnowledgeFailure::NotAdmitted { reason },
+            BridgeError::ProtocolViolation { reason } => {
+                ExternalKnowledgeFailure::ProtocolViolation { reason }
+            }
+            BridgeError::EvidenceIncomplete { reason } => {
+                ExternalKnowledgeFailure::EvidenceIncomplete { reason }
+            }
+            // The retained raw provider evidence stays with this error so a
+            // reconcile reuses the same bytes; only the outcome is projected.
+            BridgeError::UnknownOutcome { .. } => ExternalKnowledgeFailure::UnknownOutcome,
+            BridgeError::Process(_) => ExternalKnowledgeFailure::ProcessFailed,
+        }
+    }
 }
 
 /// Lifecycle phase of one admitted operation. One bridge serves exactly one
@@ -367,6 +402,127 @@ impl TerminalFailure {
             evidence: error.evidence().cloned(),
             cancellation: error.cancellation().cloned(),
         }
+    }
+}
+
+/// The exact typed acquisition-coverage degradation one failed provider attempt
+/// produced.
+///
+/// A13.11 and I21.13 make the *scope* of a provider failure the whole point: a
+/// local capability degrades, the Kernel and independent work survive, and
+/// dependent work continues with a narrower declared coverage. This record is
+/// therefore the degradation itself rather than a claim about it, and it is the
+/// only thing this process may report for a run that failed.
+///
+/// It cannot stand in for the material it did not obtain. The type is `Copy`
+/// over closed vocabularies and has no field for a result, a candidate digest,
+/// a source handle, a State Fence, an authority epoch or a finish, so there is
+/// no way to read a degradation as an answer or as an admitted finding. It
+/// cannot be a Researcher semantic failure either: it is built only from a
+/// [`TerminalFailure`] — the retained projection of a [`BridgeError`] — so a
+/// degradation exists exactly when a provider attempt failed and never as a way
+/// of stating a verdict about the question.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct AcquisitionCoverageDegradation {
+    /// Typed coverage-gap kind, taken from the bridge's own closed error
+    /// vocabulary rather than from a second local classification.
+    pub coverage_gap: CoverageGapKind,
+    /// Exact I7.20 reason code for the terminal disposition.
+    pub reason_code: &'static str,
+    /// Provider-local terminal outcome this degradation classifies. This is
+    /// acquisition evidence, never a semantic verdict and never task finish.
+    pub outcome: ProviderOutcome,
+    /// The typed I21.11 source-gap outcome the dependent inquiry records, or
+    /// `None` when this gap is not one of the two named source gaps.
+    ///
+    /// The absence is load-bearing: a deadline overrun, a policy denial, an
+    /// exhausted budget and an unclassifiable outcome are each their own
+    /// disposition, and coercing any of them into `RESEARCH_SOURCE_UNAVAILABLE`
+    /// would claim a source could not be fetched when the retained evidence
+    /// does not say that.
+    pub inquiry_outcome: Option<ResearchSourceGapOutcome>,
+}
+
+impl AcquisitionCoverageDegradation {
+    /// Returns the exact I21.11 wire name a dependent inquiry records for this
+    /// degradation, or `None` when the gap is not one of the two named source
+    /// gaps.
+    #[must_use]
+    pub const fn inquiry_reason_code(self) -> Option<&'static str> {
+        match self.inquiry_outcome {
+            Some(outcome) => Some(outcome.wire_name()),
+            None => None,
+        }
+    }
+}
+
+/// Converts one failed or unavailable provider attempt into the exact typed
+/// acquisition-coverage degradation this process reports.
+///
+/// This is the crate's single conversion from "the provider did not deliver" to
+/// "acquisition coverage narrows, and only that". Every consumer of a failed run
+/// reads it: the terminal receipt's outcome and reason code, the degraded
+/// disposition the binary exits with, and the `I21.11` outcome the dependent
+/// inquiry records all come from here, so a degradation can neither be
+/// fabricated for a run that succeeded nor be replaced by a second, privately
+/// chosen classification of the same failure.
+///
+/// The mapping reuses the vocabularies the contract already defines and invents
+/// none. The coverage-gap kind and the reason code arrive through the retained
+/// [`TerminalFailure`], which [`TerminalFailure::from_error`] built from
+/// [`BridgeError::coverage_gap_kind`] and [`BridgeError::reason_code`]; the
+/// inquiry outcome is the exchange contract's own [`ResearchSourceGapOutcome`],
+/// so an unavailable source keeps its `RESEARCH_SOURCE_UNAVAILABLE` spelling and
+/// an unverifiable generation or index keeps `INCOMPLETE_COVERAGE`:
+///
+/// ```text
+/// source that cannot be fetched        -> RESEARCH_SOURCE_UNAVAILABLE
+/// source generation/index not verified -> INCOMPLETE_COVERAGE
+/// ```
+///
+/// The `R6` domain binds that code into the terminal inquiry record together
+/// with the preserved explicit unknown and the preserved next probe, so a
+/// narrowed coverage is recorded as a narrowed coverage. Every other
+/// acquisition reason keeps the receipt's own classification: a timeout is not
+/// an unfetchable source, a policy denial is not incomplete coverage, and an
+/// exhausted budget is neither, so none of them is coerced into one of the two
+/// named gaps. The acquisition outcome itself stays the receipt's: this process
+/// reports what the provider run did, and the inquiry records why its coverage
+/// narrowed.
+///
+/// An absent failure is not an answer either. A submit refused before the
+/// executor was contacted has no retained terminal classification, and it is
+/// reported as the explicit `UNKNOWN_OUTCOME` disposition with an unknown
+/// acquisition outcome — never as a completion, never as an absence of
+/// findings, and never as a source that could not be fetched.
+pub fn acquisition_coverage_degradation(
+    failure: Option<&TerminalFailure>,
+) -> AcquisitionCoverageDegradation {
+    let (reason_code, coverage_gap, outcome) = match failure {
+        Some(terminal) => (
+            terminal.reason_code,
+            terminal.coverage_gap,
+            terminal.outcome,
+        ),
+        None => (
+            eliot_kernel_service::REASON_UNKNOWN_OUTCOME,
+            CoverageGapKind::Unknown,
+            ProviderOutcome::Unknown,
+        ),
+    };
+    let inquiry_outcome = match coverage_gap {
+        CoverageGapKind::SourceUnavailable => {
+            Some(ResearchSourceGapOutcome::ResearchSourceUnavailable)
+        }
+        CoverageGapKind::StaleSourceOrIndex => Some(ResearchSourceGapOutcome::IncompleteCoverage),
+        _ => None,
+    };
+    AcquisitionCoverageDegradation {
+        coverage_gap,
+        reason_code,
+        outcome,
+        inquiry_outcome,
     }
 }
 
@@ -622,6 +778,43 @@ impl ResearchBridge for AdmittedResearchBridge {
             reason: "nothing was attempted through the executor yet",
         })
     }
+
+    fn classify(error: &Self::Error) -> ExternalKnowledgeFailure {
+        // Exhaustive by design: a timeout, a crash, an unavailable source and an
+        // unknown provider outcome must stay distinct on the way into the
+        // exchange, so every outcome this error type distinguishes keeps its own
+        // external-knowledge value and no catch-all arm may re-collapse them.
+        // Identical to `GovernedResearchBridge` because both bridges report the
+        // same `BridgeError`; it is repeated rather than shared so neither impl
+        // can be silently narrowed by the other.
+        match error {
+            // An invalid bridge identity never reached a provider, and this crate
+            // already classifies it as the same source-unavailable gap an absent
+            // provider is, so it folds into that outcome rather than inventing an
+            // external-knowledge meaning it does not have, so the
+            // RESEARCH_SOURCE_UNAVAILABLE disposition is reachable for both.
+            BridgeError::InvalidBridgeIdentity { .. } | BridgeError::ProviderUnavailable => {
+                ExternalKnowledgeFailure::SourceUnavailable
+            }
+            // The retained cancellation receipt stays with this error; only the
+            // outcome is projected.
+            BridgeError::TimedOut { .. } => ExternalKnowledgeFailure::TimedOut,
+            BridgeError::ProviderFailed { reason } => {
+                ExternalKnowledgeFailure::ProviderFailed { reason }
+            }
+            BridgeError::NotAdmitted { reason } => ExternalKnowledgeFailure::NotAdmitted { reason },
+            BridgeError::ProtocolViolation { reason } => {
+                ExternalKnowledgeFailure::ProtocolViolation { reason }
+            }
+            BridgeError::EvidenceIncomplete { reason } => {
+                ExternalKnowledgeFailure::EvidenceIncomplete { reason }
+            }
+            // The retained raw provider evidence stays with this error so a
+            // reconcile reuses the same bytes; only the outcome is projected.
+            BridgeError::UnknownOutcome { .. } => ExternalKnowledgeFailure::UnknownOutcome,
+            BridgeError::Process(_) => ExternalKnowledgeFailure::ProcessFailed,
+        }
+    }
 }
 
 pub type ResearchComposition = Researcher<GovernedResearchBridge>;
@@ -793,6 +986,15 @@ pub fn project_admitted_inquiry(
         "{}@{}",
         receipt.module_generation_id, receipt.executable_sha256
     );
+    // The acquisition-coverage degradation this run suffered is read from the
+    // crate's single named conversion rather than re-derived here. A dependent
+    // inquiry therefore records the same typed gap the provider receipt and the
+    // degraded disposition were built from, and it records one of the two named
+    // I21.11 outcomes exactly when the failure was that gap. Every other
+    // acquisition reason keeps the receipt's own classification, so a timeout
+    // is not an unfetchable source, a policy denial is not incomplete coverage,
+    // and an exhausted budget is neither.
+    let degradation = acquisition_coverage_degradation(failure);
     let observation = InquiryObservation {
         inquiry_id: receipt.exchange_id.clone(),
         evidence_set_id: request.allowed_references.run_id.clone(),
@@ -818,7 +1020,10 @@ pub fn project_admitted_inquiry(
         features: admitted_selection_features(request),
         candidates: vec![retained_provider_material(request, receipt, &route)],
         outcome: acquisition_outcome(receipt),
-        reason_code: dependent_inquiry_reason_code(failure, receipt),
+        reason_code: degradation
+            .inquiry_reason_code()
+            .unwrap_or(receipt.reason_code)
+            .to_owned(),
         assessment_time_ms,
     };
     InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
@@ -839,42 +1044,6 @@ const fn admitted_disclosure_wire(class: DisclosureClass) -> &'static str {
         DisclosureClass::ProjectBound => "ProjectBound",
         DisclosureClass::ExportableRedacted => "ExportableRedacted",
         DisclosureClass::Public => "Public",
-    }
-}
-
-/// The reason code one dependent inquiry records for this run.
-///
-/// I21.11 and I21.13 name two distinct typed outcomes for a Research-held source
-/// this operation could not obtain, and the `R6` domain binds that code into
-/// the terminal inquiry record together with the preserved explicit unknown and
-/// the preserved next probe:
-///
-/// ```text
-/// source that cannot be fetched      -> RESEARCH_SOURCE_UNAVAILABLE
-/// source generation/index not verified -> INCOMPLETE_COVERAGE
-/// ```
-///
-/// The spelling comes from the exchange contract's own typed outcomes rather
-/// than from a second local vocabulary. Every other acquisition reason keeps the
-/// receipt's own classification: a timeout is not an unfetchable source, a
-/// policy denial is not incomplete coverage, and an exhausted budget is
-/// neither, so none of them is coerced into one of the two named gaps. The
-/// acquisition outcome itself stays the receipt's: this process reports what the
-/// provider run did, and the inquiry records why its coverage narrowed.
-fn dependent_inquiry_reason_code(
-    failure: Option<&TerminalFailure>,
-    receipt: &ProviderExecutionReceipt,
-) -> String {
-    match failure.map(|terminal| terminal.coverage_gap) {
-        Some(CoverageGapKind::SourceUnavailable) => {
-            ResearchSourceGapOutcome::ResearchSourceUnavailable
-                .wire_name()
-                .to_owned()
-        }
-        Some(CoverageGapKind::StaleSourceOrIndex) => ResearchSourceGapOutcome::IncompleteCoverage
-            .wire_name()
-            .to_owned(),
-        _ => receipt.reason_code.to_owned(),
     }
 }
 
@@ -1097,7 +1266,7 @@ pub(crate) mod support {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use eliot_research_exchange_api::CoverageGapKind;
+    use eliot_research_exchange_api::{CoverageGapKind, ExternalKnowledgeStage};
 
     use super::support::{
         DIGEST_A, DIGEST_SHORT, DIGEST_UPPER, test_fence, test_identity, test_request,
@@ -1164,8 +1333,14 @@ mod tests {
         let mut researcher = compose_with_bridge(test_identity());
         let result = submit(&mut researcher, test_request());
         assert!(
-            matches!(result, Err(ExchangeError::InvalidTransition)),
-            "bridge gap must surface without fabricating a job"
+            matches!(
+                result,
+                Err(ExchangeError::ExternalKnowledge {
+                    stage: ExternalKnowledgeStage::Submit,
+                    failure: ExternalKnowledgeFailure::SourceUnavailable,
+                })
+            ),
+            "bridge gap must surface as the provider's own unavailable-source outcome at the submit stage, without fabricating a job"
         );
         assert!(
             exchange_snapshot(&researcher).jobs.is_empty(),
@@ -1375,8 +1550,14 @@ mod tests {
         );
         let result = submit(&mut researcher, test_request());
         assert!(
-            matches!(result, Err(ExchangeError::InvalidTransition)),
-            "absent process authority must surface as a gap, never a job"
+            matches!(
+                result,
+                Err(ExchangeError::ExternalKnowledge {
+                    stage: ExternalKnowledgeStage::Submit,
+                    failure: ExternalKnowledgeFailure::SourceUnavailable,
+                })
+            ),
+            "absent process authority must surface as a typed unavailable-source gap at the submit stage, never a job"
         );
         assert!(
             exchange_snapshot(&researcher).jobs.is_empty(),

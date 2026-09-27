@@ -35,6 +35,18 @@
 //! is never executed as queries, old session/lease/grant/epoch state is never
 //! imported, and invariant checks are never disabled. Nothing here activates an
 //! installation, unblocks effects, or retires a source.
+//!
+//! Local attempt ownership: an apply is owned by a private, non-cloneable
+//! [`RestoreAttemptGuard`] acquired before the first suspension that needs
+//! exclusion and bound to the destination/adapter owner namespace, the admitted
+//! operation identity and a fresh *local bookkeeping incarnation*. The
+//! incarnation is local-only: it is not a new external operation, lease or epoch.
+//! Local ownership and effect exposure are separate facts — the slot records both
+//! the first redacted failure and the highest provider-write exposure ever
+//! observed — so a dropped future releases only its own incarnation while an
+//! effect that may already have been submitted stays an exact-reconciliation
+//! obligation. Releasing the guard is never provider cancellation and never
+//! durable settlement.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -81,16 +93,17 @@ const RESTORE_DESTINATION_CLASS: &str = "ISOLATED_RESTORE";
 /// Closed isolation state label stored in the durable fence document.
 const RESTORE_ISOLATION_STATE: &str = "ISOLATED";
 
-/// Ceiling on distinct operation identities the shared projection may track at
-/// once.
+/// Ceiling on distinct owner-scoped attempt slots the shared projection may
+/// track at once.
 ///
 /// The in-process attempt map is keyed by admitted-but-caller-supplied operation
-/// ids and is process-lifetime, so a caller that keeps failing with fresh ids is
-/// refused rather than allowed to grow memory without limit. It reuses the batch
-/// ceiling: one restore batch already bounds the member set of a single
-/// operation, so the projection never needs to track more live operation
-/// identities than that bound. Re-attempting a known identity reuses its slot and
-/// never grows the map.
+/// ids inside the destination/adapter owner namespace and is process-lifetime,
+/// so a caller that keeps failing with fresh ids is refused rather than allowed
+/// to grow memory without limit. It reuses the batch ceiling: one restore batch
+/// already bounds the member set of a single operation, so the projection never
+/// needs to track more live operation identities than that bound. Re-attempting
+/// a known identity reuses its slot and never grows the map, and the ceiling is
+/// not raised to accommodate a leaked incarnation.
 const MAX_RESTORE_TRACKED_ATTEMPTS: usize = MAX_RESTORE_BATCH_MEMBERS;
 
 /// Closed per-member disposition of one canonical restore batch.
@@ -609,39 +622,164 @@ struct StoredRestoreEntry {
     receipt: RestoreValidationReceipt,
 }
 
-/// One in-process attempt record of an operation identity.
+/// Closed local bookkeeping state of one owner-scoped attempt slot.
+///
+/// Local ownership and effect exposure are separate facts and never collapse
+/// into one another: a slot that was released cleanly can still owe an exact
+/// provider reconciliation, and a slot that still holds a live owner may owe
+/// nothing yet. The variants are ordered by increasing certainty, so merging two
+/// observations is the maximum of the two and the highest observation is never
+/// lowered by a later, less informed one.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RestoreEffectState {
+    /// No write was submitted by the invocation that observed this state.
+    NoWriteSubmitted,
+    /// A provider write may have been submitted: the request was handed to the
+    /// transport and its result is not known here.
+    WriteMayHaveBeenSubmitted,
+    /// The provider answered the write. The answer is not yet an exact durable
+    /// result, so the effect is still unproven.
+    ResponseObserved,
+    /// The exact durable result was read back and derived from the provider.
+    /// This is the only state that discharges the reconciliation obligation.
+    DurableResultVerified,
+}
+
+impl RestoreEffectState {
+    /// Reports whether the slot's remote effect is still unproven.
+    ///
+    /// `NoWriteSubmitted` proves that nothing was sent and
+    /// `DurableResultVerified` proves the exact outcome, so only the two
+    /// intermediate states keep the slot reconciliation-required.
+    const fn is_unproven(self) -> bool {
+        matches!(
+            self,
+            Self::WriteMayHaveBeenSubmitted | Self::ResponseObserved
+        )
+    }
+}
+
+/// Effect exposure of one invocation, carried beside the uncertainty it
+/// inherited from the slot it acquired.
+///
+/// The two halves are kept apart so a clean release can never read as proof of
+/// non-commit: the inherited half is what an earlier incarnation may already
+/// have submitted, and only the durable readback clears it.
+#[derive(Clone, Copy, Debug)]
+struct RestoreEffectExposure {
+    /// Exposure inherited from the slot at acquisition time.
+    inherited: RestoreEffectState,
+    /// Exposure of this invocation alone.
+    current: RestoreEffectState,
+}
+
+impl RestoreEffectExposure {
+    /// Starts a fresh invocation against an already-tracked slot.
+    const fn new(inherited: RestoreEffectState) -> Self {
+        Self {
+            inherited,
+            current: RestoreEffectState::NoWriteSubmitted,
+        }
+    }
+
+    /// The highest exposure ever observed for this slot.
+    fn state(self) -> RestoreEffectState {
+        self.inherited.max(self.current)
+    }
+
+    /// Reports whether the slot still owes an exact provider reconciliation.
+    fn requires_reconciliation(self) -> bool {
+        self.state().is_unproven()
+    }
+
+    /// Marks the instant before the first effectful transport poll.
+    fn note_write_may_be_submitted(&mut self) {
+        self.current = self
+            .current
+            .max(RestoreEffectState::WriteMayHaveBeenSubmitted);
+    }
+
+    /// Marks that the provider answered the write.
+    fn note_response_observed(&mut self) {
+        self.current = self.current.max(RestoreEffectState::ResponseObserved);
+    }
+
+    /// Marks that the exact durable result was verified.
+    fn note_durable_result_verified(&mut self) {
+        self.current = RestoreEffectState::DurableResultVerified;
+    }
+}
+
+/// One in-process attempt slot of one destination/adapter owner's admitted
+/// operation identity.
 ///
 /// It exists only to serialize concurrent same-operation attempts inside this
-/// process and to preserve the *original* failure across bounded, cancelled and
-/// retried attempts. It is never a receipt and never an outcome. A record left
-/// behind by a finished attempt is bounded evidence, not a lock: it never
+/// process and to carry two independent facts forward across bounded,
+/// cancelled, retried and dropped attempts: the *first* redacted failure and the
+/// *highest* effect exposure. It is never a receipt and never an outcome. A slot
+/// left behind by a released attempt is bounded evidence, not a lock: it never
 /// blocks a retry from reaching the provider's own durable reconciliation
 /// readback, which is the only authority on whether the earlier attempt
 /// committed.
 #[derive(Clone, Debug)]
 struct RestoreAttempt {
+    /// Closed phase label this slot was admitted for.
     phase: String,
-    /// True only while an attempt of this identity is still running here.
-    in_flight: bool,
-    original_failure: Option<RestoreFailureRecord>,
+    /// The local bookkeeping incarnation that owns the slot right now.
+    incarnation: u64,
+    /// True only while the owning incarnation is still live in this process.
+    running: bool,
+    /// Highest effect exposure ever observed for this slot; never lowered.
+    effect_state: RestoreEffectState,
+    /// First redacted failure observed for this slot; never overwritten,
+    /// independently of the current effect certainty.
+    first_failure: Option<RestoreFailureRecord>,
 }
 
-/// In-process restore projection: durable-receipt cache, in-flight attempt
-/// guard, and original-failure preservation.
+/// The bounded local bookkeeping facts of one attempt slot, as observed by a
+/// reader that does not own it.
+#[derive(Clone, Debug)]
+struct RestoreAttemptState {
+    /// First redacted failure observed for the slot.
+    first_failure: Option<RestoreFailureRecord>,
+    /// Highest effect exposure ever observed for the slot.
+    effect_state: RestoreEffectState,
+}
+
+impl RestoreAttemptState {
+    /// Reports whether the slot still owes an exact provider reconciliation.
+    const fn requires_reconciliation(&self) -> bool {
+        self.effect_state.is_unproven()
+    }
+
+    /// Reconstructs the first observed failure, if one was recorded.
+    fn original_failure(&self) -> Option<StoreError> {
+        self.first_failure
+            .as_ref()
+            .map(RestoreFailureRecord::restore)
+    }
+}
+
+/// In-process restore projection: durable-receipt cache, owner-scoped attempt
+/// slots, and original-failure preservation.
 ///
 /// This is **not** a source of truth. A receipt only enters [`Self::entries`]
 /// after the provider confirmed it by exact durable readback, and restore
 /// record rows are create-only, so a confirmed receipt is immutable: the cache
 /// may only rescue availability when the provider is temporarily unreachable,
 /// and it never decides whether an operation committed. Every verdict the port
-/// returns is derived from the provider. A retained attempt record is likewise
-/// not a gate: it refuses only a genuinely concurrent attempt and is bounded by
-/// [`MAX_RESTORE_TRACKED_ATTEMPTS`], so a failed apply never makes its own
-/// operation identity permanently un-retryable.
+/// returns is derived from the provider. A retained attempt slot is likewise
+/// not a gate: it refuses only a genuinely concurrent attempt, it is bounded by
+/// [`MAX_RESTORE_TRACKED_ATTEMPTS`], and a retry always reaches the provider's
+/// durable reconciliation readback first.
 #[derive(Clone, Debug, Default)]
 pub struct RestoreLedger {
     entries: HashMap<String, StoredRestoreEntry>,
     attempts: HashMap<String, RestoreAttempt>,
+    /// Next local bookkeeping incarnation to hand out. Monotonic and
+    /// process-local: it identifies one attempt's ownership of one slot and is
+    /// never an external operation, lease or epoch.
+    next_incarnation: u64,
 }
 
 impl RestoreLedger {
@@ -651,6 +789,7 @@ impl RestoreLedger {
         Self {
             entries: HashMap::new(),
             attempts: HashMap::new(),
+            next_incarnation: 0,
         }
     }
 
@@ -747,94 +886,264 @@ pub fn shared_restore_ledger() -> &'static Mutex<RestoreLedger> {
     SHARED_RESTORE_LEDGER.get_or_init(|| Mutex::new(RestoreLedger::new()))
 }
 
-/// Marks one operation identity as in flight for a phase.
+/// Derives the owner-scoped key of one local restore-attempt slot.
 ///
-/// The projection lock is taken only for the duration of this map update: it is
-/// never held across a provider await, so a restore can never deadlock against
-/// its own readback. A *concurrent* second in-process attempt of the same
-/// operation identity while one is still in flight is refused with retryable
-/// unavailability.
-///
-/// A retained original failure is deliberately **not** a gate. Refusing here
-/// would make a failed apply permanently un-retryable, so the retry instead
-/// falls through to the provider's durable reconciliation readback: that
-/// readback, not a local marker, is the only thing that can honestly say
-/// whether the earlier attempt committed. The original class stays reportable
-/// through [`original_failure`].
-///
-/// The map is bounded by [`MAX_RESTORE_TRACKED_ATTEMPTS`]; a fresh identity
-/// arriving at the ceiling is refused instead of growing the map.
-fn begin_attempt(key: &str, phase: &str) -> Result<(), StoreError> {
-    let mut ledger = shared_restore_ledger()
-        .lock()
-        .map_err(|_| unknown_outcome(key))?;
-    if ledger
-        .attempts
-        .get(key)
-        .is_some_and(|attempt| attempt.in_flight)
-    {
-        return Err(StoreError::Unavailable);
-    }
-    // A retry of a known identity reuses its own slot: the retained original
-    // failure survives the new attempt, and the map does not grow. Only a key
-    // that is not tracked yet competes for the bounded capacity.
-    let retained = ledger
-        .attempts
-        .get(key)
-        .and_then(|attempt| attempt.original_failure.clone());
-    if retained.is_none() && ledger.attempts.len() >= MAX_RESTORE_TRACKED_ATTEMPTS {
-        return Err(StoreError::PayloadTooLarge);
-    }
-    ledger.attempts.insert(
-        key.to_owned(),
-        RestoreAttempt {
-            phase: phase.to_owned(),
-            in_flight: true,
-            original_failure: retained,
-        },
+/// Bare operation text is not a key. Two destination owners — or two adapters of
+/// the same installation — may legitimately spell the same operation id, and the
+/// cleanup of one owner's attempt must never release the other's. The key
+/// therefore binds the adapter owner namespace (active database and
+/// installation), the destination owner and the admitted operation identity; the
+/// request commitment of that identity is bound durably by the create-only
+/// record row, so a same-identity retry still reuses one slot here.
+fn attempt_slot_key(
+    active_store: &str,
+    active_installation: &str,
+    destination: &IsolatedDestination,
+    operation: &OperationIdentity,
+) -> String {
+    let shape = (
+        "restore-attempt-v1",
+        active_store,
+        active_installation,
+        destination.destination_id.as_str(),
+        operation.operation_id.as_str(),
     );
-    Ok(())
-}
-
-/// Closes one attempt, preserving the first observed failure.
-///
-/// A successful attempt is evicted entirely. A failed one is retained only as
-/// bounded evidence of *why* the operation first failed and is marked no longer
-/// in flight, so a retry of the same identity is admitted and reaches the
-/// durable reconciliation readback instead of being permanently refused. The
-/// first observed class wins, so a bounded, cancelled or retried attempt still
-/// reports the original failure rather than a newer one.
-fn end_attempt(key: &str, failure: Option<&StoreError>) {
-    let Ok(mut ledger) = shared_restore_ledger().lock() else {
-        return;
-    };
-    let Some(error) = failure else {
-        ledger.attempts.remove(key);
-        return;
-    };
-    let Some(attempt) = ledger.attempts.get_mut(key) else {
-        return;
-    };
-    attempt.in_flight = false;
-    if attempt.original_failure.is_some() {
-        return;
-    }
-    attempt.original_failure = Some(RestoreFailureRecord {
-        phase: attempt.phase.clone(),
-        classification: RestoreFailureRecord::classify(error).to_owned(),
-        observed_at_unix_ms: current_unix_ms(),
+    let bytes = canonical_json_bytes(&shape).unwrap_or_else(|_| {
+        let mut fallback = Vec::with_capacity(256);
+        fallback.extend_from_slice(b"restore-attempt-v1");
+        fallback.extend_from_slice(active_store.as_bytes());
+        fallback.extend_from_slice(active_installation.as_bytes());
+        fallback.extend_from_slice(destination.destination_id.as_bytes());
+        fallback.extend_from_slice(operation.operation_id.as_str().as_bytes());
+        fallback
     });
+    sha256_hex(&bytes)
 }
 
-/// Returns the original failure observed for one operation identity.
-fn original_failure(key: &str) -> Option<StoreError> {
-    shared_restore_ledger().lock().ok().and_then(|ledger| {
-        ledger
+/// Private, non-cloneable owner of one local restore-attempt incarnation.
+///
+/// The guard is acquired before the first suspension that requires exclusion and
+/// is bound to three things: the destination/adapter owner namespace, the
+/// admitted logical operation identity, and a fresh *local bookkeeping
+/// incarnation* of the slot. The incarnation only names this process's ownership
+/// of one slot — it is not a new external operation, lease or epoch, and it
+/// grants no authority over the destination.
+///
+/// Ownership and effect exposure are tracked apart. The guard carries what *this
+/// invocation* may already have submitted, and the slot keeps the highest
+/// exposure ever observed, so no release — not even an early return, an error
+/// path, or a dropped pending future — can clear an effect that may already have
+/// reached the provider.
+struct RestoreAttemptGuard {
+    /// Owner-scoped slot key, derived once so release never formats anything.
+    key: String,
+    /// The exact incarnation this guard owns.
+    incarnation: u64,
+    /// Operation identity this incarnation was admitted for; used only to type a
+    /// conservative bookkeeping failure.
+    operation_id: String,
+    /// Effect exposure of this invocation beside the slot's inherited
+    /// uncertainty.
+    exposure: RestoreEffectExposure,
+    /// False once explicit completion disarmed the destructor.
+    armed: bool,
+}
+
+impl RestoreAttemptGuard {
+    /// Acquires local ownership of one owner-scoped attempt slot.
+    ///
+    /// The projection lock is taken only for the duration of this map update: it
+    /// is never held across a provider await, so a restore can never deadlock
+    /// against its own readback. A *concurrent* second in-process attempt of the
+    /// same owner-scoped identity while one is still live is refused with
+    /// retryable unavailability.
+    ///
+    /// A retained first failure is deliberately **not** a gate. Refusing here
+    /// would make a failed apply permanently un-retryable, so the retry instead
+    /// falls through to the provider's durable reconciliation readback: that
+    /// readback, not a local marker, is the only thing that can honestly say
+    /// whether the earlier attempt committed. What the retained slot *does* carry
+    /// forward is the effect exposure, which keeps the fresh-write branch closed
+    /// until the exact durable result resolves it.
+    ///
+    /// The map is bounded by [`MAX_RESTORE_TRACKED_ATTEMPTS`]; a fresh slot
+    /// arriving at the ceiling is refused instead of growing the map, and
+    /// unreadable bookkeeping is a typed conservative failure rather than a
+    /// clean absence.
+    fn acquire(
+        batch: &CanonicalRestoreBatch,
+        config: &SurrealAdapterConfig,
+    ) -> Result<Self, StoreError> {
+        let (active_store, active_installation) = active_store_identity(config);
+        let key = attempt_slot_key(
+            &active_store,
+            &active_installation,
+            &batch.destination,
+            &batch.operation,
+        );
+        let operation_id = batch.operation.operation_id.as_str().to_owned();
+        let mut ledger = shared_restore_ledger()
+            .lock()
+            .map_err(|_| unknown_outcome(&operation_id))?;
+        if ledger
             .attempts
-            .get(key)
-            .and_then(|attempt| attempt.original_failure.as_ref())
-            .map(RestoreFailureRecord::restore)
-    })
+            .get(&key)
+            .is_some_and(|attempt| attempt.running)
+        {
+            return Err(StoreError::Unavailable);
+        }
+        // A retry of a known identity reuses its own slot: the retained first
+        // failure and the retained effect exposure survive the new attempt, and
+        // the map does not grow. Only a slot that is not tracked yet competes for
+        // the bounded capacity.
+        let retained = ledger
+            .attempts
+            .get(&key)
+            .map(|attempt| (attempt.first_failure.clone(), attempt.effect_state));
+        if retained.is_none() && ledger.attempts.len() >= MAX_RESTORE_TRACKED_ATTEMPTS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        // A fresh incarnation is never reused: an exhausted counter admits no new
+        // attempt rather than letting a delayed finalizer match a later owner.
+        let incarnation = ledger
+            .next_incarnation
+            .checked_add(1)
+            .ok_or(StoreError::Unavailable)?;
+        ledger.next_incarnation = incarnation;
+        let (first_failure, effect_state) =
+            retained.unwrap_or((None, RestoreEffectState::NoWriteSubmitted));
+        let exposure = RestoreEffectExposure::new(effect_state);
+        ledger.attempts.insert(
+            key.clone(),
+            RestoreAttempt {
+                phase: RESTORE_PHASE_APPLIED.to_owned(),
+                incarnation,
+                running: true,
+                effect_state,
+                first_failure,
+            },
+        );
+        Ok(Self {
+            key,
+            incarnation,
+            operation_id,
+            exposure,
+            armed: true,
+        })
+    }
+
+    /// Records the outcome of this incarnation and disarms the destructor.
+    ///
+    /// Consuming, so an incarnation can be completed exactly once and a
+    /// completed guard is never finished again by `Drop`. The recorded outcome
+    /// preserves the first observed failure and merges this incarnation's effect
+    /// exposure into the slot. The slot is evicted only when nothing is left to
+    /// reconcile; an uncertain effect keeps its slot and its recovery
+    /// obligation.
+    fn complete(mut self, outcome: Option<&StoreError>) -> Result<(), StoreError> {
+        // Disarm first: a bookkeeping failure below must not be followed by a
+        // second release attempt from the destructor.
+        self.armed = false;
+        if self.release(outcome).is_err() {
+            return Err(unknown_outcome(&self.operation_id));
+        }
+        Ok(())
+    }
+
+    /// Releases this incarnation's local ownership into the slot.
+    ///
+    /// Returns a typed conservative failure when the bookkeeping is unreadable,
+    /// and leaves the map untouched in that case: the slot, its running flag and
+    /// its recovery obligation all survive, so no later reader can mistake poison
+    /// for a completed cleanup. A guard whose incarnation no longer owns the
+    /// slot — because a replacement was acquired after this one was displaced —
+    /// releases nothing at all.
+    fn release(&mut self, outcome: Option<&StoreError>) -> Result<(), StoreError> {
+        let mut ledger = shared_restore_ledger()
+            .lock()
+            .map_err(|_| unknown_outcome(&self.operation_id))?;
+        if ledger
+            .attempts
+            .get(&self.key)
+            .is_none_or(|attempt| attempt.incarnation != self.incarnation)
+        {
+            return Ok(());
+        }
+        let merged = self
+            .exposure
+            .state()
+            .max(ledger.attempts[&self.key].effect_state);
+        if outcome.is_none() && !merged.is_unproven() {
+            // Nothing is owed any more: the exact durable result is known, so the
+            // bounded evidence leaves the map instead of accumulating in it.
+            ledger.attempts.remove(&self.key);
+            return Ok(());
+        }
+        let Some(attempt) = ledger.attempts.get_mut(&self.key) else {
+            return Ok(());
+        };
+        attempt.running = false;
+        attempt.effect_state = merged;
+        if let Some(error) = outcome.filter(|_| attempt.first_failure.is_none()) {
+            attempt.first_failure = Some(RestoreFailureRecord {
+                phase: attempt.phase.clone(),
+                classification: RestoreFailureRecord::classify(error).to_owned(),
+                observed_at_unix_ms: current_unix_ms(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RestoreAttemptGuard {
+    /// Releases only this incarnation's local ownership.
+    ///
+    /// Bounded and synchronous by construction: one map update under the
+    /// projection lock, never held across a provider await, with no RPC, no
+    /// detached task, no async destructor, no recursive logging and no payload
+    /// formatting. Dropping a pending apply future is **not** provider
+    /// cancellation and **not** durable settlement: it releases the local
+    /// running owner and merges this incarnation's exposure into the slot, so an
+    /// effect that may already have been submitted stays uncertain and keeps its
+    /// exact-reconciliation obligation. Unreadable bookkeeping keeps the slot
+    /// untouched rather than reporting a cleanup that never happened.
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `Drop` has no channel to report a bookkeeping failure on; the retained
+        // slot and the typed unknown outcome every later acquire returns are the
+        // honest, bounded consequence.
+        let _ = self.release(None);
+    }
+}
+
+/// Reads the bounded local bookkeeping facts of one owner-scoped attempt slot.
+///
+/// An unreadable map is a typed conservative failure, never an absent attempt:
+/// reporting "no original failure" from an unreadable map would turn unknown
+/// bookkeeping into a clean answer.
+fn restore_attempt_state(
+    batch: &CanonicalRestoreBatch,
+    config: &SurrealAdapterConfig,
+) -> Result<Option<RestoreAttemptState>, StoreError> {
+    let (active_store, active_installation) = active_store_identity(config);
+    let key = attempt_slot_key(
+        &active_store,
+        &active_installation,
+        &batch.destination,
+        &batch.operation,
+    );
+    let ledger = shared_restore_ledger()
+        .lock()
+        .map_err(|_| unknown_outcome(batch.operation.operation_id.as_str()))?;
+    Ok(ledger
+        .attempts
+        .get(&key)
+        .map(|attempt| RestoreAttemptState {
+            first_failure: attempt.first_failure.clone(),
+            effect_state: attempt.effect_state,
+        }))
 }
 
 /// Projects one provider-verified batch outcome into the shared projection.
@@ -1443,19 +1752,34 @@ fn classify_restore_errors(errors: &[String], fallback: StoreError) -> StoreErro
 /// writes: the port never takes the protected permit, the health/admin lane, or
 /// any bypass of the maintenance-admission facade, so a restore cannot relabel
 /// itself protected work.
+///
+/// `exposure` is the local bookkeeping of the caller that owns an attempt
+/// incarnation, if any. The "may have been submitted" mark is set on the last
+/// synchronous line before the transport poll — after the closed registry and
+/// statement have been resolved, so a refusal that never reaches the wire is not
+/// reported as a possible commit.
 async fn execute_restore_write(
     transport: &RpcTransport,
     operation: &'static str,
     bindings: serde_json::Map<String, serde_json::Value>,
+    exposure: Option<&mut RestoreEffectExposure>,
 ) -> Result<(), StoreError> {
     check_registry_capability()?;
     crate::client::validate_restore_operation(operation).map_err(AdapterError::into_store_error)?;
     let statement = crate::client::fixed_restore_statement(operation)
         .map_err(AdapterError::into_store_error)?;
-    let mut response = transport
-        .query_write(operation, statement, bindings)
-        .await
-        .map_err(AdapterError::into_store_error)?;
+    let mut response = match exposure {
+        Some(exposure) => {
+            exposure.note_write_may_be_submitted();
+            let response = transport.query_write(operation, statement, bindings).await;
+            if response.is_ok() {
+                exposure.note_response_observed();
+            }
+            response
+        }
+        None => transport.query_write(operation, statement, bindings).await,
+    }
+    .map_err(AdapterError::into_store_error)?;
     let errors = response.take_errors();
     if errors.is_empty() {
         return Ok(());
@@ -1696,24 +2020,34 @@ fn check_cumulative_bytes(cumulative: u64, added: u64) -> Result<(), StoreError>
 
 /// Refuses a phase whose operation identity was cancelled in the installed
 /// write-execution generation, preserving the original failure class.
+///
+/// The two bookkeeping facts stay independent here. An older pre-effect refusal
+/// may still be reported as the reason the operation first failed, but it never
+/// stands in for the current effect certainty: while the owner-scoped slot still
+/// owes an exact provider reconciliation, the cancellation answer is the typed
+/// unknown outcome, and the first failure is preserved beside it rather than
+/// overwritten by it.
 fn check_cancellation(
     adapter: &SurrealStoreAdapter,
-    operation: &OperationIdentity,
+    batch: &CanonicalRestoreBatch,
 ) -> Result<(), StoreError> {
     let Some(execution) = adapter.execution_handle() else {
         return Ok(());
     };
-    if execution.is_cancelled(&operation.operation_id) {
-        // A cancelled phase reports the original failure when one exists, so a
-        // bounded or cancelled attempt never masks why the operation first
-        // failed.
-        let key = operation.operation_id.as_str();
-        if let Some(original) = original_failure(key) {
-            return Err(original);
-        }
-        return Err(StoreError::Unavailable);
+    if !execution.is_cancelled(&batch.operation.operation_id) {
+        return Ok(());
     }
-    Ok(())
+    let state = restore_attempt_state(batch, &adapter.config)?;
+    if state
+        .as_ref()
+        .is_some_and(RestoreAttemptState::requires_reconciliation)
+    {
+        return Err(unknown_outcome(batch.operation.operation_id.as_str()));
+    }
+    if let Some(original) = state.and_then(|state| state.original_failure()) {
+        return Err(original);
+    }
+    Err(StoreError::Unavailable)
 }
 
 /// Verifies the expected-state identity: every expected head must carry the
@@ -2086,6 +2420,11 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
             transport,
             crate::client::RESTORE_OPERATION_PREPARE,
             bindings,
+            // Destination preparation owns no admitted restore batch, so it owns
+            // no attempt incarnation: there is no local bookkeeping obligation to
+            // carry, and its own write is create-only and reconciled by readback
+            // below.
+            None,
         )
         .await
         {
@@ -2124,19 +2463,26 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
     /// derives the returned receipt from exact durable readback. A repeated
     /// same-operation input reconciles to the original receipt, changed content
     /// conflicts, and a lost response stays unknown.
+    ///
+    /// Local ownership of the owner-scoped attempt slot is held by one private
+    /// guard across the whole apply. Every return path completes that guard
+    /// explicitly, and a future dropped mid-apply releases only its own
+    /// incarnation through `Drop`; neither can cancel a provider write that was
+    /// already submitted, so both preserve the reconciliation obligation.
     async fn restore_canonical_batch(
         &self,
         ctx: &RequestMeta,
         batch: CanonicalRestoreBatch,
     ) -> Result<RestoreValidationReceipt, StoreError> {
         ctx.validate().map_err(StoreError::Foundation)?;
-        let operation_key = batch.operation.operation_id.as_str().to_owned();
-        begin_attempt(&operation_key, RESTORE_PHASE_APPLIED)?;
+        let mut attempt = RestoreAttemptGuard::acquire(&batch, &self.config)?;
         let outcome = self
-            .apply_canonical_batch(ctx, &batch)
+            .apply_canonical_batch(ctx, &batch, &mut attempt.exposure)
             .await
             .map_err(redact_store_error);
-        end_attempt(&operation_key, outcome.as_ref().err());
+        // A conservative bookkeeping failure outranks the phase's own outcome:
+        // the outcome is only honest if its bookkeeping was recorded.
+        attempt.complete(outcome.as_ref().err())?;
         outcome
     }
 
@@ -2155,7 +2501,7 @@ impl IsolatedRestorePort for SurrealStoreAdapter {
     ) -> Result<RestoreValidationReceipt, StoreError> {
         ctx.validate().map_err(StoreError::Foundation)?;
         batch.validate()?;
-        check_cancellation(self, &batch.operation)?;
+        check_cancellation(self, &batch)?;
         check_expected_state(&batch, ctx)?;
         validate_reference_closure(&batch).map_err(redact_store_error)?;
         let (active_store, active_installation) = active_store_identity(&self.config);
@@ -2415,15 +2761,20 @@ impl SurrealStoreAdapter {
     }
 
     /// Applies one validated batch and returns the provider-derived receipt.
+    ///
+    /// `exposure` records what this invocation may already have submitted to the
+    /// provider. It is local bookkeeping only: it never decides a verdict, and
+    /// every returned receipt is still derived from exact durable readback.
     #[allow(clippy::too_many_lines)]
     async fn apply_canonical_batch(
         &self,
         ctx: &RequestMeta,
         batch: &CanonicalRestoreBatch,
+        exposure: &mut RestoreEffectExposure,
     ) -> Result<RestoreValidationReceipt, StoreError> {
         batch.validate()?;
         let (active_store, active_installation) = active_store_identity(&self.config);
-        check_cancellation(self, &batch.operation)?;
+        check_cancellation(self, batch)?;
         check_expected_state(batch, ctx)?;
         let now = current_unix_ms();
         let transport = restore_transport(self).await?;
@@ -2468,8 +2819,19 @@ impl SurrealStoreAdapter {
             // original member identities and missing denominator.
             check_duration(existing.started_at_unix_ms, now)?;
             let receipt = receipt_from_document(&existing, batch)?;
+            exposure.note_durable_result_verified();
             project_verified_receipt(batch, &receipt)?;
             return Ok(receipt);
+        }
+        // Reacquiring local ownership is not permission to take the fresh-write
+        // branch. This invocation has submitted nothing, but an earlier
+        // incarnation of this same owner-scoped identity may have handed a write
+        // to the provider that can still complete, and an absent record row is
+        // not proof of non-commit. The obligation is therefore reported as the
+        // typed unknown outcome and resolved by exact operation identity, never
+        // by writing again.
+        if exposure.requires_reconciliation() {
+            return Err(unknown_outcome(batch.operation.operation_id.as_str()));
         }
         let (member_entry, scope_entry) = read_purge_ledger(
             transport,
@@ -2585,8 +2947,13 @@ impl SurrealStoreAdapter {
             &placement_key_value,
             &fence,
         )?;
-        match execute_restore_write(transport, crate::client::RESTORE_OPERATION_APPLY, bindings)
-            .await
+        match execute_restore_write(
+            transport,
+            crate::client::RESTORE_OPERATION_APPLY,
+            bindings,
+            Some(&mut *exposure),
+        )
+        .await
         {
             Ok(()) => {}
             Err(StoreError::IdentityConflict) => {
@@ -2604,6 +2971,7 @@ impl SurrealStoreAdapter {
                     .await?
                 {
                     let receipt = receipt_from_document(&existing, batch)?;
+                    exposure.note_durable_result_verified();
                     project_verified_receipt(batch, &receipt)?;
                     return Ok(receipt);
                 }
@@ -2622,6 +2990,7 @@ impl SurrealStoreAdapter {
                     .await?
                 {
                     let receipt = receipt_from_document(&existing, batch)?;
+                    exposure.note_durable_result_verified();
                     project_verified_receipt(batch, &receipt)?;
                     return Ok(receipt);
                 }
@@ -2642,6 +3011,7 @@ impl SurrealStoreAdapter {
             .await?
             .ok_or(StoreError::MissingReceiptEnvelope)?;
         let receipt = receipt_from_document(&committed, batch)?;
+        exposure.note_durable_result_verified();
         project_verified_receipt(batch, &receipt)?;
         Ok(receipt)
     }

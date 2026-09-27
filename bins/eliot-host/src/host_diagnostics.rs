@@ -635,6 +635,22 @@ impl HostRequestProjection {
         self
     }
 
+    /// Attaches the id of the serving Host process that holds the owner
+    /// state this record projects: the same identity the owner binds in
+    /// `HostProcessBinding` from `std::process::id()`. Pass only an id the
+    /// call site already knows; it is never probed, looked up, or inferred
+    /// from a name, path, or port.
+    ///
+    /// Distinct from [`Self::process_started`], which additionally claims
+    /// start evidence and therefore fits only where the owner observed the
+    /// start itself. Use this accessor where a later sighting of the same
+    /// process must correlate without asserting a start.
+    #[must_use]
+    pub const fn with_process(mut self, process_id: u32) -> Self {
+        self.process = Some(process_id);
+        self
+    }
+
     /// Attaches the installation and generation from launch options
     /// already held at this site (admitted values only, never argv text).
     /// The installation handle is bounded with truncation honesty.

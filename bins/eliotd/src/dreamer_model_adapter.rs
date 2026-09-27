@@ -79,12 +79,17 @@ use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerpri
 use serde::Deserialize;
 
 use super::capability_admission::{
-    CapabilityEvidenceRecord, DynamicCapabilityPulse, ProductionAdmissionRequest,
-    ProductionEvidenceBundle, StaticCapabilityAttestation, admit_production_route,
-    canonical_required_set,
+    CapabilityEvidenceRecord, CapabilityEvidenceStatus, DynamicCapabilityPulse,
+    ProductionAdmissionRequest, ProductionEvidenceBundle, StaticCapabilityAttestation,
+    admit_production_route, canonical_required_set,
 };
 use super::capability_evidence_wiring::GovernorCapabilityAdmission;
-use super::capability_outcome::{AttemptReceipt, FallbackOutcomeRequest, fallback_outcome};
+use super::capability_outcome::{
+    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
+    FallbackOutcomeRequest, GenerationChallengeOutcomeRequest, MAX_REFS, OutcomeDisposition,
+    fallback_outcome, generation_challenge_outcome, project_degradation, removed_promise,
+    surviving_operation,
+};
 use super::route_receipts::{RuntimeObservedFacts, effective_route_key};
 use super::{DaemonComposition, DaemonKernelClient, SERVICE_NAME, kernel_port_error};
 
@@ -430,6 +435,123 @@ const INTAKE_PROOF_CEILING: &str = "CANDIDATE_ARTIFACT";
 /// static marker, never a schedule: no freshness window is minted here.
 const INTAKE_RECOVERY: &str = "requalify-exact-fingerprint-on-fresh-evidence";
 
+/// Effective mode recorded on an outcome for a call that never executed.
+///
+/// The execution port is not touched on a capability refusal, so there is no
+/// fallback mode to report. `none` is the honest effective mode; naming any
+/// other mode would claim a substitution this module forbids.
+const REFUSED_EFFECTIVE_MODE: &str = "none";
+
+/// Proof ceiling recorded on a refused call or a blocked generation.
+///
+/// The weakest [`ProofCeiling`](eliot_receipts::ProofCeiling) value: the
+/// degraded execution proves at most that the refusal was observed. It
+/// subtracts the candidate-artifact, scoped-verification, and
+/// observed-external-effect promises instead of reporting the incomplete
+/// state as complete.
+const REFUSED_PROOF_CEILING: &str = "OBSERVATION";
+
+/// Recovery marker recorded on a call-scoped capability refusal.
+///
+/// A refused call carries no sticky block: the next attempt is admitted on
+/// its own evidence through the same gate. This is the acceptance-visible
+/// half of "later attempts remain eligible for their own evidence-based
+/// admission".
+const CALL_RECOVERY: &str = "re-admit-next-attempt-on-its-own-fresh-evidence";
+
+/// Refusal context naming the adopted Governor registry side of the gate.
+const REGISTRY_REFUSAL_CONTEXT: &str = "governor capability registry";
+
+/// Refusal context naming the production admission funnel side of the gate.
+const FUNNEL_REFUSAL_CONTEXT: &str = "production admission";
+
+/// Recovery marker recorded on a generation-scoped challenge failure.
+///
+/// Names the two defined recovery paths of the owning registry view:
+/// explicit requalification of the exact fingerprint, or reaching the
+/// owner-set expiry carried on the outcome.
+const GENERATION_RECOVERY: &str =
+    "requalify-exact-fingerprint-on-fresh-evidence-or-reach-outcome-expiry";
+
+/// What survives every degradation this gate records (A13.11).
+///
+/// The capability is subtracted, not the installation: deterministic memory,
+/// state, and tools keep working, and the attempt receipt that carries the
+/// outcome is itself retained evidence.
+const SURVIVES_DETERMINISTIC_CORE: &str = "deterministic-memory-state-tools-and-partial-work";
+/// The attempt receipt outlives the refusal that produced it.
+const SURVIVES_ATTEMPT_RECEIPT: &str = "attempt-receipt-carrying-this-outcome";
+/// A blocked generation leaves every other generation fingerprint alone.
+const SURVIVES_OTHER_GENERATIONS: &str = "attempts-on-other-generation-fingerprints";
+/// Candidate artifact for the affected attempt is removed.
+const REMOVES_CANDIDATE_ARTIFACT: &str = "candidate-artifact-on-this-attempt";
+/// Verified finish for the affected attempt is removed.
+const REMOVES_VERIFIED_FINISH: &str = "verified-finish-on-this-attempt";
+
+/// Truthful subtraction projection for one refused or blocked call.
+///
+/// Reports both sides A13.11 requires: what keeps working and which promises
+/// the degradation removes, on the affected attempt.
+fn call_degradation_projection() -> Vec<String> {
+    vec![
+        surviving_operation(SURVIVES_DETERMINISTIC_CORE),
+        surviving_operation(SURVIVES_ATTEMPT_RECEIPT),
+        removed_promise(REMOVES_CANDIDATE_ARTIFACT),
+        removed_promise(REMOVES_VERIFIED_FINISH),
+    ]
+}
+
+/// Truthful subtraction projection for one blocked generation fingerprint.
+///
+/// Adds the surviving sibling generations: the block is keyed to the exact
+/// generation/route fingerprint and never widens to the installation.
+fn generation_degradation_projection() -> Vec<String> {
+    vec![
+        surviving_operation(SURVIVES_DETERMINISTIC_CORE),
+        surviving_operation(SURVIVES_OTHER_GENERATIONS),
+        surviving_operation(SURVIVES_ATTEMPT_RECEIPT),
+        removed_promise(REMOVES_CANDIDATE_ARTIFACT),
+        removed_promise(REMOVES_VERIFIED_FINISH),
+    ]
+}
+
+/// Renders one adopted outcome's subtraction projection into bounded text.
+///
+/// Keeps the refusal reason and the surviving/removed split in the same
+/// string, so a caller that only surfaces the error still shows the reduced
+/// promises instead of a bare failure.
+fn render_projection(projection: &DegradationProjection) -> String {
+    let surviving = if projection.surviving_operations.is_empty() {
+        "none recorded".to_owned()
+    } else {
+        projection.surviving_operations.join(", ")
+    };
+    let removed = if projection.removed_promises.is_empty() {
+        "none recorded".to_owned()
+    } else {
+        projection.removed_promises.join(", ")
+    };
+    let evidence = if projection.evidence_refs.is_empty() {
+        "absent".to_owned()
+    } else {
+        projection.evidence_refs.join(", ")
+    };
+    format!(
+        "scope={:?} owner={} generation={} proof-ceiling={} survives=[{}] removed=[{}] evidence=[{}]",
+        projection.degradation_scope,
+        projection.scope_owner,
+        if projection.generation_fingerprint.is_empty() {
+            "unknown".to_owned()
+        } else {
+            projection.generation_fingerprint.clone()
+        },
+        projection.proof_ceiling,
+        surviving,
+        removed,
+        evidence
+    )
+}
+
 /// Core model-call flow over explicit authority values.
 ///
 /// `readiness`, `admitted_fence`, and `coordinator_config` must come from the live
@@ -478,15 +600,26 @@ pub(crate) async fn invoke_admitted_model(
         &input.admission,
         &input.binding,
     )?;
-    // C1 capability join (issues #1957/#1959): every required capability must
-    // hold fresh admission on BOTH the adopted Governor registry side and the
-    // funnel side before the execution port is touched.
-    let required = gate_model_capability(admitted_fence, registry, input)?;
     // R4 generation binding: the Kernel-issued projection (when served) is
-    // validated against the admitted fence before execution; the bound
-    // fingerprint rides the intake outcomes below.
+    // validated against the admitted fence before execution. It is resolved
+    // before the capability gate because the gate needs the exact generation
+    // fingerprint to scope a reproduced failure and to admit only the routes
+    // that fingerprint admits. Both joins are pure and run before the
+    // execution port is touched, so the ordering guarantee is unchanged.
     let generation_fingerprint =
         bind_kernel_generation_projection(admitted_fence, input.kernel_generation.as_ref())?;
+    // C1 capability join (issues #1957/#1959): every required capability must
+    // hold fresh admission on BOTH the adopted Governor registry side and the
+    // funnel side before the execution port is touched. A refusal is recorded
+    // as a scoped outcome on this attempt's receipt (#1961), never as global
+    // capability state.
+    let required = gate_model_capability(
+        admitted_fence,
+        registry,
+        input,
+        &generation_fingerprint,
+        intake,
+    )?;
     let result = execution
         .execute(&candidate, &input.admission, &input.binding)
         .await?;
@@ -533,42 +666,266 @@ fn is_critical_capability(
         })
 }
 
-/// Runs the C1 capability join for one invoke: registry side plus funnel side.
+/// Returns the exact `reproduced_failure` evidence reference for one record,
+/// or `None` when the record is not a reproduced failure.
 ///
-/// Order is load-bearing and every failure returns before the execution port
-/// is touched:
-/// - snapshot boundaries (I1.8): the caller-observed live fence must validate
-///   and the admitted (startup-boundary) fence must stay compatible with it,
-///   using the same owner check as the startup evidence build. Rotation fails
-///   closed instead of admitting on stale evidence; compatibility carries the
-///   exact generation agreement, so the evaluated generation below is current.
-/// - R2: the canonical required set (launch intent plus Human Dreamer-role
-///   preference, via [`canonical_required_set`]) is resolved per call; empty
-///   or malformed fails closed.
-/// - R4: the generation under evaluation is the Kernel-owned admitted
-///   fence's resource generation, and the execution binding must agree with
-///   it exactly. No caller-supplied generation is trusted.
-/// - R3: freshness is evaluated at the caller-threaded observation time
-///   against owner-set windows (`observed_at`/`expires_at` on funnel
-///   records, `observed_at`/`expires_at` plus derived scope invalidation on
-///   registry records). No window is minted here and no TTL constant exists.
-/// - the registry side requires fresh exact-scope positive evidence with no
-///   fresh restriction; a missing observed scope fails closed.
-/// - the funnel side runs through [`admit_production_route`]: the same
-///   requested route is evaluated over the threaded records plus the
-///   critical join exactly when the caller threaded critical evidence,
-///   while `RouteAdmissionVisibility::observe` plus `GovernorRouteAttempt::new`
-///   observe and link the caller-threaded attempt on handshake-observed
-///   facts. The registry bool path stays: the receipt observes and links
-///   the attempt, it never admits — only the funnel disposition admits.
-///   Absent observed facts fail closed; facts are never fabricated from
-///   the resolved route.
+/// The I3.4 `reproduced_failure` source is exactly the fresh `broken` or
+/// `unsupported` standing: "reproduced failure on the exact fingerprint;
+/// overrides declared proof". The reference is derived from the already
+/// observed record values — capability, generation, standing, and the
+/// owner-set observation window — so it names the exact evidence that carried
+/// the failure. No digest, receipt, or identity is minted here.
+fn reproduced_failure_evidence_reference(record: &CapabilityEvidenceRecord) -> Option<String> {
+    let standing = match record.status {
+        CapabilityEvidenceStatus::Broken => "broken",
+        CapabilityEvidenceStatus::Unsupported => "unsupported",
+        _ => return None,
+    };
+    Some(format!(
+        "capability-evidence:{}@generation{}:{standing}@observed{}@expires{}",
+        record.capability, record.generation, record.observed_at_unix_ms, record.expires_at_unix_ms
+    ))
+}
+
+/// Derives the generation-scoped outcome for one required capability, or
+/// `None` when no exact-generation failure is evidenced.
 ///
-/// Returns the evaluated required set for the result-intake join below.
-fn gate_model_capability(
-    admitted_fence: &StateFence,
-    registry: &GovernorCapabilityAdmission,
+/// Returns `Some` only when all three hold, so a broad scope is never
+/// asserted from absence:
+/// - the Kernel-issued generation projection is served, so the exact
+///   fingerprint is known (an unserved projection leaves the generation
+///   unknown and the failure stays call-scoped, never widened);
+/// - the threaded evidence carries at least two fresh reproduced failures on
+///   this exact capability, route fingerprint, and generation, observed at
+///   distinct times — one failure is a call error, two independent
+///   observations of the same exact failure are the reproduction I3.4
+///   requires;
+/// - those records share one owner-set expiry, which becomes the outcome's
+///   expiry instead of a minted window.
+///
+/// Returns `None` rather than failing the call when the fresh reproduced
+/// evidence set exceeds the owner's bounded evidence shape or the records
+/// disagree about their expiry: declining to broaden is the safe direction,
+/// and the refusal then stays `CALL`-scoped with the owner's own reason.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the derivation reads one exact evidence slice plus the identities already threaded per call; a struct would duplicate the request"
+)]
+fn exact_generation_outcome(
+    capability: &str,
+    evidence: &[CapabilityEvidenceRecord],
+    route: &RouteFingerprint,
+    generation: u64,
+    now_unix_ms: u64,
+    generation_fingerprint: &str,
+    generation_owner: &str,
+    requested_mode: &str,
+) -> Result<Option<CapabilityOutcome>, CompositionError> {
+    if generation_fingerprint.is_empty() {
+        return Ok(None);
+    }
+    let mut references: Vec<String> = Vec::new();
+    let mut observed_times: Vec<u64> = Vec::new();
+    let mut expiry: Option<u64> = None;
+    for record in evidence {
+        if record.capability != capability
+            || record.generation != generation
+            || record.route != *route
+            || record.observed_at_unix_ms > now_unix_ms
+            || now_unix_ms >= record.expires_at_unix_ms
+        {
+            continue;
+        }
+        let Some(reference) = reproduced_failure_evidence_reference(record) else {
+            continue;
+        };
+        if observed_times.contains(&record.observed_at_unix_ms) {
+            // The same observation threaded twice is one observation, not a
+            // reproduction, and never a second evidence reference.
+            continue;
+        }
+        match expiry {
+            None => expiry = Some(record.expires_at_unix_ms),
+            Some(bound) if bound == record.expires_at_unix_ms => {}
+            Some(_) => {
+                // Conflicting owner-set windows on the same exact failure
+                // are not a settled generation finding; keep the scope
+                // narrow instead of picking a window.
+                return Ok(None);
+            }
+        }
+        observed_times.push(record.observed_at_unix_ms);
+        references.push(reference);
+    }
+    if observed_times.len() < 2 {
+        return Ok(None);
+    }
+    if references.len() > MAX_REFS {
+        return Ok(None);
+    }
+    let outcome = generation_challenge_outcome(GenerationChallengeOutcomeRequest {
+        capability: capability.to_owned(),
+        requested_mode: requested_mode.to_owned(),
+        effective_mode: REFUSED_EFFECTIVE_MODE.to_owned(),
+        reason: format!(
+            "reproduced failure on the exact route fingerprint at the admitted generation across {} independent observations",
+            observed_times.len()
+        ),
+        evidence_refs: references,
+        affected_outputs_or_operations: generation_degradation_projection(),
+        proof_ceiling: REFUSED_PROOF_CEILING.to_owned(),
+        recovery_requalification_or_expiry: GENERATION_RECOVERY.to_owned(),
+        generation_owner: generation_owner.to_owned(),
+        generation_fingerprint: generation_fingerprint.to_owned(),
+        valid_until_unix_ms: expiry,
+    })
+    .map_err(|error| owner_error(format!("dreamer model generation outcome: {error}")))?;
+    Ok(Some(outcome))
+}
+
+/// Records one refused capability on this attempt's receipt and returns the
+/// refusal error carrying the truthful subtraction projection.
+///
+/// `context` names the join that refused, so the caller still sees which side
+/// of the capability gate stopped the call. The outcome is `CALL`-scoped: it
+/// becomes visible on the attempt that refused and nothing else. It is never
+/// handed to a registry view, so a single refused call cannot become an
+/// installation-global flag and the next attempt is admitted by the same gate
+/// on its own fresh evidence.
+fn refuse_capability_call(
+    context: &str,
+    capability: &str,
+    reason: &str,
+    requested_key: &str,
+    generation_fingerprint: &str,
+    attempt_id: &str,
+    intake: &mut AttemptReceipt,
+) -> CompositionError {
+    let mut outcome = match fallback_outcome(FallbackOutcomeRequest {
+        capability: capability.to_owned(),
+        requested_mode: requested_key.to_owned(),
+        effective_mode: REFUSED_EFFECTIVE_MODE.to_owned(),
+        reason: reason.to_owned(),
+        affected_outputs_or_operations: call_degradation_projection(),
+        proof_ceiling: REFUSED_PROOF_CEILING.to_owned(),
+        recovery_requalification_or_expiry: CALL_RECOVERY.to_owned(),
+        attempt_id: attempt_id.to_owned(),
+    }) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return owner_error(format!(
+                "{context} does not admit capability {capability} for the bound route and its call-scoped outcome is malformed: {error}"
+            ));
+        }
+    };
+    // R4: the Kernel-issued fingerprint bound pre-execution; empty while the
+    // projection query is unserved (unknown, never inferred).
+    generation_fingerprint.clone_into(&mut outcome.generation_fingerprint);
+    match intake.attach(outcome) {
+        Ok(()) => {
+            let recorded = intake.capability_outcomes.last();
+            let detail = recorded.map_or_else(String::new, |outcome| {
+                render_projection(&project_degradation(outcome))
+            });
+            owner_error(format!(
+                "{context} does not admit capability {capability} for the bound route: {reason} ({detail})"
+            ))
+        }
+        Err(error) => owner_error(format!(
+            "{context} does not admit capability {capability} for the bound route and its call-scoped outcome could not be recorded on the attempt receipt: {error} ({reason})"
+        )),
+    }
+}
+
+/// Applies the #1961 exact-generation scope to one invoke.
+///
+/// A reproduced failure on the exact capability, route fingerprint, and
+/// admitted generation is a generation finding, not a call error. The owning
+/// [`CapabilityRegistryView`] decides eligibility and refuses every route
+/// presenting that exact fingerprint; the outcome is attached to this
+/// attempt's receipt so the finding stays visible with its evidence and
+/// current scope, and it is never installation-global state.
+///
+/// Returns the refusal when the bound generation fingerprint is blocked, and
+/// `Ok(None)` when no required capability carries reproduced
+/// exact-fingerprint evidence at that generation — including when the
+/// Kernel-issued projection is unserved, so the generation stays unknown
+/// rather than inferred.
+fn refuse_blocked_generation(
+    required: &[String],
     input: &ModelInvokeInput,
+    generation: u64,
+    generation_fingerprint: &str,
+    generation_owner: &str,
+    requested_key: &str,
+    intake: &mut AttemptReceipt,
+) -> Result<Option<CompositionError>, CompositionError> {
+    for capability in required {
+        let Some(outcome) = exact_generation_outcome(
+            capability,
+            &input.evidence_records,
+            &input.binding.route,
+            generation,
+            input.now_unix_ms,
+            generation_fingerprint,
+            generation_owner,
+            requested_key,
+        )?
+        else {
+            continue;
+        };
+        let mut view = CapabilityRegistryView::default();
+        let disposition = view
+            .record(&outcome)
+            .map_err(|error| owner_error(format!("dreamer model generation record: {error}")))?;
+        view.clear_expired(input.now_unix_ms);
+        // The block verdict stays bound to this operation through the
+        // validated original record: the eligibility key is the digest the
+        // record itself carries (checked by the owner's validate() during
+        // record()), compared by content against the operation-bound
+        // fingerprint. A record naming any other fingerprint fails closed
+        // instead of blocking a foreign generation, and no fresh key is
+        // recomputed for the check.
+        if outcome.generation_fingerprint != generation_fingerprint {
+            return Err(owner_error(format!(
+                "evidenced generation outcome for {capability} does not name the bound generation fingerprint"
+            )));
+        }
+        if disposition != OutcomeDisposition::GlobalApplied
+            || view.is_route_eligible(&outcome.generation_fingerprint, None, input.now_unix_ms)
+        {
+            return Err(owner_error(format!(
+                "evidenced generation outcome for {capability} did not block its exact fingerprint"
+            )));
+        }
+        intake
+            .attach(outcome.clone())
+            .map_err(|error| owner_error(format!("dreamer model generation attach: {error}")))?;
+        return Ok(Some(owner_error(format!(
+            "capability {capability} is not admitted on generation {generation} of route {requested_key} after a reproduced exact-fingerprint failure: {}",
+            render_projection(&project_degradation(&outcome))
+        ))));
+    }
+    Ok(None)
+}
+
+/// Verifies the boundary conditions the C1 capability gate depends on and
+/// returns the canonical required set.
+///
+/// These are the same fail-closed preconditions the gate evaluated inline
+/// before, kept in one place so the gate body stays the admission join:
+/// - the caller-observed live fence validates and the admitted
+///   (startup-boundary) fence stays compatible with it, so rotation fails
+///   closed instead of admitting on stale evidence;
+/// - the binding generation equals the admitted Kernel generation exactly;
+/// - the caller-threaded attempt is the bound attempt, and the receipt the
+///   gate may write into is that attempt's own receipt. A foreign receipt
+///   fails closed instead of filing this call's degradation under another
+///   attempt.
+fn verify_gate_preconditions(
+    admitted_fence: &StateFence,
+    input: &ModelInvokeInput,
+    intake: &AttemptReceipt,
 ) -> Result<Vec<String>, CompositionError> {
     input
         .current_fence
@@ -588,38 +945,116 @@ fn gate_model_capability(
             "dreamer model invoke has no valid required capabilities; refusing an empty required set",
         )
     })?;
-    let generation = admitted_fence.resource_generation.value();
     if input.binding.runtime_generation != admitted_fence.resource_generation {
         return Err(owner_error(
             "dreamer model binding generation does not match the admitted Kernel generation",
         ));
     }
-    let scope = input.evidence_scope.as_ref().ok_or_else(|| {
-        owner_error(
-            "dreamer model invoke threads no observed route scope; capability evidence is unevaluable",
-        )
-    })?;
-    // A1 attempt linkage: the caller-threaded attempt must be the bound
-    // attempt (binding and admission agreement is proven before the gate);
-    // the receipt below links this same identity.
     if input.attempt_id != input.binding.attempt_id {
         return Err(owner_error(
             "dreamer model invoke attempt does not match the bound attempt",
         ));
     }
-    // A1 observed facts: handshake/transport observations arrive per call;
-    // absent facts fail closed, never defaulted from the resolved route.
+    if intake.attempt_id != input.binding.attempt_id.as_str() {
+        return Err(owner_error(
+            "dreamer model capability gate receipt does not belong to the bound attempt",
+        ));
+    }
+    Ok(required)
+}
+
+/// Runs the C1 capability join for one invoke: registry side plus funnel side.
+///
+/// Order is load-bearing and every failure returns before the execution port
+/// is touched:
+/// - snapshot boundaries (I1.8): the caller-observed live fence must validate
+///   and the admitted (startup-boundary) fence must stay compatible with it,
+///   using the same owner check as the startup evidence build. Rotation fails
+///   closed instead of admitting on stale evidence; compatibility carries the
+///   exact generation agreement, so the evaluated generation below is current.
+/// - R2: the canonical required set (launch intent plus Human Dreamer-role
+///   preference, via [`canonical_required_set`]) is resolved per call; empty
+///   or malformed fails closed.
+/// - R4: the generation under evaluation is the Kernel-owned admitted
+///   fence's resource generation, and the execution binding must agree with
+///   it exactly. No caller-supplied generation is trusted. The Kernel-issued
+///   exact fingerprint for that generation arrives bound and is the only key
+///   a generation-scoped outcome may use.
+/// - R3: freshness is evaluated at the caller-threaded observation time
+///   against owner-set windows (`observed_at`/`expires_at` on funnel
+///   records, `observed_at`/`expires_at` plus derived scope invalidation on
+///   registry records). No window is minted here and no TTL constant exists.
+/// - the registry side requires fresh exact-scope positive evidence with no
+///   fresh restriction; a missing observed scope fails closed.
+/// - #1961 exact-generation scope: before the per-capability join, a
+///   reproduced failure on the exact fingerprint is recorded at
+///   `GENERATION` scope, attached to this attempt's receipt, and admitted
+///   through [`CapabilityRegistryView::is_route_eligible`], which refuses
+///   every route presenting that exact fingerprint and no other. A refusal
+///   with no such evidence stays `CALL`-scoped (see
+///   [`refuse_capability_call`]).
+/// - the funnel side runs through [`admit_production_route`]: the same
+///   requested route is evaluated over the threaded records plus the
+///   critical join exactly when the caller threaded critical evidence,
+///   while `RouteAdmissionVisibility::observe` plus `GovernorRouteAttempt::new`
+///   observe and link the caller-threaded attempt on handshake-observed
+///   facts. The registry bool path stays: the receipt observes and links
+///   the attempt, it never admits — only the funnel disposition admits.
+///   Absent observed facts fail closed; facts are never fabricated from
+///   the resolved route.
+///
+/// Returns the evaluated required set for the result-intake join below.
+fn gate_model_capability(
+    admitted_fence: &StateFence,
+    registry: &GovernorCapabilityAdmission,
+    input: &ModelInvokeInput,
+    generation_fingerprint: &str,
+    intake: &mut AttemptReceipt,
+) -> Result<Vec<String>, CompositionError> {
+    let required = verify_gate_preconditions(admitted_fence, input, intake)?;
+    let generation = admitted_fence.resource_generation.value();
+    let scope = input.evidence_scope.as_ref().ok_or_else(|| {
+        owner_error(
+            "dreamer model invoke threads no observed route scope; capability evidence is unevaluable",
+        )
+    })?;
     let observed = input.observed_facts.as_ref().ok_or_else(|| {
         owner_error(
             "dreamer model invoke threads no handshake-observed route facts; capability evidence is unevaluable",
         )
     })?;
     let now = input.now_unix_ms;
+    let requested_key = effective_route_key(&input.binding.route)
+        .map_err(|error| owner_error(format!("dreamer model gate requested route key: {error}")))?
+        .as_str()
+        .to_owned();
+    // #1961 exact-generation scope: a reproduced failure on the exact
+    // fingerprint is a generation finding, not a call error. The owning
+    // registry view decides eligibility; the outcome stays visible on this
+    // attempt's receipt and never becomes installation-global state.
+    let generation_owner = format!("kernel-resource-generation:{generation}");
+    if let Some(refusal) = refuse_blocked_generation(
+        &required,
+        input,
+        generation,
+        generation_fingerprint,
+        &generation_owner,
+        &requested_key,
+        intake,
+    )? {
+        return Err(refusal);
+    }
     for capability in &required {
         if !registry.admit_production_route(capability, scope, now) {
-            return Err(owner_error(format!(
-                "no fresh Governor capability evidence admits {capability} on the observed scope"
-            )));
+            return Err(refuse_capability_call(
+                REGISTRY_REFUSAL_CONTEXT,
+                capability,
+                "no fresh exact-scope capability evidence admits it on the observed scope",
+                &requested_key,
+                generation_fingerprint,
+                input.binding.attempt_id.as_str(),
+                intake,
+            ));
         }
         let request = ProductionAdmissionRequest {
             capability: capability.clone(),
@@ -641,10 +1076,15 @@ fn gate_model_capability(
             admit_production_route(&request, &bundle, input.attempt_id.clone(), observed)
                 .map_err(|error| owner_error(format!("dreamer model route receipt: {error}")))?;
         if !decision.outcome.admitted() {
-            return Err(owner_error(format!(
-                "production admission does not admit {capability} for the bound route: {}",
-                decision.outcome.reason
-            )));
+            return Err(refuse_capability_call(
+                FUNNEL_REFUSAL_CONTEXT,
+                capability,
+                decision.outcome.reason,
+                &requested_key,
+                generation_fingerprint,
+                input.binding.attempt_id.as_str(),
+                intake,
+            ));
         }
     }
     Ok(required)
@@ -774,14 +1214,18 @@ pub async fn query_kernel_generation(
 ///   never global state. Route keys are the canonical digests of the
 ///   admitted requested route and (on divergence) the runtime-observed
 ///   route. Each outcome carries the bound Kernel generation fingerprint
-///   (R4; empty while the projection query is unserved).
+///   (R4; empty while the projection query is unserved) and the
+///   surviving/removed projection A13.11 requires, so the receipt reports
+///   the reduced promises instead of a bare failure.
 /// - unobserved route, `UnknownOutcome` disposition, or unknown execution
-///   outcome: no positive claim is recorded; the receipt stays empty.
+///   outcome: no positive claim is recorded; the receipt stays empty. Absent
+///   evidence stays unknown and is never reported as healthy or broken.
 /// - matched successful execution: nothing to record.
 ///
-/// Broad degradation scopes are never emitted here: broader invalidation
-/// requires evidence tied to the broader owner plus its named recovery,
-/// which the invoke site does not hold.
+/// Broad degradation scopes are never emitted here: the generation scope
+/// requires reproduced exact-fingerprint evidence, which this site does not
+/// observe, so the wider invalidation stays with the capability gate's
+/// [`exact_generation_outcome`].
 fn record_model_result_intake(
     result: &AgentResult,
     binding: &ProviderExecutionBinding,
@@ -822,7 +1266,7 @@ fn record_model_result_intake(
             requested_mode: requested_key.as_str().to_owned(),
             effective_mode: effective_key.as_str().to_owned(),
             reason: reason.to_owned(),
-            affected_outputs_or_operations: Vec::new(),
+            affected_outputs_or_operations: call_degradation_projection(),
             proof_ceiling: INTAKE_PROOF_CEILING.to_owned(),
             recovery_requalification_or_expiry: INTAKE_RECOVERY.to_owned(),
             attempt_id: binding.attempt_id.as_str().to_owned(),

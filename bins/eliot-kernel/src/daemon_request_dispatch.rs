@@ -20,23 +20,25 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
-    AuthenticatedUserAutomationHostExecutionTransport, UserAutomationDueWakeRejection,
-    UserAutomationDueWakeResolution, UserAutomationDurableJobPort, UserAutomationHorizonOutcome,
-    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
-    UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
-    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
-    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError,
+    UserAutomationDueWakeRejection, UserAutomationDueWakeResolution, UserAutomationDurableJobPort,
+    UserAutomationHorizonOutcome, UserAutomationHorizonPhase, UserAutomationHorizonTrigger,
+    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionTransport, UserAutomationOwnerLookup,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
+    resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
-    AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
-    RequestIdentity, TaskControllerResultBody, host_request_operation_id,
+    AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
+    HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt, RequestIdentity,
+    TaskControllerResultBody, host_request_operation_id,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -448,6 +450,7 @@ fn daemon_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownRequest => "daemon_unknown_request",
         TransportError::UnknownOutcome => "daemon_unknown_outcome",
         TransportError::IdentityConflict => "daemon_identity_conflict",
+        TransportError::LegacyCorrelationUnresolved => "daemon_legacy_correlation_unresolved",
         TransportError::Cancelled => "daemon_cancelled",
         TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
             "daemon_backpressure"
@@ -5699,9 +5702,19 @@ impl KernelComposition {
             eliot_kernel_service::WasmControlKind::Shutdown,
         )?;
         let cancelled = gateway
-            .cancel_with_origin_grant(&owner, operation.operation_id, &grant)
+            .cancel_with_origin_grant(&owner, operation.operation_id.clone(), &grant)
             .await
             .map_err(|_| TransportError::SessionFenced)?;
+        // CHILD-1/CHILD-2 (#1918): closing the kill produces the
+        // descendant-closure receipt as durable audit evidence. The kill
+        // receipt stays authoritative: a close fault keeps its own terminal
+        // diagnostic from the close boundary and never loses the kill.
+        if let Ok(receipt) = gateway
+            .close_registered_descendant(&owner, operation.operation_id.clone())
+            .await
+        {
+            self.audit_observe(AuditEventDraft::descendant_closure(&receipt));
+        }
         let mut value = serde_json::json!({
             "kind": "origin_control_kill",
             "grant": grant,
@@ -6912,9 +6925,9 @@ impl KernelComposition {
             };
         }
         let gateway = self.retained_store_gateway()?;
-        match gateway.execute_named(operation.request).await {
+        match gateway.execute_named_with_error(operation.request).await {
             Ok(response) => Ok(store_named_response(&response)),
-            Err(error) => Ok(Self::store_error_response_text("store_named", &error)),
+            Err(error) => Ok(Self::store_read_failure_response("store_named", &error)),
         }
     }
 
@@ -7033,14 +7046,18 @@ impl KernelComposition {
         }
         validate_store_session_fence(session, &read.state_fence)?;
         let gateway = self.retained_store_gateway()?;
-        let response = match gateway.execute_named(read).await {
+        let response = match gateway.execute_named_with_error(read).await {
             Ok(response) => response,
-            Err(error) => return Ok(Self::store_error_response_text("local_read", &error)),
+            Err(error) => {
+                return Ok(Self::store_read_failure_response("local_read", &error));
+            }
         };
-        if response.operation != NamedReadOperation::GetEvidencePack {
+        if response.operation != NamedReadOperation::GetEvidencePack
+            || response.state_fence != envelope.state_fence
+        {
             return Ok(Self::store_error_response_text(
                 "local_read",
-                "named-read operation does not match request",
+                "named-read operation or State Fence does not match request",
             ));
         }
         let (digest, body) = AuthenticatedHostSession::build_local_read_result_body(
@@ -7049,9 +7066,35 @@ impl KernelComposition {
             &selectors.subject,
             selectors.max_records,
             &selectors.intent_mode,
-            response.payload,
+            response.payload.clone(),
+            Some(&response),
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        let lineage = HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: digest.clone(),
+            producer_ref: None,
+            source_revisions: Some(
+                response
+                    .revision_heads
+                    .iter()
+                    .map(|head| HostRequestResultSourceRevision {
+                        key: head.key.as_str().to_owned(),
+                        revision: head.revision,
+                        state_fence: head.state_fence.clone(),
+                    })
+                    .collect(),
+            ),
+            source_state_fence: Some(response.state_fence),
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        };
         // The sync leg completes through the shared submit gate, never
         // through a private persist: attempt currency, deadline, fence, and
         // staleness joins are identical to the async submit leg. A concurrent
@@ -7065,9 +7108,10 @@ impl KernelComposition {
             result_digest: digest,
             response: body,
             attempt: Some(attempt),
+            lineage: Some(lineage),
         };
         submission
-            .validate()
+            .validate_local_read_submission()
             .map_err(|_| TransportError::SessionFenced)?;
         let resulted = match self.submit_local_read_result(session, &submission)? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
@@ -7852,6 +7896,21 @@ impl KernelComposition {
             "recovery": null,
         })
     }
+
+    #[cfg(windows)]
+    fn store_read_failure_response(kind: &str, error: &NamedReadGatewayError) -> serde_json::Value {
+        if matches!(error, NamedReadGatewayError::Store(StoreError::Unavailable)) {
+            return serde_json::json!({
+                "status": "error",
+                "code": "DB_UNAVAILABLE",
+                "reason": "Canonical Store is unavailable; named read was not completed.",
+                "value": { "kind": kind, "value": null },
+                "recovery": null,
+            });
+        }
+
+        Self::store_error_response_text(kind, &error.to_string())
+    }
 }
 
 /// Closed outcome of the graceful WASM control half of one
@@ -8523,6 +8582,7 @@ mod local_read_dispatch_tests {
             identity: eliot_protocol::HostRequestIdentity {
                 request_id: eliot_contracts::RequestId::new("host-request-1")
                     .expect("valid request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,

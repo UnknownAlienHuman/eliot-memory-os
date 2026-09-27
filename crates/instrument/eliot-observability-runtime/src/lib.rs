@@ -31,10 +31,12 @@ pub mod config;
 pub mod crash;
 pub mod critical_path;
 pub mod event_log;
+pub mod metric_groups;
 pub mod metrics;
 pub mod otlp;
 pub mod rolling_log;
 pub mod spool;
+pub mod usage_cost;
 
 pub use bootstrap::{MetricsRegistry, ObservabilityInstall, ObservabilityInstallOutcome, install};
 pub use config::{
@@ -46,7 +48,19 @@ pub use critical_path::{
     CriticalEventState, CriticalPath, CriticalPathOutcome, SinkStatus, UnavailableReason,
 };
 pub use event_log::{EventLogOutcome, EventLogReport, SystemServiceEvent};
-pub use metrics::{Metric, MetricError, MetricKind, OpenMetrics};
+pub use metric_groups::{
+    AuditSinkOutcome, BinaryIdentity, ExecutionPathMetrics, FinishOutcome, LABEL_KEY_COUNT,
+    LabelKey, LifecycleOutcome, LocalPortOutcome, LocalPortPhase, MetricDefinition, MetricGroup,
+    MetricLabelError, MetricSubject, ModuleHealthOutcome, ModuleIdentity, RouteFingerprintId,
+    RouteOutcome, TraceCompletenessOutcome, WorkClass, WorkTerminationOutcome, metric_catalogue,
+    metric_label_schema_version,
+};
+pub use metrics::{METRIC_LABEL_KEYS, Metric, MetricError, MetricKind, OpenMetrics};
 pub use otlp::{OtlpBridge, OtlpBridgeError, OtlpDisposition, OtlpExport, otlp_enabled};
 pub use rolling_log::{RollingLogError, RollingLogHandle, RollingLogShutdown, RollingLogWriter};
 pub use spool::{EventSpool, EventSpoolError, SpoolSinks};
+pub use usage_cost::{
+    BilledCost, CallCounts, CostEstimate, CurrencyCode, CurrencyContract, EstimateUnit,
+    IncidentalCost, ProviderId, QuotaSource, ResourceUse, SubscriptionQuota, TokenCounts,
+    UsageCostError, UsageCostRecord, UsageCostStore, UsageFacts, UsageKey, UsageScope, UsageTruth,
+};

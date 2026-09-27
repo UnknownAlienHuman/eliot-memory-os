@@ -123,6 +123,7 @@ mod integration_discovery;
 mod package;
 mod package_planner;
 mod plan;
+mod profile_governed_roots;
 mod profile_roots;
 mod redb_state;
 mod registry_wire;
@@ -216,6 +217,7 @@ pub use plan::{
     PackageArtifactDigest, PlannedChange, SupervisionAuthorityProvisionPlan,
 };
 use plan::{validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings};
+pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
 pub use profile_roots::InstallationRoots;
 pub use redb_state::{
     RedbInstallationTransactionStore, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,

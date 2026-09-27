@@ -56,6 +56,7 @@ fn query_envelope(
         connection_id: "conn-test-1".to_owned(),
         identity: HostRequestIdentity {
             request_id: eliot_contracts::RequestId::new(request_id).expect("valid request id"),
+            correlation_projection: None,
             idempotency_key: format!("{request_id}:invoke"),
             cancellation_id: format!("{request_id}:invoke:cancel"),
             parent_operation_id: None,
@@ -132,6 +133,7 @@ fn result_body_for(
         result_digest: digest,
         response,
         attempt,
+        lineage: None,
     }
 }
 

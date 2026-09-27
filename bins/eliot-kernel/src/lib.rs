@@ -71,6 +71,7 @@ mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
+mod tool_exposure;
 
 /// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
@@ -164,6 +165,7 @@ use eliot_kernel_core::{
     ProcessExecutionReplayRecord, ProcessExecutionReplayState, process_admission_digest,
 };
 
+mod activation_lifecycle;
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
@@ -4037,6 +4039,37 @@ impl KernelComposition {
         }
         if !runtime_outcome.no_orphans {
             pending.push("runtime-orphans-retained".to_owned());
+        }
+        // CHILD-1/CHILD-2 (#1918): every still-registered descendant closes
+        // with its own receipt as durable audit evidence. An unproven or
+        // still-open closure retains pending work instead of reporting a
+        // clean terminal.
+        let descendant_outcomes = match self.process_gateway.as_ref() {
+            Some(gateway) => gateway.close_all_registered_descendants().await,
+            None => Vec::new(),
+        };
+        if self
+            .process_gateway
+            .as_ref()
+            .is_some_and(|gateway| gateway.descendants.lock().is_err())
+        {
+            pending.push("descendant-registry-unreadable".to_owned());
+        }
+        for (operation_id, outcome) in &descendant_outcomes {
+            match outcome {
+                Ok(receipt) => {
+                    self.audit_observe(AuditEventDraft::descendant_closure(receipt));
+                    if !receipt.all_closed() {
+                        pending.push(format!("descendant-closure-open:{}", operation_id.as_str()));
+                    }
+                }
+                Err(_) => {
+                    pending.push(format!(
+                        "descendant-closure-unproven:{}",
+                        operation_id.as_str()
+                    ));
+                }
+            }
         }
         if drain.is_ok() && pending.is_empty() {
             coordinator

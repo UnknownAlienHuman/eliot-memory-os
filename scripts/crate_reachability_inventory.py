@@ -195,6 +195,10 @@ class MetadataGraph:
     workspace_default_members: tuple[str, ...]
     packages: tuple[Mapping[str, Any], ...]
     resolve: Mapping[str, Any] | None
+    # True when resolved under --locked against a pre-existing adjacent lockfile.
+    # An unlocked graph resolved against ambient registry cache, which is not a
+    # bound evidence input; the flag keeps that resolution mode visible (A10).
+    locked: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -495,16 +499,43 @@ def _tracked_manifests(root: Path, runner: Runner) -> tuple[str, ...]:
     return unique
 
 
+def _remove_created_lockfile(lock_path: Path, *, existed_before: bool) -> None:
+    """Delete a Cargo.lock created as a side effect of unlocked metadata.
+
+    `cargo metadata` without `--locked` resolves and writes the adjacent
+    lockfile. The inventory is read-only evidence (A12): a lockfile that did
+    not exist before the call must not survive it. A pre-existing lockfile,
+    symlink, or directory is never touched.
+    """
+    if existed_before:
+        return
+    if lock_path.is_symlink() or not lock_path.is_file():
+        return
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise InventoryError(
+            "LOCKFILE_CLEANUP_FAILED",
+            f"cannot remove cargo-created lockfile: {lock_path}",
+        ) from exc
+
+
 def _metadata(root: Path, runner: Runner, manifest: str | None = None) -> MetadataGraph:
     manifest_dir = (root / manifest).parent if manifest is not None else root
-    lockfile_exists = (manifest_dir / "Cargo.lock").exists()
+    lock_path = manifest_dir / "Cargo.lock"
+    lockfile_exists = lock_path.exists()
     argv: list[str] = ["cargo", "metadata"]
     if lockfile_exists:
         argv.append("--locked")
     argv.extend(("--offline", "--all-features", "--format-version", "1"))
     if manifest is not None:
         argv.extend(("--manifest-path", manifest))
-    raw = runner.run(root, tuple(argv))
+    try:
+        raw = runner.run(root, tuple(argv))
+    finally:
+        _remove_created_lockfile(lock_path, existed_before=lockfile_exists)
     value = _json_object(raw, source="cargo metadata")
     packages = value.get("packages")
     members = value.get("workspace_members")
@@ -523,6 +554,7 @@ def _metadata(root: Path, runner: Runner, manifest: str | None = None) -> Metada
         workspace_default_members=tuple(str(item) for item in defaults),
         packages=tuple(item for item in packages if isinstance(item, dict)),
         resolve=value.get("resolve") if isinstance(value.get("resolve"), dict) else None,
+        locked=lockfile_exists,
     )
 
 
@@ -1399,6 +1431,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
                 "workspace_root": graph.workspace_root,
                 "workspace_members": graph.workspace_members,
                 "workspace_default_members": graph.workspace_default_members,
+                "locked": graph.locked,
             }
             for graph in sorted(graphs, key=lambda item: (item.manifest_path, item.graph_id))
         ],
@@ -1422,6 +1455,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
         "summary": {
             "tracked_manifests": len(manifests),
             "metadata_graphs": len(graphs),
+            "unlocked_metadata_graphs": sum(not graph.locked for graph in graphs),
             "packages": len(packages),
             "source_files": len(source_files),
             "findings": len(findings),

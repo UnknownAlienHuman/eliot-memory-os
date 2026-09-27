@@ -18,9 +18,12 @@ use eliot_contracts::{
 };
 use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
-use eliot_receipts::{ReceiptEnvelope, ReceiptKind, RequestBinding};
+use eliot_receipts::{ProofCeiling, ReceiptEnvelope, ReceiptKind, RequestBinding};
 pub use eliot_runtime_contracts::ModuleGeneration as ProtocolModuleGeneration;
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, RecoveryDirective};
+use eliot_security_contracts::{
+    InfluenceState, InstructionTaint, PolicyFence, TransformationLineage,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -192,6 +195,9 @@ pub enum ProtocolError {
     /// A message type is not admitted by this protocol surface.
     #[error("unknown message type")]
     UnknownMessageType,
+    /// An event payload type is not in the closed known-payload registry.
+    #[error("unknown event payload type")]
+    UnknownEventPayloadType,
     /// The negotiated encoding has no implementation in this crate.
     #[error("unsupported encoding profile: {0}")]
     UnsupportedEncoding(String),
@@ -830,6 +836,42 @@ impl EventEnvelope {
     fn replay_key(&self) -> EventIdentityKey {
         EventIdentityKey::new(&self.stream_id, &self.event_id)
     }
+
+    /// Rejects envelopes whose payload type no known producer mints.
+    ///
+    /// The rejection preserves the presented event identity: nothing is
+    /// minted, staged, or cursor-advanced. Receivers call this after
+    /// [`Self::validate`].
+    pub fn require_known_payload_type(&self) -> Result<(), ProtocolError> {
+        if is_known_event_payload_type(&self.payload_type) {
+            Ok(())
+        } else {
+            Err(ProtocolError::UnknownEventPayloadType)
+        }
+    }
+}
+
+/// Bridge-event payload type minted by the `OpenCode` plugin route.
+///
+/// Paired with `eliot-agent-opencode/src/ingress.rs::HOST_EVENTS_PAYLOAD_TYPE`,
+/// which cannot depend on this crate back; both are the same stable wire
+/// string and must change together.
+pub const OPENCODE_HOST_EVENT_PAYLOAD_TYPE: &str = "eliot.opencode.host-event.v1";
+
+/// Returns whether an event payload type is produced by a known owner.
+///
+/// The closed registry names exactly the production [`EventEnvelope`]
+/// producers: the reactive-context route ([`REACTIVE_CONTEXT_PAYLOAD_TYPE`]),
+/// the backup route ([`BACKUP_PAYLOAD_TYPE`]), and the `OpenCode` bridge route
+/// ([`OPENCODE_HOST_EVENT_PAYLOAD_TYPE`]). Receivers reject anything else via
+/// [`EventEnvelope::require_known_payload_type`] without minting a new event
+/// identity.
+#[must_use]
+pub fn is_known_event_payload_type(payload_type: &str) -> bool {
+    matches!(
+        payload_type,
+        REACTIVE_CONTEXT_PAYLOAD_TYPE | BACKUP_PAYLOAD_TYPE | OPENCODE_HOST_EVENT_PAYLOAD_TYPE
+    )
 }
 
 /// Explicit acknowledgement phase for a durable event.
@@ -3019,7 +3061,7 @@ pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID: &str =
 /// Current bridge process binding wire version.
 pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_VERSION: u16 = 1;
 /// Bounded length for host-request identity text fields.
-const MAX_HOST_REQUEST_TEXT_BYTES: usize = 512;
+pub const MAX_HOST_REQUEST_TEXT_BYTES: usize = 512;
 
 /// Closed P-04 host-request kinds admitted by the Kernel admission gate.
 ///
@@ -3069,12 +3111,16 @@ impl HostRequestKind {
 pub struct HostRequestIdentity {
     /// Exact request identity, unique per envelope.
     pub request_id: RequestId,
+    /// Explicit typed host correlation; absent only on historical envelopes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_projection: Option<eliot_contracts::HostCorrelationProjection>,
     /// Caller-provided idempotency key for exact replay.
     pub idempotency_key: String,
     /// Cancellation identity for the request lifecycle.
     pub cancellation_id: String,
     /// Exact previously admitted operation targeted by Cancellation, Status,
-    /// and Reconciliation kinds; lineage reference otherwise.
+    /// and Reconciliation kinds; absent only for lookup-only Status.
     pub parent_operation_id: Option<String>,
     /// Kernel-owned absolute deadline in Unix milliseconds.
     pub deadline_unix_ms: u64,
@@ -3248,12 +3294,35 @@ impl HostRequestIdentity {
             MAX_HOST_REQUEST_TEXT_BYTES,
         )?;
         lowercase_sha256(&self.payload_sha256, "host_request.payload_sha256")?;
+        if let Some(projection) = &self.correlation_projection {
+            projection
+                .validate()
+                .map_err(|_| ProtocolError::InvalidField {
+                    field: "host_request.correlation_projection",
+                    reason: "must be a bounded explicit correlation projection",
+                })?;
+            if projection.occurrence_text() != self.request_id.as_str() {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request.correlation_projection",
+                    reason: "must encode the exact request_id text",
+                });
+            }
+        }
         Ok(())
     }
 
     /// Validates per-kind identity presence rules.
     pub fn validate_for_kind(&self, kind: HostRequestKind) -> Result<(), ProtocolError> {
         self.validate()?;
+        if matches!(
+            self.correlation_projection.as_ref(),
+            Some(eliot_contracts::HostCorrelationProjection::KernelOperational { .. })
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.correlation_projection",
+                reason: "Kernel operational correlation is not admitted from a host envelope",
+            });
+        }
         let semantic_selected =
             self.session_id.is_some() || self.task_id.is_some() || self.work_scope_id.is_some();
         match kind {
@@ -3272,6 +3341,18 @@ impl HostRequestIdentity {
                 }
             }
             HostRequestKind::Invocation => {
+                if self
+                    .correlation_projection
+                    .as_ref()
+                    .is_some_and(|projection| {
+                        projection.domain() != eliot_contracts::HostCorrelationDomain::Request
+                    })
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "invocation projection must use request domain",
+                    });
+                }
                 if self.session_id.is_none() {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.session_id",
@@ -3282,10 +3363,24 @@ impl HostRequestIdentity {
             HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
-                if self.parent_operation_id.is_none() {
+                if let Some(projection) = &self.correlation_projection
+                    && (kind != HostRequestKind::Cancellation
+                        || projection.domain()
+                            != eliot_contracts::HostCorrelationDomain::Cancellation)
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "only cancellations may carry a cancellation-domain projection",
+                    });
+                }
+                if self.parent_operation_id.is_none()
+                    && !(kind == HostRequestKind::Status
+                        && self.session_id.is_some()
+                        && self.correlation_projection.is_none())
+                {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.parent_operation_id",
-                        reason: "must target one exact previously admitted operation",
+                        reason: "must target one exact previously admitted operation unless this is an untyped lookup-only Status",
                     });
                 }
             }
@@ -3443,6 +3538,21 @@ impl HostRequestEnvelope {
         self.validate_identity_separation()
     }
 
+    /// Validates an envelope that may receive a Kernel admission receipt.
+    ///
+    /// Parentless `Status` envelopes are lookup-only observations and cannot
+    /// be admitted or reconciled as new host-request operations.
+    pub fn validate_for_admission(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.kind == HostRequestKind::Status && self.identity.parent_operation_id.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.parent_operation_id",
+                reason: "lookup-only Status cannot receive an admission receipt",
+            });
+        }
+        Ok(())
+    }
+
     /// Rejects reuse of one string value across distinct identity domains.
     fn validate_identity_separation(&self) -> Result<(), ProtocolError> {
         let mut domains: Vec<(&str, &'static str)> = vec![
@@ -3574,7 +3684,7 @@ impl HostRequestAdmissionReceipt {
 
     /// Issues a receipt for one validated envelope.
     pub fn issue(envelope: &HostRequestEnvelope) -> Result<Self, ProtocolError> {
-        envelope.validate()?;
+        envelope.validate_for_admission()?;
         Self {
             wire_id: HOST_REQUEST_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
             wire_version: Self::CONTRACT_VERSION,
@@ -3674,7 +3784,7 @@ impl HostRequestAdmissionReceipt {
     /// Validates that this receipt was issued for the exact envelope.
     pub fn validate_envelope(&self, envelope: &HostRequestEnvelope) -> Result<(), ProtocolError> {
         self.validate()?;
-        envelope.validate()?;
+        envelope.validate_for_admission()?;
         if self.operation_id != host_request_operation_id(envelope)
             || self.request_id != envelope.identity.request_id
             || self.kind != envelope.kind
@@ -3699,12 +3809,13 @@ pub const HOST_REQUEST_INVOKE_READ_WIRE_VERSION: u16 = 1;
 pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-result-body";
 /// Current host-request result body wire version.
 ///
-/// Version 2 carries the governed attempt binding (`attempt`): the
-/// Kernel-issued fenced capability the completing daemon must present. Stored
-/// version-1 rows predate attempt ownership and still decode (the field
-/// defaults to `None`); the Kernel claim/submit legs require a current attempt
-/// and never accept a body without one.
-pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 2;
+/// Version 3 adds optional, byte-bound result lineage. Version 2 remains
+/// readable for retained-result readback only. Version 1 rows predate attempt
+/// ownership and still decode (the field defaults to `None`). Current
+/// submissions require a v3 body and the Kernel-minted attempt; local-read
+/// submissions additionally require explicit result lineage.
+pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 3;
+const HOST_REQUEST_RESULT_BODY_V2_READBACK_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for a Kernel-issued local-read attempt capability.
 pub const LOCAL_READ_ATTEMPT_WIRE_ID: &str = "eliot.protocol.local-read-attempt";
 /// Current local-read attempt capability wire version.
@@ -3814,6 +3925,10 @@ pub struct HostRequestResultBody {
     pub result_digest: String,
     /// Exact bounded response JSON (answer payload plus revision).
     pub response: Value,
+    /// Exact result lineage. Missing legacy lineage means unknown origin and
+    /// influence; it never means clean or semantically admitted.
+    #[serde(default)]
+    pub lineage: Option<HostRequestResultLineage>,
     /// Governed attempt binding for the completing daemon. `None` only for
     /// stored rows that predate attempt ownership; submissions must carry the
     /// current attempt.
@@ -3821,18 +3936,204 @@ pub struct HostRequestResultBody {
     pub attempt: Option<LocalReadAttempt>,
 }
 
+/// Result-side lineage bound to the exact bytes in [`HostRequestResultBody::response`].
+///
+/// Each optional field uses `None` to mean unknown or unavailable, never clean.
+/// This contract preserves claims and references; it does not authenticate an
+/// origin, establish semantic truth, or promote a model result. The output
+/// digest must equal the parent body's `result_digest` so these claims follow
+/// the exact final result bytes rather than only the request identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestResultLineage {
+    /// Optional immutable artifact handle for the exact output bytes.
+    #[serde(default)]
+    pub output_artifact_ref: Option<String>,
+    /// SHA-256 of the exact parent response bytes; must equal `result_digest`.
+    pub output_digest: String,
+    /// Authenticated producer principal/service reference, when available.
+    #[serde(default)]
+    pub producer_ref: Option<String>,
+    /// Exact source revision heads. `None` means that source revision coverage
+    /// is unknown; each known head retains its own fence.
+    #[serde(default)]
+    pub source_revisions: Option<Vec<HostRequestResultSourceRevision>>,
+    /// Fence bound to the named read itself, distinct from per-head fences.
+    #[serde(default)]
+    pub source_state_fence: Option<StateFence>,
+    /// Exact source or intermediate input references, when available.
+    #[serde(default)]
+    pub input_refs: Option<Vec<String>>,
+    /// Existing typed transformation/taint lineage, in source-to-output order.
+    #[serde(default)]
+    pub transformation_lineage: Option<Vec<TransformationLineage>>,
+    /// Inherited disclosure/taint closure references, when available.
+    #[serde(default)]
+    pub closure_refs: Option<Vec<String>>,
+    /// Applicable policy snapshot and its exact fence, when available.
+    #[serde(default)]
+    pub policy_fence: Option<PolicyFence>,
+    /// References to origin-authentication evidence; presence is not itself
+    /// authentication because the referenced evidence must be verified by its owner.
+    #[serde(default)]
+    pub origin_evidence_refs: Option<Vec<String>>,
+    /// Maximum receipt interpretation, not a semantic truth/admission status.
+    #[serde(default)]
+    pub proof_ceiling: Option<ProofCeiling>,
+    /// Influence is fail-closed when omitted from a lineage record.
+    #[serde(default = "unknown_result_influence")]
+    pub influence_state: InfluenceState,
+    /// Instruction/data taint. `None` means unknown, not cleared.
+    #[serde(default)]
+    pub instruction_taint: Option<InstructionTaint>,
+}
+
+/// Exact source revision observed by a local read, without depending on the
+/// storage crate that owns the canonical `RevisionHead` type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestResultSourceRevision {
+    /// Exact opaque source revision key.
+    pub key: String,
+    /// Nonzero revision observed for `key`.
+    pub revision: u64,
+    /// Fence attached to this particular revision head.
+    pub state_fence: StateFence,
+}
+
+const fn unknown_result_influence() -> InfluenceState {
+    InfluenceState::Unknown
+}
+
+impl HostRequestResultLineage {
+    fn validate(
+        &self,
+        result_digest: &str,
+        attempt: Option<&LocalReadAttempt>,
+    ) -> Result<(), ProtocolError> {
+        lowercase_sha256(
+            &self.output_digest,
+            "host_request_result_body.lineage.output_digest",
+        )?;
+        if self.output_digest != result_digest {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage.output_digest",
+                reason: "lineage digest does not bind the exact response bytes",
+            });
+        }
+        if let Some(reference) = &self.output_artifact_ref {
+            bounded_text(
+                reference,
+                "host_request_result_body.lineage.output_artifact_ref",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        if let Some(reference) = &self.producer_ref {
+            bounded_text(
+                reference,
+                "host_request_result_body.lineage.producer_ref",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        for (references, field) in [
+            (
+                &self.input_refs,
+                "host_request_result_body.lineage.input_refs",
+            ),
+            (
+                &self.closure_refs,
+                "host_request_result_body.lineage.closure_refs",
+            ),
+            (
+                &self.origin_evidence_refs,
+                "host_request_result_body.lineage.origin_evidence_refs",
+            ),
+        ] {
+            if let Some(references) = references {
+                unique_texts(references, field)?;
+                for reference in references {
+                    bounded_text(reference, field, MAX_HOST_REQUEST_TEXT_BYTES)?;
+                }
+            }
+        }
+        if let Some(fence) = &self.source_state_fence {
+            fence.validate()?;
+            if attempt.is_some_and(|attempt| {
+                !fence
+                    .authority_epoch
+                    .is_same_authority(&attempt.authority_epoch)
+            }) {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request_result_body.lineage.source_state_fence",
+                    reason: "source fence does not match the governed attempt epoch",
+                });
+            }
+        }
+        if let Some(revisions) = &self.source_revisions {
+            let mut revision_keys = std::collections::BTreeSet::new();
+            for revision in revisions {
+                bounded_text(
+                    &revision.key,
+                    "host_request_result_body.lineage.source_revisions.key",
+                    MAX_HOST_REQUEST_TEXT_BYTES,
+                )?;
+                if !revision_keys.insert(&revision.key) {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request_result_body.lineage.source_revisions",
+                        reason: "source revision keys must be unique",
+                    });
+                }
+                if revision.revision == 0 {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request_result_body.lineage.source_revisions.revision",
+                        reason: "source revision must be non-zero",
+                    });
+                }
+                revision.state_fence.validate()?;
+            }
+        }
+        if let Some(policy_fence) = &self.policy_fence {
+            bounded_text(
+                &policy_fence.policy_snapshot_id,
+                "host_request_result_body.lineage.policy_fence.policy_snapshot_id",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+            policy_fence.state_fence.validate()?;
+        }
+        if let Some(transformations) = &self.transformation_lineage {
+            for transformation in transformations {
+                transformation
+                    .validate()
+                    .map_err(|error| ProtocolError::Provider {
+                        provider: "eliot-security-contracts",
+                        reason: error.to_string(),
+                    })?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl HostRequestResultBody {
     /// Current body contract version.
     pub const CONTRACT_VERSION: u16 = HOST_REQUEST_RESULT_BODY_WIRE_VERSION;
 
-    /// Validates the closed body shape and the digest binding.
+    /// Validates the closed body shape and exact response/lineage digest binding.
+    ///
+    /// Version 2 is accepted only as a retained readback with no lineage. It is
+    /// never accepted by submission validation. Version 1 remains decodable
+    /// for compatibility, but is not shape-validated by this method.
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        let version_is_current = self.wire_version == Self::CONTRACT_VERSION;
+        let version_is_legacy_readback = self.wire_version
+            == HOST_REQUEST_RESULT_BODY_V2_READBACK_WIRE_VERSION
+            && self.lineage.is_none();
         if self.wire_id != HOST_REQUEST_RESULT_BODY_WIRE_ID
-            || self.wire_version != Self::CONTRACT_VERSION
+            || (!version_is_current && !version_is_legacy_readback)
         {
             return Err(ProtocolError::InvalidField {
                 field: "host_request_result_body.wire",
-                reason: "unsupported host-request result body",
+                reason: "unsupported host-request result body or legacy lineage",
             });
         }
         bounded_text(
@@ -3891,6 +4192,36 @@ impl HostRequestResultBody {
                     reason: "attempt does not bind the exact operation handle",
                 });
             }
+        }
+        if let Some(lineage) = &self.lineage {
+            lineage.validate(&self.result_digest, self.attempt.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Validates a current result for submission after the Kernel has attached
+    /// its governed attempt. This is not semantic admission or promotion.
+    pub fn validate_for_submission(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.wire_version != Self::CONTRACT_VERSION || self.attempt.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.submission",
+                reason: "submission requires the current wire version and governed attempt",
+            });
+        }
+        Ok(())
+    }
+
+    /// Applies the additional lineage requirement to a local-read submission.
+    /// Other producers may submit a v3 body with unknown lineage, which remains
+    /// unknown and carries no semantic admission.
+    pub fn validate_local_read_submission(&self) -> Result<(), ProtocolError> {
+        self.validate_for_submission()?;
+        if self.lineage.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage",
+                reason: "local-read submission requires explicit result lineage",
+            });
         }
         Ok(())
     }
