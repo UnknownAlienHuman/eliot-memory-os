@@ -15,7 +15,11 @@ use thiserror::Error;
 
 /// Current wire revision for the C0-06 contract fragment.
 pub const CONTRACT_VERSION: &str = "eliot-agent-contracts/v1";
-const MAX_DELTA_BYTES: usize = 64 * 1024;
+/// Maximum serialized payload size shared with the durable mailbox.
+pub const MAX_LIVE_PEER_PAYLOAD_BYTES: usize = 65_536;
+const MAX_DELTA_BYTES: usize = MAX_LIVE_PEER_PAYLOAD_BYTES;
+/// Maximum evidence/artifact handle fan-out, shared with the mailbox owner.
+pub const MAX_LIVE_PEER_REFERENCES: usize = 16;
 
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
@@ -603,6 +607,14 @@ pub enum DeliveryPolicy {
     Unavailable,
 }
 
+/// When an admitted delta may be observed; this is separate from the route's
+/// delivery capability (`DeliveryPolicy`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LivePeerDeliveryPolicy {
+    NextAdmissibleBoundary,
+}
+
 /// Mailbox lifecycle. Delivery, acknowledgement, use and helpfulness remain
 /// separate observations and are not fields on this lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -615,6 +627,84 @@ pub enum LivePeerMessageState {
     Stale,
     Expired,
     Cancelled,
+}
+
+/// Content-only live-peer payload stored inside the existing mailbox record.
+/// Message identity, principals, time/order, privacy, State Fence and
+/// lifecycle stay on the common mailbox envelope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LivePeerMessagePayload {
+    pub sender_attempt_id: AgentAttemptId,
+    pub sender_work_item_id: WorkItemId,
+    pub recipients: Vec<RecipientRef>,
+    pub plan_revision: RevisionId,
+    pub wave_revision: RevisionId,
+    pub kind: LivePeerMessageKind,
+    pub concise_delta: String,
+    pub evidence_refs: Vec<PublicReference>,
+    pub requested_reaction: RequestedReaction,
+    pub urgency: MessageUrgency,
+    pub dedup_key: String,
+    pub expires_at: Option<String>,
+    pub delivery_policy: LivePeerDeliveryPolicy,
+}
+
+impl LivePeerMessagePayload {
+    /// Validates payload bounds, explicit recipients and public evidence.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_text(self.sender_attempt_id.as_str(), "sender_attempt_id")?;
+        validate_text(self.sender_work_item_id.as_str(), "sender_work_item_id")?;
+        validate_text(self.plan_revision.as_str(), "plan_revision")?;
+        validate_text(self.wave_revision.as_str(), "wave_revision")?;
+        validate_text(&self.concise_delta, "concise_delta")?;
+        if self.concise_delta.len() > MAX_DELTA_BYTES {
+            return Err(ContractError::PayloadTooLarge("concise_delta"));
+        }
+        validate_text(&self.dedup_key, "dedup_key")?;
+        validate_collection(&self.recipients, "recipients")?;
+        if self.evidence_refs.len() > MAX_LIVE_PEER_REFERENCES {
+            return Err(ContractError::PayloadTooLarge("evidence_refs"));
+        }
+        if let Some(expires_at) = &self.expires_at {
+            if expires_at.is_empty() || !expires_at.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ContractError::InvalidReference);
+            }
+            let _ = expires_at
+                .parse::<u64>()
+                .map_err(|_| ContractError::InvalidReference)?;
+        }
+        for recipient in &self.recipients {
+            recipient.validate()?;
+            if recipient.attempt_id.as_ref() == Some(&self.sender_attempt_id)
+                || recipient.work_item_id.as_ref() == Some(&self.sender_work_item_id)
+            {
+                return Err(ContractError::SelfRecipient);
+            }
+        }
+        for reference in &self.evidence_refs {
+            reference.validate()?;
+        }
+        let payload_bytes = eliot_contracts::canonical_json_bytes(self)
+            .map_err(|_| ContractError::InvalidReference)?;
+        if payload_bytes.len() > MAX_LIVE_PEER_PAYLOAD_BYTES {
+            return Err(ContractError::PayloadTooLarge("live_peer_payload"));
+        }
+        Ok(())
+    }
+
+    /// Checks recipient and frozen revision identity against the current map.
+    pub fn validate_against_map(&self, map: &CoordinationMapView) -> Result<(), ContractError> {
+        self.validate()?;
+        map.validate()?;
+        if self.plan_revision != map.plan_revision || self.wave_revision != map.wave_revision {
+            return Err(ContractError::StaleFence);
+        }
+        for recipient in &self.recipients {
+            map.resolve_recipient(recipient)?;
+        }
+        Ok(())
+    }
 }
 
 /// Public bounded peer delta.
@@ -640,30 +730,30 @@ pub struct LivePeerMessage {
 }
 
 impl LivePeerMessage {
+    /// Projects the existing envelope contract into its content-only payload.
+    #[must_use]
+    pub fn payload(&self) -> LivePeerMessagePayload {
+        LivePeerMessagePayload {
+            sender_attempt_id: self.sender_attempt_id.clone(),
+            sender_work_item_id: self.sender_work_item_id.clone(),
+            recipients: self.recipients.clone(),
+            plan_revision: self.plan_revision.clone(),
+            wave_revision: self.wave_revision.clone(),
+            kind: self.kind,
+            concise_delta: self.concise_delta.clone(),
+            evidence_refs: self.evidence_refs.clone(),
+            requested_reaction: self.requested_reaction,
+            urgency: self.urgency,
+            dedup_key: self.dedup_key.clone(),
+            expires_at: self.expires_at.clone(),
+            delivery_policy: LivePeerDeliveryPolicy::NextAdmissibleBoundary,
+        }
+    }
+
     /// Validates recipients, payload bound, public-only evidence and fence.
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_text(self.message_id.as_str(), "message_id")?;
-        validate_text(self.sender_attempt_id.as_str(), "sender_attempt_id")?;
-        validate_text(self.sender_work_item_id.as_str(), "sender_work_item_id")?;
-        validate_text(self.plan_revision.as_str(), "plan_revision")?;
-        validate_text(self.wave_revision.as_str(), "wave_revision")?;
-        validate_text(&self.concise_delta, "concise_delta")?;
-        if self.concise_delta.len() > MAX_DELTA_BYTES {
-            return Err(ContractError::PayloadTooLarge("concise_delta"));
-        }
-        validate_text(&self.dedup_key, "dedup_key")?;
-        validate_collection(&self.recipients, "recipients")?;
-        for recipient in &self.recipients {
-            recipient.validate()?;
-            if recipient.attempt_id.as_ref() == Some(&self.sender_attempt_id)
-                || recipient.work_item_id.as_ref() == Some(&self.sender_work_item_id)
-            {
-                return Err(ContractError::SelfRecipient);
-            }
-        }
-        for reference in &self.evidence_refs {
-            reference.validate()?;
-        }
+        self.payload().validate()?;
         self.state_fence
             .validate()
             .map_err(|_| ContractError::StaleFence)?;
@@ -673,14 +763,7 @@ impl LivePeerMessage {
     /// Checks exact recipient and plan/wave identity against a frozen map.
     pub fn validate_against_map(&self, map: &CoordinationMapView) -> Result<(), ContractError> {
         self.validate()?;
-        map.validate()?;
-        if self.plan_revision != map.plan_revision || self.wave_revision != map.wave_revision {
-            return Err(ContractError::StaleFence);
-        }
-        for recipient in &self.recipients {
-            map.resolve_recipient(recipient)?;
-        }
-        Ok(())
+        self.payload().validate_against_map(map)
     }
 }
 
@@ -820,6 +903,10 @@ pub struct AnchoredReviewItem {
     pub state_fence: StateFence,
     pub lifecycle: ReviewLifecycle,
     pub response_refs: Vec<PublicReference>,
+    #[serde(default)]
+    pub change_refs: Vec<PublicReference>,
+    #[serde(default)]
+    pub verifier_refs: Vec<PublicReference>,
     pub rejection_reason: Option<String>,
 }
 
@@ -844,6 +931,12 @@ impl AnchoredReviewItem {
             .validate()
             .map_err(|_| ContractError::StaleFence)?;
         for reference in &self.response_refs {
+            reference.validate()?;
+        }
+        for reference in &self.change_refs {
+            reference.validate()?;
+        }
+        for reference in &self.verifier_refs {
             reference.validate()?;
         }
         Ok(())
@@ -2228,6 +2321,8 @@ mod tests {
             state_fence: fence(),
             lifecycle: ReviewLifecycle::Draft,
             response_refs: Vec::new(),
+            change_refs: Vec::new(),
+            verifier_refs: Vec::new(),
             rejection_reason: None,
         };
         let resolution = AnchorResolution {
@@ -2264,6 +2359,8 @@ mod tests {
             state_fence: fence(),
             lifecycle: ReviewLifecycle::Draft,
             response_refs: Vec::new(),
+            change_refs: Vec::new(),
+            verifier_refs: Vec::new(),
             rejection_reason: None,
         };
         let resolution = AnchorResolution {
@@ -2384,6 +2481,8 @@ mod tests {
             state_fence: fence(),
             lifecycle: ReviewLifecycle::Answered,
             response_refs: Vec::new(),
+            change_refs: Vec::new(),
+            verifier_refs: Vec::new(),
             rejection_reason: None,
         };
         let mut item = item;

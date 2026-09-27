@@ -105,6 +105,19 @@ fn host_lifecycle_observe_terminal(boundary: &'static HostLifecycleBoundary) {
     host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(boundary));
 }
 
+/// Observes one identity bundle for a boundary the entrypoint records
+/// cannot correlate alone (#891 case 15).
+///
+/// Observation only: the projection carries identities already held at the
+/// call site; slots without a fitting taxonomy value stay explicitly
+/// missing, never guessed. Emits one `INFO` subordinate record, never a
+/// terminal, and returns `()` without touching results, order, locks, or
+/// cleanup.
+fn host_lifecycle_observe_identity(projection: &host_diagnostics::HostRequestProjection) {
+    note_event_log_sink_status();
+    host_diagnostics::observe_host_request(projection);
+}
+
 /// Single-terminal guard for one public fallible operation.
 ///
 /// Armed on entry; the single outermost boundary disarms on success. Any
@@ -1405,6 +1418,63 @@ const BOUNDARY_WAKE_SATISFY_TERMINAL: &HostLifecycleBoundary =
     boundary_by_event("host-wake-satisfy-failed");
 const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
     boundary_by_event("host.wake-satisfied observed");
+
+/// Static identifiers for the propagated-to-boundary exclusions (#891 case
+/// 1): the table rows that own no emission because a coordinated child
+/// boundary emits instead. Every `propagated:` row has exactly one
+/// identifier here, so the exclusion set is explicit and compiler-checked
+/// alongside the emitting `BOUNDARY_*` identifiers above.
+const PROPAGATED_PHASE_B_ROLLBACK: &HostLifecycleBoundary = boundary_by_event(
+    "propagated: emitted by host_composition_phase_b::rollback_uncommitted_phase_b",
+);
+const PROPAGATED_ACTIVATION_TRANSITIONS: &HostLifecycleBoundary =
+    boundary_by_event("propagated: inner edges observed at decision boundaries only");
+const PROPAGATED_CUTOVER_CANDIDATE_ARM: &HostLifecycleBoundary =
+    boundary_by_event("propagated: candidate launch observed at start-manifest boundary");
+
+/// Compile-time `propagated:` prefix test over raw bytes, so exclusion
+/// coverage can run in `const` context like [`boundary_str_eq`].
+const fn boundary_event_is_propagated(event: &str) -> bool {
+    let bytes = event.as_bytes();
+    let prefix = "propagated:".as_bytes();
+    if bytes.len() < prefix.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len() {
+        if bytes[i] != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Compile-time proof that the exclusion identifiers above cover every
+/// propagated row and nothing else: a new `propagated:` row fails the
+/// build until it gains an explicit exclusion identifier, and an
+/// identifier rebound to an emitting row fails the membership check.
+const fn propagated_exclusions_cover_table() -> bool {
+    let mut count = 0;
+    let mut i = 0;
+    while i < HOST_LIFECYCLE_BOUNDARY_TABLE.len() {
+        if boundary_event_is_propagated(HOST_LIFECYCLE_BOUNDARY_TABLE[i].event) {
+            count += 1;
+        }
+        i += 1;
+    }
+    if count != 3 {
+        return false;
+    }
+    boundary_event_is_propagated(PROPAGATED_PHASE_B_ROLLBACK.event)
+        && boundary_event_is_propagated(PROPAGATED_ACTIVATION_TRANSITIONS.event)
+        && boundary_event_is_propagated(PROPAGATED_CUTOVER_CANDIDATE_ARM.event)
+}
+
+const _: () = assert!(
+    propagated_exclusions_cover_table(),
+    "propagated exclusion drift in HOST_LIFECYCLE_BOUNDARY_TABLE",
+);
 /// Returns the frozen `event` spelling for the selected boundary row.
 ///
 /// Every production observation passes its static [`HOST_LIFECYCLE_BOUNDARY_TABLE`]
@@ -4358,26 +4428,31 @@ impl HostJobBranches {
     ) -> Result<BranchLiveness, String> {
         match child {
             Some(child) => {
-                let process = child.evidence().process();
-                if !child
-                    .job_processes()
-                    .map_err(|error| error.to_string())?
-                    .iter()
-                    .any(|observed| observed == process)
-                {
-                    return Err(
-                        "Job observation does not contain the exact launched process".to_owned(),
-                    );
-                }
                 match child.observe().map_err(|error| error.to_string())? {
                     eliot_platform_windows::RunningJobObservation::Running { active_processes }
                         if active_processes > 0 =>
                     {
+                        let process = child.evidence().process();
+                        if !child
+                            .job_processes()
+                            .map_err(|error| error.to_string())?
+                            .iter()
+                            .any(|observed| observed == process)
+                        {
+                            return Err(
+                                "Job observation does not contain the exact launched process"
+                                    .to_owned(),
+                            );
+                        }
                         Ok(BranchLiveness::Live)
                     }
                     eliot_platform_windows::RunningJobObservation::Running { .. } => {
                         Err("running observation reports zero active processes".to_owned())
                     }
+                    // A root-exit observation from the retained Job handle
+                    // routes this branch into cleanup even if member-history
+                    // readback cannot re-observe the root. Replacement still
+                    // requires terminal evidence for the whole Job lineage.
                     eliot_platform_windows::RunningJobObservation::RootExited { .. }
                     | eliot_platform_windows::RunningJobObservation::Exited { .. } => {
                         Ok(BranchLiveness::Dead)
@@ -4505,6 +4580,12 @@ impl HostJobBranches {
                 "approved generation material changed; bounded cutover is required".to_owned(),
             ));
         }
+        if self.approved_generation.as_ref() != Some(generation) {
+            return Err(HostError::ProcessContour(
+                "approved Kernel generation changed; existing recovery decision is required"
+                    .to_owned(),
+            ));
+        }
         let profile = self
             .launch
             .as_ref()
@@ -4589,12 +4670,20 @@ impl HostJobBranches {
                 let Some(child) = kernel.as_mut() else {
                     return Ok(());
                 };
-                child
-                    .terminate_in_place(0xE017_0001)
-                    .map(|_| {
+                let process = child.evidence().process().clone();
+                let job = child.job_identity().clone();
+                match child.terminate_in_place(0xE017_0001) {
+                    Ok(terminated)
+                        if terminated.job_empty()
+                            && terminated.root_reaped()
+                            && terminated.process() == &process
+                            && terminated.job_identity() == &job =>
+                    {
                         kernel.take();
-                    })
-                    .map_err(|_| ())
+                        Ok(())
+                    }
+                    Ok(_) | Err(_) => Err(()),
+                }
             },
             || {
                 self.relaunch_kernel(
@@ -7043,6 +7132,16 @@ impl HostComposition {
         // One terminal per Unknown outcome; inner `execute` shares correlation
         // and never emits its own terminal.
         host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_REQUESTED);
+        // F-LOG-HOST-1 case 15: the restart sighting carries the admitted
+        // installation/generation so SCM restart records correlate; the
+        // operation/process slots stay missing (no fitting taxonomy value
+        // on this path, never a guessed one).
+        host_lifecycle_observe_identity(
+            &host_diagnostics::HostRequestProjection::observed(
+                host_diagnostics::EntrypointStage::ScmDispatch,
+            )
+            .with_launch_options(&self.launch_options),
+        );
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
             // Reconcile is query-only replay, not another restart commit.
             host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK);
@@ -7183,6 +7282,7 @@ impl HostComposition {
                 "unsupported runtime-control operation".to_owned(),
             ));
         }
+
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(existing) = self.runtime_restarts.get(&key).cloned() {
             return Ok(existing);
@@ -7190,6 +7290,18 @@ impl HostComposition {
         if has_runtime_restart_pending(self.launch_options.host_state_root(), &key)? {
             return Err(HostError::RecoveryRequired(
                 "Kernel restart intent is pending and outcome is unknown; reconcile required"
+                    .to_owned(),
+            ));
+        }
+        let active_manifest = self
+            .registry
+            .active()
+            .ok_or_else(|| HostError::ProcessContour("no active manifest".to_owned()))?
+            .manifest
+            .clone();
+        if self.jobs.approved_generation.as_ref() != Some(&active_manifest.generation) {
+            return Err(HostError::ProcessContour(
+                "Kernel restart target differs from the retained approved generation; recovery decision required"
                     .to_owned(),
             ));
         }
@@ -7309,12 +7421,6 @@ impl HostComposition {
                 "Prior kernel disposition does not match durable terminated evidence".to_owned(),
             ));
         }
-        let active_manifest = self
-            .registry
-            .active()
-            .ok_or_else(|| HostError::ProcessContour("no active manifest".to_owned()))?
-            .manifest
-            .clone();
         let (kernel_artifact, _) = active_manifest
             .host_child_artifact_digests()
             .map_err(|e| HostError::ProcessContour(e.to_string()))?;

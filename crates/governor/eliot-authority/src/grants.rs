@@ -11,7 +11,10 @@ use eliot_security_contracts::{EffectCeiling, RevocationReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::revocation_history::derive_suppressions;
+use crate::revocation_history::{
+    AdmittedRevocationClosure, AuthorityRootRef, OriginTargetMismatch, RevocationOrigin,
+    ValidatedRevocationClosure, derive_suppressions,
+};
 use crate::root_transition::{AdmittedRootTransition, AdmittedRootTransitionRecord};
 use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
 
@@ -22,12 +25,42 @@ fn map_bounded_revocation_error(error: eliot_influence::InfluenceError) -> Autho
     AuthorityError::BoundedRevocation(error)
 }
 
+/// Maps one graph-owner refusal onto the typed recovery vocabulary.
+///
+/// The bounded cause is preserved verbatim so a caller can still tell
+/// unsupported schema, incomplete coverage, target drift, and unverified
+/// recovery apart. Every other authority refusal means the graph could not
+/// answer the question at all, which is unknown history; the mapping is
+/// exhaustive so a new authority cause can never be collapsed into a
+/// recovery cause by accident.
 fn map_bounded_history_error(error: AuthorityError) -> RevocationHistoryError {
     match error {
         AuthorityError::BoundedRevocation(error) => {
             RevocationHistoryError::BoundedRevocation(error)
         }
-        _ => RevocationHistoryError::UnknownHistory,
+        AuthorityError::InvalidField(_)
+        | AuthorityError::DuplicateGrant(_)
+        | AuthorityError::MissingParent(_)
+        | AuthorityError::GrantCycle(_)
+        | AuthorityError::GrantNotNarrower(_)
+        | AuthorityError::GrantInactive(_)
+        | AuthorityError::GrantRevoked(_)
+        | AuthorityError::NoEffectivePath
+        | AuthorityError::SupportingPathMissing
+        | AuthorityError::FenceMismatch
+        | AuthorityError::EpochMismatch
+        | AuthorityError::Expired
+        | AuthorityError::Revoked
+        | AuthorityError::Consumed
+        | AuthorityError::UseBudgetExhausted
+        | AuthorityError::UnauthorizedOperation
+        | AuthorityError::UnauthorizedResource
+        | AuthorityError::EffectCeilingExceeded
+        | AuthorityError::IdentityConflict
+        | AuthorityError::StaleTransitionEvidence(_)
+        | AuthorityError::InvalidLifecycleTransition
+        | AuthorityError::ReceiptMismatch
+        | AuthorityError::P07Unavailable => RevocationHistoryError::UnknownHistory,
     }
 }
 
@@ -428,11 +461,28 @@ pub struct GrantRecoveryRecord {
 }
 
 impl GrantGraphRecoverySnapshot {
-    /// Validates both the deterministic wire shape and the graph semantics
-    /// that would be enforced when this snapshot is restored.
+    /// Validates deterministic wire shape and internal graph consistency.
+    ///
+    /// This is not owner readback and does not authorize a transition-bearing
+    /// snapshot for restoration. Public graph restore entry points refuse
+    /// snapshots containing admitted root-transition evidence until a current
+    /// owner readback path is available.
     pub fn validate(&self) -> Result<(), AuthorityError> {
         self.validate_wire()?;
         GrantGraphRecoverySnapshot::restore_owned(self).map(|_| ())
+    }
+
+    /// Refuses to treat snapshot-local transition evidence as current owner
+    /// readback. The original records stay in the caller-owned snapshot for
+    /// audit and later reconciliation.
+    fn require_owner_readback_for_restore(&self) -> Result<(), AuthorityError> {
+        if self.admitted_root_transitions.is_empty() {
+            Ok(())
+        } else {
+            Err(AuthorityError::StaleTransitionEvidence(
+                "grant_graph_recovery.root_transition_owner_readback_required",
+            ))
+        }
     }
 
     fn validate_wire(&self) -> Result<(), AuthorityError> {
@@ -500,8 +550,12 @@ impl GrantGraphRecoverySnapshot {
         Ok(())
     }
 
-    /// Restores owned graph state: admitted authority, admitted transition
-    /// evidence, and inert quarantined relations (#2875 item 9, #2962).
+    /// Reconstructs graph state for internal consistency validation:
+    /// admitted authority, admitted transition evidence, and inert
+    /// quarantined relations (#2875 item 9, #2962). Public restore entry
+    /// points separately reject transition-bearing snapshots because this
+    /// helper can check only snapshot-local consistency, not current owner
+    /// readback.
     ///
     /// Grants whose parent edge stays inside one root — or names exact admitted
     /// transition evidence — restore into the authority map. Grants whose
@@ -517,12 +571,12 @@ impl GrantGraphRecoverySnapshot {
     /// reinterpreted. A legacy cross-root child therefore can never restore
     /// as active authority.
     ///
-    /// Admitted transition evidence is NOT re-admitted from its copied fields:
-    /// every row is re-verified by
-    /// [`AdmittedRootTransition::admit_restored`] against the CURRENT grants,
-    /// the CURRENT graph revision, and the fence the child is bound to. An
-    /// evidence row that no longer matches live state migrates its child to
-    /// quarantine rather than activating stale authority.
+    /// The internal consistency pass rechecks every transition row with
+    /// [`AdmittedRootTransition::admit_restored`] against the grants, graph
+    /// revision, and fence carried by this same snapshot. That is not current
+    /// owner readback and cannot authorize restoration. The public restore
+    /// entry points reject transition-bearing snapshots before invoking this
+    /// helper; the original input remains intact for audit and reconciliation.
     #[allow(
         clippy::too_many_lines,
         reason = "restore keeps evidence admission, partitioning, quarantine and revocation in one fail-closed sequence"
@@ -925,6 +979,57 @@ pub struct RevocationClosureVerdict {
     pub state: RevocationClosureState,
 }
 
+/// Owner-declared expected denominator for exactly one declared revocation
+/// origin (#2966).
+///
+/// This is the single result every restored suppression is compared against
+/// before any grant status changes. It is computed under the exact graph
+/// revision and fence the restore is bound to, deduplicates by grant
+/// identity, and keeps the retained root marker — the typed
+/// [`RevocationOrigin`] — separately from the grant members. A retained
+/// quarantine relation contributes forensic frontier evidence only and is
+/// never active reachability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationDenominator {
+    /// The one declared origin this denominator was computed for.
+    pub origin: RevocationOrigin,
+    /// Restored graph revision the denominator was computed at.
+    pub revision: u64,
+    /// Exact fence the denominator was computed at.
+    pub state_fence: StateFence,
+    /// Active grant members, deduplicated by grant identity, so a branching
+    /// or converging descendant appears exactly once.
+    pub members: BTreeSet<String>,
+    /// Cross-root members that joined only through exact admitted `#2962`
+    /// transition evidence, with the authorizing transition id. A raw
+    /// transition DTO can never populate this.
+    pub authorized_cross_root: Vec<AuthorizedCrossRootMember>,
+    /// Retained quarantined dependents the walk reached; their relation ids
+    /// are forensic labels, not members.
+    pub quarantined_frontier: Vec<QuarantinedFrontierMember>,
+    /// Every transition id authorizing a followed crossing, in order.
+    pub traversed_transitions: Vec<String>,
+    /// Honest completeness of this denominator, reconciled against the
+    /// bounded engine outcome. Anything but `Complete` denies it whole.
+    pub completeness: RevocationClosureState,
+}
+
+/// The result of resolving one declared closure origin against the bound
+/// graph. Every case is explicit, so the spelling of a reference never
+/// decides a revocation kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BoundRevocationOrigin {
+    /// The declared reference resolves to exactly one entity of this graph.
+    Bound(RevocationOrigin),
+    /// The declared reference names no entity of this graph: it belongs to a
+    /// denominator this graph does not own.
+    Foreign,
+    /// The declared reference names both an admitted grant and an owned
+    /// authority root here, so no single typed origin can be resolved from
+    /// it and the closure is not a usable declaration.
+    Ambiguous,
+}
+
 /// `ELIOT_ARCH_OWNER`: ARCH-AUTH-01
 /// Pure grant-lineage evaluator.
 #[derive(Clone, Debug)]
@@ -1075,6 +1180,187 @@ impl GrantGraph {
         self.grants.get(&id)
     }
 
+    /// Whether one reference names an entity this graph owns — admitted
+    /// authority, or lineage retained as quarantined evidence.
+    ///
+    /// A reference that names neither is not proven to belong to another
+    /// graph's denominator; a lookup miss only proves that this graph holds
+    /// no such entity, which is why a reference under a bound origin is
+    /// bound to this namespace (see
+    /// [`Self::admit_origin_bound_closure`]).
+    pub(crate) fn names_in_graph(&self, reference: &str) -> bool {
+        self.grant(reference).is_some()
+            || self
+                .quarantined
+                .values()
+                .any(|relation| relation.child.grant_id.as_str() == reference)
+    }
+
+    /// Resolves one declared closure origin against this graph, the only
+    /// namespace a restore of this snapshot is bound to.
+    ///
+    /// The declared reference is never classified by its spelling, its
+    /// prefix, or by "it matches a grant, otherwise it is a root". The two
+    /// candidates are checked independently against the bound graph: it is
+    /// a grant origin when this graph holds an admitted grant with exactly
+    /// that identity, and an authority-root origin when this graph holds at
+    /// least one admitted grant whose `authority_root_ref` is exactly that
+    /// reference. A reference that satisfies neither is
+    /// [`BoundRevocationOrigin::Foreign`], and a reference that satisfies
+    /// both is [`BoundRevocationOrigin::Ambiguous`] and refuses — two
+    /// entities of one graph claiming a single revocation declaration is not
+    /// resolved by guessing which one the record meant.
+    pub(crate) fn resolve_revocation_origin(
+        &self,
+        root_ref: &str,
+    ) -> Result<BoundRevocationOrigin, RevocationHistoryError> {
+        validate_text(root_ref, "revocation_origin")
+            .map_err(|_| RevocationHistoryError::UnknownHistory)?;
+        let grant_id = GrantId::new(root_ref).ok();
+        let authority_root = AuthorityRootRef::new(root_ref).ok();
+        match (
+            grant_id.as_ref().filter(|id| self.grants.contains_key(*id)),
+            authority_root.as_ref().filter(|root| {
+                self.grants
+                    .values()
+                    .any(|grant| grant.authority_root_ref == root.as_str())
+            }),
+        ) {
+            (Some(_), Some(_)) => Ok(BoundRevocationOrigin::Ambiguous),
+            (Some(grant_id), None) => Ok(BoundRevocationOrigin::Bound(RevocationOrigin::Grant(
+                grant_id.clone(),
+            ))),
+            (None, Some(root_ref)) => Ok(BoundRevocationOrigin::Bound(
+                RevocationOrigin::AuthorityRoot(root_ref.clone()),
+            )),
+            (None, None) => Ok(BoundRevocationOrigin::Foreign),
+        }
+    }
+
+    /// Computes the one expected revocation denominator for exactly one
+    /// declared origin, under the exact graph revision and fence (#2966).
+    ///
+    /// A **grant origin** is evaluated once through
+    /// [`revocation_closure_verdict`](Self::revocation_closure_verdict), so
+    /// the denominator holds that grant's own same-root members and only the
+    /// cross-root descendants reached through exact admitted transition
+    /// evidence. An **authority-root origin** enumerates exactly the
+    /// admitted grants that root owns in grant-id order, closes each one's
+    /// authorized descendant paths through that same verdict owner, and
+    /// deduplicates by grant identity, so a branching or converging
+    /// descendant appears exactly once. The root marker stays on the typed
+    /// [`RevocationOrigin`], separately from the grant members, and any
+    /// retained quarantine relation contributes forensic frontier evidence
+    /// only.
+    ///
+    /// The bounded traversal itself stays in `eliot-influence`; this is the
+    /// graph owner's enumeration of it. Nothing here mints a receipt, a
+    /// durable commitment, or a second graph, and the result is immutable:
+    /// durable fencing remains with the Governor/Kernel owner (#2100).
+    pub fn revocation_denominator_for_origin(
+        &self,
+        origin: &RevocationOrigin,
+        fence: &StateFence,
+        bounds: &eliot_influence::RevocationBounds,
+    ) -> Result<RevocationDenominator, AuthorityError> {
+        match origin {
+            RevocationOrigin::Grant(grant_id) => {
+                let verdict = self.revocation_closure_verdict(grant_id, fence, bounds)?;
+                Ok(self.denominator_from_verdicts(origin, fence, [verdict]))
+            }
+            RevocationOrigin::AuthorityRoot(root_ref) => {
+                // `BTreeMap` iteration is grant-id ordered, so the union below
+                // is deterministic across restarts and owners.
+                let owned: Vec<GrantId> = self
+                    .grants
+                    .values()
+                    .filter(|grant| grant.authority_root_ref == root_ref.as_str())
+                    .map(|grant| grant.grant_id.clone())
+                    .collect();
+                let mut verdicts = Vec::with_capacity(owned.len());
+                for grant_id in owned {
+                    verdicts.push(self.revocation_closure_verdict(&grant_id, fence, bounds)?);
+                }
+                Ok(self.denominator_from_verdicts(origin, fence, verdicts))
+            }
+        }
+    }
+
+    /// Collapses the one verdict per declared origin into the single typed
+    /// denominator recovery compares against, deduplicating by grant
+    /// identity and keeping every honest partial/unknown frontier.
+    fn denominator_from_verdicts(
+        &self,
+        origin: &RevocationOrigin,
+        state_fence: &StateFence,
+        verdicts: impl IntoIterator<Item = RevocationClosureVerdict>,
+    ) -> RevocationDenominator {
+        let mut members = BTreeSet::new();
+        let mut authorized_cross_root: BTreeMap<String, AuthorizedCrossRootMember> =
+            BTreeMap::new();
+        let mut quarantined_frontier: BTreeMap<String, QuarantinedFrontierMember> = BTreeMap::new();
+        let mut traversed = BTreeSet::new();
+        let mut frontier = BTreeSet::new();
+        let mut omissions = Vec::new();
+        let mut separately_quarantined = BTreeSet::new();
+        let mut partial = false;
+        for verdict in verdicts {
+            members.extend(
+                verdict
+                    .members
+                    .iter()
+                    .map(|member| member.grant_id.to_string()),
+            );
+            for member in &verdict.authorized_cross_root {
+                members.insert(member.grant_id.to_string());
+                authorized_cross_root.insert(member.grant_id.to_string(), member.clone());
+            }
+            for member in &verdict.quarantined_frontier {
+                quarantined_frontier.insert(member.grant_id.to_string(), member.clone());
+            }
+            traversed.extend(verdict.traversed_transitions.iter().cloned());
+            match verdict.state {
+                RevocationClosureState::Complete {
+                    separately_quarantined: listed,
+                } => {
+                    separately_quarantined.extend(listed);
+                }
+                RevocationClosureState::PartialOrUnknown {
+                    frontier: listed_frontier,
+                    omissions: listed_omissions,
+                    separately_quarantined: listed,
+                } => {
+                    partial = true;
+                    frontier.extend(listed_frontier);
+                    omissions.extend(listed_omissions);
+                    separately_quarantined.extend(listed);
+                }
+            }
+        }
+        let separately_quarantined: Vec<String> = separately_quarantined.into_iter().collect();
+        let completeness = if partial {
+            RevocationClosureState::PartialOrUnknown {
+                frontier: frontier.into_iter().collect(),
+                omissions,
+                separately_quarantined,
+            }
+        } else {
+            RevocationClosureState::Complete {
+                separately_quarantined,
+            }
+        };
+        RevocationDenominator {
+            origin: origin.clone(),
+            revision: self.revision,
+            state_fence: state_fence.clone(),
+            members,
+            authorized_cross_root: authorized_cross_root.into_values().collect(),
+            quarantined_frontier: quarantined_frontier.into_values().collect(),
+            traversed_transitions: traversed.into_iter().collect(),
+            completeness,
+        }
+    }
+
     /// Marks one grant revoked without replaying history.
     pub(crate) fn apply_restored_revocation(&mut self, grant_id: &GrantId) {
         self.revoked.insert(grant_id.clone());
@@ -1130,10 +1416,15 @@ impl GrantGraph {
         Ok(snapshot)
     }
 
+    /// Restores graph state from a recovery snapshot.
+    ///
+    /// Snapshots with admitted root-transition records fail closed until a
+    /// current owner readback path can confirm those records.
     pub fn from_recovery_snapshot(
         snapshot: &GrantGraphRecoverySnapshot,
     ) -> Result<Self, AuthorityError> {
         snapshot.validate_wire()?;
+        snapshot.require_owner_readback_for_restore()?;
         GrantGraphRecoverySnapshot::restore_owned(snapshot)
     }
 
@@ -1154,6 +1445,10 @@ impl GrantGraph {
     /// evidence, applying all applicable committed revocations before any
     /// grant becomes effective.
     ///
+    /// Transition-bearing snapshots refuse until their transition evidence is
+    /// confirmed by current owner readback; revocation history is not a
+    /// substitute for that readback.
+    ///
     /// `None` history refuses with
     /// [`RevocationHistoryError::MissingHistory`]: unavailable history is
     /// not absence of revocation and never restores as an empty closure.
@@ -1164,26 +1459,36 @@ impl GrantGraph {
     /// exact suppressed set and reasons are reported in the outcome.
     /// Unrelated valid grants restore exactly as the snapshot carries them.
     ///
-    /// The production recheck refuses by named cause through
-    /// [`RevocationHistoryError::BoundedRevocation`], so a caller can tell the
-    /// four failure classes apart instead of reading one untyped refusal:
+    /// #2966 production order, and the order is the guarantee: decode and
+    /// shape-check the history, restore the snapshot, resolve each closure's
+    /// ONE typed [`RevocationOrigin`] against this graph, compute that
+    /// origin's expected [`RevocationDenominator`], compare the committed
+    /// membership against it, and only then derive the suppression
+    /// projection and apply it. Every refusal happens before the first
+    /// suppression exists, so a failure leaves the restored graph exactly
+    /// as the snapshot carried it and never presents a partial projection
+    /// as applied.
+    ///
+    /// The production recheck refuses by named cause, so a caller can tell
+    /// the failure classes apart instead of reading one untyped refusal.
     /// [`UnsupportedSchema`](eliot_influence::InfluenceError::UnsupportedSchema)
-    /// for a snapshot whose declared schema or version is not the supported one
-    /// (decided before any other wire field is validated),
+    /// names a snapshot whose declared schema or version is not the supported
+    /// one (decided before any other wire field is validated);
     /// [`UnverifiedRecovery`](eliot_influence::InfluenceError::UnverifiedRecovery)
-    /// for a committed closure whose declared origin this graph cannot relate to
-    /// its own lineage while the closure still names in-graph targets,
+    /// names a committed closure whose declared origin this graph cannot
+    /// relate to its own lineage while the closure still names in-graph
+    /// targets;
     /// [`IncompleteCoverage`](eliot_influence::InfluenceError::IncompleteCoverage)
-    /// when the bounded evaluator could not prove the whole dependent closure
-    /// inside the declared bounds, and
-    /// [`TargetDrift`](eliot_influence::InfluenceError::TargetDrift) when the
-    /// closure recomputed from the live graph reaches an in-graph target the
-    /// committed closure does not name. The first, third, and fourth of these
-    /// refused before this change as well, under `InvalidSnapshot` or the
-    /// untyped `UnknownHistory`; only the cause is named there. The second is a
-    /// strictly new refusal: a foreign-origin closure naming in-graph targets
-    /// used to restore unrecheckable, and now refuses. Nothing that restored
-    /// before stops restoring, and no field is newly ignored.
+    /// names a denominator that could not be proven whole inside the declared
+    /// bounds;
+    /// [`TargetDrift`](eliot_influence::InfluenceError::TargetDrift) names a
+    /// reachable in-graph target the committed closure left unrepresented; and
+    /// [`RevocationHistoryError::OriginTargetMismatch`] names the opposite
+    /// failure — an in-graph target the committed closure claims that the one
+    /// declared origin cannot reach at all. The mismatch is a distinct typed
+    /// variant, not a string folded into a bounded cause, because an extra
+    /// target is exactly the case that must never be reinterpreted as a
+    /// second revocation origin.
     ///
     /// The legacy [`from_recovery_snapshot`](Self::from_recovery_snapshot)
     /// preserves its exact prior behavior for previously-admitted callers.
@@ -1219,6 +1524,9 @@ impl GrantGraph {
         snapshot
             .validate_wire()
             .map_err(RevocationHistoryError::InvalidSnapshot)?;
+        snapshot
+            .require_owner_readback_for_restore()
+            .map_err(RevocationHistoryError::InvalidSnapshot)?;
         let evidence = history.ok_or(RevocationHistoryError::MissingHistory)?;
         let closures = evidence.require_current()?;
         let mut graph = GrantGraphRecoverySnapshot::restore_owned(snapshot)
@@ -1231,30 +1539,19 @@ impl GrantGraph {
                 return Err(RevocationHistoryError::StaleHistory);
             }
         }
-        let suppressed = derive_suppressions(&graph, &closures);
-        // Fail-closed recheck: every verdict-reachable in-graph descendant
-        // of an affected in-graph grant must already be suppressed. The
-        // verdict reconciles the bounded engine outcome against the live
-        // graph: it follows same-root and receipt-authorized parent links,
-        // preserves omitted cross-scope dependents as unresolved frontier
-        // entries, and reports anything less as
-        // partial/unknown — so a partial verdict, or a closure that
-        // under-claims its transitive descendants, still refuses. An
-        // omitted dependent without owner-qualified quarantine evidence is never silently
-        // cleared. Affected references naming no grant in this graph belong
-        // to another graph's denominator and refuse nothing.
-        let suppressed_ids: BTreeSet<&str> = suppressed
-            .iter()
-            .map(|entry| entry.grant_id.as_str())
-            .collect();
+        // #2966: the origin-bound comparison runs before any `SuppressedGrant`
+        // exists. Every refusal on this path returns before
+        // `apply_restored_revocation` is ever called, so the restored graph is
+        // left exactly as the snapshot carried it.
+        let mut admitted: Vec<AdmittedRevocationClosure> = Vec::with_capacity(closures.len());
         for closure in &closures {
-            Self::recheck_committed_closure(
-                &graph,
-                closure,
-                &evidence.state_fence,
-                &suppressed_ids,
-            )?;
+            if let Some(admitted_closure) =
+                graph.admit_origin_bound_closure(closure, &evidence.state_fence)?
+            {
+                admitted.push(admitted_closure);
+            }
         }
+        let suppressed = derive_suppressions(&graph, &admitted);
         for entry in &suppressed {
             if let Ok(grant_id) = GrantId::new(entry.grant_id.clone()) {
                 graph.apply_restored_revocation(&grant_id);
@@ -1263,103 +1560,167 @@ impl GrantGraph {
         Ok(GrantRestoreOutcome { graph, suppressed })
     }
 
-    /// Fail-closed recheck of one committed revocation closure against the
-    /// restored graph, naming the cause of every refusal.
+    /// Validates one committed revocation closure against the denominator of
+    /// exactly one declared origin, and admits it only when the whole
+    /// origin-to-affected relation holds.
     ///
-    /// Three decisions, all reached from
-    /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history):
+    /// `Ok(None)` means the closure declares an origin that names no entity
+    /// of this graph and names no in-graph target either: it belongs to a
+    /// denominator this graph does not own, it can suppress nothing here,
+    /// and it keeps exactly the prior behavior. Proving that such a
+    /// reference is *another graph's* denominator rather than an unscoped
+    /// one is the history owner's obligation, because only the durable
+    /// history owner can partition by owner namespace; a reference under a
+    /// *bound* origin is a different case and is checked against this
+    /// namespace below.
     ///
-    /// 1. the closure's declared origin must be relatable to this graph's own
-    ///    lineage, because `derive_suppressions` will revoke the in-graph
-    ///    targets the closure names and an origin outside the graph cannot be
-    ///    rechecked against live lineage. An in-graph grant origin and an
-    ///    authority-root origin both stay admissible, and a closure naming no
-    ///    in-graph grant still refuses nothing. This is the A0.3 hard boundary
+    /// Four decisions, all reached from
+    /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history)
+    /// before any suppression is derived:
+    ///
+    /// 1. the declared origin resolves against this graph to exactly one
+    ///    typed [`RevocationOrigin`] — a grant or an authority root, never a
+    ///    guess read from the reference's spelling. An origin that resolves
+    ///    to none, or to two, refuses. This is the A0.3 hard boundary
     ///    "restoration of revoked influence after recovery" refused by cause
     ///    instead of accepted unrecheckable;
-    /// 2. the bounded evaluator must prove the whole dependent closure inside
-    ///    the declared bounds, otherwise the affected set is a bounded prefix
-    ///    and I15.7's explicit incomplete-coverage refusal applies;
-    /// 3. every in-graph grant the verdict can reach - a same-root member or a
-    ///    receipt-authorized cross-root member - must already be suppressed,
-    ///    otherwise the committed closure under-claims its transitive
-    ///    descendants and the stored target set drifted.
+    /// 2. the expected denominator for that one origin must be complete.
+    ///    [`revocation_denominator_for_origin`](Self::revocation_denominator_for_origin)
+    ///    evaluates the declared origin exactly once and reconciles the
+    ///    bounded engine outcome against the live graph, following same-root
+    ///    and admitted-crossing parent links and preserving omitted
+    ///    cross-scope dependents as unresolved frontier entries, so a partial
+    ///    verdict still refuses under I15.7's explicit incomplete-coverage
+    ///    rule and an omitted dependent without owner-qualified quarantine
+    ///    evidence is never silently cleared;
+    /// 3. every in-graph target the closure names must be a member of that
+    ///    one denominator. An in-graph target outside it is
+    ///    [`RevocationHistoryError::OriginTargetMismatch`]: a
+    ///    record-supplied `dependent_refs` member never becomes a second
+    ///    implicit revocation origin, and it is never folded into
+    ///    `TargetDrift`, which means a reachable target the closure omitted;
+    /// 4. every reachable in-graph member must be represented by the
+    ///    committed membership — named directly, owned by the declared
+    ///    authority root, or inheriting from one of those — otherwise the
+    ///    closure under-claims its transitive descendants and the stored
+    ///    target set drifted. No different historical affected set is
+    ///    reconstructed under the same closure identity.
     ///
-    /// The recheck reads the verdict owner, not the bounded engine directly:
-    /// [`GrantGraph::revocation_closure_verdict`] reconciles the engine outcome
-    /// against the live graph, follows same-root and receipt-authorized parent
-    /// links, preserves omitted cross-scope dependents as unresolved frontier
-    /// entries, and reports anything less as
-    /// [`RevocationClosureState::PartialOrUnknown`] - so a partial verdict, or a
-    /// closure that under-claims its descendants, still refuses, and an omitted
-    /// dependent without owner-qualified quarantine evidence is never silently cleared.
-    ///
-    /// An affected reference naming no grant in this graph belongs to another
-    /// graph's denominator and refuses nothing.
-    fn recheck_committed_closure(
-        graph: &GrantGraph,
-        closure: &crate::revocation_history::ValidatedRevocationClosure,
+    /// Descendant completeness is checked against that one origin result.
+    /// The declared origin is never re-traversed from each supplied member:
+    /// doing so is what let a record-supplied target act as its own origin.
+    pub(crate) fn admit_origin_bound_closure(
+        &self,
+        closure: &ValidatedRevocationClosure,
         fence: &StateFence,
-        suppressed_ids: &BTreeSet<&str>,
-    ) -> Result<(), RevocationHistoryError> {
-        let origin_is_local = graph.grant(closure.root_ref.as_str()).is_some()
-            || graph
-                .grants
-                .values()
-                .any(|grant| grant.authority_root_ref == closure.root_ref);
-        if !origin_is_local
-            && closure
-                .affected
-                .iter()
-                .any(|reference| graph.grant(reference.as_str()).is_some())
-        {
+    ) -> Result<Option<AdmittedRevocationClosure>, RevocationHistoryError> {
+        let origin = match self.resolve_revocation_origin(&closure.root_ref)? {
+            BoundRevocationOrigin::Bound(origin) => origin,
+            BoundRevocationOrigin::Foreign => {
+                if closure
+                    .affected
+                    .iter()
+                    .any(|reference| self.names_in_graph(reference))
+                {
+                    return Err(RevocationHistoryError::BoundedRevocation(
+                        eliot_influence::InfluenceError::UnverifiedRecovery(
+                            "recovery.closure_origin",
+                        ),
+                    ));
+                }
+                return Ok(None);
+            }
+            BoundRevocationOrigin::Ambiguous => {
+                return Err(RevocationHistoryError::UnknownHistory);
+            }
+        };
+        let denominator = self
+            .revocation_denominator_for_origin(
+                &origin,
+                fence,
+                &eliot_influence::RevocationBounds::default_bounds(),
+            )
+            .map_err(map_bounded_history_error)?;
+        // A denominator that is not complete is a bounded prefix, so the
+        // committed affected set cannot be compared against it at all.
+        if !matches!(
+            denominator.completeness,
+            RevocationClosureState::Complete { .. }
+        ) {
             return Err(RevocationHistoryError::BoundedRevocation(
-                eliot_influence::InfluenceError::UnverifiedRecovery("recovery.closure_origin"),
+                eliot_influence::InfluenceError::IncompleteCoverage("recovery.closure_verdict"),
             ));
         }
-        for affected_ref in &closure.affected {
-            let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
-                continue;
-            };
-            if graph.grant(grant_id.as_str()).is_none() {
-                continue;
-            }
-            let verdict = graph
-                .revocation_closure_verdict(
-                    &grant_id,
-                    fence,
-                    &eliot_influence::RevocationBounds::default_bounds(),
-                )
-                .map_err(map_bounded_history_error)?;
-            // The verdict has exactly two states, so a non-`Complete` verdict IS
-            // the incomplete-coverage cause: the closure could not be proven
-            // whole inside the declared bounds, or an omitted cross-scope
-            // dependent lacked owner-qualified quarantine evidence.
-            if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
-                return Err(RevocationHistoryError::BoundedRevocation(
-                    eliot_influence::InfluenceError::IncompleteCoverage("recovery.closure_verdict"),
-                ));
-            }
-            let denied = verdict
-                .members
-                .iter()
-                .map(|member| member.grant_id.as_str())
-                .chain(
-                    verdict
-                        .authorized_cross_root
-                        .iter()
-                        .map(|member| member.grant_id.as_str()),
-                )
-                .any(|denied_ref| {
-                    graph.grant(denied_ref).is_some() && !suppressed_ids.contains(denied_ref)
-                });
-            if denied {
-                return Err(RevocationHistoryError::BoundedRevocation(
-                    eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
+        for reference in &closure.affected {
+            if self.names_in_graph(reference) && !denominator.members.contains(reference.as_str()) {
+                return Err(RevocationHistoryError::OriginTargetMismatch(
+                    OriginTargetMismatch {
+                        closure_id: closure.closure_id.clone(),
+                        origin: origin.clone(),
+                        target: reference.clone(),
+                    },
                 ));
             }
         }
-        Ok(())
+        if self
+            .unrepresented_member(closure, &origin, &denominator)
+            .is_some()
+        {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
+            ));
+        }
+        Ok(Some(AdmittedRevocationClosure::admit(
+            closure,
+            origin,
+            denominator,
+        )))
+    }
+
+    /// The first denominator member the committed closure leaves
+    /// unrepresented, if any.
+    ///
+    /// A member is represented when the committed membership names it, when
+    /// the declared origin is the authority root that owns it, or when any
+    /// ancestor of it is represented. The walk keeps a visited set so a
+    /// delegation cycle (rejected at construction, but defended here)
+    /// terminates instead of looping.
+    fn unrepresented_member(
+        &self,
+        closure: &ValidatedRevocationClosure,
+        origin: &RevocationOrigin,
+        denominator: &RevocationDenominator,
+    ) -> Option<String> {
+        for member in &denominator.members {
+            let mut seen = BTreeSet::new();
+            let mut cursor = Some(member.as_str());
+            let mut represented = false;
+            while let Some(current) = cursor {
+                if !seen.insert(current.to_owned()) {
+                    break;
+                }
+                if closure.affected.contains(current) {
+                    represented = true;
+                    break;
+                }
+                if let RevocationOrigin::AuthorityRoot(root_ref) = origin
+                    && self
+                        .grant(current)
+                        .is_some_and(|grant| grant.authority_root_ref == root_ref.as_str())
+                {
+                    represented = true;
+                    break;
+                }
+                cursor = self
+                    .grant(current)
+                    .and_then(|grant| grant.parent_grant_id.as_ref())
+                    .map(GrantId::as_str);
+            }
+            if !represented {
+                return Some(member.clone());
+            }
+        }
+        None
     }
 
     pub fn revoke(&mut self, grant_id: &GrantId) -> Result<(), AuthorityError> {

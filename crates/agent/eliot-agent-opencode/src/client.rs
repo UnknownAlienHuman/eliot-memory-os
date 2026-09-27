@@ -13,6 +13,7 @@ use crate::{
 };
 use eliot_agent_api::{EventCursor, ExecutionOutcome};
 use eliot_contracts::{ClockReading, ResourceGeneration, StateFence};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -233,11 +234,76 @@ pub enum OpenCodeRunError {
 /// disposition is computed before candidate sealing, bound into the sealed
 /// candidate digest through the run extra, and finalized before slot
 /// confirmation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdmittedAttemptOutcome {
     pub run: NoAuthorityRunResult,
     pub candidate: AdmittedAttemptCandidate,
     pub route: SealedRouteDisposition,
+}
+
+/// Classifies the route disposition carried by one sealed candidate artifact
+/// (issue #2902 item 11).
+///
+/// A candidate sealed under typed route-observation truthfulness carries its
+/// exact disposition in [`AdmittedAttemptCandidate::route_disposition`]. A
+/// legacy candidate predating typed truthfulness carries no field at all and
+/// decodes as `None`: it is explicitly unverified quarantine evidence, never
+/// silently read as a current `Unobserved` or `Matched` receipt. The
+/// classification is total over both artifact generations, so every consumer
+/// of a sealed candidate distinguishes legacy absence from every typed
+/// disposition.
+pub fn classify_sealed_candidate(candidate: &AdmittedAttemptCandidate) -> SealedRouteDisposition {
+    candidate
+        .route_disposition
+        .clone()
+        .unwrap_or_else(SealedRouteDisposition::legacy_unverified)
+}
+
+/// Maximum length of one redacted route-diagnostics line (issue #2902 item
+/// 12): bounded so diagnostics can never grow into a raw-material channel.
+const MAX_ROUTE_DIAGNOSTIC_CHARS: usize = 512;
+
+/// Bounded, redacted route-diagnostics line for one sealed route disposition
+/// (issue #2902 item 12).
+///
+/// The line carries only the disposition's bounded cause code and
+/// digest-bound references (receipt digest, reconciliation handle, legacy
+/// reason). Raw provider, session, and path material never enters it:
+/// control characters are replaced and the line is length-bounded, so
+/// diagnostics can never leak restricted wire content.
+pub fn redact_route_diagnostics(disposition: &SealedRouteDisposition) -> String {
+    let mut line = format!("route-disposition: {}", disposition.cause_code());
+    if let Some(receipt) = disposition.receipt() {
+        line.push_str("; receipt ");
+        line.push_str(receipt.self_digest.as_str());
+    }
+    if let SealedRouteDisposition::UnknownOutcome {
+        reconciliation_ref, ..
+    } = disposition
+    {
+        line.push_str("; reconcile ");
+        line.push_str(reconciliation_ref);
+    }
+    if let SealedRouteDisposition::LegacyUnverified { reason } = disposition {
+        line.push_str("; ");
+        line.push_str(reason);
+    }
+    let truncated = line.chars().count() > MAX_ROUTE_DIAGNOSTIC_CHARS;
+    let mut redacted: String = line
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .take(MAX_ROUTE_DIAGNOSTIC_CHARS)
+        .collect();
+    if truncated {
+        redacted.push('…');
+    }
+    redacted
 }
 
 pub struct OpenCodeClient {
@@ -1649,7 +1715,9 @@ fn seal_route_disposition(
         return Ok(SealedRouteDisposition::UnknownOutcome {
             last_cursor: event_cursor,
             last_sequence: SEAL_OBSERVATION_SEQUENCE,
-            cause: OpenCodeObservationConversionError::InvalidInput("observed_completed_at_ms"),
+            cause: OpenCodeObservationConversionError::InvalidInput(
+                "observed_completed_at_ms".to_owned(),
+            ),
             wire_evidence_digest,
             wire_evidence_ref,
             reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
@@ -1789,7 +1857,13 @@ fn seal_admitted_outcome(
         "route_disposition".to_owned(),
         route.summary_value(admitted.admission())?,
     );
-    let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+    let mut candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+    // The typed route disposition computed and validated above is bound into
+    // the sealed candidate artifact itself (issue #2902 items 8 and 11): the
+    // published artifact carries the exact disposition, so a consumer can
+    // classify it — and a legacy artifact predating this field decodes as
+    // explicitly unverified rather than a current receipt.
+    candidate.route_disposition = Some(route.clone());
     slot.confirm(admitted, &session_id, message_id)?;
     // The terminal observation is emitted bound to the exact attempt,
     // quoting the seal it follows; the seal digest covers the run at seal

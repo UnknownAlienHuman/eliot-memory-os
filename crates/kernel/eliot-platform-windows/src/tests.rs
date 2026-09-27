@@ -5,10 +5,8 @@
 //! Authority: Test-only. Explicitly forbids production, semantic, or authority ownership. Production truth remains in `lib.rs` and sibling modules.
 //! Verification: Topology mirrors the production modules in this crate; the
 //! current source tree is authoritative.
-//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
-//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
-//! the governing shards are named per anchor above).
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
+//! sharded fragments named per anchor above.
 //! Policy: No wildcard imports, no new lint allows; existing test-module import/lint policy moves unchanged.
 use super::*;
 #[cfg(windows)]

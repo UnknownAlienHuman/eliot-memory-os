@@ -1,0 +1,278 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.cue.index",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "smart.cue.index",
+    "source_package": "eliot-cue-index",
+    "source_manifest": "crates/smart/eliot-cue-index/Cargo.toml",
+    "source_root_path": "crates/smart/eliot-cue-index",
+    "module_manifest": "crates/smart/eliot-cue-index/module.toml",
+    "workspace_member": true,
+    "bins_reachable": true,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Build and validate one immutable rebuildable CueSnapshot from Governor-admitted binding projections and typed activation edges."
+    },
+    "causal_property": {
+      "state": "DECLARED",
+      "origin": "module.toml|causal_property",
+      "value": "cue projection construction"
+    },
+    "invariants": {
+      "state": "DECLARED",
+      "origin": "module.toml|invariants",
+      "value": [
+        "CueBindingCandidate output never bypasses Governor admission",
+        "snapshot has one source fence",
+        "rows contain handles rather than payload authority",
+        "invalid rows or edges fail locally"
+      ]
+    },
+    "non_goals": {
+      "state": "DECLARED",
+      "origin": "module.toml|non_goals",
+      "value": [
+        "canonical binding mutation",
+        "CueBindingCandidate admission",
+        "hot evaluation",
+        "semantic graph mining"
+      ]
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "smart-memory-context",
+        "title": "Smart memory, context, and understanding",
+        "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+        "documentation_handles": [
+          "I12.13",
+          "I17.11"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "DECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": "smart.cue.index"
+    },
+    "source_maintenance_owner": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": null
+    },
+    "state_class": {
+      "state": "DECLARED",
+      "origin": "module.toml|state_class",
+      "value": "stateless"
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return partial or failed publication with exact rejected rows; the previous current snapshot remains visible."
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|inputs",
+      "value": [
+        "admitted cue-binding projection",
+        "typed activation edges",
+        "projection revision and fence"
+      ]
+    },
+    "outputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|outputs",
+      "value": [
+        "CueSnapshot",
+        "publication manifest",
+        "rejected row and edge report"
+      ]
+    },
+    "providers": {
+      "state": "DECLARED",
+      "origin": "module.toml|providers",
+      "value": [
+        "Governor/store named-read projection over admitted cue bindings"
+      ]
+    },
+    "depends_on": {
+      "state": "DECLARED",
+      "origin": "module.toml|depends_on",
+      "value": [
+        "eliot-cue-contracts"
+      ]
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": "R5"
+      },
+      "runtime_bundle": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": "eliotd"
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "DECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "DECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": "merge back when no independent consumer, proof, dependency or replacement seam remains"
+    },
+    "split_trigger": {
+      "state": "DECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": null
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "DECLARED",
+      "origin": "module.toml|discriminator",
+      "value": "The same admitted bindings and profile rebuild the same snapshot; raw CueBindingCandidate values cannot enter the index."
+    },
+    "old_failure_or_missing_capability": {
+      "state": "DECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": "Legacy CueRuntime combines snapshot construction and evaluation, while the first prototype did not make the cue-binding admission edge explicit."
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [],
+    "contract_refs_source": "crates/smart/eliot-cue-index/Cargo.toml",
+    "donor_records": [
+      {
+        "path": "ELIOT_IMPLEMENTATION I12.6-I12.7",
+        "disposition": "authoritative binding-admission and Cue Index contract"
+      },
+      {
+        "path": "crates/smart/eliot-cues/src/lib.rs",
+        "disposition": "extract snapshot model"
+      }
+    ]
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-cue-index/Cargo.toml",
+        "sha256": "aeef7dfec4e7752b3314816d857def9930b9e069bea394a8597571b53ef02f2e"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-cue-index/module.toml",
+        "sha256": "6559682a4478de585f4035dbce1f0cef85ff3a12215a26eb9745e34fd69b8736"
+      },
+      "selected_source": {
+        "path_count": 4,
+        "sha256": "f69c26eb176fe3910e9f2be6a4721f5f61508ad4f31d4fd0a1939d28a5ac96d5"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "f7e12ec995b6157e5fca77f120046ba1a775e1cab47025e9897e3254d93b8d83",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "f7e12ec995b6157e"
+  }
+}

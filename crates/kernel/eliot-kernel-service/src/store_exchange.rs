@@ -6,17 +6,24 @@
 //! reconciliation. It never builds provider queries, mints authority, or decides
 //! completion.
 //!
-//! Architecture anchors: `docs/architecture/ELIOT_ARCHITECTURE.md` §A12.3
-//! (single governed write path), §A13.2 (Kernel failure domains),
-//! `ARCH-AUTH-01` (explicit, scoped, fenced authority), `ARCH-SEC-02` (one
-//! canonical transition path), and `ARCH-RES-01` (fail locally, recover
-//! globally) — the exchange stays neutral, bounded, and fail-closed.
+//! Architecture anchors: `A12.3`
+//! (`docs/architecture/A12-03-one-governed-write-path.md`, single governed write
+//! path), `A13.2`
+//! (`docs/architecture/A13-02-kernel-and-failure-domains.md`, Kernel failure
+//! domains), `docs/architecture/A16-01-decision-anchors.md` `ARCH-AUTH-01`
+//! (explicit, scoped, fenced authority), `ARCH-SEC-02` (one canonical transition
+//! path), and `ARCH-RES-01` (fail locally, recover globally) — the exchange
+//! stays neutral, bounded, and fail-closed.
 //!
-//! Implementation anchors: `docs/architecture/ELIOT_IMPLEMENTATION.md` §R2
-//! (canonical substrate), §I5.1 (storage boundary), §I5.9 (`SurrealDB`
-//! implementation), §I5.11 (storage replacement), §B.2 (Kernel↔Store), and
-//! §I2.23 (capability-family topology) — the cell is a narrow transport
-//! boundary with no semantic synthesis.
+//! Implementation anchors: the canonical-substrate runtime layer
+//! (`docs/architecture/I-PREFACE-04-runtime-layer-model.md`), `I5.1`
+//! (`docs/architecture/I05-01-storage-boundary.md`, storage boundary), `I5.9`
+//! (`docs/architecture/I05-09-surrealdb-implementation.md`, `SurrealDB`
+//! implementation), `I5.11` (`docs/architecture/I05-11-storage-replacement.md`,
+//! storage replacement), the Kernel-Store boundary `I5.1`, and `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`,
+//! capability-family topology) — the cell is a narrow transport boundary with
+//! no semantic synthesis.
 //!
 //! This cell owns no Governor semantic types and no Store semantic ownership;
 //! those concerns remain in their owning layers.

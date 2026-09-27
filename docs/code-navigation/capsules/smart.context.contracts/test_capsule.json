@@ -1,0 +1,244 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.context.contracts",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-context-contracts",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [
+      {
+        "pattern": "serde_json::Value",
+        "path": "crates/smart/eliot-context-contracts/tests/work_unit_584.rs"
+      }
+    ],
+    "inline_cfg_test_modules": 0
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "schema compatibility",
+        "required-role completeness",
+        "append-only selection stages",
+        "consumer fixtures"
+      ]
+    },
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-context-contracts/tests/admission_input.rs",
+        "bytes": 26377,
+        "sha256": "41e37e8df49ef02d0ec4809de33bd5fd25489b4f12a242aab3dddd60fe4ab2f1",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-context-contracts/tests/context_contracts.rs",
+        "bytes": 29484,
+        "sha256": "6f7542ed01d4a4b7c054ea0821518bebc7abfbf3012717647683b3890310e8ba",
+        "test_attributes": 12,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-context-contracts/tests/learning_ticket_1869.rs",
+        "bytes": 3593,
+        "sha256": "dd78ad46ab48fed59a4f4ffdeec8e02d09c4d372599ea7a46e4c19f2e49f31c0",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-context-contracts/tests/reactive_contracts.rs",
+        "bytes": 15263,
+        "sha256": "a39cd48b0c95bb234d384bc535e71fe8997e401d700da02a0e2ff4af2856237c",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-context-contracts/tests/support/reactive.rs",
+        "bytes": 32671,
+        "sha256": "6dee3f5a1bbc7fcb2b5f6b0836aae5459ca57d67ee6cc854c714821137866046",
+        "test_attributes": 0,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-context-contracts/tests/work_unit_584.rs",
+        "bytes": 116288,
+        "sha256": "fa5f82b8c66f73672808cee8516b6ed6b5be96a2ad5c0f00274961936e631cee",
+        "test_attributes": 62,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "test_attribute_count": 90
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "bins/eliot-agent-bridge",
+      "bins/eliot-dreamer",
+      "bins/eliot-wasm-host",
+      "bins/eliotd",
+      "crates/governor/eliot-governor",
+      "crates/meta/eliot-improvement",
+      "crates/smart/eliot-context",
+      "crates/smart/eliot-context-admission",
+      "crates/smart/eliot-context-assembly",
+      "crates/smart/eliot-context-candidates",
+      "crates/smart/eliot-context-compiler-wasm",
+      "crates/smart/eliot-context-measurement",
+      "crates/smart/eliot-dreamer-bundle",
+      "crates/smart/eliot-dreamer-contracts",
+      "crates/smart/eliot-dreamer-memory-revision",
+      "crates/smart/eliot-epistemic-context-provider",
+      "crates/smart/eliot-memory-quality",
+      "crates/smart/eliot-reactive-context-plan",
+      "crates/smart/eliot-understanding-assessment"
+    ],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "context candidates",
+        "context admission",
+        "context assembly",
+        "reactive context plan",
+        "Dreamer bundle"
+      ]
+    },
+    "edge_profile_tests": [
+      "crates/smart/eliot-context-contracts/tests/learning_ticket_1869.rs"
+    ]
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Schema incompatibility prevents dependent compilation; no untyped packet fallback."
+    },
+    "selected_cases": [
+      "crates/smart/eliot-context-contracts/tests/learning_ticket_1869.rs",
+      "crates/smart/eliot-context-contracts/tests/reactive_contracts.rs",
+      "crates/smart/eliot-context-contracts/tests/support/reactive.rs",
+      "crates/smart/eliot-context-contracts/tests/work_unit_584.rs"
+    ]
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 90,
+    "test_stu": 74559,
+    "nonzero": true
+  },
+  "bound_contract_digest": "fbfbbb3ffd6797d91067ff7837b282a955228ce8d45d3f8f609992346926b5fe",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-context-contracts/Cargo.toml",
+        "sha256": "34e893003fbd76c6cc4f2283ce6653174650fe0273462122abf1718b0e8531cd"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-context-contracts/module.toml",
+        "sha256": "aa1ce78c1ad58c950bd65cfeaf76594f11ca836e97c6892a84ae154b2b7247e7"
+      },
+      "selected_source": {
+        "path_count": 25,
+        "sha256": "fdbca3a90e0688468003bd88e232551d9a2e60583f3652f27367816ba2015464"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "6a5fe8fe714cfa7147eb5156f9e65cebc78899bb861793b16dda6c0a22e95052",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "6a5fe8fe714cfa71"
+  }
+}

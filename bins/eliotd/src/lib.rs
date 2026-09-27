@@ -12,17 +12,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, FinishAttemptError, GovernorActivationOutcome,
-    GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
-    KernelGenerationSnapshotProvider, QueueLimits,
+    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
+    GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
+    KernelGenerationSnapshotProvider, PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
     AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding,
+    AgentActivationResolutionTicket, AgentActivationResolvedBinding, RequestIdentity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -47,6 +47,8 @@ pub mod campaign_task_controller;
 pub use campaign_context_owner::build_context_owner_publications;
 pub use campaign_evaluation_owner::build_product_evaluation_publications;
 pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publications;
+pub use daemon_kernel_client::FinishSubmitOutcome;
+pub use finish_attempt::serve_finish_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
@@ -60,6 +62,7 @@ mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
 mod experience_runtime;
+pub mod finish_attempt;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
@@ -140,8 +143,8 @@ pub use controlboard_adapters::{
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
-    DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome, ObserveSubmitOutcome,
-    OwnerSessionFacts, TaskControllerSubmitOutcome,
+    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
+    ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -1161,6 +1164,49 @@ impl DaemonComposition {
     // the surviving path: `plan_testd_terminal_owner_fact` prepares the fact
     // through the Governor finish owner, and `accept_prepared_exchange`
     // re-checks the pre-commit fence before the receipt is admitted.
+
+    /// Prepares the Governor-owned finish-evidence exchange without transporting it.
+    ///
+    /// Runtime callers hold the composition lock only for this synchronous phase,
+    /// then exchange the immutable plan through Kernel after releasing the lock.
+    pub fn prepare_finish_evidence(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_finish_evidence(identity, operation_id, draft)
+    }
+
+    /// Revalidates one exchanged finish leg against the live Governor owner.
+    pub fn accept_prepared_finish_exchange(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        self.governor.accept_prepared_exchange(prepared)
+    }
+
+    /// Refreshes canonical state and prepares the Governor-owned finish decision.
+    ///
+    /// The returned exchange is immutable and must be transported with the
+    /// composition lock released; the decision is projected only after it is
+    /// revalidated by [`Self::accept_prepared_finish_exchange`].
+    pub fn prepare_finish_decision(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<PreparedFinishDecision, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_finish_decision(identity, operation_id, draft)
+    }
 
     /// Returns the admitted Kernel snapshot.
     #[must_use]

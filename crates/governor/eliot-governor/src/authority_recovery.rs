@@ -780,9 +780,14 @@ impl PresentedAuthorityRequest {
 pub enum AuthorityPresentationState {
     Pending,
     UnknownOutcome,
-    Active { activation_id: String },
+    Active {
+        activation_id: String,
+        transition_receipt: Option<Box<RootTransitionActivationReceipt>>,
+    },
     RevocationIntended,
-    Revoked { revocation_id: String },
+    Revoked {
+        revocation_id: String,
+    },
 }
 
 /// Exact presented request retained with the owner snapshot that produced its
@@ -838,6 +843,19 @@ impl RetainedAuthorityRequest {
         &self.state
     }
 
+    /// Returns the complete validated owner-issued receipt for an active root
+    /// transition. Other authority presentations do not carry this receipt.
+    #[must_use]
+    pub fn transition_receipt(&self) -> Option<&RootTransitionActivationReceipt> {
+        match &self.state {
+            AuthorityPresentationState::Active {
+                transition_receipt: Some(receipt),
+                ..
+            } => Some(receipt),
+            _ => None,
+        }
+    }
+
     /// Records a lost acknowledgement for the exact presented snapshot. Any
     /// other snapshot fails closed: it cannot reconcile this presentation.
     pub fn note_unknown_outcome(
@@ -878,6 +896,7 @@ impl RetainedAuthorityRequest {
             AuthorityPresentationState::Pending | AuthorityPresentationState::UnknownOutcome => {
                 self.state = AuthorityPresentationState::Active {
                     activation_id: receipt.activation_id.clone(),
+                    transition_receipt: None,
                 };
                 Ok(())
             }
@@ -909,6 +928,7 @@ impl RetainedAuthorityRequest {
             AuthorityPresentationState::Pending | AuthorityPresentationState::UnknownOutcome => {
                 self.state = AuthorityPresentationState::Active {
                     activation_id: receipt.kernel_activation.activation_id.clone(),
+                    transition_receipt: Some(Box::new(receipt.clone())),
                 };
                 Ok(())
             }
@@ -993,7 +1013,7 @@ impl RetainedAuthorityRequest {
 /// conflict, never a silent success: the caller re-serves fresh state instead
 /// of retrying the same operation under a new request. This mirrors the daemon
 /// adapter's `map_transition_validation_error` at the same boundary.
-fn map_transition_receipt_error(error: &AuthorityError) -> P07PortError {
+pub(crate) fn map_transition_receipt_error(error: &AuthorityError) -> P07PortError {
     match error {
         AuthorityError::IdentityConflict => P07PortError::IdentityConflict,
         AuthorityError::P07Unavailable => P07PortError::Unavailable,

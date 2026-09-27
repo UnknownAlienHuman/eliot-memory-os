@@ -14,6 +14,7 @@
 //! complete 42-case matrix remain outside this prototype.
 #![forbid(unsafe_code)]
 
+pub mod derived_stage;
 mod error;
 mod evaluate;
 mod profile;

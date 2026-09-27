@@ -7,10 +7,15 @@
 //! facade/control plane remains outside this module.
 //!
 //! Normative anchors:
-//! - Architecture `A2.3` and `A12.2` in
-//!   `docs/architecture/ELIOT_ARCHITECTURE.md`.
-//! - Implementation `I2.3`, `I2.23`, and `I6.15` in
-//!   `docs/architecture/ELIOT_IMPLEMENTATION.md`.
+//! - Architecture `A2.3`
+//!   (`docs/architecture/A02-03-modular-architecture.md`) and `A12.2`
+//!   (`docs/architecture/A12-02-principal-session-and-visibility.md`).
+//! - Implementation `I2.3`
+//!   (`docs/architecture/I02-03-workspace-topology-and-dependency-direction.md`),
+//!   `I2.23`
+//!   (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`),
+//!   and `I6.15`
+//!   (`docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md`).
 //! - Authority and precedence: `docs/ARCHITECTURE_CONTRACT.md`.
 
 #[cfg(windows)]

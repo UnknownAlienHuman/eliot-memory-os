@@ -1,13 +1,15 @@
 //! Provider runtime contract construction, validation, and zero-model preflight.
 //!
-//! Normative handles in `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.2` and
-//! `A12.2` keep authority explicit, scoped, and fenced; this runtime boundary
-//! validates provider bindings without creating authority. Implementation
-//! handles in `docs/architecture/ELIOT_IMPLEMENTATION.md`: `I10.11` separates
-//! routing from physical model attempts behind provider-neutral contracts, and
-//! `I10.17` keeps external-agent adapters replaceable supervised bridges with
-//! no canonical-write authority. Precedence remains governed by
-//! `docs/ARCHITECTURE_CONTRACT.md`.
+//! Normative Architecture handles: `A2.2`
+//! (`docs/architecture/A02-02-roles.md`) and `A12.2`
+//! (`docs/architecture/A12-02-principal-session-and-visibility.md`) keep
+//! authority explicit, scoped, and fenced; this runtime boundary validates
+//! provider bindings without creating authority. Implementation handles: `I10.11`
+//! (`docs/architecture/I10-11-external-model-bridges.md`) separates routing from
+//! physical model attempts behind provider-neutral contracts, and `I10.17`
+//! (`docs/architecture/I10-17-adapter-subsystem.md`) keeps external-agent
+//! adapters replaceable supervised bridges with no canonical-write authority.
+//! Precedence remains governed by `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This cell may construct and inspect candidate runtime contracts and perform
 //! bounded preflight observation. It never mutates canonical state, changes

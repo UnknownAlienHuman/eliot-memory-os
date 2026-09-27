@@ -2621,10 +2621,42 @@ function Invoke-HarnessRun {
         $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
         $byIdentity = @{}
         $rowTables = [System.Collections.Generic.List[hashtable]]::new()
+        $inventoryRowAliases = [ordered]@{
+            package_id = 'packageId'
+            target_kind = 'targetKind'
+            target_name = 'targetName'
+            test_name = 'testName'
+            row_digest = 'rowDigest'
+        }
         foreach ($row in @($parsed.rows)) {
             $h = @{}
-            foreach ($prop in $row.PSObject.Properties) {
-                $h[[string]$prop.Name] = $prop.Value
+            $rowProperties = @($row.PSObject.Properties)
+            foreach ($alias in $inventoryRowAliases.GetEnumerator()) {
+                $hasInventoryName = $false
+                $hasModelName = $false
+                foreach ($prop in $rowProperties) {
+                    $propertyName = [string]$prop.Name
+                    if ($propertyName -ceq [string]$alias.Key) {
+                        $hasInventoryName = $true
+                    }
+                    elseif ($propertyName -ieq [string]$alias.Value) {
+                        $hasModelName = $true
+                    }
+                }
+                if ($hasInventoryName -and $hasModelName) {
+                    throw [System.ArgumentException]::new("HARNESS-AMBIGUOUS-ROW-FIELD: inventory row contains both '$($alias.Key)' and '$($alias.Value)'.")
+                }
+            }
+            foreach ($prop in $rowProperties) {
+                $propertyName = [string]$prop.Name
+                $modelName = $propertyName
+                foreach ($alias in $inventoryRowAliases.GetEnumerator()) {
+                    if ($propertyName -ceq [string]$alias.Key) {
+                        $modelName = [string]$alias.Value
+                        break
+                    }
+                }
+                $h[$modelName] = $prop.Value
             }
             try {
                 $rowCommand = Get-Command -Name 'Test-IntegrationHarnessInventoryRow' -ErrorAction SilentlyContinue

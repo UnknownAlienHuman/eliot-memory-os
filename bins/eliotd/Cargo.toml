@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 # Issue #18 required work 1, implemented through the #13
 # capability-cell-registry contract. `eliotd` is the production Governor
-# composition root (crates/eliotd/src/lib.rs:1-7), so it hosts the daemon
+# composition root (bins/eliotd/src/lib.rs:1-7), so it hosts the daemon
 # capability cells the generated `CapabilityCellRegistry` is compiled from
 # (I2.8 package metadata; I2.23 capability cell registry). Each cell below is a
 # real capability with a real single mutable-state owner; the owner is named

@@ -1,0 +1,151 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.memory_repair",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-dreamer-memory-repair",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [],
+    "inline_cfg_test_modules": 1
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "poisoned source closure",
+        "incomplete lineage",
+        "false relation",
+        "independent support survival",
+        "Doctor and merge-split boundary"
+      ]
+    },
+    "selected_tests": [],
+    "test_attribute_count": 71
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "eliot-dreamer-curation"
+      ]
+    },
+    "edge_profile_tests": []
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return unsupported or inconclusive MemoryRepairCandidate with exact missing evidence; original semantic and operational state remains unchanged."
+    },
+    "selected_cases": []
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 71,
+    "test_stu": 0,
+    "nonzero": true
+  },
+  "bound_contract_digest": "4b177079db331b82f6fe71d51d11d6e3a2b062c77a5f6fdaa3b4bed9b6807ba5",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-memory-repair/Cargo.toml",
+        "sha256": "9c9e39b5443c158e0aea3170492653d3c2dc14b84a4db11d5a50a710b2e4abaf"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-memory-repair/module.toml",
+        "sha256": "a2b0d27e9ae43646786f01ed9f5c121fb2da577befb902bb7767594741442a2d"
+      },
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "1687314f1c91360d2cc9cf8c6df7546b888953d20a58d23a6fa695073e48f584"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "9e15c2cf4e7671619409e0e439af636f9767983b8b141a36435f74b96e01ac71",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "9e15c2cf4e767161"
+  }
+}

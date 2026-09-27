@@ -15,6 +15,17 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod professional_execution;
+
+pub use professional_execution::{
+    PrematureAbandonmentSignal, ProfessionalAbandonmentDecision, ProfessionalApproachRevision,
+    ProfessionalArtifactEntry, ProfessionalArtifactManifest, ProfessionalAttempt,
+    ProfessionalAttemptOutcome, ProfessionalCompletionEvidence, ProfessionalEvaluationOutcome,
+    ProfessionalEvaluatorResult, ProfessionalExecutionContract, ProfessionalExecutionError,
+    ProfessionalExecutionState, ProfessionalRequirement, ProfessionalRequirementKind,
+    ProfessionalRoleOwners, TaskControllerDisposition,
+};
+
 pub const CONTRACT_NAME: &str = "eliot.governor.task_lifecycle";
 pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
     eliot_contracts::ContractVersion::new(1, 0, 0);
@@ -49,6 +60,8 @@ pub enum TaskError {
     MissingEvidence { field: &'static str },
     #[error("event sequence must follow the current causal sequence")]
     CausalSequenceMismatch,
+    #[error("professional execution state rejected the task command: {0}")]
+    ProfessionalExecution(#[from] ProfessionalExecutionError),
 }
 
 /// Canonical task state from Architecture 22.2.
@@ -115,10 +128,29 @@ pub enum TaskCommand {
     Reopen {
         reopen_ref: String,
     },
+    SetProfessionalExecutionContract {
+        contract: Box<ProfessionalExecutionContract>,
+    },
+    ReportProfessionalAttempt {
+        attempt: Box<ProfessionalAttempt>,
+        outcome: ProfessionalAttemptOutcome,
+        signal_ref: String,
+    },
+    ChangeProfessionalApproach {
+        revision: Box<ProfessionalApproachRevision>,
+        attempt: Box<ProfessionalAttempt>,
+        signal_ref: String,
+    },
+    DecideProfessionalAbandonment {
+        decision: Box<ProfessionalAbandonmentDecision>,
+    },
+    RecordProfessionalCompletionEvidence {
+        evidence: Box<ProfessionalCompletionEvidence>,
+    },
 }
 
 impl TaskCommand {
-    fn target(&self) -> TaskState {
+    fn target(&self, current: TaskState) -> TaskState {
         match self {
             Self::Open | Self::Reopen { .. } => TaskState::Open,
             Self::Frame { .. } => TaskState::Framed,
@@ -129,7 +161,24 @@ impl TaskCommand {
             Self::Verify { .. } => TaskState::DoneVerified,
             Self::Block { .. } => TaskState::Blocked,
             Self::Fail { .. } => TaskState::Failed,
-            Self::MarkPartial { .. } => TaskState::Partial,
+            Self::MarkPartial { .. }
+            | Self::ReportProfessionalAttempt {
+                outcome: ProfessionalAttemptOutcome::Stopped,
+                ..
+            } => TaskState::Partial,
+            Self::DecideProfessionalAbandonment { decision }
+                if matches!(
+                    &decision.disposition,
+                    TaskControllerDisposition::AcceptPartial { .. }
+                ) =>
+            {
+                TaskState::Partial
+            }
+            Self::SetProfessionalExecutionContract { .. }
+            | Self::ReportProfessionalAttempt { .. }
+            | Self::ChangeProfessionalApproach { .. }
+            | Self::DecideProfessionalAbandonment { .. }
+            | Self::RecordProfessionalCompletionEvidence { .. } => current,
         }
     }
 
@@ -149,6 +198,47 @@ impl TaskCommand {
             }
             Self::MarkPartial { result_ref } => text(result_ref, "result_ref"),
             Self::Reopen { reopen_ref } => text(reopen_ref, "reopen_ref"),
+            Self::SetProfessionalExecutionContract { contract } => contract
+                .validate()
+                .map_err(TaskError::ProfessionalExecution),
+            Self::ReportProfessionalAttempt {
+                attempt,
+                signal_ref,
+                ..
+            }
+            | Self::ChangeProfessionalApproach {
+                attempt,
+                signal_ref,
+                ..
+            } => {
+                if matches!(
+                    self,
+                    Self::ReportProfessionalAttempt {
+                        outcome: ProfessionalAttemptOutcome::ApproachChanged,
+                        ..
+                    }
+                ) {
+                    return Err(TaskError::InvalidField("approach_revision_required"));
+                }
+                text(&attempt.attempt_ref, "attempt_ref")?;
+                text(&attempt.reason, "attempt_reason")?;
+                text(signal_ref, "signal_ref")
+            }
+            Self::DecideProfessionalAbandonment { decision } => match &decision.disposition {
+                TaskControllerDisposition::Reframe { rationale }
+                | TaskControllerDisposition::Supersede { rationale } => {
+                    text(rationale, "rationale")
+                }
+                TaskControllerDisposition::AcceptPartial { acceptance_ref } => {
+                    text(acceptance_ref, "acceptance_ref")
+                }
+                TaskControllerDisposition::RequestHumanInput { question } => {
+                    text(question, "question")
+                }
+            },
+            Self::RecordProfessionalCompletionEvidence { evidence } => {
+                text(&evidence.artifact_manifest.manifest_ref, "manifest_ref")
+            }
             Self::Open
             | Self::RequireUnderstanding
             | Self::BeginExecution
@@ -202,6 +292,10 @@ pub struct TaskLifecycleEvent {
     pub from: Option<TaskState>,
     pub to: TaskState,
     pub command: Option<TaskCommand>,
+    /// Updated professional state carried with the lifecycle event so its
+    /// derived signals and decisions travel through the same canonical write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub professional_execution: Option<ProfessionalExecutionState>,
     pub state_fence: StateFence,
     pub authority_epoch: EpochId,
     pub observed_at: ClockReading,
@@ -228,6 +322,8 @@ pub struct TaskLifecycleSnapshot {
     pub next_sequence: u64,
     pub tasks: BTreeMap<TaskId, TaskRecord>,
     pub events: Vec<TaskLifecycleEvent>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub professional_execution: BTreeMap<TaskId, ProfessionalExecutionState>,
 }
 
 /// Deterministic owner of all task lifecycle transitions in one fence.
@@ -238,6 +334,7 @@ pub struct TaskLifecycleOwner {
     next_sequence: u64,
     tasks: BTreeMap<TaskId, TaskRecord>,
     events: Vec<TaskLifecycleEvent>,
+    professional_execution: BTreeMap<TaskId, ProfessionalExecutionState>,
     requests: BTreeMap<String, (TaskId, Option<TaskCommand>, TaskLifecycleEvent)>,
 }
 
@@ -256,6 +353,7 @@ impl TaskLifecycleOwner {
             next_sequence: 1,
             tasks: BTreeMap::new(),
             events: Vec::new(),
+            professional_execution: BTreeMap::new(),
             requests: BTreeMap::new(),
         })
     }
@@ -286,8 +384,58 @@ impl TaskLifecycleOwner {
             }
             owner.tasks.insert(record.task_id.clone(), record.clone());
         }
+        if snapshot
+            .professional_execution
+            .keys()
+            .any(|task_id| !owner.tasks.contains_key(task_id))
+        {
+            return Err(TaskError::InvalidField("professional_execution_task"));
+        }
+        owner.professional_execution = snapshot.professional_execution;
         owner.next_sequence = snapshot.next_sequence;
         owner.events = snapshot.events;
+        let mut event_completion_evidence: BTreeMap<TaskId, Vec<ProfessionalCompletionEvidence>> =
+            BTreeMap::new();
+        for event in &owner.events {
+            if let Some(TaskCommand::RecordProfessionalCompletionEvidence { evidence }) =
+                &event.command
+            {
+                let state = event
+                    .professional_execution
+                    .as_ref()
+                    .ok_or(TaskError::InvalidField("professional_completion_history"))?;
+                let mut checked = ProfessionalExecutionState::new(state.contract.clone())?;
+                checked.record_completion_evidence(*evidence.clone())?;
+                event_completion_evidence
+                    .entry(event.task_id.clone())
+                    .or_default()
+                    .push(*evidence.clone());
+            }
+            if let Some(state) = &event.professional_execution {
+                let recorded = event_completion_evidence
+                    .get(&event.task_id)
+                    .map_or(&[][..], Vec::as_slice);
+                if state.completion_evidence.as_slice() != recorded {
+                    return Err(TaskError::InvalidField("professional_completion_history"));
+                }
+            }
+        }
+        for (task_id, state) in &owner.professional_execution {
+            if !state.completion_evidence.is_empty()
+                && event_completion_evidence
+                    .get(task_id)
+                    .is_none_or(|recorded| *recorded != state.completion_evidence)
+            {
+                return Err(TaskError::InvalidField("professional_completion_history"));
+            }
+        }
+        for event in &owner.events {
+            if let Some(state) = &event.professional_execution {
+                owner
+                    .professional_execution
+                    .insert(event.task_id.clone(), state.clone());
+            }
+        }
         for event in &owner.events {
             if let Some(command) = &event.command {
                 owner.requests.insert(
@@ -321,6 +469,7 @@ impl TaskLifecycleOwner {
             proposal.task_id.clone(),
             None,
             TaskState::Proposed,
+            None,
             None,
         );
         self.tasks.insert(
@@ -375,20 +524,53 @@ impl TaskLifecycleOwner {
                 current: current.revision,
             });
         }
-        let target = command.target();
+        if matches!(command, TaskCommand::Verify { .. })
+            && let Some(state) = self.professional_execution.get(&task_id)
+        {
+            state.require_evaluator_result()?;
+        }
+        if matches!(
+            command,
+            TaskCommand::Block { .. } | TaskCommand::Fail { .. }
+        ) && self
+            .professional_execution
+            .get(&task_id)
+            .is_some_and(|state| !state.latest_attempt_stopped_with_signal())
+        {
+            return Err(TaskError::MissingEvidence {
+                field: "premature_abandonment_signal",
+            });
+        }
+        if matches!(command, TaskCommand::MarkPartial { .. })
+            && self.professional_execution.contains_key(&task_id)
+        {
+            return Err(TaskError::MissingEvidence {
+                field: "task_controller_partial_disposition",
+            });
+        }
+        let target = command.target(current.state);
         if !allowed(current.state, &command) {
             return Err(TaskError::IllegalTransition {
                 from: current.state,
                 to: target,
             });
         }
+        let mut next_professional_execution = self.professional_execution.clone();
+        Self::apply_professional_command(
+            &mut next_professional_execution,
+            &task_id,
+            &context,
+            &command,
+        )?;
         let event = self.emit(
             &context,
             task_id.clone(),
             Some(current.state),
             target,
             Some(command.clone()),
+            next_professional_execution.get(&task_id).cloned(),
         );
+        self.professional_execution = next_professional_execution;
         let record = self
             .tasks
             .get_mut(&task_id)
@@ -418,6 +600,7 @@ impl TaskLifecycleOwner {
             next_sequence: self.next_sequence,
             tasks: self.tasks.clone(),
             events: self.events.clone(),
+            professional_execution: self.professional_execution.clone(),
         }
     }
 
@@ -441,6 +624,7 @@ impl TaskLifecycleOwner {
         from: Option<TaskState>,
         to: TaskState,
         command: Option<TaskCommand>,
+        professional_execution: Option<ProfessionalExecutionState>,
     ) -> TaskLifecycleEvent {
         let event = TaskLifecycleEvent {
             sequence: self.next_sequence,
@@ -451,6 +635,7 @@ impl TaskLifecycleOwner {
             from,
             to,
             command,
+            professional_execution,
             state_fence: context.state_fence.clone(),
             authority_epoch: context.authority_epoch.clone(),
             observed_at: context.observed_at,
@@ -458,6 +643,71 @@ impl TaskLifecycleOwner {
         self.next_sequence += 1;
         self.events.push(event.clone());
         event
+    }
+
+    fn apply_professional_command(
+        professional_execution: &mut BTreeMap<TaskId, ProfessionalExecutionState>,
+        task_id: &TaskId,
+        context: &TaskCommandContext,
+        command: &TaskCommand,
+    ) -> Result<(), TaskError> {
+        match command {
+            TaskCommand::SetProfessionalExecutionContract { contract } => {
+                if professional_execution.contains_key(task_id) {
+                    return Err(ProfessionalExecutionError::ContractAlreadyExists.into());
+                }
+                professional_execution.insert(
+                    task_id.clone(),
+                    ProfessionalExecutionState::new(*contract.clone())?,
+                );
+            }
+            TaskCommand::ReportProfessionalAttempt {
+                attempt,
+                outcome,
+                signal_ref,
+            } => {
+                let state = professional_execution
+                    .get_mut(task_id)
+                    .ok_or(ProfessionalExecutionError::ContractNotFound)?;
+                state.record_attempt(
+                    task_id.clone(),
+                    context.state_fence.clone(),
+                    *attempt.clone(),
+                    *outcome,
+                    signal_ref.clone(),
+                )?;
+            }
+            TaskCommand::ChangeProfessionalApproach {
+                revision,
+                attempt,
+                signal_ref,
+            } => {
+                let state = professional_execution
+                    .get_mut(task_id)
+                    .ok_or(ProfessionalExecutionError::ContractNotFound)?;
+                state.change_approach(
+                    *revision.clone(),
+                    task_id.clone(),
+                    context.state_fence.clone(),
+                    *attempt.clone(),
+                    signal_ref.clone(),
+                )?;
+            }
+            TaskCommand::DecideProfessionalAbandonment { decision } => {
+                let state = professional_execution
+                    .get_mut(task_id)
+                    .ok_or(ProfessionalExecutionError::ContractNotFound)?;
+                state.decide(*decision.clone())?;
+            }
+            TaskCommand::RecordProfessionalCompletionEvidence { evidence } => {
+                let state = professional_execution
+                    .get_mut(task_id)
+                    .ok_or(ProfessionalExecutionError::ContractNotFound)?;
+                state.record_completion_evidence(*evidence.clone())?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -469,10 +719,18 @@ fn allowed(from: TaskState, command: &TaskCommand) -> bool {
         TaskCommand::AuthorizeAction { .. } => from == TaskState::UnderstandingRequired,
         TaskCommand::BeginExecution => from == TaskState::ActionAuthorized,
         TaskCommand::BeginVerification => from == TaskState::Executing,
-        TaskCommand::Verify { .. } => from == TaskState::Verifying,
+        TaskCommand::Verify { .. } | TaskCommand::RecordProfessionalCompletionEvidence { .. } => {
+            from == TaskState::Verifying
+        }
         TaskCommand::Block { .. } | TaskCommand::Fail { .. } | TaskCommand::MarkPartial { .. } => {
             from.is_active()
         }
         TaskCommand::Reopen { .. } => from.is_terminal(),
+        TaskCommand::SetProfessionalExecutionContract { .. } => from.is_active(),
+        TaskCommand::ReportProfessionalAttempt { .. }
+        | TaskCommand::ChangeProfessionalApproach { .. } => {
+            matches!(from, TaskState::Executing | TaskState::Verifying)
+        }
+        TaskCommand::DecideProfessionalAbandonment { .. } => from != TaskState::DoneVerified,
     }
 }

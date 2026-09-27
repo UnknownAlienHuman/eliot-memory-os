@@ -4,6 +4,16 @@
 //! already validated whole units or exact handles and accounts for qualified
 //! UTF-8 contributions. Providers, renderers, tokenizers, stores and runtime
 //! effects remain outside this crate.
+//!
+//! Privacy is refused HERE, by the contracts cell's own rule and not only
+//! downstream: `AdmissionInput::validate` calls
+//! `ContextCandidate::validate_public_privacy` on every candidate, so an atom whose
+//! `PrivacyClass` is not `Public` fails admission input with
+//! `ContextError::InvalidField("candidate.privacy")` and never reaches an admitted set.
+//! The wider A00.3 question — which routes a non-public atom may then reach — belongs to
+//! `crates/governor/eliot-workscope` (`PrivacyProfile::admits`, `WorkScopeError::PrivacyDenied`).
+//! An earlier version of this note claimed the opposite ("never refused by admission");
+//! it was wrong, and the rule it denied is two calls away in `admission_input.rs`.
 
 #![forbid(unsafe_code)]
 

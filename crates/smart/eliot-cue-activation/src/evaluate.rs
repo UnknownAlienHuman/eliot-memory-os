@@ -1,4 +1,5 @@
 //! Bounded A14 activation over an immutable A10 build candidate.
+use crate::derived_stage::{DerivedStage, RelationCoverage};
 use crate::{ActivationError, ActivationProfile};
 use eliot_cue_contracts::{
     ActivationRequest, ActivationResult, ActivationResultSpec, ActivationStrength, ActivationTrace,
@@ -24,6 +25,12 @@ pub struct CueActivationEvaluation {
     pub policy_digest: eliot_cue_contracts::Digest,
     pub candidate_build_digest: eliot_cue_contracts::Digest,
     pub input_digest: eliot_cue_contracts::Digest,
+    /// Disposition of the optional relation-derived stage.
+    ///
+    /// The direct domain and the optional relation domain are reported apart, so
+    /// absent, stale, unqualified, or bounded relation coverage can never be
+    /// read as a direct-match absence.
+    pub derived_stage: DerivedStage,
     pub result: ActivationResult,
 }
 
@@ -76,19 +83,150 @@ pub fn evaluate_activation(
     let input_digest = input_digest(candidate, request, profile)?;
     let mut budget = Budget::default();
     let direct = direct_phase(candidate, request, profile, &mut budget)?;
-    let (derived, trace, completeness) =
-        spread_phase(candidate, request, profile, &direct, &mut budget)?;
-    let result = assemble_result(request, direct, derived, trace, completeness)?;
+    let outcome = derived_stage(candidate, request, profile, &direct, &mut budget)?;
+    let result = assemble_result(
+        request,
+        direct,
+        outcome.derived,
+        outcome.trace,
+        outcome.completeness,
+    )?;
     let evaluation = CueActivationEvaluation {
         policy_id: profile.profile_id.clone(),
         policy_revision: profile.profile_revision,
         policy_digest: profile.digest.clone(),
         candidate_build_digest: candidate.build_digest.clone(),
         input_digest,
+        derived_stage: outcome.stage,
         result,
     };
     validate_output(&evaluation, request)?;
     Ok(evaluation)
+}
+
+/// The optional stage's contribution and its typed disposition.
+struct DerivedOutcome {
+    derived: Vec<DerivedActivation>,
+    trace: ActivationTrace,
+    completeness: Completeness,
+    stage: DerivedStage,
+}
+
+/// Resolves direct-only versus spread-enabled policy, then runs the optional stage.
+///
+/// The direct-only branch is decided from the request bounds before any relation
+/// material is validated, so a direct-only request never requires, contacts,
+/// starts, or rebuilds a relation service. A spread-enabled request already
+/// carries the optional relation material the caller acquired; this resolves
+/// whether that material is usable and preserves a valid completed direct result
+/// whenever only the optional stage is unavailable or reaches an admitted limit.
+fn derived_stage(
+    candidate: &CueSnapshotBuildCandidate,
+    request: &ActivationRequest,
+    profile: &ActivationProfile,
+    direct: &[DirectActivation],
+    budget: &mut Budget,
+) -> Result<DerivedOutcome, ActivationError> {
+    if request.is_direct_only() {
+        return direct_result_without_derived(direct, request, DerivedStage::Disabled);
+    }
+    match relation_gap(candidate, request, profile) {
+        Some(gap) => direct_result_without_derived(
+            direct,
+            request,
+            DerivedStage::Unavailable {
+                reason: gap.reason,
+                unusable: gap.unusable,
+            },
+        ),
+        None => spread_phase(candidate, request, profile, direct, budget),
+    }
+}
+
+/// The result of a completed direct evaluation with no derived contribution.
+///
+/// The trace still records every direct hit, so an absent, unusable, or disabled
+/// optional stage never removes the evidence for an exact cue. The direct
+/// completeness is derived from the un-followed relation edges: with a resumable
+/// remainder the search was partial, and with none it was complete. Neither
+/// declares the direct snapshot absent.
+fn direct_result_without_derived(
+    direct: &[DirectActivation],
+    request: &ActivationRequest,
+    stage: DerivedStage,
+) -> Result<DerivedOutcome, ActivationError> {
+    let completeness = match &stage {
+        DerivedStage::Unavailable { unusable, .. } if unusable.is_empty() => Completeness::Complete,
+        DerivedStage::Unavailable { unusable, .. } => Completeness::Partial {
+            frontier: unusable.clone(),
+        },
+        _ => Completeness::Complete,
+    };
+    Ok(DerivedOutcome {
+        derived: Vec::new(),
+        trace: direct_trace(direct, trace_limit(request))?,
+        completeness,
+        stage,
+    })
+}
+
+/// Why the optional relation domain could not contribute, and where it stopped.
+struct RelationGap {
+    reason: RelationCoverage,
+    unusable: Vec<RelationEdgeId>,
+}
+
+/// Supplied relation edges this profile and fence do not admit.
+///
+/// Only coverage and currency are resolved here. Identity, scope, and fence
+/// binding of the supplied edges remain hard refusals in `preflight`, because a
+/// forged or mismatched edge set is corrupted shared input rather than absent
+/// optional material. Reasons are reported in declaration order so the same
+/// evidence always yields the same typed outcome.
+fn relation_gap(
+    candidate: &CueSnapshotBuildCandidate,
+    request: &ActivationRequest,
+    profile: &ActivationProfile,
+) -> Option<RelationGap> {
+    if candidate.relation_edges.is_empty() {
+        return Some(RelationGap {
+            reason: RelationCoverage::Absent,
+            unusable: Vec::new(),
+        });
+    }
+    let mut unusable: BTreeSet<RelationEdgeId> = BTreeSet::new();
+    let mut not_current = false;
+    let mut registry_changed = false;
+    let mut kind_not_admitted = false;
+    for edge in &candidate.relation_edges {
+        // Allowed edge direction and kind are explicit profile semantics. An
+        // unweighted kind is not traversed and never fails the direct domain.
+        if !is_current_evidence(edge.evidence.freshness, edge.evidence.status)
+            || edge.evidence.state_fence != request.state_fence
+        {
+            not_current = true;
+        } else if profile.registry_revision.as_deref() != Some(edge.registry_revision.as_str()) {
+            registry_changed = true;
+        } else if profile.relation_weight(edge.kind).is_none() {
+            kind_not_admitted = true;
+        } else {
+            continue;
+        }
+        unusable.insert(edge.relation_edge_id.clone());
+    }
+    let reason = if not_current {
+        RelationCoverage::NotCurrent
+    } else if registry_changed {
+        RelationCoverage::RegistryRevisionChanged
+    } else if kind_not_admitted {
+        RelationCoverage::KindNotAdmitted
+    } else {
+        return None;
+    };
+    Some(RelationGap {
+        reason,
+        unusable: unusable.into_iter().collect(),
+    })
 }
 
 impl CueActivationEvaluation {
@@ -121,8 +259,56 @@ impl CueActivationEvaluation {
         }) {
             return Err(ActivationError::ProfileBinding);
         }
+        self.validate_derived_stage(candidate, request, profile)?;
         validate_output(self, request)?;
         Ok(())
+    }
+
+    /// Checks that the recorded optional-stage disposition is the one these
+    /// exact inputs produce.
+    ///
+    /// A structurally valid arbitrary result is not proof the local evaluator
+    /// ran, so the optional stage is re-resolved here. Only the coverage and
+    /// policy decision is re-derived; the traversal itself is not replayed.
+    fn validate_derived_stage(
+        &self,
+        candidate: &CueSnapshotBuildCandidate,
+        request: &ActivationRequest,
+        profile: &ActivationProfile,
+    ) -> Result<(), ActivationError> {
+        let expected = if request.is_direct_only() {
+            Some(DerivedStage::Disabled)
+        } else {
+            relation_gap(candidate, request, profile).map(|gap| DerivedStage::Unavailable {
+                reason: gap.reason,
+                unusable: gap.unusable,
+            })
+        };
+        match (&self.derived_stage, expected) {
+            (DerivedStage::Disabled, Some(DerivedStage::Disabled)) => Ok(()),
+            (
+                DerivedStage::Unavailable { reason, unusable },
+                Some(DerivedStage::Unavailable {
+                    reason: expected_reason,
+                    unusable: expected_unusable,
+                }),
+            ) => {
+                if *reason == expected_reason && *unusable == expected_unusable {
+                    Ok(())
+                } else {
+                    Err(ActivationError::ProfileBinding)
+                }
+            }
+            // A spread-enabled run with usable relation evidence is the only
+            // stage that may report a traversal outcome, and a direct-only
+            // request is the only one that may report `Disabled`.
+            (DerivedStage::Evaluated | DerivedStage::BoundReached { .. }, None)
+                if !request.is_direct_only() =>
+            {
+                Ok(())
+            }
+            _ => Err(ActivationError::ProfileBinding),
+        }
     }
 }
 
@@ -145,21 +331,23 @@ fn preflight(
     {
         return Err(ActivationError::ProfileBinding);
     }
-    if candidate.relation_edges.len() != request.relation_edges.len() {
-        return Err(ActivationError::ProfileBinding);
-    }
-    let candidate_edges: BTreeMap<_, _> = candidate
-        .relation_edges
-        .iter()
-        .map(|edge| (&edge.relation_edge_id, edge))
-        .collect();
-    let request_edges: BTreeMap<_, _> = request
-        .relation_edges
-        .iter()
-        .map(|edge| (&edge.relation_edge_id, edge))
-        .collect();
-    if candidate_edges != request_edges {
-        return Err(ActivationError::ProfileBinding);
+    // Relation identity is only bound when the optional stage may run. A
+    // direct-only request carries no relation edges, so the published snapshot's
+    // optional relation set is neither required nor validated here.
+    if !request.is_direct_only() {
+        let candidate_edges: BTreeMap<_, _> = candidate
+            .relation_edges
+            .iter()
+            .map(|edge| (&edge.relation_edge_id, edge))
+            .collect();
+        let request_edges: BTreeMap<_, _> = request
+            .relation_edges
+            .iter()
+            .map(|edge| (&edge.relation_edge_id, edge))
+            .collect();
+        if candidate_edges != request_edges {
+            return Err(ActivationError::ProfileBinding);
+        }
     }
     for projection in &candidate.admitted_bindings {
         validate_current_projection(projection, request)?;
@@ -170,19 +358,6 @@ fn preflight(
             if profile.rule(seed.observed.kind, key.match_mode).is_none() {
                 return Err(ActivationError::Unsupported);
             }
-        }
-    }
-    for edge in &candidate.relation_edges {
-        if edge.evidence.state_fence != request.state_fence
-            || !is_current_evidence(edge.evidence.freshness, edge.evidence.status)
-        {
-            return Err(ActivationError::StaleInput);
-        }
-        if profile.registry_revision.as_deref() != Some(edge.registry_revision.as_str()) {
-            return Err(ActivationError::ProfileBinding);
-        }
-        if profile.relation_weight(edge.kind).is_none() {
-            return Err(ActivationError::Unsupported);
         }
     }
     Ok(())
@@ -621,12 +796,15 @@ struct SpreadWork<'a> {
     best: BestStates,
     stopped_frontier: Vec<RelationEdgeId>,
     stopped_by_fanout: bool,
+    /// The admitted bound that stopped this optional stage, when one did.
+    stopped_by_bound: Option<&'static str>,
     derived_states: Vec<SearchState>,
 }
 
 struct SpreadRun {
     stopped_frontier: Vec<RelationEdgeId>,
     stopped_by_fanout: bool,
+    stopped_by_bound: Option<&'static str>,
     derived_states: Vec<SearchState>,
 }
 
@@ -636,18 +814,7 @@ fn spread_phase(
     profile: &ActivationProfile,
     direct: &[DirectActivation],
     budget: &mut Budget,
-) -> Result<(Vec<DerivedActivation>, ActivationTrace, Completeness), ActivationError> {
-    if request.bounds.max_depth == 0 {
-        return Ok((
-            Vec::new(),
-            direct_trace(
-                direct,
-                usize::from(request.bounds.max_trace_steps)
-                    .min(eliot_cue_contracts::MAX_TRACE_STEPS),
-            )?,
-            Completeness::Complete,
-        ));
-    }
+) -> Result<DerivedOutcome, ActivationError> {
     let mut direct_best = BTreeMap::new();
     for hit in direct {
         let replace = direct_best
@@ -675,32 +842,98 @@ fn spread_phase(
         best: BTreeMap::new(),
         stopped_frontier: Vec::new(),
         stopped_by_fanout: false,
+        stopped_by_bound: None,
         derived_states: Vec::new(),
     }
     .run()?;
-    let derived = final_derived(&run.derived_states, direct, request)?;
+    let (derived, unreported) = final_derived(&run.derived_states, direct, request)?;
     let trace = trace_for(
         direct,
         &run.derived_states,
         &candidate.relation_edges,
-        usize::from(request.bounds.max_trace_steps).min(eliot_cue_contracts::MAX_TRACE_STEPS),
+        trace_limit(request),
     )?;
-    if run.stopped_frontier.is_empty() {
-        return Ok((derived, trace, Completeness::Complete));
-    }
-    let bound_hit = if run.stopped_by_fanout {
-        BoundKind::Fanout
-    } else {
-        BoundKind::Depth
+    // An admitted bound that stopped this optional stage never retracts the
+    // completed direct result. Every derived hit it did reach is kept, the
+    // un-followed remainder becomes the frontier, and the exact bound is named,
+    // so a cap can neither become `Complete` nor fail the whole evaluation.
+    let bounded = run.stopped_by_bound.map(|field| {
+        (
+            field,
+            unfollowed_edges(candidate, &run.derived_states, &run.stopped_frontier),
+        )
+    });
+    let stage = match bounded {
+        Some((field, frontier)) if frontier.is_empty() => {
+            return Err(ActivationError::Limit { field });
+        }
+        Some((field, _)) => DerivedStage::BoundReached {
+            field: field.to_owned(),
+        },
+        None if !unreported.is_empty() => DerivedStage::BoundReached {
+            field: "activation.max_derived".to_owned(),
+        },
+        None => DerivedStage::Evaluated,
     };
-    Ok((
+    let completeness = match bounded {
+        Some((_, frontier)) => Completeness::Partial { frontier },
+        None if !unreported.is_empty() => Completeness::Partial {
+            frontier: unreported,
+        },
+        None if run.stopped_frontier.is_empty() => Completeness::Complete,
+        None => Completeness::Truncated {
+            bound_hit: if run.stopped_by_fanout {
+                BoundKind::Fanout
+            } else {
+                BoundKind::Depth
+            },
+            frontier: run.stopped_frontier,
+        },
+    };
+    Ok(DerivedOutcome {
         derived,
         trace,
-        Completeness::Truncated {
-            frontier: run.stopped_frontier,
-            bound_hit,
-        },
-    ))
+        completeness,
+        stage,
+    })
+}
+
+/// Every supplied relation edge the traversal did not follow.
+///
+/// A state records each edge it consumed, so the remainder is the work a resumed
+/// search still owes. It is non-empty whenever an admitted bound stopped the
+/// optional stage, which is what keeps a cap from collapsing into a `Complete`
+/// result. Depth and fan-out stops contribute their own stopped frontier too,
+/// because those edges were admitted but never followed.
+fn unfollowed_edges(
+    candidate: &CueSnapshotBuildCandidate,
+    states: &[SearchState],
+    stopped_frontier: &[RelationEdgeId],
+) -> Vec<RelationEdgeId> {
+    let mut followed: BTreeSet<&RelationEdgeId> = BTreeSet::new();
+    for state in states {
+        followed.extend(state.path.iter());
+    }
+    let mut frontier: Vec<RelationEdgeId> = candidate
+        .relation_edges
+        .iter()
+        .map(|edge| &edge.relation_edge_id)
+        .filter(|id| !followed.contains(id))
+        .cloned()
+        .collect();
+    for id in stopped_frontier {
+        if !followed.contains(id) {
+            frontier.push(id.clone());
+        }
+    }
+    frontier.sort();
+    frontier.dedup();
+    frontier
+}
+
+/// The trace bound this request admits, capped by the contract ceiling.
+fn trace_limit(request: &ActivationRequest) -> usize {
+    usize::from(request.bounds.max_trace_steps).min(eliot_cue_contracts::MAX_TRACE_STEPS)
 }
 
 impl SpreadWork<'_> {
@@ -724,6 +957,7 @@ impl SpreadWork<'_> {
         Ok(SpreadRun {
             stopped_frontier: self.stopped_frontier,
             stopped_by_fanout: self.stopped_by_fanout,
+            stopped_by_bound: self.stopped_by_bound,
             derived_states: self.derived_states,
         })
     }
@@ -741,10 +975,16 @@ impl SpreadWork<'_> {
     }
 
     fn process_state(&mut self, state: &SearchState) -> Result<(), ActivationError> {
-        self.charge_node()?;
+        if let Some(field) = self.charge_node() {
+            self.stop_optional(field);
+            return Ok(());
+        }
         let mut outgoing = Vec::new();
         for index in 0..self.candidate.relation_edges.len() {
-            self.charge_edge()?;
+            if let Some(field) = self.charge_edge() {
+                self.stop_optional(field);
+                return Ok(());
+            }
             let edge = &self.candidate.relation_edges[index];
             if edge.from == state.target && self.profile.relation_weight(edge.kind).is_some() {
                 outgoing.push(index);
@@ -779,20 +1019,35 @@ impl SpreadWork<'_> {
         }
         for index in outgoing {
             let edge = self.candidate.relation_edges[index].clone();
-            self.expand_edge(state, &edge)?;
+            if self.expand_edge(state, &edge)? {
+                self.stop_optional("activation.max_path_len");
+                return Ok(());
+            }
         }
         Ok(())
     }
 
+    /// Stops the optional stage at an admitted bound.
+    ///
+    /// Only the relation-derived traversal stops here. The completed direct
+    /// result, the derived hits already reached, and the un-followed remainder
+    /// are all preserved, and the exact bound is named in the stage outcome.
+    fn stop_optional(&mut self, field: &'static str) {
+        self.stopped_by_bound = Some(field);
+        self.frontier.clear();
+    }
+
+    /// Returns `true` when this edge may not extend the path under the
+    /// admitted path-length bound.
     fn expand_edge(
         &mut self,
         state: &SearchState,
         edge: &RelationEdge,
-    ) -> Result<(), ActivationError> {
+    ) -> Result<bool, ActivationError> {
         if state.path.iter().any(|id| id == &edge.relation_edge_id)
             || edge_in_path_target(state, edge, &self.candidate.relation_edges)
         {
-            return Ok(());
+            return Ok(false);
         }
         let weight = self
             .profile
@@ -808,12 +1063,10 @@ impl SpreadWork<'_> {
         let mut path = state.path.clone();
         path.push(edge.relation_edge_id.clone());
         if path.len() > usize::from(self.request.bounds.max_path_len) {
-            return Err(ActivationError::Limit {
-                field: "activation.max_path_len",
-            });
+            return Ok(true);
         }
         if score < self.request.bounds.activation_threshold {
-            return Ok(());
+            return Ok(false);
         }
         let depth = u8::try_from(path.len()).map_err(|_| ActivationError::Limit {
             field: "activation.max_depth",
@@ -833,71 +1086,60 @@ impl SpreadWork<'_> {
             self.derived_states.push(next.clone());
             self.frontier.push(next);
         }
-        Ok(())
+        Ok(false)
     }
 
-    fn charge_node(&mut self) -> Result<(), ActivationError> {
-        self.budget.nodes = self
-            .budget
-            .nodes
-            .checked_add(1)
-            .ok_or(ActivationError::Limit {
-                field: "activation.max_nodes",
-            })?;
-        if self.budget.nodes > self.request.bounds.max_nodes {
-            return Err(ActivationError::Limit {
-                field: "activation.max_nodes",
-            });
+    /// Charges one node visit, returning the admitted bound that stopped the
+    /// optional stage instead of refusing the whole evaluation.
+    fn charge_node(&mut self) -> Option<&'static str> {
+        let nodes = self.budget.nodes.checked_add(1)?;
+        if nodes > self.request.bounds.max_nodes {
+            self.budget.nodes = nodes;
+            return Some("activation.max_nodes");
         }
-        self.budget.work = self
-            .budget
-            .work
-            .checked_add(1)
-            .ok_or(ActivationError::Limit {
-                field: "activation.max_work",
-            })?;
-        if self.budget.work > self.request.bounds.max_work {
-            return Err(ActivationError::Limit {
-                field: "activation.max_work",
-            });
+        let work = self.budget.work.checked_add(1)?;
+        if work > self.request.bounds.max_work {
+            self.budget.nodes = nodes;
+            self.budget.work = work;
+            return Some("activation.max_work");
         }
-        Ok(())
+        self.budget.nodes = nodes;
+        self.budget.work = work;
+        None
     }
 
-    fn charge_edge(&mut self) -> Result<(), ActivationError> {
-        self.budget.edges = self
-            .budget
-            .edges
-            .checked_add(1)
-            .ok_or(ActivationError::Limit {
-                field: "activation.max_edges",
-            })?;
-        if self.budget.edges > self.request.bounds.max_edges {
-            return Err(ActivationError::Limit {
-                field: "activation.max_edges",
-            });
+    /// Charges one edge inspection, returning the admitted bound that stopped
+    /// the optional stage instead of refusing the whole evaluation.
+    fn charge_edge(&mut self) -> Option<&'static str> {
+        let edges = self.budget.edges.checked_add(1)?;
+        if edges > self.request.bounds.max_edges {
+            self.budget.edges = edges;
+            return Some("activation.max_edges");
         }
-        self.budget.work = self
-            .budget
-            .work
-            .checked_add(1)
-            .ok_or(ActivationError::Limit {
-                field: "activation.max_work",
-            })?;
-        if self.budget.work > self.request.bounds.max_work {
-            return Err(ActivationError::Limit {
-                field: "activation.max_work",
-            });
+        let work = self.budget.work.checked_add(1)?;
+        if work > self.request.bounds.max_work {
+            self.budget.edges = edges;
+            self.budget.work = work;
+            return Some("activation.max_work");
         }
-        Ok(())
+        self.budget.edges = edges;
+        self.budget.work = work;
+        None
     }
 }
 
+/// The strongest observed path per non-direct target, within the derived bound.
+///
+/// Selection keeps the maximum admissible path contribution per target, so a
+/// duplicate relation or a second route to the same target never adds to its
+/// score. The second return value names the resumable edges of the paths the
+/// admitted derived bound did not admit, so that cap stays visible as a frontier
+/// instead of becoming a silently smaller answer.
 fn final_derived(
     states: &[SearchState],
     direct: &[DirectActivation],
     request: &ActivationRequest,
-) -> Result<Vec<DerivedActivation>, ActivationError> {
+) -> Result<(Vec<DerivedActivation>, Vec<RelationEdgeId>), ActivationError> {
     let direct_targets: BTreeSet<_> = direct.iter().map(|hit| hit.target.clone()).collect();
     let mut selected: BTreeMap<TargetHandle, &SearchState> = BTreeMap::new();
     for state in states {
@@ -914,21 +1156,26 @@ fn final_derived(
             selected.insert(state.target.clone(), state);
         }
     }
+    let limit = usize::from(request.bounds.max_derived);
     let mut result = Vec::new();
+    let mut unreported: Vec<RelationEdgeId> = Vec::new();
     for state in selected.values() {
+        if result.len() >= limit {
+            if let Some(last) = state.path.last() {
+                unreported.push(last.clone());
+            }
+            continue;
+        }
         result.push(DerivedActivation::try_new(
             state.target.clone(),
             state.direct_seed.clone(),
             state.path.clone(),
             state.score,
         )?);
-        if result.len() > usize::from(request.bounds.max_derived) {
-            return Err(ActivationError::Limit {
-                field: "activation.max_derived",
-            });
-        }
     }
-    Ok(result)
+    unreported.sort();
+    unreported.dedup();
+    Ok((result, unreported))
 }
 
 fn direct_trace(

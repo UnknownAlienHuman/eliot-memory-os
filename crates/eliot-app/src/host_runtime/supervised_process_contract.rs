@@ -1,11 +1,13 @@
 //! Typed supervision contract for host-runtime supervised child processes.
 //!
-//! Architecture handles: `A2.2` (Roles), `A13.2` (Kernel and failure domains),
-//! `A13.3` (Module supervision and Doctor). Implementation handles: `I1.1`
-//! (Process principle), `I1.4` (Supervision tree), `I1.8` (Exact ownership and
-//! call paths). Canonical sources are the repository-local
-//! `docs/architecture/ELIOT_ARCHITECTURE.md` and
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md`.
+//! Architecture handles: `A2.2` (`docs/architecture/A02-02-roles.md`),
+//! `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`), `A13.3`
+//! (`docs/architecture/A13-03-module-supervision-and-doctor.md`). Implementation
+//! handles: `I1.1` (`docs/architecture/I01-01-process-principle.md`), `I1.4`
+//! (`docs/architecture/I01-04-supervision-tree.md`), `I1.8`
+//! (`docs/architecture/I01-08-exact-ownership-and-call-paths.md`). Canonical
+//! sources are the repository-local sharded Architecture and Implementation
+//! fragments named above.
 //!
 //! This module owns only the contiguous typed process-supervision input/output
 //! policy closure extracted from `host_runtime::supervised_process.rs`:

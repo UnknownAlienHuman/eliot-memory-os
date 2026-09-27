@@ -1,0 +1,289 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.self_query",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "smart.dreamer.self_query",
+    "source_package": "eliot-dreamer-self-query",
+    "source_manifest": "crates/smart/eliot-dreamer-self-query/Cargo.toml",
+    "source_root_path": "crates/smart/eliot-dreamer-self-query",
+    "module_manifest": "crates/smart/eliot-dreamer-self-query/module.toml",
+    "workspace_member": true,
+    "bins_reachable": false,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Pose one validated SelfQueryInput with source citation into a SelfQueryPoseReceipt for the brief projectors."
+    },
+    "causal_property": {
+      "state": "DECLARED",
+      "origin": "module.toml|causal_property",
+      "value": "bounded Dreamer self-query pose with source citation"
+    },
+    "invariants": {
+      "state": "DECLARED",
+      "origin": "module.toml|invariants",
+      "value": [
+        "no local request types: the owner input and projection are the only surfaces",
+        "owner validate() runs before any digest freezes",
+        "every cited triple matches a projected ref exactly or the pose fails closed",
+        "opaque bundle handles are never treated as typed citations",
+        "no compilation, admission, briefing, or model work"
+      ]
+    },
+    "non_goals": {
+      "state": "DECLARED",
+      "origin": "module.toml|non_goals",
+      "value": [
+        "second ContextCompiler invocation",
+        "second admission pass",
+        "mutable UnderstandingState",
+        "ArchitectureBrief/ImplementationBrief authorship",
+        "parallel request/candidate types",
+        "model route calls",
+        "support/truth promotion",
+        "opaque bundle-handle verification"
+      ]
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "smart-memory-context",
+        "title": "Smart memory, context, and understanding",
+        "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+        "documentation_handles": [
+          "I12.13",
+          "I17.11"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "DECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": "smart.dreamer.self_query"
+    },
+    "source_maintenance_owner": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": null
+    },
+    "state_class": {
+      "state": "DECLARED",
+      "origin": "module.toml|state_class",
+      "value": "stateless"
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return the owner's own rejection for invalid input, stale/uncited sources, lineage drift, or projection-fence drift; reject malformed receipt digests and non-1 schema versions explicitly. Retained receipts revalidate before durable use. Pose acceptance with an owner-valid fixture executes at package proof."
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|inputs",
+      "value": [
+        "eliot_dreamer_contracts::self_query::SelfQueryInput by reference (A-03 owner, PR #1060)",
+        "AcceptedSourceProjection by reference (same owner)"
+      ]
+    },
+    "outputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|outputs",
+      "value": [
+        "SelfQueryPoseReceipt"
+      ]
+    },
+    "providers": {
+      "state": "DECLARED",
+      "origin": "module.toml|providers",
+      "value": [
+        "A-03 self-query contract owner (input and projection supply only)"
+      ]
+    },
+    "depends_on": {
+      "state": "DECLARED",
+      "origin": "module.toml|depends_on",
+      "value": [
+        "eliot-dreamer-contracts",
+        "eliot-contracts"
+      ]
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": "R6"
+      },
+      "runtime_bundle": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": "eliot-dreamer"
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "DECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "DECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": "merge back when no independent consumer, proof, dependency or replacement seam remains"
+    },
+    "split_trigger": {
+      "state": "DECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": null
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "DECLARED",
+      "origin": "module.toml|discriminator",
+      "value": "posing runs the owner validate() and freezes the owner input_digest(); cited triples must match projected refs exactly before any digest freezes; no local subject/request/candidate types exist"
+    },
+    "old_failure_or_missing_capability": {
+      "state": "DECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": "Self-queries recompile context, rerun admission, invent a parallel request type, or cite sources without a currency check instead of using the existing SelfQueryInput and accepted-source owner contracts (CC-006)."
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [],
+    "contract_refs_source": "crates/smart/eliot-dreamer-self-query/Cargo.toml",
+    "donor_records": [
+      {
+        "path": "crates/smart/cognitive-rev12-contract-schema-freeze.toml",
+        "disposition": "wave authority: accepted-source projection recorded NOT_FROZEN (CC-006); no parallel request surface"
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-architecture-brief/src/projection.rs",
+        "disposition": "consumer pattern reused: validate-then-digest prefix shared with project_architecture_brief; no projection logic copied"
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/self_query/accepted.rs",
+        "disposition": "owner contract reused: AcceptedSourceProjection project()/validate()/check_cited() with frozen digest and exact-triple currency; adapter only cites it"
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-contracts/src/self_query/input.rs",
+        "disposition": "owner contract reused: SelfQueryInput validate() plus input_digest(); A-03 owner per merged PR #1060"
+      }
+    ]
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-self-query/Cargo.toml",
+        "sha256": "412d72d5d97846a1903bda4165ca4bc4d8d26848e191f9f71e36991ddc61da8d"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-self-query/module.toml",
+        "sha256": "b7ab59222f5f2a8d70d4cfdea4486c792dd8753c15de8b4557f3296177c6cad4"
+      },
+      "selected_source": {
+        "path_count": 2,
+        "sha256": "7a8246a0a1091e25b2bd532f6f825ec1d8e74b64f2ff8dc3d56230beff2f57e5"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "78c86a355afcfcd26accb907e92a73f9f1a854c2d943d8c52a3e156ee783cbbe",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "78c86a355afcfcd2"
+  }
+}

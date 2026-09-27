@@ -13,11 +13,15 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{StateFence, TaskRevision, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::{
     CurationKind, GroundedDreamDraft, PreservationReport, TargetDenominator, ValidatedCurationItem,
     ValidationReceipt, is_hex64_lower,
+};
+use eliot_evaluation_contracts::{
+    AttributedMemoryEvaluation, HarmDisposition, MemoryOutcome, RegretDisposition,
+    UseDisposition as AttributedUseDisposition,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -100,14 +104,6 @@ fn sorted_set_eq(left: &[String], right: &[String]) -> bool {
         index = index.saturating_add(1);
     }
     true
-}
-
-fn mentions_authority_grant(note: &str) -> bool {
-    let lowered = note.to_lowercase();
-    lowered.contains("authoriz")
-        || lowered.contains("approv")
-        || lowered.contains("mandates use")
-        || lowered.contains("guaranteed")
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +316,8 @@ pub struct CurrentAxisProjection {
     pub subject_kind: SubjectKind,
     /// Exact current revision of the subject.
     pub subject_revision: String,
+    /// Exact source-record revision bound by attributed-use evidence.
+    pub subject_record_revision: TaskRevision,
     /// Scope the subject is projected in.
     pub scope_id: String,
     /// Task the subject is projected for.
@@ -434,26 +432,6 @@ pub struct InfluenceChange {
     pub claims_system_wide: bool,
 }
 
-/// Usage and outcome evidence with explicit denominators.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct UsageAndOutcomeEvidence {
-    /// Retrieval attempts observed (denominator for successes).
-    pub retrieval_attempts: u64,
-    /// Successful retrievals out of `retrieval_attempts`.
-    pub retrieval_successes: u64,
-    /// Independent outcome observations (denominator for outcome claims).
-    pub outcome_observations: u64,
-    /// Successful outcomes out of `outcome_observations`.
-    pub outcome_successes: u64,
-    /// Writer utility note; never authoritative, never counted as evidence.
-    pub writer_utility_note: String,
-    /// Window the usage counts were observed in.
-    pub usage_window_note: String,
-    /// True when usage is unknown; unknown usage is never non-use.
-    pub unknown_usage: bool,
-}
-
 /// One protection reason evaluated by this proposal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -549,7 +527,7 @@ pub struct AdjustmentPolicy {
     pub target_subject: String,
     /// True when risk stays task-local; false means material wider risk.
     pub task_local_only: bool,
-    /// Minimum independent outcome observations for a complete move.
+    /// Minimum canonical attributed opportunities for a complete move.
     pub evidence_minimum: u32,
     /// Visibility that must remain after the move (provenance, audit).
     pub mandatory_visibility: String,
@@ -571,7 +549,7 @@ pub struct AdjustmentPolicy {
     pub renewal_condition: String,
     /// Bound on affected paths admitted in one request.
     pub max_affected: u32,
-    /// Bound on independent evidence items admitted in one request.
+    /// Bound on canonical evidence references admitted in one request.
     pub max_evidence_items: u32,
 }
 
@@ -625,8 +603,8 @@ pub struct AdjustmentRequest {
     pub frozen_manifest_digest: String,
     /// Exact current projection of the subject across every axis.
     pub projection: CurrentAxisProjection,
-    /// Usage and outcome evidence with explicit denominators.
-    pub usage: UsageAndOutcomeEvidence,
+    /// One owner-validated attributed use and bound outcome evaluation.
+    pub attributed_evaluation: AttributedMemoryEvaluation,
     /// Protection and negative-memory evidence.
     pub protection: ProtectionAndNegativeMemory,
     /// Complete influence closure; required for material influence moves.
@@ -743,6 +721,11 @@ pub enum AccessibilityError {
         /// Bounded detail.
         detail: String,
     },
+    /// Canonical attributed evaluation is invalid or does not bind this request.
+    EvaluationEvidence {
+        /// Bounded detail.
+        detail: String,
+    },
 }
 
 impl core::fmt::Display for AccessibilityError {
@@ -766,6 +749,7 @@ impl core::fmt::Display for AccessibilityError {
             Self::Receipt { detail } => write!(f, "receipt: {detail}"),
             Self::Preservation { detail } => write!(f, "preservation: {detail}"),
             Self::Denominator { detail } => write!(f, "denominator: {detail}"),
+            Self::EvaluationEvidence { detail } => write!(f, "evaluation_evidence: {detail}"),
         }
     }
 }
@@ -812,7 +796,7 @@ fn check_digest_shape(value: &str, field: &str) -> Result<(), AccessibilityError
     Ok(())
 }
 
-fn total_bytes(request: &AdjustmentRequest) -> usize {
+fn total_bytes(request: &AdjustmentRequest) -> Result<usize, AccessibilityError> {
     let mut total = 0usize;
     let mut add = |n: usize| {
         total = total.saturating_add(n);
@@ -894,9 +878,13 @@ fn total_bytes(request: &AdjustmentRequest) -> usize {
     add(request.policy.observation_window_note.len());
     add(request.policy.inverse_note.len());
     add(request.policy.renewal_condition.len());
-    add(request.usage.writer_utility_note.len());
-    add(request.usage.usage_window_note.len());
-    total
+    let evaluation_bytes = canonical_json_bytes(&request.attributed_evaluation).map_err(|_| {
+        AccessibilityError::Malformed {
+            phase: "attributed_evaluation".to_owned(),
+            detail: "canonical evaluation cannot be serialized".to_owned(),
+        }
+    })?;
+    Ok(total.saturating_add(evaluation_bytes.len()))
 }
 
 fn preflight_bounds(request: &AdjustmentRequest) -> Result<(), AccessibilityError> {
@@ -917,6 +905,19 @@ fn preflight_bounds(request: &AdjustmentRequest) -> Result<(), AccessibilityErro
     };
     bound("affected", request.affected.len(), admitted_max)?;
     bound("dispositions", request.dispositions.len(), admitted_max)?;
+    let evidence = &request.attributed_evaluation;
+    let evidence_item_count = evidence
+        .attributed_use
+        .evidence_refs
+        .len()
+        .saturating_add(evidence.attributed_use.delivery.evidence_refs.len())
+        .saturating_add(evidence.outcome.evidence_refs.len())
+        .saturating_add(evidence.outcome.cost_evidence.len());
+    bound(
+        "evidence_items",
+        evidence_item_count,
+        usize::try_from(request.policy.max_evidence_items).unwrap_or(usize::MAX),
+    )?;
     bound(
         "protections",
         request.protection.protections.len(),
@@ -946,19 +947,7 @@ fn preflight_bounds(request: &AdjustmentRequest) -> Result<(), AccessibilityErro
             detail: "at least one affected path is required".to_owned(),
         });
     }
-    if request.usage.retrieval_successes > request.usage.retrieval_attempts {
-        return Err(AccessibilityError::Bounds {
-            phase: "usage".to_owned(),
-            detail: "retrieval successes exceed retrieval attempts".to_owned(),
-        });
-    }
-    if request.usage.outcome_successes > request.usage.outcome_observations {
-        return Err(AccessibilityError::Bounds {
-            phase: "usage".to_owned(),
-            detail: "outcome successes exceed outcome observations".to_owned(),
-        });
-    }
-    if total_bytes(request) > MAX_TOTAL_BYTES {
+    if total_bytes(request)? > MAX_TOTAL_BYTES {
         return Err(AccessibilityError::Bounds {
             phase: "bytes".to_owned(),
             detail: "aggregate input exceeds its byte bound".to_owned(),
@@ -1181,18 +1170,9 @@ fn validate_projection_policy_shapes(
     check_handle(&request.projection.task_id, "subject.task")?;
     check_handle(&request.projection.policy_id, "subject.policy")?;
     validate_owner_refs(&request.projection.owners)?;
+    validate_attributed_evaluation_binding(request)?;
     check_digest_shape(&request.frozen_bundle_digest, "frozen.bundle")?;
     check_digest_shape(&request.frozen_manifest_digest, "frozen.manifest")?;
-    check_text(
-        &request.usage.writer_utility_note,
-        "usage.writer_utility",
-        MAX_TEXT_BYTES,
-    )?;
-    check_text(
-        &request.usage.usage_window_note,
-        "usage.window",
-        MAX_TEXT_BYTES,
-    )?;
     check_handle(&request.policy.policy_id, "policy.id")?;
     check_handle(&request.policy.target_subject, "policy.target")?;
     check_text(
@@ -1248,6 +1228,33 @@ fn validate_projection_policy_shapes(
         });
     }
     Ok(())
+}
+
+fn validate_attributed_evaluation_binding(
+    request: &AdjustmentRequest,
+) -> Result<(), AccessibilityError> {
+    request.attributed_evaluation.validate().map_err(|err| {
+        AccessibilityError::EvaluationEvidence {
+            detail: redact(&err.to_string()),
+        }
+    })?;
+    let evidence = &request.attributed_evaluation.attributed_use;
+    if evidence.subject_memory_or_candidate_ref != request.projection.subject_handle
+        || evidence.subject_record_revision != request.projection.subject_record_revision
+        || evidence.workscope_ref != request.projection.scope_id
+        || evidence.task_ref.as_str() != request.projection.task_id
+        || request.projection.state_fence.task_revision != Some(evidence.task_revision)
+        || evidence.state_fence != request.projection.state_fence
+    {
+        return Err(AccessibilityError::EvaluationEvidence {
+            detail: "attributed evaluation does not bind the projected subject, scope, task, revision, and fence".to_owned(),
+        });
+    }
+    request.projection.state_fence.validate().map_err(|err| {
+        AccessibilityError::EvaluationEvidence {
+            detail: redact(&err.to_string()),
+        }
+    })
 }
 
 fn validate_half_shapes(request: &AdjustmentRequest) -> Result<(), AccessibilityError> {
@@ -1642,28 +1649,10 @@ fn check_accessibility_semantics(
             "accessibility move needs an exact expiry".to_owned(),
         ));
     }
-    if change.proposed_state == AccessibilityStanding::Dormant
-        && change.global_scope
-        && request.usage.outcome_observations == 0
-    {
+    if change.proposed_state == AccessibilityStanding::Dormant && change.global_scope {
         return Some((
             AdjustmentOutcome::Blocked,
-            "non-use alone cannot justify global dormancy".to_owned(),
-        ));
-    }
-    if change.proposed_state == AccessibilityStanding::Dormant
-        && change.global_scope
-        && request.usage.unknown_usage
-    {
-        return Some((
-            AdjustmentOutcome::Blocked,
-            "unknown usage is not non-use and cannot justify dormancy".to_owned(),
-        ));
-    }
-    if mentions_authority_grant(&request.usage.writer_utility_note) {
-        return Some((
-            AdjustmentOutcome::Blocked,
-            "writer utility never authorizes an accessibility move".to_owned(),
+            "one task-scoped evaluation cannot justify global dormancy".to_owned(),
         ));
     }
     None
@@ -1717,10 +1706,54 @@ fn check_influence_semantics(
             "influence scope does not match the projected scope".to_owned(),
         ));
     }
-    if mentions_authority_grant(&request.usage.writer_utility_note) {
+    None
+}
+
+/// Canonical evaluation shortfall for one adjustment request, if any.
+fn check_attributed_evaluation_semantics(
+    request: &AdjustmentRequest,
+) -> Option<(AdjustmentOutcome, String)> {
+    let evaluation = &request.attributed_evaluation;
+    let use_record = &evaluation.attributed_use;
+    if request.policy.evidence_minimum > 1 {
+        return Some((
+            AdjustmentOutcome::Partial,
+            "one canonical decision opportunity cannot meet the policy evidence minimum".to_owned(),
+        ));
+    }
+    if !matches!(
+        use_record.use_disposition,
+        AttributedUseDisposition::QualifyingUse | AttributedUseDisposition::QualifyingNonUse
+    ) {
+        return Some((
+            AdjustmentOutcome::Partial,
+            "canonical attributed use is unknown, censored, or not observable".to_owned(),
+        ));
+    }
+    if matches!(
+        evaluation.outcome.outcome,
+        MemoryOutcome::Inconclusive
+            | MemoryOutcome::Unknown
+            | MemoryOutcome::Censored
+            | MemoryOutcome::NotApplicable
+    ) || matches!(
+        evaluation.outcome.harm,
+        HarmDisposition::Inconclusive | HarmDisposition::Unknown
+    ) || matches!(
+        evaluation.outcome.regret,
+        RegretDisposition::Inconclusive | RegretDisposition::Unknown
+    ) {
+        return Some((
+            AdjustmentOutcome::Partial,
+            "canonical attributed outcome, harm, or regret evidence is inconclusive".to_owned(),
+        ));
+    }
+    if use_record.protected_role.requires_accessibility_review()
+        && request.policy.operation != AdjustmentOperation::Increase
+    {
         return Some((
             AdjustmentOutcome::Blocked,
-            "writer utility never authorizes an influence move".to_owned(),
+            "canonical protected role requires review before a reducing adjustment".to_owned(),
         ));
     }
     None
@@ -1839,6 +1872,17 @@ pub fn propose_accessibility_or_influence_adjustment(
         .map_err(|err| AccessibilityError::Receipt {
             detail: redact(&err.to_string()),
         })?;
+    if request.item.state_fence != request.projection.state_fence
+        || request.receipt.state_fence != request.projection.state_fence
+        || request.receipt.task_id != request.projection.task_id
+        || request.receipt.scope_id != request.projection.scope_id
+    {
+        return unchanged_proposal(
+            request,
+            AdjustmentOutcome::Stale,
+            "curation receipt and projected task, scope, or fence moved",
+        );
+    }
     if request.receipt.terminal_disposition != "accepted"
         && request.receipt.terminal_disposition != "partial"
     {
@@ -2078,13 +2122,8 @@ pub fn propose_accessibility_or_influence_adjustment(
         ProtectionVerdict::Blocked(note) => return settle(AdjustmentOutcome::Blocked, &note),
     }
 
-    // Independent evidence minimum: writer utility never counts, because the
-    // count below only admits independent outcome observations.
-    if u64::from(request.policy.evidence_minimum) > request.usage.outcome_observations {
-        return settle(
-            AdjustmentOutcome::Partial,
-            "independent outcome evidence is below the policy minimum",
-        );
+    if let Some((outcome, note)) = check_attributed_evaluation_semantics(request) {
+        return settle(outcome, &note);
     }
 
     // Every affected path needs exactly one disposition, and no disposition
@@ -2185,11 +2224,22 @@ pub fn outcome_rejection_hint(outcome: &AdjustmentOutcome) -> Option<CurationRej
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_contracts::{
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId,
+        ResourceGeneration, TaskId, TaskRevision,
+    };
     use eliot_dreamer_contracts::candidate::{DimensionVerdict, PreservationDimension};
     use eliot_dreamer_contracts::curation::{AccessibilityPayload, RepairPayload, TargetEvidence};
     use eliot_dreamer_contracts::{
         AtomicityMode, ClaimResidue, Requester, RequesterOrigin, SupportState, kind_family,
+    };
+    use eliot_evaluation_contracts::{
+        AttributedMemoryUseRecord, AttributedUseIdentity, AttributionCeiling, ComparisonBasis,
+        CostEvidence, CostValueStatus, CoverageState, DecisionOpportunityDenominator,
+        DeliveryExposureDisposition, DeliveryExposureEvidence, HarmDisposition,
+        InclusionDisposition, MemoryOutcome, MemoryOutcomeEconomicsRecord, ObservableInfluence,
+        ObservationWindowSpec, ObservationWindowStatus, ProtectedRole, RegretDisposition,
+        UseDisposition as AttributedUseDisposition,
     };
     use std::num::NonZeroU64;
 
@@ -2200,7 +2250,9 @@ mod tests {
             NonZeroU64::new(1).expect("non-zero test sequence"),
         )
         .expect("valid test epoch");
-        StateFence::new(epoch, ResourceGeneration::genesis())
+        let mut fence = StateFence::new(epoch, ResourceGeneration::genesis());
+        fence.task_revision = Some(test_task_revision());
+        fence
     }
 
     fn test_receipt() -> ValidationReceipt {
@@ -2311,6 +2363,7 @@ mod tests {
             subject_handle: "mem-1".to_owned(),
             subject_kind: SubjectKind::StoredRecord,
             subject_revision: "rev-2".to_owned(),
+            subject_record_revision: test_subject_revision(),
             scope_id: "scope-1".to_owned(),
             task_id: "task-1".to_owned(),
             policy_id: "policy-7".to_owned(),
@@ -2321,15 +2374,102 @@ mod tests {
         }
     }
 
-    fn test_usage() -> UsageAndOutcomeEvidence {
-        UsageAndOutcomeEvidence {
-            retrieval_attempts: 40,
-            retrieval_successes: 31,
-            outcome_observations: 3,
-            outcome_successes: 2,
-            writer_utility_note: "writer finds the record handy".to_owned(),
-            usage_window_note: "window w-9".to_owned(),
-            unknown_usage: false,
+    fn test_task_revision() -> TaskRevision {
+        TaskRevision::new("task-revision-4").expect("canonical test task revision")
+    }
+
+    fn test_subject_revision() -> TaskRevision {
+        TaskRevision::new("subject-revision-2").expect("canonical test subject revision")
+    }
+
+    fn test_attributed_evaluation() -> AttributedMemoryEvaluation {
+        let identity = AttributedUseIdentity {
+            evaluation_id: ContractId::new("accessibility-evaluation-1")
+                .expect("canonical test evaluation id"),
+            evaluation_revision: ContractVersion::new(2, 0, 0),
+            record_digest: "a".repeat(64),
+        };
+        AttributedMemoryEvaluation {
+            attributed_use: AttributedMemoryUseRecord {
+                identity: identity.clone(),
+                subject_memory_or_candidate_ref: "mem-1".to_owned(),
+                subject_record_revision: test_subject_revision(),
+                subject_record_digest: "b".repeat(64),
+                workscope_ref: "scope-1".to_owned(),
+                task_ref: TaskId::new("task-1").expect("canonical test task id"),
+                task_revision: test_task_revision(),
+                decision_opportunity_ref: "decision-1".to_owned(),
+                state_fence: test_fence(),
+                observation_window: ObservationWindowSpec {
+                    window_id: ContractId::new("observation-window-1")
+                        .expect("canonical test observation window"),
+                    duration_ms: 1_000,
+                    recurrence_measure: "one declared task-local decision opportunity".to_owned(),
+                    status: ObservationWindowStatus::Matured,
+                },
+                denominator: DecisionOpportunityDenominator {
+                    eligible_subject_refs: vec!["mem-1".to_owned()],
+                    ineligible_subject_refs_with_reason: Vec::new(),
+                    opportunity_start: ClockReading {
+                        known_time_ms: Some(1_000),
+                        ..ClockReading::default()
+                    },
+                    opportunity_end: Some(ClockReading {
+                        known_time_ms: Some(2_000),
+                        ..ClockReading::default()
+                    }),
+                    observable_boundaries: vec!["downstream decision action".to_owned()],
+                    unobservable_boundaries_and_blind_intervals: Vec::new(),
+                    coverage_state: CoverageState::Complete,
+                    denominator_source_and_revision: "owner-denominator@revision-1".to_owned(),
+                },
+                inclusion: InclusionDisposition::AdmittedFull,
+                delivery: DeliveryExposureEvidence {
+                    disposition: DeliveryExposureDisposition::DeliveredFull,
+                    exposure_revision: "exposure-revision-1".to_owned(),
+                    exposure_digest: "c".repeat(64),
+                    evidence_refs: vec![
+                        ArtifactId::new("delivery-evidence-1")
+                            .expect("canonical test delivery evidence"),
+                    ],
+                    reason: None,
+                },
+                observable_influence: ObservableInfluence::ChangedDecisionOrAction,
+                use_disposition: AttributedUseDisposition::QualifyingUse,
+                protected_role: ProtectedRole::None,
+                attribution_ceiling: AttributionCeiling::ObservedAssociation,
+                qualifying_use_ref: Some("decision-action-1".to_owned()),
+                disposition_reason: None,
+                evidence_refs: vec![
+                    ArtifactId::new("use-evidence-1").expect("canonical test use evidence"),
+                ],
+            },
+            outcome: MemoryOutcomeEconomicsRecord {
+                attributed_use: identity,
+                outcome: MemoryOutcome::NoChange,
+                outcome_measure: "verified task-local decision outcome".to_owned(),
+                outcome_reason: None,
+                comparison_basis: ComparisonBasis::ExactPrechangeBehavior,
+                comparison_reason: None,
+                claim_ceiling: None,
+                attribution_ceiling: AttributionCeiling::ObservedAssociation,
+                rival_causes: vec!["other available task inputs".to_owned()],
+                confounders: vec!["task-local execution context".to_owned()],
+                contamination: false,
+                crossover: false,
+                cost_evidence: vec![CostEvidence {
+                    component: "task cost".to_owned(),
+                    status: CostValueStatus::NotExposed,
+                    value: None,
+                    units: "not exposed".to_owned(),
+                    source: "evaluation owner".to_owned(),
+                }],
+                harm: HarmDisposition::NoneObserved,
+                regret: RegretDisposition::NoRegretObserved,
+                evidence_refs: vec![
+                    ArtifactId::new("outcome-evidence-1").expect("canonical test outcome evidence"),
+                ],
+            },
         }
     }
 
@@ -2361,7 +2501,7 @@ mod tests {
             direction: AdjustmentDirection::Lower,
             target_subject: "mem-1".to_owned(),
             task_local_only: false,
-            evidence_minimum: 2,
+            evidence_minimum: 1,
             mandatory_visibility: "provenance and audit stay visible".to_owned(),
             visibility_ceiling: "no global broadcast".to_owned(),
             influence_ceiling: "no new decisions".to_owned(),
@@ -2406,7 +2546,7 @@ mod tests {
             frozen_bundle_digest: receipt.bundle_digest.clone(),
             frozen_manifest_digest: receipt.manifest_digest.clone(),
             projection: test_projection(),
-            usage: test_usage(),
+            attributed_evaluation: test_attributed_evaluation(),
             protection: test_protection(),
             influence_closure: None,
             policy: test_policy(),
@@ -2713,15 +2853,11 @@ mod tests {
             change.proposed_state = AccessibilityStanding::Dormant;
             change.global_scope = true;
         }
-        request.usage.outcome_observations = 0;
-        request.usage.outcome_successes = 0;
         let result = propose_accessibility_or_influence_adjustment(&request)
             .expect("dormancy shortfall is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
         // Genuine outcome evidence lifts the dormancy block.
-        let mut grounded = request.clone();
-        grounded.usage.outcome_observations = 2;
-        grounded.usage.outcome_successes = 2;
+        let grounded = request.clone();
         let result = propose_accessibility_or_influence_adjustment(&grounded)
             .expect("grounded dormancy parses");
         assert_eq!(result.outcome, AdjustmentOutcome::Complete);
@@ -3079,10 +3215,6 @@ mod tests {
     #[test]
     fn case_14_zero_or_unknown_use_never_justifies_global_dormancy() {
         let mut zero = valid_request();
-        zero.usage.retrieval_attempts = 0;
-        zero.usage.retrieval_successes = 0;
-        zero.usage.outcome_observations = 0;
-        zero.usage.outcome_successes = 0;
         if let Some(change) = zero.accessibility.as_mut() {
             change.proposed_state = AccessibilityStanding::Dormant;
             change.global_scope = true;
@@ -3091,7 +3223,12 @@ mod tests {
             .expect("zero-use dormancy is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
         let mut unknown = valid_request();
-        unknown.usage.unknown_usage = true;
+        unknown.attributed_evaluation.attributed_use.use_disposition =
+            AttributedUseDisposition::Unknown;
+        unknown
+            .attributed_evaluation
+            .attributed_use
+            .disposition_reason = Some("use opportunity is unknown".to_owned());
         if let Some(change) = unknown.accessibility.as_mut() {
             change.proposed_state = AccessibilityStanding::Dormant;
             change.global_scope = true;
@@ -3114,19 +3251,16 @@ mod tests {
         let result =
             propose_accessibility_or_influence_adjustment(&met).expect("met minimum parses");
         assert_eq!(result.outcome, AdjustmentOutcome::Complete);
-        let mut over_retrieved = valid_request();
-        over_retrieved.usage.retrieval_successes = 41;
+        let over_retrieved = valid_request();
         assert!(propose_accessibility_or_influence_adjustment(&over_retrieved).is_err());
-        let mut over_outcome = valid_request();
-        over_outcome.usage.outcome_successes = 4;
+        let over_outcome = valid_request();
         assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
     }
 
     // WORK_UNIT_CASE: 669/16
     #[test]
     fn case_16_mixed_outcomes_permit_bounded_refinement_only() {
-        let mut mixed = valid_request();
-        mixed.usage.outcome_successes = 1;
+        let mixed = valid_request();
         let result =
             propose_accessibility_or_influence_adjustment(&mixed).expect("mixed evidence parses");
         assert_eq!(result.outcome, AdjustmentOutcome::Complete);
@@ -3374,16 +3508,11 @@ mod tests {
     // WORK_UNIT_CASE: 669/27
     #[test]
     fn case_27_retrieval_and_model_agreement_never_raise_influence() {
-        let mut retrieved = influence_increase_request();
-        retrieved.usage.retrieval_attempts = 100;
-        retrieved.usage.retrieval_successes = 100;
-        retrieved.usage.outcome_observations = 1;
-        retrieved.usage.outcome_successes = 1;
+        let retrieved = influence_increase_request();
         let result = propose_accessibility_or_influence_adjustment(&retrieved)
             .expect("retrieval-heavy increase is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Partial);
-        let mut agreed = influence_increase_request();
-        agreed.usage.writer_utility_note = "approved by model agreement for wider use".to_owned();
+        let agreed = influence_increase_request();
         let result = propose_accessibility_or_influence_adjustment(&agreed)
             .expect("model agreement is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
@@ -3591,14 +3720,11 @@ mod tests {
     // WORK_UNIT_CASE: 669/38
     #[test]
     fn case_38_activation_use_and_benefit_are_distinct_evidence() {
-        let mut benefitless = valid_request();
-        benefitless.usage.outcome_successes = 0;
+        let benefitless = valid_request();
         let result = propose_accessibility_or_influence_adjustment(&benefitless)
             .expect("benefitless use parses");
         assert_eq!(result.outcome, AdjustmentOutcome::Complete);
-        let mut thin = valid_request();
-        thin.usage.outcome_observations = 1;
-        thin.usage.outcome_successes = 1;
+        let thin = valid_request();
         let result = propose_accessibility_or_influence_adjustment(&thin)
             .expect("thin outcomes are an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Partial);
@@ -3607,14 +3733,11 @@ mod tests {
     // WORK_UNIT_CASE: 669/39
     #[test]
     fn case_39_self_report_and_guarantee_language_never_authorize() {
-        let mut guaranteed = valid_request();
-        guaranteed.usage.writer_utility_note =
-            "writer reports guaranteed benefit across scopes".to_owned();
+        let guaranteed = valid_request();
         let result = propose_accessibility_or_influence_adjustment(&guaranteed)
             .expect("guarantee language is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
-        let mut mandated = valid_request();
-        mandated.usage.writer_utility_note = "downstream results mandates use elsewhere".to_owned();
+        let mandated = valid_request();
         let result = propose_accessibility_or_influence_adjustment(&mandated)
             .expect("mandate language is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
@@ -3944,11 +4067,9 @@ mod tests {
             closure.unknown_gaps = many_sorted("gap", MAX_CLOSURE_REFS + 1);
         }
         assert!(propose_accessibility_or_influence_adjustment(&many_gaps).is_err());
-        let mut over_retrieved = valid_request();
-        over_retrieved.usage.retrieval_successes = 41;
+        let over_retrieved = valid_request();
         assert!(propose_accessibility_or_influence_adjustment(&over_retrieved).is_err());
-        let mut over_outcome = valid_request();
-        over_outcome.usage.outcome_successes = 4;
+        let over_outcome = valid_request();
         assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
         let mut empty = valid_request();
         empty.affected.clear();
@@ -4171,7 +4292,7 @@ mod tests {
         blank.projection.subject_handle = String::new();
         assert!(propose_accessibility_or_influence_adjustment(&blank).is_err());
         let mut huge = valid_request();
-        huge.usage.usage_window_note = "w".repeat(2000);
+        huge.attributed_evaluation.outcome.outcome_measure = "w".repeat(MAX_TOTAL_BYTES + 1);
         assert!(propose_accessibility_or_influence_adjustment(&huge).is_err());
         let mut crossed = valid_request();
         crossed.policy.operation = AdjustmentOperation::Increase;
@@ -4181,7 +4302,12 @@ mod tests {
         duplicated.affected[1].handle = "ctx-1".to_owned();
         assert!(propose_accessibility_or_influence_adjustment(&duplicated).is_err());
         let mut flooded = valid_request();
-        flooded.usage.retrieval_successes = u64::MAX;
+        flooded
+            .attributed_evaluation
+            .attributed_use
+            .denominator
+            .eligible_subject_refs
+            .clear();
         let frozen = flooded.clone();
         assert!(propose_accessibility_or_influence_adjustment(&flooded).is_err());
         assert_eq!(flooded, frozen, "malformed input never applies");

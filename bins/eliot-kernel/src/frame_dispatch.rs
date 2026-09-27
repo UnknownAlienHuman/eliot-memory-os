@@ -129,7 +129,9 @@ fn frame_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownOutcome => "frame_unknown_outcome",
         TransportError::IdentityConflict => "frame_identity_conflict",
         TransportError::Cancelled => "frame_cancelled",
-        TransportError::Backpressure => "frame_backpressure",
+        TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
+            "frame_backpressure"
+        }
         TransportError::InvalidLimits => "frame_invalid_limits",
         TransportError::UnauthenticatedPeer => "frame_unauthenticated_peer",
         TransportError::InvalidPipeName => "frame_invalid_pipe",
@@ -1282,6 +1284,12 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "task_controller_result"
             | "campaign_packet_claim"
             | "campaign_packet_result"
+            // Issue #1741: the finish claim/result legs are separate admitted
+            // operations with their own queue and attempt type, so the frame
+            // must reach their own dispatch instead of falling through to the
+            // generic `ProcessExecutionRequest` decode.
+            | "finish_claim"
+            | "finish_result"
     )
 }
 

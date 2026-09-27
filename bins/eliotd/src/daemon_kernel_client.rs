@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+    StateFence,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
@@ -22,7 +23,7 @@ use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
+    AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
     RequestIdentity, TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
@@ -112,6 +113,62 @@ struct ActivationSubmitResponse {
     expired: bool,
     #[serde(default)]
     ack: Option<AgentActivationResultAck>,
+}
+
+/// Typed failure of one `agent_activation_submit`, preserving *why* the submit
+/// did not produce an acknowledgement instead of erasing that provenance into
+/// one opaque string (issue #839, W14/A3).
+///
+/// The issue requires that "not attempted" stay distinct from "possibly
+/// submitted / unknown": only the latter obliges the daemon to reconcile the
+/// retained ticket/result identity before any other semantic resolution, and a
+/// failure that never reached the transport must not be reported as an
+/// ambiguous commit. Each variant names the exact point at which the attempt
+/// stopped, so the dispatcher classifies a real transport fact rather than
+/// guessing from a diagnostic message. A raw transport error is never recovered
+/// by parsing its text.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationSubmitError {
+    /// Kernel linearized a result-less deadline expiry. The daemon retires
+    /// this ticket without retry and without reconciliation: no result was
+    /// accepted and no Apply progress exists.
+    Expired,
+    /// The daemon refused or failed to build the request, so no frame was
+    /// written and Kernel provably holds nothing for this ticket. There is
+    /// nothing to reconcile; the failure is reported as-is and fails closed.
+    NotAttempted {
+        /// Bounded diagnostic detail. Carries no protected field and no whole
+        /// payload or error dump.
+        detail: String,
+    },
+    /// The request reached the transport and Kernel answered that it did not
+    /// accept the result. The attempt is recorded and definitively not
+    /// committed, so reconciliation is not required for this failure.
+    Rejected {
+        /// Bounded diagnostic detail.
+        detail: String,
+    },
+    /// The request reached the transport and its commit is unknown. Kernel may
+    /// already hold this exact result, so the retained ticket/result identity
+    /// must be reconciled before any other semantic resolution.
+    PossiblySubmitted {
+        /// Bounded diagnostic detail.
+        detail: String,
+    },
+}
+
+#[cfg(windows)]
+impl ActivationSubmitError {
+    /// The bounded diagnostic detail of this failure, whatever its provenance.
+    pub fn detail(&self) -> &str {
+        match self {
+            ActivationSubmitError::Expired => "Kernel expired the activation result deadline",
+            ActivationSubmitError::NotAttempted { detail }
+            | ActivationSubmitError::Rejected { detail }
+            | ActivationSubmitError::PossiblySubmitted { detail } => detail,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -422,6 +479,267 @@ pub fn parse_task_controller_submit_outcome(
         return Ok(TaskControllerSubmitOutcome::StaleAttempt);
     }
     Err("Kernel task_controller_result answer is not accepted, expired, or stale".to_owned())
+}
+
+/// Exact legacy proof member spelling rejected from `eliot.finish` arguments
+/// (issue #1741, I7.9/I7.20).
+///
+/// This mirrors the `completion_proof` spelling pinned by
+/// `eliot_mcp::contract::LEGACY_FINISH_PROOF_MEMBER`: the strict
+/// `FinishAttemptDraft` contract has no such member. Only this exact spelling
+/// is recognized here — no aliases are invented. The spelling is cited, not
+/// imported, because the daemon has no dependency on the MCP surface crate.
+pub(crate) const LEGACY_FINISH_PROOF_MEMBER: &str = "completion_proof";
+
+/// Exact typed diagnostic for a caller-supplied finish proof member.
+///
+/// The text carries the pinned `LEGACY_FINISH_INPUT_REJECTED` reason code
+/// first so the typed reason survives even the string error channel, and it
+/// echoes only the static member spelling — never caller bytes. It mirrors
+/// the ingress message shape so every lane reports one identical rejection.
+pub(crate) const LEGACY_FINISH_PROOF_REJECTION: &str = "LEGACY_FINISH_INPUT_REJECTED: caller-supplied finish proof member `completion_proof` is not accepted; submit only the strict FinishAttemptDraft fields";
+
+/// Typed outcome of one `finish_result` submit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishSubmitOutcome {
+    /// Kernel persisted the result body or recognized an exact replay.
+    Accepted,
+    /// The admitted attempt expired before the result was committed.
+    Expired,
+    /// The attempt was replaced, revoked or otherwise stale.
+    StaleAttempt,
+}
+
+/// Kernel-derived finish claim. The duplicated envelope, tool, attempt and
+/// identity are checked for exact binding before they reach the Governor.
+#[derive(Clone, Debug)]
+pub struct FinishClaimedInvocation {
+    pub envelope: HostRequestEnvelope,
+    pub tool: serde_json::Value,
+    pub request_identity: RequestIdentity,
+    pub operation_id: OperationId,
+    pub attempt: eliot_protocol::FinishAttempt,
+}
+
+/// Derives the Governor request identity for one admitted finish candidate.
+///
+/// The task binding comes exclusively from the digest-bound admitted draft
+/// plus the admitted envelope fence: the task id from the draft, the task
+/// revision the caller captured, and the envelope's live authority epoch and
+/// resource generation. The Governor finish owner re-proves that claimed
+/// revision against the canonical owner fence before any evaluation, so a
+/// stale or substituted claim fails closed instead of being trusted.
+fn derive_finish_request_identity(
+    draft: &eliot_governor::FinishAttemptDraft,
+    envelope: &HostRequestEnvelope,
+) -> Result<RequestIdentity, String> {
+    draft
+        .validate()
+        .map_err(|error| format!("claimed finish draft is invalid: {error}"))?;
+    let fence = StateFence {
+        task_revision: Some(
+            eliot_contracts::TaskRevision::new(draft.expected_task_revision)
+                .map_err(|error| format!("claimed finish revision is invalid: {error}"))?,
+        ),
+        ..envelope.state_fence.clone()
+    };
+    let session_id = envelope
+        .identity
+        .session_id
+        .clone()
+        .map(|value| SessionId::new(value).map_err(|error| error.to_string()))
+        .transpose()?;
+    let metadata = RequestMetadata {
+        request_id: envelope.identity.request_id.clone(),
+        session_id,
+        task_id: Some(
+            eliot_contracts::TaskId::new(draft.task_id.clone())
+                .map_err(|error| format!("claimed finish task id is invalid: {error}"))?,
+        ),
+        product_id: ProductId::new("eliotd").map_err(|error| error.to_string())?,
+        source_id: SourceId::new("eliotd-finish-lane").map_err(|error| error.to_string())?,
+        state_fence: fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: fence,
+        },
+        idempotency_key: envelope.identity.idempotency_key.clone(),
+        deadline_unix_ms: envelope.identity.deadline_unix_ms,
+        cancellation_id: envelope.identity.cancellation_id.clone(),
+    };
+    identity
+        .validate()
+        .map_err(|error| format!("derived finish identity is invalid: {error}"))?;
+    Ok(identity)
+}
+
+fn validate_finish_claim_request_identity(
+    envelope: &HostRequestEnvelope,
+    draft: &eliot_governor::FinishAttemptDraft,
+    request_identity: &RequestIdentity,
+    expected_identity: &RequestIdentity,
+) -> Result<(), String> {
+    if !envelope
+        .state_fence
+        .is_compatible_with(&request_identity.request.state_fence)
+        || request_identity.request.state_fence != expected_identity.request.state_fence
+        || request_identity.request.metadata.request_id != envelope.identity.request_id
+        || request_identity.request.metadata.session_id
+            != expected_identity.request.metadata.session_id
+        || request_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .is_none_or(|task| task.as_str() != draft.task_id.as_str())
+        || envelope
+            .identity
+            .task_id
+            .as_deref()
+            .is_some_and(|task| task != draft.task_id)
+        || request_identity.idempotency_key != envelope.identity.idempotency_key
+        || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+        || request_identity.cancellation_id != envelope.identity.cancellation_id
+        || request_identity.request.metadata.product_id
+            != expected_identity.request.metadata.product_id
+        || request_identity.request.metadata.source_id
+            != expected_identity.request.metadata.source_id
+        || request_identity
+            .request
+            .metadata
+            .state_fence
+            .task_revision
+            .is_none_or(|revision| revision.value() != draft.expected_task_revision)
+    {
+        return Err("Kernel finish identity does not bind its admitted envelope".to_owned());
+    }
+    Ok(())
+}
+
+/// Parses one unwrapped finish poll answer into its exact admitted envelope,
+/// tool, Kernel-issued attempt and derived owner request identity.
+pub fn parse_finish_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<FinishClaimedInvocation>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel finish_claim answer omits pair".to_owned())?;
+    if pair.is_null() {
+        return Ok(None);
+    }
+    if !pair.is_object() {
+        return Err("Kernel finish_claim pair is neither an object nor null".to_owned());
+    }
+    let decode = |field: &str| {
+        pair.get(field)
+            .cloned()
+            .ok_or_else(|| format!("Kernel finish_claim pair omits {field}"))
+    };
+    let envelope: HostRequestEnvelope = serde_json::from_value(decode("envelope")?)
+        .map_err(|error| format!("Kernel finish envelope does not decode: {error}"))?;
+    envelope
+        .validate()
+        .map_err(|error| format!("Kernel finish envelope is invalid: {error}"))?;
+    let tool = decode("tool")?;
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|error| format!("Kernel finish tool bytes are not envelope-bound: {error}"))?;
+    let arguments = tool
+        .get("arguments")
+        .cloned()
+        .ok_or_else(|| "Kernel finish pair omits the admitted draft".to_owned())?;
+    // A legacy caller-supplied proof is rejected with its pinned reason code
+    // before strict typed decoding, which would otherwise report only a
+    // generic unknown-field failure. This mirrors the protected-ingress order
+    // (`decode_protected_request_bytes`); only the exact legacy spelling is
+    // recognized and no caller bytes are echoed.
+    if arguments.get(LEGACY_FINISH_PROOF_MEMBER).is_some() {
+        return Err(LEGACY_FINISH_PROOF_REJECTION.to_owned());
+    }
+    let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
+        .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
+    draft
+        .validate()
+        .map_err(|error| format!("admitted finish draft is invalid: {error}"))?;
+    let attempt: eliot_protocol::FinishAttempt = serde_json::from_value(decode("attempt")?)
+        .map_err(|error| format!("Kernel finish attempt does not decode: {error}"))?;
+    attempt
+        .validate()
+        .map_err(|error| format!("Kernel finish attempt is invalid: {error}"))?;
+    let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
+        .map_err(|error| format!("Kernel finish operation id does not decode: {error}"))?;
+    let expected_operation = host_request_operation_id(&envelope);
+    let expected_identity = derive_finish_request_identity(&draft, &envelope)?;
+    let request_identity = match pair.get("identity") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("Kernel finish identity does not decode: {error}"))?,
+        None => expected_identity.clone(),
+    };
+    request_identity
+        .validate()
+        .map_err(|error| format!("Kernel finish identity is invalid: {error}"))?;
+    validate_finish_claim_request_identity(
+        &envelope,
+        &draft,
+        &request_identity,
+        &expected_identity,
+    )?;
+    let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
+    if envelope.kind != eliot_protocol::HostRequestKind::Invocation
+        || envelope.identity.capability != "eliot.finish"
+        || envelope.identity.payload_schema_id != eliot_protocol::FINISH_INVOKE_PAYLOAD_SCHEMA_ID
+        || tool_name != Some("eliot.finish")
+        || operation_id.as_str() != expected_operation
+        || attempt.operation_id != expected_operation
+        || attempt.session_id != envelope.identity.session_id.as_deref().unwrap_or_default()
+        || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+    {
+        return Err("Kernel finish pair does not bind its admitted envelope".to_owned());
+    }
+    Ok(Some(FinishClaimedInvocation {
+        envelope,
+        tool,
+        request_identity,
+        operation_id,
+        attempt,
+    }))
+}
+
+/// Parses one unwrapped finish result submit answer.
+pub fn parse_finish_submit_outcome(
+    value: &serde_json::Value,
+) -> Result<FinishSubmitOutcome, String> {
+    let accepted = value
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "Kernel finish_result answer omits accepted outcome".to_owned())?;
+    if accepted {
+        return Ok(FinishSubmitOutcome::Accepted);
+    }
+    if value
+        .get("expired")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(FinishSubmitOutcome::Expired);
+    }
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(FinishSubmitOutcome::StaleAttempt);
+    }
+    Err("Kernel finish_result answer is not accepted, expired, or stale".to_owned())
 }
 
 /// Parses one unwrapped `local_read_claim` answer value into the claimed
@@ -794,12 +1112,25 @@ impl DaemonKernelClient {
         }
     }
 
+    /// Submits one already-resolved v2 result through the existing authenticated
+    /// transport. Every valid disposition is submitted; no disposition is
+    /// coerced to success and none is silently discarded.
+    ///
+    /// #839 (W14/A3): each failure below is reported with its real transport
+    /// provenance instead of one erased string. The two pre-send failures are
+    /// [`ActivationSubmitError::NotAttempted`] because no frame was written; a
+    /// definitive non-acceptance is [`ActivationSubmitError::Rejected`]; and
+    /// every failure observed at or after the exchange — a transport error, an
+    /// undecodable response, a missing acknowledgement or an ack that does not
+    /// bind the submitted result — is
+    /// [`ActivationSubmitError::PossiblySubmitted`], because Kernel may already
+    /// hold this exact result. The transport itself is unchanged.
     #[cfg(windows)]
     pub async fn submit_agent_activation_result(
         &self,
         result: &AgentActivationResolutionResult,
         owner_readback: Option<AgentActivationOwnerReadback>,
-    ) -> Result<AgentActivationResultAck, super::DaemonError> {
+    ) -> Result<AgentActivationResultAck, ActivationSubmitError> {
         if matches!(
             result.disposition,
             eliot_protocol::AgentActivationResolutionDisposition::Resolved { .. }
@@ -808,36 +1139,49 @@ impl DaemonKernelClient {
             .and_then(|readback| readback.kernel_owner.as_ref())
             .is_none()
         {
-            return Err(super::DaemonError::Kernel(
-                "Resolved activation submission requires the current Kernel owner readback"
+            return Err(ActivationSubmitError::NotAttempted {
+                detail: "Resolved activation submission requires the current Kernel owner readback"
                     .to_owned(),
-            ));
+            });
         }
         let submit =
             AgentActivationResultSubmit::new_with_owner_readback(result.clone(), owner_readback)
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+                .map_err(|error| ActivationSubmitError::NotAttempted {
+                    detail: format!("activation result submit does not bind: {error}"),
+                })?;
         let value = self
             .transact_async(
                 "agent_activation_submit",
                 serde_json::json!({ "result": submit }),
             )
             .await
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let response: ActivationSubmitResponse = serde_json::from_value(value)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+            .map_err(|error| ActivationSubmitError::PossiblySubmitted {
+                detail: format!("Kernel activation result submit: {error}"),
+            })?;
+        let response: ActivationSubmitResponse =
+            serde_json::from_value(value).map_err(|error| {
+                ActivationSubmitError::PossiblySubmitted {
+                    detail: format!("Kernel activation submit response does not decode: {error}"),
+                }
+            })?;
         if response.expired {
-            return Err(super::DaemonError::ActivationExpired);
+            return Err(ActivationSubmitError::Expired);
         }
         if !response.accepted {
-            return Err(super::DaemonError::Kernel(
-                "Kernel submit response was not accepted".to_owned(),
-            ));
+            return Err(ActivationSubmitError::Rejected {
+                detail: "Kernel submit response was not accepted".to_owned(),
+            });
         }
-        let ack = response.ack.ok_or_else(|| {
-            super::DaemonError::Kernel("Kernel submit response omitted acknowledgement".to_owned())
+        let ack = response
+            .ack
+            .ok_or_else(|| ActivationSubmitError::PossiblySubmitted {
+                detail: "Kernel submit response omitted acknowledgement".to_owned(),
+            })?;
+        ack.validate_against_result(result).map_err(|error| {
+            ActivationSubmitError::PossiblySubmitted {
+                detail: format!("Kernel activation result ack payload mismatch: {error}"),
+            }
         })?;
-        ack.validate_against_result(result)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         Ok(ack)
     }
 
@@ -1792,6 +2136,48 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_task_controller_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one queued admitted `eliot.finish` pair and its distinct
+    /// Kernel-issued attempt capability (issue #1741).
+    ///
+    /// Mirrors [`claim_task_controller_pair_async`](Self::claim_task_controller_pair_async):
+    /// the call travels as the single-`operation`-key `"finish_claim"` payload
+    /// and a null `pair` is the empty-queue backoff signal, not an error. The
+    /// claimed pair carries the Kernel-minted fenced attempt capability,
+    /// which the caller must present back on the submit leg.
+    #[cfg(windows)]
+    pub async fn claim_finish_pair_async(
+        &self,
+    ) -> Result<Option<FinishClaimedInvocation>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "finish_claim",
+                serde_json::json!({ "operation": "finish_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_finish_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Submits one daemon-produced finish result body for its waiting host
+    /// request (issue #1741).
+    ///
+    /// Mirrors [`submit_task_controller_result_async`](Self::submit_task_controller_result_async):
+    /// the body travels as the single-`result`-key `"finish_result"` payload
+    /// and is validated before any transport is touched.
+    #[cfg(windows)]
+    pub async fn submit_finish_result_async(
+        &self,
+        body: &FinishResultBody,
+    ) -> Result<FinishSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async("finish_result", serde_json::json!({ "result": body }))
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_finish_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
     /// Executes one closed local read through the authenticated Kernel route.

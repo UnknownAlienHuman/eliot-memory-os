@@ -10,7 +10,10 @@ mod sse;
 mod types;
 
 pub use catalogue::*;
-pub use client::{AdmittedAttemptOutcome, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy};
+pub use client::{
+    AdmittedAttemptOutcome, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy,
+    classify_sealed_candidate, redact_route_diagnostics,
+};
 pub use endpoint::{LoopbackEndpoint, LoopbackEndpointError};
 pub use gate::{
     GateToolClass, GateValidationError, OPENCODE_ARGUMENT_NORMALIZATION_VERSION,

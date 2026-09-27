@@ -1495,6 +1495,10 @@ fn materialize_descriptor_bound_host_fixture(
 
 #[cfg(windows)]
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one ordered initial-launch-then-relaunch scenario rejecting descriptor-generation substitution; splitting would fragment the invariant"
+)]
 fn production_initial_and_relaunch_reject_descriptor_generation_substitution() -> TestResult {
     let host = test_host();
     let (mut manifest, root) = liveness_manifest_with_distinct_store_digests()?;

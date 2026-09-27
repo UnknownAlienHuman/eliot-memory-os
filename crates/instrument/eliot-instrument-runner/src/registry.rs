@@ -1195,6 +1195,201 @@ fn dotnet_entry(
     })
 }
 
+/// Executable supply-chain receipt admitted for one instrument kind.
+///
+/// The receipt pins the exact executable file identity, content digest, and
+/// tool version an admitted [`InstrumentSpec`](crate::profile::InstrumentSpec)
+/// revision was verified against, together with the spec digest and the
+/// registry generation of that verification. Receipts are admitted through
+/// the canonical registry path alongside specs (see
+/// [`SupplyChainTable`]); the pre-launch gate refuses an observed
+/// executable whose file, digest, or pinned version drifts from the receipt
+/// before any child process is created. Parser and profile generations stay
+/// replaceable through ordinary module/daemon cutover: a new generation
+/// ships a new receipt, never a Rust DLL ABI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupplyChainReceipt {
+    /// Instrument contract identity the receipt pins.
+    pub instrument: ContractId,
+    /// Exact admitted executable file identity (for example `cargo`).
+    pub executable: String,
+    /// Lowercase SHA-256 hex over the exact executable bytes.
+    pub content_digest: String,
+    /// Admitted tool version text, when the verification pinned one.
+    pub tool_version: Option<String>,
+    /// Digest of the admitted spec revision the receipt was verified against.
+    pub spec_digest: String,
+    /// Registry generation the verification was validated against.
+    pub generation: u64,
+}
+
+impl SupplyChainReceipt {
+    /// Admits one supply-chain receipt, validating every field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnresolvedExecutable`] when the executable
+    /// identity, content digest, spec digest, or version text is malformed.
+    pub fn new(
+        instrument: ContractId,
+        executable: String,
+        content_digest: String,
+        tool_version: Option<String>,
+        spec_digest: String,
+        generation: u64,
+    ) -> Result<Self, RegistryError> {
+        let name = instrument.as_str().to_owned();
+        if executable.trim().is_empty() || executable.chars().any(char::is_control) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: name,
+                reason: ExecutableIdentityCause::InvalidPath,
+            });
+        }
+        if !is_lower_hex_digest(&content_digest) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: name,
+                reason: ExecutableIdentityCause::InvalidDigest,
+            });
+        }
+        if !is_lower_hex_digest(&spec_digest) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: name,
+                reason: ExecutableIdentityCause::InvalidDigest,
+            });
+        }
+        if tool_version.as_ref().is_some_and(|version| {
+            version.trim().is_empty() || version.chars().any(char::is_control)
+        }) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: name,
+                reason: ExecutableIdentityCause::MissingVersion,
+            });
+        }
+        Ok(Self {
+            instrument,
+            executable,
+            content_digest,
+            tool_version,
+            spec_digest,
+            generation,
+        })
+    }
+
+    /// Registry key: the admitted instrument contract name.
+    pub fn instrument_key(&self) -> &str {
+        self.instrument.as_str()
+    }
+
+    /// Checks a machine-derived observation against this receipt before launch.
+    ///
+    /// The observation must name the admitted executable file, carry the
+    /// admitted content digest, and — when the receipt pins a version — carry
+    /// that exact version. Any drift fails closed so a replaced executable
+    /// can never launch under an earlier receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::ExecutableMismatch`] when the observation
+    /// names a different file, digest, or pinned version.
+    pub fn check_observation(
+        &self,
+        observation: &ResolvedExecutableIdentity,
+    ) -> Result<(), RegistryError> {
+        let instrument = self.instrument.as_str().to_owned();
+        if observation.executable_file_name() != self.executable.to_ascii_lowercase() {
+            return Err(RegistryError::ExecutableMismatch {
+                instrument,
+                expected: self.executable.clone(),
+                observed: observation.canonical_path.clone(),
+            });
+        }
+        if observation.content_digest != self.content_digest {
+            return Err(RegistryError::ExecutableMismatch {
+                instrument,
+                expected: self.content_digest.clone(),
+                observed: observation.content_digest.clone(),
+            });
+        }
+        if let Some(pinned) = self.tool_version.as_deref()
+            && observation.tool_version.as_deref() != Some(pinned)
+        {
+            return Err(RegistryError::ExecutableMismatch {
+                instrument,
+                expected: pinned.to_owned(),
+                observed: observation
+                    .tool_version
+                    .clone()
+                    .unwrap_or_else(|| "<unobserved>".to_owned()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Deterministic identity over every receipt field.
+    pub fn digest(&self) -> String {
+        let version = self.tool_version.as_deref().unwrap_or("");
+        let material = format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            self.instrument.as_str(),
+            self.executable,
+            self.content_digest,
+            version,
+            self.spec_digest,
+            self.generation,
+        );
+        eliot_contracts::sha256_hex(material.as_bytes())
+    }
+}
+
+/// Durable supply-chain receipt table on the canonical registry path.
+///
+/// Receipts are keyed by admitted instrument contract name in a [`BTreeMap`],
+/// so iteration order is sorted and stable. The table is admitted together
+/// with specs through the owning registry and digested into the registry
+/// identity; physical persistence beyond the registry (canonical store,
+/// artifact/receipt client) belongs to the Governor write path, which owns
+/// canonical-store authority.
+#[derive(Clone, Debug, Default)]
+pub struct SupplyChainTable {
+    receipts: BTreeMap<String, SupplyChainReceipt>,
+}
+
+impl SupplyChainTable {
+    /// Admits one receipt, rejecting a second receipt for the same instrument.
+    ///
+    /// Replacement ships as a new registry generation with a new receipt,
+    /// never as a silent overwrite: the owning registry rebuilds the table
+    /// per generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Duplicate`] when the instrument already
+    /// carries a receipt in this table.
+    pub fn admit(&mut self, receipt: SupplyChainReceipt) -> Result<(), RegistryError> {
+        let key = receipt.instrument_key().to_owned();
+        if self.receipts.contains_key(&key) {
+            return Err(RegistryError::Duplicate { instrument: key });
+        }
+        self.receipts.insert(key, receipt);
+        Ok(())
+    }
+
+    /// Looks up the admitted receipt for one instrument contract name.
+    pub fn get(&self, instrument: &str) -> Option<&SupplyChainReceipt> {
+        self.receipts.get(instrument)
+    }
+
+    /// Deterministic identity over the admitted receipts.
+    pub fn digest(&self) -> String {
+        let mut material = String::new();
+        for receipt in self.receipts.values() {
+            material.push_str(&receipt.digest());
+            material.push('\0');
+        }
+        eliot_contracts::sha256_hex(material.as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

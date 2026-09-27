@@ -320,8 +320,8 @@ impl TransportLimits {
 ///
 /// `Cancel`, heartbeat, and `Control` frames must remain sendable while
 /// ordinary request capacity is exhausted (issue #1881). Lane classification
-/// is enforced inside [`AdmissionQueue::admit_frame`], which derives the lane
-/// from the frame kind through this predicate; no caller supplies it.
+/// is enforced inside [`AdmissionQueue::admit_frame`], which validates the
+/// frame before deriving the lane from its kind; no caller supplies it.
 #[must_use]
 pub const fn is_control_capacity_frame(frame: &Frame) -> bool {
     matches!(
@@ -402,6 +402,8 @@ pub enum TransportError {
     SessionFenced,
     #[error("transport queue is full")]
     Backpressure,
+    #[error("transport capacity is exhausted: {0:?}")]
+    AttributedBackpressure(BackpressureSignal),
     #[error("transport operation timed out")]
     Timeout,
     #[error("transport operation was cancelled")]
@@ -425,14 +427,15 @@ pub enum TransportError {
     RegistryFull,
 }
 
-/// One named exhaustible dimension behind [`TransportError::Backpressure`]
-/// (issue #2731, item 6; I14.3 multidimensional reserve accounting).
+/// One named exhaustible dimension carried by
+/// [`TransportError::AttributedBackpressure`] (issue #2731, item 6; I14.3
+/// multidimensional reserve accounting).
 ///
-/// The [`TransportError::Backpressure`] variant itself stays a bare unit so
-/// every existing producer and exhaustive consumer keeps compiling:
-/// saturation sites that know their exact resource name it with one of the
-/// canonical [`BackpressureSignal`] constants below, while a bare error
-/// observed at the transport seam attributes only the dispatch lane through
+/// The bare [`TransportError::Backpressure`] remains available to existing
+/// non-event and unattributed callers. A producer that knows the exhausted
+/// resource uses [`TransportError::AttributedBackpressure`] with one of the
+/// canonical [`BackpressureSignal`] constants below. A bare error observed at
+/// the transport seam attributes only the dispatch lane through
 /// [`TransportError::backpressure_signal`]. Each signal names the exhausted
 /// resource, the permitted recovery action, and the shed, deferred, or
 /// quarantined work — never an authentication failure.
@@ -536,6 +539,7 @@ impl TransportError {
     pub const fn backpressure_signal(&self) -> Option<BackpressureSignal> {
         match self {
             TransportError::Backpressure => Some(BACKPRESSURE_BRIDGE_DISPATCH),
+            TransportError::AttributedBackpressure(signal) => Some(*signal),
             _ => None,
         }
     }
@@ -1292,7 +1296,7 @@ impl Session {
         })
     }
 
-    /// Performs the server-authoritative handshake and capability intersection.
+    /// Performs the server-authoritative handshake and rejects unsupported capability claims.
     pub fn establish_with_server(
         connection_id: impl Into<String>,
         peer: PeerIdentity,
@@ -1312,6 +1316,27 @@ impl Session {
             || client.launch_nonce != server.launch_nonce
         {
             return Err(TransportError::SessionFenced);
+        }
+        if client
+            .capabilities
+            .iter()
+            .any(|capability| !server.allowed_capabilities.contains(capability))
+        {
+            return Err(TransportError::Protocol(ProtocolError::InvalidField {
+                field: "client.capabilities",
+                reason: "must be a subset of server-admitted capabilities",
+            }));
+        }
+        if client
+            .module_contract
+            .required_capabilities
+            .iter()
+            .any(|capability| !server.allowed_capabilities.contains(capability))
+        {
+            return Err(TransportError::Protocol(ProtocolError::InvalidField {
+                field: "client.module_contract.required_capabilities",
+                reason: "must be a subset of server-admitted capabilities",
+            }));
         }
         let protocol_version = negotiate(client, server.protocol_range)?;
         let capabilities = intersection(&client.capabilities, &server.allowed_capabilities);
@@ -1509,13 +1534,15 @@ impl AdmissionQueue {
     ///
     /// # Errors
     ///
-    /// Returns `ZeroLengthFrame` / `OversizeFrame` for size violations and
-    /// `Backpressure` when the applicable in-flight bound is exhausted.
+    /// Returns a protocol error for invalid frames, `ZeroLengthFrame` /
+    /// `OversizeFrame` for size violations, and `Backpressure` when the
+    /// applicable in-flight bound is exhausted.
     pub fn admit_frame(
         &mut self,
         frame: &Frame,
         encoded_bytes: usize,
     ) -> Result<QueueReservation, TransportError> {
+        frame.validate()?;
         self.admit(encoded_bytes, is_control_capacity_frame(frame))
     }
 

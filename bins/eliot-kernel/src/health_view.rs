@@ -63,7 +63,7 @@ impl KernelActivationView {
         generation: "unbound",
         governance: "unsupervised",
         lease_state: "unavailable",
-        drain_disposition: "proceed",
+        drain_disposition: "unavailable",
     };
 }
 
@@ -233,6 +233,10 @@ impl KernelComposition {
             .lock()
             .is_ok_and(|policy| policy.module_generation.generation.value() != 0);
         let census = self.idle_lease_census();
+        let Ok(coordinator) = crate::coordinator_for(&self.work_root) else {
+            observe_health("kernel.activation.view_projected", "fenced");
+            return KernelActivationView::FENCED;
+        };
         let view = KernelActivationView {
             service_state: kernel_service_state_code(state),
             generation: if generation_bound { "bound" } else { "unbound" },
@@ -242,7 +246,7 @@ impl KernelComposition {
                 "unsupervised"
             },
             lease_state: census.observation_code(),
-            drain_disposition: crate::coordinator_for(&self.work_root).drain_disposition(),
+            drain_disposition: coordinator.drain_disposition(),
         };
         observe_health("kernel.activation.view_projected", view.lease_state);
         view

@@ -73,3 +73,144 @@ forbid_unsafe = true
 required_exports = []
 required_tests = []
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
+
+# ---------------------------------------------------------------------------
+# Field contract. Same table shape as the W9 catalogue
+# crates/smart/cognitive-wave-09.toml [[field_contract]]; this file is the
+# owning crate's own copy, so the implementation agent reads the contract from
+# the crate it is asked to implement instead of from a remote catalogue.
+# Frozen here under Issue #259; the catalogue row is the wave-level index of
+# the same contract id and is not a second owner of it.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+id = "CognitiveQualityAssessment"
+owner_crate = "eliot-cognitive-quality"
+family = "skill lifecycle, tool-surface, Dreamer economics, EliotSelfQualityView, bottleneck, advisory intervention"
+source_handles = ["I07-25", "I09-16", "I16-23", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["skill_ref_and_revision", "skill_task_host_route_and_governance_scope", "skill_applies_when_and_does_not_apply_when", "skill_dependency_and_tool_definition_versions", "skill_delivered_expanded_and_executed_counts", "skill_eligibility_activation_and_activation_latency", "skill_adherence_at_early_mid_and_final_checkpoints", "skill_verified_success_failure_and_uncertain_outcomes", "skill_observed_decision_or_verifier_delta", "skill_false_activation_and_distractor_history", "skill_interactions_ordering_and_mutual_exclusion", "skill_stale_or_quarantine_reason", "skill_proposed_action_keep_or_patch_or_split_or_merge_or_suppress_or_archive_or_quarantine_or_restore", "skill_evidence_review_and_rollback", "tool_surface_eligibility_retrieval_delivery_activation_adherence_per_attempt_with_exact_tool_definition_version", "tool_surface_where_not_apply_stop_and_escalation_first_class", "dreamer_job_accepted_rejected_expired_candidates", "dreamer_job_verified_decision_verifier_and_downstream_outcome_delta", "dreamer_job_false_merge_split_procedure_and_negative_transfer", "dreamer_job_source_coverage_missed_material_evidence_and_unresolved_uncertainty", "dreamer_job_model_agent_swarm_calls_raw_route_usage_and_retries", "dreamer_job_cpu_ram_storage_network_queue_wait_wall_latency_and_human_attention", "dreamer_job_context_reconstruction_savings_without_shifted_cost", "dreamer_job_clarification_usefulness_backlog_age_and_expiry", "dreamer_job_model_route_calibration_rollback_and_invalidation", "self_quality_agent_loop_and_no_progress", "self_quality_observation_coverage_and_integration_gaps", "self_quality_context_packet_size_quality_and_feedback", "self_quality_memory_growth_staleness_duplicates_false_activation_and_use", "self_quality_dreamer_watchdog_doctor_job_utility_and_failures", "self_quality_configuration_maintenance_and_update_outcomes", "self_quality_orphan_descendant_and_unknown_effect_state", "self_quality_product_pulse_and_user_outcome_delta", "self_quality_open_problems_improvement_candidates_and_human_actions", "self_quality_counter_metrics_context_bytes_vs_usefulness_delivery_vs_use_growth_vs_resolved_activity_vs_progress_cost_vs_delta_maintenance_vs_recurrence_resolution_latency", "bottleneck_diagnosis_update_quality_high_activation_low_or_activation_high_adherence_low_or_adherence_high_no_delta_or_delta_present_outcome_worse_or_immediate_gain_retention_regression", "intervention_id_and_trigger_observation_refs", "intervention_affected_capability_scope_and_owner", "intervention_causal_hypothesis_rivals_and_discriminator", "intervention_selected_action_observe_or_repair_or_configure_or_reroute_or_experiment_or_abstain_or_escalate", "intervention_candidate_change_and_authority_refs", "intervention_proof_ceiling_verifier_and_counter_metrics", "intervention_rollback_and_validity_scope", "intervention_immediate_and_delayed_outcomes", "intervention_terminal_disposition_retained_or_narrowed_or_rolled_back_or_reopened_or_escalated_or_inconclusive", "intervention_system_observation_and_experience_writeback_refs"]
+denominator = "per_sub_assessment_denominators: skill_counts_over_task_host_route_scope_with_tool_versions; job_window_over_declared_job_family_with_full_cost_ledger; self_quality_observations_over_obligation_profile; intervention_scope_closure_over_affected_capability"
+denominator_rule = "RECHECK: for Skill/tool-surface recompute delivered/expanded/executed and eligibility/activation/adherence from per-attempt HarnessActivationReceipt refs at the named scope; for Dreamer economics re-resolve the declared job/job-family window and full compute/storage/context/Human cost ledger plus held-out/live outcome refs; for SelfQuality compare observations against the ObservationObligationProfile; for intervention re-enumerate the affected capability closure. Each Complete sub-assessment requires its own exact denominator; aggregate counts never substitute for per-attempt receipts."
+complete_rule = "Every Complete state requires the exact independently recheckable per-sub-assessment denominator above; installed != delivered != executed != useful; acknowledgement is not use; use is not adherence; adherence is not benefit."
+fence = "Task/host/route/governance scope plus StateFence; tool-definition versions pin staleness."
+omission_semantics = "Silence about adherence is unknown, not compliance; shared success may remain distributed or uncertain; missing observability stays unknown; each owner projection is consumed as a whole with its own coverage, so per-role input digests never collide in one flat digest list."
+invariants = ["no aggregate intelligence/confidence/utility score and no aggregate learning score", "installed != delivered != executed != useful, and acknowledgement is not use, use is not adherence, adherence is not benefit", "retrieval/repetition/model-agreement do not reinforce a Skill", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish utility, support or understanding", "tool availability is not utility proof and a tool-definition change marks the surface stale before material use", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "one model's delete recommendation is never its own oracle", "EliotSelfQualityView is a problem-oriented projection: no global intelligence score, no second projection owner, no self-certification, no self-promotion, no silent system rewrite", "learning-bottleneck diagnosis is a table lookup over observed combinations, never a single aggregate self-learning score", "recurring failure without a changed hypothesis or discriminator opens Mechanism Review rather than another equivalent retry", "consume immutable owner-produced projections only", "no Skill, tool, configuration or route mutation, no scheduler, effect, authority or task finish", "every Complete state requires the exact independently recheckable denominator", "this crate owns no canonical state or lifecycle transition"]
+
+[[field_contract_index]]
+contract_id = "CognitiveQualityAssessment"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+catalogue = "crates/smart/cognitive-wave-09.toml"
+denominator_ref = "per_sub_assessment_denominators (skill counts; job window with cost ledger; observations over obligation profile; intervention closure)"
+source_handles = ["I07-25", "I09-16", "I16-23", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+coverage_state = "INCONCLUSIVE"
+coverage_state_rule = "No Complete sub-assessment is claimed by this manifest. Implementation, package Module Proof, real provider-consumer Edge Proof and the named Product Pulse W9_COGNITIVE_QUALITY_PULSE_01 are all NOT_EXECUTED, so no rechecked per-sub-assessment denominator is claimed as observed; INCONCLUSIVE is the only state this file supports at STATIC_FIELD_CONTRACT_ONLY."
+
+[[ownership]]
+public_type = "SkillLifecycleView"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.skill.lifecycle"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer/Curator review surface (candidate only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[ownership]]
+public_type = "ToolSurfaceAssessment"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.tool.surface"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer/Curator review surface (candidate only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[ownership]]
+public_type = "DreamerJobEconomics"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.dreamer.job_economics"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer route/curation review surface (projection only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[ownership]]
+public_type = "EliotSelfQualityView"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.self.quality_view"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Governor/Diagnostic Compiler projection owner (this crate supplies candidates only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[ownership]]
+public_type = "LearningBottleneckDiagnosis"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.self.quality_view"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer/Doctor diagnosis review surface (candidate only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[ownership]]
+public_type = "SelfQualityInterventionReceipt"
+owner_crate = "eliot-cognitive-quality"
+defining_owner = "this crate; the wave-09 catalogue row is an index, not a second owner"
+functional_cells = ["smart.self.intervention_candidate"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Human/Main Agent/Governor decision owner (candidate only)"]
+re_export_rule = "A re-export is not a second owner; the defining fields stay in this crate."
+
+[[crate_manifest]]
+crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+catalogue = "crates/smart/cognitive-wave-09.toml"
+status = "PROTOTYPE"
+functional_cells = ["smart.skill.lifecycle", "smart.tool.surface", "smart.dreamer.job_economics", "smart.self.quality_view", "smart.self.intervention_candidate"]
+field_contract_ids = ["CognitiveQualityAssessment"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+product_pulse_status = "NOT_EXECUTED"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+[[validation_gate]]
+id = "W9-CQ-PER-SUB-ASSESSMENT-DENOMINATOR"
+rule = "Each of the six sub-assessments (Skill lifecycle, tool surface, Dreamer job economics, EliotSelfQualityView, learning bottleneck, advisory intervention) carries its own exact independently recheckable denominator. An aggregate count never substitutes for a per-attempt HarnessActivationReceipt, and a Complete sub-assessment without its own denominator is invalid."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-CQ-NO-AGGREGATE-SCORE"
+rule = "No aggregate intelligence, confidence, utility or learning score is emitted. Learning-bottleneck diagnosis selects the bottleneck from the observed combination; it never collapses into one number, and no self-certification or self-promotion is produced."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-CQ-NO-FREQUENCY-AS-UTILITY"
+rule = "Installed, delivered, expanded, executed, used and useful stay distinct. Retrieval, popularity, completion, delivery, tool availability and model agreement never establish utility, support or understanding, and never reinforce a Skill."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-CQ-CANDIDATE-ONLY-NO-MUTATION"
+rule = "Every emitted value is a reversible candidate. This crate performs no Skill, tool, configuration or route mutation, owns no job, route, schedule, policy, effect, authority or task finish, and never lets one model's delete recommendation act as its own oracle."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-CQ-RECURRING-FAILURE-OPENS-MECHANISM-REVIEW"
+rule = "Recurring failure without a changed hypothesis or discriminator opens Mechanism Review rather than another equivalent retry; activity volume, summary volume and maintenance completion alone cannot close the loop."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"

@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use eliot_contracts::{
     ArtifactId, ContractId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
 };
+use eliot_governor::{CONFORMANCE_COMPONENT, PromotionExpectations};
 use eliot_process::ProcessEvidenceSink;
 use eliot_process_executor::{WindowsProcessExecutor, wasm_p03_adapter::WasmP03ProcessAdapter};
 use eliot_runtime_contracts::{LeaseState, ModuleGeneration, ModuleGenerationState, RuntimeLease};
@@ -566,6 +567,42 @@ impl AdmittedOwnerPorts {
             Err(PortError::Denied)
         }
     }
+
+    /// Binds the declared reference of a conformance-component invocation to
+    /// the ELIOT-owned conformance corpus.
+    ///
+    /// When the sealed invocation targets the registered conformance
+    /// component, the owner-published expected digests retained here must
+    /// equal the expectations recomputed from the ELIOT-owned deterministic
+    /// oracle over the actual invocation input and seed; a declared
+    /// reference that contradicts the corpus fails closed instead of
+    /// reaching the differential. The oracle is input- and seed-determined
+    /// and reports no effects, so the recomputation carries no digest
+    /// convention of its own: result and state-delta digests hash raw
+    /// bytes, and the empty effect proposals canonicalize identically under
+    /// every scheme. Invocations of any other component keep their
+    /// owner-declared reference untouched — non-corpus semantic admission
+    /// stays Governor/Kernel-owned, and the neutral differential still
+    /// classifies the run against that declared reference.
+    fn check_corpus_binding(&self, invocation: &EngineInvocation) -> Result<(), PortError> {
+        if invocation.component_id.as_str() != CONFORMANCE_COMPONENT {
+            return Ok(());
+        }
+        let owned = PromotionExpectations::for_component(
+            CONFORMANCE_COMPONENT,
+            &invocation.input,
+            invocation.deterministic_seed,
+        )?;
+        let bound = owned.corpus_digest == self.corpus_digest
+            && owned.expected_result_digest == self.expected_result_digest
+            && owned.expected_effect_digest == self.expected_effect_digest
+            && owned.expected_state_delta_digest == self.expected_state_delta_digest;
+        if bound {
+            Ok(())
+        } else {
+            Err(PortError::Denied)
+        }
+    }
 }
 
 impl GovernorResolutionPort for AdmittedOwnerPorts {
@@ -657,6 +694,7 @@ impl PromotionVerificationPort for AdmittedOwnerPorts {
         derived: &DerivedExecutionEvidence,
     ) -> Result<(), PortError> {
         self.check_live()?;
+        self.check_corpus_binding(invocation)?;
         let work_scope = decode_owner_scope(&self.scope_json)?;
         let exact = invocation.manifest == self.manifest
             && invocation.imports == self.manifest.imports

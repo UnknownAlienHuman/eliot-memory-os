@@ -1,0 +1,155 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.conflict_analysis",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-dreamer-conflict-analysis",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [],
+    "inline_cfg_test_modules": 1
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "majority wrong",
+        "shared evidence dependence",
+        "local conflict",
+        "no discriminative probe",
+        "Concilium output rejection"
+      ]
+    },
+    "selected_tests": [],
+    "test_attribute_count": 65
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "bins/eliot-dreamer"
+    ],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "development diagnosis",
+        "deferred Research synthesis",
+        "advanced Orientation path"
+      ]
+    },
+    "edge_profile_tests": []
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return inconclusive or unsupported conflict analysis with exact missing evidence; never resolve the conflict or fabricate a deliberation plan."
+    },
+    "selected_cases": []
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 65,
+    "test_stu": 0,
+    "nonzero": true
+  },
+  "bound_contract_digest": "606c3429ecb96c3fd4474bfa30e25fbe954b0b6c4a0f31c37038c31ef426687e",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-conflict-analysis/Cargo.toml",
+        "sha256": "45912cba9eca26c43178873639077c927976124c069e7f6953b8857fadd65dd2"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-conflict-analysis/module.toml",
+        "sha256": "0c95679c7f73456879325dcb50cdadd7e530eb50678cb090325b1677a7ba6ffd"
+      },
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "2ee75ccf36942f9a2e67160191651416fbd7b7ffad88703704bcbed6bbd6d2d0"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "b618a054ee3534c9858f4b710e04ce6899c0e1a8b7fa28f1122a26a7f77e9fbc",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "b618a054ee3534c9"
+  }
+}

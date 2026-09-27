@@ -1,0 +1,128 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "user-broker-core",
+  "product_objective": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_objective",
+    "value": null
+  },
+  "functional_capability_cell_refs": [
+    "user-broker-core"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/user-broker-core",
+  "primary_source_package": {
+    "package": "eliot-user-broker-core",
+    "root_path": "crates/surfaces/eliot-user-broker-core",
+    "manifest_path": "crates/surfaces/eliot-user-broker-core/Cargo.toml",
+    "module_manifest": null,
+    "description": "Provider-neutral A-09 interactive user broker core"
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 65318,
+    "test_stu": 0,
+    "selected_file_count": 1,
+    "inline_cfg_test_modules": 1,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/surfaces/eliot-user-broker-core/src/lib.rs",
+        "bytes": 195953,
+        "sha256": "6ab575ed76b6aa7231bfe2fad9c332ea97c02c94eb91155fa204db34892cbbe5",
+        "stu": 65318,
+        "inline_cfg_test": true
+      }
+    ],
+    "selected_tests": [],
+    "source_selection_digest": "3d155b9de59758b6464c45d4f73cf2b7ab6c9c73e58bc2e5ec25401e2c5ef368"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-process",
+    "eliot-protocol",
+    "eliot-receipts",
+    "eliot-runtime-contracts",
+    "eliot-security-contracts",
+    "serde",
+    "serde_json",
+    "sha2",
+    "thiserror",
+    "uuid"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-agent-bridge",
+    "bins/eliot-user-broker",
+    "crates/agent/eliot-agent-opencode",
+    "crates/surfaces/eliot-cli"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "operator-surfaces",
+      "title": "Operator, MCP, human, and notification surfaces",
+      "responsibility": "Canonical CLI, MCP, ControlBoard, User Broker, notification, human UI, and surface-only orchestration.",
+      "documentation_handles": [
+        "I11.1"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": null
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "af9d04d2e3af4687c6b40ff285fbc813ba2a2d74292b689cc749b4b8e8484fb8",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/surfaces/eliot-user-broker-core/Cargo.toml",
+        "sha256": "2a0cd86dc715450b9ac910b6bf789836b4a31bda89a13e901fbcf72091f6e030"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "3d155b9de59758b6464c45d4f73cf2b7ab6c9c73e58bc2e5ec25401e2c5ef368"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "ada85d1aecea743514365b2bb1f921bf6e46da57fc5af1cb5a78473475d845fe",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "ada85d1aecea7435"
+  }
+}

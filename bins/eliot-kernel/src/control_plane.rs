@@ -1,18 +1,20 @@
 //! Kernel control-plane transition and authenticated request handling.
 //!
 //! Architecture traceability:
-//! - `ELIOT_ARCHITECTURE.md :: A13.2. Kernel и failure domains` keeps Kernel
-//!   as the lifecycle and failure boundary for this control path.
-//! - `ELIOT_ARCHITECTURE.md :: A13.5. Bounded resources и Control Reserve`
+//! - `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`) keeps
+//!   Kernel as the lifecycle and failure boundary for this control path.
+//! - `A13.5` (`docs/architecture/A13-05-bounded-resources-and-control-reserve.md`)
 //!   binds control work to the existing protected-control reserve; this module
 //!   exposes its capacity without creating a second budget.
-//! - `ELIOT_IMPLEMENTATION.md :: P.3. Kernel control boundary` keeps
+//! - The R1 Kernel runtime layer
+//!   (`docs/architecture/I-PREFACE-04-runtime-layer-model.md`) keeps
 //!   front-door request admission and lifecycle transitions in Kernel while
 //!   service semantics stay behind the existing `KernelService` gateway.
-//! - `ELIOT_IMPLEMENTATION.md :: I1.5. Demand-start, observable use,
-//!   supervision and idle shutdown` and `I14.13. Idle drain and cancellation`
+//! - `I1.5`
+//!   (`docs/architecture/I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md`)
+//!   and `I14.13` (`docs/architecture/I14-13-idle-drain-and-cancellation.md`)
 //!   constrain shutdown to the existing runtime signal and drain owners.
-//! - `ELIOT_IMPLEMENTATION.md :: I14.23. Safe shutdown` leaves the complete
+//! - `I14.23` (`docs/architecture/I14-23-safe-shutdown.md`) leaves the complete
 //!   cooperative shutdown sequence in `KernelComposition::shutdown`.
 //!
 //! The implementation remains an ordinary module so the composition root keeps
@@ -70,7 +72,9 @@ fn control_request_terminal_code(error: &TransportError) -> &'static str {
         TransportError::PeerIdentityUnavailable => "control_peer_unavailable",
         TransportError::Protocol(_) => "control_protocol",
         TransportError::SessionFenced => "control_fenced",
-        TransportError::Backpressure => "control_backpressure",
+        TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
+            "control_backpressure"
+        }
         TransportError::Timeout => "control_timeout",
         TransportError::Cancelled => "control_cancelled",
         TransportError::InvalidPipeName => "control_invalid_pipe",
@@ -80,6 +84,19 @@ fn control_request_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownRequest => "control_unknown_request",
         TransportError::IdentityConflict => "control_identity_conflict",
         TransportError::RegistryFull => "control_registry_full",
+    }
+}
+
+/// Preserves the original failure class until the request boundary chooses
+/// the sole terminal code for this operation.
+enum ControlRequestFailure {
+    Transport(TransportError),
+    Transition(KernelServiceError),
+}
+
+impl From<TransportError> for ControlRequestFailure {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
     }
 }
 
@@ -109,6 +126,14 @@ impl KernelComposition {
         &self,
         command: KernelControlCommand,
     ) -> Result<KernelServiceState, KernelServiceError> {
+        self.apply_control_with_terminal(command, true)
+    }
+
+    fn apply_control_with_terminal(
+        &self,
+        command: KernelControlCommand,
+        emit_terminal: bool,
+    ) -> Result<KernelServiceState, KernelServiceError> {
         observe_control("kernel.control.transition_requested", "attempt");
         match self.apply_control_inner(command) {
             Ok(state) => {
@@ -117,9 +142,11 @@ impl KernelComposition {
             }
             Err(error) => {
                 observe_control("kernel.control.transition_failed", "rejected");
-                super::kernel_diagnostics::observe_terminal_error(
-                    control_transition_terminal_code(&error),
-                );
+                if emit_terminal {
+                    super::kernel_diagnostics::observe_terminal_error(
+                        control_transition_terminal_code(&error),
+                    );
+                }
                 Err(error)
             }
         }
@@ -153,10 +180,8 @@ impl KernelComposition {
     /// transport's handle-proven peer and the approved generation contour.
     ///
     /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): exactly one terminal is
-    /// emitted per failed request with the request operation's own stable
-    /// code; failures already terminaled by the transition gateway below
-    /// arrive here transformed into the request error, never re-terminaled
-    /// under their original value.
+    /// emitted per failed request. A nested transition's preserved cause
+    /// selects its stable code; other failures use the request error code.
     pub async fn apply_control_request(
         &self,
         request: KernelControlRequest,
@@ -171,10 +196,17 @@ impl KernelComposition {
             }
             Err(error) => {
                 observe_control("kernel.control.request_denied", "rejected");
-                super::kernel_diagnostics::observe_terminal_error(control_request_terminal_code(
-                    &error,
-                ));
-                Err(error)
+                let (terminal_code, transport_error) = match error {
+                    ControlRequestFailure::Transport(error) => {
+                        (control_request_terminal_code(&error), error)
+                    }
+                    ControlRequestFailure::Transition(error) => (
+                        control_transition_terminal_code(&error),
+                        TransportError::SessionFenced,
+                    ),
+                };
+                super::kernel_diagnostics::observe_terminal_error(terminal_code);
+                Err(transport_error)
             }
         }
     }
@@ -191,7 +223,7 @@ impl KernelComposition {
         request: KernelControlRequest,
         peer: &PeerIdentity,
         expected_sequence: u64,
-    ) -> Result<KernelControlResponse, TransportError> {
+    ) -> Result<KernelControlResponse, ControlRequestFailure> {
         request
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -206,7 +238,7 @@ impl KernelComposition {
             || observed_peer.start_time_100ns() != request.candidate.host_process.start_time_100ns
             || observed_peer.image_path() != request.candidate.host_process.image_path
         {
-            return Err(TransportError::SessionFenced);
+            return Err(TransportError::SessionFenced.into());
         }
         #[cfg(windows)]
         self.validate_candidate_process_binding(&request.candidate)
@@ -255,7 +287,7 @@ impl KernelComposition {
                     .as_deref()
                     .is_some_and(|hash| hash != request.candidate.config_hash.as_str())
             {
-                return Err(TransportError::SessionFenced);
+                return Err(TransportError::SessionFenced.into());
             }
             if !request
                 .candidate
@@ -311,7 +343,7 @@ impl KernelComposition {
                 .await
             {
                 let _ = error;
-                return Err(TransportError::SessionFenced);
+                return Err(TransportError::SessionFenced.into());
             }
         }
         // I14.23 wake/attach race: a new activation arriving before the
@@ -323,13 +355,15 @@ impl KernelComposition {
             // Post-linearization activation cannot reuse the drained
             // generation; the caller re-establishes a fresh generation
             // through the reconcile path.
-            let disposition = coordinator_for(&self.work_root).on_activate_request();
+            let disposition = coordinator_for(&self.work_root)
+                .and_then(|coordinator| coordinator.on_activate_request())
+                .map_err(|_| TransportError::SessionFenced)?;
             observe_control(
                 "kernel.control.drain_disposition_observed",
                 disposition_code(disposition),
             );
             if disposition.fences_old_authority() {
-                return Err(TransportError::SessionFenced);
+                return Err(TransportError::SessionFenced.into());
             }
         }
         let store_rebind_receipt: Option<eliot_kernel_service::StoreRebindReceipt> = match &request
@@ -361,7 +395,7 @@ impl KernelComposition {
                         if !is_store_rebind_latest_committed(&self.generation_gateway.ors, &record)
                             .map_err(|_| TransportError::SessionFenced)?
                         {
-                            return Err(TransportError::SessionFenced);
+                            return Err(TransportError::SessionFenced.into());
                         }
                         let receipt = store_rebind_receipt_from_ors_record(
                             &record,
@@ -371,10 +405,14 @@ impl KernelComposition {
                         self.verify_store_rebind_publication_complete(&receipt)?;
                         // A reconciled commit resolves the matching drain-gate
                         // receipt when a shutdown is waiting on it.
-                        coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
-                            "store-rebind:{}",
-                            query.operation_id.as_str()
-                        ));
+                        coordinator_for(&self.work_root)
+                            .and_then(|coordinator| {
+                                coordinator.resolve_pending_receipt(&format!(
+                                    "store-rebind:{}",
+                                    query.operation_id.as_str()
+                                ))
+                            })
+                            .map_err(|_| TransportError::SessionFenced)?;
                         Some(receipt)
                     }
                     Some(record)
@@ -401,10 +439,14 @@ impl KernelComposition {
                                 self.rollback_store_rebind_if_exact_query(query)?;
                                 // The abort removed the staged row, resolving
                                 // the matching drain-gate receipt if any.
-                                coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
-                                    "store-rebind:{}",
-                                    query.operation_id.as_str()
-                                ));
+                                coordinator_for(&self.work_root)
+                                    .and_then(|coordinator| {
+                                        coordinator.resolve_pending_receipt(&format!(
+                                            "store-rebind:{}",
+                                            query.operation_id.as_str()
+                                        ))
+                                    })
+                                    .map_err(|_| TransportError::SessionFenced)?;
                                 None
                             }
                             (_, Some(after))
@@ -424,7 +466,7 @@ impl KernelComposition {
                                 )
                                 .map_err(|_| TransportError::SessionFenced)?
                                 {
-                                    return Err(TransportError::SessionFenced);
+                                    return Err(TransportError::SessionFenced.into());
                                 }
                                 let receipt = store_rebind_receipt_from_ors_record(
                                     &after,
@@ -434,16 +476,20 @@ impl KernelComposition {
                                 self.verify_store_rebind_publication_complete(&receipt)?;
                                 // A reconciled commit resolves the matching
                                 // drain-gate receipt when a shutdown waits.
-                                coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
-                                    "store-rebind:{}",
-                                    query.operation_id.as_str()
-                                ));
+                                coordinator_for(&self.work_root)
+                                    .and_then(|coordinator| {
+                                        coordinator.resolve_pending_receipt(&format!(
+                                            "store-rebind:{}",
+                                            query.operation_id.as_str()
+                                        ))
+                                    })
+                                    .map_err(|_| TransportError::SessionFenced)?;
                                 Some(receipt)
                             }
-                            _ => return Err(TransportError::SessionFenced),
+                            _ => return Err(TransportError::SessionFenced.into()),
                         }
                     }
-                    Some(_) => return Err(TransportError::SessionFenced),
+                    Some(_) => return Err(TransportError::SessionFenced.into()),
                     None => {
                         // A service receipt without an exact durable ORS
                         // commit is intentionally not query-visible. In
@@ -537,7 +583,7 @@ impl KernelComposition {
                 // there is no equivalent supervision proof on this platform, so
                 // no ready receipt — and no supervised-readiness claim of any
                 // kind — may be emitted here.
-                return Err(TransportError::SessionFenced);
+                return Err(TransportError::SessionFenced.into());
             }
         } else {
             None
@@ -556,7 +602,7 @@ impl KernelComposition {
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
             if after.as_ref() != Some(expected) {
-                return Err(TransportError::SessionFenced);
+                return Err(TransportError::SessionFenced.into());
             }
             self.verify_published_eliotd_live_receipt(expected_live_receipt)
                 .map_err(|_| TransportError::SessionFenced)?;
@@ -572,7 +618,7 @@ impl KernelComposition {
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
             if after_receipt_readback.as_ref() != Some(expected) {
-                return Err(TransportError::SessionFenced);
+                return Err(TransportError::SessionFenced.into());
             }
             // I1.11 step 11 is intentionally not latched by ProbeReady.
             // Only the typed per-tick progress path may set it after a fresh
@@ -650,8 +696,8 @@ impl KernelComposition {
                 | KernelControlCommand::ReconcileRebindStore(_)
                 | KernelControlCommand::ReportHostStartupEvidence(_) => {}
                 command => {
-                    self.apply_control(command.clone())
-                        .map_err(|_| TransportError::SessionFenced)?;
+                    self.apply_control_with_terminal(command.clone(), false)
+                        .map_err(ControlRequestFailure::Transition)?;
                 }
             }
         }
@@ -696,7 +742,7 @@ impl KernelComposition {
             payload_digest: String::new(),
         }
         .with_computed_digest()
-        .map_err(|_| TransportError::SessionFenced)
+        .map_err(|_| TransportError::SessionFenced.into())
     }
 
     /// Consumes one authenticated Host startup-evidence carrier. Host owns
@@ -745,7 +791,14 @@ impl KernelComposition {
     /// the request even when admission closure wins the race.
     #[must_use]
     pub fn request_shutdown(&self) -> bool {
-        let _ = coordinator_for(&self.work_root).request_shutdown();
+        let Ok(coordinator) = coordinator_for(&self.work_root) else {
+            observe_control("kernel.control.drain_request_failed", "unavailable");
+            return false;
+        };
+        if coordinator.request_shutdown().is_err() {
+            observe_control("kernel.control.drain_request_failed", "unavailable");
+            return false;
+        }
         let view = self.activation_operational_view();
         observe_control(
             "kernel.control.drain_requested_observed",

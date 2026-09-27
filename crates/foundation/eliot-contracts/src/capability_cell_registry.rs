@@ -27,7 +27,10 @@ use std::{fmt, str::FromStr};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::{ContractError, ContractVersion, canonical_json_bytes, sha256_hex};
+use crate::{
+    ContractError, ContractVersion, ModuleCatalog, ModuleCatalogError, ModuleCatalogRecord,
+    canonical_json_bytes, sha256_hex,
+};
 
 /// Stable contract name for the owner-neutral capability-cell registry family.
 pub const CAPABILITY_CELL_REGISTRY_CONTRACT_NAME: &str =
@@ -646,6 +649,47 @@ impl fmt::Display for RegistryValidationError {
 
 impl std::error::Error for RegistryValidationError {}
 
+/// Fail-closed failure of a capability classification query. Any variant
+/// refuses the query instead of reporting a partial or name-derived
+/// classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CellClassificationError {
+    /// The registry declares no such functional capability cell.
+    UnknownCell {
+        /// Cell that the registry does not declare.
+        cell: String,
+    },
+    /// The cell is registered but carries no Module Catalog record, so its five
+    /// `I2.10` classifications and selection rationale cannot be reported.
+    UnclassifiedCell {
+        /// Registered cell with no catalog record.
+        cell: String,
+    },
+    /// The Module Catalog failed validation, so its records cannot be reported
+    /// as a complete classification.
+    InvalidCatalog(ModuleCatalogError),
+}
+
+impl fmt::Display for CellClassificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownCell { cell } => {
+                write!(
+                    formatter,
+                    "capability cell registry declares no cell '{cell}'"
+                )
+            }
+            Self::UnclassifiedCell { cell } => write!(
+                formatter,
+                "registered cell '{cell}' has no Module Catalog classification record"
+            ),
+            Self::InvalidCatalog(error) => write!(formatter, "invalid Module Catalog: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CellClassificationError {}
+
 #[derive(Serialize)]
 struct RegistryDigestInput<'a> {
     namespace: &'static str,
@@ -700,6 +744,40 @@ impl CapabilityCellRegistry {
         } else {
             Err(RegistryValidationError { diagnostics })
         }
+    }
+
+    /// Returns the `I2.10` classification of one registered cell.
+    ///
+    /// The returned [`ModuleCatalogRecord`] carries all five classifications
+    /// (execution contour, runtime class, state class, replacement class, and
+    /// iteration lane) together with the recorded selection rationale: the
+    /// least-privilege reason, the rejected alternatives, and the applicable
+    /// promotion path. Classification completeness is part of support
+    /// classification: an unregistered cell is refused with
+    /// [`CellClassificationError::UnknownCell`], a registered cell with no
+    /// record is refused with [`CellClassificationError::UnclassifiedCell`],
+    /// and an invalid catalog is refused with
+    /// [`CellClassificationError::InvalidCatalog`]. No value is derived from a
+    /// crate, bundle, source-layer, or runtime-layer name.
+    pub fn cell_classification<'a>(
+        &self,
+        catalog: &'a ModuleCatalog,
+        cell: &CapabilityCellId,
+    ) -> Result<&'a ModuleCatalogRecord, CellClassificationError> {
+        if !self.cells.iter().any(|record| &record.cell == cell) {
+            return Err(CellClassificationError::UnknownCell {
+                cell: cell.as_str().to_owned(),
+            });
+        }
+        catalog
+            .validate()
+            .map_err(CellClassificationError::InvalidCatalog)?;
+        catalog.record(cell).map_err(|error| match error {
+            ModuleCatalogError::UnknownCapability { cell } => {
+                CellClassificationError::UnclassifiedCell { cell }
+            }
+            error => CellClassificationError::InvalidCatalog(error),
+        })
     }
 }
 

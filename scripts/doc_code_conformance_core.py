@@ -697,7 +697,11 @@ def fixture_config() -> dict[str, Any]:
         },
         "retired_references": {
             "scan_roots": ["crates", ".github"],
-            "tokens": ["docs/normative/"],
+            "tokens": [
+                "docs/normative/",
+                "docs/architecture/ELIOT_ARCHITECTURE.md",
+                "docs/architecture/ELIOT_IMPLEMENTATION.md",
+            ],
             "extensions": [".rs", ".yml"],
             "ignore_globs": [],
             "unstable_line_reference_regex": r"(?<![A-Za-z0-9_./-])(?:docs/(?:normative|architecture)/)?ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+(?:-(?:[A-Za-z0-9_]+)?)?",
@@ -711,6 +715,16 @@ def fixture_config() -> dict[str, Any]:
                     "path": "crates/x/src/lib.rs",
                     "token": "ELIOT_ARCHITECTURE.md:999",
                     "reason": "negative fixture allowance",
+                },
+                {
+                    "path": "crates/x/src/reader.rs",
+                    "token": "docs/architecture/ELIOT_ARCHITECTURE.md",
+                    "reason": "bounded compatibility-map reader",
+                },
+                {
+                    "path": "crates/x/src/reader.rs",
+                    "token": "docs/architecture/ELIOT_IMPLEMENTATION.md",
+                    "reason": "bounded compatibility-map reader",
                 },
             ],
         },
@@ -790,8 +804,19 @@ def write_fixture(root: Path) -> None:
         encoding="utf-8",
     )
     (root / "docs/current.md").write_text("# Current\n", encoding="utf-8")
+    (root / "docs/architecture/A02-02-roles.md").write_text(
+        "# Roles\n", encoding="utf-8"
+    )
     (root / "crates/x/src/lib.rs").write_text(
         "//! docs/current.md:A1.1\npub fn ok() {}\n", encoding="utf-8"
+    )
+    # A bounded legitimate reader of the stable compatibility-map paths. It is
+    # the only place in the fixture allowed to name them, and it does so through
+    # an explicit path/token exception.
+    (root / "crates/x/src/reader.rs").write_text(
+        "//! Reads docs/architecture/ELIOT_ARCHITECTURE.md and\n"
+        "//! docs/architecture/ELIOT_IMPLEMENTATION.md as compatibility maps.\n",
+        encoding="utf-8",
     )
     (root / "Cargo.toml").write_text(
         '[workspace]\nmembers = ["bins/tool"]\n', encoding="utf-8"
@@ -804,11 +829,15 @@ def write_fixture(root: Path) -> None:
     (root / "docs/architecture/ELIOT_ARCHITECTURE.md").write_text(
         "# Architecture\n", encoding="utf-8"
     )
+    (root / "docs/architecture/ELIOT_IMPLEMENTATION.md").write_text(
+        "# Implementation\n", encoding="utf-8"
+    )
     (root / "docs/architecture/handle-index.json").write_text(
         json.dumps(
             {
                 "handles": {
                     "A1.1": {"path": "docs/current.md"},
+                    "A2.2": {"path": "docs/architecture/A02-02-roles.md"},
                     "A2.3": {"path": "docs/architecture/ELIOT_ARCHITECTURE.md"},
                 }
             }
@@ -921,7 +950,8 @@ def self_test() -> None:
                 f"ordinary source coordinate triggered DCC-003: {dcc3_findings}"
             )
         source.write_text(
-            "//! docs/architecture/ELIOT_ARCHITECTURE.md:A2.3\n", encoding="utf-8"
+            "//! docs/architecture/A02-03-modular-architecture.md:A2.3\n",
+            encoding="utf-8",
         )
         dcc3_findings = [f for f in audit(root, cfg)[0] if f.finding_id == "DCC-003"]
         if dcc3_findings:
@@ -937,6 +967,86 @@ def self_test() -> None:
             raise AuditError(
                 f"allowed negative fixture token triggered DCC-003: {dcc3_findings}"
             )
+        source.write_text("//! docs/current.md:A1.1\n", encoding="utf-8")
+
+        # Issue #1147: the stable monolith paths are compatibility maps, not the
+        # normative book. A production comment citing one as current authority
+        # must fail DCC-003 with a path/line/token diagnostic, the canonical
+        # shard form must pass, and a legitimate reader stays accepted only
+        # through the explicit bounded exception declared in fixture_config.
+        source.write_text(
+            "//! `A2.2` (`docs/architecture/ELIOT_ARCHITECTURE.md`) requires"
+            " explicit authority.\n",
+            encoding="utf-8",
+        )
+        provenance = [
+            item
+            for item in audit(root, cfg)[0]
+            if item.finding_id == "DCC-003"
+            and item.path == "crates/x/src/lib.rs"
+            and "docs/architecture/ELIOT_ARCHITECTURE.md" in item.message
+        ]
+        if len(provenance) != 1 or provenance[0].line != 1:
+            raise AuditError(
+                "legacy Architecture compatibility-map citation must fail DCC-003"
+                f" with one path/line/token diagnostic, got: {provenance}"
+            )
+        source.write_text(
+            "//! `I1.8` (`docs/architecture/ELIOT_IMPLEMENTATION.md`) assigns"
+            " Kernel verification.\n",
+            encoding="utf-8",
+        )
+        provenance = [
+            item
+            for item in audit(root, cfg)[0]
+            if item.finding_id == "DCC-003"
+            and item.path == "crates/x/src/lib.rs"
+            and "docs/architecture/ELIOT_IMPLEMENTATION.md" in item.message
+        ]
+        if len(provenance) != 1 or provenance[0].line != 1:
+            raise AuditError(
+                "legacy Implementation compatibility-map citation must fail"
+                f" DCC-003 with one path/line/token diagnostic, got: {provenance}"
+            )
+        source.write_text(
+            "//! `A2.2` (`docs/architecture/A02-02-roles.md`) requires explicit"
+            " authority.\n",
+            encoding="utf-8",
+        )
+        provenance = [
+            item
+            for item in audit(root, cfg)[0]
+            if item.finding_id == "DCC-003"
+        ]
+        if provenance:
+            raise AuditError(
+                f"canonical sharded fragment reference triggered DCC-003: {provenance}"
+            )
+
+        reader = root / "crates/x/src/reader.rs"
+        original_reader = text(reader)
+        reader.write_text(
+            "//! Reads docs/architecture/ELIOT_ARCHITECTURE.md as a payload.\n",
+            encoding="utf-8",
+        )
+        provenance = [
+            item
+            for item in audit(root, cfg)[0]
+            if item.finding_id == "DCC-003" and item.path == "crates/x/src/reader.rs"
+        ]
+        if provenance:
+            raise AuditError(
+                f"bounded compatibility-map reader was rejected: {provenance}"
+            )
+        # The exception is per token: an unlisted reader on the same
+        # compatibility-map path family stays rejected.
+        reader.write_text(
+            "//! Reads docs/architecture/ELIOT_ARCHITECTURE.md and\n"
+            "//! docs/normative/ELIOT_ARCHITECTURE.md as a payload.\n",
+            encoding="utf-8",
+        )
+        expect(root, cfg, "DCC-003")
+        reader.write_text(original_reader, encoding="utf-8")
         source.write_text("//! docs/current.md:A1.1\n", encoding="utf-8")
 
         extra = root / "scripts/new_helper.py"
@@ -963,7 +1073,7 @@ def self_test() -> None:
         source.write_text("//! docs/current.md:A9.9\n", encoding="utf-8")
         expect(root, cfg, "DCC-007")
 
-    print("DOC_CODE_CONFORMANCE_SELF_TEST: PASS cases=18")
+    print("DOC_CODE_CONFORMANCE_SELF_TEST: PASS cases=22")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:

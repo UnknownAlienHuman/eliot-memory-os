@@ -1,8 +1,11 @@
-use eliot_agent_api::{AdmittedRouteReceipt, AgentAttempt, ProviderExecutionBinding};
+use eliot_agent_api::{
+    AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, LowercaseSha256, ProviderExecutionBinding,
+};
 use eliot_agent_opencode::{
-    AdmittedAttemptCandidate, AdmittedOpenCodeAttempt, BasicAuth, LoopbackEndpoint, ModelSelection,
-    NoAuthorityRunResult, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest,
-    RunStatus,
+    AdmittedAttemptCandidate, AdmittedAttemptOutcome, AdmittedOpenCodeAttempt, BasicAuth,
+    LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient, OpenCodeRunError,
+    OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus, classify_sealed_candidate,
+    redact_route_diagnostics,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use secrecy::SecretString;
@@ -370,15 +373,43 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
                 .to_owned(),
         ));
     }
-    // The production boundary emits only the sealed candidate artifact:
-    // re-sealing the observed run must reproduce the identical seal, and the
-    // seal must link the admitted attempt and admission digest carried by
-    // this envelope. Anything else is refused, never printed.
-    let resealed = AdmittedAttemptCandidate::seal(&admitted, &outcome.run)
-        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
+    emit_sealed_candidate(
+        &outcome,
+        &admitted,
+        &admitted_attempt_id,
+        &admitted_route_digest,
+        &password,
+    )
+}
+
+/// Emits the sealed candidate artifact for one admitted seal (issue #2902
+/// items 8, 11, and 12).
+///
+/// The reseal guard proves the published candidate re-derives from the same
+/// admitted attempt and run: re-sealing the observed run must reproduce the
+/// identical seal, and the seal must link the admitted attempt and admission
+/// digest carried by the envelope. The typed route disposition the seal
+/// bound into the candidate rides the comparison too — an identical run
+/// re-derives an identical disposition (the result digest covers the run
+/// extra that carries the disposition summary), so a changed wire route fails
+/// at the digest first. The published artifact carries the disposition, and
+/// the bounded diagnostics line classifies it: a legacy candidate without
+/// the disposition field classifies as explicitly unverified rather than a
+/// current receipt.
+fn emit_sealed_candidate(
+    outcome: &AdmittedAttemptOutcome,
+    admitted: &AdmittedOpenCodeAttempt,
+    admitted_attempt_id: &AgentAttemptId,
+    admitted_route_digest: &LowercaseSha256,
+    password: &str,
+) -> Result<(), CliError> {
+    // The production boundary emits only the sealed candidate artifact.
+    let mut resealed = AdmittedAttemptCandidate::seal(admitted, &outcome.run)
+        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), password)))?;
+    resealed.route_disposition = Some(outcome.route.clone());
     if resealed != outcome.candidate
-        || outcome.candidate.attempt_id != admitted_attempt_id
-        || outcome.candidate.admitted_route_digest != admitted_route_digest
+        || outcome.candidate.attempt_id != *admitted_attempt_id
+        || outcome.candidate.admitted_route_digest != *admitted_route_digest
     {
         return Err(CliError::Run(
             "OpenCode admitted seal does not match the admitted attempt; nothing was serialized"
@@ -386,14 +417,21 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
         ));
     }
     let encoded = serde_json::to_string(&outcome.candidate)
-        .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), &password)))?;
+        .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), password)))?;
     let stdout = io::stdout();
     let mut writer = io::BufWriter::new(stdout.lock());
     writeln!(writer, "{encoded}")
-        .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), &password)))?;
+        .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), password)))?;
     writer
         .flush()
-        .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), &password)))?;
+        .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), password)))?;
+    // Bounded, redacted route diagnostics (issue #2902 item 12): only
+    // bounded codes and digest-bound references — never raw provider,
+    // session, or path material.
+    let classified = classify_sealed_candidate(&outcome.candidate);
+    let mut stderr = io::stderr();
+    writeln!(stderr, "{}", redact_route_diagnostics(&classified))
+        .map_err(|error| CliError::Output(sanitize_error(&error.to_string(), password)))?;
     Ok(())
 }
 

@@ -1,0 +1,167 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.context.admission",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "The Active View preserves every distinction that can change the decision, risk, verifier or unknown."
+  },
+  "functional_capability_cell_refs": [
+    "smart.context.admission"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.context.admission",
+  "primary_source_package": {
+    "package": "eliot-context-admission",
+    "root_path": "crates/smart/eliot-context-admission",
+    "manifest_path": "crates/smart/eliot-context-admission/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-context-admission/module.toml",
+    "description": "Apply one immutable ContextRecipe and decide include, handle-only, revalidate, suppress or quarantine for each candidate."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 36164,
+    "test_stu": 42665,
+    "selected_file_count": 6,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-context-admission/src/closure.rs",
+        "bytes": 3124,
+        "sha256": "94ee08265265a5b67eb6b5220097bbdbba3df76629f9ac5bbed1f3b8ddc49874",
+        "stu": 1042,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-context-admission/src/decision.rs",
+        "bytes": 32501,
+        "sha256": "f7d3b6f0b32f9ae4cca7e2fb71afc10eeca9ca174c7b38125bec5fd735b40036",
+        "stu": 10834,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-context-admission/src/learning_gate.rs",
+        "bytes": 10067,
+        "sha256": "b89cb9c73b36e45f6c114c6a965ed12b5918ce62e866f75a2cba06c69ac85a19",
+        "stu": 3356,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-context-admission/src/lib.rs",
+        "bytes": 62800,
+        "sha256": "b22617c7f6fe605a813030e54cc7a3f0bf7a6471c4b4752200cb44b83e5d1995",
+        "stu": 20934,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-context-admission/tests/admission.rs",
+        "bytes": 105796,
+        "sha256": "ccdee8714b55b8ba8a3985588f527f36fe63166ce422d2a00babb2802c64f5e2",
+        "test_attributes": 68,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-context-admission/tests/learning_gate_1869.rs",
+        "bytes": 22199,
+        "sha256": "e18bee769a2da6777613a8ec9eef3c1f5050ec16026684f6e572660d85f75283",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "4393d0a187943778d496a6c9cfb57f0656a4c881b43446036479c103025d8215"
+  },
+  "one_hop_providers": [
+    "eliot-context-contracts",
+    "eliot-contracts",
+    "eliot-evidence",
+    "eliot-reactive-context-plan",
+    "eliot-receipts",
+    "serde"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-wasm-host",
+    "bins/eliotd",
+    "crates/smart/eliot-context",
+    "crates/smart/eliot-context-compiler-wasm"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3B_REACTIVE_CONTEXT_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "ff4085c2f50c482dbe91184f0a3e2d76e5893cd3e70d4c4c51ecaac9ebc9e3ff",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-context-admission/Cargo.toml",
+        "sha256": "90e4ce41866bdc2996fe3c57331152eeeaf26c36c12d6add955e2d14d277842f"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-context-admission/module.toml",
+        "sha256": "415048acdafcb182712b77b0a9eeba5a3663abd5766cf16e38ede5211ce2b2b2"
+      },
+      "selected_source": {
+        "path_count": 6,
+        "sha256": "4393d0a187943778d496a6c9cfb57f0656a4c881b43446036479c103025d8215"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "b411a255da3281e98c899b5b9415af60fa2b6b30800e1e3daa36a5adb9e2a46f",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "b411a255da3281e9"
+  }
+}

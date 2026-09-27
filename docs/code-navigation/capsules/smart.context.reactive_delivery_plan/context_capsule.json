@@ -1,0 +1,242 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.context.reactive_delivery_plan",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Relevant assembled context reaches the next available host boundary once, while Critical Attention and delivery limitations remain visible."
+  },
+  "functional_capability_cell_refs": [
+    "smart.context.reactive_delivery_plan"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.context.reactive_delivery_plan",
+  "primary_source_package": {
+    "package": "eliot-reactive-context-plan",
+    "root_path": "crates/smart/eliot-reactive-context-plan",
+    "manifest_path": "crates/smart/eliot-reactive-context-plan/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-reactive-context-plan/module.toml",
+    "description": "Plan one bounded context injection/delivery from an assembled view, cue result and immutable session delivery snapshot."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 69243,
+    "test_stu": 42131,
+    "selected_file_count": 15,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/bridge_admission.rs",
+        "bytes": 13005,
+        "sha256": "bfdd2622e2c822df3de13934513c32e96056c2ee1e2e8ab199a6d92f16341359",
+        "stu": 4335,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/compiler.rs",
+        "bytes": 4741,
+        "sha256": "2ec48d1fa08725cdefed2af99c12578400d06e0c2f64c16edebe0e1186255f2d",
+        "stu": 1581,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/input.rs",
+        "bytes": 15941,
+        "sha256": "7027d9d302ceb80229cc65f16d8e6b3ead5b3a1ed9a7e8aa1d43b60ab12de68f",
+        "stu": 5314,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/lib.rs",
+        "bytes": 2265,
+        "sha256": "d49ea66293073a16aa86bab9b6ce9f9e8db9210e481a60e3fb2ade5e88492717",
+        "stu": 755,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/plan.rs",
+        "bytes": 113504,
+        "sha256": "a617fc5cb498368277ac6a8d35eb0783d9de47cc02e85340524e75e39f67cbd5",
+        "stu": 37835,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/reactive_owner_producers.rs",
+        "bytes": 7161,
+        "sha256": "14e2e889cce9a969678857d55b867fad1dba6a9bae0f12ad3fef50db112b706f",
+        "stu": 2387,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/reactive_owner_suppliers.rs",
+        "bytes": 11371,
+        "sha256": "8e60f2fcf6e4040af637fb462b584aa03a499aebb31ae9863684b4eade681495",
+        "stu": 3791,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/result.rs",
+        "bytes": 10146,
+        "sha256": "e19e159bbde2c2a488204b717a679879fdbc658736052f1da1505e680fca4ec8",
+        "stu": 3382,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/retrieval_plan.rs",
+        "bytes": 17290,
+        "sha256": "be8f29e4de954ef62816a22b2944f32a3fd99b75927bef78092fdef8f338a5d5",
+        "stu": 5764,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/src/settled_plan_feed.rs",
+        "bytes": 12304,
+        "sha256": "0fd13bdcfd482d9abf4d2b5bc87a77f7a96790c061fe5da29099f6931ad63041",
+        "stu": 4102,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/tests/bridge_admission_producer.rs",
+        "bytes": 5800,
+        "sha256": "0340f38aa3c61328dc61340024001cd94f2f238ce531d110257769c757d9dace",
+        "test_attributes": 2,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/tests/reactive_delivery_plan.rs",
+        "bytes": 16207,
+        "sha256": "a0d58ea06c220686a6f0c91f223e7a704e54e6a598bc825081ec9dba4231e82d",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/tests/settled_plan_feed.rs",
+        "bytes": 15466,
+        "sha256": "f10f51aa30dfad4371aafe12b4f35343db4c186664e05a3f2a8624a4b48fa50b",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "classes": []
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/tests/support/reactive_plan.rs",
+        "bytes": 25265,
+        "sha256": "c0a79ab854159b11e7b3a4ddc46c4b9a99e15fcf74628c70b83dfa86b1228567",
+        "test_attributes": 0,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-reactive-context-plan/tests/work_unit_612.rs",
+        "bytes": 63655,
+        "sha256": "d9e422187c9dac63968f6ba655a25ca7928f9e666b590cb37dbe9ff1a7cb4245",
+        "test_attributes": 52,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "2bdcf8ad67efa7c32f51f9f5f0433093467389db70f8586ba936d5e9002b4f82"
+  },
+  "one_hop_providers": [
+    "eliot-agent-contracts",
+    "eliot-context-contracts",
+    "eliot-contracts",
+    "eliot-cue-contracts",
+    "eliot-protocol",
+    "eliot-receipts",
+    "schemars",
+    "serde",
+    "serde_json"
+  ],
+  "one_hop_consumers": [
+    "bins/eliot-agent-bridge",
+    "bins/eliotd",
+    "crates/governor/eliot-governor",
+    "crates/smart/eliot-context-admission",
+    "crates/smart/eliot-learning-state-view",
+    "crates/storage/eliot-store-api"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3B_REACTIVE_CONTEXT_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "e686330617798b2ebea8c3d94d1a79667b50fbf2172a3f7daca1aee2edf7f028",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-reactive-context-plan/Cargo.toml",
+        "sha256": "da8c6d149b99c5713466603da7a4e85424c69fb7e6b1a09eb525177ad210bb83"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-reactive-context-plan/module.toml",
+        "sha256": "55b43daaa62c12e600b41f258649f9d17c63b73f2710e58dc5542fa07de83b55"
+      },
+      "selected_source": {
+        "path_count": 15,
+        "sha256": "2bdcf8ad67efa7c32f51f9f5f0433093467389db70f8586ba936d5e9002b4f82"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "3627a98b381aca5766200ab93fd55f4127a328dfc49056279dc6f3cd8ed9f5ef",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "3627a98b381aca57"
+  }
+}

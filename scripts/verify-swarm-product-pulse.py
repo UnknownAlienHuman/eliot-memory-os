@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Callable
 
@@ -38,6 +39,16 @@ def _expect_failure(case: str, operation: Callable[[], object]) -> None:
 
 def _execute(root: Path, contract: dict, scenario: dict) -> dict:
     return run_swarm_pulse(root, contract, scenario)
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
 
 
 def self_test(root: Path) -> None:
@@ -177,15 +188,17 @@ def verify_current(root: Path) -> dict:
 
 
 def _emit_receipt_create_new(root: Path, candidate: Path, payload: bytes) -> None:
-    evidence_root = (root / ".eliot").resolve()
+    evidence_root_path = root / ".eliot"
     absolute_candidate = candidate if candidate.is_absolute() else (root / candidate)
-    if os.path.islink(absolute_candidate):
-        raise SwarmPulseError("refusing swarm pulse receipt over symlink final path")
-    for ancestor in [absolute_candidate, *absolute_candidate.parents]:
-        if os.path.islink(ancestor):
-            raise SwarmPulseError("refusing swarm pulse receipt through symlink path")
-        if ancestor == ancestor.parent:
-            break
+    for ancestor in [
+        evidence_root_path,
+        *evidence_root_path.parents,
+        absolute_candidate,
+        *absolute_candidate.parents,
+    ]:
+        if _is_reparse_point(ancestor):
+            raise SwarmPulseError("refusing swarm pulse receipt through symlink or reparse-point path")
+    evidence_root = evidence_root_path.resolve()
     resolved_candidate = absolute_candidate.resolve()
     try:
         resolved_candidate.relative_to(evidence_root)
@@ -199,8 +212,8 @@ def _emit_receipt_create_new(root: Path, candidate: Path, payload: bytes) -> Non
     parent.mkdir(parents=True, exist_ok=True)
     current: Path = parent
     while True:
-        if os.path.islink(current):
-            raise SwarmPulseError("refusing swarm pulse receipt through symlink parent")
+        if _is_reparse_point(current):
+            raise SwarmPulseError("refusing swarm pulse receipt through symlink or reparse-point parent")
         try:
             current.relative_to(evidence_root)
         except ValueError:

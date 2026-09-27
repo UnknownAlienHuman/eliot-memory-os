@@ -1,0 +1,165 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.cue.normalizer",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Capture and firing cannot miss each other because of asymmetric or destructive normalization."
+  },
+  "functional_capability_cell_refs": [
+    "smart.cue.normalizer"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.cue.normalizer",
+  "primary_source_package": {
+    "package": "eliot-cue-normalizer",
+    "root_path": "crates/smart/eliot-cue-normalizer",
+    "manifest_path": "crates/smart/eliot-cue-normalizer/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-cue-normalizer/module.toml",
+    "description": "Normalize observed cue material into canonical identity plus policy-correct comparison keys used identically by writers and readers."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 13536,
+    "test_stu": 22105,
+    "selected_file_count": 6,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-cue-normalizer/src/bounds.rs",
+        "bytes": 7249,
+        "sha256": "e8278429b02ffb1ed44fd51354b9b184c80b90bc321d6740319e5bb92ca58982",
+        "stu": 2417,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-normalizer/src/error.rs",
+        "bytes": 1958,
+        "sha256": "db9d5271cd5948d8cb72d21e5f0577e8e39259fbfbfce0a8fa38418a30f1130f",
+        "stu": 653,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-normalizer/src/lib.rs",
+        "bytes": 2432,
+        "sha256": "dbfe5b5534a89487f501e8816e8aca0dab9bbc4a94ec92074af0e445709bc1a7",
+        "stu": 811,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-normalizer/src/normalize.rs",
+        "bytes": 18327,
+        "sha256": "89b4726dc5d6b3925b13fac22562e1bf9eac5c68ab358d60b4e38f4c14062860",
+        "stu": 6109,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-cue-normalizer/src/policy.rs",
+        "bytes": 10641,
+        "sha256": "89ebaae114492bc8d019db0a7116428b416be1aa0d6b57271cd788a57193d22b",
+        "stu": 3547,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-cue-normalizer/tests/normalization.rs",
+        "bytes": 66313,
+        "sha256": "1f1c6bbe6b8815aa64563cd13fce32bda702c1d31b18fbac8dae3841feebb285",
+        "test_attributes": 48,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "0c4155068b5f68c0ad73abfbf33a538de1eef16c4436dbb72aaf09d3ea51b46a"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-cue-contracts",
+    "eliot-evidence",
+    "schemars",
+    "serde",
+    "serde_json",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "crates/smart/eliot-cue-binding",
+    "crates/smart/eliot-cues"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3B_REACTIVE_CONTEXT_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "dc8908928d0c43e95fb29a6df3b550a6ce3eba2c24cb98dcf4254769bf016539",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-cue-normalizer/Cargo.toml",
+        "sha256": "e96c8a3d8dafaa04d379fbfb704f275c13daf68a5e58e4378ac7fa604cab6d30"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-cue-normalizer/module.toml",
+        "sha256": "38ec84f77c1c54f27b716c58d7abf313c56d906002f381ae69951a3e7783d595"
+      },
+      "selected_source": {
+        "path_count": 6,
+        "sha256": "0c4155068b5f68c0ad73abfbf33a538de1eef16c4436dbb72aaf09d3ea51b46a"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "93366730ced2a87669f2ff00d9e91d5c6287df7cae0c72a227d747d4bd2eca97",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "93366730ced2a876"
+  }
+}

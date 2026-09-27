@@ -592,7 +592,9 @@ async fn serve_admitted_bridge_host_requests(
         };
         let action = match kernel.dispatch_frame(&session, &frame) {
             Ok(action) => action,
-            Err(TransportError::Backpressure) => {
+            Err(
+                error @ (TransportError::Backpressure | TransportError::AttributedBackpressure(_)),
+            ) => {
                 // Capacity saturation is typed backpressure with its
                 // exhausted dimension and permitted recovery action, never
                 // an authentication failure (issue #2731, item 6): the
@@ -608,7 +610,7 @@ async fn serve_admitted_bridge_host_requests(
                 // duplicate/reconcile legs rather than a blind retry. Any
                 // send failure still revokes and fences exactly as for the
                 // other kinds.
-                let signal = TransportError::Backpressure
+                let signal = error
                     .backpressure_signal()
                     .unwrap_or(eliot_ipc::BACKPRESSURE_BRIDGE_DISPATCH);
                 let reply = eliot_protocol::Frame {

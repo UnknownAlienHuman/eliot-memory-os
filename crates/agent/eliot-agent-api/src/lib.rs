@@ -19,6 +19,7 @@ use thiserror::Error;
 
 pub mod execution_binding;
 pub mod host_event;
+pub mod provider_translation;
 pub mod route_receipts;
 pub use execution_binding::{
     ExecutionUnit, ExecutionUnitObservation, NativeSession, NativeSessionLocator,
@@ -40,6 +41,14 @@ pub use host_event::{
     ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
     UnsupportedEventReason, WarningObservation, candidate_result_digest_for,
     contains_restricted_source_token, stable_event_id_for,
+};
+pub use provider_translation::{
+    CodecRevision, EventOrderChange, IdentifierPolicy, LossyConversionPolicy, NormalizedMutation,
+    PreservationPolicy, ProviderNeutralRuntimeIr, ProviderPayloadHandle, ProviderRepresentation,
+    ProviderTranslationBridge, ReasoningOrderingPolicy, ReceiptedTranslationTransform,
+    SharedProviderPayload, TranslatedProviderPayload, TranslationByteBounds, TranslationDiagnostic,
+    TranslationError, TranslationLossClass, TranslationOverlay, TranslationPolicyProfile,
+    TranslationProfileKind, TranslationReceipt, TranslationTransform, UnknownFieldPolicy,
 };
 pub use route_receipts::{
     AdmittedRouteReceipt, CandidateSelectionDisposition, ExecutionOutcome,
@@ -154,7 +163,8 @@ id_type!(EventCursor);
 
 /// Contract validation failures.  Errors are safe to expose to an external
 /// provider and never contain raw provider error bodies or credentials.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ContractError {
     #[error("{0} must not be empty")]
     EmptyField(&'static str),

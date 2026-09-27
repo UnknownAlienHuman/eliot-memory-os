@@ -138,7 +138,7 @@ use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde_json::{Map, Value};
 
 use super::backup_capture::{
-    MEMBER_DOMAIN_BLOB, MEMBER_DOMAIN_CANONICAL, MEMBER_DOMAIN_RECEIPT,
+    KernelBackupCapture, MEMBER_DOMAIN_BLOB, MEMBER_DOMAIN_CANONICAL, MEMBER_DOMAIN_RECEIPT,
     archived_state_fence_digest, class_name, member_domain_count,
 };
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
@@ -1184,9 +1184,78 @@ fn backup_verify_identity(
     report: &CaptureReport,
     idempotency_key: &str,
 ) -> Result<BackupVerifyRequestIdentity, String> {
+    let mut identity = backup_verify_admitted_identity(session, caller, idempotency_key)?;
+    // `clone_from` rather than `= ....clone()`: the probe above already owns these
+    // eight buffers, and clippy's `assigning_clones` is right that re-allocating them
+    // to hand them straight back is the wasteful spelling.
+    identity.archive_sha256.clone_from(&report.archive_sha256);
+    identity
+        .archive_owner_contract
+        .clone_from(&report.owner_contract);
+    identity
+        .archive_source_installation
+        .clone_from(&report.source_installation);
+    identity
+        .archive_export_fence_digest
+        .clone_from(&report.export_fence_digest);
+    // #2863: the archived complete fence is half of what the relation is a
+    // relation BETWEEN, so it is bound into the operation identity and a
+    // different fence value under one identity is an I5.27 conflict. The
+    // observed (current) fence is deliberately AMBIENT and is recorded
+    // beside it, never hashed into the key: a retry after a lost response, a
+    // module re-registration or an Authority Epoch rotation all change the
+    // live fence while remaining the same operation.
+    identity
+        .archived_fence_digest
+        .clone_from(&report.archived_state_fence_digest);
+    identity.observed_fence_digest =
+        archived_state_fence_digest(&session.module_generation.state_fence)
+            .map_err(|error| error.to_string())?;
+    // The probe's copy of this term is still the empty string it was born as, so the
+    // owner's closed class spelling replaces it outright. `String::from` and not
+    // `= ....to_owned()`, which is the spelling clippy's `assigning_clones` rejects;
+    // the seven `clone_from` calls above are for terms the probe actually allocated.
+    identity.evidenced_class = String::from(class_name(report.class));
+    identity
+        .capture_receipt
+        .clone_from(&report.receipt_identity);
+    identity
+        .with_computed_digest()
+        .map_err(|error| error.to_string())
+}
+
+/// The part of one `backup.verify` operation identity that the ADMITTED SESSION and
+/// the caller's own idempotency text already decide, before any archive byte is read.
+///
+/// #2802: this is what makes the durable key addressable on the path where the archive
+/// recompute FAILED. I5.27 requires that reusing an idempotency key with different
+/// bytes returns `IDENTITY_CONFLICT` and performs no transition, and the verify route
+/// used to be able to say that only after a successful recompute, because the identity
+/// — and with it the key — was built from the [`CaptureReport`] the recompute produces.
+/// A recompute that returns `Err` therefore dropped the already-bound row on the floor
+/// and answered a structural archive refusal instead, so changed bytes under a bound
+/// identity were never a conflict. The key preimage is deliberately free of every
+/// archive answer and of all three ambient observation terms
+/// (`eliot_ors::BackupVerifyRequestIdentity::namespace_digest`), so the terms collected
+/// here address EXACTLY the row the completed identity will address.
+///
+/// The EIGHT archive-answer terms are left empty here on purpose and that is
+/// load-bearing, not lazy: the archive digest, the declared owner contract, the declared
+/// source installation, the export-fence digest, the archived complete fence digest, the
+/// observed fence digest, the evidenced class and the capture receipt are not read by
+/// the key, and this value is never validated, projected or digested as a request — only
+/// `namespace_digest()` is ever called on it. If a future key ever grew one of them,
+/// this probe would address a key no row is stored under, find nothing, and leave the
+/// caller's own structural refusal standing: the safe direction, and the direction a
+/// raw-bytes digest would fail in.
+fn backup_verify_admitted_identity(
+    session: &Session,
+    caller: &CaptureCallerAuth,
+    idempotency_key: &str,
+) -> Result<BackupVerifyRequestIdentity, String> {
     let (principal, session_id) =
         authenticated_backup_principal(session).map_err(|_| "unauthenticated peer".to_owned())?;
-    let identity = BackupVerifyRequestIdentity {
+    Ok(BackupVerifyRequestIdentity {
         profile_id: BACKUP_VERIFY_PROFILE_ID.to_owned(),
         profile_version: BACKUP_VERIFY_PROFILE_VERSION,
         domain_separator: BACKUP_VERIFY_REQUEST_DOMAIN.to_owned(),
@@ -1206,28 +1275,17 @@ fn backup_verify_identity(
             .authority_epoch
             .clone(),
         operation_id: idempotency_key.to_owned(),
-        archive_sha256: report.archive_sha256.clone(),
-        archive_owner_contract: report.owner_contract.clone(),
-        archive_source_installation: report.source_installation.clone(),
-        archive_export_fence_digest: report.export_fence_digest.clone(),
-        // #2863: the archived complete fence is half of what the relation is a
-        // relation BETWEEN, so it is bound into the operation identity and a
-        // different fence value under one identity is an I5.27 conflict. The
-        // observed (current) fence is deliberately AMBIENT and is recorded
-        // beside it, never hashed into the key: a retry after a lost response, a
-        // module re-registration or an Authority Epoch rotation all change the
-        // live fence while remaining the same operation.
-        archived_fence_digest: report.archived_state_fence_digest.clone(),
-        observed_fence_digest: archived_state_fence_digest(&session.module_generation.state_fence)
-            .map_err(|error| error.to_string())?,
-        evidenced_class: class_name(report.class).to_owned(),
-        capture_receipt: report.receipt_identity.clone(),
+        archive_sha256: String::new(),
+        archive_owner_contract: String::new(),
+        archive_source_installation: String::new(),
+        archive_export_fence_digest: String::new(),
+        archived_fence_digest: String::new(),
+        observed_fence_digest: String::new(),
+        evidenced_class: String::new(),
+        capture_receipt: None,
         retention_and_collision_window: BACKUP_VERIFY_RETENTION_WINDOW.to_owned(),
         identity_digest: String::new(),
-    };
-    identity
-        .with_computed_digest()
-        .map_err(|error| error.to_string())
+    })
 }
 
 /// Computes the canonical request digest of one `backup.verify` operation.
@@ -1292,10 +1350,46 @@ fn reply_body_digest(body: &Value) -> Result<String, String> {
 ///
 /// So the single parameter is always the caller's own presented digest, and this
 /// function is unreachable from any path where the presented digest is a guess.
+///
+/// A third path reaches the same wire `identity_conflict` code without reaching this
+/// function: [`changed_bytes_identity_conflict_reply`], which is what a recompute that
+/// FAILED under an already-bound key answers with. It projects the same refusal from a
+/// reason that names an ARCHIVE digest instead, because the canonical request hash is
+/// not computable without the report the failed recompute did not produce.
 fn identity_conflict_reply(idempotency_key: &str, presented_request_digest: &str) -> Value {
     let reason = format!(
         "IDENTITY_CONFLICT: idempotency key is already bound to a different canonical request than {presented_request_digest}; no transition"
     );
+    identity_conflict_body(idempotency_key, &reason)
+}
+
+/// Projects the I5.27 identity conflict for CHANGED ARCHIVE BYTES under a key that is
+/// already bound, on the path where the archive recompute itself returned `Err`.
+///
+/// This is the same closed refusal as [`identity_conflict_reply`] — the same
+/// `identity_conflict` code, no transition, no stored answer — and it differs in one
+/// thing only: what it can honestly NAME. On this path the canonical request hash is
+/// not computable, because the [`CaptureReport`] that carries the remaining identity
+/// terms is exactly what the failed recompute did not produce. The value quoted here
+/// is the caller's own presented ARCHIVE digest, and the reason says so, instead of
+/// passing an archive digest into a sentence that calls its argument the canonical
+/// request. The stored row's digest is still never named: rendering it is only safe
+/// when the caller already owns the row, and the same reasoning as
+/// [`identity_conflict_reply`] applies unchanged.
+fn changed_bytes_identity_conflict_reply(
+    idempotency_key: &str,
+    presented_archive_sha256: &str,
+) -> Value {
+    let reason = format!(
+        "IDENTITY_CONFLICT: idempotency key is already bound to a different canonical request; the presented archive digest {presented_archive_sha256} is not the bound archive; no transition"
+    );
+    identity_conflict_body(idempotency_key, &reason)
+}
+
+/// The one wire body both I5.27 identity-conflict projections share: the closed code,
+/// the field, and the caller's own bounded reason. `status` stays `invalid` because a
+/// refusal is not a transition.
+fn identity_conflict_body(idempotency_key: &str, reason: &str) -> Value {
     backup_reply(
         BACKUP_VERIFY_OPERATION,
         "invalid",
@@ -1303,7 +1397,7 @@ fn identity_conflict_reply(idempotency_key: &str, presented_request_digest: &str
         vec![
             ("code", Value::String("identity_conflict".to_owned())),
             ("field", Value::String("backup.verify".to_owned())),
-            ("reason", Value::String(bounded_reason(&reason))),
+            ("reason", Value::String(bounded_reason(reason))),
         ],
     )
 }
@@ -1972,7 +2066,24 @@ impl KernelComposition {
             idempotency_key,
         ) {
             Ok(report) => report,
-            Err(error) => return Ok(capture_error_reply(idempotency_key, &error)),
+            // #2802: the bound row is consulted BEFORE the structural refusal is
+            // returned, so bytes that are not the archive this key is bound to answer
+            // the I5.27 identity conflict instead of an archive-invalid reply. The
+            // recompute is what failed, not the identity: `successor_of` is answered
+            // further down and is a read of another operation, so a successor whose
+            // named predecessor cannot be reconciled still answers from the archive
+            // owner's own refusal.
+            Err(error) => {
+                if let Some(conflict) = self.changed_bytes_identity_conflict(
+                    session,
+                    &caller,
+                    &bundle_raw,
+                    idempotency_key,
+                ) {
+                    return Ok(conflict);
+                }
+                return Ok(capture_error_reply(idempotency_key, &error));
+            }
         };
         if let Some(refusal) = undecided_report_reply(&report, idempotency_key) {
             return Ok(refusal);
@@ -2026,6 +2137,54 @@ impl KernelComposition {
             return Ok(verification_not_recorded_reply(idempotency_key));
         };
         Ok(self.answer_backup_verify(prior, &identity, &fresh, idempotency_key))
+    }
+
+    /// Answers the I5.27 identity conflict for presented bytes that are NOT the archive
+    /// this operation identity is already bound to, on the path where the recompute
+    /// failed.
+    ///
+    /// #2802 Work 3 requires that "changed bytes under the same identity conflict", and
+    /// the route used to be able to decide that only after a successful recompute. This
+    /// is the missing half: the durable key is addressable from the admitted session and
+    /// the caller's own idempotency text alone ([`backup_verify_admitted_identity`]), so
+    /// the already-bound row is consulted here too, and the caller's structural refusal
+    /// is answered only when these bytes ARE the bound archive (or are not an archive at
+    /// all, which is the one case where no canonical archive identity exists to
+    /// compare).
+    ///
+    /// Four refusals answer "no conflict here", and each is a real answer rather than a
+    /// fallback:
+    /// - an unauthenticated peer or an uncanonicalisable identity — the caller is not
+    ///   admitted, so there is no key that could be bound;
+    /// - a store read that fails or finds nothing — nothing is stored under this key;
+    /// - presented bytes that are not a decodable archive — no canonical archive
+    ///   identity exists, so no comparison is possible and the caller's own structural
+    ///   refusal stands;
+    /// - the bound archive digest EQUAL to the presented one — this is the same archive,
+    ///   so any refusal here is about something other than the bytes and belongs to the
+    ///   capture owner that produced it.
+    ///
+    /// Only the NAMESPACE key is probed. A pre-#2883 row bound to the caller's raw
+    /// idempotency text is deliberately not consulted: that row is quarantined by
+    /// [`Self::load_prior_verification`] and must not become a conflict verdict, since
+    /// a conflict is a stronger statement than a quarantine.
+    fn changed_bytes_identity_conflict(
+        &self,
+        session: &Session,
+        caller: &CaptureCallerAuth,
+        bundle_raw: &[u8],
+        idempotency_key: &str,
+    ) -> Option<Value> {
+        let probe = backup_verify_admitted_identity(session, caller, idempotency_key).ok()?;
+        let record_key = probe.namespace_digest().ok()?;
+        let stored = self
+            .p07_ors
+            .load_backup_verification_result(record_key.as_str())
+            .ok()
+            .flatten()?;
+        let presented = KernelBackupCapture::presented_archive_digest(bundle_raw)?;
+        (stored.archive_sha256 != presented)
+            .then(|| changed_bytes_identity_conflict_reply(idempotency_key, presented.as_str()))
     }
 
     /// Reads the durable verification result already bound to this scoped

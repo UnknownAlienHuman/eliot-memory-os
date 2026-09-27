@@ -709,6 +709,150 @@ impl fmt::Display for VerificationOutcome {
     }
 }
 
+/// Typed pre-launch admission request for one instrument invocation.
+///
+/// This is the single fact bundle the pre-launch admission boundary
+/// (`eliot-instrument-runner` shared gate) validates before any child
+/// process is created. Invocation facts (instrument, class, profile,
+/// arguments) come from the provider-neutral [`InstrumentInvocation`];
+/// executable facts are the launcher-observed machine identity, when the
+/// composition root can observe one. It carries no shell text, no command
+/// line, and no process permit: the gate admits it into an
+/// [`InstrumentAdmissionGrant`] or refuses it with a typed failure.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentAdmissionRequest {
+    /// Registered instrument identity the caller claims.
+    pub instrument: ContractId,
+    /// Instrument class the caller claims.
+    pub kind: InstrumentKind,
+    /// Immutable profile name selected by the caller.
+    pub profile: String,
+    /// Bounded argument list supplied by the caller.
+    pub arguments: Vec<String>,
+    /// Observed canonical path of the executable, when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    /// Observed lowercase SHA-256 over the executable bytes, when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_digest: Option<String>,
+    /// Observed tool version text, when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_version: Option<String>,
+}
+
+impl InstrumentAdmissionRequest {
+    /// Validates shape only, with no admission effects.
+    pub fn validate(&self) -> Result<(), InstrumentContractError> {
+        validate_text(&self.profile, "profile")?;
+        for argument in &self.arguments {
+            validate_text(argument, "arguments")?;
+        }
+        if let Some(path) = &self.executable_path {
+            validate_text(path, "executable_path")?;
+        }
+        if let Some(digest) = &self.executable_digest {
+            validate_digest(digest, "executable_digest")?;
+        }
+        if let Some(version) = &self.executable_version {
+            validate_text(version, "executable_version")?;
+        }
+        Ok(())
+    }
+}
+
+/// Bound process grant sealed by the pre-launch admission boundary.
+///
+/// Every field is admission-sealed: the validated executable identity, the
+/// exact arguments, the environment and scope classes, the
+/// credential/network policy identities, the resource limits, the parser
+/// identity and generation, and the spec/profile revisions. The
+/// [`InstrumentAdmissionGrant::grant_digest`] binds them all into one
+/// identity that the launch receipt records, so a changed
+/// executable/argument combination can never reuse an earlier grant.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentAdmissionGrant {
+    /// Opaque versioned kind identity that admitted the invocation.
+    pub kind_id: String,
+    /// Admitted kind version.
+    pub kind_version: ContractVersion,
+    /// Admitted instrument class.
+    pub kind: InstrumentKind,
+    /// Admitted profile name.
+    pub profile: String,
+    /// Exact admitted profile revision.
+    pub profile_revision: u64,
+    /// Digest of the admitted spec revision.
+    pub spec_digest: String,
+    /// Exact admitted executable file identity.
+    pub executable: String,
+    /// Admitted tool version requirement, when the spec pins one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_version: Option<String>,
+    /// Machine-observed content digest bound at admission.
+    pub content_digest: String,
+    /// Exact validated arguments bound by the grant.
+    pub arguments: Vec<String>,
+    /// Admitted environment class.
+    pub environment_class: String,
+    /// Admitted scope class; exact roots bind at resolve time.
+    pub scope_class: String,
+    /// Admitted credential policy identity.
+    pub credential_policy: ContractId,
+    /// Admitted network policy identity.
+    pub network_policy: ContractId,
+    /// Admitted wall-clock ceiling in milliseconds, when the spec sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Admitted raw-output capture ceiling in bytes, when the spec sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_bytes: Option<u64>,
+    /// Admitted parser identity.
+    pub parser: ContractId,
+    /// Admitted parser generation; replaceable through module cutover.
+    pub parser_generation: u64,
+    /// Digest binding every field above into one grant identity.
+    pub grant_digest: String,
+}
+
+impl InstrumentAdmissionGrant {
+    /// Deterministic identity over every bound grant field.
+    pub fn digest(&self) -> String {
+        self.canonical_digest()
+    }
+
+    /// Canonical grant material shared by construction and verification.
+    fn canonical_digest(&self) -> String {
+        let material = format!(
+            "{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            self.kind_id,
+            self.kind_version,
+            self.kind,
+            self.profile,
+            self.profile_revision,
+            self.spec_digest,
+            self.executable,
+            self.executable_version.as_deref().unwrap_or(""),
+            self.content_digest,
+            self.arguments.join("\u{0}"),
+            self.environment_class,
+            self.scope_class,
+            self.credential_policy.as_str(),
+            self.network_policy.as_str(),
+            self.timeout_ms
+                .map(|timeout| timeout.to_string())
+                .unwrap_or_default(),
+            self.max_output_bytes
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
+            self.parser.as_str(),
+            self.parser_generation,
+        );
+        sha256_hex(material.as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

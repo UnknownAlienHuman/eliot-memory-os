@@ -1,15 +1,16 @@
 //! Kernel composition construction and bootstrap assembly.
 //!
 //! Architecture traceability:
-//! - `ELIOT_ARCHITECTURE.md` :: A13.2. Kernel и failure domains keeps
+//! - `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`) keeps
 //!   construction inside the Kernel lifecycle and failure boundary.
-//! - `ELIOT_ARCHITECTURE.md` :: A13.5. Bounded resources и Control Reserve
+//! - `A13.5` (`docs/architecture/A13-05-bounded-resources-and-control-reserve.md`)
 //!   keeps assembly tied to the existing bounded runtime/control contour.
-//! - `ELIOT_IMPLEMENTATION.md` :: I1.11. Startup algorithm preserves explicit
+//! - `I1.11` (`docs/architecture/I01-11-startup-algorithm.md`) preserves explicit
 //!   startup ordering and fail-closed admission inputs.
-//! - `ELIOT_IMPLEMENTATION.md` :: I14.16. Kernel and Host update keeps
+//! - `I14.16` (`docs/architecture/I14-16-kernel-and-host-update.md`) keeps
 //!   Host-approved bindings explicit across composition updates.
-//! - `ELIOT_IMPLEMENTATION.md` :: P.3. Kernel control boundary preserves
+//! - The R1 Kernel runtime layer
+//!   (`docs/architecture/I-PREFACE-04-runtime-layer-model.md`) preserves
 //!   the Kernel ownership boundary while lower-layer adapters are assembled.
 //!
 //! Public construction semantics remain on `KernelComposition`; this ordinary

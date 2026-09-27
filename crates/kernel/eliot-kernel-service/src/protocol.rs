@@ -2420,6 +2420,12 @@ impl ProcessExecutionRequest {
 
 /// Provider-neutral response projection; no child handle or permit crosses
 /// the Kernel front door.
+// Boxing Reconciled(ProcessEvidence) is source-breaking for versioned
+// constructors/matches and adds heap allocation; the wire shape is fixed.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "public Kernel front-door protocol enum: boxing is source-breaking and adds heap allocation; wire shape is fixed by serde tag"
+)]
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "result", content = "payload")]
 pub enum ProcessExecutionResponse {

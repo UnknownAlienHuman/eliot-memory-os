@@ -32,11 +32,11 @@ pub use process_owner::{
     KernelInstrumentRequestPort, UnprovisionedKernelAdmission,
 };
 pub use profile::{
-    AdmittedProfile, AdmittedStage, BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION,
-    COMPILER_PROFILE, CompiledProfile, InstrumentProfile, InstrumentProfileResolver,
-    InstrumentRegistry, InstrumentSpec, ProfileCompiler, ProfileError, ProfileScopeClasses,
-    ResolvedProfile, ResolvedStage, StageDag, StageDecl, StageEnvironment, TEST_PROFILE,
-    TargetLayout, WorkScope,
+    AdmissionError, AdmittedProfile, AdmittedStage, BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION,
+    COMPILER_PROFILE, CompiledProfile, InstrumentClass, InstrumentKindId, InstrumentProfile,
+    InstrumentProfileResolver, InstrumentRegistry, InstrumentSpec, InstrumentSpecParams,
+    ProfileCompiler, ProfileError, ProfileScopeClasses, ResolvedProfile, ResolvedStage,
+    ResourceLimits, StageDag, StageDecl, StageEnvironment, TEST_PROFILE, TargetLayout, WorkScope,
 };
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
@@ -53,7 +53,7 @@ pub use provider_denominator::{
 };
 pub use registry::{
     ExecutableIdentityCause, ProviderRegistry, RegistryEntry, RegistryError,
-    ResolvedExecutableIdentity,
+    ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,

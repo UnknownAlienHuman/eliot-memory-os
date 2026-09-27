@@ -1,0 +1,161 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.experience.provider",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-experience-provider",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "DECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": "PACKAGE_PROOF_ONLY"
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [],
+    "inline_cfg_test_modules": 0
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "bridge fetch over the existing named-read catalogue (no new operations)",
+        "V1 shaping with honest Partial/Complete coverage",
+        "head-fence equality and revision minimums mirroring the read facade",
+        "canonical key-ordered heads carried for durability re-proof",
+        "bank/feedback view legs over owner-issued cursors with retention postures",
+        "live presence binding",
+        "Smart view assembly plus owner-envelope revalidation",
+        "self-quality assess-plus-recheck invocation over true owner envelopes",
+        "memory-quality assessment invocation over the edge request",
+        "scoped understanding invocation with provider-bound outcome evidence",
+        "common-ground invocation with provider-bound outcome evidence"
+      ]
+    },
+    "selected_tests": [],
+    "test_attribute_count": 0
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "bins/eliotd"
+    ],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "eliot-cognitive-quality self-quality assessment (candidate only)",
+        "eliot-memory-quality ecology assessment (advisory only)",
+        "eliot-understanding-assessment scoped assessment (finding-free candidate)"
+      ]
+    },
+    "edge_profile_tests": []
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Reject non-audit responses, fence drift, head-fence inequality, stale revisions, malformed payloads, malformed members, scope/fence drift, and presence drift explicitly. Bridge outage surfaces as BridgeUnavailable with no hold claimed; per-record retention resolves through the owner resolver with caller-carried holds only, and withheld members carry gap postures. Malformed bridge bytes fail closed as integrity errors, never as partial projections."
+    },
+    "selected_cases": []
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 0,
+    "test_stu": 0,
+    "nonzero": false
+  },
+  "bound_contract_digest": "a5e3172c808b4ee29b3613726348e9259843048c83bb4bf305886150b932c7d8",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-experience-provider/Cargo.toml",
+        "sha256": "65169410a605c76633ecfc4b676e9801b7f74d9bb17e56adef9fa4a9574eca9f"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-experience-provider/module.toml",
+        "sha256": "688bf8adbd31c80e0decd438e5e5c3de21f8852720d795f6a2904d70b80068af"
+      },
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "f7cadd5f6cb5361bb4d2a6e42b2ae696e55134c5c2b1518cc3fe67df493ea517"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "707ff1d26ae45dabbada555c01c785e87887cee92bc2dca1540e411edfe2aef7",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "707ff1d26ae45dab"
+  }
+}

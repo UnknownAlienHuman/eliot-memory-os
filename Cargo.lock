@@ -684,6 +684,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-contracts",
  "eliot-contracts",
+ "eliot-observation-contracts",
  "eliot-receipts",
  "schemars",
  "serde",
@@ -899,6 +900,7 @@ dependencies = [
  "eliot-blob-api",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
  "eliot-receipts",
  "eliot-security-contracts",
  "serde",
@@ -1200,6 +1202,7 @@ dependencies = [
 name = "eliot-coordination"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-contracts",
  "schemars",
  "serde",
@@ -1376,6 +1379,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
+ "eliot-evaluation-contracts",
  "eliot-evidence",
  "schemars",
  "serde",
@@ -2081,6 +2085,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evidence",
  "eliot-governor",
+ "eliot-learning-contracts",
  "eliot-receipts",
  "serde",
  "thiserror",
@@ -2671,6 +2676,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-observability-runtime"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-platform-windows",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "eliot-observation"
 version = "0.1.0"
 dependencies = [
@@ -2983,6 +3001,7 @@ dependencies = [
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-problem",
  "eliot-process",
  "eliot-protocol",
  "eliot-runtime-contracts",
@@ -4718,6 +4737,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4727,12 +4756,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

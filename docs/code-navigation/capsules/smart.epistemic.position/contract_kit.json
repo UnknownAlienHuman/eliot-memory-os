@@ -1,0 +1,272 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.epistemic.position",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "smart.epistemic.position",
+    "source_package": "eliot-epistemic",
+    "source_manifest": "crates/smart/eliot-epistemic/Cargo.toml",
+    "source_root_path": "crates/smart/eliot-epistemic",
+    "module_manifest": "crates/smart/eliot-epistemic/module.toml",
+    "workspace_member": true,
+    "bins_reachable": true,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Resolve one explicit question into observed, supported, assumed, conflicted, stale or unknown position while preserving provenance and required inquiry."
+    },
+    "causal_property": {
+      "state": "DECLARED",
+      "origin": "module.toml|causal_property",
+      "value": "resolve one explicit question over one admitted fenced evidence set"
+    },
+    "invariants": {
+      "state": "DECLARED",
+      "origin": "module.toml|invariants",
+      "value": [
+        "rivals and superseded lineage remain visible",
+        "missing data is a valid position",
+        "scope/fence mismatch fails locally"
+      ]
+    },
+    "non_goals": {
+      "state": "DECLARED",
+      "origin": "module.toml|non_goals",
+      "value": [
+        "truth declaration",
+        "record mutation",
+        "model voting",
+        "action authority"
+      ]
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "smart-memory-context",
+        "title": "Smart memory, context, and understanding",
+        "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+        "documentation_handles": [
+          "I12.13",
+          "I17.11"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "DECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": "smart.epistemic.position"
+    },
+    "source_maintenance_owner": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": null
+    },
+    "state_class": {
+      "state": "DECLARED",
+      "origin": "module.toml|state_class",
+      "value": "stateless"
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return conflicted, stale or unknown with an explicit discriminative inquiry; only the dependent effect may be narrowed by its caller."
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|inputs",
+      "value": [
+        "PositionRequest",
+        "admitted evidence records",
+        "verifier competence/freshness projection"
+      ]
+    },
+    "outputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|outputs",
+      "value": [
+        "CurrentEpistemicPosition",
+        "ProvenanceView",
+        "InvestigationDirective candidate"
+      ]
+    },
+    "providers": {
+      "state": "DECLARED",
+      "origin": "module.toml|providers",
+      "value": [
+        "canonical evidence projection",
+        "eliot-evidence"
+      ]
+    },
+    "depends_on": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|depends_on",
+      "value": null
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": "R5"
+      },
+      "runtime_bundle": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": "eliotd"
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "DECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "DECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": "merge back when no independent consumer, proof, dependency or replacement seam remains"
+    },
+    "split_trigger": {
+      "state": "DECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": null
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "DECLARED",
+      "origin": "module.toml|discriminator",
+      "value": "fresh outlier, stale verifier and conflicting evidence produce different typed positions and inquiries without source mutation"
+    },
+    "old_failure_or_missing_capability": {
+      "state": "DECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": "the existing resolver omits complete assumption, verifier-competence and Investigation semantics"
+    },
+    "forbidden_patterns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": null
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [],
+    "contract_refs_source": "crates/smart/eliot-epistemic/Cargo.toml",
+    "donor_records": [
+      {
+        "path": "ELIOT_IMPLEMENTATION I12.12",
+        "disposition": "authoritative contract"
+      },
+      {
+        "path": "crates/smart/eliot-epistemic/src/lib.rs",
+        "disposition": "retain and harden"
+      }
+    ]
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-epistemic/Cargo.toml",
+        "sha256": "f1013b528e594af7ca061a5e1e95f451d417c747ea3fe9c9a48b69b845c655b3"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-epistemic/module.toml",
+        "sha256": "5d202b7039feaa3b46b8ae9bbaea7165f4c47ef522cca6ba03d00bcfe1a5a4d2"
+      },
+      "selected_source": {
+        "path_count": 5,
+        "sha256": "805950f5c956b0b4b369a836b56d20ceb0fcb37a25298c27ed1acbd8a54b6533"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "5674aea006e0bdd18badb0dfd8900dad294e65a8493f506e1cdbbf94ee82a372",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "5674aea006e0bdd1"
+  }
+}

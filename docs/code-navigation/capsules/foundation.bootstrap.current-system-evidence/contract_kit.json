@@ -1,0 +1,278 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "foundation.bootstrap.current-system-evidence",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "foundation.bootstrap.current-system-evidence",
+    "source_package": "eliot-bootstrap",
+    "source_manifest": "crates/foundation/eliot-bootstrap/Cargo.toml",
+    "source_root_path": "crates/foundation/eliot-bootstrap",
+    "module_manifest": null,
+    "workspace_member": true,
+    "bins_reachable": true,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Compile immutable D0 evidence, normative-coverage, and work-unit brief artifacts without acquiring runtime, semantic, or canonical authority."
+    },
+    "causal_property": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|causal_property",
+      "value": null
+    },
+    "invariants": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|invariants",
+      "value": null
+    },
+    "non_goals": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|non_goals",
+      "value": null
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [
+      "ELIOT_IMPLEMENTATION:I0.5",
+      "ELIOT_IMPLEMENTATION:I2.20",
+      "ELIOT_IMPLEMENTATION:I2.23",
+      "ELIOT_IMPLEMENTATION:I2.8"
+    ],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "foundation-contracts",
+        "title": "Foundation contracts and evidence",
+        "responsibility": "Shared protocols, contracts, receipts, rules, evidence, observation, security, runtime, and test-support types.",
+        "documentation_handles": [
+          "A2.3",
+          "I2.8"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": null
+    },
+    "source_maintenance_owner": {
+      "state": "DECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": "foundation.bootstrap"
+    },
+    "state_class": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|state_class",
+      "value": null
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": null
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|inputs",
+      "value": null
+    },
+    "outputs": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|outputs",
+      "value": null
+    },
+    "providers": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|providers",
+      "value": null
+    },
+    "depends_on": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|depends_on",
+      "value": null
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "UNDECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": null
+      },
+      "runtime_bundle": {
+        "state": "UNDECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": null
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": null
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": null
+    },
+    "split_trigger": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": null
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "DECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": "eliot-bootstrap"
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|discriminator",
+      "value": null
+    },
+    "old_failure_or_missing_capability": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": null
+    },
+    "forbidden_patterns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": null
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I0.5",
+        "resolved_as": "documentation_handle",
+        "handle": "I0.5",
+        "path": "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
+        "anchor": "i05-conformance-support-and-evidence-status",
+        "sha256": "bfb599eb462ebfb904ec97ba199a8447371bce91ab73b7bad9e71f150cb837f9"
+      },
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I2.20",
+        "resolved_as": "documentation_handle",
+        "handle": "I2.20",
+        "path": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+        "anchor": "i220-module-contract-kit-crate-context-capsule-and-module-test-capsule",
+        "sha256": "8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5"
+      },
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I2.23",
+        "resolved_as": "documentation_handle",
+        "handle": "I2.23",
+        "path": "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+        "anchor": "i223-capability-family-topology-and-crate-extraction-decisions",
+        "sha256": "e003d8e17b414ee0715028d7d3997d1b109c18df20ad0294ae2856d3e21e4e49"
+      },
+      {
+        "ref": "ELIOT_IMPLEMENTATION:I2.8",
+        "resolved_as": "documentation_handle",
+        "handle": "I2.8",
+        "path": "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md",
+        "anchor": "i28-package-metadata-source-ownership-and-generated-registry",
+        "sha256": "d3be9013f76013acb64d426ba0860a9f325d9675c4d1ae59cbe80eb119344faf"
+      }
+    ],
+    "contract_refs_source": "crates/foundation/eliot-bootstrap/Cargo.toml",
+    "donor_records": []
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/foundation/eliot-bootstrap/Cargo.toml",
+        "sha256": "6b2404bc38ecb260cb534660e80cc0b2d27d6eca5b48f619711efaabe13a4847"
+      },
+      "module_manifest": null,
+      "selected_source": {
+        "path_count": 3,
+        "sha256": "00861fbbb6f94bea1c4c4a681384f50f5a0fdea54c348fb6fe2854212fb0a72e"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "47eb212c8826781c25944520ae47dffa1faae3684ef8872a18965a1c8dee3f7d",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "47eb212c8826781c"
+  }
+}

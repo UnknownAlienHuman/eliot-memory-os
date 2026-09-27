@@ -1,0 +1,119 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.maintenance_plan",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Bounded self-maintenance evidence yields one reviewable plan candidate with owner, budget, expected delta, rollback and Human boundary while executing nothing."
+  },
+  "functional_capability_cell_refs": [
+    "smart.dreamer.maintenance_plan"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.dreamer.maintenance_plan",
+  "primary_source_package": {
+    "package": "eliot-dreamer-maintenance-plan",
+    "root_path": "crates/smart/eliot-dreamer-maintenance-plan",
+    "manifest_path": "crates/smart/eliot-dreamer-maintenance-plan/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-dreamer-maintenance-plan/module.toml",
+    "description": "Translate bounded self-scope quality/problem evidence into one maintenance plan candidate with expected delta, cost, rollback and Human boundary."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 66157,
+    "test_stu": 0,
+    "selected_file_count": 1,
+    "inline_cfg_test_modules": 1,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs",
+        "bytes": 198470,
+        "sha256": "8db80076507adbff9ee8f7e5fb26ecfa40885c9fca1792a93781db398da4d3ed",
+        "stu": 66157,
+        "inline_cfg_test": true
+      }
+    ],
+    "selected_tests": [],
+    "source_selection_digest": "cfc9ecb97159960305b43cc488483b9a897a04db91e9874dadf003f6a405448f"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-dreamer-contracts",
+    "eliot-evidence"
+  ],
+  "one_hop_consumers": [],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_ADVISORY_DIAGNOSIS_PLANNING_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "6cdddae53707b3afd893582930f27d9928a3f5901c6a60054acfa4253c111855",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-maintenance-plan/Cargo.toml",
+        "sha256": "1b8ab6de9cf1cd32cb0c65060a7a77639e405bdbc15f58fa8bd367745240f267"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-maintenance-plan/module.toml",
+        "sha256": "ab9bb1e7ab90aa32dd4c3c94f84aca14b4fa078dde3ff708db4ee665475e7160"
+      },
+      "selected_source": {
+        "path_count": 1,
+        "sha256": "cfc9ecb97159960305b43cc488483b9a897a04db91e9874dadf003f6a405448f"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "25f519d743e0b12075cd3d0d699c68630edc3acd1424ad2cd424aa6622a16183",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "25f519d743e0b120"
+  }
+}

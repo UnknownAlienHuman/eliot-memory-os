@@ -1,0 +1,170 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.memory.curation_screen",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Cheap obvious findings are screened without model cost while protected evidence cannot be discarded by utility heuristics."
+  },
+  "functional_capability_cell_refs": [
+    "smart.memory.curation_screen"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.memory.curation_screen",
+  "primary_source_package": {
+    "package": "eliot-memory-curation-screen",
+    "root_path": "crates/smart/eliot-memory-curation-screen",
+    "manifest_path": "crates/smart/eliot-memory-curation-screen/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-memory-curation-screen/module.toml",
+    "description": "Identify bounded deterministic curation findings and protected records before optional model curation."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 13340,
+    "test_stu": 29992,
+    "selected_file_count": 7,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-memory-curation-screen/src/bounds.rs",
+        "bytes": 10282,
+        "sha256": "7676124122566150f050c8469402841cd5a05c6599543c45ea68fea47320316d",
+        "stu": 3428,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-memory-curation-screen/src/dimensions.rs",
+        "bytes": 4242,
+        "sha256": "7a13591100f792ee448ff1c7b764404181a008b815cf979c4e1f216e01194e44",
+        "stu": 1414,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-memory-curation-screen/src/lib.rs",
+        "bytes": 1166,
+        "sha256": "e78afed4e8bfa6cad06a202adf097ff05de9d45356a0e39175edc21bab9be726",
+        "stu": 389,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-memory-curation-screen/src/protection.rs",
+        "bytes": 3947,
+        "sha256": "b8cb4b397dd16551da29c62c0f759c4c04a1757e76dc6f940028eb45cf5fdf28",
+        "stu": 1316,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-memory-curation-screen/src/rules.rs",
+        "bytes": 3360,
+        "sha256": "7450f15ea53a3e9c0e50a6257ff19b81bf18ba5846701c7318b59b8abe2e78c1",
+        "stu": 1120,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-memory-curation-screen/src/screen.rs",
+        "bytes": 17023,
+        "sha256": "7c9b2693dd1d21ef8706c79bed5e68302302f6973407437c0edb1cbf71a408de",
+        "stu": 5675,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-memory-curation-screen/tests/screen.rs",
+        "bytes": 89976,
+        "sha256": "5506b778c380a575c4b216d56aab5245182746dad49e207a31474cdf1bddfe35",
+        "test_attributes": 52,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "44d085da048770735aa330198fef16543baab1be59fa9dcd8508c478bc3898ec"
+  },
+  "one_hop_providers": [
+    "eliot-contracts",
+    "eliot-evidence",
+    "eliot-memory-curation-contracts",
+    "serde",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "crates/smart/eliot-memory-curation",
+    "crates/smart/eliot-memory-curation-screen-wasm"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "D3A_CURATION_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "db5fbba2493c992d78c994f4e983a7b2d81cc92d21c5c8c673558ca1d4c55d7d",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-memory-curation-screen/Cargo.toml",
+        "sha256": "82dd45d7ec2f5228db35a7e0c8f72016e96c56eb88eb81597a6dd70d8abf786d"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-memory-curation-screen/module.toml",
+        "sha256": "17f38febd895d070a4c91cfc9f9a97b02da3ad2b460847e36703f00acdd59107"
+      },
+      "selected_source": {
+        "path_count": 7,
+        "sha256": "44d085da048770735aa330198fef16543baab1be59fa9dcd8508c478bc3898ec"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "6940353ba1088ee8e792ef645814e143bbff8c7cd33dba7cda4e988adcf15ec6",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "6940353ba1088ee8"
+  }
+}

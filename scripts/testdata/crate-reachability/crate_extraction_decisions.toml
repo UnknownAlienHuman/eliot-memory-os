@@ -1,0 +1,40 @@
+# CrateExtractionDecision registry (issue #1720).
+#
+# This is the EXPLICIT, POLICY record the reachability inventory checks. Dispositions
+# are never inferred from source statistics, name similarity or LOC. A package absent
+# from this file is reported by
+# `scripts/crate_reachability_inventory.py` as an `UNCLASSIFIED` admission defect,
+# which is the correct, honest outcome for a package nobody has dispositioned.
+#
+# Allowed `disposition` values (exactly four):
+#   Connect          - wire to its first intended binary/runtime bundle through the
+#                      owning composition crate, preserving C0->C4 dependency direction.
+#   ContractOnly     - library-only by intent; a real public consumer is established
+#                      through a service or contract boundary.
+#   MigrationFacade  - retained only as a time-bounded facade. REQUIRES `owner`,
+#                      `expires`, `successor` and `removal_condition`; the tool rejects
+#                      a facade whose expiry is missing, unparsable or already past.
+#   OptionalContour  - optional/laboratory dependency island moved to a federated
+#                      workspace contour, excluded from the root daily path while
+#                      retaining an explicit invocation/proof entrypoint.
+#
+# Adding a package here is a reviewed policy act, not a mechanical fix. Do not add an
+# entry to silence the report: an unclassified package is a true finding until a human
+# records a real disposition with a real owner.
+#
+# `source_ref` points at the record that justifies the disposition. A disposition
+# without a traceable source reference is a defect in itself.
+
+schema = "eliot.crate-extraction-decision.v1"
+revision = "2026-09-27.1"
+
+# Intentionally empty. Every production-admitted, binary-unreachable workspace package
+# is currently UNCLASSIFIED and is reported as an admission defect by the inventory.
+#
+# This is the honest starting state for #1720: no explicit, reviewed per-package
+# disposition record exists in the repository yet. The registry mechanism, the four
+# decision types, the facade obligations and the fail-closed admission-defect path are
+# implemented and enforced; populating the rows requires a human to supply a genuine
+# owner, expiry, successor and removal condition per package, and guessing those here
+# would fabricate exactly the authority this issue forbids inventing.
+decision = []

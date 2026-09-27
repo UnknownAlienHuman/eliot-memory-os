@@ -143,6 +143,7 @@ pub fn restore_reactive_runtime(
                 BridgeError::ProviderContract("restore deadline exceeded".to_owned())
             }
             PortFailure::Cancelled => BridgeError::ProviderContract("restore cancelled".to_owned()),
+            PortFailure::AgentResponse { failure } => BridgeError::AgentHostRequestFailure(failure),
         })?;
     reply
         .validate()

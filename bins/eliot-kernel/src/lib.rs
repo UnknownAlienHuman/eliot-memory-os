@@ -111,8 +111,9 @@ use process_execution::{
 };
 pub use process_execution_client::process_execution_client;
 pub(crate) use shutdown_drain::{
-    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition, ShutdownPhase,
-    ShutdownTerminal, coordinator_for, reverse_quiescence_order,
+    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
+    ReceiptOwnerEvidence, ReceiptOwnerFamily, ReceiptReconciliation, ReceiptRescanObservation,
+    ShutdownPhase, ShutdownTerminal, coordinator_for, reverse_quiescence_order,
 };
 /// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
 mod idle_lease_census;
@@ -3974,8 +3975,11 @@ impl KernelComposition {
     /// runtime shutdown still proceeds. Host carries the linearized decision
     /// into `DrainCommitRecord`; Watchdog observes it through the journal.
     pub async fn shutdown(&self) -> Result<ShutdownOutcome, ProcessExecutionError> {
-        let coordinator = coordinator_for(&self.work_root);
-        coordinator.request_shutdown();
+        let coordinator =
+            coordinator_for(&self.work_root).map_err(ProcessExecutionError::Unavailable)?;
+        coordinator
+            .request_shutdown()
+            .map_err(ProcessExecutionError::Unavailable)?;
         let drain = self.run_shutdown_drain(&coordinator).await;
         let process_result = self
             .process_gateway
@@ -3993,7 +3997,9 @@ impl KernelComposition {
             pending.push("runtime-orphans-retained".to_owned());
         }
         if drain.is_ok() && pending.is_empty() {
-            coordinator.complete_terminal(ShutdownTerminal::Intentional);
+            coordinator
+                .complete_terminal(ShutdownTerminal::Intentional)
+                .map_err(ProcessExecutionError::Unavailable)?;
         } else {
             if pending.is_empty() {
                 pending.push(
@@ -4004,7 +4010,9 @@ impl KernelComposition {
                         .to_owned(),
                 );
             }
-            coordinator.complete_terminal(ShutdownTerminal::Incomplete { pending });
+            coordinator
+                .complete_terminal(ShutdownTerminal::Incomplete { pending })
+                .map_err(ProcessExecutionError::Unavailable)?;
         }
         coordinator.observe_published_state();
         process_result?;
@@ -4023,9 +4031,6 @@ impl KernelComposition {
         coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
     ) -> Result<DrainCommitDecision, DrainHalt> {
         let generation = coordinator.drain_generation();
-        let resumed_note = coordinator
-            .recovery_interrupted()
-            .then_some(":resumed-interrupted");
         let record = |phase: ShutdownPhase, evidence: String| {
             coordinator
                 .record_phase(phase, evidence)
@@ -4037,15 +4042,12 @@ impl KernelComposition {
         match self.apply_control(KernelControlCommand::Drain) {
             Ok(state) => record(
                 ShutdownPhase::AdmissionsClosed,
-                format!(
-                    "service-drain-admitted:{state}{}",
-                    resumed_note.unwrap_or("")
-                ),
+                format!("service-drain-admitted:{state}"),
             )?,
             Err(_) => match self.service_state() {
                 Ok(KernelServiceState::Draining | KernelServiceState::Stopped) => record(
                     ShutdownPhase::AdmissionsClosed,
-                    format!("service-already-draining{}", resumed_note.unwrap_or("")),
+                    "service-already-draining".to_owned(),
                 )?,
                 _ => return Err(DrainHalt::new("admissions-close-rejected")),
             },
@@ -4080,23 +4082,32 @@ impl KernelComposition {
 
         // CanonicalDrainReceiptsReconciled: every pending canonical-write
         // receipt (ORS store-rebind rows) must resolve before the
-        // linearization point; the bounded wait retains the remainder.
-        for identity in self
+        // linearization point; the bounded wait retains the remainder. The
+        // next phase proceeds only on a successful complete observation, not
+        // on a raw empty collection.
+        let scanned = self
             .pending_rebind_receipts()
-            .map_err(|_| DrainHalt::new("ors-rebind-scan-failed"))?
-        {
-            coordinator.register_pending_receipt(identity);
+            .map_err(|_| DrainHalt::new("ors-rebind-scan-failed"))?;
+        for identity in scanned.pending.iter().map(ReceiptOwnerEvidence::identity) {
+            coordinator
+                .register_pending_receipt(identity)
+                .map_err(|_| DrainHalt::new("durable-pending-receipt-unavailable"))?;
         }
-        let remainder = coordinator
-            .reconcile_pending_to_deadline(DRAIN_RECEIPT_DEADLINE, || {
-                self.pending_rebind_receipts().unwrap_or_default()
-            })
-            .await;
-        if !remainder.is_empty() {
-            return Err(DrainHalt::with_pending(
-                "receipt-reconciliation-incomplete",
-                remainder,
-            ));
+        match coordinator
+            .reconcile_pending_observation(
+                DRAIN_RECEIPT_DEADLINE,
+                ReceiptOwnerFamily::StoreRebind,
+                || self.pending_rebind_receipts(),
+            )
+            .await
+        {
+            ReceiptReconciliation::Reconciled => {}
+            ReceiptReconciliation::Incomplete { pending, reason } => {
+                return Err(DrainHalt::with_pending(reason, pending));
+            }
+            ReceiptReconciliation::Unavailable { reason } => {
+                return Err(DrainHalt::new(reason));
+            }
         }
         record(
             ShutdownPhase::CanonicalDrainReceiptsReconciled,
@@ -4318,19 +4329,47 @@ impl KernelComposition {
         })
     }
 
-    /// Lists pending canonical-write receipts (ORS store-rebind rows) as
-    /// drain-gate identities. Read-only: shutdown never mutates staged rows.
-    fn pending_rebind_receipts(&self) -> Result<Vec<String>, String> {
-        let records = self
+    /// Reads the ORS store-rebind family as one typed, bounded observation for
+    /// the drain gate. Read-only: shutdown never mutates staged rows.
+    ///
+    /// Every row is reported with the exact operation/request binding the
+    /// owner stored, so reconciliation proves resolution against the owner
+    /// instead of an unversioned string. The read is one bounded page: a
+    /// family that does not fit the page budget is reported as an incomplete
+    /// observation, which carries no removal authority, rather than being
+    /// silently truncated. Absence is not resolution here — the owner
+    /// removes an aborted row, so a miss is a query miss and never success.
+    fn pending_rebind_receipts(&self) -> Result<ReceiptRescanObservation, String> {
+        let (records, has_more) = self
             .generation_gateway
             .ors
-            .load_all_store_rebinds()
+            .load_store_rebind_page(eliot_ors::MAX_RECOVERY_PAGE)
             .map_err(|_| "ors-rebind-scan-failed".to_owned())?;
-        Ok(records
-            .iter()
-            .filter(|record| record.state == eliot_ors::StoreRebindReplayState::Pending)
-            .map(|record| format!("store-rebind:{}", record.operation_id.as_str()))
-            .collect())
+        let mut pending = Vec::new();
+        let mut resolved = Vec::new();
+        let mut revision = 0_u64;
+        for record in &records {
+            let evidence = ReceiptOwnerEvidence::new(
+                format!("store-rebind:{}", record.operation_id.as_str()),
+                record.request_digest.clone(),
+                record.generation,
+                record.commit_order,
+            );
+            revision = revision.max(record.commit_order);
+            if record.state == eliot_ors::StoreRebindReplayState::Pending {
+                pending.push(evidence);
+            } else {
+                resolved.push(evidence);
+            }
+        }
+        Ok(ReceiptRescanObservation {
+            family: ReceiptOwnerFamily::StoreRebind,
+            complete: !has_more,
+            absence_resolves: false,
+            revision,
+            pending,
+            resolved,
+        })
     }
 }
 

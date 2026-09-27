@@ -155,6 +155,11 @@ pub struct AdapterRequest {
 #[serde(rename_all = "snake_case")]
 pub enum AdapterResultStatus {
     Succeeded,
+    TransportFailure,
+    IntegrityFailure,
+    NoResults,
+    StaleIndex,
+    UnsupportedCapability,
     Failed,
     Timeout,
     Rejected,

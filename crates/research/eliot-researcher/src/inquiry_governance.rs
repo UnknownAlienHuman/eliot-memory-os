@@ -44,8 +44,8 @@ use crate::evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, ClaimVerdict, CoverageAccount, LineageTable,
     ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
     SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    check_precision, digest, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
-    text,
+    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
+    push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -3437,10 +3437,10 @@ impl ResearchDebtRestriction {
 /// Claim-audit binding for one audited claim (I21.8).
 ///
 /// The audit itself is owned by [`crate::evidence_portfolio::audit_claim`]; this
-/// record binds its verdict to the inquiry profile, the frozen manifest and the
-/// State Fence, and states that the result is a non-canonical candidate. The
-/// reference firewall holds: no citation, source identity, URL, line range or
-/// support relation is minted here through prose.
+/// record binds its verdict to the inquiry profile, the run-bound reference
+/// manifest and the State Fence, and states that the result is a non-canonical
+/// candidate. The reference firewall holds: no citation, source identity, URL,
+/// line range or support relation is minted here through prose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimAuditRecord {
     /// Audited claim identity.
@@ -3451,13 +3451,26 @@ pub struct ClaimAuditRecord {
     pub profile_id_and_revision: String,
     /// Profile revision digest.
     pub profile_digest: String,
-    /// Manifest digest the claim was audited against.
-    pub manifest_digest: String,
+    /// Digest of the run-bound `AllowedReferenceManifest` the claim was audited
+    /// against.
+    ///
+    /// Sourced from the re-proved manifest itself rather than from a
+    /// caller-supplied string, so it cannot disagree with the manifest that
+    /// produced the verdict.
+    pub run_reference_manifest_digest: String,
+    /// Run identity the audit was bound to.
+    pub run_id: String,
+    /// Root context revision the audit was bound to.
+    pub root_context_revision: String,
     /// Evidence-set identity.
     pub evidence_set_id: String,
     /// Verdict produced by the existing claim-audit owner.
     pub verdict: ClaimVerdict,
     /// State Fence the audit ran under.
+    ///
+    /// The run-bound manifest's own fence, and proven equal to the profile's
+    /// when the record is bound, so a verdict cannot be filed under a fence that
+    /// is neither the run's nor the profile's.
     pub state_fence: StateFence,
     /// Always false: a claim audit never becomes canonical state by itself.
     pub canonical: bool,
@@ -3466,31 +3479,61 @@ pub struct ClaimAuditRecord {
 }
 
 impl ClaimAuditRecord {
-    /// Binds one claim verdict to the inquiry it was produced under.
+    /// Binds one claim verdict to the inquiry and run it was produced under.
+    ///
+    /// `run_manifest` is the re-proved [`AllowedReferenceManifest`] itself, not a
+    /// digest of one. It used to take a bare `manifest_digest: &str` that was
+    /// only shape-checked as 64 lowercase hex and never compared with any
+    /// manifest, so the binding proved nothing: a record could name a digest that
+    /// no manifest ever produced, and the field it filled had no `run_id`, no
+    /// `root_context_revision` and no fence of its own. I21.7 requires an audit
+    /// job to be bound to the exact run and State Fence, so the manifest is now
+    /// an input and the fence is taken from it.
+    ///
+    /// The profile's own State Fence must equal the manifest's. A profile
+    /// resolved under one fence and a manifest frozen under another describe two
+    /// different runs, and binding them together would produce a record whose two
+    /// halves disagree about which run it describes.
     ///
     /// # Errors
     ///
-    /// Returns a field error for a blank identity or a malformed manifest
-    /// digest.
+    /// Returns a field error for a blank identity, and
+    /// [`InquiryError::IntegrityMismatch`] when the run-bound manifest does not
+    /// re-prove its own digest or the profile's State Fence is not the manifest's.
     pub fn bind(
         inquiry_id: &str,
         profile: &InquiryProtocolProfile,
-        manifest_digest: &str,
+        run_manifest: &AllowedReferenceManifest,
         evidence_set_id: &str,
         verdict: ClaimVerdict,
     ) -> Result<Self, InquiryError> {
         require_text(inquiry_id, "claim_audit.inquiry_id")?;
         require_text(evidence_set_id, "claim_audit.evidence_set_id")?;
-        require_digest(manifest_digest, "claim_audit.manifest_digest")?;
+        // Re-prove the manifest rather than trusting a digest a caller could have
+        // typed: `validate` recomputes the digest over every field that can change
+        // what a citation is allowed to say, so a widened or edited manifest is
+        // refused here instead of being filed under its own stale identity.
+        run_manifest
+            .validate()
+            .map_err(|_| InquiryError::IntegrityMismatch {
+                field: "claim_audit.run_reference_manifest",
+            })?;
+        if profile.state_fence != run_manifest.state_fence {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "claim_audit.state_fence",
+            });
+        }
         let mut record = Self {
             claim_id: verdict.claim_id.clone(),
             inquiry_id: inquiry_id.to_owned(),
             profile_id_and_revision: profile.profile_id_and_revision(),
             profile_digest: profile.integrity_digest.clone(),
-            manifest_digest: manifest_digest.to_owned(),
+            run_reference_manifest_digest: run_manifest.digest.clone(),
+            run_id: run_manifest.run_id.clone(),
+            root_context_revision: run_manifest.root_context_revision.clone(),
             evidence_set_id: evidence_set_id.to_owned(),
             verdict,
-            state_fence: profile.state_fence.clone(),
+            state_fence: run_manifest.state_fence.clone(),
             canonical: false,
             digest: String::new(),
         };
@@ -3499,7 +3542,12 @@ impl ClaimAuditRecord {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("claim-audit-record/v1;");
+        // `v1` -> `v2`: the preimage now names the run identity and the root
+        // context revision, and takes its State Fence from the run-bound manifest
+        // rather than from the profile. A `v1` record could not be re-derived from
+        // its own bytes under one name, so the domain says so rather than letting
+        // one name cover two field sets.
+        let mut preimage = String::from("claim-audit-record/v2;");
         push_field(&mut preimage, "claim_id", &self.claim_id);
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(
@@ -3508,12 +3556,43 @@ impl ClaimAuditRecord {
             &self.profile_id_and_revision,
         );
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
-        push_field(&mut preimage, "manifest_digest", &self.manifest_digest);
+        push_field(
+            &mut preimage,
+            "run_reference_manifest_digest",
+            &self.run_reference_manifest_digest,
+        );
+        push_field(&mut preimage, "run_id", &self.run_id);
+        push_field(
+            &mut preimage,
+            "root_context_revision",
+            &self.root_context_revision,
+        );
         push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
         push_field(
             &mut preimage,
             "verdict_outcome",
             self.verdict.outcome.wire_name(),
+        );
+        // I21.7: the audit's own run binding is inside this record's identity, not
+        // only inside the manifest's, so a binding that covers this record cannot
+        // be re-pointed at another run's verdict.
+        for (tag, value) in [
+            (
+                "verdict_run_reference_manifest_digest",
+                self.verdict.run_reference_manifest_digest.as_str(),
+            ),
+            ("verdict_run_id", self.verdict.run_id.as_str()),
+            (
+                "verdict_root_context_revision",
+                self.verdict.root_context_revision.as_str(),
+            ),
+        ] {
+            push_field(&mut preimage, tag, value);
+        }
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
         );
         for (tag, values) in [
             ("residue", &self.verdict.residue),
@@ -3538,6 +3617,27 @@ impl ClaimAuditRecord {
             self.verdict.unsupported_precision.len(),
         );
         freeze(&preimage)
+    }
+
+    /// Re-proves this binding's own digest and its run binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one, when the record claims canonical state, or
+    /// when its verdict names a different run than the record does.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.canonical
+            || self.compute_digest() != self.digest
+            || self.verdict.run_reference_manifest_digest != self.run_reference_manifest_digest
+            || self.verdict.run_id != self.run_id
+            || self.verdict.root_context_revision != self.root_context_revision
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "claim_audit.digest",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -3984,10 +4084,27 @@ pub struct CandidateEvidence {
 /// — and the kind is kept because a candidate handle is caller-shaped, not fixed.
 /// A source identity is judged on the `SourceRecord.handle` the observation
 /// projects into
-/// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`], and a
-/// line range is judged by the manifest's admitted anchor precision in
-/// [`EvidenceSetPrecision::evaluate`]; neither can be a *citation* on this path,
-/// so neither is a candidate diagnostic here.
+/// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`].
+///
+/// # What a line range is, and is not
+///
+/// `LineSpan` names a *reference the run observed*, not an anchor decision. How
+/// coarse an admitted anchor may be is the manifest's `allowed_anchor_precision`
+/// and belongs to [`EvidenceSetPrecision::evaluate`]; that check answers "may a
+/// citation anchor this finely?", while this kind answers "was a line range
+/// minted in prose?". They are separate obligations and neither substitutes for
+/// the other: a line range can be perfectly well formed and still be outside the
+/// manifest's admitted anchor precision, and it is refused here for the list
+/// reason rather than for the precision one.
+///
+/// Which candidates the run actually produces is the composition root's
+/// projection, not this boundary's: `retained_provider_material` in
+/// `bins/eliot-mod-research` mints one `provider-artifact:<sha256>` handle from
+/// the retained stdout digest and never decodes the body, so neither a URL nor a
+/// line range reaches this classification from the current live path. Both arms
+/// are reachable for a candidate whose handle carries that shape, which is what a
+/// caller-influenced handle means; enumerating the references inside provider
+/// output is a separate and still-open step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnadmittedReferenceKind {
     /// An absolute locator URL, named for what the spelling presents itself as.
@@ -4016,6 +4133,21 @@ pub enum UnadmittedReferenceKind {
     /// `ArtifactHandle`, because a namespaced opaque handle is a handle and the
     /// grammar is what keeps it distinct from a URI scheme.
     AmbiguousReference,
+    /// A line anchor or line range: a handle the shared classifier reads as an
+    /// opaque handle, followed by `:<line>` or an inclusive `:<first>-<last>`.
+    ///
+    /// I21.7 lists a line range beside citation, URL, source ID, artifact handle
+    /// and support relation as a reference a model cannot mint through prose, so
+    /// it is a reference identity here and gets its own kind rather than being
+    /// reported as whatever the classifier made of the handle part. It is not an
+    /// *anchor* decision either: how coarse an admitted anchor may be belongs to
+    /// the manifest's admitted anchor precision in
+    /// [`EvidenceSetPrecision::evaluate`], and this kind only says that the
+    /// observed spelling is a line range.
+    ///
+    /// Recognition is fail-closed and refuses every spelling it cannot decide:
+    /// see [`line_span_shape`], which is the single reader of the grammar.
+    LineSpan,
     /// A handle the manifest lists but marks stale or revoked.
     StaleOrRevoked,
 }
@@ -4029,6 +4161,7 @@ impl UnadmittedReferenceKind {
             Self::ArtifactHandle => "ARTIFACT_HANDLE",
             Self::InternalOwnedReference => "INTERNAL_OWNED_REFERENCE",
             Self::AmbiguousReference => "AMBIGUOUS_REFERENCE",
+            Self::LineSpan => "LINE_SPAN",
             Self::StaleOrRevoked => "STALE_OR_REVOKED",
         }
     }
@@ -4129,14 +4262,25 @@ impl UnadmittedReference {
 
     /// I21.7 reference firewall: the fence is part of what this record means, so
     /// it is inside the preimage and not only cross-checked by the governance
-    /// record. No sibling record in this crate pushes a fence of its own, so the
-    /// encoding is the crate's single canonical one — `push_field` per fence
-    /// component, tagged with the `StateFence` field names that
-    /// `canonical_json_bytes` gives the same value inside the sealed
-    /// `AllowedReferenceManifest` — and an absent optional revision is spelled
-    /// `none` under its own tag, as everywhere else in these preimages.
+    /// record. The encoding is [`crate::evidence_portfolio::fence_preimage`],
+    /// the crate's single canonical one: `push_field` per fence component, tagged
+    /// with the `StateFence` field names that `canonical_json_bytes` gives the
+    /// same value inside the sealed `AllowedReferenceManifest`, with an absent
+    /// optional revision spelled `none` under its own tag, as everywhere else in
+    /// these preimages. It used to be spelled out inline here on the stated
+    /// ground that no sibling record in this crate pushed a fence; the audit
+    /// reference binding now does, so the encoding moved to the one owner rather
+    /// than being copied, and two spellings of a fence preimage would be two
+    /// identities for the same fence.
+    ///
+    /// `v1` -> `v2` with that move. The fence's five components were five
+    /// top-level preimage fields and are now one `state_fence` field, so the
+    /// bytes changed under an unchanged name — which is the same defect the
+    /// `source-record/v2` and `frozen-inquiry/v3` bumps exist to prevent. A
+    /// diagnostic sealed under the old spelling cannot re-verify under this one
+    /// and needs re-sealing, not a grandfathered admission.
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("unadmitted-reference/v1;");
+        let mut preimage = String::from("unadmitted-reference/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
         push_field(&mut preimage, "reference", &self.reference);
@@ -4144,47 +4288,9 @@ impl UnadmittedReference {
         push_field(&mut preimage, "reason", &self.reason);
         push_field(
             &mut preimage,
-            "authority_epoch_lineage",
-            self.state_fence.authority_epoch.lineage_id.as_str(),
+            "state_fence",
+            &fence_preimage(&self.state_fence),
         );
-        push_field(
-            &mut preimage,
-            "authority_epoch_sequence",
-            &self.state_fence.authority_epoch.sequence.to_string(),
-        );
-        push_field(
-            &mut preimage,
-            "resource_generation",
-            &self.state_fence.resource_generation.value().to_string(),
-        );
-        // The three optional revisions have three DISTINCT types, so each is
-        // spelled out rather than iterated: an array would require one element
-        // type and would either coerce or fail to compile.
-        for (tag, revision) in [
-            (
-                "task_revision",
-                self.state_fence
-                    .task_revision
-                    .map(|value| value.value().to_string()),
-            ),
-            (
-                "policy_revision",
-                self.state_fence
-                    .policy_revision
-                    .map(|value| value.value().to_string()),
-            ),
-            (
-                "integration_revision",
-                self.state_fence
-                    .integration_revision
-                    .map(|value| value.value().to_string()),
-            ),
-        ] {
-            match revision {
-                Some(value) => push_field(&mut preimage, tag, &value),
-                None => push_field(&mut preimage, tag, "none"),
-            }
-        }
         push_field(&mut preimage, "trusted", bool_text(self.trusted));
         freeze(&preimage)
     }
@@ -5089,6 +5195,16 @@ fn assess_sources(
 /// composition root derives it from the retained provider artifact digest, so it
 /// is caller-influenced text and is checked against the manifest like any other.
 ///
+/// The kind is a function of that one reference text, not of the shape the
+/// composition root happens to mint today. A candidate whose handle is a
+/// syntactically valid absolute URL reaches [`UnadmittedReferenceKind::LocatorUrl`]
+/// and one that carries a line anchor or range reaches
+/// [`UnadmittedReferenceKind::LineSpan`], because both are reference identities
+/// I21.7 names and neither is an artifact handle. Which candidates the run
+/// actually produces is the composition root's projection and is not decided
+/// here; what is decided here is that a reference of either shape is refused and
+/// retained rather than typed as a handle.
+///
 /// #2894: the kind is read from the one shared classifier,
 /// [`eliot_research_exchange_api::classify_locator`], which is the same
 /// classification the delivered-bundle firewall applies to
@@ -5110,6 +5226,14 @@ fn assess_sources(
 /// the diagnostic whatever the spelling is. A reason here names a list this
 /// function actually reads, and says plainly when the remaining problem is the
 /// text rather than the list.
+///
+/// The line-range arm runs before the shared locator classification, because a
+/// line range is a position inside a reference rather than a reference identity
+/// of its own kind: `README.md:12-40` classifies as an external URI under
+/// `classify_locator` (the `README.md` prefix is a valid RFC 3986 scheme token),
+/// and reporting that as a URL would name the wrong acquisition path for a
+/// spelling that is a line range. [`line_span_shape`] is the single reader of
+/// that grammar and it declines every spelling it cannot decide.
 fn reference_firewall(
     observation: &InquiryObservation,
 ) -> Result<Vec<UnadmittedReference>, InquiryError> {
@@ -5136,18 +5260,21 @@ fn reference_firewall(
                     .to_owned(),
             )
         } else if !manifest.allows(&candidate.handle) {
-            // Every reason below names the one thing that can change this
-            // verdict, and the arm it names is one this path actually reads.
-            // This path tests `manifest.allows` and nothing else:
-            // `AllowedReferenceManifest::allows` reads `source_handles`,
-            // `evidence_handles` and `artifact_handles`, so the handle allowlist
-            // is the only lever here. `url_handles` belongs to the separate
-            // `admits_url` predicate, which is the delivered-locator path in
-            // `eliot_research_exchange_api` and is never called from this
-            // function — so a reason that told a reader to add the value to
-            // `url_handles` would name a list that cannot admit it and the
-            // diagnostic would recur forever.
-            match classify_locator(&candidate.handle) {
+            if let Some(shape) = line_span_shape(&candidate.handle) {
+                (UnadmittedReferenceKind::LineSpan, line_span_reason(shape))
+            } else {
+                // Every reason below names the one thing that can change this
+                // verdict, and the arm it names is one this path actually reads.
+                // This path tests `manifest.allows` and nothing else:
+                // `AllowedReferenceManifest::allows` reads `source_handles`,
+                // `evidence_handles` and `artifact_handles`, so the handle allowlist
+                // is the only lever here. `url_handles` belongs to the separate
+                // `admits_url` predicate, which is the delivered-locator path in
+                // `eliot_research_exchange_api` and is never called from this
+                // function — so a reason that told a reader to add the value to
+                // `url_handles` would name a list that cannot admit it and the
+                // diagnostic would recur forever.
+                match classify_locator(&candidate.handle) {
                 // The spelling presents as an absolute locator, and the lever is
                 // still the handle allowlist: a candidate handle is a reference
                 // identity, not a `SourceSnapshot::locator`, so it is admitted by
@@ -5195,6 +5322,7 @@ fn reference_firewall(
                     ),
                 ),
             }
+            }
         } else {
             continue;
         };
@@ -5208,6 +5336,90 @@ fn reference_firewall(
         )?);
     }
     Ok(diagnostics)
+}
+
+/// The closed shape of one recognised line-range reference spelling.
+///
+/// The shape is carried rather than the text: this module's residue convention
+/// is to name the observed fact and never echo the supplied reference, and the
+/// two shapes are the only thing a consumer acts on differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineSpanShape {
+    /// `<handle>:<line>` — one line anchor.
+    Single,
+    /// `<handle>:<first>-<last>` — an inclusive line range, `first <= last`.
+    Range,
+}
+
+/// Recognises a line anchor or line range in one observed reference, or declines.
+///
+/// This is the single reader of that grammar, and it declines every spelling it
+/// cannot decide rather than guessing. Three conditions, each stated because
+/// dropping it would re-type something that is not a line range:
+///
+/// 1. The text is `<precedent>:<anchor>` at its **last** colon, and the
+///    precedent is non-empty. The anchor is decimal digits, optionally a
+///    `-`-separated inclusive pair with `first <= last`. A range spelled the
+///    other way round is not a range, and no upper bound is assumed.
+/// 2. The **precedent** classifies as [`LocatorClass::OpaqueHandle`], so a
+///    colon the shared classifier already reads as a scheme separator is never
+///    re-read as a line separator. This is what keeps `https://host:8080` a
+///    URL rather than a line anchor: its precedent is an external URI.
+/// 3. The **whole** text does not classify as [`LocatorClass::InternalUri`], so
+///    a scheme a named owner mints keeps its opaque part. `provider-artifact:12`
+///    is an internally owned handle, not the twelfth line of anything, and this
+///    is the condition that says so.
+///
+/// Condition 2 alone would already re-type `README.md:12-40` away from the
+/// external URI `classify_locator` calls it, which is the point: the prefix
+/// there is a valid RFC 3986 scheme token and nothing more, and a position
+/// inside a reference is a line range rather than a URL. The live
+/// `provider-artifact:<sha256>` candidate is unaffected by all three.
+fn line_span_shape(text: &str) -> Option<LineSpanShape> {
+    let colon = text.rfind(':')?;
+    let (precedent, anchor) = text.split_at(colon);
+    let anchor = anchor.strip_prefix(':')?;
+    if precedent.is_empty() || !matches!(classify_locator(precedent), LocatorClass::OpaqueHandle) {
+        return None;
+    }
+    if matches!(classify_locator(text), LocatorClass::InternalUri { .. }) {
+        return None;
+    }
+    match anchor.split_once('-') {
+        Some((first, last)) => match (first.parse::<u64>(), last.parse::<u64>()) {
+            (Ok(first), Ok(last)) if first <= last => Some(LineSpanShape::Range),
+            _ => None,
+        },
+        None => decimal_exact(anchor).then_some(LineSpanShape::Single),
+    }
+}
+
+/// Whether `value` is one or more ASCII decimal digits and nothing else.
+///
+/// A hand-rolled digit test rather than a numeric parse, because the single-line
+/// shape never needs a value: only the shape is load-bearing, and parsing it
+/// would imply a base and a bound the grammar does not state.
+fn decimal_exact(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The reason a line-range reference is retained unadmitted.
+///
+/// As every reason on this path does, it names the list that can change the
+/// verdict — here the same handle allowlist every other arm names, because
+/// `line_span_shape` chose the *kind* and takes no part in the admission
+/// decision — and it states the second fact a reader needs, that a line range
+/// is not a citable identity on this path at all.
+fn line_span_reason(shape: LineSpanShape) -> String {
+    let observed = match shape {
+        LineSpanShape::Single => "a single line anchor over a handle",
+        LineSpanShape::Range => "an inclusive line range over a handle",
+    };
+    format!(
+        "this reference carries {observed}; a line range is not a citable identity on this path, \
+         and the only lever here is the manifest's source, evidence and artifact handle allowlist, \
+         which admits the exact text as a handle or not at all"
+    )
 }
 
 /// Opens the exact coverage accounting over the admitted reference members.

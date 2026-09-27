@@ -1,0 +1,196 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleTestCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.epistemic.contracts",
+  "independent_proof_entrypoint": {
+    "entrypoint": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].proof_entrypoint",
+      "value": null
+    },
+    "package": "eliot-epistemic-contracts",
+    "executable": false,
+    "state": "UNDECLARED",
+    "runnable": "no executable proof entrypoint is declared for this cell"
+  },
+  "proof_level_ceiling": {
+    "state": "UNDECLARED",
+    "origin": "module.toml|proof_ceiling",
+    "value": null
+  },
+  "shape_checks": {
+    "deny_unknown_fields": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.deny_unknown_fields",
+      "value": null
+    },
+    "forbid_unsafe": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbid_unsafe",
+      "value": true
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    },
+    "forbidden_pattern_hits": [
+      {
+        "pattern": "serde_json::Value",
+        "path": "crates/smart/eliot-epistemic-contracts/src/tests.rs"
+      }
+    ],
+    "inline_cfg_test_modules": 1
+  },
+  "unit_property_model_tests": {
+    "declared_proof_surface": {
+      "state": "DECLARED",
+      "origin": "module.toml|proof_surface",
+      "value": [
+        "schema round-trip",
+        "unknown-field rejection",
+        "version compatibility",
+        "fence/provenance fixtures",
+        "contribution envelope binding"
+      ]
+    },
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-epistemic-contracts/tests/consumer_fixtures.rs",
+        "bytes": 14166,
+        "sha256": "648d11908965a0ecdf8eefa6ae3af209ac850fe751b0e3bbedf86e8ed64dc0ca",
+        "test_attributes": 1,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "test_attribute_count": 51
+  },
+  "parser_or_golden_corpus": [],
+  "fake_port_contract_tests": [],
+  "real_edge_profiles": {
+    "one_hop_consumers": [
+      "bins/eliot-dreamer",
+      "bins/eliotd",
+      "crates/governor/eliot-canonical",
+      "crates/governor/eliot-governor",
+      "crates/kernel/eliot-kernel-service",
+      "crates/smart/eliot-cognitive-quality",
+      "crates/smart/eliot-context-candidates",
+      "crates/smart/eliot-dreamer-architecture-brief",
+      "crates/smart/eliot-dreamer-classification",
+      "crates/smart/eliot-dreamer-conflict-analysis",
+      "crates/smart/eliot-dreamer-contracts",
+      "crates/smart/eliot-dreamer-episode",
+      "crates/smart/eliot-dreamer-implementation-brief",
+      "crates/smart/eliot-dreamer-orientation",
+      "crates/smart/eliot-dreamer-orientation-wasm",
+      "crates/smart/eliot-dreamer-relation",
+      "crates/smart/eliot-dreamer-rival-model",
+      "crates/smart/eliot-epistemic",
+      "crates/smart/eliot-epistemic-context-provider",
+      "crates/smart/eliot-experience-provider",
+      "crates/smart/eliot-understanding-assessment",
+      "crates/storage/eliot-store-api",
+      "crates/storage/eliot-store-memory",
+      "crates/storage/eliot-store-surreal-adapter"
+    ],
+    "declared_consumers": {
+      "state": "DECLARED",
+      "origin": "module.toml|consumers",
+      "value": [
+        "eliot-epistemic",
+        "eliot-context-candidates",
+        "Dreamer handlers"
+      ]
+    },
+    "edge_profile_tests": []
+  },
+  "fault_restart_replay_cases": {
+    "declared_failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Reject malformed or version-incompatible values without inventing a position."
+    },
+    "selected_cases": [
+      "crates/smart/eliot-epistemic-contracts/tests/consumer_fixtures.rs"
+    ]
+  },
+  "resource_and_serial_groups": {
+    "declared_serial_groups": {
+      "state": "UNDECLARED",
+      "origin": "no resource or serial group registry is declared in the repository metadata",
+      "value": null
+    },
+    "boundary_tracked_test_debt": []
+  },
+  "known_uncovered_behavior": {
+    "declared_required_tests": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_tests",
+      "value": null
+    },
+    "declared_required_exports": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|acceptance.required_exports",
+      "value": null
+    },
+    "observation": "A zero counted test is not a pass; counted attributes are source metadata, not executed evidence (A14.8, I0.5)."
+  },
+  "expected_nonzero_test_count": {
+    "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
+    "test_attribute_count": 51,
+    "test_stu": 4722,
+    "nonzero": true
+  },
+  "bound_contract_digest": "3427a2c2f8a7613157827503c770fd12e9b56129e6b701819435277e674ffe7b",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+        "sha256": "326ea2aa5c8b1101fc3ed4cbb85fb154b021f8dd5705e1a4cd529cdf9b3022a3"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-epistemic-contracts/module.toml",
+        "sha256": "b1f6a6a4fcb2378cbbafe06d01b5029f9ccf97d91ff7b4505b86b4e7045d0a66"
+      },
+      "selected_source": {
+        "path_count": 24,
+        "sha256": "004f197687b84bffc2bb8e193dde8625fd799712e2c40d5507457a1e140df31e"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "06b33ab1e9194aea832e12c51c0a9561904a31fbff9934572c7dbc53dd0cd7d0",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "06b33ab1e9194aea"
+  }
+}

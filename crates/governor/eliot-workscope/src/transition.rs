@@ -34,8 +34,8 @@
 //! each step's outcome in the receipt and fails closed on the first mismatch.
 
 use super::{
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuardReceipt, WorkScopeError, counter, text,
-    unique,
+    IdentityLegOutcome, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuardReceipt,
+    WorkScopeError, counter, identity_legs, text, unique,
 };
 use eliot_contracts::StateFence;
 use schemars::JsonSchema;
@@ -407,8 +407,9 @@ impl ScopeTransitionReceipt {
 /// This is a transient execution argument, not a persisted binding: every
 /// field carries caller-observed authority (affected records, preserved
 /// provenance, staged candidates, the new-generation binding, invalidated
-/// sessions, boundary verification, and the commit fence). The executor
-/// checks each step against the proposal and records the outcome.
+/// sessions with their bindings observed at invalidation time, boundary
+/// verification, and the commit fence). The executor checks each step against
+/// the proposal and records the outcome.
 #[derive(Clone, Debug)]
 pub struct TransitionStepEvidence {
     pub affected_record_refs: Vec<String>,
@@ -417,6 +418,14 @@ pub struct TransitionStepEvidence {
     pub staged_candidates: Vec<StagedCandidateRecord>,
     pub new_binding: ScopeBinding,
     pub invalidated_session_refs: Vec<String>,
+    /// Caller-observed bindings of the invalidated sessions/leases, counted
+    /// against `invalidated_session_refs` (one binding per recorded ref).
+    ///
+    /// Step 6 runs the existing guard legs ([`identity_legs`]) of each
+    /// binding against `new_binding`: an invalidated session must *not* be
+    /// identity-clear under the new generation (a still-clear session is not
+    /// incompatible and must not be recorded as invalidated).
+    pub invalidated_session_bindings: Vec<ScopeBinding>,
     pub boundary_evidence_refs: Vec<String>,
     pub commit_fence: StateFence,
 }
@@ -457,6 +466,12 @@ impl TransitionStepEvidence {
             "invalidated_session_refs",
             128,
         )?;
+        if self.invalidated_session_bindings.len() != self.invalidated_session_refs.len() {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        for binding in &self.invalidated_session_bindings {
+            binding.validate()?;
+        }
         collection(&self.boundary_evidence_refs, "boundary_evidence_refs", 32)?;
         self.commit_fence
             .validate()
@@ -640,6 +655,7 @@ struct StepRunner {
     scope_ref: String,
     old_generation: u64,
     new_generation: u64,
+    revision: u64,
     proposal_fence: StateFence,
     receipt_ref: String,
     outcomes: Vec<TransitionStepOutcome>,
@@ -653,6 +669,7 @@ impl StepRunner {
             scope_ref: proposal.scope_ref.clone(),
             old_generation: proposal.old_generation,
             new_generation: proposal.new_generation,
+            revision: 1,
             proposal_fence: proposal.state_fence.clone(),
             receipt_ref,
             outcomes: Vec::new(),
@@ -667,7 +684,7 @@ impl StepRunner {
                 receipt_ref: self.receipt_ref,
                 transition_ref: self.transition_ref,
                 kind: self.kind,
-                revision: 1,
+                revision: self.revision,
                 scope_ref: self.scope_ref,
                 old_generation: self.old_generation,
                 new_generation: self.new_generation,
@@ -695,6 +712,83 @@ fn same_refs(left: &[String], right: &[String]) -> bool {
     left_sorted.sort();
     right_sorted.sort();
     left_sorted == right_sorted
+}
+
+/// Checks step 3 against the proposal: the preserved provenance must cover
+/// everything later staged, or the candidate carries no old-scope lineage.
+fn check_preserve_old_scope(evidence: &TransitionStepEvidence) -> Result<(), WorkScopeError> {
+    let uncovered = evidence.staged_candidates.iter().any(|candidate| {
+        !evidence
+            .old_scope_provenance_refs
+            .contains(&candidate.provenance_ref)
+    });
+    if uncovered {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    Ok(())
+}
+
+/// Checks step 4 against the proposal: staged records stay inside the
+/// affected set, validate, and admit material effects only under a
+/// non-self-referential deterministic validity transfer (I4.2.1).
+fn check_stage_candidates(
+    proposal: &ScopeTransition,
+    evidence: &TransitionStepEvidence,
+) -> Result<(), WorkScopeError> {
+    let staged_outside_scope = evidence.staged_candidates.iter().any(|candidate| {
+        !proposal
+            .affected_record_refs
+            .contains(&candidate.record_ref)
+    });
+    if staged_outside_scope {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    for candidate in &evidence.staged_candidates {
+        candidate.validate()?;
+        if candidate.admits_material_effects() {
+            match &candidate.standing {
+                CandidateRecordStanding::ValidityTransferred { transfer_ref }
+                    if transfer_ref != &candidate.record_ref
+                        && transfer_ref != &candidate.provenance_ref => {}
+                _ => return Err(WorkScopeError::BindingReceiptMismatch),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks step 6 against the proposal through the existing guard legs: every
+/// recorded session binding is evaluated against the new binding, and a
+/// session that is still identity-clear under the new generation is not
+/// incompatible — recording it as invalidated fails instead of silently
+/// carrying it over or killing a live session.
+fn check_invalidate_sessions(evidence: &TransitionStepEvidence) -> Result<(), WorkScopeError> {
+    if evidence.invalidated_session_bindings.len() != evidence.invalidated_session_refs.len() {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    let live_recorded = evidence.invalidated_session_bindings.iter().any(|session| {
+        identity_legs(&evidence.new_binding, session) == IdentityLegOutcome::IdentityClear
+    });
+    if live_recorded {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    Ok(())
+}
+
+/// Checks step 7 against the proposal: boundary attestation for the new scope
+/// is neither a killed session token nor moved data.
+fn check_verify_boundaries(
+    proposal: &ScopeTransition,
+    evidence: &TransitionStepEvidence,
+) -> Result<(), WorkScopeError> {
+    let recycled = evidence.boundary_evidence_refs.iter().any(|boundary| {
+        evidence.invalidated_session_refs.contains(boundary)
+            || proposal.affected_record_refs.contains(boundary)
+    });
+    if recycled {
+        return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    Ok(())
 }
 
 /// Runs one procedure step against the proposal, recording its outcome.
@@ -727,6 +821,7 @@ fn run_step(
             ));
         }
         ScopeTransitionStep::PreserveOldScope => {
+            check_preserve_old_scope(evidence).map_err(|reason| (step, reason))?;
             outcomes.push(completed(
                 step,
                 evidence.old_scope_provenance_refs.clone(),
@@ -734,14 +829,7 @@ fn run_step(
             ));
         }
         ScopeTransitionStep::StageCandidates => {
-            let staged_outside_scope = evidence.staged_candidates.iter().any(|candidate| {
-                !proposal
-                    .affected_record_refs
-                    .contains(&candidate.record_ref)
-            });
-            if staged_outside_scope {
-                return failed(WorkScopeError::BindingReceiptMismatch);
-            }
+            check_stage_candidates(proposal, evidence).map_err(|reason| (step, reason))?;
             outcomes.push(completed(
                 step,
                 evidence
@@ -768,6 +856,7 @@ fn run_step(
             ));
         }
         ScopeTransitionStep::InvalidateSessions => {
+            check_invalidate_sessions(evidence).map_err(|reason| (step, reason))?;
             outcomes.push(completed(
                 step,
                 evidence.invalidated_session_refs.clone(),
@@ -775,6 +864,7 @@ fn run_step(
             ));
         }
         ScopeTransitionStep::VerifyBoundaries => {
+            check_verify_boundaries(proposal, evidence).map_err(|reason| (step, reason))?;
             outcomes.push(completed(
                 step,
                 evidence.boundary_evidence_refs.clone(),
@@ -889,7 +979,9 @@ pub fn execute_transition(
 /// it, and fresh caller evidence is checked against the proposal exactly as in
 /// [`execute_transition`]. Outcomes already recorded are preserved verbatim
 /// and the revision advances by one. A committed receipt is never resumed: it
-/// is returned intact inside the failure.
+/// is returned intact inside the failure. Refusals before a matching valid
+/// proposal and partial receipt are admitted also return the input partial
+/// intact; the new revision begins only after resume admission.
 ///
 /// # Errors
 ///
@@ -901,22 +993,38 @@ pub fn resume_transition(
     partial: &ScopeTransitionReceipt,
     evidence: &TransitionStepEvidence,
 ) -> Result<ScopeTransitionReceipt, TransitionFailure> {
-    let receipt_ref = partial.receipt_ref.clone();
-    if let Err(reason) = proposal.validate() {
-        return Err(StepRunner::for_proposal(proposal, receipt_ref)
-            .fail(ScopeTransitionStep::Propose, reason));
+    if partial.committed {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::BindingReceiptMismatch,
+        });
     }
-    let mut runner = StepRunner::for_proposal(proposal, receipt_ref);
+    let Some(revision) = partial.revision.checked_add(1) else {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::InvalidCounter { field: "revision" },
+        });
+    };
+    if let Err(reason) = proposal.validate() {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::Propose,
+            reason,
+        });
+    }
     let belongs = partial.transition_ref == proposal.transition_ref
         && partial.kind == proposal.kind
         && partial.scope_ref == proposal.scope_ref
         && partial.old_generation == proposal.old_generation
         && partial.new_generation == proposal.new_generation;
-    if !belongs || partial.committed || partial.validate().is_err() {
-        return Err(runner.fail(
-            ScopeTransitionStep::CommitReceipt,
-            WorkScopeError::BindingReceiptMismatch,
-        ));
+    if !belongs || partial.validate().is_err() {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::BindingReceiptMismatch,
+        });
     }
     let completed_prefix = partial
         .step_outcomes
@@ -924,11 +1032,15 @@ pub fn resume_transition(
         .take_while(|outcome| outcome.completed)
         .count();
     if completed_prefix == 0 || completed_prefix >= TRANSITION_STEP_COUNT as usize {
-        return Err(runner.fail(
-            ScopeTransitionStep::CommitReceipt,
-            WorkScopeError::BindingReceiptMismatch,
-        ));
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::BindingReceiptMismatch,
+        });
     }
+    let receipt_ref = partial.receipt_ref.clone();
+    let mut runner = StepRunner::for_proposal(proposal, receipt_ref);
+    runner.revision = revision;
     runner.outcomes = partial.step_outcomes[..completed_prefix].to_vec();
     if let Err(reason) = evidence.validate() {
         let next = ScopeTransitionStep::from_number(completed_prefix + 1)
@@ -941,7 +1053,7 @@ pub fn resume_transition(
             return Err(runner.fail(failed_step, reason));
         }
     }
-    match assemble_committed(&runner, evidence, partial.revision + 1) {
+    match assemble_committed(&runner, evidence, runner.revision) {
         Ok(receipt) => Ok(receipt),
         Err(reason) => Err(runner.fail(ScopeTransitionStep::CommitReceipt, reason)),
     }
@@ -1027,10 +1139,21 @@ pub fn observe_transition(
 /// Endorses a committed receipt with the post-commit guard and projects its
 /// observation.
 ///
+/// This is the production endorse-and-observe composition of the transition
+/// surface: [`ScopeTransition::drive`] and [`ScopeTransition::resume_interrupted`]
+/// run it after commit, so the MATCHED revalidation on the new generation
+/// ([`attach_post_commit_guard`]) and the queryable projection
+/// ([`observe_transition`]) execute in product code, not only in fixtures.
+///
 /// A failure carries the committed receipt inside [`TransitionFailure`]
 /// (failed step [`ScopeTransitionStep::CommitReceipt`]): the commit stands,
 /// endorsement or observation is retried, the receipt is never resumed.
-fn endorse_and_observe(
+///
+/// # Errors
+///
+/// Returns [`TransitionFailure`] when the post-commit guard is not MATCHED
+/// on the new generation or the observation projection is malformed.
+pub fn endorse_and_observe(
     proposal: &ScopeTransition,
     receipt: ScopeTransitionReceipt,
     post_commit_guard: &ScopeBindingGuardReceipt,
@@ -1226,6 +1349,7 @@ mod tests {
             staged_candidates: vec![staged("record:one")],
             new_binding: new_scope_binding(2),
             invalidated_session_refs: vec!["session:old".into()],
+            invalidated_session_bindings: vec![new_scope_binding(1)],
             boundary_evidence_refs: vec!["boundary:one".into()],
             commit_fence: fence_at(2),
         }

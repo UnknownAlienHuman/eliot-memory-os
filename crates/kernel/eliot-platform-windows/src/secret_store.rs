@@ -26,10 +26,8 @@
 //!   (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`)
 //!   — single-responsibility micro-module extraction within the owning crate.
 //!
-//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
-//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
-//! the governing shards are named per anchor above).
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
+//! sharded fragments named per anchor above.
 //!
 //! Non-normative source-symbol references (traceability only, not authority).
 //! Every symbol below is owned by this module; it was extracted here from the

@@ -1,11 +1,18 @@
 //! Retained launch-artifact leases and approved-path validation.
 //!
-//! Canonical ELIOT anchors: `ELIOT_ARCHITECTURE.md` `A5.5` scopes verifier
-//! inputs and failure applicability, and `A13.2` separates Host, Kernel, and
-//! Watchdog failure domains. `ELIOT_IMPLEMENTATION.md` `I1.2` assigns Host
-//! approved-artifact ownership without project semantics, `I1.8` defines exact
-//! ownership and call paths, `I2.23` requires a bounded extraction closure, and
-//! `B.0` limits Host protocol evidence to immutable artifact/config hashes.
+//! Canonical ELIOT anchors: `A5.5`
+//! (`docs/architecture/A05-05-verifier-and-evaluation-contract.md`) scopes
+//! verifier inputs and failure applicability, and `A13.2`
+//! (`docs/architecture/A13-02-kernel-and-failure-domains.md`) separates Host,
+//! Kernel, and Watchdog failure domains. `I1.2`
+//! (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`)
+//! assigns Host approved-artifact ownership without project semantics, `I1.8`
+//! (`docs/architecture/I01-08-exact-ownership-and-call-paths.md`) defines exact
+//! ownership and call paths, `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`)
+//! requires a bounded extraction closure, and the storage boundary `I5.1`
+//! (`docs/architecture/I05-01-storage-boundary.md`) limits Host protocol evidence
+//! to immutable artifact/config hashes.
 //!
 //! This child only opens and validates already-approved immutable launch
 //! artifacts and returns lease evidence. It cannot create, replace, or delete

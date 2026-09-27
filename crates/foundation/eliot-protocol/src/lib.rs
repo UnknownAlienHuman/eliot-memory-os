@@ -20,7 +20,7 @@ use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
 use eliot_receipts::{ReceiptEnvelope, ReceiptKind, RequestBinding};
 pub use eliot_runtime_contracts::ModuleGeneration as ProtocolModuleGeneration;
-use eliot_runtime_contracts::{ModuleContract, ModuleGeneration};
+use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, RecoveryDirective};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -479,6 +479,8 @@ pub enum MessageType {
     Result,
     /// Publish an event.
     Event,
+    /// Acknowledge one event at an explicit receipt phase.
+    EventAck,
     /// Cancel an operation.
     Cancel,
     /// Quiesce a module.
@@ -552,6 +554,10 @@ pub enum ProtocolPayload {
     VerificationRun(VerificationRun),
     /// Public bounded peer delta owned and validated by C0-06.
     AgentMessage(LivePeerMessage),
+    /// Lifecycle event with stable replay identity and ordering.
+    Event(Box<EventEnvelope>),
+    /// Explicit receiver receipt for a lifecycle event.
+    EventAck(Box<EventAckReceipt>),
 }
 
 impl ProtocolPayload {
@@ -574,6 +580,8 @@ impl ProtocolPayload {
             Self::AgentMessage(message) => message
                 .validate()
                 .map_err(|error| provider_error("eliot-agent-contracts", error)),
+            Self::Event(event) => event.validate(),
+            Self::EventAck(receipt) => receipt.validate(),
         }
     }
 }
@@ -600,6 +608,54 @@ pub struct Frame {
     pub payload: ProtocolPayload,
     /// Non-authoritative trace correlation values.
     pub trace_context: BTreeMap<String, String>,
+}
+
+fn validate_event_message(
+    kind: FrameKind,
+    message_type: MessageType,
+    payload: &ProtocolPayload,
+) -> Result<(), ProtocolError> {
+    match (kind, message_type, payload) {
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Event(_))
+        | (FrameKind::Control, MessageType::EventAck, ProtocolPayload::EventAck(_)) => Ok(()),
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Json(value)) => {
+            let event: EventEnvelope =
+                serde_json::from_value(value.clone()).map_err(|_| ProtocolError::InvalidField {
+                    field: "payload",
+                    reason: "lifecycle Event JSON must encode an EventEnvelope",
+                })?;
+            event.validate()
+        }
+        (_, _, ProtocolPayload::Event(_)) => Err(ProtocolError::InvalidField {
+            field: "kind/message_type",
+            reason: "EventEnvelope payloads require the lifecycle Event frame",
+        }),
+        (_, _, ProtocolPayload::EventAck(_)) => Err(ProtocolError::InvalidField {
+            field: "kind/message_type",
+            reason: "EventAckReceipt payloads require the EventAck control frame",
+        }),
+        (FrameKind::Event, MessageType::Event, _) => Err(ProtocolError::InvalidField {
+            field: "payload",
+            reason: "lifecycle Event frames require an EventEnvelope",
+        }),
+        (FrameKind::Event, _, _) => Err(ProtocolError::InvalidField {
+            field: "message_type",
+            reason: "Event frames require the lifecycle Event message type",
+        }),
+        (_, MessageType::Event, _) => Err(ProtocolError::InvalidField {
+            field: "kind",
+            reason: "lifecycle Event messages require an Event frame",
+        }),
+        (FrameKind::Control, MessageType::EventAck, _) => Err(ProtocolError::InvalidField {
+            field: "payload",
+            reason: "event acknowledgement frames require an EventAckReceipt",
+        }),
+        (_, MessageType::EventAck, _) => Err(ProtocolError::InvalidField {
+            field: "kind",
+            reason: "event acknowledgement messages require a Control frame",
+        }),
+        _ => Ok(()),
+    }
 }
 
 impl Frame {
@@ -631,6 +687,7 @@ impl Frame {
                 });
             }
         }
+        validate_event_message(self.kind, self.message_type, &self.payload)?;
         self.payload.validate()?;
         for (key, value) in &self.trace_context {
             text(key, "trace_context.key")?;
@@ -2896,6 +2953,7 @@ fn is_known_message_type(value: &str) -> bool {
             | "Execute"
             | "Result"
             | "Event"
+            | "EventAck"
             | "Cancel"
             | "Quiesce"
             | "Checkpoint"
@@ -2917,6 +2975,10 @@ pub fn negotiate(
 
 /// Stable wire identity for a versioned P-04 host-request envelope.
 pub const HOST_REQUEST_WIRE_ID: &str = "eliot.protocol.host-request";
+/// Stable wire identity for owner-authored host-request failures.
+pub const AGENT_HOST_REQUEST_FAILURE_WIRE_ID: &str = "eliot.protocol.agent-host-request-failure";
+/// Current host-request failure envelope version.
+pub const AGENT_HOST_REQUEST_FAILURE_WIRE_VERSION: u16 = 1;
 /// Current P-04 host-request envelope wire version.
 pub const HOST_REQUEST_WIRE_VERSION: u16 = 1;
 /// Stable wire identity for a Kernel-issued host-request admission receipt.
@@ -3001,6 +3063,109 @@ pub struct HostRequestIdentity {
     pub payload_schema_id: String,
     /// Lowercase SHA-256 over the exact opaque payload bytes.
     pub payload_sha256: String,
+}
+
+/// Kernel-authored non-success result for a validated host-request identity.
+///
+/// `reason_code` is intentionally open so a bridge can retain codes introduced
+/// by a newer Kernel. `operation_identity` is present only when the Kernel
+/// already has an actual operation identity; it is never derived from the
+/// request identity by a consumer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHostRequestFailure {
+    /// Stable failure-envelope wire identity.
+    pub wire_id: String,
+    /// Failure-envelope wire version.
+    pub wire_version: u16,
+    /// Negotiated EBP version of the correlated request.
+    pub protocol_version: ProtocolVersion,
+    /// Exact canonical digest of the presented request envelope.
+    pub envelope_sha256: String,
+    /// Closed non-success disposition.
+    pub disposition: AgentResponseDisposition,
+    /// Exact owner-issued reason code, open to future values.
+    pub reason_code: String,
+    /// Existing runtime-contract recovery directive owner.
+    pub directive: RecoveryDirective,
+    /// Exact request identity presented to the Kernel.
+    pub request_identity: HostRequestIdentity,
+    /// Actual Kernel operation identity, only when already known.
+    pub operation_identity: Option<String>,
+}
+
+impl AgentHostRequestFailure {
+    /// Current host-request failure envelope version.
+    pub const CONTRACT_VERSION: u16 = AGENT_HOST_REQUEST_FAILURE_WIRE_VERSION;
+
+    /// Validates the complete owner-issued non-success envelope.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_HOST_REQUEST_FAILURE_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_host_request_failure.wire",
+                reason: "unsupported host-request failure envelope",
+            });
+        }
+        self.protocol_version.validate()?;
+        bounded_text(
+            &self.reason_code,
+            "agent_host_request_failure.reason_code",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.envelope_sha256,
+            "agent_host_request_failure.envelope_sha256",
+        )?;
+        self.request_identity.validate()?;
+        bounded_text(
+            &self.directive.reason,
+            "agent_host_request_failure.directive.reason",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.directive.next_action,
+            "agent_host_request_failure.directive.next_action",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.directive.required_authority,
+            "agent_host_request_failure.directive.required_authority",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        for reference in &self.directive.evidence_refs {
+            bounded_text(
+                reference,
+                "agent_host_request_failure.directive.evidence_ref",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        if let Some(operation_identity) = &self.operation_identity {
+            bounded_text(
+                operation_identity,
+                "agent_host_request_failure.operation_identity",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        let encoded = canonical_json_bytes(self).map_err(|_| ProtocolError::InvalidField {
+            field: "agent_host_request_failure",
+            reason: "failure envelope could not be canonicalized",
+        })?;
+        if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_host_request_failure",
+                reason: "failure envelope exceeds the structured-response limit",
+            });
+        }
+        self.directive
+            .validate()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "agent_host_request_failure.directive",
+                reason: "recovery directive is invalid",
+            })?;
+        Ok(())
+    }
 }
 
 impl HostRequestIdentity {

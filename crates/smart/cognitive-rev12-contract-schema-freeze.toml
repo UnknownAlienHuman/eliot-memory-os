@@ -1,12 +1,12 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
-revision = 6
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5"
-supersedes_freeze_digest = "sha256:b9f08ae6ad849e1c808703e711b9ef2acfd5715844f8bacba1aacc0bf2d176b9"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r7"
+revision = 7
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6"
+supersedes_freeze_digest = "sha256:737571ecfba0a1731875a2d66f0dbc863d4a756e983244dacbd266d79738b50c"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
-purpose = "Single versioned upstream projection surface for #223 Wave 1 projection packages. Reuses exact public fields, type owners, version-compatibility rules, scope/fence bindings, and denominator definitions from memory-projection, context, learning, epistemic, dreamer, and observation contracts. No invented authority, no guessed cell mapping."
+purpose = "Single versioned upstream projection surface for #223 Wave 1 projection packages. Reuses exact public fields, type owners, version-compatibility rules, scope/fence bindings, and denominator definitions from memory-projection, context, learning, epistemic, dreamer, observation, cue, and memory-curation contracts. No invented authority, no guessed cell mapping."
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
@@ -480,6 +480,201 @@ crate = "eliot-observation-contracts"
 name = "MAX_OBSERVATION_TEXT"
 value = 1024
 
+# r7: the two W0 families the r6 freeze left at zero rows. Every field list
+# below is read from the current defining struct in the named crate; no type,
+# field, bound or owner is introduced here.
+[[upstream_crate]]
+crate = "eliot-cue-contracts"
+source_path = "crates/smart/eliot-cue-contracts"
+version_scheme = "schema_revision string equality on CONTRACT_REVISION 2.0.0 through is_supported_schema_revision; the A-10 index candidate envelope carries a separate INDEX_CONTRACT_REVISION 1.0.0 equality"
+frozen = true
+role = "Provider-neutral cue vocabulary for the A-11 normalizer, A-12 binding, A-13 index, A-14a activation and A-16a context candidates. Owns schemas, canonical identities and intrinsic validation; runs no normalization algorithm, builds no index, traverses no graph and performs no I/O. Keeps observed source, canonical identity, comparison key, admitted binding, snapshot membership, direct match and relation-derived activation as seven distinct types."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::ObservedCue"
+fields = ["schema_revision", "observed_cue_id", "kind", "original_value", "source", "context"]
+scope_fence_fields = ["context task_id", "context scope_id", "context state_fence"]
+denominator_note = "Observed source material only. It carries no canonical identity, no comparison key, no target handle and no admission, and original_value is the captured text before normalization, never a match result."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::NormalizedCue"
+fields = ["schema_revision", "observed", "profile", "canonical", "comparison_keys", "outcome", "transformation_evidence"]
+denominator_note = "The one record that joins the three upstream seams, and it keeps them in separate fields: observed stays the source material, canonical is the identity, comparison_keys are the keys. NormalizationOutcome is closed to Lossless, and the ordered transformation evidence is bounded by MAX_TRANSFORMATION_STEPS. Keys per identity are bounded by MAX_COMPARISON_KEYS, so identity count is never match count."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::CanonicalCueIdentity"
+fields = ["canonical_cue_id", "kind", "canonical_value", "digest"]
+denominator_note = "Canonical identity only. It names no target handle and no comparison key, so existence of an identity is not accessibility of a target and not a match."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::ComparisonKey"
+fields = ["comparison_key_id", "profile", "key_value", "form", "match_mode"]
+denominator_note = "Comparison key bound to one NormalizationProfile. ComparisonForm and MatchMode are closed enums, so a key is a comparable spelling, not an identity and not a direct match."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::CueBindingCandidate"
+fields = ["binding_candidate_id", "canonical", "target", "role", "freshness", "disposition", "digest"]
+denominator_note = "Proposed canonical-to-target binding. BindingRole is Names/Touched/ExpectedReuse and BindingDisposition is Admitted/Withheld/Rejected, so a proposal is not a binding: admission is carried separately by AdmittedCueBindingProjection with its admission receipt, and a Withheld or Rejected candidate never becomes a member."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::CueSnapshot"
+fields = ["schema_revision", "snapshot_id", "members", "rebuild", "state_fence", "source_revision", "closure"]
+scope_fence_fields = ["state_fence", "source_revision"]
+denominator_note = "Snapshot membership with its RebuildIdentity, so projection state stays rebuildable. A member is a stored canonical identity plus target handle: membership is neither a direct match nor a relation-derived activation, and the snapshot is not editable in place."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::CueSnapshotClosure"
+fields = ["denominator", "rows", "relation_edges", "edge_weights", "fanout"]
+denominator_note = "The closure that makes the snapshot recheckable: rows and relation edges are bounded by the declared CueProjectionDenominator and by CueSnapshotFanout. fanout bounds traversal only; a Complete closure with a nonempty frontier, or truncation with no stated bound, is rejected by the owner."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::DirectActivation"
+fields = ["target", "matched_key", "strength"]
+denominator_note = "Direct match against one comparison key. The activation path is empty because no relation was traversed, which is the frozen statement of exact-cue independence: a result set with zero relation edges still fires on exact keys, and BoundedRelationTraversal is optional, never a precondition for a direct match."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::DerivedActivation"
+fields = ["target", "direct_seed", "path", "depth", "strength"]
+denominator_note = "Relation-derived activation. It always names the direct_seed it descends from and always carries a nonempty path and its depth; a derived activation without a resolvable path is rejected as BrokenActivationPath. Bounded by MAX_DERIVED and MAX_PATH_LEN, and traversal is bounded separately by MAX_RELATION_EDGES."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::ActivationResult"
+fields = ["schema_revision", "request_id", "snapshot_id", "normalization_profile", "state_fence", "observed_at", "deadline_ms", "cancelled", "direct", "derived", "completeness", "trace"]
+scope_fence_fields = ["state_fence"]
+denominator_note = "direct and derived are two separate collections and are never merged into one ranked list. Completeness::Complete asserts the whole denominator was searched with no frontier, so pairing Complete with a frontier is rejected as CompleteWithFrontier, and a bound that stopped the search without a stated frontier is rejected as TruncationWithoutBound. ActivationStrength carries a threshold bound, not a score of usefulness."
+
+[[frozen_type]]
+crate = "eliot-cue-contracts"
+rust_path = "eliot_cue_contracts::CueSnapshotBuildCandidate"
+fields = ["schema_revision", "scope_id", "snapshot", "admitted_bindings", "relation_edges", "proof_ceiling", "build_digest"]
+denominator_note = "The only candidate-shaped record in this family. It is validated against the separate INDEX_CONTRACT_REVISION 1.0.0 and must carry proof_ceiling CandidateArtifact, so a built index stays a candidate artifact and never becomes the canonical cue index on its own."
+
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_COMPARISON_KEYS"
+value = 8
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_TRANSFORMATION_STEPS"
+value = 16
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_SEEDS"
+value = 64
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_RELATION_EDGES"
+value = 4096
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_DIRECT"
+value = 256
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_DERIVED"
+value = 512
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_PATH_LEN"
+value = 8
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_SNAPSHOT_MEMBERS"
+value = 65536
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_TRACE_STEPS"
+value = 1024
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_INVALIDATION_HISTORY"
+value = 64
+[[bound]]
+crate = "eliot-cue-contracts"
+name = "MAX_LINEAGE_SELECTIONS"
+value = 768
+
+[[upstream_crate]]
+crate = "eliot-memory-curation-contracts"
+source_path = "crates/smart/eliot-memory-curation-contracts"
+contract_name = "eliot.smart.memory-curation-screen"
+contract_version = "1.0.0"
+frozen = true
+role = "Provider-neutral read-only memory curation screening contracts: source snapshot, finite denominator, protection assessment, findings, dimension verdicts, eligibility and the screen result. Owns vocabulary and intrinsic validation only; it does not execute a screen, read a store, select a semantic kind, or apply a lifecycle or action transition. Reported disagreement, not resolved here: this crate's own module.toml outputs list names ProtectionReason, which is defined in eliot-dreamer-accessibility and not in this crate, so that name is not a frozen output of this family."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::CurationScreenRequest"
+fields = ["source", "denominator", "partition", "binding", "profile", "cursor", "cancellation_requested"]
+scope_fence_fields = ["binding task_id", "binding attempt_id", "binding scope", "binding state_fence"]
+denominator_note = "Screening request: the source identity and its declared FiniteDenominator, the target/reference partition, the request binding, the ScreenProfile and an optional resume cursor. The request proposes a bounded read; it carries no finding, no protection decision and no action."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::SourceIdentity"
+fields = ["product_id", "source_id", "snapshot_id", "query", "revision", "digest", "scope", "state_fence"]
+scope_fence_fields = ["scope", "state_fence"]
+denominator_note = "Immutable owner source identity at one revision and digest. Every result revalidates against it, so a screen bound to a drifted source revision is a BindingMismatch rather than a quiet refresh."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::FiniteDenominator"
+fields = ["coverage", "total_members", "declared_member_ids"]
+denominator_note = "Declared member denominator for one screen. DenominatorCoverage Complete is accepted only when total_members equals the length of the unique declared_member_ids, and total_members below the observed page is rejected, so a count can never be larger than the members it declares."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::ScreenCoverage"
+fields = ["denominator", "start_position", "members", "frontier", "usage", "next_cursor", "digest"]
+denominator_note = "Per-member accounting: every observed member has exactly one MemberDisposition, the frontier names where a bounded screen resumes, and the next cursor pins the resume position and usage. Coverage member identities must be a subset of the source members, and the immutable-reference disposition is reconciled against the partition, so mixed-lineage target/reference influence stays visible instead of merged."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::CurationFinding"
+fields = ["finding_id", "source", "profile_id", "member_id", "rule_id", "class", "evidence", "invariant", "proof", "invalidated_by", "digest"]
+denominator_note = "Structural evidence about one member under one profile rule. FindingClass is a closed set (Duplicate, StaleSuperseded, MalformedIncomplete, ProvenanceGap, ProtectionGap, ConflictAmbiguity, BoundedOut, Unprocessed) and FindingProof separates Deterministic, Observed and Unknown, so an unproven finding cannot read as a deterministic one. A finding states evidence; it applies nothing."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::ProtectionAssessment"
+fields = ["source", "member_id", "applicable_rule_ids", "required", "evidence", "decision"]
+denominator_note = "Protection is assessed independently of the finding that flagged a member. ProtectionDecision is Unprotected/Protected/Unknown and ProtectionEvidenceState separates CurrentVerified, Stale, Missing, Malformed, Unavailable and Unknown, so a missing protection record is Unknown rather than Unprotected, and DisclosureCeiling bounds what may leave the boundary. A Protected member stays protected regardless of any other verdict."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::Eligibility"
+fields = ["source", "member_id", "protection", "finding_ids", "status"]
+denominator_note = "Neutral eligibility decision per member, carrying the protection decision and the finding identities it was derived from. EligibilityStatus keeps EligibleForSemanticCuration distinct from Protected, Malformed, StaleUnavailable, OutsideScope, IncompleteTruncated and UnknownBlocked, so eligibility is not authority and never names a lifecycle action."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::MemberSets"
+fields = ["changed_targets", "immutable_references"]
+denominator_note = "The target/reference boundary for later fan-in. The two sets must be disjoint, so a member cannot be proposed for change and simultaneously held as an immutable reference, which is how mixed-lineage influence stays bounded."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts::CurationScreenResult"
+fields = ["request", "source", "findings", "protection", "eligibility", "coverage", "member_sets", "state", "result_digest"]
+scope_fence_fields = ["request binding", "source state_fence"]
+denominator_note = "Read-only screen result for a later semantic curation owner. ResultState is Complete, Partial, Blocked or Unknown, and Complete is accepted only when the source denominator is complete, the frontier is empty, the coverage order equals the source member order, and no resume cursor is present; incomplete, truncated or blocked evidence therefore yields Partial, Blocked or Unknown and never Complete by default. The result applies no lifecycle change and grants no authority."
+
+[[frozen_type]]
+crate = "eliot-memory-curation-contracts"
+rust_path = "eliot_memory_curation_contracts enums"
+fields = ["CurationDimension{Existence, Support, Lifecycle, Accessibility, PermittedInfluence}", "DimensionOutcome{Clear, Flagged, Protected, Unknown, Reference}", "MemberDisposition{Eligible, Protected, Blocked, PreservedReference, Unprocessed}", "ResultState{Complete, Partial, Blocked, Unknown}", "ProtectionClass{CurrentTruth, MinorityDissent, Counterexample, UnresolvedConflict, NegativeMemory, AuditHistory, RetentionErasure, ProtectedDependency}"]
+denominator_note = "The five curation dimensions are separate verdicts on separate axes and no one of them implies another: existence, support, lifecycle, accessibility and permitted influence each carry their own DimensionOutcome per member, and Clear on one axis never stands in for Unknown on another."
+
 [[version_rule]]
 id = "VR-EXACT-CONTRACT-VERSION"
 rule = "A record, batch, set, or view written against a different ContractVersion triple is rejected with VersionMismatch. Equality only; no range, no negotiation."
@@ -515,6 +710,16 @@ id = "VR-EXACT-CONTRACT-VERSION-EXT"
 rule = "Same equality rule as VR-EXACT-CONTRACT-VERSION, extended to the observation family admitted in r3."
 applies_to = ["eliot-observation-contracts"]
 
+[[version_rule]]
+id = "VR-CUE-SCHEMA-REVISION"
+rule = "Cue records validate their schema_revision by string equality against CONTRACT_REVISION 2.0.0 through is_supported_schema_revision, and the A-10 index candidate envelope validates its own INDEX_CONTRACT_REVISION 1.0.0 equality. Equality only; a payload written against a retired revision is rejected by current decoding rather than interpreted under the current shape. Admitted in r7."
+applies_to = ["eliot-cue-contracts"]
+
+[[version_rule]]
+id = "VR-CURATION-CONTRACT-VERSION"
+rule = "The screen surface is the eliot_contracts ContractVersion triple 1.0.0 and ScreenProfile.schema_revision is matched exactly, under CONTRACT_NAME eliot.smart.memory-curation-screen. Deny-unknown-fields plus the closed FindingClass, MemberDisposition, ResultState and ProtectionClass sets make an unknown field or an unknown variant fail closed at the boundary. Legacy action and lifecycle fields are rejected on the current schema, not mapped onto a current field. Admitted in r7."
+applies_to = ["eliot-memory-curation-contracts"]
+
 [[denominator]]
 id = "DEN-MEMORY-BATCH"
 definition = "DenominatorState::Known{total} over the read-side observed volume at the named batch fence, with explicit truncation frontier, named omissions, and revalidation flag. Every Complete state requires this exact independently recheckable denominator."
@@ -539,6 +744,16 @@ owner = "eliot-epistemic-contracts"
 id = "DEN-EXPERIENCE-COVERAGE"
 definition = "Owner coverage binding per envelope: disposition plus denominator source ref plus coverage digest plus observed count plus explicit blind intervals. Carried members reconciling against observed volume is necessary but never sufficient; completeness additionally requires the owner Complete posture with exact count, empty omissions, and empty blind intervals. Bare counts never establish completeness."
 owner = "eliot-observation-contracts"
+
+[[denominator]]
+id = "DEN-CUE-SNAPSHOT-CLOSURE"
+definition = "CueProjectionDenominator{expected_rows, expected_edges, omitted_rows, omitted_edges, row_omissions, edge_omissions, source_revision} per snapshot closure. Every omitted row and every omitted edge is named by a CueProjectionOmission{identity, kind, reason} drawn from the closed CueProjectionOmissionReason set, so an omission is a value and not a free-form reason string. Row and edge totals are reconciled against the declared expected counts and bounded by CueSnapshotFanout; counts alone never establish closure, and a source_revision drift invalidates the denominator rather than refreshing it silently."
+owner = "eliot-cue-contracts"
+
+[[denominator]]
+id = "DEN-CURATION-SCREEN"
+definition = "FiniteDenominator{coverage, total_members, declared_member_ids} per screen request, with DenominatorCoverage Complete accepted only when total_members equals the unique declared member identity count. ScreenCoverage adds the per-member disposition, the frontier, the resume position and the accumulated work usage, and the coverage member identities must be a subset of the source members. A ResultState Complete claim additionally requires a complete source denominator, an empty frontier, coverage order equal to source member order, and no resume cursor, so unknown, blocked, truncated or unprocessed evidence cannot become Complete by default."
+owner = "eliot-memory-curation-contracts"
 
 [[cell_binding]]
 order = 44
@@ -574,6 +789,20 @@ crate = "eliot-epistemic-contracts"
 functional_cell = "smart.epistemic.contracts"
 frozen_inputs = []
 frozen_outputs = ["CurrentEpistemicPosition", "ProviderContribution"]
+
+[[cell_binding]]
+order = 10
+crate = "eliot-cue-contracts"
+functional_cell = "smart.cue.contracts"
+frozen_inputs = ["observed source material", "StateFence", "NormalizationProfile", "admitted binding receipts"]
+frozen_outputs = ["ObservedCue", "NormalizedCue", "CanonicalCueIdentity", "ComparisonKey", "CueBindingCandidate", "CueSnapshot", "CueSnapshotClosure", "CueSnapshotBuildCandidate", "ActivationResult"]
+
+[[cell_binding]]
+order = 19
+crate = "eliot-memory-curation-contracts"
+functional_cell = "smart.memory.curation_contracts"
+frozen_inputs = ["canonical memory projection handles", "StateFence", "bounded scan metadata"]
+frozen_outputs = ["CurationScreenRequest", "CurationScreenResult", "CurationFinding", "ScreenCoverage", "FiniteDenominator"]
 
 [[cell_binding]]
 order = 76

@@ -114,6 +114,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Scoped, candidate-only provider-memory feed contracts and read outcomes.
+pub mod provider_memory_feed;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{

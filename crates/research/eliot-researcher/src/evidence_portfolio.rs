@@ -51,7 +51,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_research_exchange_api::{CompletionDisposition, DisclosureClass, SourceClass};
+use eliot_research_exchange_api::{
+    AllowedReferenceManifest, CompletionDisposition, DisclosureClass, ResearchContractError,
+    SourceClass,
+};
 use serde::{Serialize, Serializer};
 
 /// Stable identity of this discipline surface.
@@ -178,6 +181,65 @@ pub enum PortfolioError {
         field: &'static str,
     },
 }
+
+/// Why one claim-audit job refused its run-bound reference authorization.
+///
+/// I21.7 opens the reference firewall with "Every Dreamer, Researcher, audit,
+/// local-model and external-model job receives an `AllowedReferenceManifest`
+/// bound to the exact run and State Fence", so refusing that binding is a
+/// distinct, typed failure rather than one more field error on
+/// [`PortfolioError`]. Both layers' own errors are carried whole: a refusal here
+/// must not be reachable by collapsing [`ResearchContractError`] or
+/// [`PortfolioError`] into a string, because "the run-bound manifest does not
+/// match its own digest" and "the authorized manifest does not match its own
+/// digest" are different facts about a different owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuditBindingError {
+    /// The frozen authorized manifest refused its own re-proof.
+    AuthorizedManifest {
+        /// The refusal the portfolio owner raised, carried unchanged.
+        cause: PortfolioError,
+    },
+    /// The run-bound `AllowedReferenceManifest` refused its own re-proof.
+    RunReferenceManifest {
+        /// The refusal the exchange contract owner raised, carried unchanged.
+        cause: ResearchContractError,
+    },
+    /// The audit job's State Fence is not the fence its run-bound manifest froze.
+    ///
+    /// I21.7 requires the manifest to be bound to the exact run *and* State
+    /// Fence, so a job that ran under a stale fence and was handed a manifest
+    /// frozen under a later one is refused here rather than audited: every
+    /// verdict it could produce would be about a run that did not happen.
+    FenceMismatch {
+        /// Failing field path.
+        field: &'static str,
+    },
+}
+
+impl std::fmt::Display for AuditBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthorizedManifest { cause } => {
+                write!(f, "authorized manifest refused the audit binding: {cause}")
+            }
+            Self::RunReferenceManifest { cause } => {
+                write!(
+                    f,
+                    "run-bound reference manifest refused the audit binding: {cause}"
+                )
+            }
+            Self::FenceMismatch { field } => {
+                write!(
+                    f,
+                    "{field} is not the State Fence the run-bound manifest froze"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuditBindingError {}
 
 impl std::fmt::Display for PortfolioError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4015,6 +4077,32 @@ pub enum PrecisionKind {
     Version,
     /// Causal mechanism assertion.
     Causal,
+    /// Line-anchored assertion: the claimed line or line range of a citation.
+    ///
+    /// I21.7 names a *line* among the four things a file-level or
+    /// document-level support does not automatically support, and
+    /// [`Self::Coordinate`] already carries the general form of that rule over
+    /// the whole anchor ladder. This arm names the line rung so the residue says
+    /// *which* overreach it was instead of collapsing a false line anchor into an
+    /// unnamed coordinate, and it reads the ladder through the one
+    /// [`coordinate_rank`] owner rather than keeping a second rank table for the
+    /// single rung — the same single-owner reason
+    /// [`Self::Causal`] gives for reusing the declared-set form.
+    ///
+    /// The `line` and `byte_range` rungs this arm ranks against are the ones
+    /// `eliot_research_exchange_api::AnchorPrecision` spells, so this crate
+    /// never carries a rung the contract type cannot express.
+    Line,
+    /// Population-wide assertion: the population the statement holds for.
+    ///
+    /// A population is not a position inside a source, so this rung deliberately
+    /// has no place on the anchor ladder and must not be given one. It is
+    /// supported only when the support *declares* the asserted population, in
+    /// the same `|`-separated declared-set form [`Self::Causal`] already reads
+    /// for mechanisms: a document that happens to discuss a population does not
+    /// thereby evidence a statement about all of it, and an undeclared
+    /// population is refused rather than inferred from the basis prose.
+    Population,
     /// Coordinate/anchor assertion: the claimed anchor precision of a citation.
     ///
     /// I21.7: "A source that supports a file-level or document-level claim does
@@ -4022,6 +4110,12 @@ pub enum PrecisionKind {
     /// population-wide statement." The coordinate form of that rule is this
     /// kind: a citation may not claim an anchor finer than the support it
     /// actually carries.
+    ///
+    /// This is the ladder-wide arm; [`Self::Line`] is the named line rung of the
+    /// same rule. The `symbol` rung I21.7 lists beside `line` has no arm here
+    /// and no rung on `AnchorPrecision` either, so a symbol claim is
+    /// unrepresentable on this path rather than checked against a rank table the
+    /// contract type does not own.
     Coordinate,
 }
 
@@ -4063,6 +4157,12 @@ pub struct UnsupportedPrecisionItem {
 /// `source` is the coarsest anchor and `byte_range` the finest. A spelling this
 /// function does not know has no rank, and an unknown rank is never treated as
 /// coarse enough to admit a fine anchor.
+///
+/// This is the single rank table in this crate, shared by
+/// [`PrecisionKind::Coordinate`] and [`PrecisionKind::Line`]. It is derived from
+/// `AnchorPrecision`, not owned by it, so a rung may be added here only when
+/// `AnchorPrecision` carries the same spelling — the `symbol` rung I21.7 names
+/// is absent from both, which is why no arm ranks it.
 fn coordinate_rank(name: &str) -> Option<u8> {
     match name {
         "source" => Some(0),
@@ -4191,15 +4291,26 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             .supported
             .split('|')
             .any(|mechanism| mechanism.trim() == assertion.asserted.trim()),
-        PrecisionKind::Coordinate => match (
+        // The line rung and the ladder-wide coordinate form are ONE comparison
+        // on purpose: they differ only in the residue they produce, and a
+        // separate rank table for the single rung would be the second,
+        // differently shaped vocabulary the `Coordinate` doc comment exists to
+        // prevent. An unrecognised spelling is never treated as supported for
+        // either: an unknown rank fails closed.
+        PrecisionKind::Line | PrecisionKind::Coordinate => match (
             coordinate_rank(assertion.asserted.trim()),
             coordinate_rank(assertion.supported.trim()),
         ) {
-            // An unrecognised coordinate spelling is never treated as supported:
-            // an unknown rank fails closed rather than falling back to equality.
             (Some(asserted_rank), Some(supported_rank)) => asserted_rank <= supported_rank,
             _ => false,
         },
+        // Declared-set membership, on the delimiter `Causal` already reads. The
+        // support has to name the population; nothing is inferred from the basis
+        // prose or from the asserted value's own shape.
+        PrecisionKind::Population => assertion
+            .supported
+            .split('|')
+            .any(|population| population.trim() == assertion.asserted.trim()),
     };
     if supported {
         Ok(())
@@ -4220,6 +4331,17 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             PrecisionKind::Causal => (
                 "false causal mechanism without evidenced mechanism",
                 "name only evidenced mechanisms or declare correlation",
+            ),
+            PrecisionKind::Line => (
+                "a citation anchored at a line or line range finer than the admitted support would \
+                 be unbacked text",
+                "narrow the anchor to the supported precision or admit a source that supports it",
+            ),
+            PrecisionKind::Population => (
+                "a population-wide claim from support that declares a different or narrower \
+                 population",
+                "restate at the population the admitted coverage declares, or admit coverage of \
+                 the claimed population",
             ),
             PrecisionKind::Coordinate => (
                 "a citation at an anchor finer than the admitted support would be unbacked text",
@@ -4997,8 +5119,16 @@ pub enum CounterclaimDisposition {
     /// The handle is allowlisted but explicitly revoked, so it cannot be
     /// verified as counterevidence and is not merely absent.
     Revoked,
-    /// The handle is outside the frozen manifest.
+    /// The handle is outside the frozen authorized manifest.
     OutsideManifest,
+    /// The authorized manifest admits the handle, but this run's
+    /// `AllowedReferenceManifest` does not.
+    ///
+    /// A distinct finding from [`Self::OutsideManifest`] and from
+    /// [`Self::Revoked`]: the evidence exists and is committed, and this run was
+    /// simply never authorized to quote it. I21.7 keeps the four apart because
+    /// only one of them is fixable by acquisition.
+    UnadmittedByRunManifest,
     /// No authoritative lineage stands behind the handle.
     UnresolvedLineage,
     /// The record does not cover the claim's authority domain.
@@ -5022,6 +5152,7 @@ impl CounterclaimDisposition {
             Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
             Self::Revoked => "REVOKED",
             Self::OutsideManifest => "OUTSIDE_MANIFEST",
+            Self::UnadmittedByRunManifest => "UNADMITTED_BY_RUN_MANIFEST",
             Self::UnresolvedLineage => "UNRESOLVED_LINEAGE",
             Self::OutsideDomain => "OUTSIDE_DOMAIN",
             Self::Stale => "STALE",
@@ -5077,6 +5208,17 @@ pub enum HandleStanding {
     Revoked,
     /// The manifest never admitted this handle.
     OutsideManifest,
+    /// The manifest admitted this handle, but the run's reference manifest does
+    /// not.
+    ///
+    /// Distinct from [`Self::OutsideManifest`] because the two are different
+    /// facts: the authorized manifest never admitted this handle, while the
+    /// authorized manifest did admit it and the run was never authorized to
+    /// quote it. I21.7: "A model may quote, summarize or select only entries in
+    /// this manifest", so a citable handle the run's own
+    /// `AllowedReferenceManifest` does not admit cannot support a claim in that
+    /// run no matter how completely the authorized manifest commits it.
+    UnadmittedByRunManifest,
     /// The manifest admits this handle, but the portfolio holds no record for it.
     Unresolved,
     /// The portfolio holds a record for this handle that no longer matches the
@@ -5193,6 +5335,27 @@ pub struct ClaimVerdict {
     /// Empty when the claim carried no frozen identity, which is itself a reason
     /// the verdict cannot be `Supported`.
     pub claim_identity_digest: String,
+    /// Run identity the audit job was authorized under.
+    ///
+    /// I21.7: an audit job receives an `AllowedReferenceManifest` bound to the
+    /// exact run, so a verdict that does not name its run cannot be checked
+    /// against the run it claims to describe. Empty is impossible here: the
+    /// binding refuses a blank run identity and `audit_claim` takes no other
+    /// route to a verdict.
+    pub run_id: String,
+    /// Root context revision the audit job was authorized under.
+    pub root_context_revision: String,
+    /// Digest of the run-bound reference manifest the audit job was authorized
+    /// under.
+    ///
+    /// This one field is what transitively binds the manifest's URL, tool,
+    /// verifier and expansion-route allowlists, its anchor-precision ceiling and
+    /// its scope, disclosure and retention classes: the exchange contract computes
+    /// that digest over all of them, and re-proving it is the audit's
+    /// precondition.
+    pub run_reference_manifest_digest: String,
+    /// State Fence the audit job ran under.
+    pub state_fence: StateFence,
 }
 
 /// One named dimension the claim audit examined.
@@ -5721,34 +5884,277 @@ struct AuthorizedManifestDigestInput<'a> {
     manifest: &'a AuthorizedManifest,
 }
 
+/// The run-bound reference authorization one claim-audit job runs under
+/// (I21.7).
+///
+/// I21.7 opens with "Every Dreamer, Researcher, audit, local-model and
+/// external-model job receives an `AllowedReferenceManifest` bound to the exact
+/// run and State Fence", and an `AllowedReferenceManifest` is the only type in
+/// this repository carrying that binding. [`AuthorizedManifest`] does not: it has
+/// no `run_id`, no `root_context_revision`, no State Fence, and no URL, tool,
+/// verifier or expansion-route allowlist. An audit job handed one was therefore
+/// authorized against nothing that identified a run, which is what let a verdict
+/// be produced for a run it did not belong to.
+///
+/// This pairs the two and refuses to exist unless they agree, so the audit
+/// entry point cannot be reached without the run binding:
+///
+/// * the [`AuthorizedManifest`] re-proves against its own frozen digest;
+/// * the [`AllowedReferenceManifest`] re-proves against its own, which is
+///   computed over every field that can change what a citation is allowed to say
+///   — the run identity, the root context revision, the State Fence, all five
+///   allowlists, the precision ceiling, the scope/disclosure/retention classes,
+///   the stale-or-revoked set and the expansion routes. Those are bound
+///   *transitively* by the digest this value stores, and are deliberately not
+///   duplicated into fields here: a second copy could disagree with the manifest
+///   it claims to mirror;
+/// * the caller states the State Fence the job actually ran under, and it must
+///   equal the manifest's own. A job that ran under a stale fence and was handed
+///   another fence's manifest is refused rather than audited.
+///
+/// Every field is private, so the only way to obtain a value is [`Self::bind`],
+/// and readback re-proves both manifests through [`Self::verify_integrity`] at
+/// the audit entry point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditReferenceBinding {
+    /// The frozen authorized manifest the audit grades against.
+    authorized: AuthorizedManifest,
+    /// The run-bound reference manifest the audit job is authorized under.
+    allowed_references: AllowedReferenceManifest,
+    /// The State Fence the audit job ran under, proven equal to the manifest's.
+    state_fence: StateFence,
+    /// Digest over the binding shape, with both manifest digests inside.
+    digest: String,
+}
+
+impl AuditReferenceBinding {
+    /// Binds one audit job to the exact run and State Fence it may judge under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditBindingError`] when either manifest fails its own
+    /// re-proof, or when `state_fence` is not the fence
+    /// `allowed_references` froze. Both refusals are typed and carry the owning
+    /// layer's error unchanged.
+    pub fn bind(
+        authorized: AuthorizedManifest,
+        allowed_references: AllowedReferenceManifest,
+        state_fence: StateFence,
+    ) -> Result<Self, AuditBindingError> {
+        authorized
+            .verify_integrity()
+            .map_err(|cause| AuditBindingError::AuthorizedManifest { cause })?;
+        allowed_references
+            .validate()
+            .map_err(|cause| AuditBindingError::RunReferenceManifest { cause })?;
+        if state_fence != allowed_references.state_fence {
+            return Err(AuditBindingError::FenceMismatch {
+                field: "audit.state_fence",
+            });
+        }
+        let mut binding = Self {
+            authorized,
+            allowed_references,
+            state_fence,
+            digest: String::new(),
+        };
+        binding.digest = binding.canonical_digest();
+        Ok(binding)
+    }
+
+    /// The frozen authorized manifest, for the audit's own classification.
+    pub fn authorized(&self) -> &AuthorizedManifest {
+        &self.authorized
+    }
+
+    /// The run-bound reference manifest.
+    pub fn allowed_references(&self) -> &AllowedReferenceManifest {
+        &self.allowed_references
+    }
+
+    /// The State Fence this audit job was authorized under.
+    pub fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Digest of the run-bound reference manifest this job was authorized under.
+    ///
+    /// This is the identity a later reader checks to learn *which* run's
+    /// references the verdict was decided under.
+    pub fn run_reference_manifest_digest(&self) -> &str {
+        &self.allowed_references.digest
+    }
+
+    /// Run identity this binding is bound to.
+    pub fn run_id(&self) -> &str {
+        &self.allowed_references.run_id
+    }
+
+    /// Root context revision this binding is bound to.
+    pub fn root_context_revision(&self) -> &str {
+        &self.allowed_references.root_context_revision
+    }
+
+    /// Canonical digest over the binding shape.
+    ///
+    /// The authorized manifest's own digest and the run-bound manifest's own
+    /// digest are both inside the preimage, so this identity moves if either
+    /// manifest is re-sealed, and the two cannot be swapped for one another.
+    ///
+    /// Infallible, and deliberately so: the preimage is built from
+    /// [`fence_preimage`] and two already-computed digests through the crate's
+    /// infallible field encoder, so there is no encoding step that can refuse.
+    /// Returning a `Result` here would be a refusal no caller could ever
+    /// distinguish from success.
+    pub fn canonical_digest(&self) -> String {
+        let mut preimage = String::from("audit-reference-binding/v1;");
+        push_field(
+            &mut preimage,
+            "authorized_manifest_digest",
+            &self.authorized.digest,
+        );
+        push_field(
+            &mut preimage,
+            "run_reference_manifest_digest",
+            &self.allowed_references.digest,
+        );
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
+        freeze(&preimage)
+    }
+
+    /// Re-proves both manifests and the binding's own digest.
+    ///
+    /// Readback, not admission: [`Self::bind`] already proved both manifests, so
+    /// this catches a binding whose parts were re-sealed after it was made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditBindingError`] on the same conditions as [`Self::bind`],
+    /// plus [`AuditBindingError::AuthorizedManifest`] for a binding whose own
+    /// recorded digest no longer matches its parts.
+    pub fn verify_integrity(&self) -> Result<(), AuditBindingError> {
+        self.authorized
+            .verify_integrity()
+            .map_err(|cause| AuditBindingError::AuthorizedManifest { cause })?;
+        self.allowed_references
+            .validate()
+            .map_err(|cause| AuditBindingError::RunReferenceManifest { cause })?;
+        if self.state_fence != self.allowed_references.state_fence {
+            return Err(AuditBindingError::FenceMismatch {
+                field: "audit.state_fence",
+            });
+        }
+        if self.canonical_digest() != self.digest {
+            return Err(AuditBindingError::AuthorizedManifest {
+                cause: PortfolioError::InvalidDigest {
+                    field: "audit.binding_digest",
+                },
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Length-prefixed canonical spelling of one State Fence.
+///
+/// `push_field` is the crate's single field encoder and `UnadmittedReference`
+/// already fixes the fence encoding in this crate as one `push_field` per
+/// component under the `StateFence` field names, with an absent optional
+/// revision spelled `none`. This is that same encoding expressed once, so the
+/// audit binding and the retained reference diagnostic cannot disagree about how
+/// a fence is digested. `canonical_json_bytes` is deliberately not used here:
+/// it would bind the *type's* serde shape, and this preimage is a declared
+/// contract of this crate's own.
+pub(crate) fn fence_preimage(fence: &StateFence) -> String {
+    let mut preimage = String::new();
+    push_field(
+        &mut preimage,
+        "authority_epoch_lineage",
+        fence.authority_epoch.lineage_id.as_str(),
+    );
+    push_field(
+        &mut preimage,
+        "authority_epoch_sequence",
+        &fence.authority_epoch.sequence.to_string(),
+    );
+    push_field(
+        &mut preimage,
+        "resource_generation",
+        &fence.resource_generation.value().to_string(),
+    );
+    // The three optional revisions have three DISTINCT types, so each is spelled
+    // out rather than iterated: an array would require one element type and would
+    // either coerce or fail to compile.
+    for (tag, revision) in [
+        (
+            "task_revision",
+            fence.task_revision.map(|value| value.value().to_string()),
+        ),
+        (
+            "policy_revision",
+            fence.policy_revision.map(|value| value.value().to_string()),
+        ),
+        (
+            "integration_revision",
+            fence
+                .integration_revision
+                .map(|value| value.value().to_string()),
+        ),
+    ] {
+        match revision {
+            Some(value) => push_field(&mut preimage, tag, &value),
+            None => push_field(&mut preimage, tag, "none"),
+        }
+    }
+    preimage
+}
+
 /// Derives the one standing `handle` holds inside `claim`'s audit.
 ///
-/// The inputs are exactly the four facts the two partitions used to read
+/// The inputs are exactly the facts the two partitions used to read
 /// separately, which is why they could disagree: whether the frozen manifest
-/// revoked the handle, whether its allowlist admits it, whether the portfolio
-/// resolves it to a record the manifest still commits, and whether the claim
-/// itself lists it as a citation. Nothing here reads freshness, grade,
-/// authority domain, evidence weight or the caller's counterclaim list: those
-/// are eligibility and evidence questions, they belong to the partition that
-/// raises them, and treating any of them as opposition is the inference
-/// `#2874` forbids.
+/// revoked the handle, whether its allowlist admits it, whether the run's own
+/// `AllowedReferenceManifest` admits it, whether the portfolio resolves it to a
+/// record the manifest still commits, and whether the claim itself lists it as a
+/// citation. Nothing here reads freshness, grade, authority domain, evidence
+/// weight or the caller's counterclaim list: those are eligibility and evidence
+/// questions, they belong to the partition that raises them, and treating any of
+/// them as opposition is the inference `#2874` forbids.
 ///
 /// The function is pure, so the citation loop and the opposition loop can each
 /// call it and get the same value; that is the whole repair. Revocation is
 /// tested before anything else, so a handle the manifest withdrew is reported as
 /// revoked by both partitions instead of being "outside" on one side and "also
 /// a citation" on the other.
+///
+/// The run-bound check sits immediately after authorized-manifest membership and
+/// before any record lookup, because it is a question about *this run* rather
+/// than about the evidence: a handle the run was never authorized to quote has no
+/// standing here whatever the portfolio holds, so reading the record first would
+/// do work whose answer cannot change the standing.
 fn classify_handle(
     handle: &str,
     claim: &AuditedClaim,
     portfolio: &EvidencePortfolio,
-    manifest: &AuthorizedManifest,
+    binding: &AuditReferenceBinding,
 ) -> HandleStanding {
+    let manifest = binding.authorized();
     if manifest.revoked.iter().any(|revoked| revoked == handle) {
         return HandleStanding::Revoked;
     }
     if !manifest.allowlist.iter().any(|allowed| allowed == handle) {
         return HandleStanding::OutsideManifest;
+    }
+    // I21.7: a model may quote, summarize or select only entries in the
+    // run-bound manifest. `allows` already applies that manifest's
+    // stale-or-revoked set, so this single call covers both non-membership and
+    // revocation on the run side.
+    if !binding.allowed_references().allows(handle) {
+        return HandleStanding::UnadmittedByRunManifest;
     }
     let Some(record) = portfolio.records.get(handle) else {
         return HandleStanding::Unresolved;
@@ -5767,7 +6173,7 @@ fn classify_handle(
 
 /// The disposition a standing forces, for the standings that force one.
 ///
-/// Four of the six standings are decided from the manifest and the record
+/// Five of the seven standings are decided from the manifests and the record
 /// alone, so what the opposition partition reports for them is not a judgement
 /// it is free to make: a revoked handle reports `Revoked` whether or not it is
 /// also a citation, and a handle with no provable record reports
@@ -5779,6 +6185,9 @@ fn forced_disposition(standing: HandleStanding) -> Option<CounterclaimDispositio
     match standing {
         HandleStanding::Revoked => Some(CounterclaimDisposition::Revoked),
         HandleStanding::OutsideManifest => Some(CounterclaimDisposition::OutsideManifest),
+        HandleStanding::UnadmittedByRunManifest => {
+            Some(CounterclaimDisposition::UnadmittedByRunManifest)
+        }
         HandleStanding::Unresolved | HandleStanding::SubstitutedRecord => {
             Some(CounterclaimDisposition::UnresolvedLineage)
         }
@@ -5806,11 +6215,11 @@ fn resolve_counterclaim(
     counterclaim_id: &str,
     claim: &AuditedClaim,
     portfolio: &EvidencePortfolio,
-    manifest: &AuthorizedManifest,
+    binding: &AuditReferenceBinding,
     now_ms: i64,
     residue: &mut Vec<String>,
 ) -> CounterclaimDisposition {
-    match classify_handle(counterclaim_id, claim, portfolio, manifest) {
+    match classify_handle(counterclaim_id, claim, portfolio, binding) {
         HandleStanding::Revoked => {
             residue.push(format!(
                 "claim: counterclaim {counterclaim_id} is revoked and cannot be verified"
@@ -5822,6 +6231,13 @@ fn resolve_counterclaim(
                 "claim: counterclaim {counterclaim_id} outside frozen manifest"
             ));
             return CounterclaimDisposition::OutsideManifest;
+        }
+        HandleStanding::UnadmittedByRunManifest => {
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} is not admitted by this run's reference \
+                 manifest and cannot be verified"
+            ));
+            return CounterclaimDisposition::UnadmittedByRunManifest;
         }
         HandleStanding::Unresolved | HandleStanding::SubstitutedRecord => {
             residue.push(format!(
@@ -6051,38 +6467,49 @@ fn verified_opposition(
     Some(CounterclaimDisposition::Contradicts)
 }
 
-/// Audits one already-structured claim against the frozen portfolio and
-/// manifest: exact membership, authoritative lineage, scope/time/version/
-/// quantity/causal/absence compatibility and complete material-claim
-/// accounting. Unsupported precision, outside-manifest references and
-/// insufficient coverage remain typed residue. Counterevidence and unknowns
+/// Audits one already-structured claim against the frozen portfolio and the
+/// run-bound reference authorization: exact membership, authoritative lineage,
+/// scope/time/version/quantity/causal/absence compatibility and complete
+/// material-claim accounting. Unsupported precision, outside-manifest references
+/// and insufficient coverage remain typed residue. Counterevidence and unknowns
 /// are preserved, never smoothed.
+///
+/// `binding` is an [`AuditReferenceBinding`], not a bare
+/// [`AuthorizedManifest`], and that is the point rather than a convenience: an
+/// `AllowedReferenceManifest` is the only type that names a run and its State
+/// Fence, so accepting the authorized manifest alone would let this audit run —
+/// and return a `ClaimOutcome::Supported` — against a manifest frozen for a
+/// different run under a fence that was never this job's. [`Self`] now names its
+/// run on the verdict, and a citation the run's manifest does not admit cannot
+/// reach `Supported` through any path.
 ///
 /// Every handle this claim names — cited or alleged counterevidence alike — is
 /// classified once by `classify_handle`, and the citation loop below and
-/// [`resolve_counterclaim`] both read that one value. Revocation, non-admission
-/// and unavailable evidence are therefore decided in exactly one place and
-/// reported the same way on both sides, and the de-duplicated record of it is
-/// [`ClaimVerdict::handle_resolutions`].
+/// [`resolve_counterclaim`] both read that one value. Revocation, non-admission,
+/// run-bound non-admission and unavailable evidence are therefore decided in
+/// exactly one place and reported the same way on both sides, and the
+/// de-duplicated record of it is [`ClaimVerdict::handle_resolutions`].
 #[allow(clippy::too_many_lines)]
 pub fn audit_claim(
     claim: &AuditedClaim,
     portfolio: &EvidencePortfolio,
-    manifest: &AuthorizedManifest,
+    binding: &AuditReferenceBinding,
     now_ms: i64,
 ) -> ClaimVerdict {
+    let manifest = binding.authorized();
     let mut residue: Vec<String> = Vec::new();
     let mut supporting: Vec<&SourceRecord> = Vec::new();
     let mut evidence_map: Vec<String> = Vec::new();
     let mut unsupported_precision: Vec<UnsupportedPrecisionItem> = Vec::new();
     let mut stale_hit = false;
-    // A manifest whose bytes no longer hash to the digest frozen beside them is
-    // not the manifest that was authorized: an expiry widened, a revocation
-    // cleared or a handle re-admitted after the freeze all leave every field
-    // individually well-formed. The audit refuses to derive anything from it,
-    // which is a different failure from a citation being individually
+    // A binding whose parts no longer re-prove is not the authorization this
+    // claim was judged under, and neither is an authorized manifest whose bytes
+    // no longer hash to the digest frozen beside them: an expiry widened, a
+    // revocation cleared or a handle re-admitted after the freeze all leave every
+    // field individually well-formed. The audit refuses to derive anything from
+    // it, which is a different failure from a citation being individually
     // unverifiable, so it is decided once here rather than per handle.
-    let manifest_intact = manifest.verify_integrity().is_ok();
+    let manifest_intact = binding.verify_integrity().is_ok() && manifest.verify_integrity().is_ok();
     if !manifest_intact {
         residue.push("claim: manifest does not match its own frozen digest".to_owned());
     }
@@ -6119,11 +6546,11 @@ pub fn audit_claim(
         .into_iter()
         .map(|handle| HandleResolution {
             handle: handle.to_owned(),
-            standing: classify_handle(handle, claim, portfolio, manifest),
+            standing: classify_handle(handle, claim, portfolio, binding),
         })
         .collect();
     for handle in &claim.citations {
-        match classify_handle(handle, claim, portfolio, manifest) {
+        match classify_handle(handle, claim, portfolio, binding) {
             HandleStanding::Revoked => {
                 revoked_citation = true;
                 residue.push(format!(
@@ -6134,6 +6561,18 @@ pub fn audit_claim(
             HandleStanding::OutsideManifest => {
                 outside_citation = true;
                 residue.push(format!("claim: citation {handle} outside frozen manifest"));
+                continue;
+            }
+            // A handle this run was never authorized to quote is recorded as an
+            // outside reference, because that is exactly what it is for this run:
+            // I21.7 admits a citation only through the run-bound manifest, so the
+            // claim cannot come out `Supported` on it however completely the
+            // authorized manifest commits the record behind it.
+            HandleStanding::UnadmittedByRunManifest => {
+                outside_citation = true;
+                residue.push(format!(
+                    "claim: citation {handle} is not admitted by this run's reference manifest and cannot support the claim"
+                ));
                 continue;
             }
             HandleStanding::Unresolved => {
@@ -6225,7 +6664,7 @@ pub fn audit_claim(
             counterclaim_id,
             claim,
             portfolio,
-            manifest,
+            binding,
             now_ms,
             &mut residue,
         );
@@ -6385,6 +6824,10 @@ pub fn audit_claim(
         dimensions,
         relation_digests,
         claim_identity_digest,
+        run_id: binding.run_id().to_owned(),
+        root_context_revision: binding.root_context_revision().to_owned(),
+        run_reference_manifest_digest: binding.run_reference_manifest_digest().to_owned(),
+        state_fence: binding.state_fence().clone(),
     }
 }
 

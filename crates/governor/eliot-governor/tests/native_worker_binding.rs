@@ -214,10 +214,12 @@ fn activation_task_snapshot(fence: &StateFence) -> TaskLifecycleSnapshot {
             from: None,
             to: TaskState::ActionAuthorized,
             command: None,
+            professional_execution: None,
             state_fence: fence.clone(),
             authority_epoch: fence.authority_epoch.clone(),
             observed_at: ClockReading::default(),
         }],
+        professional_execution: BTreeMap::new(),
     }
 }
 

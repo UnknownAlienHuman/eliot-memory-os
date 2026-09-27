@@ -60,6 +60,9 @@ pub enum ChangeMonitorError {
     /// An observation marked unknown origin while carrying a false exact link.
     #[error("unknown-origin observation cannot claim exact attribution")]
     UnknownOriginAttribution,
+    /// A reconciliation did not identify admitted observations that prove the same change.
+    #[error("unknown-change reconciliation evidence is invalid")]
+    InvalidReconciliation,
     /// A resolver candidate did not carry a valid public anchor.
     #[error("invalid anchor candidate")]
     InvalidAnchor,
@@ -361,16 +364,32 @@ pub struct ObservedChangeRecord {
 pub struct ChangeMonitorSnapshot {
     /// Immutable observation records by change identity.
     pub observations: Vec<ObservedChangeRecord>,
+    /// Explicit links from unknown-origin material changes to admitted evidence.
+    #[serde(default)]
+    pub reconciliations: Vec<UnknownChangeReconciliation>,
     /// Current resource projection by stable resource identity.
     pub current_resources: Vec<ResourceSnapshot>,
     /// Dependencies observed invalidated by any included change.
     pub invalidated_dependencies: Vec<String>,
 }
 
+/// A rebuildable projection link from one immutable unknown-origin change to
+/// a separate admitted observation that proves the same resource transition.
+/// This link is not a canonical observation or an authority decision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownChangeReconciliation {
+    /// Immutable unknown-origin material observation being reconciled.
+    pub unknown_change_id: String,
+    /// Separate immutable evidence observation for the exact same transition.
+    pub evidence_change_id: String,
+}
+
 /// In-memory rebuildable projection over immutable observations.
 #[derive(Clone, Debug, Default)]
 pub struct ChangeMonitor {
     observations: BTreeMap<String, ObservedChangeRecord>,
+    reconciliations: BTreeMap<String, UnknownChangeReconciliation>,
     current_resources: BTreeMap<String, ResourceSnapshot>,
     invalidated_dependencies: BTreeSet<String>,
 }
@@ -386,8 +405,15 @@ impl ChangeMonitor {
             }
             monitor.ingest(observed)?;
         }
+        for reconciliation in &snapshot.reconciliations {
+            monitor.reconcile_unknown_change(
+                &reconciliation.unknown_change_id,
+                &reconciliation.evidence_change_id,
+            )?;
+        }
         if monitor.snapshot().current_resources != snapshot.current_resources
             || monitor.snapshot().invalidated_dependencies != snapshot.invalidated_dependencies
+            || monitor.snapshot().reconciliations != snapshot.reconciliations
         {
             return Err(ChangeMonitorError::IdentityConflict);
         }
@@ -409,8 +435,7 @@ impl ChangeMonitor {
                 change_id,
                 observation_digest: digest,
                 disposition: IngestDisposition::Replayed,
-                acceptance_blocked: existing.observation.unknown_origin
-                    && is_material_mutation(existing.observation.kind),
+                acceptance_blocked: self.has_unknown_material_change(),
                 invalidation_dependencies: existing
                     .observation
                     .invalidations
@@ -419,8 +444,6 @@ impl ChangeMonitor {
                     .collect(),
             });
         }
-        let acceptance_blocked =
-            observation.unknown_origin && is_material_mutation(observation.kind);
         if let Some(after) = &observation.after {
             self.current_resources
                 .insert(after.resource_ref.clone(), after.clone());
@@ -443,6 +466,7 @@ impl ChangeMonitor {
                 observation_digest: digest.clone(),
             },
         );
+        let acceptance_blocked = self.has_unknown_material_change();
         Ok(ObservationAdmission {
             change_id,
             observation_digest: digest,
@@ -456,16 +480,90 @@ impl ChangeMonitor {
     pub fn snapshot(&self) -> ChangeMonitorSnapshot {
         ChangeMonitorSnapshot {
             observations: self.observations.values().cloned().collect(),
+            reconciliations: self.reconciliations.values().cloned().collect(),
             current_resources: self.current_resources.values().cloned().collect(),
             invalidated_dependencies: self.invalidated_dependencies.iter().cloned().collect(),
         }
     }
 
+    /// Reconciles an unknown-origin material change against a separate
+    /// admitted observation only when both prove the exact same before/after
+    /// resource snapshots under the same State Fence. The separate evidence
+    /// must be a Git reconciliation, process/tool receipt, or artifact scan
+    /// carrying an operation or diff/artifact handle and attributable evidence.
+    /// This conservative projection does not treat a host event, human
+    /// observation, or filesystem notification alone as confirmation.
+    /// Repeated exact links are idempotent; a conflicting link is rejected.
+    /// This projection creates no canonical history or acceptance authority;
+    /// callers must supply admitted canonical observations.
+    pub fn reconcile_unknown_change(
+        &mut self,
+        unknown_change_id: &str,
+        evidence_change_id: &str,
+    ) -> Result<(), ChangeMonitorError> {
+        text(unknown_change_id, "reconciliation.unknown_change_id")?;
+        text(evidence_change_id, "reconciliation.evidence_change_id")?;
+        let unknown = self
+            .observations
+            .get(unknown_change_id)
+            .ok_or(ChangeMonitorError::InvalidReconciliation)?;
+        let evidence = self
+            .observations
+            .get(evidence_change_id)
+            .ok_or(ChangeMonitorError::InvalidReconciliation)?;
+        if !unknown.observation.unknown_origin
+            || !is_material_mutation(unknown.observation.kind)
+            || !is_material_mutation(evidence.observation.kind)
+            || evidence.observation.unknown_origin
+            || !matches!(
+                evidence.observation.origin,
+                ChangeOrigin::GitReconciliation
+                    | ChangeOrigin::ProcessToolReceipt
+                    | ChangeOrigin::ArtifactScan
+            )
+            || !matches!(
+                evidence.observation.attribution,
+                Attribution::Exact | Attribution::ReceiptLinked | Attribution::Correlated
+            )
+            || evidence.observation.origin_ref.is_none()
+            || (evidence.observation.operation_ref.is_none()
+                && evidence.observation.diff_or_artifact_ref.is_none())
+            || evidence.observation.kind != unknown.observation.kind
+            || evidence.observation.state_fence != unknown.observation.state_fence
+            || evidence.observation.before != unknown.observation.before
+            || evidence.observation.after != unknown.observation.after
+        {
+            return Err(ChangeMonitorError::InvalidReconciliation);
+        }
+
+        let link = UnknownChangeReconciliation {
+            unknown_change_id: unknown_change_id.to_owned(),
+            evidence_change_id: evidence_change_id.to_owned(),
+        };
+        if let Some(existing) = self.reconciliations.get(unknown_change_id) {
+            if existing == &link {
+                return Ok(());
+            }
+            return Err(ChangeMonitorError::IdentityConflict);
+        }
+        self.reconciliations
+            .insert(unknown_change_id.to_owned(), link);
+        Ok(())
+    }
+
+    fn has_unresolved_unknown_change(&self, change_id: &str) -> bool {
+        self.observations.get(change_id).is_some_and(|record| {
+            record.observation.unknown_origin
+                && is_material_mutation(record.observation.kind)
+                && !self.reconciliations.contains_key(change_id)
+        })
+    }
+
     /// Returns whether any unknown-origin material mutation blocks acceptance.
     pub fn has_unknown_material_change(&self) -> bool {
-        self.observations.values().any(|record| {
-            record.observation.unknown_origin && is_material_mutation(record.observation.kind)
-        })
+        self.observations
+            .keys()
+            .any(|change_id| self.has_unresolved_unknown_change(change_id))
     }
 }
 
@@ -500,6 +598,146 @@ impl AnchorCandidate {
     }
 }
 
+/// Version of the deterministic evolving-anchor resolution order.
+pub const EVOLVING_ANCHOR_RESOLVER_ALGORITHM_VERSION: &str = "evolving-anchor-resolver/v2";
+
+/// Evidence tier that produced a resolver observation.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorResolutionBasis {
+    /// The complete immutable anchor reference matched exactly.
+    ExactAnchorReference,
+    /// Exact provenance or an operation/diff observation linked both revisions.
+    ProvenanceIdentity,
+    /// The exact immutable target artifact and revision matched.
+    TargetRevision,
+    /// Both the exact file path and symbol identity matched.
+    ExactFileAndSymbol,
+    /// The original content digest and structural-neighborhood digest matched.
+    ContentAndStructuralFingerprint,
+    /// A VCS/history adapter matched the original historical range.
+    HistoricalRange,
+    /// A matching immutable deletion observation was present.
+    DeletionObservation,
+    /// No current candidate was available.
+    NoCandidates,
+    /// Candidates existed but no identity evidence matched.
+    NoMatch,
+}
+
+/// Evidence strength for a resolver observation, not a probability estimate.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorResolutionConfidence {
+    /// A complete anchor, provenance, artifact, file/symbol, or deletion identity matched.
+    ExactIdentity,
+    /// Both independent content and structural-neighborhood digests matched.
+    Corroborated,
+    /// Only an explicit historical-range match was available.
+    HistoricalOnly,
+    /// No matching evidence supported a current target.
+    Unresolved,
+}
+
+/// Immutable identity and digest for one `ChangeMonitor` input observation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorResolverObservationReference {
+    /// Idempotent `ChangeMonitor` observation identity.
+    pub change_id: String,
+    /// Digest of the complete immutable observation.
+    pub observation_digest: String,
+}
+
+/// Evidence selected by one resolution pass.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorResolutionEvidence {
+    /// First matching tier in the resolver's precedence order.
+    pub basis: AnchorResolutionBasis,
+    /// Indices into `AnchorResolutionObservation::candidate_inputs` that matched.
+    pub candidate_indices: Vec<u32>,
+    /// Indices into `AnchorResolutionObservation::monitor_observation_inputs` used as evidence.
+    pub monitor_observation_indices: Vec<u32>,
+}
+
+/// Rebuildable, evidence-bearing result over an immutable original anchor.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorResolutionObservation {
+    /// Algorithm version used for this result.
+    pub algorithm_version: String,
+    /// Immutable original anchor supplied to the resolver.
+    pub original_anchor: AnchorReference,
+    /// Complete candidate inputs supplied to the resolver.
+    pub candidate_inputs: Vec<AnchorCandidate>,
+    /// Complete observation identities examined for deletion evidence.
+    pub monitor_observation_inputs: Vec<AnchorResolverObservationReference>,
+    /// Evidence tier and exact inputs that matched it.
+    pub evidence: AnchorResolutionEvidence,
+    /// Evidence strength for the selected tier, independent of target uniqueness.
+    pub confidence: AnchorResolutionConfidence,
+    /// Existing wire-compatible resolution projection.
+    pub resolution: AnchorResolution,
+}
+
+fn candidate_location_status(
+    original: &AnchorReference,
+    candidate: &AnchorReference,
+) -> AnchorResolutionStatus {
+    let same_location = candidate.path == original.path
+        && candidate.symbol == original.symbol
+        && candidate.line_start == original.line_start
+        && candidate.line_end == original.line_end;
+    if same_location {
+        AnchorResolutionStatus::Modified
+    } else {
+        AnchorResolutionStatus::Moved
+    }
+}
+
+fn snapshot_matches_target(
+    snapshot: &ResourceSnapshot,
+    target: &eliot_agent_contracts::PublicReference,
+) -> bool {
+    snapshot.resource_ref == target.id.as_str()
+        && snapshot.revision == target.revision.as_str()
+        && target
+            .digest
+            .as_ref()
+            .is_none_or(|digest| snapshot.content_digest.as_ref() == Some(digest))
+}
+
+fn observation_links_provenance(
+    observation: &ChangeObservation,
+    original: &AnchorReference,
+    candidate: &AnchorCandidate,
+) -> bool {
+    let Some(provenance) = original.provenance.as_ref() else {
+        return false;
+    };
+    let exact_provenance = candidate.reference.provenance.as_ref() == Some(provenance);
+    let exact_symbol = original
+        .symbol
+        .as_ref()
+        .is_some_and(|symbol| candidate.reference.symbol.as_ref() == Some(symbol));
+    let source_id = provenance.source_id.as_str();
+    let exact_operation_or_diff = observation.operation_ref.as_deref() == Some(source_id)
+        || observation.diff_or_artifact_ref.as_deref() == Some(source_id);
+    exact_provenance
+        && exact_symbol
+        && candidate.reference.target.kind == original.target.kind
+        && exact_operation_or_diff
+        && observation
+            .before
+            .as_ref()
+            .is_some_and(|before| snapshot_matches_target(before, &original.target))
+        && observation
+            .after
+            .as_ref()
+            .is_some_and(|after| snapshot_matches_target(after, &candidate.reference.target))
+}
+
 /// Deterministic resolver over immutable original identity and explicit
 /// current candidates.
 #[derive(Clone, Copy, Debug, Default)]
@@ -517,115 +755,250 @@ impl EvolvingAnchorResolver {
         candidates: &[AnchorCandidate],
         monitor: &ChangeMonitorSnapshot,
     ) -> Result<AnchorResolution, ChangeMonitorError> {
+        self.resolve_observed(original, candidates, monitor)
+            .map(|observation| observation.resolution)
+    }
+
+    /// Resolves one historical anchor and records the exact inputs and evidence tier.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "resolution order is priority-sensitive and kept contiguous to preserve deterministic status precedence"
+    )]
+    pub fn resolve_observed(
+        &self,
+        original: &AnchorReference,
+        candidates: &[AnchorCandidate],
+        monitor: &ChangeMonitorSnapshot,
+    ) -> Result<AnchorResolutionObservation, ChangeMonitorError> {
         original.validate().map_err(ChangeMonitorError::from)?;
         for candidate in candidates {
             candidate.validate()?;
         }
+        let _validated_monitor = ChangeMonitor::from_snapshot(monitor.clone())?;
         let anchor_id = original.anchor_id.clone();
         let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
-        let exact: Vec<&AnchorCandidate> = candidates
+        let monitor_observation_inputs: Vec<AnchorResolverObservationReference> = monitor
+            .observations
             .iter()
-            .filter(|candidate| &candidate.reference == original)
-            .collect();
-        if exact.len() == 1 {
-            return Ok(AnchorResolution {
-                anchor_id,
-                status: AnchorResolutionStatus::Exact,
-                current_reference: Some(exact[0].reference.clone()),
-                candidate_count,
-            });
-        }
-        if exact.len() > 1 {
-            return Ok(AnchorResolution {
-                anchor_id,
-                status: AnchorResolutionStatus::Ambiguous,
-                current_reference: None,
-                candidate_count,
-            });
-        }
-        let same_target: Vec<&AnchorCandidate> = candidates
-            .iter()
-            .filter(|candidate| candidate.reference.target.id == original.target.id)
-            .collect();
-        if same_target.len() == 1 {
-            let candidate = same_target[0];
-            let same_location = candidate.reference.path == original.path
-                && candidate.reference.symbol == original.symbol
-                && candidate.reference.line_start == original.line_start
-                && candidate.reference.line_end == original.line_end;
-            return Ok(AnchorResolution {
-                anchor_id,
-                status: if same_location {
-                    AnchorResolutionStatus::Modified
-                } else {
-                    AnchorResolutionStatus::Moved
-                },
-                current_reference: Some(candidate.reference.clone()),
-                candidate_count,
-            });
-        }
-        if same_target.len() > 1 {
-            return Ok(AnchorResolution {
-                anchor_id,
-                status: AnchorResolutionStatus::Ambiguous,
-                current_reference: None,
-                candidate_count,
-            });
-        }
-        let fingerprint_matches: Vec<&AnchorCandidate> = candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.reference.context_digest == original.context_digest
-                    || candidate.content_digest.as_deref() == Some(original.context_digest.as_str())
-                    || candidate.structural_digest.as_deref()
-                        == Some(original.context_digest.as_str())
+            .map(|record| AnchorResolverObservationReference {
+                change_id: record.observation.change_id.clone(),
+                observation_digest: record.observation_digest.clone(),
             })
             .collect();
-        if fingerprint_matches.len() == 1 {
-            return Ok(AnchorResolution {
-                anchor_id,
-                status: AnchorResolutionStatus::Moved,
-                current_reference: Some(fingerprint_matches[0].reference.clone()),
-                candidate_count,
-            });
-        }
-        if fingerprint_matches.len() > 1 {
-            return Ok(AnchorResolution {
-                anchor_id,
-                status: AnchorResolutionStatus::Ambiguous,
-                current_reference: None,
-                candidate_count,
-            });
-        }
-        let historical_matches: Vec<&AnchorCandidate> = candidates
-            .iter()
-            .filter(|candidate| candidate.historical_range_match)
-            .collect();
-        let status = if historical_matches.len() == 1 {
-            return Ok(AnchorResolution {
-                anchor_id,
-                status: AnchorResolutionStatus::Moved,
-                current_reference: Some(historical_matches[0].reference.clone()),
-                candidate_count,
-            });
-        } else if historical_matches.len() > 1 {
-            AnchorResolutionStatus::Ambiguous
-        } else if monitor.observations.iter().any(|record| {
-            record.observation.kind == ChangeKind::Deleted
-                && record.observation.resource_ref() == original.target.id.as_str()
-        }) {
-            AnchorResolutionStatus::Deleted
-        } else if candidates.is_empty() {
-            AnchorResolutionStatus::Unavailable
-        } else {
-            AnchorResolutionStatus::Stale
+        let observe = |status: AnchorResolutionStatus,
+                       current_reference: Option<AnchorReference>,
+                       basis: AnchorResolutionBasis,
+                       candidate_indices: Vec<u32>,
+                       monitor_observation_indices: Vec<u32>,
+                       confidence: AnchorResolutionConfidence| {
+            AnchorResolutionObservation {
+                algorithm_version: EVOLVING_ANCHOR_RESOLVER_ALGORITHM_VERSION.to_owned(),
+                original_anchor: original.clone(),
+                candidate_inputs: candidates.to_vec(),
+                monitor_observation_inputs: monitor_observation_inputs.clone(),
+                evidence: AnchorResolutionEvidence {
+                    basis,
+                    candidate_indices,
+                    monitor_observation_indices,
+                },
+                confidence,
+                resolution: AnchorResolution {
+                    anchor_id: anchor_id.clone(),
+                    status,
+                    current_reference,
+                    candidate_count,
+                },
+            }
         };
-        Ok(AnchorResolution {
-            anchor_id,
-            status,
-            current_reference: None,
-            candidate_count,
-        })
+        let candidate_indices = |predicate: &dyn Fn(&AnchorCandidate) -> bool| {
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| predicate(candidate))
+                .map(|(index, _)| u32::try_from(index).unwrap_or(u32::MAX))
+                .collect::<Vec<_>>()
+        };
+        let resolution_for_matches =
+            |indices: &[u32],
+             basis: AnchorResolutionBasis,
+             confidence: AnchorResolutionConfidence| {
+                if indices.len() == 1 {
+                    let candidate = &candidates[indices[0] as usize];
+                    observe(
+                        candidate_location_status(original, &candidate.reference),
+                        Some(candidate.reference.clone()),
+                        basis,
+                        indices.to_vec(),
+                        Vec::new(),
+                        confidence,
+                    )
+                } else {
+                    observe(
+                        AnchorResolutionStatus::Ambiguous,
+                        None,
+                        basis,
+                        indices.to_vec(),
+                        Vec::new(),
+                        confidence,
+                    )
+                }
+            };
+
+        let exact = candidate_indices(&|candidate| &candidate.reference == original);
+        if !exact.is_empty() {
+            if exact.len() == 1 {
+                return Ok(observe(
+                    AnchorResolutionStatus::Exact,
+                    Some(candidates[exact[0] as usize].reference.clone()),
+                    AnchorResolutionBasis::ExactAnchorReference,
+                    exact,
+                    Vec::new(),
+                    AnchorResolutionConfidence::ExactIdentity,
+                ));
+            }
+            return Ok(resolution_for_matches(
+                &exact,
+                AnchorResolutionBasis::ExactAnchorReference,
+                AnchorResolutionConfidence::ExactIdentity,
+            ));
+        }
+
+        let provenance_matches = candidate_indices(&|candidate| {
+            monitor.observations.iter().any(|record| {
+                observation_links_provenance(&record.observation, original, candidate)
+            })
+        });
+        if !provenance_matches.is_empty() {
+            let mut evidence_indices = BTreeSet::new();
+            for candidate_index in &provenance_matches {
+                let candidate = &candidates[*candidate_index as usize];
+                for (observation_index, record) in monitor.observations.iter().enumerate() {
+                    if observation_links_provenance(&record.observation, original, candidate) {
+                        evidence_indices
+                            .insert(u32::try_from(observation_index).unwrap_or(u32::MAX));
+                    }
+                }
+            }
+            if provenance_matches.len() == 1 {
+                let candidate = &candidates[provenance_matches[0] as usize];
+                return Ok(observe(
+                    candidate_location_status(original, &candidate.reference),
+                    Some(candidate.reference.clone()),
+                    AnchorResolutionBasis::ProvenanceIdentity,
+                    provenance_matches,
+                    evidence_indices.into_iter().collect(),
+                    AnchorResolutionConfidence::ExactIdentity,
+                ));
+            }
+            return Ok(observe(
+                AnchorResolutionStatus::Ambiguous,
+                None,
+                AnchorResolutionBasis::ProvenanceIdentity,
+                provenance_matches,
+                evidence_indices.into_iter().collect(),
+                AnchorResolutionConfidence::ExactIdentity,
+            ));
+        }
+
+        let same_target_revision = candidate_indices(&|candidate| {
+            candidate.reference.target == original.target
+                && candidate_location_status(original, &candidate.reference)
+                    == AnchorResolutionStatus::Modified
+        });
+        if !same_target_revision.is_empty() {
+            return Ok(resolution_for_matches(
+                &same_target_revision,
+                AnchorResolutionBasis::TargetRevision,
+                AnchorResolutionConfidence::ExactIdentity,
+            ));
+        }
+
+        let exact_file_and_symbol = candidate_indices(&|candidate| {
+            candidate.reference.target == original.target
+                && original
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| candidate.reference.path.as_ref() == Some(path))
+                && original
+                    .symbol
+                    .as_ref()
+                    .is_some_and(|symbol| candidate.reference.symbol.as_ref() == Some(symbol))
+        });
+        if !exact_file_and_symbol.is_empty() {
+            return Ok(resolution_for_matches(
+                &exact_file_and_symbol,
+                AnchorResolutionBasis::ExactFileAndSymbol,
+                AnchorResolutionConfidence::ExactIdentity,
+            ));
+        }
+
+        let fingerprint_matches = candidate_indices(&|candidate| {
+            original
+                .target
+                .digest
+                .as_ref()
+                .is_some_and(|content_digest| {
+                    candidate.content_digest.as_ref() == Some(content_digest)
+                })
+                && candidate.structural_digest.as_deref() == Some(original.context_digest.as_str())
+        });
+        if !fingerprint_matches.is_empty() {
+            return Ok(resolution_for_matches(
+                &fingerprint_matches,
+                AnchorResolutionBasis::ContentAndStructuralFingerprint,
+                AnchorResolutionConfidence::Corroborated,
+            ));
+        }
+
+        let historical_matches = candidate_indices(&|candidate| candidate.historical_range_match);
+        if !historical_matches.is_empty() {
+            return Ok(resolution_for_matches(
+                &historical_matches,
+                AnchorResolutionBasis::HistoricalRange,
+                AnchorResolutionConfidence::HistoricalOnly,
+            ));
+        }
+
+        let deletion_indices: Vec<u32> = monitor
+            .observations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.observation.kind == ChangeKind::Deleted
+                    && record.observation.resource_ref() == original.target.id.as_str()
+            })
+            .map(|(index, _)| u32::try_from(index).unwrap_or(u32::MAX))
+            .collect();
+        if !deletion_indices.is_empty() {
+            return Ok(observe(
+                AnchorResolutionStatus::Deleted,
+                None,
+                AnchorResolutionBasis::DeletionObservation,
+                Vec::new(),
+                deletion_indices,
+                AnchorResolutionConfidence::ExactIdentity,
+            ));
+        }
+
+        if candidates.is_empty() {
+            return Ok(observe(
+                AnchorResolutionStatus::Unavailable,
+                None,
+                AnchorResolutionBasis::NoCandidates,
+                Vec::new(),
+                Vec::new(),
+                AnchorResolutionConfidence::Unresolved,
+            ));
+        }
+
+        Ok(observe(
+            AnchorResolutionStatus::Stale,
+            None,
+            AnchorResolutionBasis::NoMatch,
+            Vec::new(),
+            Vec::new(),
+            AnchorResolutionConfidence::Unresolved,
+        ))
     }
 }
 

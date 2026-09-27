@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use self::authority_recovery::map_transition_receipt_error;
 use crate::activation_outcome::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
     GovernorSelectionDirective,
@@ -95,11 +96,11 @@ use eliot_workscope::{
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingSingleFlight,
-    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
-    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
-    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
+    OnboardingSingleFlight, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
+    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
+    ResolutionRequest, ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
@@ -852,6 +853,17 @@ pub enum CompositionError {
     /// Durable recovery did not prove the complete owner set.
     #[error("Governor recovery failed: {0}")]
     Recovery(String),
+    /// Material readiness denied one effect with its exact receipt, directive,
+    /// and missing-input details preserved for the caller.
+    #[error(
+        "material readiness denied {effect:?} for receipt {receipt_ref}: {directive:?}; missing inputs: {missing_inputs:?}"
+    )]
+    MaterialReadinessDenied {
+        receipt_ref: String,
+        effect: RequestedEffect,
+        directive: MaterialReadinessDirective,
+        missing_inputs: Vec<String>,
+    },
     /// A scope-sensitive operation failed its observed `WorkScope` guard; the
     /// structured report preserves the exact identity legs and receipt.
     #[error(
@@ -3496,8 +3508,21 @@ pub enum CompositionReadiness {
     Stopped,
 }
 
+/// Bound on the in-process scope-quarantine projection retained by
+/// [`GovernorComposition`] (issue #1787, W6). A later mismatch must not
+/// silently discard an earlier unresolved conflict, so mismatches accumulate
+/// up to this bound instead of overwriting one slot; the bound itself keeps
+/// the projection from growing without owner storage. Durable quarantine with
+/// restart recovery still belongs to the `WorkScope` owner path.
+const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
+
 /// One daemon-owned Governor composition. There is no second provider or
 /// process executor hidden behind this value.
+///
+/// The in-process scope-quarantine projection below keeps at most
+/// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`] records (one per mandatory
+/// trigger plus margin); older records evict first. It is a diagnostic
+/// projection only, never durable owner state.
 pub struct GovernorComposition<P: ?Sized> {
     kernel: Arc<P>,
     /// Retained P-07 authority port. `None` means diagnosed degradation
@@ -3521,11 +3546,16 @@ pub struct GovernorComposition<P: ?Sized> {
     /// cold-start legs below coalesces on exact workspace identity, privacy
     /// boundary and governing-source generation.
     cold_start: OnboardingSingleFlight,
-    /// Latest in-process diagnostic projection of a scope-identity mismatch
-    /// (issue #1787). It is overwritten by a later mismatch and is not durable,
-    /// rehydrated, or an authority for rebind. Read with
+    /// Bounded in-process diagnostic projection of scope-identity mismatches
+    /// (issue #1787, W6 partial projection). Newest record is last; a later
+    /// mismatch appends instead of overwriting, up to
+    /// [`MAX_RETAINED_SCOPE_QUARANTINE_RECORDS`] records, so one unresolved
+    /// conflict cannot silently discard another. This is not durable,
+    /// rehydrated, or an authority for rebind: durable quarantine with an
+    /// owner-issued write/readback receipt and restart recovery belongs to
+    /// the `WorkScope` owner path. Read the latest with
     /// [`Self::last_scope_quarantine`].
-    scope_quarantine: Option<QuarantinedScopeRecord>,
+    scope_quarantine: Vec<QuarantinedScopeRecord>,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -4151,7 +4181,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
             cold_start: OnboardingSingleFlight::new(),
-            scope_quarantine: None,
+            scope_quarantine: Vec::new(),
         })
     }
 
@@ -4168,8 +4198,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `None` means no mismatch has been observed since construction. The
     /// retained binding is never replaced by this record.
     #[must_use]
-    pub const fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
-        self.scope_quarantine.as_ref()
+    pub fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
+        self.scope_quarantine.last()
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -4993,8 +5023,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the guard returns `Allow` with a fresh `MATCHED` source-closure receipt.
     /// The observed binding is never derived from the retained binding or the
     /// write claim. Missing binding or source closure fails closed. Identity
-    /// mismatches are retained only as a process-local diagnostic projection;
-    /// durable quarantine and restart recovery remain partial (W6).
+    /// mismatches append to the bounded process-local diagnostic projection
+    /// (no silent overwrite, no state or memory transfer); durable quarantine
+    /// and restart recovery remain partial (W6).
     pub fn check_canonical_write_work_scope(
         &mut self,
         scope_id: &str,
@@ -5034,7 +5065,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                         "canonical write withheld after scope mismatch, but its process-local diagnostic could not be retained: {error}"
                     ))
                 })?;
-                self.scope_quarantine = Some(record);
+                // Preserve every unresolved conflict instead of overwriting one
+                // slot: an exact repeat of the latest record adds no new
+                // evidence, anything else appends with oldest-first eviction at
+                // the bound. The retained binding, task state, and project
+                // memory stay untouched; durable quarantine still belongs to
+                // the WorkScope owner path.
+                if self.scope_quarantine.last() != Some(&record) {
+                    if self.scope_quarantine.len() >= MAX_RETAINED_SCOPE_QUARANTINE_RECORDS {
+                        self.scope_quarantine.remove(0);
+                    }
+                    self.scope_quarantine.push(record);
+                }
             }
             return Err(CompositionError::ScopeGuardWithheld {
                 claimed_scope: scope_id.to_owned(),
@@ -5561,9 +5603,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// An admission is then bound to the retained authenticated instance:
     /// the presented receipt must name exactly the live `WorkScope` binding
     /// read at the retained fence. Without a retained binding there is no
-    /// authenticated instance to bind, so the write fails closed. A denial
-    /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
-    /// the typed directive token; nothing is committed on any failure.
+    /// authenticated instance to bind, so the write fails closed. A malformed
+    /// bundle fails as [`CompositionError::Recovery`]. A typed denial is
+    /// returned as [`CompositionError::MaterialReadinessDenied`] with its
+    /// receipt, requested effect, directive, and exact missing inputs; nothing
+    /// is committed on any failure.
     pub fn check_material_readiness_for_write(
         &self,
         readiness: &MaterialReadinessInputs<'_>,
@@ -5604,14 +5648,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         match self.check_material_readiness_for_write(readiness, observed, sources, privacy)? {
             MaterialAdmission::Admitted { .. } => self.commit_canonical(identity, envelope).await,
             MaterialAdmission::Denied {
+                receipt_ref,
+                effect,
                 directive,
                 missing_inputs,
-                ..
-            } => Err(CompositionError::Recovery(format!(
-                "material readiness denies canonical write: {}; missing: {}",
-                directive.kind_str(),
-                missing_inputs.join(",")
-            ))),
+            } => Err(CompositionError::MaterialReadinessDenied {
+                receipt_ref,
+                effect,
+                directive,
+                missing_inputs,
+            }),
         }
     }
 
@@ -6126,8 +6172,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Fail-closed behavior:
     /// - Without a retained port, or when the composition is not ready, no
     ///   crossing is presented.
-    /// - A second presentation on an already-recorded active identity fails
-    ///   closed instead of minting a second transition.
+    /// - An exact replay of an active identity is re-presented to the owner;
+    ///   the complete returned receipt must equal the retained validated
+    ///   receipt. The process-local receipt is never returned as a substitute
+    ///   for owner readback.
+    /// - Changed content under the retained transition identity returns
+    ///   `IdentityConflict` before transport.
     /// - An `UnknownOutcome` retains the exact request with its owner snapshot
     ///   until exact reconciliation; the crossing stays unadmitted, never
     ///   active.
@@ -6141,17 +6191,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.require_ready_for_authority()?;
         let port = self.authority_port()?;
         let presented = PresentedAuthorityRequest::RootTransition(Box::new(request.clone()));
-        self.require_admissible_transition(&presented)?;
+        let retained_receipt = self.require_admissible_transition(&presented)?;
         let receipt = match port.activate_root_transition(request) {
             Ok(receipt) => receipt,
             Err(P07PortError::UnknownOutcome { snapshot_id }) => {
-                self.note_unknown_outcome(presented, &snapshot_id)?;
+                // A prior validated receipt remains historical evidence, but
+                // a failed owner readback cannot be replaced by that local
+                // copy. Keep the retained Active state unchanged and report
+                // the owner's unresolved outcome.
+                if retained_receipt.is_none() {
+                    self.note_unknown_outcome(presented, &snapshot_id)?;
+                } else if &snapshot_id != request.snapshot_id() {
+                    return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+                }
                 return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
                     snapshot_id,
                 }));
             }
             Err(error) => return Err(CompositionError::Authority(error)),
         };
+
+        if let Some(retained_receipt) = retained_receipt {
+            receipt.validate(request).map_err(|error| {
+                CompositionError::Authority(map_transition_receipt_error(&error))
+            })?;
+            if receipt != retained_receipt {
+                return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+            }
+            return Ok(receipt);
+        }
+
         let retained = self.retain_presentation(presented)?;
         retained.note_transition_activated(&receipt)?;
         Ok(receipt)
@@ -6435,25 +6504,48 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(())
     }
 
-    /// Resolves the transition identity for an activation presentation: an
-    /// already-recorded active identity fails closed before any transport is
-    /// touched, so a lost acknowledgement can reconcile but never mint a
-    /// second transition.
+    /// Resolves the transition identity for an activation presentation.
+    /// Changed content under a retained identity conflicts before transport.
+    /// An exact active replay returns its retained receipt only as a
+    /// comparison value; the caller must obtain and validate owner readback
+    /// before returning a result.
     fn require_admissible_transition(
         &self,
         presented: &PresentedAuthorityRequest,
-    ) -> Result<(), CompositionError> {
-        let PresentedAuthorityRequest::RootTransition(_) = presented else {
+    ) -> Result<Option<RootTransitionActivationReceipt>, CompositionError> {
+        let PresentedAuthorityRequest::RootTransition(request) = presented else {
             return Err(CompositionError::Authority(P07PortError::InvalidBinding));
         };
+        let incoming = request.record();
+        let conflicting_identity = self.authority_presentations.values().any(|retained| {
+            let PresentedAuthorityRequest::RootTransition(previous) = retained.request() else {
+                return false;
+            };
+            let held = previous.record();
+            (held.transition_id == incoming.transition_id
+                || held.operation_id == incoming.operation_id
+                || held.idempotency_key == incoming.idempotency_key)
+                && previous != request
+        });
+        if conflicting_identity {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
         if let Some(retained) = self
             .authority_presentations
             .get(presented.ledger_key().as_str())
-            && matches!(retained.state(), AuthorityPresentationState::Active { .. })
         {
-            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+            if retained.request() != presented {
+                return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+            }
+            if matches!(retained.state(), AuthorityPresentationState::Active { .. }) {
+                return retained
+                    .transition_receipt()
+                    .cloned()
+                    .map(Some)
+                    .ok_or(CompositionError::Authority(P07PortError::InvalidBinding));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn recovered_grant_status(&self, grant_id: &GrantId) -> Option<GrantStatus> {
@@ -7636,6 +7728,7 @@ mod tests {
                 next_sequence: 1,
                 tasks: BTreeMap::new(),
                 events: Vec::new(),
+                professional_execution: BTreeMap::new(),
             }),
             RecoveryOwner::Session => serde_json::to_value(SessionLifecycleSnapshot {
                 next_sequence: 1,
@@ -7775,10 +7868,12 @@ mod tests {
                 from: None,
                 to: TaskState::ActionAuthorized,
                 command: None,
+                professional_execution: None,
                 state_fence: fence.clone(),
                 authority_epoch: fence.authority_epoch.clone(),
                 observed_at: ClockReading::default(),
             }],
+            professional_execution: BTreeMap::new(),
         }
     }
 

@@ -1,0 +1,247 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "CrateContextCapsule",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.learning.contracts",
+  "product_objective": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_objective",
+    "value": "Consequential work changes the next compatible attempt through inspectable local learning, or records why no change is justified."
+  },
+  "functional_capability_cell_refs": [
+    "smart.learning.contracts"
+  ],
+  "effective_micro_module_manifest_ref": "docs/code-navigation/capsules/index.json#/cells/smart.learning.contracts",
+  "primary_source_package": {
+    "package": "eliot-learning-contracts",
+    "root_path": "crates/smart/eliot-learning-contracts",
+    "manifest_path": "crates/smart/eliot-learning-contracts/Cargo.toml",
+    "module_manifest": "crates/smart/eliot-learning-contracts/module.toml",
+    "description": "Own provider-neutral contracts for CampaignLearningStateView, AttemptLearningDelta, CampaignHarnessOverlay candidate, activation/adherence assessment and closure inputs."
+  },
+  "source_token_estimate": {
+    "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "source_stu": 69149,
+    "test_stu": 66868,
+    "selected_file_count": 15,
+    "inline_cfg_test_modules": 0,
+    "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "selected_source_and_tests": {
+    "selected_source": [
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/activation.rs",
+        "bytes": 34471,
+        "sha256": "ce894e1db015c901b7606b63e0772bb80af613ab083472d25334b44d84522f5a",
+        "stu": 11491,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/assessment.rs",
+        "bytes": 12103,
+        "sha256": "438e7d03ee86aaecdbf4ff5fd1a344ebd3789f2f2beae11cd935099ecea9d55f",
+        "stu": 4035,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/attribution.rs",
+        "bytes": 15635,
+        "sha256": "55ce728e228ca780a905fd484ab464808036ff81f302673a38e9664dc0ca6ef1",
+        "stu": 5212,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/closure.rs",
+        "bytes": 8004,
+        "sha256": "1055fe449c599d7537cc847d256b6a4eb3a47f69293defaa0a6169ea9046c8a0",
+        "stu": 2668,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/delta.rs",
+        "bytes": 19652,
+        "sha256": "19ee7497616ecd82f161bf544c2da8b06c50bb711f962ff51001360014c42596",
+        "stu": 6551,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/error.rs",
+        "bytes": 2710,
+        "sha256": "6d41f483b82667c08f78babcfcf7507be2895790b471f9e678860c0392f53461",
+        "stu": 904,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/experiment.rs",
+        "bytes": 11169,
+        "sha256": "4b64a365023600c7b19356e54fd03e272694354d5a4ba17b49e503097eb3d579",
+        "stu": 3723,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/identity.rs",
+        "bytes": 6712,
+        "sha256": "5a945bc03fe483717e2183bb4678c3523d7c7e07768e33e850087ee71610c393",
+        "stu": 2238,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/lib.rs",
+        "bytes": 2603,
+        "sha256": "11306356b374e11ae79b0feffd975a82175ac1db6e3e29938e49244c384b8826",
+        "stu": 868,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/overlay.rs",
+        "bytes": 17810,
+        "sha256": "0fcbc16be2bf736913e0a0f2434f019ccd34a67709fcd7aca2a22202af41ec46",
+        "stu": 5937,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/promotion.rs",
+        "bytes": 11633,
+        "sha256": "2e1f0f878eb00d0fa96d6d848f78728d0382b73794395820034754008d2fae07",
+        "stu": 3878,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/src/state_view.rs",
+        "bytes": 64943,
+        "sha256": "3aae2b7b6c6c58d5167451eb328682b91480ae4a1e28708d1d86b7e39ace78df",
+        "stu": 21648,
+        "inline_cfg_test": false
+      }
+    ],
+    "selected_tests": [
+      {
+        "path": "crates/smart/eliot-learning-contracts/tests/contracts.rs",
+        "bytes": 33670,
+        "sha256": "fae5ed4aff6bd98c483970a2f1024e98c83de080d7463f074e44e7a3ddf86a32",
+        "test_attributes": 6,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/tests/self_learning_contracts.rs",
+        "bytes": 22194,
+        "sha256": "f9e9bba270d13ec7ac82e465d6f966e2e9cf569183b996f66e19493d1bac191c",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/smart/eliot-learning-contracts/tests/work_unit_590.rs",
+        "bytes": 144738,
+        "sha256": "a6f8142ab649d755a4a395336dfe03e204fd7b6be405495d28b6ec8faa0343a4",
+        "test_attributes": 58,
+        "inline_cfg_test": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "source_selection_digest": "8f587079c2c62aaf3962d3439b1316ccfbe615cbfdd1890fa85d874273970c52"
+  },
+  "one_hop_providers": [
+    "eliot-agent-contracts",
+    "eliot-contracts",
+    "eliot-evidence",
+    "eliot-receipts",
+    "schemars",
+    "serde",
+    "serde_json",
+    "thiserror"
+  ],
+  "one_hop_consumers": [
+    "bins/eliotd",
+    "crates/governor/eliot-governor",
+    "crates/meta/eliot-learning-activation-assessment",
+    "crates/smart/eliot-cognitive-quality",
+    "crates/smart/eliot-context",
+    "crates/smart/eliot-experience-provider",
+    "crates/smart/eliot-learning-delta",
+    "crates/smart/eliot-learning-overlay",
+    "crates/smart/eliot-learning-state-view",
+    "crates/smart/eliot-memory-quality",
+    "crates/storage/eliot-store-api"
+  ],
+  "architecture_implementation_refs": [
+    {
+      "block": "smart-memory-context",
+      "title": "Smart memory, context, and understanding",
+      "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+      "documentation_handles": [
+        "I12.13",
+        "I17.11"
+      ]
+    }
+  ],
+  "failure_fingerprints": [],
+  "edge_tests": [
+    "crates/smart/eliot-learning-contracts/tests/work_unit_590.rs"
+  ],
+  "product_pulse": {
+    "state": "DECLARED",
+    "origin": "module.toml|product_pulse",
+    "value": "ONLINE_LEARNING_INNER_LOOP_PULSE_01"
+  },
+  "omitted_material_and_handles": {
+    "unresolved_contract_refs": [],
+    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+  },
+  "effective_context_profile": {
+    "estimate": "planning_estimate_only",
+    "qualification": "UNVALIDATED (I2.16, I0.5)",
+    "reference_capsule_handle": "I2.20"
+  },
+  "bound_contract_digest": "5f5a590931a3e1aab18c7f0504134b69effd144b5bbd22c2771e70c46b561648",
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-learning-contracts/Cargo.toml",
+        "sha256": "ec5cfcf9853571be950f64e9220003751b3368611eb3f7d81940f0531e3b7ff6"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-learning-contracts/module.toml",
+        "sha256": "39dd44251020b5fd6ca526b6a4fe4b250188026f52bf21dd9c1a7b92831dcbb0"
+      },
+      "selected_source": {
+        "path_count": 15,
+        "sha256": "8f587079c2c62aaf3962d3439b1316ccfbe615cbfdd1890fa85d874273970c52"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "65c955b0fa0d9e69d5464e68c6965eb1c4c034275a8863b46c4810ae182a348d",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "65c955b0fa0d9e69"
+  }
+}

@@ -1,0 +1,300 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.dreamer.orientation-wasm",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "smart.dreamer.orientation-wasm",
+    "source_package": "eliot-dreamer-orientation-wasm",
+    "source_manifest": "crates/smart/eliot-dreamer-orientation-wasm/Cargo.toml",
+    "source_root_path": "crates/smart/eliot-dreamer-orientation-wasm",
+    "module_manifest": "crates/smart/eliot-dreamer-orientation-wasm/module.toml",
+    "workspace_member": false,
+    "bins_reachable": false,
+    "excluded_scope": {
+      "disposition": "WRAP",
+      "owner": "smart.dreamer.orientation-wasm",
+      "workspace_admission": "pending_package_proof_and_integration_owner_review",
+      "source": "workstreams/security/standalone-crate-dispositions.toml"
+    }
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Adapt the exact accepted guest.wit `run` export to one exhaustive typed call of the native Orientation projector."
+    },
+    "causal_property": {
+      "state": "DECLARED",
+      "origin": "module.toml|causal_property",
+      "value": "thin typed WASM adaptation of the Orientation leaf"
+    },
+    "invariants": {
+      "state": "DECLARED",
+      "origin": "module.toml|invariants",
+      "value": [
+        "exactly one native call per valid invocation, zero per rejected invocation",
+        "no wildcard, Other, Value or whole-payload JSON/bytes bridge",
+        "native semantic digests distinct from component/artifact hashes",
+        "no ambient WASI capability in the pure-world import gate"
+      ]
+    },
+    "non_goals": {
+      "state": "DECLARED",
+      "origin": "module.toml|non_goals",
+      "value": [
+        "typed `dreamer-handler` world definition (owner #756)",
+        "Host/runtime/engine implementation (#758/#760)",
+        "toolchain pinning (#870)",
+        "source acquisition, parsing, grounding, rival/probe/clarification algorithms, Human interaction, probe execution, mutable state, authority/effect, Finish"
+      ]
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "smart-memory-context",
+        "title": "Smart memory, context, and understanding",
+        "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+        "documentation_handles": [
+          "I12.13",
+          "I17.11"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "DECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": "smart.dreamer.orientation-wasm"
+    },
+    "source_maintenance_owner": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": null
+    },
+    "state_class": {
+      "state": "DECLARED",
+      "origin": "module.toml|state_class",
+      "value": "stateless"
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Reject wrong subtype/shape/version/descriptor before native execution; retain the actual native or component error; never promote to success."
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|inputs",
+      "value": [
+        "GuestRequest (typed envelope over the five native Orientation inputs)",
+        "canonical request bytes at the `run` boundary"
+      ]
+    },
+    "outputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|outputs",
+      "value": [
+        "GuestResponse (native packet or exhaustive typed error)",
+        "component descriptor and import gate verdicts"
+      ]
+    },
+    "providers": {
+      "state": "DECLARED",
+      "origin": "module.toml|providers",
+      "value": [
+        "Governor-admitted bundle via the native owner",
+        "bins/eliot-wasm-host guest.wit (read-only)",
+        "rust-toolchain.toml pinned target (read-only)"
+      ]
+    },
+    "depends_on": {
+      "state": "DECLARED",
+      "origin": "module.toml|depends_on",
+      "value": [
+        "eliot-contracts",
+        "eliot-evidence",
+        "eliot-epistemic-contracts",
+        "eliot-dreamer-contracts",
+        "eliot-dreamer-orientation"
+      ]
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": "R6"
+      },
+      "runtime_bundle": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": "eliot-dreamer"
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "DECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "DECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": "merge back when no independent consumer, proof, dependency or replacement seam remains"
+    },
+    "split_trigger": {
+      "state": "DECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": null
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "DECLARED",
+      "origin": "module.toml|discriminator",
+      "value": "One valid guest invocation calls native #628 exactly once; rejected ABI/input calls it zero times; every native field, disposition, digest and bound is preserved with no duplicate algorithm."
+    },
+    "old_failure_or_missing_capability": {
+      "state": "DECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": "PR #635 closed unmerged: starting the guest then required a speculative private ABI or duplicate native Orientation logic."
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!",
+        "std::process",
+        "std::fs",
+        "tokio",
+        "reqwest",
+        "surrealdb"
+      ]
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [],
+    "contract_refs_source": "crates/smart/eliot-dreamer-orientation-wasm/Cargo.toml",
+    "donor_records": [
+      {
+        "path": "bins/eliot-wasm-host/wit/guest.wit",
+        "disposition": "read-only ABI source compiled into the descriptor at build time; not copied by hand"
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-orientation/src/lib.rs",
+        "disposition": "reuse the native five-input projector behind the guest envelope; no logic copied"
+      },
+      {
+        "path": "docs/architecture/I14-19-wasm-components.md",
+        "disposition": "authoritative component boundary; typed dreamer-handler arm still owned by #756"
+      }
+    ]
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/Cargo.toml",
+        "sha256": "bce0ebba3cf16f8501858d90e3c2e2b5096e4df53abd7aa431ff3747906c6e9e"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-dreamer-orientation-wasm/module.toml",
+        "sha256": "1c790e4204c91a7bfc20538b5b4658740c228ce4136be9ffc1e6741898b3106f"
+      },
+      "selected_source": {
+        "path_count": 5,
+        "sha256": "fa9451dcee3fe54f48fefd6ab0f8b740948058b006c78b68102462b696f8e7b1"
+      },
+      "excluded_disposition": {
+        "path": "workstreams/security/standalone-crate-dispositions.toml",
+        "sha256": "4a5ce7ef7ee19bd18e4d106dbcd3218c7d950e461ea8b9d039ab854bffb3884d"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "c4688a99e55f437a34881729792bf499d5134d6a345c8899bcdf419c22b16a41",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "c4688a99e55f437a"
+  }
+}

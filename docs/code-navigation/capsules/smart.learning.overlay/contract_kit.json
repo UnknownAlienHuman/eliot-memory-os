@@ -1,0 +1,272 @@
+{
+  "schema_version": "eliot-capule-triad-v1",
+  "artifact_kind": "ModuleContractKit",
+  "generator": "scripts/code_navigation.py capsules",
+  "generator_version": "1.0.0",
+  "governing_handle": "I2.20",
+  "governing_fragment": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+  "cell_id": "smart.learning.overlay",
+  "crate_or_cell_identity": {
+    "functional_capability_cell": "smart.learning.overlay",
+    "source_package": "eliot-learning-overlay",
+    "source_manifest": "crates/smart/eliot-learning-overlay/Cargo.toml",
+    "source_root_path": "crates/smart/eliot-learning-overlay",
+    "module_manifest": "crates/smart/eliot-learning-overlay/module.toml",
+    "workspace_member": true,
+    "bins_reachable": false,
+    "excluded_scope": null
+  },
+  "purpose_and_invariants": {
+    "purpose": {
+      "state": "DECLARED",
+      "origin": "module.toml|primary_responsibility or [package].description",
+      "value": "Assemble and validate one task-local CampaignHarnessOverlay candidate from admitted learning deltas and preserved-success constraints."
+    },
+    "causal_property": {
+      "state": "DECLARED",
+      "origin": "module.toml|causal_property",
+      "value": "task-local behavioral overlay construction"
+    },
+    "invariants": {
+      "state": "DECLARED",
+      "origin": "module.toml|invariants",
+      "value": [
+        "one parent revision",
+        "next discriminator frozen before evaluation",
+        "local scope/expiry/rollback mandatory"
+      ]
+    },
+    "non_goals": {
+      "state": "DECLARED",
+      "origin": "module.toml|non_goals",
+      "value": [
+        "objective/acceptance change",
+        "authority/privacy/cost widening",
+        "sealed holdout/evaluator change",
+        "production promotion"
+      ]
+    }
+  },
+  "public_types_and_schemas": {
+    "public_targets": [],
+    "declared_contract_refs": [],
+    "contract_catalogue": "docs/architecture/handle-index.json",
+    "governing_logic_blocks": [
+      {
+        "block": "smart-memory-context",
+        "title": "Smart memory, context, and understanding",
+        "responsibility": "Context assembly, cues, governed memory, understanding, epistemic state, Dreamer candidates, learning overlays, and system experience.",
+        "documentation_handles": [
+          "I12.13",
+          "I17.11"
+        ]
+      }
+    ]
+  },
+  "owned_state_and_effects": {
+    "lifecycle_owner": {
+      "state": "DECLARED",
+      "origin": "module.toml|lifecycle_owner",
+      "value": "smart.learning.overlay"
+    },
+    "source_maintenance_owner": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].source_maintenance_owner",
+      "value": null
+    },
+    "state_class": {
+      "state": "DECLARED",
+      "origin": "module.toml|state_class",
+      "value": "stateless"
+    },
+    "owned_mutable_state": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|owned_mutable_state",
+      "value": null
+    },
+    "allowed_effects": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|allowed_effects",
+      "value": null
+    },
+    "allowed_effect_classes": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].allowed_effect_classes",
+      "value": null
+    },
+    "failure_behavior": {
+      "state": "DECLARED",
+      "origin": "module.toml|failure_behavior",
+      "value": "Return explicit inconclusive/no-change/unsupported output with exact missing evidence; never fabricate learning or promotion."
+    },
+    "execution_contour": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].execution_contour",
+      "value": null
+    },
+    "runtime_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].runtime_class",
+      "value": null
+    }
+  },
+  "dependency_ports": {
+    "inputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|inputs",
+      "value": [
+        "CampaignLearningStateView and LearningStateViewRecipe",
+        "exact externally admitted AttemptLearningDeltaCandidate IDs/digests",
+        "candidate identity, parent task revision, protected-surface digests, next discriminator and explicit observation/expiry values"
+      ]
+    },
+    "outputs": {
+      "state": "DECLARED",
+      "origin": "module.toml|outputs",
+      "value": [
+        "CampaignHarnessOverlayCandidate"
+      ]
+    },
+    "providers": {
+      "state": "DECLARED",
+      "origin": "module.toml|providers",
+      "value": [
+        "learning delta",
+        "task/evaluator constraint projections"
+      ]
+    },
+    "depends_on": {
+      "state": "DECLARED",
+      "origin": "module.toml|depends_on",
+      "value": [
+        "eliot-learning-contracts"
+      ]
+    },
+    "runtime_owner_and_bundle": {
+      "runtime_layer": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_layer",
+        "value": "R5"
+      },
+      "runtime_bundle": {
+        "state": "DECLARED",
+        "origin": "module.toml|runtime_bundle",
+        "value": "eliotd"
+      },
+      "runtime_root_rules": [],
+      "boundary_source": "config/architecture-boundaries.toml"
+    }
+  },
+  "compatibility_rules": {
+    "replacement_boundary": {
+      "state": "DECLARED",
+      "origin": "module.toml|replacement_boundary",
+      "value": "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+    },
+    "replacement_class": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].replacement_class",
+      "value": null
+    },
+    "merge_rejoin_condition": {
+      "state": "DECLARED",
+      "origin": "module.toml|merge_rejoin_condition",
+      "value": "merge back when no independent consumer, proof, dependency or replacement seam remains"
+    },
+    "split_trigger": {
+      "state": "DECLARED",
+      "origin": "module.toml|split_trigger",
+      "value": "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+    },
+    "iteration_lane": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].iteration_lane",
+      "value": null
+    },
+    "proof_latency_profile": {
+      "state": "UNDECLARED",
+      "origin": "[package.metadata.eliot].independent_proof_profile",
+      "value": null
+    }
+  },
+  "negative_cases": {
+    "discriminator": {
+      "state": "DECLARED",
+      "origin": "module.toml|discriminator",
+      "value": "forbidden-surface fixtures reject widening while a reversible context/tool/probe delta remains representable"
+    },
+    "old_failure_or_missing_capability": {
+      "state": "DECLARED",
+      "origin": "module.toml|old_failure_or_missing_capability",
+      "value": "local learning can otherwise widen task authority, alter evaluator or leak into unrelated work"
+    },
+    "forbidden_patterns": {
+      "state": "DECLARED",
+      "origin": "module.toml|acceptance.forbidden_patterns",
+      "value": [
+        "serde_json::Value",
+        "unimplemented!",
+        "todo!"
+      ]
+    }
+  },
+  "known_unknowns": {
+    "declared_known_unknowns": {
+      "state": "UNDECLARED",
+      "origin": "module.toml|known_unknowns",
+      "value": null
+    },
+    "unresolved_contract_refs": [],
+    "contract_ref_failures": [],
+    "observation": "A generated capsule is generation evidence from the named metadata, not executed product evidence (I0.5, I2.20)."
+  },
+  "oracle_origins": {
+    "resolved_contract_refs": [],
+    "contract_refs_source": "crates/smart/eliot-learning-overlay/Cargo.toml",
+    "donor_records": [
+      {
+        "path": "ELIOT_IMPLEMENTATION I12.24 CampaignHarnessOverlay",
+        "disposition": "authoritative contract"
+      }
+    ]
+  },
+  "source_provenance": {
+    "input_digests": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+      },
+      "contract_catalogue": {
+        "path": "docs/architecture/handle-index.json",
+        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+      },
+      "architecture_boundaries": {
+        "path": "config/architecture-boundaries.toml",
+        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+      },
+      "logical_block_config": {
+        "path": "docs/code-navigation/logical-blocks.toml",
+        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+      },
+      "package_manifest": {
+        "path": "crates/smart/eliot-learning-overlay/Cargo.toml",
+        "sha256": "a3d4c65b26a53288c4f43e29576b567644b46cb6ca4e16b3715c2acbcd2f8338"
+      },
+      "module_manifest": {
+        "path": "crates/smart/eliot-learning-overlay/module.toml",
+        "sha256": "ff884ae55a33ae745fe4ae7e6bd4cd175acc74c9d39083ee267b7411ad996ef3"
+      },
+      "selected_source": {
+        "path_count": 12,
+        "sha256": "f1f6e685437d8ca6d1eba1367f988506822ff7d5547a5ae08823f57a9b71bf0e"
+      }
+    },
+    "generator": "scripts/code_navigation.py capsules",
+    "generator_version": "1.0.0"
+  },
+  "artifact_digest": "4f6f73ab99890b3fd1eb8d4a34d5305c61ea37dd7bbab8929ad804263c2a97d6",
+  "contract_revision": {
+    "derivation": "first 16 hex characters of the artifact digest",
+    "value": "4f6f73ab99890b3f"
+  }
+}

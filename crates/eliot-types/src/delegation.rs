@@ -243,11 +243,8 @@ pub struct DelegationOutcome {
     pub actual_runtime_ms: u64,
     pub provider_call_count: u32,
     pub monetary_cost_known: bool,
-    #[serde(default)]
     pub integrity_evidence_present: bool,
-    #[serde(default)]
     pub authority_violations: u32,
-    #[serde(default)]
     pub live_tree_violations: u32,
     pub notes: Vec<String>,
     pub created_at: OffsetDateTime,
@@ -261,25 +258,15 @@ pub struct DelegationState {
     pub budgets: Vec<DelegationBudget>,
     pub jobs: Vec<DelegationJob>,
     pub outcomes: Vec<DelegationOutcome>,
-    #[serde(default)]
     pub provider_call_budgets: Vec<ProviderCallBudgetState>,
-    #[serde(default)]
     pub provider_call_reservations: Vec<ProviderCallReservation>,
-    #[serde(default)]
     pub agent_host_sessions: Vec<AgentSessionHostBinding>,
-    #[serde(default)]
     pub task_role_leases: Vec<TaskRoleLease>,
-    #[serde(default)]
     pub controller_leases: Vec<ControllerLease>,
-    #[serde(default)]
     pub operation_jobs: Vec<OperationJob>,
-    #[serde(default)]
     pub agent_invocations: Vec<AgentInvocationRequest>,
-    #[serde(default)]
     pub agent_results: Vec<AgentResultEnvelope>,
-    #[serde(default)]
     pub agent_result_dispositions: Vec<AgentResultDisposition>,
-    #[serde(default)]
     pub authority_revocation_receipts: Vec<crate::AuthorityRevocationReceipt>,
 }
 

@@ -1,16 +1,27 @@
 //! Kernel admission client transport for native-worker lifecycle (Wave C).
 //!
-//! Architecture: Kernel is the governing admission authority per
-//! `docs/architecture/ELIOT_ARCHITECTURE.md` (A0.3, A2.2, A12.2, A12.3,
-//! A13.2; ARCH-AUTH-01, ARCH-SEC-01, ARCH-SEC-02). Native-worker is a thin
-//! composition boundary that must not assume or synthesize admission/authority.
+//! Architecture: Kernel is the governing admission authority per `A0.3`
+//! (`docs/architecture/A00-03-hard-boundaries.md`), `A2.2`
+//! (`docs/architecture/A02-02-roles.md`), `A12.2`
+//! (`docs/architecture/A12-02-principal-session-and-visibility.md`), `A12.3`
+//! (`docs/architecture/A12-03-one-governed-write-path.md`), `A13.2`
+//! (`docs/architecture/A13-02-kernel-and-failure-domains.md`); and
+//! `docs/architecture/A16-01-decision-anchors.md` `ARCH-AUTH-01`, `ARCH-SEC-01`,
+//! `ARCH-SEC-02`. Native-worker is a thin composition boundary that must not
+//! assume or synthesize admission/authority.
 //!
 //! Implementation: Uses `eliot-cli::kernel_client::KernelClient` health probe and
-//! typed `native_worker.*` transact spans per
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (I1.2, I7.3, I7.5, I15.2,
-//! P.3, I2.23) and the `bins/eliot-native-worker` crate boundary. Fails closed
-//! until Kernel supplies a session-bound claim and preserves exact transport
-//! error mapping and handshake strings.
+//! typed `native_worker.*` transact spans per `I1.2`
+//! (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`),
+//! `I7.3` (`docs/architecture/I07-03-handshake.md`), `I7.5`
+//! (`docs/architecture/I07-05-named-pipes.md`), `I15.2`
+//! (`docs/architecture/I15-02-principal-and-session-binding.md`), `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`),
+//! the R1 Kernel runtime layer
+//! (`docs/architecture/I-PREFACE-04-runtime-layer-model.md`), and the
+//! `bins/eliot-native-worker` crate boundary. Fails closed until Kernel
+//! supplies a session-bound claim and preserves exact transport error mapping
+//! and handshake strings.
 //!
 //! Responsibility: Kernel admission client transport only — health handshake,
 //! typed registration/claim/readiness/heartbeat/checkpoint/result/cancel

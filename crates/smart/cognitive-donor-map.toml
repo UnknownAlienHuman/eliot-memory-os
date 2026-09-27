@@ -67,7 +67,7 @@ disposition = "RETIRED_DUPLICATE_COGNITIVE_STATE_OWNER"
 targets = ["governor.observation.classifier"]
 rationale = "Extraction outcome idea-only: the classify helper informed the Governor observation classifier; ObservationHint/RecordKind/EpistemicStatus vocabulary rejected, nothing copied. Zero-consumer proof at base 7a1a6eaa (cargo metadata reverse-deps 0, no eliot_memory:: import, Cargo.lock own-entry only). Package source, root member and lock entry removed in work/39-retire-duplicate-cognitive-owners atop base 7a1a6eaa (removal commit SHA in #39 work unit)."
 rejected_overgeneralization = "Any second memory plane, status owner, retrieval reinforcement or direct write surface."
-extraction_proof = "D1_CAPTURE_CLASSIFICATION_EDGE_01 via crates/governor/eliot-observation/tests/classifier_first_pass.rs (5 tests)"
+extraction_proof = "Module/package proof scope only: crates/governor/eliot-observation/tests/classifier_first_pass.rs (5 contract/admission tests); these do not establish Edge or Product proof. D1_CAPTURE_CLASSIFICATION_EDGE_01 Edge proof: NOT_EXECUTED. Product Pulse: NOT_EXECUTED; no distinct admitted Product-proof reference."
 
 [[donor]]
 path = "crates/smart/eliot-system-experience"

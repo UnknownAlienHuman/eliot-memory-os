@@ -28,9 +28,10 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots, TestJob, TestdError,
-    TestdSourceObservation, TestdStore, is_admitted_testd_profile, issue_process_admission,
-    testd_profile_binding, testd_profile_resource_limits, validate_running_lease,
+    Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, TargetRoots, TestJob,
+    TestdError, TestdSourceObservation, TestdStore, is_admitted_testd_profile,
+    issue_process_admission, testd_profile_binding, testd_profile_resource_limits,
+    validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -326,6 +327,10 @@ pub struct TestReceipt {
     pub target_root: String,
     pub cache_root: String,
     pub state: String,
+    /// Declared job class, resource weight, and the classes this job's claim
+    /// reserves against. Absent only before the first claim allocates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<SchedulingDecision>,
 }
 
 /// Explicit failure issuer used by the standalone line protocol until Kernel
@@ -1788,6 +1793,7 @@ pub(crate) fn receipt(job: &TestJob) -> TestReceipt {
         target_root: job.target_roots.target_root.clone(),
         cache_root: job.target_roots.cache_root.clone(),
         state: format!("{:?}", job.state),
+        scheduling: job.scheduling.clone(),
     }
 }
 

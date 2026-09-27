@@ -421,6 +421,9 @@ pub enum SkillResultOutcome {
     /// A canonical write was withheld by the `WorkScope` guard. The complete
     /// identity classification and receipt remain typed across the bridge.
     ScopeGuardWithheld(Box<eliot_skill::SkillScopeGuardFailure>),
+    /// A readiness refusal retains its owner receipt, effect, directive, and
+    /// exact missing inputs through the result wire.
+    MaterialReadinessDenied(Box<eliot_skill::SkillMaterialReadinessDenial>),
 }
 
 impl SkillResultEnvelope {
@@ -478,6 +481,9 @@ impl SkillResultEnvelope {
         let outcome = match error {
             SkillError::ScopeGuardWithheld(failure) => {
                 SkillResultOutcome::ScopeGuardWithheld(failure.clone())
+            }
+            SkillError::MaterialReadinessDenied(failure) => {
+                SkillResultOutcome::MaterialReadinessDenied(failure.clone())
             }
             SkillError::FenceMismatch => SkillResultOutcome::Refused {
                 code: "FENCE_MISMATCH".to_owned(),

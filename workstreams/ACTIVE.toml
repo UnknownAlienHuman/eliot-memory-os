@@ -1,6 +1,5 @@
 schema = "eliot.active-workstreams.v1"
 authority_branch = "main"
-updated_at = "2026-09-10"
 workflow = "WORKFLOW.md"
 agent_rules = "AGENTS.md"
 
@@ -17,7 +16,6 @@ unlisted_branch_mutation_allowed = false
 id = "regression-probes"
 status = "active"
 branch_strategy = "fresh_per_issue_from_current_main"
-issue_refs = [7, 8, 9, 10]
 implementation_rule = "Historical observations are regression discriminators only. Each issue first reproduces or refutes the failure on exact current source/runtime/provider/store identities, then changes one causal owner in its own branch and PR."
 
 [[workstream]]
@@ -28,9 +26,6 @@ issue_refs = [13, 14, 15, 18, 19, 20, 21, 22, 24]
 completed_baseline_issue_refs = [16, 17, 23]
 cross_cutting_follow_up_issue_refs = [100]
 integration_issue_refs = [11]
-confirmed_open_defect_refs = [63, 64, 65, 66, 67, 74, 77, 78, 79]
-merged_source_fix_refs = [59, 61, 68, 70, 72, 73, 75, 76, 120]
-forbidden_active_defect_refs = [82, 83, 84]
 briefs = ["workstreams/core-daemons/AGENTS.md"]
 inventories = ["workstreams/core-daemons/inventory.json"]
 excluded_capabilities = ["dreamer"]
@@ -40,7 +35,6 @@ implementation_rule = "Open primary issues own current integration. Completed ba
 id = "cognitive-micromodules"
 status = "active"
 branch_strategy = "fresh_per_issue_from_current_main"
-issue_refs = [38, 39, 40, 41, 43, 44, 45]
 briefs = [
   "crates/smart/cognitive-wave-01.toml",
   "crates/smart/cognitive-wave-02.toml"
