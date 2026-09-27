@@ -387,46 +387,105 @@ impl FencedProjectionPublication {
         expected_source_generation: u64,
         expected_definition_digest: &str,
     ) -> Result<(), StoreError> {
-        self.validate()?;
-        if self.record.status != ProjectionStatus::Current {
-            return Err(StoreError::InvalidProjection);
-        }
-        if !matches!(self.record.split_view, SplitView::None) {
-            return Err(StoreError::InvalidProjection);
-        }
+        self.check_published_at(expected_source_heads, expected_source_generation)?;
         if self.projection_definition_digest != expected_definition_digest {
-            return Err(StoreError::InvalidProjection);
-        }
-        if self.record.source_generation != expected_source_generation {
-            return Err(StoreError::InvalidProjection);
-        }
-        unique(
-            self.record
-                .source_revision_heads
-                .iter()
-                .map(|head| head.key.clone()),
-            "source_revision_heads",
-        )?;
-        unique(
-            expected_source_heads.iter().map(|head| head.key.clone()),
-            "expected_source_heads",
-        )?;
-        let mut actual = BTreeMap::new();
-        for head in &self.record.source_revision_heads {
-            actual.insert(head.key.clone(), head.revision);
-        }
-        let mut expected = BTreeMap::new();
-        for head in expected_source_heads {
-            if head.state_fence != self.record.state_fence {
-                return Err(StoreError::InvalidProjection);
-            }
-            expected.insert(head.key.clone(), head.revision);
-        }
-        if actual != expected {
             return Err(StoreError::InvalidProjection);
         }
         Ok(())
     }
+
+    /// Requires the same readability fence from a bare publication record.
+    ///
+    /// [`Self::check_current`] is this predicate plus the projection
+    /// definition digest, which only a [`Self`] can carry. A reader that holds
+    /// the record itself — the durable `projection_record` row a published
+    /// transition committed beside its own receipt — reaches every clause the
+    /// record can actually prove through this one function, so the
+    /// record-carried fence has exactly one implementation and a reader never
+    /// re-spells it. The definition-digest clause stays where it belongs: it
+    /// needs a projection definition identity the record does not carry, and
+    /// it is never dropped from [`Self::check_current`] to make a record look
+    /// sufficient.
+    ///
+    /// The caller owns the one clause a bare record cannot prove against
+    /// itself: that its `atomic_data_commit` is the commit whose data the
+    /// reader is about to serve.
+    pub fn check_record_current(
+        record: &ProjectionPublicationRecord,
+        expected_source_heads: &[RevisionHead],
+        expected_source_generation: u64,
+    ) -> Result<(), StoreError> {
+        record.validate()?;
+        check_published(record, expected_source_heads, expected_source_generation)
+    }
+
+    /// The record-carried readability fence shared by [`Self::check_current`]
+    /// and [`Self::check_record_current`].
+    ///
+    /// Valid fence and record shape, `CURRENT` status, no split view, the
+    /// expected source generation, and an exact fence-pinned source-head
+    /// match. `validate()` additionally pins `atomic_commit_ref` to the
+    /// record's own atomic data commit, so candidate data and its provenance
+    /// are proved to have become visible under one commit reference.
+    pub fn check_published_at(
+        &self,
+        expected_source_heads: &[RevisionHead],
+        expected_source_generation: u64,
+    ) -> Result<(), StoreError> {
+        self.validate()?;
+        check_published(
+            &self.record,
+            expected_source_heads,
+            expected_source_generation,
+        )
+    }
+}
+
+/// The one implementation of the record-carried readability fence (`I5.8`).
+///
+/// `CURRENT` status, no split view, the expected source generation, and an
+/// exact fence-pinned source-head match. Shape and atomic-commit pinning live
+/// in the callers' `validate`, so this is reached only from a validated fence.
+fn check_published(
+    record: &ProjectionPublicationRecord,
+    expected_source_heads: &[RevisionHead],
+    expected_source_generation: u64,
+) -> Result<(), StoreError> {
+    if record.status != ProjectionStatus::Current {
+        return Err(StoreError::InvalidProjection);
+    }
+    if !matches!(record.split_view, SplitView::None) {
+        return Err(StoreError::InvalidProjection);
+    }
+    if record.source_generation != expected_source_generation {
+        return Err(StoreError::InvalidProjection);
+    }
+    unique(
+        record
+            .source_revision_heads
+            .iter()
+            .map(|head| head.key.clone()),
+        "source_revision_heads",
+    )?;
+    unique(
+        expected_source_heads.iter().map(|head| head.key.clone()),
+        "expected_source_heads",
+    )?;
+    let mut actual = BTreeMap::new();
+    for head in &record.source_revision_heads {
+        actual.insert(head.key.clone(), head.revision);
+    }
+    let mut expected = BTreeMap::new();
+    for head in expected_source_heads {
+        if head.state_fence != record.state_fence {
+            return Err(StoreError::InvalidProjection);
+        }
+        expected.insert(head.key.clone(), head.revision);
+    }
+    if actual != expected {
+        return Err(StoreError::InvalidProjection);
+    }
+    Ok(())
 }
 
 /// Authority to initiate a projection rebuild.

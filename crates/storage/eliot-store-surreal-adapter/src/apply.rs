@@ -984,6 +984,11 @@ struct VerifiedAttemptState {
     /// (issue #1931). Read beside the heads so a link can never claim a
     /// genesis prior for a scope that already advanced.
     current_chain_tips: plan::OrderingChainTips,
+    /// Retained publication generations for the transition's declared
+    /// projection kinds (issue #1931, `I5.8`). Read beside the heads so every
+    /// planned publication advances from the store's own state instead of a
+    /// constant.
+    current_projection_generations: plan::ProjectionGenerations,
 }
 
 impl VerifiedAttemptState {
@@ -1077,6 +1082,15 @@ async fn load_verified_attempt_state(
         read_ordering_heads_inner(db, &adapter.config, &ordering_scopes).await?;
     let current_chain_tips =
         read_ordering_chain_tips_inner(db, &adapter.config, &ordering_scopes).await?;
+    let current_projection_generations = read_projection_generations_inner(
+        db,
+        &adapter.config,
+        &transition
+            .event_projection_relation_intents
+            .projection_kinds
+            .clone(),
+    )
+    .await?;
     check_expected_revisions(
         &current_revisions,
         expected_revision_heads,
@@ -1092,6 +1106,7 @@ async fn load_verified_attempt_state(
         current_revisions,
         current_orderings,
         current_chain_tips,
+        current_projection_generations,
     })
 }
 
@@ -1231,14 +1246,28 @@ async fn apply_with_retry(
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
-            plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?
+            // Issue #1931: allocation retry re-reads the retained publication
+            // generations, so the publication generation on the attempt that
+            // actually commits is still exactly the retained generation plus
+            // one. Every other semantic value stays byte-for-byte from the
+            // established plan.
+            let mut recomputed =
+                plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?;
+            plan::rebind_publication_generations(
+                &mut recomputed,
+                &verified.current_projection_generations,
+            )?;
+            recomputed
         } else {
             let full = plan::select_apply_plan_with_chain_tips(
                 &transition,
                 authorities,
-                &verified.current_revisions,
-                &verified.current_orderings,
-                &verified.current_chain_tips,
+                &plan::ObservedStoreState {
+                    revision_heads: verified.current_revisions.clone(),
+                    ordering_heads: verified.current_orderings.clone(),
+                    chain_tips: verified.current_chain_tips.clone(),
+                    projection_generations: verified.current_projection_generations.clone(),
+                },
                 next_commit_sequence,
                 next_outbox_sequence,
             )?;
@@ -1300,6 +1329,7 @@ async fn apply_with_retry(
                     &expected_ordering_heads,
                 )?;
                 validate_committed_canonical_transition(&plan, &receipt)?;
+                validate_committed_projection_publications(&plan, &receipt)?;
                 return Ok(receipt);
             }
             Err(AdapterError::AllocationContention { .. }) if retries < MAX_ALLOCATION_RETRIES => {
@@ -1340,6 +1370,54 @@ fn validate_committed_canonical_transition(
     }
     .validate_atomic()
     .map_err(AdapterError::Store)
+}
+
+/// Post-commit publication fence for one canonical transition (issue #1931).
+///
+/// `I5.8` requires candidate data and provenance to become visible atomically
+/// at an explicit source fence. This runs on the live `Ok(())` arm beside
+/// [`validate_committed_canonical_transition`] and refuses a commit whose
+/// projection publications are not whole: every publication the transaction
+/// wrote must be named by the very receipt this commit produced, must pin that
+/// receipt's commit as its atomic data/provenance commit, must sit at the
+/// receipt's own fence, and must name exactly the scope-revision heads this
+/// transaction committed as its source heads — read back through the same
+/// [`eliot_store_api::FencedProjectionPublication::check_record_current`]
+/// predicate the reader-side publication gate uses, so the write-side and
+/// read-side fences cannot drift.
+///
+/// It is pure over the values the one transaction bound and needs no second
+/// provider round trip, so it can never refuse a commit whose own plan and
+/// receipt are whole. A transition that declares no projection kind has nothing
+/// to fence and passes trivially.
+fn validate_committed_projection_publications(
+    plan: &plan::ApplyPlan,
+    receipt: &WriteReceipt,
+) -> Result<(), AdapterError> {
+    if plan.projection_records.len() != receipt.projection_refs.len() {
+        return Err(AdapterError::Store(StoreError::InvalidProjection));
+    }
+    let Some(commit_id) = receipt.commit_id.as_ref() else {
+        if plan.projection_records.is_empty() {
+            return Ok(());
+        }
+        return Err(AdapterError::Store(StoreError::InvalidProjection));
+    };
+    for record in &plan.projection_records {
+        if record.state_fence != receipt.state_fence
+            || record.atomic_data_commit != *commit_id
+            || !receipt.projection_refs.contains(&record.publication_id)
+        {
+            return Err(AdapterError::Store(StoreError::InvalidProjection));
+        }
+        eliot_store_api::FencedProjectionPublication::check_record_current(
+            record,
+            &plan.next_revision_heads,
+            record.source_generation,
+        )
+        .map_err(AdapterError::Store)?;
+    }
+    Ok(())
 }
 
 /// 688-B: the adapter's apply-path erasure execution.
@@ -1698,6 +1776,63 @@ async fn read_ordering_chain_tips_inner(
         }
     }
     Ok(tips)
+}
+
+/// One retained projection publication generation, read beside the chain tips.
+#[derive(Deserialize)]
+struct ProjectionGenerationRow {
+    projection_kind: String,
+    projection_generation: u64,
+    source_generation: u64,
+}
+
+/// Reads each declared projection kind's retained publication generations
+/// (issue #1931, `I5.8`).
+///
+/// The generations a publication must advance from are the store's own
+/// retained `projection_record` rows, so the planner never hard-codes a
+/// generation and a publication can never claim one another publication
+/// already holds. This is the same sanctioned pre-transaction readback
+/// mechanism as [`read_ordering_chain_tips_inner`]: one closed `SELECT` beside
+/// the other verified heads, before any provider write, and folding the
+/// maximum observed per kind because publications accumulate one row each.
+/// A kind with no retained publication stays absent and reads as the genesis
+/// cursor, so the first publication of a kind is generation 1.
+///
+/// The publication read gate reuses this one reader rather than a second copy:
+/// the writer advances from the retained maximum and the reader refuses anything
+/// below it, so both sides compare against the same durable state.
+pub(super) async fn read_projection_generations_inner(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    kinds: &[String],
+) -> Result<plan::ProjectionGenerations, AdapterError> {
+    let mut generations = plan::ProjectionGenerations::new();
+    if kinds.is_empty() {
+        return Ok(generations);
+    }
+    let mut bindings = Map::new();
+    bindings.insert("kinds".to_owned(), to_value(&kinds.to_vec())?);
+    let mut response = client::query(
+        db,
+        config,
+        "read.projection_generations",
+        schema::READ_PROJECTION_GENERATIONS_BY_KINDS,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<ProjectionGenerationRow>(&mut response, 0)?;
+    for row in rows {
+        plan::retain_projection_generations(
+            &mut generations,
+            row.projection_kind,
+            plan::RetainedProjectionGeneration {
+                projection_generation: row.projection_generation,
+                source_generation: row.source_generation,
+            },
+        );
+    }
+    Ok(generations)
 }
 
 fn union_revision_keys(
