@@ -1403,7 +1403,7 @@ impl From<StoreError> for StoreReadFailure {
             StoreError::ReceiptNotFound => Self::ReceiptNotFound,
             StoreError::MissingReceiptEnvelope => Self::MissingReceiptEnvelope,
             StoreError::PayloadTooLarge => Self::PayloadTooLarge,
-            StoreError::Unavailable => Self::Unavailable,
+            StoreError::Unavailable | StoreError::SnapshotClosePending { .. } => Self::Unavailable,
             StoreError::Serialization(detail) => Self::Serialization(detail),
         }
     }

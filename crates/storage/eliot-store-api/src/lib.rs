@@ -5490,6 +5490,19 @@ pub enum StoreError {
     },
     #[error("receipt not found")]
     ReceiptNotFound,
+    /// A snapshot close could not observe its bound source point, so the live
+    /// capture remains pending under this exact owner-issued identity. The
+    /// served counters are recovery progress, not a terminal receipt or a
+    /// claim that the source stayed stable.
+    #[error("snapshot close is pending after the source point could not be observed")]
+    SnapshotClosePending {
+        /// The exact handle originally issued for the still-live capture.
+        handle: SnapshotHandle,
+        /// Exact cumulative member count still retained by the capture owner.
+        members_served: u64,
+        /// Exact cumulative byte count still retained by the capture owner.
+        bytes_served: u64,
+    },
     #[error("receipt envelope is missing; write outcome is unknown")]
     MissingReceiptEnvelope,
     #[error("payload exceeds named-operation limit")]
