@@ -113,12 +113,25 @@ pub(super) fn run_watchdog(
                 SpoolError::LeaseStale(_) => "stale",
                 SpoolError::LeaseFenced(_) => "fenced",
             };
-            tracing::info!(
-                event = "watchdog.initial_admission_unavailable",
-                observation = "unavailable",
-                reason = reason,
-                "initial durable admission is unavailable; starting a gap-only sensor"
-            );
+            // I1.10: freshness is its own health dimension, so a stale lease
+            // owns the exact stale diagnostic here — never the unavailable
+            // record and never a failure. The gap-only sensor below still
+            // opens either way; only the observation vocabulary differs.
+            if matches!(&error, SpoolError::LeaseStale(_)) {
+                tracing::info!(
+                    event = "watchdog.initial_admission_stale",
+                    observation = "stale",
+                    reason = reason,
+                    "initial durable admission is stale; starting a gap-only sensor"
+                );
+            } else {
+                tracing::info!(
+                    event = "watchdog.initial_admission_unavailable",
+                    observation = "unavailable",
+                    reason = reason,
+                    "initial durable admission is unavailable; starting a gap-only sensor"
+                );
+            }
             None
         }
     };
