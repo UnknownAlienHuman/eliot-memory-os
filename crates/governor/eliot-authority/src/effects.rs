@@ -194,12 +194,23 @@ impl ActionContract {
 /// `Observe` permits only observation effects; `Reversible` permits
 /// reversible mutations; `Material` and `Critical` permit external
 /// effects; `Forbidden` permits nothing (refused before this is called).
-fn effect_rank_for_impact(impact: ImpactClass) -> u8 {
+fn effect_rank(class: eliot_receipts::EffectClass) -> u8 {
     use eliot_receipts::EffectClass;
+    match class {
+        EffectClass::Read => 0,
+        EffectClass::Candidate => 1,
+        EffectClass::ReversibleMutation => 2,
+        EffectClass::ExternalEffect => 3,
+    }
+}
+
+fn effect_rank_for_impact(impact: ImpactClass) -> u8 {
     match impact {
-        ImpactClass::Observe => effect_rank(EffectClass::Observation),
-        ImpactClass::Reversible => effect_rank(EffectClass::ReversibleMutation),
-        ImpactClass::Material | ImpactClass::Critical => effect_rank(EffectClass::ExternalEffect),
+        ImpactClass::Observe => effect_rank(eliot_receipts::EffectClass::Read),
+        ImpactClass::Reversible => effect_rank(eliot_receipts::EffectClass::ReversibleMutation),
+        ImpactClass::Material | ImpactClass::Critical => {
+            effect_rank(eliot_receipts::EffectClass::ExternalEffect)
+        }
         ImpactClass::Forbidden => 0,
     }
 }
@@ -808,7 +819,7 @@ impl CompiledEffect {
         outcome: EffectOutcome,
         canonical_receipt: ReceiptEnvelope,
     ) -> Result<(), AuthorityError> {
-        let receipt = std::mem::replace(&mut self.receipt, self.receipt.clone());
+        let receipt = self.receipt.clone();
         let reconciled = receipt.reconcile(outcome, canonical_receipt)?;
         self.receipt = reconciled;
         Ok(())
