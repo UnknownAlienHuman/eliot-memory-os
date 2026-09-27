@@ -169,6 +169,26 @@ fn owner_name(value: &str) -> Result<(), ProblemError> {
     text(value, "owner")
 }
 
+/// Advances a record revision, refusing overflow instead of reusing one.
+///
+/// A saturating bump pins a live record to the revision that already names its
+/// current committed state, so the transition is refused and the caller must
+/// re-read the record rather than write a reused identity.
+fn next_revision(current: u64) -> Result<u64, ProblemError> {
+    current.checked_add(1).ok_or(ProblemError::InvalidField {
+        field: "revision",
+        reason: "revision overflow",
+    })
+}
+
+/// Advances the reopen counter under the same no-reuse rule as the revision.
+fn next_reopen_count(current: u32) -> Result<u32, ProblemError> {
+    current.checked_add(1).ok_or(ProblemError::InvalidField {
+        field: "reopen_count",
+        reason: "reopen_count overflow",
+    })
+}
+
 /// Signal severity from deterministic supervision.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -477,6 +497,9 @@ impl Problem {
     }
 
     /// Advances only along the declared Problem lifecycle.
+    ///
+    /// The candidate state is validated on a copy, so a rejected edge or a
+    /// refused revision leaves the live record exactly as it was.
     pub fn transition(
         &mut self,
         expected_fence: &StateFence,
@@ -489,14 +512,12 @@ impl Problem {
                 to: format!("{next:?}"),
             });
         }
-        self.state = next;
-        self.revision = self.revision.saturating_add(1);
-        if self.revision == 0 {
-            return Err(ProblemError::InvalidField {
-                field: "revision",
-                reason: "revision overflow",
-            });
-        }
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.state = next;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
@@ -521,7 +542,14 @@ impl Problem {
         }
     }
 
-    /// Changes owner only after comparing the current owner fence.
+    /// Changes owner only after comparing the caller's fence against the live one.
+    ///
+    /// `expected_fence` is the fence the caller believes is current; it is
+    /// compared against the record's live fence and a mismatch is refused, so a
+    /// renewed or already-reassigned record cannot be fenced by a stale caller.
+    /// `new_fence` is the successor authority fence and must be structurally
+    /// valid. The successor is built and validated as a candidate, so a refused
+    /// reassignment leaves the live record untouched.
     pub fn reassign_owner(
         &mut self,
         expected_fence: &StateFence,
@@ -530,15 +558,22 @@ impl Problem {
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         owner.validate()?;
-        same_fence(&new_fence, &new_fence)?;
-        self.owner = owner;
-        self.state_fence = new_fence;
-        self.acknowledged_by = None;
-        self.revision = self.revision.saturating_add(1);
+        fence(&new_fence)?;
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.owner = owner;
+        candidate.state_fence = new_fence;
+        candidate.acknowledged_by = None;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
     /// Reopens a terminal problem only with new evidence and the current fence.
+    ///
+    /// The reopened record is built as a candidate and validated before it is
+    /// committed, so a refused reopen leaves the terminal record unchanged.
     pub fn reopen(
         &mut self,
         expected_fence: &StateFence,
@@ -560,12 +595,17 @@ impl Problem {
         if new_evidence.is_empty() {
             return Err(ProblemError::ReopenRequiresEvidence);
         }
-        self.evidence_refs.extend(new_evidence);
-        self.state = ProblemState::Open;
-        self.acknowledged_by = None;
-        self.reopen_count = self.reopen_count.saturating_add(1);
-        self.revision = self.revision.saturating_add(1);
-        self.validate()
+        let revision = next_revision(self.revision)?;
+        let reopen_count = next_reopen_count(self.reopen_count)?;
+        let mut candidate = self.clone();
+        candidate.evidence_refs.extend(new_evidence);
+        candidate.state = ProblemState::Open;
+        candidate.acknowledged_by = None;
+        candidate.reopen_count = reopen_count;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Returns whether evidence-backed terminal resolution was reached.
@@ -589,6 +629,8 @@ impl Problem {
     /// `Quarantined` and the typed rebuild-from-clean-inputs requirement
     /// (I12.20 S1) is returned for the caller to persist alongside it.
     /// `transition` and `reopen` are unchanged for non-revocation paths.
+    /// The quarantined record is assembled and validated as a candidate, so a
+    /// refused entry leaves the live record unchanged.
     pub fn open_for_revocation(
         &mut self,
         expected_fence: &StateFence,
@@ -602,6 +644,7 @@ impl Problem {
                 reason: "problem scope lies outside the bounded revocation scope",
             });
         }
+        let mut candidate = self.clone();
         if matches!(
             self.state,
             ProblemState::Resolved
@@ -618,24 +661,19 @@ impl Problem {
             if fresh.is_empty() {
                 return Err(ProblemError::ReopenRequiresEvidence);
             }
-            self.reopen(expected_fence, fresh)?;
+            candidate.reopen(expected_fence, fresh)?;
         } else {
             for evidence in &request.revocation_evidence {
-                if !self.evidence_refs.contains(evidence) {
-                    self.evidence_refs.push(evidence.clone());
+                if !candidate.evidence_refs.contains(evidence) {
+                    candidate.evidence_refs.push(evidence.clone());
                 }
             }
-            self.acknowledged_by = None;
+            candidate.acknowledged_by = None;
         }
-        self.state = ProblemState::Quarantined;
-        self.revision = self.revision.saturating_add(1);
-        if self.revision == 0 {
-            return Err(ProblemError::InvalidField {
-                field: "revision",
-                reason: "revision overflow",
-            });
-        }
-        self.validate()?;
+        candidate.revision = next_revision(candidate.revision)?;
+        candidate.state = ProblemState::Quarantined;
+        candidate.validate()?;
+        *self = candidate;
         Ok(RevocationRebuildOrder {
             problem_id: self.problem_id.clone(),
             impacted_scopes: request.impacted_scopes.clone(),
@@ -726,11 +764,13 @@ impl Incident {
             });
         }
         nonempty(&evidence, "new_evidence")?;
+        let revision = next_revision(self.revision)?;
+        let reopen_count = next_reopen_count(self.reopen_count)?;
         self.evidence_refs.extend(evidence);
         self.state = IncidentState::Open;
         self.acknowledged_by = None;
-        self.reopen_count = self.reopen_count.saturating_add(1);
-        self.revision = self.revision.saturating_add(1);
+        self.reopen_count = reopen_count;
+        self.revision = revision;
         Ok(())
     }
 }
@@ -1078,8 +1118,9 @@ impl CriticalAttention {
         if self.delivery_state == DeliveryState::Acknowledged {
             return Ok(());
         }
+        let revision = next_revision(self.revision)?;
         self.delivery_state = DeliveryState::Acknowledged;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1099,8 +1140,9 @@ impl CriticalAttention {
         if self.delivery_state == DeliveryState::NextBoundaryPending {
             return Ok(());
         }
+        let revision = next_revision(self.revision)?;
         self.delivery_state = DeliveryState::NextBoundaryPending;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1112,9 +1154,10 @@ impl CriticalAttention {
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         nonempty(&evidence_refs, "resolution_evidence")?;
+        let revision = next_revision(self.revision)?;
         self.evidence_refs.extend(evidence_refs);
         self.state = AttentionState::Resolved;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1128,6 +1171,7 @@ impl CriticalAttention {
         same_fence(expected_fence, &self.state_fence)?;
         owner.validate()?;
         fence(&new_fence)?;
+        let revision = next_revision(self.revision)?;
         match self.state {
             AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
                 return Err(ProblemError::ImmutableState);
@@ -1140,7 +1184,7 @@ impl CriticalAttention {
         self.owner = owner;
         self.state_fence = new_fence;
         self.delivery_state = DeliveryState::Pending;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1162,8 +1206,9 @@ impl CriticalAttention {
             }
             AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
         }
+        let revision = next_revision(self.revision)?;
         self.state = AttentionState::Waived;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1185,8 +1230,9 @@ impl CriticalAttention {
             }
             AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
         }
+        let revision = next_revision(self.revision)?;
         self.state = AttentionState::Superseded;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1202,6 +1248,7 @@ impl CriticalAttention {
         same_fence(expected_fence, &self.state_fence)?;
         owner.validate()?;
         fence(&new_fence)?;
+        let revision = next_revision(self.revision)?;
         match self.state {
             AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
                 return Err(ProblemError::ImmutableState);
@@ -1212,7 +1259,7 @@ impl CriticalAttention {
         self.state_fence = new_fence;
         self.delivery_state = DeliveryState::Pending;
         self.state = AttentionState::Escalated;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 }
