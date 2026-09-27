@@ -10,6 +10,15 @@ mod protocol_v1;
 
 pub use protocol_v1::*;
 
+mod maintenance_trigger;
+pub use maintenance_trigger::{
+    MAINTENANCE_TRIGGER_CONTRACT_NAME, MAINTENANCE_TRIGGER_CONTRACT_VERSION,
+    MAINTENANCE_TRIGGER_WIRE_ID, MAINTENANCE_TRIGGER_WIRE_VERSION, MaintenanceTriggerContentRef,
+    MaintenanceTriggerPayloadRef, MaintenanceTriggerPosition, MaintenanceTriggerRecord,
+    MaintenanceTriggerRoutingClass, MaintenanceTriggerSourceEvent,
+    maintenance_trigger_contract_identity,
+};
+
 pub mod activation_resolution_v1;
 
 mod reason_codes;
