@@ -1,4 +1,4 @@
-inventory_digest = "4674cea600e5c3665d2b699f367899df61b86fc3a4f5e142e0f5ecb6edd4ad03"
+inventory_digest = "27d13d2a57e4e3622156457cef65fb5ef4fdeeda67aff570473abfa1881b71cd"
 
 [header]
 schema = "eliot.long-lived-collection-inventory.v1"
@@ -10,7 +10,7 @@ scan_denominator_bytes = 202371
 candidate_count = 82
 classified_count = 82
 unresolved_count = 78
-generation_command = "python scripts/long_lived_collection_inventory.py sync --root ."
+generation_command = "python scripts/long_lived_collection_inventory.py sync --root C:/Development/Rust/projects/eliot-swarm/MC-885"
 coverage_disposition = "COMPLETE"
 coverage_reason = "every selected file scanned; every candidate carries exactly one row"
 safety_disposition = "FINDINGS_REMAIN_BLOCKING"
