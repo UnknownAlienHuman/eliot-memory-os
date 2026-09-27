@@ -34,8 +34,16 @@ pub mod adapter_registry;
 /// contract proof addresses the identical gate the contour drives.
 pub mod governed_action;
 
+/// Explicit job envelope for the production native-worker lifecycle
+/// (issue #1912, I14.1/A12.2/A12.3/A12.6/A14.7).
+pub mod job_envelope;
+
 pub use dispatch_authority::{
     NativeWorkerDispatchAuthority, ValidatedDispatchGrant, now_unix_ms as dispatch_now_unix_ms,
+};
+pub use job_envelope::{
+    ConsumptionAttribution, CoverageGap, JobEnvelope, require_consumption_attribution,
+    require_job_envelope, require_paid_start_eligible,
 };
 pub use kernel_admission_client::{
     KernelCheckpointPort, KernelNativeWorkerClient, KernelReplayPort, KernelReplayTransport,
@@ -483,7 +491,8 @@ pub fn require_worker_cell_match(
 /// retained record, never a second process), compose-checked
 /// `start_claimed` through the exact `WorkerCore::demand_start_claimed` gate,
 /// then submit readiness. Invalid admission fails before any factory or
-/// process start is invoked: the artifact/manifest pin refuses first, then
+/// process start is invoked: the owner's ready-or-blocked verdict refuses
+/// paid work first (issue #1912), then the artifact/manifest pin, then
 /// the catalog-revision (W1) and cell-identity (W7) pins, then the lifecycle
 /// transport refuses, and the claimed core gate refuses before
 /// P-03 starts anything. No coordinator
@@ -507,6 +516,10 @@ where
     C: DurableCheckpointPort,
     L: AdmittedLifecycle,
 {
+    // Paid-start eligibility (issue #1912): a `Blocked` owner verdict
+    // refuses before any registration submit, factory effect, or process
+    // start, so no paid work starts against the owner's refusal.
+    require_paid_start_eligible(readiness)?;
     // Artifact/manifest negative (#22): a worker starting from a
     // non-matching artifact/manifest identity is refused before any
     // registration submit, factory effect, or process start. The generation's
@@ -679,7 +692,11 @@ fn truncate_text(value: &str, limit: usize) -> String {
 
 /// Drives one admitted generation behind the governed gate (issue #1911).
 ///
-/// Admits every [`GOVERNED_DRIVE_OPS`] envelope against the material's fence
+/// Pins the explicit job envelope first (issue #1912): principal/session,
+/// `WorkScope`, Authority Epoch, State Fence, allowed effects, route
+/// class, task/job budget, deadline, and cancellation must bind across the
+/// admitted halves before anything else runs. Then admits every
+/// [`GOVERNED_DRIVE_OPS`] envelope against the material's fence
 /// and epoch BEFORE the first lifecycle submit, then runs the exact
 /// [`drive_admitted_claimed`] sequence. A missing, malformed, mismatched,
 /// stale, or invalid envelope refuses with zero submits and zero starts.
@@ -703,6 +720,11 @@ where
     C: DurableCheckpointPort,
     L: AdmittedLifecycle,
 {
+    // Explicit job-envelope pin (issue #1912): the admitted halves must
+    // bind every envelope dimension before the governed gate admits any
+    // driven operation. A disagreement refuses with zero submits and zero
+    // starts, ahead of the envelope negatives below.
+    require_job_envelope(material)?;
     let fence = serde_json::to_value(&material.hello.state_fence).map_err(|_| {
         NativeWorkerError::KernelAdmissionRequired(
             "admitted fence is not projectable to the governed gate".to_owned(),

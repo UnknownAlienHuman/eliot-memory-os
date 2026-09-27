@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use super::NativeWorkerError;
 use crate::AdmittedLifecycle;
+use crate::job_envelope::{ConsumptionAttribution, require_consumption_attribution};
 
 /// Registers (or renews) one worker generation. Paired with the Kernel route.
 pub const NATIVE_WORKER_REGISTRATION_OPERATION: &str = "native_worker.registration";
@@ -491,7 +492,10 @@ impl KernelNativeWorkerClient {
     /// Submission is not acceptance: Kernel reconciles the digest under the
     /// original claim before any reclaim or retry. The admitted claim travels
     /// with the envelope so Kernel can prove the submitted schema is the
-    /// admitted schema from the binding digest.
+    /// admitted schema from the binding digest. The reply must carry the
+    /// admitted governed transition (issue #1912): identity echoes plus the
+    /// `ADMITTED` decision as the canonical receipt, otherwise the result
+    /// is not treated as accepted and affects no canonical state.
     pub fn submit_result(
         &mut self,
         claim: &NativeWorkerClaim,
@@ -517,7 +521,26 @@ impl KernelNativeWorkerClient {
         require_echo(&reply, "result_id", envelope.result_id.as_str())?;
         require_echo(&reply, "claim_id", envelope.binding.claim_id.as_str())?;
         require_echo(&reply, "result_digest", envelope.result_digest.as_str())?;
+        require_decision_admitted(&reply)?;
         Ok(reply)
+    }
+
+    /// Submits one task/job-bound result digest under the exact Ready binding.
+    ///
+    /// Issue #1912: the provider/tool consumption attribution must bind the
+    /// originating task/job/claim/attempt/operation before the governed
+    /// result submit runs, so a foreign receipt never rides this claim's
+    /// transition. STITCH: no adapter producer flows consumption receipts
+    /// through this contour yet; the future producer stitches its receipts
+    /// here instead of calling [`Self::submit_result`] directly.
+    pub fn submit_bound_result(
+        &mut self,
+        claim: &NativeWorkerClaim,
+        envelope: &NativeResultEnvelope,
+        attribution: &ConsumptionAttribution,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        require_consumption_attribution(claim, attribution)?;
+        self.submit_result(claim, envelope)
     }
 
     /// Observes cancellation for one exact attempt under the Ready binding.
