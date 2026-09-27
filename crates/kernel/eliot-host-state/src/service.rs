@@ -33,6 +33,20 @@ impl<B: JournalBackend> HostStateJournalService<B> {
         self.journal.snapshot()
     }
 
+    /// Read-only snapshot of the current Host installation epoch.
+    ///
+    /// This is the epoch a Watchdog responsiveness challenge must bind as its
+    /// expected owner epoch (issue #1757): the Host control owner reports its
+    /// current owner/epoch against this value, and equality — not ordering —
+    /// is the authority rule. Watchdog authority rule (I8.1): the Watchdog
+    /// must never open or write the Host journal to acquire authority; this
+    /// read path exists for the Host composition, not as a Watchdog writer.
+    /// The Watchdog never manufactures the next epoch; a replacement process
+    /// is bound to its newly observed identity and Host-issued epoch only.
+    pub fn host_epoch(&self) -> Result<HostInstallationEpoch, JournalError> {
+        Ok(self.journal.snapshot()?.host)
+    }
+
     pub fn append(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
         self.journal.append(record)
     }
