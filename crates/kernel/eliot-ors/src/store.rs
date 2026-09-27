@@ -1701,6 +1701,27 @@ const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
 /// bindings can never collide with admitted unbound-capture state.
 const HOST_REQUEST_UNBOUND_MARKER: &str = "-";
 
+/// The three durable namespace prefixes of the host-request identity index
+/// (issue #74 W7/A7).
+///
+/// One prefix per presented identity — idempotency key, request id,
+/// cancellation id. The three literals are the shared wire contract with the
+/// Kernel admission binder that constructs the binding rows, and both the
+/// validator and the pre-index reuse check derive their names from these
+/// prefixes, so one changed spelling can never split the index from the rule
+/// that enforces it.
+const HOST_REQUEST_IDEMPOTENCY_BINDING_PREFIX: &str = "hostreq-identity:";
+const HOST_REQUEST_REQUEST_BINDING_PREFIX: &str = "hostreq-request-id:";
+const HOST_REQUEST_CANCELLATION_BINDING_PREFIX: &str = "hostreq-cancellation-id:";
+/// Canonical `request_digest` carried by every identity namespace row.
+///
+/// It is a pure function of the fixed namespace label, never of the request, so
+/// it is derivable from durable protocol state alone and is therefore shared
+/// here instead of being restated per call site. It is also what tells an
+/// identity-index row apart from a durable operation row.
+const HOST_REQUEST_IDENTITY_BINDING_DIGEST: &str =
+    "4c34aefb3b4c7f374a9e216800835ff70f67e3f1f44672d3d6297da86aaf7c79";
+
 /// Content-addressed generated learning views retained atomically with their
 /// authenticated local-read result (`eliot.packet`).
 const CAMPAIGN_LEARNING_STATE_VIEWS: TableDefinition<&str, &str> =
@@ -4598,6 +4619,14 @@ impl RedbRecoveryStore {
     /// not stage missing identity rows. For a fresh operation, all identity
     /// rows, the operation row, and any logical link commit in one transaction;
     /// any conflict aborts the entire write.
+    ///
+    /// A fresh operation is additionally refused when a durable row that
+    /// predates this index may already hold the idempotency key, request id or
+    /// cancellation id it presents. Such a row is in neither the binding index
+    /// nor the logical links, so without that refusal the reuse would be
+    /// admitted; with it, cross-operation reuse of an indexed identity is
+    /// rejected as an identity conflict and the transaction is abandoned
+    /// without staging anything.
     pub fn resolve_or_stage_host_request_with_identity_bindings(
         &self,
         record: &crate::HostRequestRecord,
@@ -4613,14 +4642,28 @@ impl RedbRecoveryStore {
             identity_bindings,
             logical_key.is_some(),
         )?;
-        let outcome = match logical_winner {
-            Some(winner) => winner,
-            None => Self::stage_host_request_with_bindings_in(
+        // A fresh operation is the only path on which an identity can be
+        // reused: an exact replay already resolved above. A row written before
+        // the identity index existed is invisible to both the binding lookup
+        // and the logical link, so refuse the fresh operation beside it
+        // instead of admitting the reuse (issue #74 W7/A3). The refusal
+        // abandons the transaction, so nothing is staged and the index is left
+        // untouched.
+        let outcome = if let Some(winner) = logical_winner {
+            winner
+        } else {
+            if let Some(claimant) = Self::pre_index_host_request_claimant_in(&write, record)? {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: claimant.operation_id.as_str().to_owned(),
+                    request_digest: claimant.request_digest.clone(),
+                });
+            }
+            Self::stage_host_request_with_bindings_in(
                 &write,
                 record,
                 logical_key.as_deref(),
                 &missing_bindings,
-            )?,
+            )?
         };
         write.commit().map_err(storage)?;
         Ok(outcome)
@@ -4651,15 +4694,8 @@ impl RedbRecoveryStore {
                 reason: "exactly three identity binding rows are required",
             });
         }
-        let required_namespaces = [
-            format!("hostreq-identity:{}", record.idempotency_key.as_str()),
-            format!("hostreq-request-id:{}", record.request_id.as_str()),
-            format!(
-                "hostreq-cancellation-id:{}",
-                record.cancellation_id.as_str()
-            ),
-        ];
-        let binding_digest = "4c34aefb3b4c7f374a9e216800835ff70f67e3f1f44672d3d6297da86aaf7c79";
+        let required_namespaces = Self::host_request_identity_namespaces(record);
+        let binding_digest = HOST_REQUEST_IDENTITY_BINDING_DIGEST;
         let mut identity_keys = BTreeSet::new();
         let mut observed_namespaces = BTreeSet::new();
         for binding in identity_bindings {
@@ -4695,6 +4731,111 @@ impl RedbRecoveryStore {
             }
         }
         Ok(())
+    }
+
+    /// The three identity-index namespaces one presented operation occupies.
+    ///
+    /// One namespace per presented identity, built from the shared prefixes so
+    /// the validator, the durable key and the pre-index reuse check cannot
+    /// drift onto different spellings of one index.
+    fn host_request_identity_namespaces(record: &crate::HostRequestRecord) -> [String; 3] {
+        [
+            format!(
+                "{}{}",
+                HOST_REQUEST_IDEMPOTENCY_BINDING_PREFIX,
+                record.idempotency_key.as_str()
+            ),
+            format!(
+                "{}{}",
+                HOST_REQUEST_REQUEST_BINDING_PREFIX,
+                record.request_id.as_str()
+            ),
+            format!(
+                "{}{}",
+                HOST_REQUEST_CANCELLATION_BINDING_PREFIX,
+                record.cancellation_id.as_str()
+            ),
+        ]
+    }
+
+    /// Returns the durable operation row that predates the identity index and
+    /// may already claim an identity this operation presents (issue #74
+    /// W7/A3).
+    ///
+    /// A row written before the index existed carries no namespace row, so
+    /// neither the exact binding lookup nor the logical link can see it: a
+    /// fresh operation presenting a reused idempotency key, request id or
+    /// cancellation id would be admitted beside it, which is the cross-
+    /// operation reuse W7 forbids and the changed-key conflict A3 requires.
+    /// The index is authoritative for every identity it has indexed, so a
+    /// candidate whose own namespace row is present is governed by it and is
+    /// not a pre-index row.
+    ///
+    /// A pre-index row is never inferred, backfilled or rewritten —
+    /// `load_host_request_by_logical_key` deliberately keeps such a row
+    /// reachable only by exact operation/request identity — so the fresh
+    /// operation is refused instead, naming the row that already holds the
+    /// identity. A refusal, not a silent admission and not a synthesized
+    /// identity for a row the store cannot prove.
+    ///
+    /// This scans `HOST_REQUESTS` because the index is the only structure that
+    /// could answer the question and a pre-index row is absent from it. The
+    /// scan runs only on the fresh-operation path, never on an exact replay,
+    /// and only for rows that actually present one of the three identities; a
+    /// secondary index over those identities would be a new durable mechanism
+    /// with its own migration, which this issue does not own.
+    fn pre_index_host_request_claimant_in(
+        write: &redb::WriteTransaction,
+        record: &crate::HostRequestRecord,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let presented_operation = record.record_key();
+        let mut candidates: Vec<crate::HostRequestRecord> = Vec::new();
+        {
+            let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            for entry in operations.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let existing: crate::HostRequestRecord = decode(value.value())?;
+                existing.validate()?;
+                if existing.request_digest == HOST_REQUEST_IDENTITY_BINDING_DIGEST {
+                    continue;
+                }
+                // The row this operation *is* is not a claimant against itself.
+                // Re-deriving the exact operation/request identity from durable
+                // state is what an exact replay is, and A3 requires that replay
+                // to keep returning the same result; refusing it here would
+                // turn every retry of a pre-index operation into a conflict.
+                // Indexing that row on this touch is the binder's existing
+                // behaviour for any operation it admits, not a repair of it.
+                if existing.record_key() == presented_operation {
+                    continue;
+                }
+                if existing.idempotency_key.as_str() != record.idempotency_key.as_str()
+                    && existing.request_id.as_str() != record.request_id.as_str()
+                    && existing.cancellation_id.as_str() != record.cancellation_id.as_str()
+                {
+                    continue;
+                }
+                candidates.push(existing);
+            }
+        }
+        for candidate in candidates {
+            let mut indexed = true;
+            for namespace in Self::host_request_identity_namespaces(&candidate) {
+                let key = format!("{namespace}::{HOST_REQUEST_IDENTITY_BINDING_DIGEST}");
+                let present = {
+                    let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                    operations.get(key.as_str()).map_err(storage)?.is_some()
+                };
+                if !present {
+                    indexed = false;
+                    break;
+                }
+            }
+            if !indexed {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
     }
 
     fn host_request_logical_winner_in(
