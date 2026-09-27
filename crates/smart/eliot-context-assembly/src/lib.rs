@@ -3,6 +3,9 @@
 //! This crate owns assembly only. It never retrieves, ranks, re-admits, edits,
 //! or persists context. The returned [`ActiveUnderstandingView`] remains a
 //! candidate projection whose measurement is supplied by the caller.
+//!
+//! Privacy labels are carried, not enforced, here. Refusal is owned by
+//! `crates/governor/eliot-workscope` (`WorkScopeError::PrivacyDenied`).
 
 #![forbid(unsafe_code)]
 

@@ -4,6 +4,10 @@
 //! already validated whole units or exact handles and accounts for qualified
 //! UTF-8 contributions. Providers, renderers, tokenizers, stores and runtime
 //! effects remain outside this crate.
+//!
+//! Privacy labels are carried, not enforced, here: a `Secret`/`Restricted`
+//! atom is never refused by admission. Refusal is owned by
+//! `crates/governor/eliot-workscope` (`WorkScopeError::PrivacyDenied`).
 
 #![forbid(unsafe_code)]
 
