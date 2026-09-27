@@ -116,6 +116,7 @@ fn test_provisioned_supervision_authority(
 mod activation;
 mod agent_bridge_profile;
 mod approved_generation_registry;
+mod canary_removal;
 mod credential_provision;
 mod installation_registry;
 mod integration_discovery;
@@ -177,6 +178,14 @@ pub use agent_bridge_profile::{
     AgentBridgeSourceMaterializationPlan, AgentBridgeSourceObserverFactory,
     RetainedAgentBridgeArtifact, RetainedAgentBridgeSource, RetainedAgentBridgeSourceObserver,
     agent_bridge_source_plan_from_observed_kernel, derive_agent_bridge_protected_paths,
+};
+pub use canary_removal::{
+    CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalAction, CanaryRemovalBuildBinding,
+    CanaryRemovalEffect, CanaryRemovalEffectBound, CanaryRemovalEffectDisposition,
+    CanaryRemovalEffectProgress, CanaryRemovalEffectState, CanaryRemovalNextAction,
+    CanaryRemovalOperation, CanaryRemovalPlan, CanaryRemovalPostcondition, CanaryRemovalQuiesce,
+    CanaryRemovalResource, CanaryRemovalResourceOrigin, CanaryRemovalStage, CanaryRemovalStatus,
+    canary_removal_operation_id,
 };
 pub use credential_provision::{
     CredentialAccessReceipt, CredentialOwnershipMarkerIdentity, HOST_CREDENTIAL_CONTROL_PIPE,
@@ -9668,6 +9677,64 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
             transaction_id,
             expected_registry_revision,
         )
+    }
+
+    /// Resolves one exact installed canary and returns the frozen, read-only
+    /// removal plan.
+    ///
+    /// This is the only removal planning seam. It loads the accepted
+    /// installation registry and the original installer's transaction
+    /// read-only, creates no file, secret, service, reservation or transaction
+    /// row, and refuses a foreign, ambiguous, replaced, production or
+    /// last-known-good target before any destructive path exists. The
+    /// `request` is the explicit canary-removal authorization: its action must
+    /// be `Remove` and its `exact_candidate` must be the target generation.
+    pub fn plan_canary_removal(
+        &self,
+        registry: &RedbInstallationRegistry,
+        request: &ManagedEnvironmentChangeRequest,
+        generation: &PlatformHandle,
+    ) -> Result<CanaryRemovalPlan, InstallationError> {
+        canary_removal::plan_canary_removal(&self.inner, registry, request, generation)
+    }
+
+    /// Admits and drives the durable removal operation for one frozen plan.
+    ///
+    /// The plan digest, the current registry revision, the exact installed
+    /// transaction and the target's retired position are all revalidated
+    /// before the first destructive call. A reused removal operation identity
+    /// with changed inputs is an identity conflict; an identical replay resumes
+    /// the same operation and never creates a second one.
+    pub fn apply_canary_removal(
+        &mut self,
+        registry: &RedbInstallationRegistry,
+        plan: &CanaryRemovalPlan,
+    ) -> Result<CanaryRemovalStatus, InstallationError> {
+        canary_removal::apply_canary_removal(&mut self.inner, registry, plan)
+    }
+
+    /// Returns the stable, secret-free disposition of one removal operation.
+    ///
+    /// Status is read-only: it loads the durable removal record and projects it
+    /// without touching an external owner.
+    pub fn canary_removal_status(
+        &self,
+        removal_transaction_id: &PlatformHandle,
+    ) -> Result<CanaryRemovalStatus, InstallationError> {
+        canary_removal::canary_removal_status(&self.inner, removal_transaction_id)
+    }
+
+    /// Reconciles one already admitted removal operation.
+    ///
+    /// Recovery reuses the same removal operation identity and the same
+    /// per-row intent digests, reconciles before any further attempt, and never
+    /// admits a fresh removal identity for an unresolved effect.
+    pub fn recover_canary_removal(
+        &mut self,
+        registry: &RedbInstallationRegistry,
+        removal_transaction_id: &PlatformHandle,
+    ) -> Result<CanaryRemovalStatus, InstallationError> {
+        canary_removal::recover_canary_removal(&mut self.inner, registry, removal_transaction_id)
     }
 }
 

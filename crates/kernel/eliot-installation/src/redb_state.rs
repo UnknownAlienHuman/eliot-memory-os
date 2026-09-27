@@ -20,6 +20,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use super::canary_removal::{
+    CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalOperation, CanaryRemovalOperationVersion,
+};
 use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES;
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
@@ -40,6 +43,8 @@ use eliot_platform_windows::{
 
 const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("installation_transactions_v7");
+const CANARY_REMOVAL_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("canary_removal_operations_v1");
 const PUBLICATION_JOURNAL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("source_bundle_publication_journal_v1");
 const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
@@ -1037,6 +1042,190 @@ impl RedbInstallationTransactionStore {
         }
         Ok(())
     }
+
+    /// Loads one exact durable canary-removal operation by its sole removal
+    /// operation identity.
+    ///
+    /// The read is short-lived and read-only, exactly like `load`: a Watchdog
+    /// or Host reader can never be blocked behind a retained removal writer.
+    pub(crate) fn load_canary_removal_operation(
+        &self,
+        removal_transaction_id: &PlatformHandle,
+    ) -> Result<Option<CanaryRemovalOperation>, InstallationError> {
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(CANARY_REMOVAL_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(removal_transaction_id.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let operation = decode_canary_removal_operation(value.value())?;
+        if operation.removal_transaction_id != *removal_transaction_id {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(Some(operation))
+    }
+
+    /// Persists one freshly admitted canary-removal operation.
+    ///
+    /// A removal operation is never rewritten over an existing row: reusing the
+    /// same removal identity is a compare-and-save conflict, and changed inputs
+    /// under the same identity are an identity conflict.
+    pub(crate) fn create_canary_removal_operation(
+        &mut self,
+        operation: &CanaryRemovalOperation,
+    ) -> Result<(), InstallationError> {
+        operation.validate()?;
+        let bytes = encode_canary_removal_operation(operation)?;
+        let database = self.open_for_mutation()?;
+        let write = database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(CANARY_REMOVAL_TABLE)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            if table
+                .get(operation.removal_transaction_id.as_str())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?
+                .is_some()
+            {
+                return Err(InstallationError::CompareAndSaveConflict {
+                    expected: 0,
+                    actual: operation.revision,
+                });
+            }
+            table
+                .insert(operation.removal_transaction_id.as_str(), bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Revision-checked compare-and-save for one canary-removal operation.
+    ///
+    /// This is the same durable discipline the installation transaction store
+    /// already uses: an expected revision plus a checksum of the exact current
+    /// bytes, exactly one revision step per save, and a refused identity change
+    /// of the frozen plan or the removal operation identity.
+    pub(crate) fn compare_and_save_canary_removal_operation(
+        &mut self,
+        expected: &CanaryRemovalOperationVersion,
+        operation: &CanaryRemovalOperation,
+    ) -> Result<(), InstallationError> {
+        operation.validate()?;
+        let bytes = encode_canary_removal_operation(operation)?;
+        let database = self.open_for_mutation()?;
+        let write = database
+            .begin_write()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(CANARY_REMOVAL_TABLE)
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let key = operation.removal_transaction_id.as_str();
+            let current_bytes = {
+                let current = table
+                    .get(key)
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?
+                    .ok_or_else(|| InstallationError::TransactionNotFound {
+                        transaction_id: key.to_owned(),
+                    })?;
+                current.value().to_vec()
+            };
+            let current = decode_canary_removal_operation(&current_bytes)?;
+            let current_version = CanaryRemovalOperationVersion::of(&current)?;
+            if current_version.revision != expected.revision {
+                return Err(InstallationError::CompareAndSaveConflict {
+                    expected: expected.revision,
+                    actual: current_version.revision,
+                });
+            }
+            if current_version.checksum != expected.checksum {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if operation.revision != expected.revision + 1 {
+                return Err(InstallationError::InvalidField {
+                    field: "canary_removal.revision".to_owned(),
+                    reason: "compare_and_save requires exactly one revision step".to_owned(),
+                });
+            }
+            if current.removal_transaction_id != operation.removal_transaction_id
+                || current.plan.plan_digest != operation.plan.plan_digest
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanaryRemovalEnvelope {
+    wire_version: ContractVersion,
+    operation: CanaryRemovalOperation,
+}
+
+fn encode_canary_removal_operation(
+    operation: &CanaryRemovalOperation,
+) -> Result<Vec<u8>, InstallationError> {
+    serde_json::to_vec(&CanaryRemovalEnvelope {
+        wire_version: CANARY_REMOVAL_WIRE_VERSION,
+        operation: operation.clone(),
+    })
+    .map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })
+}
+
+fn decode_canary_removal_operation(
+    bytes: &[u8],
+) -> Result<CanaryRemovalOperation, InstallationError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
+            reason: error.to_string(),
+        })?;
+    let version =
+        value
+            .get("wire_version")
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "canary-removal envelope predates the required wire discriminator"
+                    .to_owned(),
+            })?;
+    let version: ContractVersion = serde_json::from_value(version.clone()).map_err(|_| {
+        InstallationError::MigrationRequired {
+            reason: "canary-removal envelope has an unsupported wire discriminator".to_owned(),
+        }
+    })?;
+    if version != CANARY_REMOVAL_WIRE_VERSION {
+        return Err(InstallationError::MigrationRequired {
+            reason: format!(
+                "canary-removal envelope wire {version} cannot be read as {CANARY_REMOVAL_WIRE_VERSION}"
+            ),
+        });
+    }
+    let envelope: CanaryRemovalEnvelope =
+        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
+            reason: format!("canary-removal record is not the strict current shape: {error}"),
+        })?;
+    envelope.operation.validate()?;
+    Ok(envelope.operation)
 }
 
 struct PendingTransactionStorePublication {

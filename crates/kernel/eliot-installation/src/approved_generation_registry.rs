@@ -4285,6 +4285,66 @@ impl ApprovedGenerationRegistry {
         Ok(())
     }
 
+    /// Removes the retired approved-generation record of one exact generation.
+    ///
+    /// This is the terminal projection of a governed canary removal, applied by
+    /// the installation registry owner under its own expected-revision
+    /// compare-and-swap. It is deliberately last in the removal order: the
+    /// record survives while the running coordinator still owns recovery, and
+    /// the surviving generations keep their own approvals.
+    ///
+    /// A generation that is active, designated last-known-good, staged in a
+    /// pending activation, named as the target of the committed cutover
+    /// activation, or named by the last activation terminal is refused. The
+    /// activation/registry owner must first release that binding; a removal can
+    /// never retire the generation that is currently serving.
+    pub(crate) fn retire_retired_generation(
+        &mut self,
+        generation: &PlatformHandle,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        let Some(entry) = self
+            .generations
+            .iter()
+            .find(|item| &item.manifest.generation == generation)
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "retired generation is not an approved generation of this registry".to_owned(),
+            ));
+        };
+        if entry.active
+            || entry.last_known_good
+            || self.active_generation.as_ref() == Some(generation)
+            || self.last_known_good_generation.as_ref() == Some(generation)
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "an active or last-known-good generation cannot be retired".to_owned(),
+            ));
+        }
+        if self
+            .pending_activation
+            .as_ref()
+            .is_some_and(|pending| &pending.manifest.generation == generation)
+            || self
+                .last_terminal_activation
+                .as_ref()
+                .is_some_and(|terminal| &terminal.generation == generation)
+            || self
+                .committed_cutover_activation
+                .as_ref()
+                .is_some_and(|committed| &committed.target_generation == generation)
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "the activation owner still projects this generation record".to_owned(),
+            ));
+        }
+        self.generations
+            .retain(|item| &item.manifest.generation != generation);
+        self.service_registration_approvals
+            .retain(|approval| &approval.generation != generation);
+        self.validate()
+    }
+
     /// Records the operation binding for the flip that this same
     /// transaction just performed.
     ///
