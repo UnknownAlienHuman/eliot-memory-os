@@ -17,9 +17,7 @@ use eliot_cue_contracts::RelationEdgeId;
 use serde::{Deserialize, Serialize};
 
 /// Why the optional relation domain could not contribute.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum RelationCoverage {

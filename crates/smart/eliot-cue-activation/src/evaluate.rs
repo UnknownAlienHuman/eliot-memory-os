@@ -156,9 +156,7 @@ fn direct_result_without_derived(
     stage: DerivedStage,
 ) -> Result<DerivedOutcome, ActivationError> {
     let completeness = match &stage {
-        DerivedStage::Unavailable { unusable, .. } if unusable.is_empty() => {
-            Completeness::Complete
-        }
+        DerivedStage::Unavailable { unusable, .. } if unusable.is_empty() => Completeness::Complete,
         DerivedStage::Unavailable { unusable, .. } => Completeness::Partial {
             frontier: unusable.clone(),
         },
@@ -305,7 +303,10 @@ impl CueActivationEvaluation {
             // stage that may report a traversal outcome, and a direct-only
             // request is the only one that may report `Disabled`.
             (DerivedStage::Evaluated | DerivedStage::BoundReached { .. }, None)
-                if !request.is_direct_only() => Ok(()),
+                if !request.is_direct_only() =>
+            {
+                Ok(())
+            }
             _ => Err(ActivationError::ProfileBinding),
         }
     }
