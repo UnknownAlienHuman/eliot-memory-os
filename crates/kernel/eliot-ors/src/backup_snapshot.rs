@@ -208,6 +208,9 @@ pub enum RowFamilyKind {
     StoreFailureRetention,
     UnknownCommitRecovery,
     CutoverOwnership,
+    /// Versioned-artifact registry metadata is installation-bound generation
+    /// authority. A restored installation must not reactivate its old paths.
+    VersionedArtifacts,
     HostRequests,
     ActivationLifecycle,
     ActivationResultRetention,
@@ -295,6 +298,7 @@ impl RowFamilyKind {
             | Self::ActivationResultRetention
             | Self::NativeWorkerClaims
             | Self::CutoverOwnership
+            | Self::VersionedArtifacts
             | Self::ScanDisclosure => RowDisposition::NonrestorableHistorical,
             // Everything else, including the #269 process-stream recovery
             // family, is `Restorable`. That word only means eligible for the
