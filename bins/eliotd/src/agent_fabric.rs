@@ -32,6 +32,19 @@
 //! operation/work, fence/epoch, disposition, next action) instead of a local
 //! substitute. Plan-only planning, read-only observation, recovery/status and
 //! independently admissible solo work never consult the broken port.
+//!
+//! Issue #1963 makes the capability-based staffing policy load-bearing on this
+//! path instead of merely available. Every plan is bridged onto
+//! [`crate::staffing_policy::plan_coordinator_staffing`], and the resulting
+//! `StaffingPlanReceipt` is the only authority on which routes a plan may use:
+//! the compiled candidate is held against it at
+//! [`AgentFabric::define_and_plan`], the enforced receipt is retained and
+//! persisted with the definition, and it is enforced again at the dispatch
+//! boundary. An unavailable independent-audit class therefore carries an
+//! explicit receipted escalate/defer disposition and can never be satisfied by
+//! a silent same-family or paid substitute, and a mid-attempt provider switch
+//! is refused unless an explicit receipted policy-authorized degradation was
+//! recorded first.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -54,6 +67,11 @@ use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::staffing_policy::{
+    PolicyAuthorizedDegradation, StaffingPlanReceipt, check_attempt_route_continuity,
+    enforce_plan_receipt, plan_coordinator_staffing, verify_receipt_digest,
+};
 
 /// Crate that owns the coordinated execution projection.
 pub const COORDINATOR_CRATE: &str = "eliot-agent-coordinator";
@@ -688,6 +706,15 @@ pub(crate) fn build_admitted_provider_capability(
 /// Task-Controller request and this function only compiles the deterministic
 /// candidate via [`AgentCoordinator::plan`]. No admission, reservation,
 /// attempt, or dispatch occurs here.
+///
+/// Issue #1963: the capability-based staffing policy is applied, not merely
+/// available. The frozen request is bridged onto
+/// [`plan_coordinator_staffing`] first, and the compiled candidate is then
+/// held against the resulting [`StaffingPlanReceipt`] by
+/// [`enforce_plan_receipt`]. A candidate that selected a route the receipt did
+/// not staff for this task class — a same-family or paid stand-in for an
+/// unavailable independent audit included — is refused here, before any
+/// reservation, admission, activation or dispatch can observe it.
 pub fn plan_candidate(
     config: &CoordinatorConfig,
     request: StaffingPlanRequest,
@@ -700,13 +727,17 @@ pub fn plan_candidate(
         candidate = %crate::diagnostics::sanitize_identity(request.candidate_id.as_str())
     )
     .entered();
+    let receipt =
+        plan_coordinator_staffing(config, &request).map_err(|error| staffing_rejection(&error))?;
     let mut coordinator = AgentCoordinator::new(
         config.clone(),
         PlanGap::G11Unavailable {
             reason: FABRIC_PLAN_GAP_REASON.to_owned(),
         },
     )?;
-    Ok(coordinator.plan(request)?)
+    let candidate = coordinator.plan(request)?;
+    enforce_plan_receipt(&receipt, &candidate).map_err(|error| staffing_rejection(&error))?;
+    Ok(candidate)
 }
 
 /// Frozen Task-Controller definition as accepted at the admitted boundary.
@@ -1086,18 +1117,40 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
     }
 }
 
+/// Maps a staffing-policy rejection onto the fabric vocabulary (issue #1963).
+///
+/// A plan the capability-based staffing policy cannot staff is a contract
+/// violation of this composition: the plan receipt is the only authority on
+/// which routes a task class may use, and an unstaffable plan never becomes a
+/// candidate. The owner message is carried verbatim so the receipted
+/// defer/degrade/escalate reason stays readable at the refusal.
+///
+/// A dedicated `FabricError` variant would also need an arm in
+/// `crate::diagnostics::rejection_of`, which is not this change's writer, so
+/// the existing `Contract` variant carries the rejection.
+fn staffing_rejection(error: &crate::staffing_policy::StaffingPolicyError) -> FabricError {
+    FabricError::Contract(format!("staffing plan receipt: {error}"))
+}
+
 /// Verifies semantic ownership maps carried by a durable snapshot.
 ///
 /// Every stored definition revalidates (shape plus bound digest); every map
 /// key must equal its record identity; every stored execution must satisfy
 /// the structural ownership links against its stored definition and
 /// admission; every supersession link must join its stored prior and
-/// replacement. Legacy snapshots carry no semantic records and pass
-/// trivially. A contradictory image fails closed so torn persistence never
-/// restores authority; live coherence (leases, active dispositions) is
+/// replacement. Every stored staffing plan receipt must still bind its own
+/// body. Legacy snapshots carry no semantic records and no staffing receipts
+/// and pass trivially. A contradictory image fails closed so torn persistence
+/// never restores authority; live coherence (leases, active dispositions) is
 /// rehydrated independently by the owners after restore, never from saved
 /// labels alone.
 fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    // Issue #1963: a restored staffing plan receipt is only usable while it
+    // still binds its own body, so a tampered or torn persisted receipt refuses
+    // the restore instead of becoming the authority on dispatchable routes.
+    for receipt in snapshot.staffing_receipts.values() {
+        verify_receipt_digest(receipt).map_err(|error| staffing_rejection(&error))?;
+    }
     for (key, definition) in &snapshot.semantic_definitions {
         definition.validate().map_err(contract_rejection)?;
         if key != definition.definition_id.as_str() {
@@ -1323,6 +1376,19 @@ pub struct FabricSnapshot {
     /// Supersession links by replacement definition identity (issue #1702).
     #[serde(default)]
     pub semantic_supersessions: BTreeMap<String, SupersessionLink>,
+    /// Capability-based staffing plan receipts by definition identity (issue
+    /// #1963). Persisted so the receipted defer/degrade/escalate dispositions
+    /// and the authorized route classes survive restart; a definition without a
+    /// stored receipt cannot dispatch. Absent on pre-#1963 snapshots, which
+    /// therefore stay un-dispatchable rather than silently unstaffed.
+    #[serde(default)]
+    pub staffing_receipts: BTreeMap<String, StaffingPlanReceipt>,
+    /// Route each already-dispatched attempt runs on, by attempt identity
+    /// (issue #1963). The first dispatch records the route its staffing plan
+    /// receipt authorized; a later route change for the same attempt is refused
+    /// unless an explicit policy-authorized degradation was recorded first.
+    #[serde(default)]
+    pub attempt_routes: BTreeMap<String, RouteFingerprint>,
 }
 
 /// Attempt lifecycle tracked by this composition. Terminal states never
@@ -1380,6 +1446,14 @@ pub struct AgentFabric {
     semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
     /// Supersession links by replacement definition identity.
     semantic_supersessions: BTreeMap<String, SupersessionLink>,
+    /// Capability-based staffing plan receipts by definition identity.
+    staffing_receipts: BTreeMap<String, StaffingPlanReceipt>,
+    /// Route each already-dispatched attempt runs on.
+    attempt_routes: BTreeMap<String, RouteFingerprint>,
+    /// Explicit policy-authorized degradations recorded before an attempt
+    /// continues on a different route. In-memory only: a restart drops them,
+    /// so a restored fabric re-refuses the switch instead of resuming it.
+    attempt_degradations: BTreeMap<String, PolicyAuthorizedDegradation>,
     initialized: bool,
 }
 
@@ -1418,6 +1492,9 @@ impl AgentFabric {
             semantic_admissions: BTreeMap::new(),
             semantic_executions: BTreeMap::new(),
             semantic_supersessions: BTreeMap::new(),
+            staffing_receipts: BTreeMap::new(),
+            attempt_routes: BTreeMap::new(),
+            attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("coordinator_constructed", "coordinator");
@@ -1466,6 +1543,9 @@ impl AgentFabric {
             semantic_admissions: BTreeMap::new(),
             semantic_executions: BTreeMap::new(),
             semantic_supersessions: BTreeMap::new(),
+            staffing_receipts: BTreeMap::new(),
+            attempt_routes: BTreeMap::new(),
+            attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("coordinator_constructed_verified", "coordinator");
@@ -1578,13 +1658,28 @@ impl AgentFabric {
     /// The definition bytes are frozen before planning; planning never rewrites
     /// them. Identity reuse with different bytes is a conflict.
     ///
+    /// Issue #1963: the capability-based staffing plan receipt is produced and
+    /// enforced here, before any reservation, admission, activation or
+    /// dispatch, and the enforced receipt is retained under the definition
+    /// identity so it is the only authority on which routes that definition may
+    /// dispatch. The `staffing_plan_receipted` ledger event precedes
+    /// `definition_validated`.
+    ///
     /// # Errors
     ///
-    /// Returns the coordinator owner rejection or [`FabricError::DefinitionConflict`].
+    /// Returns the coordinator owner rejection, the staffing-policy rejection
+    /// when the task class cannot be staffed under current evidence, or
+    /// [`FabricError::DefinitionConflict`].
     pub fn define_and_plan(
         &mut self,
         request: StaffingPlanRequest,
     ) -> Result<(SwarmDefinition, StaffingPlanCandidate), FabricError> {
+        // The receipt is computed from the frozen request and the live
+        // coordinator config before anything is recorded, so a plan the policy
+        // cannot staff never enters this composition's state.
+        let receipt = plan_coordinator_staffing(&self.config, &request)
+            .map_err(|error| staffing_rejection(&error))?;
+        self.record("staffing_plan_receipted", request.candidate_id.as_str());
         self.record("definition_validated", request.candidate_id.as_str());
         // Freeze bytes before planning: identity reuse with different bytes is
         // a definition conflict, surfaced in fabric vocabulary before the
@@ -1598,13 +1693,17 @@ impl AgentFabric {
                 )));
             }
             let candidate = self.coordinator.plan(request)?;
+            enforce_plan_receipt(&receipt, &candidate)
+                .map_err(|error| staffing_rejection(&error))?;
             let stored = self.definitions.get(&key).cloned().ok_or_else(|| {
                 FabricError::Contract(format!("definition {key} bytes without record"))
             })?;
+            self.staffing_receipts.insert(key.clone(), receipt);
             self.record("plan_replayed", &key);
             return Ok((stored, candidate));
         }
         let candidate = self.coordinator.plan(request.clone())?;
+        enforce_plan_receipt(&receipt, &candidate).map_err(|error| staffing_rejection(&error))?;
         let definition = SwarmDefinition {
             definition_id: request.candidate_id.clone(),
             definition_digest: digest.clone(),
@@ -1616,6 +1715,7 @@ impl AgentFabric {
         };
         self.definitions.insert(key.clone(), definition.clone());
         self.definition_bytes.insert(key.clone(), digest);
+        self.staffing_receipts.insert(key.clone(), receipt);
         self.record("plan_compiled", &key);
         Ok((definition, candidate))
     }
@@ -2378,11 +2478,22 @@ impl AgentFabric {
     /// Builds the provider-neutral dispatch intent for one activated attempt.
     /// The intent leaves the control boundary only through the egress port.
     ///
+    /// Issue #1963: the dispatch boundary is where the capability-based
+    /// staffing plan receipt is enforced a second time, at the point the lane
+    /// would actually run. The definition's retained receipt must exist, its
+    /// digest must still bind its body, and the attempt's route must be one the
+    /// receipt staffed. An attempt already bound to a route continues on that
+    /// route only; a different route is refused unless an explicit receipted
+    /// policy-authorized degradation for exactly this transition was recorded
+    /// first through [`AgentFabric::authorize_attempt_route_degradation`].
+    ///
     /// # Errors
     ///
     /// Returns [`FabricError::NotActivated`] when no activation evidence
-    /// exists, or [`FabricError::DuplicateLaunch`] for a replayed operation
-    /// with different bytes.
+    /// exists, [`FabricError::Contract`] when the staffing plan receipt does not
+    /// authorize this attempt's route or a mid-attempt provider switch carries
+    /// no authorized degradation, or [`FabricError::DuplicateLaunch`] for a
+    /// replayed operation with different bytes.
     pub fn dispatch(
         &mut self,
         admission_id: &AdmissionId,
@@ -2406,6 +2517,10 @@ impl AgentFabric {
             .ok_or_else(|| {
                 FabricError::NotActivated(format!("no activation for {activation_key}"))
             })?;
+        // Enforced before the replay/duplicate guards so a route change for an
+        // already-routed attempt is judged as a provider switch, not as a
+        // duplicate dispatch id.
+        let attempt_route = self.authorized_attempt_route(&admission, attempt_id)?;
         if let Some(existing) = self.intents.get(dispatch_id).cloned() {
             if existing.admission_id == *admission_id
                 && existing.attempt_id == *attempt_id
@@ -2442,8 +2557,109 @@ impl AgentFabric {
             .insert(dispatch_id.to_owned(), activation_key.clone());
         self.attempt_states
             .insert(attempt_id.as_str().to_owned(), AttemptLifecycle::Dispatched);
+        self.attempt_routes
+            .insert(attempt_id.as_str().to_owned(), attempt_route);
         self.record("dispatch_built", dispatch_id);
         Ok(intent)
+    }
+
+    /// Resolves the route this attempt's staffing plan receipt authorized, and
+    /// enforces mid-attempt route continuity (issue #1963).
+    ///
+    /// The definition's retained receipt must exist and must still bind its own
+    /// body, so a receipt that did not survive its persistence boundary fails
+    /// closed. Attempt `n` of the admission runs on the `n`th route the receipt
+    /// staffed; an attempt beyond the staffed routes is refused instead of
+    /// running on an unstaffed route.
+    ///
+    /// The first dispatch of an attempt records that route. A later dispatch of
+    /// the same attempt whose receipted route differs is a mid-attempt provider
+    /// switch and continues only when
+    /// [`AgentFabric::authorize_attempt_route_degradation`] recorded an
+    /// explicit receipted policy-authorized degradation for exactly this
+    /// attempt and this route transition; otherwise
+    /// [`check_attempt_route_continuity`] refuses it.
+    fn authorized_attempt_route(
+        &mut self,
+        admission: &FabricAdmission,
+        attempt_id: &AttemptId,
+    ) -> Result<RouteFingerprint, FabricError> {
+        let definition_key = admission.definition_id.as_str().to_owned();
+        let receipt = self
+            .staffing_receipts
+            .get(&definition_key)
+            .ok_or_else(|| {
+                FabricError::Contract(format!(
+                    "definition {definition_key} has no staffing plan receipt; nothing is authorized to dispatch"
+                ))
+            })?
+            .clone();
+        verify_receipt_digest(&receipt).map_err(|error| staffing_rejection(&error))?;
+        let position = admission
+            .attempt_ids
+            .iter()
+            .position(|candidate| candidate == attempt_id)
+            .ok_or_else(|| {
+                FabricError::IdentityConflict(
+                    "attempt does not belong to this admission".to_owned(),
+                )
+            })?;
+        let route = receipt
+            .lanes
+            .get(position)
+            .map(|lane| lane.route.clone())
+            .ok_or_else(|| {
+                FabricError::Contract(format!(
+                    "staffing plan receipt staffed {} routes for {definition_key}; attempt at position {position} is unstaffed",
+                    receipt.lanes.len()
+                ))
+            })?;
+        let attempt_key = attempt_id.as_str().to_owned();
+        if let Some(previous) = self.attempt_routes.get(&attempt_key).cloned() {
+            let degradation = self.attempt_degradations.get(&attempt_key);
+            check_attempt_route_continuity(&previous, &route, degradation, &attempt_key)
+                .map_err(|error| staffing_rejection(&error))?;
+        }
+        Ok(route)
+    }
+
+    /// Records the explicit receipted policy-authorized degradation that lets
+    /// one attempt continue on a different route (issue #1963).
+    ///
+    /// The decision is taken before continuation: the degradation must bind this
+    /// exact attempt and this exact route transition, and it is checked here by
+    /// [`check_attempt_route_continuity`] against the route the attempt is
+    /// already bound to. The recorded authorization is what
+    /// [`AgentFabric::dispatch`] consults; without it a route change is
+    /// refused. It is deliberately not persisted, so a restart drops the
+    /// authorization and re-refuses the switch rather than resuming it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the staffing-policy rejection when the attempt is not yet bound
+    /// to a route or the degradation does not bind the exact transition.
+    pub fn authorize_attempt_route_degradation(
+        &mut self,
+        attempt_id: &AttemptId,
+        next_route: &RouteFingerprint,
+        degradation: &PolicyAuthorizedDegradation,
+    ) -> Result<(), FabricError> {
+        let attempt_key = attempt_id.as_str().to_owned();
+        let previous = self
+            .attempt_routes
+            .get(&attempt_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!(
+                    "attempt {attempt_key} has no recorded route to degrade from"
+                ))
+            })?;
+        check_attempt_route_continuity(&previous, next_route, Some(degradation), &attempt_key)
+            .map_err(|error| staffing_rejection(&error))?;
+        self.attempt_degradations
+            .insert(attempt_key.clone(), degradation.clone());
+        self.record("attempt_route_degradation_authorized", &attempt_key);
+        Ok(())
     }
 
     /// Emits one built dispatch intent through the egress port.
@@ -2734,6 +2950,8 @@ impl AgentFabric {
             semantic_admissions: self.semantic_admissions.clone(),
             semantic_executions: self.semantic_executions.clone(),
             semantic_supersessions: self.semantic_supersessions.clone(),
+            staffing_receipts: self.staffing_receipts.clone(),
+            attempt_routes: self.attempt_routes.clone(),
         })
     }
 
@@ -2753,12 +2971,18 @@ impl AgentFabric {
     /// [`AgentFabric::restore_verified`], or construct an explicitly fresh
     /// plan-only fabric through [`AgentFabric::new`].
     ///
+    /// Issue #1963: a stored staffing plan receipt must still bind its own body
+    /// or the restore fails closed, and a definition with no stored receipt
+    /// cannot dispatch. Recorded policy-authorized degradations are not
+    /// persisted, so a restored fabric re-refuses a mid-attempt provider switch
+    /// until one is recorded again.
+    ///
     /// # Errors
     ///
     /// Returns [`FabricError::ProviderEvidenceRequired`] when the snapshot
     /// holds a verified provider binding, the coordinator owner restore
-    /// rejection, a stale-config conflict, or a broken semantic ownership
-    /// link.
+    /// rejection, a stale-config conflict, a broken semantic ownership link, or
+    /// a staffing plan receipt that no longer binds its body.
     pub fn restore(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -2827,6 +3051,9 @@ impl AgentFabric {
             semantic_admissions: snapshot.semantic_admissions,
             semantic_executions: snapshot.semantic_executions,
             semantic_supersessions: snapshot.semantic_supersessions,
+            staffing_receipts: snapshot.staffing_receipts,
+            attempt_routes: snapshot.attempt_routes,
+            attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("fabric_restored", "fabric");
@@ -2908,6 +3135,9 @@ impl AgentFabric {
             semantic_admissions: snapshot.semantic_admissions,
             semantic_executions: snapshot.semantic_executions,
             semantic_supersessions: snapshot.semantic_supersessions,
+            staffing_receipts: snapshot.staffing_receipts,
+            attempt_routes: snapshot.attempt_routes,
+            attempt_degradations: BTreeMap::new(),
             initialized: true,
         };
         fabric.record("fabric_restored_verified", "fabric");
