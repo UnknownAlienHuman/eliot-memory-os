@@ -790,7 +790,7 @@ impl IndependentKernelSensor {
             Err(error) => tracing::debug!(
                 event = "watchdog.intent_episode_close_failed",
                 observation = "fenced",
-                detail = error.to_string().as_str(),
+                reason_code = crate::diagnostics::spool_error_observation(&error),
                 "watchdog could not close the intent episode; no escalation was skipped"
             ),
         }
@@ -893,7 +893,7 @@ impl IndependentKernelSensor {
                 tracing::debug!(
                     event = "watchdog.intent_lineage_unusable",
                     observation = "fenced",
-                    detail = error.to_string().as_str(),
+                    reason_code = crate::diagnostics::spool_error_observation(&error),
                     "watchdog could not bind intent lineage; no intent was spooled"
                 );
                 return;
@@ -910,7 +910,7 @@ impl IndependentKernelSensor {
                 tracing::debug!(
                     event = "watchdog.intent_spool_failed",
                     observation = "fenced",
-                    detail = error.to_string().as_str(),
+                    reason_code = crate::diagnostics::spool_error_observation(&error),
                     "watchdog could not spool an intent; the observation stays an observation"
                 );
                 return;
@@ -1247,6 +1247,22 @@ async fn report_gap_nonfatal(kernel: &dyn KernelWatchdogPort, reason: GapRecover
     publish_control_loss_fallback_best_effort(&disposition, kernel);
 }
 
+/// Bounded reason code for a fallback failure, excluding nested error text.
+fn fallback_error_code(error: &FallbackCompositionError) -> &'static str {
+    match error {
+        FallbackCompositionError::StaleTimestamp => "STALE_TIMESTAMP",
+        FallbackCompositionError::FutureTimestampSkew => "FUTURE_TIMESTAMP_SKEW",
+        FallbackCompositionError::InvalidTimestamp => "INVALID_TIMESTAMP",
+        FallbackCompositionError::IdentityMismatch => "IDENTITY_MISMATCH",
+        FallbackCompositionError::InvalidKey => "INVALID_KEY",
+        FallbackCompositionError::InvalidDestination => "INVALID_DESTINATION",
+        FallbackCompositionError::MintFailed(_) => "MINT_FAILED",
+        FallbackCompositionError::PublishFailed(_) => "PUBLISH_FAILED",
+        FallbackCompositionError::KeyBindingUnavailable => "KEY_BINDING_UNAVAILABLE",
+        FallbackCompositionError::KeyBindingMismatch => "KEY_BINDING_MISMATCH",
+    }
+}
+
 /// Publishes the signed minimal fallback envelope for one recorded control loss.
 ///
 /// The installer key ceremony owns provisioning; until its protected binding
@@ -1263,7 +1279,7 @@ fn publish_control_loss_fallback_best_effort(
         tracing::debug!(
             event = "watchdog.fallback_publish_unavailable",
             observation = "attempted",
-            reason = "no admitted installation identity",
+            reason_code = "INSTALLATION_IDENTITY_UNAVAILABLE",
             "watchdog fallback publish skipped without an admitted installation identity"
         );
         return;
@@ -1274,7 +1290,7 @@ fn publish_control_loss_fallback_best_effort(
             tracing::debug!(
                 event = "watchdog.fallback_publish_unavailable",
                 observation = "attempted",
-                reason = error.to_string().as_str(),
+                reason_code = fallback_error_code(&error),
                 "watchdog fallback key binding unavailable; control-loss evidence stays in the spool"
             );
             return;
@@ -1298,7 +1314,7 @@ fn publish_control_loss_fallback_best_effort(
         Err(error) => tracing::debug!(
             event = "watchdog.fallback_publish_failed",
             observation = "attempted",
-            reason = error.to_string().as_str(),
+            reason_code = fallback_error_code(&error),
             "watchdog fallback publish failed; control-loss evidence stays in the spool"
         ),
     }
