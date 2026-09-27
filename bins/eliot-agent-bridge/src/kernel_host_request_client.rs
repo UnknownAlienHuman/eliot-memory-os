@@ -2335,6 +2335,8 @@ fn decode_record_view(
             // current attempt, enforced by the Kernel legs.
             attempt: None,
             lineage: None,
+            // Readback coherence only: stored rows predate execution evidence.
+            evidence: None,
         }
         .validate()
         .ok()?;

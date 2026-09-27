@@ -3814,7 +3814,14 @@ pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-
 /// ownership and still decode (the field defaults to `None`). Current
 /// submissions require a v3 body and the Kernel-minted attempt; local-read
 /// submissions additionally require explicit result lineage.
-pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 3;
+///
+/// Version 4 carries the executor-observed execution evidence (`evidence`,
+/// issue #1838): the invoked local-port operation, actual route, identities,
+/// immutable input/output handles, and observed side-effect declaration the
+/// Kernel binds into the sealed trace manifest. Stored version-1/2/3 rows
+/// predate execution evidence and still decode (the field defaults to `None`);
+/// a sealed manifest enumerates the absent evidence as missing parts instead.
+pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 4;
 const HOST_REQUEST_RESULT_BODY_V2_READBACK_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for a Kernel-issued local-read attempt capability.
 pub const LOCAL_READ_ATTEMPT_WIRE_ID: &str = "eliot.protocol.local-read-attempt";
@@ -3934,6 +3941,12 @@ pub struct HostRequestResultBody {
     /// current attempt.
     #[serde(default)]
     pub attempt: Option<LocalReadAttempt>,
+    /// Executor-observed execution evidence (issue #1838). `None` for stored
+    /// rows that predate execution evidence and for legs whose owner has not
+    /// wired evidence yet; the Kernel seals the trace manifest either way and
+    /// enumerates absent evidence as explicit missing parts.
+    #[serde(default)]
+    pub evidence: Option<LocalReadExecutionEvidence>,
 }
 
 /// Result-side lineage bound to the exact bytes in [`HostRequestResultBody::response`].
@@ -4196,6 +4209,15 @@ impl HostRequestResultBody {
         if let Some(lineage) = &self.lineage {
             lineage.validate(&self.result_digest, self.attempt.as_ref())?;
         }
+        if let Some(evidence) = &self.evidence {
+            evidence.validate()?;
+            if evidence.operation_id != self.operation_id {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request_result_body.evidence",
+                    reason: "evidence does not bind the exact operation handle",
+                });
+            }
+        }
         Ok(())
     }
 
@@ -4213,8 +4235,8 @@ impl HostRequestResultBody {
     }
 
     /// Applies the additional lineage requirement to a local-read submission.
-    /// Other producers may submit a v3 body with unknown lineage, which remains
-    /// unknown and carries no semantic admission.
+    /// Other producers may submit a current body with unknown lineage, which
+    /// remains unknown and carries no semantic admission.
     pub fn validate_local_read_submission(&self) -> Result<(), ProtocolError> {
         self.validate_for_submission()?;
         if self.lineage.is_none() {
@@ -4354,6 +4376,138 @@ impl LocalReadAttempt {
                 field: "local_read_attempt.use_budget",
                 reason: "attempt use budget must be positive",
             });
+        }
+        Ok(())
+    }
+}
+
+/// Stable wire identity for executor-observed local-read execution evidence.
+pub const LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID: &str =
+    "eliot.protocol.local-read-execution-evidence";
+/// Current local-read execution evidence wire version.
+pub const LOCAL_READ_EXECUTION_EVIDENCE_WIRE_VERSION: u16 = 1;
+/// Observed side-effect declaration for an execution that produced no
+/// external effect (read-only legs).
+pub const LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS: &str = "none";
+
+/// Executor-observed execution evidence for one completed local read
+/// (issue #1838).
+///
+/// The leg that executed the read — the Kernel `local_read` leg or a daemon
+/// owner flight — reports what it invoked and observed: the invoked
+/// local-port operation, the actual route taken, the presenting adapter and
+/// executing process identities, immutable input/output handles, and the
+/// observed side-effect declaration. The Kernel binds this evidence into the
+/// sealed trace manifest (I16.12); every content slot is optional so a leg
+/// reports exactly what it observed, and the manifest enumerates absent
+/// slots as explicit missing parts instead of inventing values.
+///
+/// Observation only: evidence never mints authority and never overrides the
+/// Kernel legs, which re-check operation binding, digests, fence, and attempt
+/// currency before any persist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalReadExecutionEvidence {
+    /// Evidence wire identity.
+    pub wire_id: String,
+    /// Evidence wire version.
+    pub wire_version: u16,
+    /// Kernel-derived opaque operation handle (`hostreq:` + envelope digest):
+    /// the work-item identity this evidence observes.
+    pub operation_id: String,
+    /// Invoked local-port operation (`local_read` on the query leg).
+    pub invoked_operation: Option<String>,
+    /// Actual route taken, as the observed actual-route receipt digest.
+    pub actual_route: Option<String>,
+    /// Presenting transport adapter instance (connection identity).
+    pub adapter_identity: Option<String>,
+    /// Executing-process identity (stable artifact digest when the executor
+    /// has one; absent when the executor cannot name itself stably).
+    pub executor_identity: Option<String>,
+    /// Immutable input handle: the exact admitted envelope digest.
+    pub input_handle: Option<String>,
+    /// Immutable output handle: the canonical result digest.
+    pub output_handle: Option<String>,
+    /// Observed side-effect declaration: `none` for executions with no
+    /// external effect, otherwise an immutable effect/digest reference.
+    pub side_effects: Option<String>,
+}
+
+impl LocalReadExecutionEvidence {
+    /// Current execution-evidence contract version.
+    pub const CONTRACT_VERSION: u16 = LOCAL_READ_EXECUTION_EVIDENCE_WIRE_VERSION;
+
+    /// Validates the closed evidence shape. Completeness is owned by the
+    /// Kernel trace-manifest seal, never by shape validation alone: absent
+    /// slots are honest omissions, not validation failures.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_execution_evidence.wire",
+                reason: "unsupported local-read execution evidence",
+            });
+        }
+        bounded_text(
+            &self.operation_id,
+            "local_read_execution_evidence.operation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !self
+            .operation_id
+            .strip_prefix("hostreq:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_execution_evidence.operation_id",
+                reason: "must be the deterministic opaque handle for the envelope digest",
+            });
+        }
+        for (value, field) in [
+            (
+                self.invoked_operation.as_ref(),
+                "local_read_execution_evidence.invoked_operation",
+            ),
+            (
+                self.actual_route.as_ref(),
+                "local_read_execution_evidence.actual_route",
+            ),
+            (
+                self.adapter_identity.as_ref(),
+                "local_read_execution_evidence.adapter_identity",
+            ),
+            (
+                self.executor_identity.as_ref(),
+                "local_read_execution_evidence.executor_identity",
+            ),
+            (
+                self.side_effects.as_ref(),
+                "local_read_execution_evidence.side_effects",
+            ),
+        ] {
+            if let Some(text) = value {
+                bounded_text(text, field, MAX_HOST_REQUEST_TEXT_BYTES)?;
+            }
+        }
+        for (value, field) in [
+            (
+                self.input_handle.as_ref(),
+                "local_read_execution_evidence.input_handle",
+            ),
+            (
+                self.output_handle.as_ref(),
+                "local_read_execution_evidence.output_handle",
+            ),
+        ] {
+            if let Some(digest) = value {
+                lowercase_sha256(digest, field)?;
+            }
         }
         Ok(())
     }

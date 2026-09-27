@@ -405,6 +405,9 @@ impl AuthenticatedHostSession {
             // minted by the Kernel claim record at poll time, never here.
             attempt: None,
             lineage: None,
+            // Digest-binding validation vehicle only: execution evidence is
+            // reported by the executing leg, never here.
+            evidence: None,
         }
         .validate()
         .map_err(|error| error.to_string())?;

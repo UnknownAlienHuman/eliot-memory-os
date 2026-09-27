@@ -955,6 +955,10 @@ pub fn skill_result_body(
         response,
         attempt: Some(attempt.clone()),
         lineage: None,
+        // Issue #1838 residual: the Skill owner wires execution evidence for
+        // locally served pairs; until then the sealed manifest honestly lists
+        // the absent evidence as missing parts.
+        evidence: None,
     };
     body.validate()
         .map_err(|error| SkillDispatchError::Body(error.to_string()))?;
@@ -994,6 +998,9 @@ fn skill_refusal_body(
         response,
         attempt: Some(attempt.clone()),
         lineage: None,
+        // Issue #1838 residual: no execution evidence on the last-resort
+        // refusal body; the sealed manifest lists it as missing parts.
+        evidence: None,
     })
 }
 

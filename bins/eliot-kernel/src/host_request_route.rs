@@ -53,6 +53,7 @@
 //! deadline is `Timeout`. No error prose drives routing.
 
 use super::kernel_audit::AuditEventDraft;
+use super::trace_manifest::TraceManifest;
 use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
@@ -1006,6 +1007,8 @@ impl KernelComposition {
                 // Coherence gate only: stored rows predate attempt ownership.
                 attempt: None,
                 lineage: None,
+                // Coherence gate only: stored rows predate execution evidence.
+                evidence: None,
             }
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -2477,6 +2480,13 @@ impl KernelComposition {
                 lane,
             ))
             .is_some();
+        // Issue #1838: seal the canonical replayable trace manifest for the
+        // bound result through the single audit chain. The seal is downstream
+        // of the binding it describes, so it follows the binding append and
+        // does not participate in the #1837 binding/spool reconciliation.
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
+            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
+        ));
         // Both legs sealed in the chain retire the pre-persist spool. Any
         // missing leg keeps it for reconcile (a later `audit_chain_records`
         // completes the chain from it); a failed persist likewise leaves the
@@ -3345,6 +3355,11 @@ impl KernelComposition {
             &persisted,
             queued_envelope.as_ref(),
             lane,
+        ));
+        // Issue #1838: seal the canonical replayable trace manifest for the
+        // bound result through the single audit chain.
+        self.audit_observe(AuditEventDraft::trace_manifest_sealed(
+            &TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane),
         ));
         // The single completion consumes the attempt use budget: retire the
         // pair so no later claim or submit can reuse this generation.
@@ -6010,6 +6025,8 @@ pub(crate) fn local_read_replay_response(
         // Replay readback only: stored rows predate attempt ownership.
         attempt: None,
         lineage: None,
+        // Replay readback only: stored rows predate execution evidence.
+        evidence: None,
     }
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;

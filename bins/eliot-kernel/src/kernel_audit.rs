@@ -391,6 +391,9 @@ impl AuditEventKind {
     pub const RESULT_DAEMON_SUBMITTED: &'static str = "result.daemon_submitted";
     /// The Kernel bound a daemon result to its operation (ORS persist).
     pub const RESULT_KERNEL_BOUND: &'static str = "result.kernel_bound";
+    /// The Kernel sealed the canonical replayable trace manifest for one
+    /// bound result (issue #1838; I16.12).
+    pub const TRACE_MANIFEST_SEALED: &'static str = "trace.manifest_sealed";
     /// A stale submission was quarantined without binding.
     pub const RESULT_STALE_QUARANTINED: &'static str = "result.stale_quarantined";
     /// A canonical admission receipt was issued.
@@ -442,6 +445,7 @@ impl AuditEventKind {
         Self::DISPATCH_DAEMON_CLAIM,
         Self::RESULT_DAEMON_SUBMITTED,
         Self::RESULT_KERNEL_BOUND,
+        Self::TRACE_MANIFEST_SEALED,
         Self::RESULT_STALE_QUARANTINED,
         Self::RECEIPT_ADMISSION_ISSUED,
         Self::RECEIPT_LIVE_PUBLISHED,
@@ -478,6 +482,7 @@ impl AuditEventKind {
             | Self::SESSION_REJECTED
             | Self::SESSION_REVOKED
             | Self::RESULT_KERNEL_BOUND
+            | Self::TRACE_MANIFEST_SEALED
             | Self::RECEIPT_LIVE_PUBLISHED
             | Self::CANCEL_REQUESTED
             | Self::PROCESS_LAUNCH_FAILED
@@ -746,6 +751,52 @@ impl AuditLineage {
     /// Sets the actual route receipt digest.
     pub fn fill_route_receipt_actual(&mut self, receipt_sha256: &str) {
         Self::fill(&mut self.route_receipt_actual, receipt_sha256);
+    }
+
+    /// Fills lineage slots from one sealed trace manifest (issue #1838).
+    pub fn fill_manifest(&mut self, manifest: &crate::trace_manifest::TraceManifest) {
+        Self::fill(&mut self.trace_id, manifest.trace_id.as_str());
+        Self::fill(&mut self.operation_id, &manifest.operation_id);
+        Self::fill(&mut self.work_item, &manifest.operation_id);
+        if let Some(task) = manifest.task_id.as_deref() {
+            Self::fill(&mut self.task_id, task);
+        }
+        if let Some(session) = manifest.session_id.as_deref() {
+            Self::fill(&mut self.session_id, session);
+        }
+        if let Some(scope) = manifest.work_scope_id.as_deref() {
+            Self::fill(&mut self.work_scope, scope);
+        }
+        if let Some(lease) = manifest.lease_attempt_id.as_deref() {
+            Self::fill(&mut self.attempt_id, lease);
+            Self::fill(&mut self.environment_lease, lease);
+        }
+        if self.state_fence.is_none() {
+            self.state_fence.clone_from(&manifest.state_fence);
+        }
+        if let Some(adapter) = manifest
+            .adapter_identity
+            .as_deref()
+            .or(manifest.connection_id.as_deref())
+        {
+            Self::fill(&mut self.adapter_instance, adapter);
+        }
+        if let Some(process) = manifest.executor_identity.as_deref() {
+            Self::fill(&mut self.process_identity, process);
+        }
+        if let Some(route) = manifest.requested_route.as_deref() {
+            Self::fill(&mut self.route_receipt_requested, route);
+        }
+        if let Some(route) = manifest.actual_route.as_deref() {
+            Self::fill(&mut self.route_receipt_actual, route);
+        }
+        if let Some(generation) = manifest.module_generation.as_deref() {
+            Self::fill(&mut self.module_generation, generation);
+        }
+        if let Some(epoch) = manifest.authority_epoch.as_deref() {
+            Self::fill(&mut self.authority_epoch, epoch);
+        }
+        Self::fill(&mut self.controller, "kernel");
     }
 
     fn fill(slot: &mut Option<String>, value: &str) {
@@ -1071,6 +1122,25 @@ impl AuditEventDraft {
                 "result_digest": body.result_digest,
                 "durable_state": format!("{:?}", persisted.state),
             }),
+        }
+    }
+
+    /// Returns the trace-manifest-sealed draft for one bound result.
+    ///
+    /// The lineage mirrors the manifest's I16.3 slots; the sealed body is the
+    /// manifest itself, so [`TraceManifest::find_sealed`](crate::trace_manifest::TraceManifest::find_sealed)
+    /// replays the exact record from the retained chain. A manifest that
+    /// cannot serialize seals a null body instead of failing the observation:
+    /// the kind plus the lineage operation still identify the seal, and
+    /// readback honestly reports no manifest.
+    #[must_use]
+    pub fn trace_manifest_sealed(manifest: &crate::trace_manifest::TraceManifest) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_manifest(manifest);
+        Self {
+            kind: AuditEventKind::TRACE_MANIFEST_SEALED,
+            lineage,
+            body: serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null),
         }
     }
 

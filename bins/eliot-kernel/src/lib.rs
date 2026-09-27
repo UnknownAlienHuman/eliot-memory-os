@@ -77,6 +77,10 @@ mod process_execution_client;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 mod tool_exposure;
+/// Canonical replayable trace manifests for Material/Critical work (issue
+/// #1838; I16.12): the Kernel-owned record sealed through the single audit
+/// chain, never a second store.
+pub mod trace_manifest;
 
 /// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
@@ -137,6 +141,9 @@ pub(crate) use shutdown_drain::{
     DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
     ReceiptOwnerEvidence, ReceiptOwnerFamily, ReceiptReconciliation, ReceiptRescanObservation,
     ShutdownPhase, ShutdownTerminal, coordinator_for, reverse_quiescence_order,
+};
+pub use trace_manifest::{
+    TRACE_MANIFEST_FORMAT_VERSION, TRACE_MANIFEST_REQUIRED_SLOTS, TraceFinish, TraceManifest,
 };
 /// Kernel-owned exact-fence lease census for the I1.5 idle-drain gate.
 /// Records that a supervision lease expired, at the exact decision that refuses
