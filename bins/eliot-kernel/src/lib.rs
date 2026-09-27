@@ -49,6 +49,11 @@ mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
+// Canonical immutable Failure Capsule (issue #1917; I18.45). `pub` so the
+// record is reachable by the failure paths that must mint one before exposing
+// terminal failure; a bin-private declaration in `main.rs` could not be
+// reached by any of them.
+pub mod failure_capsule;
 mod kernel_build_contract;
 mod kernel_config;
 /// Kernel structured diagnostics facade (F-LOG-KERNEL-0, #895): compiled
