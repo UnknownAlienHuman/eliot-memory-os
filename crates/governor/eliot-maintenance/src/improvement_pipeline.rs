@@ -25,6 +25,22 @@
 //! never constructs an observed completed rollback. No result variant
 //! establishes execution, independence, or canary permission.
 //!
+//! # Routing is a contract, not prose
+//!
+//! The declared experiment executor must be the Testd owner and the independent
+//! Evaluate step must be owned by the Instrument verifier family, and that
+//! verifier must be a different principal from the Testd executor, the
+//! Governor admission owner, and the rollback owner. Both requirements are
+//! refusals with a typed relation identity, so an experiment cannot be executed
+//! by a self-chosen principal or evaluated by the party proposing it.
+//!
+//! Activation evidence carries the I0.5 `EvidenceExecutionStatus` dimension
+//! rather than a boolean. Only `EXECUTED` may support admission:
+//! `NOT_EXECUTED` and `SIMULATED` can never become accepted improvement, and
+//! `UNKNOWN_OUTCOME` is refused here and reconciles before any retry. A model
+//! score, a self-report, and a zero exit code are none of these states, so none
+//! of them admits.
+//!
 //! The proposal commitment is a versioned, domain-separated SHA-256 over one
 //! canonical JSON envelope holding the complete normalized proposal. The
 //! pipeline computes exactly one commitment and carries that same value into
@@ -49,9 +65,21 @@
 //! establishes nothing and is reported as no progress; absence is never read as
 //! novelty, and no progress claim clears an unknown external effect.
 //!
+//! Material equality is a third and separate question again. A repeat is not
+//! recognized by an identical digest: the same declared mechanism, target
+//! capability, target generation, budget, deadline, bounded experiment, and
+//! declared evidence is one attempt whatever operation identity, idempotency
+//! key, or digest it carries. The separately named and versioned
+//! [`ImprovementMaterialEquality`] key answers exactly that and feeds
+//! [`ImprovementReplayAssessment::MaterialNoProgress`], so a repeated
+//! materially identical experiment is visible as no-progress evidence in the
+//! assessment itself instead of being inferred from digest equality. A
+//! materially identical experiment that is nevertheless materially *changed* is
+//! not a repeat; only the key decides that, never a caller assertion.
+//!
 //! # Wire revision
 //!
-//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `4`. Revision `2` added typed
+//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `5`. Revision `2` added typed
 //! `cause`/`remedy` fields to the rejection and block branches, added the
 //! `Blocked` disposition and the inspectable canary handoff, bound
 //! candidate/experiment/content-revision/run identities onto the admission
@@ -71,6 +99,14 @@
 //! admission gate instead of a caller-authored verdict; carries the checked
 //! discriminator projection in the canary handoff next to the checked
 //! commitment; and stops collapsing a typed admission refusal into reason text.
+//! Revision `5` replaces the `simulated` boolean on [`ActivationEvidence`] with
+//! the I0.5 `EvidenceExecutionStatus` dimension
+//! [`ImprovementEvidenceExecution`], requires the declared experiment executor
+//! to be the Testd owner and the independent Evaluate step to be owned by the
+//! Instrument verifier family and to be a distinct principal from the executor,
+//! the admission owner, and the rollback owner; adds the `improvement_candidate`
+//! ingress operation identity; and adds the material-equality projection,
+//! comparator, and `MateriallyEquivalentRepeat` outcome.
 //!
 //! Deserialization is fail-closed: bytes written before the current revision no
 //! longer decode, so a stale disposition cannot be read as a current one.
@@ -101,6 +137,14 @@ pub const VERIFIER_OWNER_FAMILY: &str = "instrument-verifier-20-1111";
 pub const KERNEL_CANARY_OWNER: &str = "kernel-generation-canary-11";
 /// Operation identity for proposing an improvement candidate.
 pub const OP_PROPOSE: &str = "improvement.propose";
+/// Operation identity of the `improvement_candidate` ingress step.
+///
+/// This is the step that admits one improvement-candidate declaration into the
+/// Governor contract. It is a proposal-side step, not a new authority: it
+/// resolves to the same single production owner as every other Governor-owned
+/// step, because the improvement candidate contract and the improvement
+/// maintenance pipeline are one cognitive mechanism with one production owner.
+pub const OP_CANDIDATE_INGRESS: &str = "improvement_candidate";
 /// Operation identity for Testd-owned experiment execution.
 pub const OP_EXECUTE_EXPERIMENT: &str = "improvement.execute_experiment";
 /// Operation identity for Testd-owned measurement.
@@ -148,8 +192,23 @@ pub const IMPROVEMENT_DISCRIMINATOR_DOMAIN: &str = "eliot.improvement.proposal.d
 /// A retained projection written under any other revision cannot be compared
 /// against a current one and stays an unestablished observation.
 pub const IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION: &str = "1";
+/// Fixed domain separator of the improvement material-equality projection.
+///
+/// The material-equality key answers the third question: "is this the same
+/// experiment?" It binds mechanism, target, budget, deadline, and the declared
+/// evidence set, so a byte-identical digest is neither necessary nor sufficient
+/// to call a repeat a repeat. A new proposal identity, a new operation, or a
+/// new idempotency key can all spell the same experiment, and only this key
+/// says so.
+pub const IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN: &str =
+    "eliot.improvement.proposal.material_equality";
+/// Canonical encoding revision of the material-equality projection.
+///
+/// A retained key written under any other revision cannot be compared against a
+/// current one and stays an unestablished observation.
+pub const IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION: &str = "1";
 /// Wire revision of the improvement pipeline result and identity contracts.
-pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 4;
+pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 5;
 /// Maximum members in one declared set of the committed proposal.
 ///
 /// Matches the nearest existing declared-set ceiling in the repository
@@ -183,6 +242,9 @@ pub const FORBIDDEN_VERIFIED_COMPLETE: &str = "VERIFIED_COMPLETE";
 pub enum ImprovementOperation {
     /// Governor-owned candidate proposal.
     Propose,
+    /// Governor-owned ingress of one improvement-candidate declaration into the
+    /// Governor contract.
+    IngestCandidate,
     /// Testd-owned bounded experiment execution.
     ExecuteExperiment,
     /// Testd-owned measurement of the bounded run.
@@ -204,6 +266,7 @@ impl ImprovementOperation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Propose => OP_PROPOSE,
+            Self::IngestCandidate => OP_CANDIDATE_INGRESS,
             Self::ExecuteExperiment => OP_EXECUTE_EXPERIMENT,
             Self::Measure => OP_MEASURE,
             Self::Evaluate => OP_EVALUATE,
@@ -218,9 +281,16 @@ impl ImprovementOperation {
     ///
     /// The rollback owner is caller-supplied because it comes from the bound
     /// rollback contract; every other step has a fixed pipeline owner.
+    ///
+    /// Candidate ingress resolves to the same production owner as proposal and
+    /// admission, because the improvement candidate contract and this pipeline
+    /// are one cognitive mechanism with one production owner. Ingesting a
+    /// candidate grants nothing.
     pub fn owner(self, rollback_owner_id: &str) -> &str {
         match self {
-            Self::Propose | Self::Admit | Self::Promote => IMPROVEMENT_PIPELINE_OWNER,
+            Self::Propose | Self::IngestCandidate | Self::Admit | Self::Promote => {
+                IMPROVEMENT_PIPELINE_OWNER
+            }
             Self::ExecuteExperiment | Self::Measure => TESTD_OWNER,
             Self::Evaluate => VERIFIER_OWNER_FAMILY,
             Self::CanaryActivate => KERNEL_CANARY_OWNER,
@@ -317,6 +387,43 @@ pub struct ExperimentPlan {
     pub scope_refinement: Option<AdmittedScopeRefinement>,
 }
 
+/// Execution status of one independent evaluation, exactly as `I0.5` defines
+/// `EvidenceExecutionStatus`.
+///
+/// The status is machine state, never prose, and it is orthogonal to
+/// independence and to the verdict: a verifier can be independent, can pass, and
+/// still have produced nothing that ran. `I0.5` forbids substituting
+/// [`Self::NotExecuted`] or [`Self::Simulated`] for real execution evidence, so
+/// this pipeline admits exactly one status and treats the other three as
+/// refusals rather than as weaker successes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementEvidenceExecution {
+    /// The evaluation was never run. Identity binding cannot replace it.
+    NotExecuted,
+    /// The evaluation was simulated. Simulation never admits a candidate.
+    Simulated,
+    /// The independent evaluation actually ran. The only admitted status.
+    Executed,
+    /// The evaluation's own outcome is unknown and must be reconciled.
+    UnknownOutcome,
+}
+
+impl ImprovementEvidenceExecution {
+    /// Returns the stable label of this status as it appears in an error.
+    ///
+    /// Derived from the typed status so the refusal cannot drift away from the
+    /// machine state it reports.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotExecuted => "not-executed",
+            Self::Simulated => "simulated",
+            Self::Executed => "executed",
+            Self::UnknownOutcome => "unknown-outcome",
+        }
+    }
+}
+
 /// Independent activation evidence bound to one candidate and one experiment.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -335,8 +442,11 @@ pub struct ActivationEvidence {
     pub run_ref: String,
     /// Exact content revision the verifier evaluated.
     pub content_revision_ref: String,
-    /// Must always be false; simulated runs never admit.
-    pub simulated: bool,
+    /// Whether the evaluation actually executed. Only
+    /// [`ImprovementEvidenceExecution::Executed`] may support activation; a
+    /// model score, a self-report, a planned run, or a local exit zero is
+    /// `NotExecuted` and is refused rather than downgraded.
+    pub execution: ImprovementEvidenceExecution,
     /// Candidate this evidence is bound to.
     pub bound_candidate_id: String,
     /// Experiment this evidence is bound to.
@@ -566,13 +676,59 @@ pub struct ImprovementDiscriminatorProjection {
     pub declared_evidence_refs: Vec<String>,
 }
 
+/// Separately named, versioned key of one proposal's *material* experiment
+/// identity.
+///
+/// [`ProposalCommitment`] answers "are these the same bytes?".
+/// [`ImprovementDiscriminatorProjection`] answers "did the causal context
+/// change?". This key answers the third question: "is this the same
+/// experiment?" It is bound to the mechanism, the target capability and
+/// generation, the budget, the deadline, the bounded experiment identity, and
+/// the declared evidence set, and to nothing else.
+///
+/// It exists because an identical digest is not enough for no-progress. A retry
+/// may carry a new proposal identity, a new operation reference, and a new
+/// idempotency key — every identity a caller controls — while repeating one and
+/// the same bounded experiment. Byte equality would miss that repeat, and a
+/// new identity must not be read as novelty. Comparing this key instead makes
+/// the repeat visible as a material fact derived from the checked records, never
+/// from a caller assertion.
+///
+/// Every field is copied from the checked records: the proposal supplies
+/// mechanism, target, budget, deadline, and evidence; the joined experiment plan
+/// supplies the bounded experiment identity. A caller cannot widen the admitted
+/// material by spelling a reference the bound records do not contain.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementMaterialEquality {
+    /// Fixed material-equality domain separator.
+    pub domain: String,
+    /// Canonical encoding revision of this key.
+    pub encoding_version: String,
+    /// Declared mechanism identity the experiment tests.
+    pub mechanism_id: String,
+    /// Capability the experiment targets.
+    pub target_capability: String,
+    /// Generation the experiment observes.
+    pub target_generation: String,
+    /// Budget the experiment must not exceed.
+    pub budget_ref: String,
+    /// Deadline the experiment must not exceed.
+    pub deadline_ref: String,
+    /// Bounded experiment identity the plan declared.
+    pub experiment_id: String,
+    /// Owner-issued evidence references in committed deterministic order.
+    pub declared_evidence_refs: Vec<String>,
+}
+
 /// One retained prior proposal record.
 ///
 /// A record, never a verdict. It pairs the retained content commitment with the
-/// discriminator projection computed from those same retained bytes, so a
-/// consumer can compare the current candidate against the retained one without
-/// re-committing either. The record supplies no judgement: a caller may read it,
-/// carry it, or withhold it, and withholding it establishes nothing.
+/// discriminator projection and the material-equality key computed from those
+/// same retained bytes and the retained experiment, so a consumer can compare
+/// the current candidate against the retained one without re-committing either.
+/// The record supplies no judgement: a caller may read it, carry it, or withhold
+/// it, and withholding it establishes nothing.
 ///
 /// Durable retention of this record is owned outside this module. Nothing here
 /// stores it, so the record's authenticity is only as good as the owner that
@@ -585,12 +741,16 @@ pub struct RetainedImprovementProposal {
     pub commitment: ProposalCommitment,
     /// Discriminator projection of the same retained bytes.
     pub discriminator: ImprovementDiscriminatorProjection,
+    /// Material-equality key of the same retained bytes and retained
+    /// experiment.
+    pub material_equality: ImprovementMaterialEquality,
 }
 
 /// The current proposal exactly as the pipeline committed it.
 ///
-/// The one commitment this run computed, plus the projection of the same
-/// normalized bytes. The pipeline builds it once and hands the same value to the
+/// The one commitment this run computed, plus the projection and the
+/// material-equality key of the same normalized bytes and the same joined
+/// experiment plan. The pipeline builds it once and hands the same value to the
 /// admission gate and to the canary handoff, so a consumer reads the checked
 /// version instead of computing a second opinion. It carries no decision: the
 /// assessment belongs to [`compare_improvement_commitments`].
@@ -601,6 +761,8 @@ pub struct ImprovementCurrentProposal {
     pub commitment: ProposalCommitment,
     /// Discriminator projection of the same normalized bytes.
     pub discriminator: ImprovementDiscriminatorProjection,
+    /// Material-equality key of the same bytes and the same joined experiment.
+    pub material_equality: ImprovementMaterialEquality,
 }
 
 /// Inspectable, non-authorizing canary handoff for one joined run.
@@ -621,6 +783,11 @@ pub struct ImprovementCanaryHandoff {
     /// compares progress against the checked content instead of recomputing it.
     /// It is a projection, not a permit and not a second commitment.
     pub proposal_discriminator: ImprovementDiscriminatorProjection,
+    /// The material-equality key of those same bytes and the same joined
+    /// experiment, carried for the same reason: a consumer compares repeats on
+    /// the experiment, not on digest equality, and reads the checked key instead
+    /// of recomputing one. It is a key, not a permit and not a third commitment.
+    pub proposal_material_equality: ImprovementMaterialEquality,
     /// Candidate identity the handoff is bound to.
     pub candidate_id: String,
     /// Campaign the handoff is bound to.
@@ -811,9 +978,20 @@ pub enum PipelineError {
     /// Evidence is not independent, did not pass, or names no raw evidence.
     #[error("improvement evidence is not independent")]
     EvidenceNotIndependent,
-    /// Simulated evidence can never admit a candidate.
-    #[error("improvement simulated evidence is forbidden")]
-    SimulatedEvidenceForbidden,
+    /// The independent evaluation did not execute, so it can never support
+    /// activation.
+    ///
+    /// `I0.5` forbids substituting `NOT_EXECUTED` or `SIMULATED` for real
+    /// execution evidence, so every status other than `EXECUTED` is refused
+    /// here instead of being downgraded into weaker evidence. The status is
+    /// machine state carried whole, never inferred from a reason string.
+    #[error(
+        "improvement evidence execution status {status} cannot support activation; only executed independent evidence may"
+    )]
+    EvidenceNotExecuted {
+        /// Typed execution status that is refused.
+        status: &'static str,
+    },
     /// Evidence, experiment, or proposal bindings diverge.
     #[error("improvement evidence is unbound: {detail}")]
     UnboundEvidence {
@@ -889,16 +1067,21 @@ pub fn proposal_digest(
 
 /// Builds the one checked current record from already-normalized bytes.
 ///
-/// The single producer of [`ImprovementCurrentProposal`]: the commitment and
-/// the discriminator projection are derived here, together, from the same
-/// normalized proposal, so no consumer can hold a commitment and a projection
-/// that describe different content.
+/// The single producer of [`ImprovementCurrentProposal`]: the commitment, the
+/// discriminator projection, and the material-equality key are derived here,
+/// together, from the same normalized proposal and the same joined experiment
+/// plan, so no consumer can hold a commitment, a projection, and a key that
+/// describe different content or different experiments. The experiment is a
+/// required argument rather than an optional refinement because a no-progress
+/// decision over the wrong experiment is not a no-progress decision.
 fn current_proposal_of(
     normalized: &ImprovementProposal,
+    experiment: &ExperimentPlan,
 ) -> Result<ImprovementCurrentProposal, PipelineError> {
     Ok(ImprovementCurrentProposal {
         commitment: commitment_of(normalized)?,
         discriminator: discriminator_of(normalized),
+        material_equality: material_equality_of(normalized, experiment),
     })
 }
 
@@ -920,6 +1103,28 @@ fn discriminator_of(normalized: &ImprovementProposal) -> ImprovementDiscriminato
     }
 }
 
+/// Derives the material-equality key of one normalized proposal and its plan.
+///
+/// Every field is copied from the two checked records. The declared evidence set
+/// arrives already in its committed deterministic order, so a permutation of the
+/// same declared set is one material experiment and not two.
+fn material_equality_of(
+    normalized: &ImprovementProposal,
+    experiment: &ExperimentPlan,
+) -> ImprovementMaterialEquality {
+    ImprovementMaterialEquality {
+        domain: IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN.to_string(),
+        encoding_version: IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION.to_string(),
+        mechanism_id: normalized.mechanism.mechanism_id.clone(),
+        target_capability: normalized.target_capability.clone(),
+        target_generation: normalized.target_generation.clone(),
+        budget_ref: experiment.budget_ref.clone(),
+        deadline_ref: experiment.deadline_ref.clone(),
+        experiment_id: experiment.experiment_id.clone(),
+        declared_evidence_refs: normalized.evidence_refs.clone(),
+    }
+}
+
 /// Exact-repeat and identity-conflict assessment for one uncommitted proposal.
 ///
 /// Integrity and semantic progress stay separate. An exact replay reproduces
@@ -930,7 +1135,12 @@ fn discriminator_of(normalized: &ImprovementProposal) -> ImprovementDiscriminato
 /// FNV-1a value, for example — stays an unqualified historical observation
 /// until its owner reconciles it. A different logical operation is not progress
 /// evidence either: a new proposal identity or a different digest establishes
-/// nothing on its own.
+/// nothing on its own, and a repeat of the same bounded experiment under fresh
+/// identities is no progress rather than novelty.
+///
+/// `experiment` is required because the material-equality key binds the bounded
+/// experiment the plan actually declared. Assessing a repeat against a
+/// different experiment would answer a question nobody asked.
 ///
 /// This entry exists for a caller that holds a proposal and has not committed
 /// it yet, and it commits those bytes exactly once. A caller that already holds
@@ -939,10 +1149,11 @@ fn discriminator_of(normalized: &ImprovementProposal) -> ImprovementDiscriminato
 pub fn assess_improvement_replay(
     retained: &RetainedImprovementProposal,
     proposal: &ImprovementProposal,
+    experiment: &ExperimentPlan,
 ) -> Result<ImprovementReplayAssessment, PipelineError> {
     Ok(compare_improvement_commitments(
         retained,
-        &current_proposal_of(&canonical_proposal(proposal)?)?,
+        &current_proposal_of(&canonical_proposal(proposal)?, experiment)?,
     ))
 }
 
@@ -974,14 +1185,16 @@ pub(crate) fn assess_improvement_progress(
 /// `ExactReplay` and changed current-encoding content is `IdentityConflict`; a
 /// retained value written under another domain, encoding revision, or algorithm
 /// is `UnestablishedPrior` and cannot be matched. Outside that operation, a
-/// different logical operation is not progress evidence: a new proposal
-/// identity or a different digest establishes nothing. Only a current-version
-/// retained projection that differs from the current one, together with
-/// owner-issued evidence the current proposal declares and the retained record
-/// did not, is an `EstablishedNewDiscriminator` — and even that is an ordinary
-/// new candidate, never a progress claim. Without a retained record nothing is
-/// established at all. None of these clears an unknown external effect; effect
-/// retry stays with its own owner.
+/// repeat of the same bounded experiment — same mechanism, target, budget,
+/// deadline, experiment, and evidence — is `MaterialNoProgress`, which is
+/// decided from the material-equality key rather than from digest equality, so
+/// a fresh proposal identity or a new idempotency key cannot disguise a repeat.
+/// Only a current-version retained projection that differs from the current
+/// one, together with owner-issued evidence the current proposal declares and
+/// the retained record did not, is an `EstablishedNewDiscriminator` — and even
+/// that is an ordinary new candidate, never a progress claim. Without a
+/// retained record nothing is established at all. None of these clears an
+/// unknown external effect; effect retry stays with its own owner.
 pub fn compare_improvement_commitments(
     retained: &RetainedImprovementProposal,
     current: &ImprovementCurrentProposal,
@@ -989,8 +1202,13 @@ pub fn compare_improvement_commitments(
     if let Some(assessment) = same_operation_replay(retained, current) {
         return assessment;
     }
-    unestablished_projection(retained, current)
-        .unwrap_or_else(|| changed_discriminator(retained, current))
+    if let Some(assessment) = unestablished_projection(retained, current) {
+        return assessment;
+    }
+    if let Some(assessment) = material_repeat(retained, current) {
+        return assessment;
+    }
+    changed_discriminator(retained, current)
 }
 
 /// Decides the outcomes that belong to the retained record's own operation.
@@ -1043,6 +1261,34 @@ fn unestablished_projection(
         UnestablishedPriorCause::UnknownDiscriminatorEncoding,
         &retained.commitment,
     ))
+}
+
+/// Decides whether the current candidate repeats a retained *experiment*, as
+/// opposed to repeating a set of bytes.
+///
+/// `None` means the current candidate is not materially equivalent to the
+/// retained one, so the decision belongs to [`changed_discriminator`]. A
+/// retained key written under another domain or encoding revision cannot be
+/// compared at all and stays an unestablished observation.
+fn material_repeat(
+    retained: &RetainedImprovementProposal,
+    current: &ImprovementCurrentProposal,
+) -> Option<ImprovementReplayAssessment> {
+    if retained.material_equality.domain != current.material_equality.domain
+        || retained.material_equality.encoding_version != current.material_equality.encoding_version
+    {
+        return Some(unestablished_prior(
+            UnestablishedPriorCause::UnknownMaterialEqualityEncoding,
+            &retained.commitment,
+        ));
+    }
+    if retained.material_equality == current.material_equality {
+        return Some(ImprovementReplayAssessment::MaterialNoProgress {
+            commitment: current.commitment.clone(),
+            material_equality: current.material_equality.clone(),
+        });
+    }
+    None
 }
 
 /// Decides whether a changed discriminator is backed by new owner-issued
@@ -1113,6 +1359,9 @@ pub enum UnestablishedPriorCause {
     /// or encoding revision, so a changed discriminator cannot be established
     /// against it.
     UnknownDiscriminatorEncoding,
+    /// The retained material-equality key carries another key domain or encoding
+    /// revision, so a repeated experiment cannot be established against it.
+    UnknownMaterialEqualityEncoding,
 }
 
 impl UnestablishedPriorCause {
@@ -1124,6 +1373,7 @@ impl UnestablishedPriorCause {
         match self {
             Self::UnknownCommitmentEncoding => "unknown-commitment-encoding",
             Self::UnknownDiscriminatorEncoding => "unknown-discriminator-encoding",
+            Self::UnknownMaterialEqualityEncoding => "unknown-material-equality-encoding",
         }
     }
 }
@@ -1168,6 +1418,20 @@ pub enum ImprovementReplayAssessment {
     NoRetainedPrior {
         /// The current commitment.
         commitment: ProposalCommitment,
+    },
+    /// The current candidate repeats a retained *experiment* rather than a set
+    /// of bytes: same mechanism, target, budget, deadline, bounded experiment,
+    /// and declared evidence, under any operation or idempotency key.
+    ///
+    /// This is the no-progress case a digest comparison cannot see. A repeat
+    /// that arrives with a new proposal identity, a new operation, and a new
+    /// idempotency key is still a repeat, and a repeat without a new
+    /// discriminator is no-progress evidence rather than improvement.
+    MaterialNoProgress {
+        /// The current commitment.
+        commitment: ProposalCommitment,
+        /// The current material-equality key that repeats the retained one.
+        material_equality: ImprovementMaterialEquality,
     },
     /// A new causal discriminator is established: the current projection
     /// differs from a current-version retained one and the current proposal
@@ -1295,12 +1559,16 @@ fn join_improvement_inputs(
     inputs.proposal.validate()?;
     check_operation_identities()?;
     check_experiment_shape(inputs.experiment)?;
+    check_experiment_owner_routing(inputs.experiment)?;
     check_evaluation_shape(inputs.evidence)?;
     let normalized = canonical_proposal(inputs.proposal)?;
-    let current = current_proposal_of(&normalized)?;
+    // The material-equality key binds the bounded experiment, so the joined
+    // experiment plan is part of the one checked record. It is built here, after
+    // the plan's own shape check, and is never recomputed downstream.
+    let current = current_proposal_of(&normalized, inputs.experiment)?;
     check_proposal_candidate_join(inputs.proposal, inputs.candidate)?;
     check_proposal_experiment_join(inputs.experiment, inputs.proposal, inputs.candidate)?;
-    check_experiment_evaluation_join(inputs.evidence, inputs.proposal, inputs.experiment)?;
+    check_experiment_evaluation_join(inputs.evidence, inputs.proposal, inputs.experiment, inputs.policy)?;
     check_admission_evidence_join(
         inputs.admission_evidence,
         inputs.evidence,
@@ -1334,10 +1602,11 @@ fn join_improvement_inputs(
     })
 }
 
-/// Verifies the eight pipeline operation strings are pairwise distinct.
+/// Verifies the nine pipeline operation strings are pairwise distinct.
 fn check_operation_identities() -> Result<(), PipelineError> {
     let operations = [
         OP_PROPOSE,
+        OP_CANDIDATE_INGRESS,
         OP_EXECUTE_EXPERIMENT,
         OP_MEASURE,
         OP_EVALUATE,
@@ -1387,7 +1656,11 @@ fn check_experiment_shape(experiment: &ExperimentPlan) -> Result<(), PipelineErr
     Ok(())
 }
 
-/// Requires independent, passed, non-simulated evidence of a real run.
+/// Requires independent, passed, executed evidence of a real run.
+///
+/// Execution is checked before independence so a never-run or simulated
+/// evaluation is refused as what it is. The status is machine state: no reason
+/// text, self-report, planned run, or local exit zero can supply it.
 fn check_evaluation_shape(evidence: &ActivationEvidence) -> Result<(), PipelineError> {
     bounded_text(
         &evidence.evidence_id,
@@ -1414,11 +1687,94 @@ fn check_evaluation_shape(evidence: &ActivationEvidence) -> Result<(), PipelineE
         "evidence.raw_evidence_ref",
         IMPROVEMENT_MAX_REFERENCE_BYTES,
     )?;
-    if evidence.simulated {
-        return Err(PipelineError::SimulatedEvidenceForbidden);
+    // `I0.5` forbids substituting `NOT_EXECUTED` or `SIMULATED` for real
+    // execution evidence, and `UNKNOWN_OUTCOME` is reconciled by its own owner
+    // rather than admitted. Only `EXECUTED` reaches the independence check, and
+    // a status is machine state: a model score, a self-report, a planned run, and
+    // a local exit zero are none of these.
+    if evidence.execution != ImprovementEvidenceExecution::Executed {
+        return Err(PipelineError::EvidenceNotExecuted {
+            status: evidence.execution.label(),
+        });
     }
     if !evidence.independent || !evidence.verifier_passed {
         return Err(PipelineError::EvidenceNotIndependent);
+    }
+    Ok(())
+}
+
+/// Requires the independent evaluation to be a competent verifier, the
+/// Instrument verifier owner family, and a principal distinct from the executor,
+/// the admitting Governor owner, and the rollback owner.
+///
+/// A0.3 treats a verifier that is the party whose change it verifies as hidden
+/// control capture, and `ARCH-GROUND-01` requires evidence to be independent of
+/// the thing it grounds. Independence is a relation between named principals, so
+/// it is checked against the exact owner identities the other records already
+/// carry — the same strings the canary handoff publishes — rather than against a
+/// caller-set independence boolean.
+fn check_evaluator_independence(
+    evidence: &ActivationEvidence,
+    experiment: &ExperimentPlan,
+    policy: &ImprovementAdmissionPolicy,
+) -> Result<(), PipelineError> {
+    // The evidence must name the planned evaluator: any competent verifier inside
+    // the owner family is admissible, but only the one the plan declared.
+    if evidence.verifier_id != experiment.evaluator_id {
+        return Err(PipelineError::UnboundRelation {
+            relation: "experiment-evaluation: evaluator-is-not-the-competent-planned-evaluator",
+        });
+    }
+    // Every verifier admitted here is owned by the Instrument verifier family
+    // (`#20`/`#1111`). A proposal author, a test executor, or a model cannot be
+    // the independent evaluator of its own candidate.
+    if !evidence.verifier_id.starts_with(VERIFIER_OWNER_FAMILY) {
+        return Err(PipelineError::UnboundRelation {
+            relation: "experiment-evaluation: evaluator-is-not-the-instrument-verifier-family",
+        });
+    }
+    for (relation, evaluator, principal) in [
+        (
+            "experiment-evaluation: evaluator-is-the-experiment-executor",
+            evidence.verifier_id.as_str(),
+            experiment.testd_owner_id.as_str(),
+        ),
+        (
+            "experiment-evaluation: evaluator-is-the-governor-admission-owner",
+            evidence.verifier_id.as_str(),
+            policy.external_owner_id.as_str(),
+        ),
+        (
+            "experiment-evaluation: evaluator-is-the-rollback-owner",
+            evidence.verifier_id.as_str(),
+            policy.rollback_owner_id.as_str(),
+        ),
+    ] {
+        if evaluator == principal {
+            return Err(PipelineError::UnboundRelation { relation });
+        }
+    }
+    Ok(())
+}
+
+/// Requires the plan's experiment execution and evaluation to be routed to their
+/// external owners.
+///
+/// `W5` routes bounded experiments through Testd and independent evaluation
+/// through the Instrument verifier family. Both routings are refusals with a
+/// typed relation identity, not documentation: a plan that names any other
+/// executor or evaluator is unbound, so the pipeline cannot be reached by an
+/// experiment its own proposer executes or grades.
+fn check_experiment_owner_routing(experiment: &ExperimentPlan) -> Result<(), PipelineError> {
+    if experiment.testd_owner_id != TESTD_OWNER {
+        return Err(PipelineError::UnboundRelation {
+            relation: "experiment-execution: executor-is-not-the-testd-owner",
+        });
+    }
+    if !experiment.evaluator_id.starts_with(VERIFIER_OWNER_FAMILY) {
+        return Err(PipelineError::UnboundRelation {
+            relation: "experiment-evaluation: evaluator-is-not-the-instrument-verifier-family",
+        });
     }
     Ok(())
 }
@@ -1587,6 +1943,7 @@ fn check_experiment_evaluation_join(
     evidence: &ActivationEvidence,
     proposal: &ImprovementProposal,
     experiment: &ExperimentPlan,
+    policy: &ImprovementAdmissionPolicy,
 ) -> Result<(), PipelineError> {
     if evidence.bound_candidate_id != proposal.candidate_id {
         return Err(PipelineError::UnboundRelation {
@@ -1598,12 +1955,7 @@ fn check_experiment_evaluation_join(
             relation: "experiment-evaluation: experiment-binding-mismatch",
         });
     }
-    if evidence.verifier_id != experiment.evaluator_id {
-        return Err(PipelineError::UnboundRelation {
-            relation: "experiment-evaluation: evaluator-is-not-the-competent-planned-evaluator",
-        });
-    }
-    Ok(())
+    check_evaluator_independence(evidence, experiment, policy)
 }
 
 /// Requires the admission-review evidence to name the same candidate, the same
@@ -1942,6 +2294,7 @@ fn build_canary_handoff(
         proposal_id: joined.proposal.proposal_id.clone(),
         proposal_commitment: joined.current.commitment.clone(),
         proposal_discriminator: joined.current.discriminator.clone(),
+        proposal_material_equality: joined.current.material_equality.clone(),
         candidate_id: joined.proposal.candidate_id.clone(),
         campaign_id: joined.proposal.campaign_id.clone(),
         closure_id: joined.proposal.closure_id.clone(),
