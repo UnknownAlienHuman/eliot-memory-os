@@ -320,6 +320,22 @@ fn map_governor_outcome_to_protocol_inner(
     };
     let disposition = match outcome {
         GovernorActivationOutcome::Resolved(snapshot) => {
+            // #740: resolved scope/task/fence triple, preserved exactly as the
+            // coherent Governor observation supplied it. The fence renders the
+            // exact (lineage, sequence, generation) tuple in the documented
+            // `epoch:…/gen:…` daemon identity shape: equal sequences from
+            // different lineages are unrelated authorities, so the lineage is
+            // part of the exact identity.
+            let fence = format!(
+                "epoch:{}:{}/gen:{}",
+                snapshot.state_fence.authority_epoch.lineage_id.as_str(),
+                snapshot.state_fence.authority_epoch.sequence.get(),
+                snapshot.state_fence.resource_generation.value()
+            );
+            let task_id = snapshot.task_id.to_string();
+            let _ =
+                crate::diagnostics::ScopeIdentities::of(&snapshot.work_scope_id, &task_id, &fence)
+                    .emit();
             let binding = AgentActivationResolvedBinding {
                 principal_id: snapshot.principal_id,
                 session_id: snapshot.session_id,
