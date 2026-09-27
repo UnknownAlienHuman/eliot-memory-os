@@ -1278,8 +1278,49 @@ impl TestdStreamEvidenceBinding {
                 reason: "a never-emitted stream has no binding record",
             });
         }
+        // Wave B (issue #456): a source-less disposition can never carry a
+        // readback binding. Admit/resolve paths never set one, and this rule
+        // keeps even crafted wire bytes from upgrading a legacy, unavailable,
+        // policy-prohibited, or redaction-failed record into a resolvable one.
+        if matches!(
+            self.disposition,
+            TestdStreamDisposition::SourceUnavailable
+                | TestdStreamDisposition::PolicyProhibited
+                | TestdStreamDisposition::RedactionFailed
+                | TestdStreamDisposition::LegacyMigrationRequired
+        ) && (self.readback_receipt_id.is_some()
+            || self.fence.is_some()
+            || self.readback_observed_at.is_some())
+        {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "a source-less disposition cannot carry a readback binding",
+            });
+        }
         self.parser.validate()?;
         self.evaluator.validate()?;
+        // An executed parser or an assessed evaluator proves a verified
+        // readback happened: both apply paths require this source's readback
+        // receipt before recording, so rest-state records must retain the
+        // binding. Idle and stale slots are exempt: they name no result.
+        let parser_executed = matches!(
+            self.parser.status,
+            TestdParsingStatus::Parsed
+                | TestdParsingStatus::ParseFailed
+                | TestdParsingStatus::NotApplicable
+        );
+        let evaluator_assessed = matches!(
+            self.evaluator.status,
+            TestdEvaluationStatus::Pass
+                | TestdEvaluationStatus::Fail
+                | TestdEvaluationStatus::Inconclusive
+        );
+        if (parser_executed || evaluator_assessed)
+            && (self.readback_receipt_id.is_none() || self.fence.is_none())
+        {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "an executed parser or assessed evaluator requires a verified readback binding",
+            });
+        }
         match &self.artifact_binding {
             TestdArtifactBinding::Unbound => {}
             TestdArtifactBinding::BoundExact(artifact)

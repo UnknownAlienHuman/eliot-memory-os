@@ -317,7 +317,10 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             )?));
         }
     };
-    let collector = Arc::new(EvidenceCollector::default());
+    // The collector is constructed internally from this exact attempt
+    // (issue #456, Wave B): it admits only records carrying the presented
+    // operation, and the start path below refuses any other sink.
+    let collector = Arc::new(EvidenceCollector::for_operation(operation_id.clone()));
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         let observation = match observe_tool_identity(permit.request()) {
             Ok(observation) => observation,
@@ -338,7 +341,6 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         };
         collector.record_tool_observation(observation)?;
     }
-    let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = collector.clone();
     // The consuming start proves nothing about the outcome by itself:
     // `start_claimed` maps every executor failure (including the
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
@@ -351,7 +353,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         current_clock_ms(),
         permit,
         contour.executor(),
-        sink,
+        &collector,
     ));
     let started_at = start_result
         .as_ref()
