@@ -6,7 +6,7 @@ use crate::config::{StoreDataRootLease, SurrealAdapterConfig};
 use crate::error::AdapterError;
 use eliot_platform_windows::{
     ProcessIdentity, RetainedProcessPathLease, is_eliot_governor_running,
-    observe_loopback_tcp_listener_owner,
+    observe_loopback_tcp_connection_peer_owner, observe_loopback_tcp_listener_owner,
 };
 use std::ffi::OsString;
 use std::fmt;
@@ -188,6 +188,63 @@ impl ProviderOwner {
         )?;
         Ok(())
     }
+
+    /// Proves the connected socket's server-side TCP row belongs to the
+    /// retained provider child before a reusable credential is attached.
+    pub(super) async fn validate_connected_peer(
+        &self,
+        client_local_endpoint: SocketAddr,
+        peer_endpoint: SocketAddr,
+    ) -> Result<(), AdapterError> {
+        self.config
+            .validate_data_root_lease(&self.data_root_lease)?;
+        let mut child = self.provider_child.lock().await;
+        let identity_before_peer = validate_child_process(
+            &self.config,
+            &self.process_lease,
+            &mut child,
+            self.provider_process_id,
+        )?;
+        require_unchanged_identity(
+            &self.provider_process_identity,
+            &identity_before_peer,
+            "authentication TCP peer precheck",
+        )?;
+        let configured_endpoint = self
+            .config
+            .provider_bind_address
+            .parse::<SocketAddr>()
+            .map_err(|_| {
+                AdapterError::Config(
+                    "provider bind address is not an exact loopback socket".to_owned(),
+                )
+            })?;
+        if peer_endpoint != configured_endpoint {
+            return Err(AdapterError::Config(
+                "connected provider peer does not match its configured endpoint".to_owned(),
+            ));
+        }
+        let observation =
+            observe_loopback_tcp_connection_peer_owner(client_local_endpoint, peer_endpoint)
+                .map_err(|_| {
+                    AdapterError::Config(
+                        "connected provider peer ownership could not be proven".to_owned(),
+                    )
+                })?;
+        require_connected_peer_owner(self.provider_process_id, observation.process_id())?;
+        let identity_after_peer = validate_child_process(
+            &self.config,
+            &self.process_lease,
+            &mut child,
+            self.provider_process_id,
+        )?;
+        require_unchanged_identity(
+            &identity_before_peer,
+            &identity_after_peer,
+            "connected peer observation",
+        )?;
+        Ok(())
+    }
 }
 
 pub(super) async fn reject_occupied_endpoint(
@@ -312,6 +369,18 @@ pub(super) fn require_listener_owner(expected: u32, observed: u32) -> Result<(),
     if expected == 0 || observed != expected {
         return Err(AdapterError::Config(
             "provider listener is not owned by the retained canonical child".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn require_connected_peer_owner(
+    expected: u32,
+    observed: u32,
+) -> Result<(), AdapterError> {
+    if expected == 0 || observed != expected {
+        return Err(AdapterError::Config(
+            "connected provider peer is not owned by the retained canonical child".to_owned(),
         ));
     }
     Ok(())

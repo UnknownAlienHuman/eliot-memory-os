@@ -4420,6 +4420,7 @@ impl HostJobBranches {
         )?;
         let (_, store_working_directory) =
             Self::approved_working_directories(launch, self.portable_root.as_ref(), config_path)?;
+        host_job_launch::ensure_store_endpoint_available(&launch.canonical_store_arguments)?;
         let child = Self::launch(
             &executable,
             executable_lease,

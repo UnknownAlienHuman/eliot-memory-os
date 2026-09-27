@@ -22,7 +22,8 @@ use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, UserOwnedRootLease,
+    SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
+    observe_loopback_tcp_listener_owner,
 };
 
 #[cfg(windows)]
@@ -170,6 +171,124 @@ fn approved_launch_paths(
     // WORK_UNIT_CASE: 978/1 — approved paths admitted, distinct from rejection.
     host_launch_observe("host.launch approved paths admitted");
     Ok(())
+}
+
+/// Extracts the planned loopback TCP endpoint from the canonical Store
+/// arguments (the `--bind` flag). The endpoint must be present exactly once,
+/// use the separate flag/value form, be a nonzero port, and be loopback.
+///
+/// Issue #1775: the planned endpoint is persisted in the approved launch
+/// descriptor; this helper reads it back without inventing a default.
+#[cfg(windows)]
+pub(super) fn planned_store_endpoint(
+    canonical_store_arguments: &[PlatformHandle],
+) -> Result<std::net::SocketAddr, HostError> {
+    let mut bind_value = None;
+    for (index, argument) in canonical_store_arguments.iter().enumerate() {
+        let argument = argument.as_str();
+        if argument.starts_with("--bind=") {
+            return Err(HostError::ProcessContour(
+                "canonical Store --bind must use one separate flag and value".to_owned(),
+            ));
+        }
+        if argument == "--bind" && bind_value.is_some() {
+            return Err(HostError::ProcessContour(
+                "canonical Store arguments contain ambiguous --bind flags".to_owned(),
+            ));
+        }
+        if argument == "--bind" {
+            bind_value = Some(canonical_store_arguments.get(index + 1).ok_or_else(|| {
+                HostError::ProcessContour("canonical Store --bind value is missing".to_owned())
+            })?);
+        }
+    }
+
+    let bind_value = bind_value.ok_or_else(|| {
+        HostError::ProcessContour("canonical Store --bind endpoint is missing".to_owned())
+    })?;
+    let endpoint = bind_value
+        .as_str()
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| {
+            HostError::ProcessContour(format!(
+                "canonical Store --bind endpoint is invalid: {error}"
+            ))
+        })?;
+    if endpoint.port() == 0 || !endpoint.ip().is_loopback() {
+        return Err(HostError::ProcessContour(
+            "canonical Store --bind endpoint must be loopback with a nonzero port".to_owned(),
+        ));
+    }
+    Ok(endpoint)
+}
+
+/// Observes whether one exact loopback TCP endpoint currently has a listener
+/// owner. Returns `Ok(Some(pid))` when a process owns the endpoint,
+/// `Ok(None)` when no exact listener exists, and a typed error when the
+/// owner cannot be determined.
+///
+/// Issue #1775: this is a read-only observation. It never kills, adopts, or
+/// reuses the occupying process. Inability to read the owner is not absence
+/// of a collision; the caller must fail closed.
+#[cfg(windows)]
+pub(super) fn store_endpoint_foreign_occupant(
+    endpoint: std::net::SocketAddr,
+) -> Result<Option<u32>, HostError> {
+    match observe_loopback_tcp_listener_owner(endpoint) {
+        Ok(observation) => Ok(Some(observation.process_id())),
+        Err(TcpListenerOwnerError::Missing) => Ok(None),
+        Err(error) => Err(HostError::ProcessContour(format!(
+            "planned Store endpoint owner observation failed: {error}"
+        ))),
+    }
+}
+
+/// Observes the planned Store endpoint and refuses launch when it is occupied.
+///
+/// The listener owner PID is observation data only; it does not prove that
+/// the process is part of this installation. The error preserves that
+/// boundary and does not authorize termination, adoption, reuse, or
+/// credential attachment.
+#[cfg(windows)]
+pub(super) fn ensure_store_endpoint_available(
+    canonical_store_arguments: &[PlatformHandle],
+) -> Result<(), HostError> {
+    ensure_store_endpoint_available_or_owned(canonical_store_arguments, None)
+}
+
+/// Checks a pre-recovery endpoint while the retained, independently verified
+/// old Store child may still own its listener. The caller must prove the old
+/// child's Job membership and committed predecessor binding before passing
+/// its PID; this observation grants no ownership to any other listener.
+#[cfg(windows)]
+pub(super) fn ensure_store_endpoint_available_or_owned(
+    canonical_store_arguments: &[PlatformHandle],
+    retained_old_child_pid: Option<u32>,
+) -> Result<(), HostError> {
+    let endpoint = planned_store_endpoint(canonical_store_arguments).inspect_err(|_error| {
+        host_launch_observe("host.launch store endpoint configuration rejected");
+    })?;
+
+    match store_endpoint_foreign_occupant(endpoint) {
+        Ok(Some(owner_pid)) if Some(owner_pid) == retained_old_child_pid => {
+            host_launch_observe("host.launch retained store endpoint owner observed");
+            Ok(())
+        }
+        Ok(Some(owner_pid)) => {
+            host_launch_observe("host.launch store endpoint collision observed");
+            Err(HostError::RecoveryRequired(format!(
+                "planned Store endpoint {endpoint} is occupied by a listener (observed owner PID {owner_pid}); exact installation ownership is unproven and the listener remains an observation/import candidate only; no kill, credential attachment, adoption, or reuse was performed"
+            )))
+        }
+        Ok(None) => {
+            host_launch_observe("host.launch store endpoint free");
+            Ok(())
+        }
+        Err(error) => {
+            host_launch_observe("host.launch store endpoint owner unknown");
+            Err(error)
+        }
+    }
 }
 
 /// Builds the exact Kernel child argv by injecting the Host-approved
@@ -753,6 +872,9 @@ impl HostJobBranches {
             &launch.kernel_arguments,
             &launch.doctor_executable_path,
         )?;
+        // Issue #1775: resolve collision before credential use. Listener PID
+        // is observation only; the preflight does not prove socket identity.
+        ensure_store_endpoint_available(&launch.canonical_store_arguments)?;
         let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(
