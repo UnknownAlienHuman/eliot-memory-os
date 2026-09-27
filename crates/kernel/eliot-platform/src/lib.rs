@@ -6,6 +6,58 @@
 //! exception used for Host ownership and one-use Kernel activation. Platform
 //! adapters implement the ports and the owning control plane supplies request
 //! identity and fences.
+//!
+//! # Portability boundary (I1.7)
+//!
+//! I1.7 keeps module protocol messages, module lifecycle, the Store API,
+//! canonical formats, authority/fencing semantics, the job/checkpoint model
+//! and agent interaction contracts uncoupled from Windows, and isolates the
+//! operating-system mechanisms behind a platform layer. I1.7 also fixes the
+//! gate: *"Linux support begins only after CI, packaging, and fault tests on a
+//! real Linux installation."* Nothing in this crate declares Linux supported,
+//! and no type here is a Linux implementation.
+//!
+//! This crate is the isolation layer's contract side. The mapping below records
+//! which port in this crate each I1.7 mechanism sits behind, and the I1.7
+//! future Linux equivalent. Every port and implementation named here is
+//! present in the tree; the two rows marked **no port trait** are the honest
+//! remainder, not an oversight.
+//!
+//! | I1.7 mechanism | port in this crate | I1.7 future Linux |
+//! |---|---|---|
+//! | SCM demand-start | [`ServicePort`] | systemd socket activation |
+//! | Task Scheduler | **no port trait** - see below | systemd timers |
+//! | named pipes | [`SessionPort`] | Unix domain sockets |
+//! | Job Objects | **no port trait** - see below | cgroups / process groups |
+//! | DPAPI / Credential Manager | [`SecretPort`] | keyring / secret service |
+//! | Windows notifications | [`NotificationPort`] | desktop notification adapter |
+//!
+//! Three further port traits here have no I1.7 row because they are not
+//! Windows-specific mechanisms: [`ClockPort`] (a point-in-time clock reading;
+//! wall time is never causal order), [`FilesystemPort`], and
+//! [`InstallationPort`].
+//!
+//! Host state persistence is isolated by [`HostStateStore`], the eighth trait in
+//! this crate; I1.7 lists no Windows mechanism against it.
+//!
+//! ## The two rows with no port trait
+//!
+//! - **Timers.** Task Scheduler is confined to one Windows module,
+//!   `eliot-platform-windows/src/platform_security.rs`, which reaches
+//!   `CLSID_CTaskScheduler`/`ITaskService` directly. No scheduler trait exists
+//!   in this crate, so a future Linux `systemd` timer would have to be
+//!   introduced behind a new port rather than substituted into an existing one.
+//! - **Process containment and resource controls.** Windows Job and process
+//!   lifecycle is owned by `eliot-platform-windows/src/process_job.rs`
+//!   ("Physical Windows Job and process lifecycle only") and is reached through
+//!   the Kernel execution gateway, not through a trait in this crate. The
+//!   provider-neutral vocabulary for it does exist here - [`ContainmentRequest`]
+//!   and [`ContainmentObservation`] - but the effect primitive behind it is not
+//!   yet a port, so a cgroup implementation would need one.
+//!
+//! Recording both as gaps is the point: a portability claim that reads as
+//! "everything is behind a port" would be false, and this crate must not be the
+//! place that claim is made.
 
 #![forbid(unsafe_code)]
 
