@@ -1419,6 +1419,64 @@ impl SnapshotBinding {
     }
 }
 
+impl DiscoveredTestSnapshot {
+    /// The frozen discovery join this normalized snapshot represents.  The
+    /// snapshot validates its own digest first, so a binding is never a
+    /// caller-asserted identity: the digest covers the normalized entries,
+    /// and therefore every stable `package/binary/test_id` identity in them.
+    pub fn binding(&self) -> Result<SnapshotBinding, PlanError> {
+        self.validate()?;
+        Ok(SnapshotBinding {
+            snapshot_producer: self.snapshot_producer.clone(),
+            snapshot_revision: self.snapshot_revision.clone(),
+            snapshot_digest: self.snapshot_digest.clone(),
+            entry_count: self.entries.len(),
+            inventory_complete: self.inventory_complete,
+        })
+    }
+}
+
+/// One frozen join of actual test discovery into a plan: the normalized
+/// discovery snapshot identified under the SAME candidate, target and
+/// feature set, with its stable package/binary/test identities bound by the
+/// snapshot digest and its non-discoverable policy overlay (resource
+/// classes, serial group, acceptance relation) retained in the snapshot.
+///
+/// The coordinates are the discovery side of the comparison, never an
+/// assumption that both sides agree: a plan's coordinates come from its
+/// [`PlanIdentity`], an observation's from the snapshot itself, and the join
+/// compares them by value.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DiscoveryJoin {
+    pub candidate_revision: String,
+    pub target: String,
+    pub features: Vec<String>,
+    pub binding: SnapshotBinding,
+}
+
+impl DiscoveryJoin {
+    /// The join one normalized discovery snapshot represents.  The snapshot
+    /// is validated (shape, unique stable identities, self-binding digest)
+    /// before its identity is quoted.
+    pub fn of(snapshot: &DiscoveredTestSnapshot) -> Result<Self, PlanError> {
+        Ok(Self {
+            candidate_revision: snapshot.candidate_revision.clone(),
+            target: snapshot.target.clone(),
+            features: snapshot.features.clone(),
+            binding: snapshot.binding()?,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), PlanError> {
+        plan_text(&self.candidate_revision, "join.candidate_revision")?;
+        plan_text(&self.target, "join.target")?;
+        for feature in &self.features {
+            plan_text(feature, "join.features")?;
+        }
+        self.binding.validate()
+    }
+}
+
 /// Widening-only hint from historical/co-change/code-intelligence evidence.
 /// A hint may add a selected check; it never modifies or cancels one.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1558,12 +1616,29 @@ impl ChangeImpactPlan {
         Ok(())
     }
 
+    /// The frozen discovery join this plan retains, or `None` when it was
+    /// built without a discovery snapshot.  The coordinates are the plan's
+    /// own identity; `revalidate_plan` compares them by value against the
+    /// coordinates of the snapshot currently observed.
+    pub fn discovery_join(&self) -> Option<DiscoveryJoin> {
+        self.snapshot_binding.as_ref().map(|binding| DiscoveryJoin {
+            candidate_revision: self.identity.candidate_revision.clone(),
+            target: self.identity.target.clone(),
+            features: self.identity.features.clone(),
+            binding: binding.clone(),
+        })
+    }
+
     /// Stable reference to this stored plan, emitted by consumers (for
     /// example in a `TestSelectionReceipt`) instead of the full contents.
+    /// The reference carries the frozen discovery join, so a downstream
+    /// receipt states which normalized discovery snapshot the plan was
+    /// joined against under which candidate, target and features.
     pub fn reference(&self) -> PlanReference {
         PlanReference {
             plan_digest: self.plan_digest.clone(),
             plan_revision: self.plan_revision,
+            discovery: self.discovery_join(),
         }
     }
 }
@@ -1590,7 +1665,7 @@ pub fn plan_impact(
     let mut checks = build_considered_checks(graph, &directive);
     apply_deviations(&mut checks, request)?;
     apply_heuristic_widening(&mut checks, request);
-    let snapshot_binding = join_snapshot(&mut checks, &mut gaps, request);
+    let snapshot_binding = join_snapshot(&mut checks, &mut gaps, request)?;
     let deferred = apply_budget(&mut checks, &mut gaps, request);
     let completeness = resolve_completeness(&directive, &gaps, request)?;
     let mut plan = ChangeImpactPlan {
@@ -1953,9 +2028,9 @@ fn join_snapshot(
     checks: &mut Vec<PlannedCheck>,
     gaps: &mut Vec<PlanGap>,
     request: &PlanRequest,
-) -> Option<SnapshotBinding> {
+) -> Result<Option<SnapshotBinding>, PlanError> {
     let Some(snapshot) = &request.snapshot else {
-        return None;
+        return Ok(None);
     };
     let mut inventory: BTreeMap<(String, String, String), &DiscoveredTestEntry> = BTreeMap::new();
     for entry in &snapshot.entries {
@@ -2022,13 +2097,7 @@ fn join_snapshot(
             ),
         });
     }
-    Some(SnapshotBinding {
-        snapshot_producer: snapshot.snapshot_producer.clone(),
-        snapshot_revision: snapshot.snapshot_revision.clone(),
-        snapshot_digest: snapshot.snapshot_digest.clone(),
-        entry_count: snapshot.entries.len(),
-        inventory_complete: snapshot.inventory_complete,
-    })
+    Ok(Some(snapshot.binding()?))
 }
 
 /// Applies the selection budget.  Exact selections are built before
@@ -2255,11 +2324,20 @@ pub fn evaluate_plan(
 }
 
 /// Stable reference to one stored plan revision, emitted by consumers in
-/// place of the full contents.
+/// place of the full contents.  It carries the plan's frozen
+/// [`DiscoveryJoin`]: the normalized discovery snapshot under the same
+/// candidate, target and features, verified against the frozen plan before
+/// this reference was emitted.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct PlanReference {
     pub plan_digest: String,
     pub plan_revision: u64,
+    /// The frozen discovery join, or `None` when the plan was built without a
+    /// discovery snapshot.  A plan that keeps no join must be dispatched
+    /// with no observed snapshot; supplying one would mix results the plan
+    /// never considered under its original commitment.
+    #[serde(default)]
+    pub discovery: Option<DiscoveryJoin>,
 }
 
 impl PlanReference {
@@ -2269,6 +2347,9 @@ impl PlanReference {
             return Err(PlanError::InvalidLimit {
                 field: "reference.revision",
             });
+        }
+        if let Some(join) = &self.discovery {
+            join.validate()?;
         }
         Ok(())
     }
@@ -2343,8 +2424,9 @@ pub fn retry_publication_content(envelope: &StoredPlanEnvelope) -> (&str, &str) 
 }
 
 /// Revalidates a stored plan against the currently applicable inputs before
-/// execution.  Candidate, target, feature, graph, or source movement
-/// invalidates the revision: the caller must build a new linked revision.
+/// execution.  Candidate, target, feature, graph, discovery, or source
+/// movement invalidates the revision: the caller must build a new linked
+/// revision.
 ///
 /// Every currently required source owner must carry the exact same owner,
 /// revision, and content digest in the retained plan, in the current owner
@@ -2352,6 +2434,11 @@ pub fn retry_publication_content(envelope: &StoredPlanEnvelope) -> (&str, &str) 
 /// missing required evidence fails even when the graph revision string is
 /// unchanged; owners outside the applicable set are not revalidated here
 /// and explicit non-applicability declarations keep their existing meaning.
+///
+/// `discovery` is the normalized discovery snapshot currently observed at the
+/// consume site.  When it is supplied, the plan's frozen [`DiscoveryJoin`] is
+/// joined against it by value; when the plan retains a join it is required,
+/// and when the plan retains none, no snapshot may be observed.
 pub fn revalidate_plan(
     plan: &ChangeImpactPlan,
     graph: &BuildTestGraph,
@@ -2359,6 +2446,7 @@ pub fn revalidate_plan(
     target: &str,
     features: &[String],
     expected_source: &[SourceCommitment],
+    discovery: Option<&DiscoveredTestSnapshot>,
 ) -> Result<(), PlanError> {
     plan.validate()?;
     if candidate_revision != plan.identity.candidate_revision {
@@ -2402,7 +2490,83 @@ pub fn revalidate_plan(
             });
         }
     }
-    Ok(())
+    join_discovery(plan, discovery)
+}
+
+/// Joins the actually discovered tests into a frozen plan (`I18.6` steps 3/4,
+/// `I18.3`).
+///
+/// The plan side of the join is the plan's frozen [`DiscoveryJoin`], taken
+/// from its retained [`SnapshotBinding`] and its own identity.  The observed
+/// side is the normalized discovery snapshot the discovery producer reports
+/// now; it validates its own digest first, so the join never trusts a
+/// caller-asserted identity, and that digest covers the normalized entries —
+/// every stable `package/binary/test_id` identity and the resource, serial
+/// and acceptance overlay in them.
+///
+/// Comparison is by value against the frozen plan: movement in candidate,
+/// target, features, snapshot producer, snapshot revision, snapshot digest,
+/// entry count, or inventory completeness is refused with the crate's typed
+/// drift refusal and requires a new linked plan revision, so results from a
+/// moved inventory are never mixed under the original commitment.  A plan
+/// that moved is refused by `plan.validate()` before this join is reached.
+fn join_discovery(
+    plan: &ChangeImpactPlan,
+    observed: Option<&DiscoveredTestSnapshot>,
+) -> Result<(), PlanError> {
+    let frozen = plan.discovery_join();
+    let Some(snapshot) = observed else {
+        return if frozen.is_some() {
+            Err(PlanError::InputDrift {
+                field: "discovery_snapshot",
+            })
+        } else {
+            Ok(())
+        };
+    };
+    let observed_join = DiscoveryJoin::of(snapshot)?;
+    let Some(frozen) = frozen else {
+        return Err(PlanError::InputDrift {
+            field: "discovery_snapshot",
+        });
+    };
+    if observed_join == frozen {
+        return Ok(());
+    }
+    if observed_join.candidate_revision != frozen.candidate_revision {
+        return Err(PlanError::SnapshotDrift {
+            field: "candidate_revision",
+        });
+    }
+    if observed_join.target != frozen.target {
+        return Err(PlanError::SnapshotDrift { field: "target" });
+    }
+    if observed_join.features != frozen.features {
+        return Err(PlanError::SnapshotDrift { field: "features" });
+    }
+    if observed_join.binding.snapshot_producer != frozen.binding.snapshot_producer {
+        return Err(PlanError::SnapshotDrift {
+            field: "snapshot_producer",
+        });
+    }
+    if observed_join.binding.snapshot_revision != frozen.binding.snapshot_revision {
+        return Err(PlanError::SnapshotDrift {
+            field: "snapshot_revision",
+        });
+    }
+    if observed_join.binding.snapshot_digest != frozen.binding.snapshot_digest {
+        return Err(PlanError::SnapshotDrift {
+            field: "snapshot_digest",
+        });
+    }
+    if observed_join.binding.entry_count != frozen.binding.entry_count {
+        return Err(PlanError::SnapshotDrift {
+            field: "entry_count",
+        });
+    }
+    Err(PlanError::SnapshotDrift {
+        field: "inventory_complete",
+    })
 }
 
 /// Replays a stored plan for readback or escaped-regression analysis.
