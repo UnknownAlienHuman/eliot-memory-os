@@ -720,18 +720,84 @@ impl ReservationEnvelopeState {
 ///   ([`ReservedWriteReconciliation::still_unknown`]), and the promotion to
 ///   [`ReservedWriteOutcome::ProvenNotApplied`] is a separate, explicitly
 ///   named act ([`ReservedWriteReconciliation::proven_not_applied`]).
+///
+/// Construction is closed: the fields are private, so outside this module a
+/// value can only come from the four named constructors above. Decoding is
+/// gated the same way: the wire shape deserializes into a private shadow
+/// struct and then passes through
+/// [`ReservedWriteReconciliation::validate`], so an inconsistent payload
+/// fails closed with a typed [`StoreError`] instead of yielding a value. A
+/// decoded value is still shape-only under the module contract, not fresh
+/// proof of currency; no new authority mechanism is introduced here.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ReconciliationWire", into = "ReconciliationWire")]
 pub struct ReservedWriteReconciliation {
     /// The ORIGINAL operation identity, never a fresh or derived one.
-    pub operation_id: OperationId,
+    operation_id: OperationId,
     /// The exact canonical receipt plus reservation binding, preserved.
-    pub admission: WriteAdmissionProjection,
+    admission: WriteAdmissionProjection,
     /// The closed outcome reached for this operation.
-    pub outcome: ReservedWriteOutcome,
+    outcome: ReservedWriteOutcome,
+}
+
+/// Private wire shape of [`ReservedWriteReconciliation`].
+///
+/// Decoding never constructs a reconciliation directly: every decoded payload
+/// takes this shape and then passes through
+/// [`ReservedWriteReconciliation::validate`], so unknown fields are rejected
+/// and an inconsistent value fails closed with a typed [`StoreError`]. The
+/// serialized shape is unchanged.
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReconciliationWire {
+    operation_id: OperationId,
+    admission: WriteAdmissionProjection,
+    outcome: ReservedWriteOutcome,
+}
+
+impl TryFrom<ReconciliationWire> for ReservedWriteReconciliation {
+    type Error = StoreError;
+
+    fn try_from(wire: ReconciliationWire) -> Result<Self, Self::Error> {
+        let value = Self {
+            operation_id: wire.operation_id,
+            admission: wire.admission,
+            outcome: wire.outcome,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+impl From<ReservedWriteReconciliation> for ReconciliationWire {
+    fn from(value: ReservedWriteReconciliation) -> Self {
+        Self {
+            operation_id: value.operation_id,
+            admission: value.admission,
+            outcome: value.outcome,
+        }
+    }
 }
 
 impl ReservedWriteReconciliation {
+    /// Returns the ORIGINAL operation identity this reconciliation is reported under.
+    #[must_use]
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// Returns the exact canonical receipt plus reservation binding, preserved.
+    #[must_use]
+    pub fn admission(&self) -> &WriteAdmissionProjection {
+        &self.admission
+    }
+
+    /// Returns the closed outcome reached for this operation.
+    #[must_use]
+    pub fn outcome(&self) -> &ReservedWriteOutcome {
+        &self.outcome
+    }
+
     /// Resolves one observed receipt read under the original identity.
     ///
     /// This is the single entry point that reads a store answer. A receipt is
