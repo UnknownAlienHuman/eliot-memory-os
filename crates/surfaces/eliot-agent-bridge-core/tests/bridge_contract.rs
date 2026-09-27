@@ -4,14 +4,20 @@ use std::sync::{Arc, Mutex};
 use eliot_agent_bridge_core::{
     ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET, ACTIVATION_DISPOSITION_FAILED, AckPhase,
     ActivationDenialReport, ActivationPortOutcome, ActivationPortResult, AgentBridgeCore,
-    AttachBinding, AttachRequest, BlindInterval, BridgeError, ConnectionId, CoverageGap,
-    CoverageInterval, CursorPolicy, DemandId, EventDisposition, EventEnvelope, EventForwardAck,
-    EventForwardStatus, EventPortOutcome, FencingToken, Generation, HostActivationPort,
-    HostEventEnvelope, McpForwardingPort, PrincipalId, ProofCeiling, ProviderFailure,
-    ProviderReadiness, ReconciliationPortOutcome, ReconciliationPortResult,
-    ReconciliationReceiptRef, ReconnectRequest, RequiredProvider, SessionId, TaskId, WorkUnitId,
+    AttachBinding, AttachRequest, BlindInterval, BridgeError, ClockReading, ConnectionId,
+    CoverageGap, CoverageInterval, CursorPolicy, DemandId, EventCursor, EventDisposition,
+    EventEnvelope, EventForwardAck, EventForwardStatus, EventId, EventPortOutcome, FencingToken,
+    Generation, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostActivationPort,
+    HostEventDeliveryDisposition, HostEventEnvelope, HostEventNormalizationReceipt,
+    HostEventPrivacyClass, LowercaseSha256, McpForwardingPort, NativeSession, NativeSessionLocator,
+    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId,
+    ProofCeiling, ProviderFailure, ProviderObservationLineage, ProviderReadiness,
+    QualifiedSourceDigest, RawSourceRecord, ReconciliationPortOutcome, ReconciliationPortResult,
+    ReconciliationReceiptRef, ReconnectRequest, RequiredProvider, RestrictedRawSourceHandle,
+    SessionId, SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
+    UnsupportedDisposition, WorkUnitId,
 };
-use eliot_contracts::{EpochId, EpochLineageId};
+use eliot_contracts::{EpochId, EpochLineageId, sha256_hex};
 use serde_json::json;
 use std::num::NonZeroU64;
 
@@ -223,8 +229,68 @@ fn event(class: &str, event_id: &str, sequence: u64) -> Result<EventEnvelope, se
     }))
 }
 
-fn hook() -> Result<HostEventEnvelope, serde_json::Error> {
-    serde_json::from_value(json!({
+/// #228 A6 fixture seam: the legacy quarantine wire is admissible only while
+/// it carries a closed, versioned, bounded normalized observation, so the
+/// fixture builds and seals one bound to the wire's own identity, cursor, and
+/// sequence.
+fn normalized_observation() -> Result<NormalizedHostEventEnvelope, Box<dyn std::error::Error>> {
+    fn digest(bytes: &[u8]) -> Result<LowercaseSha256, serde_json::Error> {
+        serde_json::from_value(serde_json::json!(sha256_hex(bytes)))
+    }
+    let source_bytes = b"bridge-contract-hook-source".to_vec();
+    let raw_source = RawSourceRecord {
+        handle: RestrictedRawSourceHandle::new("restricted:hook-1")?,
+        digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: digest(&source_bytes)?,
+        },
+    };
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new("hook-1")?,
+        cursor: EventCursor::new("cursor-1")?,
+        lineage: ProviderObservationLineage::SessionObservation(SessionObservation {
+            session_id: None,
+            native: NativeSession::Native(NativeSessionLocator::new("thread-hook-1")?),
+        }),
+        producer_adapter_identity: "bridge-fixture".to_owned(),
+        adapter_contract_version: "bridge-fixture/v1".to_owned(),
+        sequence: 1,
+        causal_predecessors: Vec::new(),
+        payload: NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+            transition: SessionLifecycleTransition::Started,
+            detail_ref: None,
+        }),
+        admitted_route_digest: None,
+        raw_source: raw_source.clone(),
+        normalization: HostEventNormalizationReceipt {
+            normalizer_identity: "bridge-fixture".to_owned(),
+            normalizer_version: "bridge-fixture/v1".to_owned(),
+            input_handle: raw_source.handle.clone(),
+            input_digest: raw_source.digest.clone(),
+            output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            output_digest: digest(b"bridge-contract-hook-seal-placeholder")?,
+            omitted_fields: Vec::new(),
+            warnings: Vec::new(),
+            unsupported_disposition: UnsupportedDisposition::None,
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        observed_at: ClockReading {
+            valid_time_ms: Some(1_700_000_000_000),
+            known_time_ms: Some(1_700_000_000_000),
+            transaction_sequence: None,
+            monotonic_ns: Some(1_000),
+        },
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+    };
+    envelope.seal()?;
+    Ok(envelope)
+}
+
+fn hook() -> Result<HostEventEnvelope, Box<dyn std::error::Error>> {
+    let mut wire = json!({
         "event_id": "hook-1",
         "attempt_id": "attempt-1",
         "sequence": 1,
@@ -249,7 +315,9 @@ fn hook() -> Result<HostEventEnvelope, serde_json::Error> {
         "normalized_payload": {},
         "parent_event_id": null,
         "observed_at": "2026-08-14T00:00:00Z"
-    }))
+    });
+    wire["normalized"] = serde_json::to_value(normalized_observation()?)?;
+    Ok(serde_json::from_value(wire)?)
 }
 
 fn bridge(

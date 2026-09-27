@@ -12,14 +12,21 @@ use std::sync::{Arc, Mutex};
 
 use eliot_agent_bridge_core::{
     ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachBinding, AttachRequest,
-    AttemptState, BridgeError, ConnectionId, CoverageGap, CursorPolicy, DemandId, EventEnvelope,
-    EventPortOutcome, FencingToken, Generation, HostActivationPort, HostEventEnvelope,
-    HostEventKind, McpForwardingPort, PrincipalId, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, ReconciliationPortResult, RecoveryDirective, RecoveryDirectiveKind,
-    RouteFingerprint, SessionId, TaskId, TerminalReductionInputs, WorkUnitId,
+    AttemptState, BridgeError, ClockReading, ConnectionId, CoverageGap, CursorPolicy, DemandId,
+    EventCursor, EventEnvelope, EventId, EventPortOutcome, FencingToken, Generation,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostActivationPort,
+    HostEventDeliveryDisposition, HostEventEnvelope, HostEventKind, HostEventNormalizationReceipt,
+    HostEventPrivacyClass, LowercaseSha256, McpForwardingPort, NativeSession, NativeSessionLocator,
+    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId,
+    ProviderFailure, ProviderObservationLineage, ProviderReadiness, QualifiedSourceDigest,
+    RawSourceRecord, ReconciliationPortOutcome, ReconciliationPortResult, RecoveryDirective,
+    RecoveryDirectiveKind, RestrictedRawSourceHandle, RouteFingerprint, SessionId,
+    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
+    TerminalReductionInputs, UnsupportedDisposition, UnsupportedEventObservation,
+    UnsupportedEventReason, WorkUnitId,
 };
 use eliot_agent_bridge_core::{TransportEdge, TransportEdgeKind};
-use eliot_contracts::{EpochId, EpochLineageId};
+use eliot_contracts::{EpochId, EpochLineageId, sha256_hex};
 use serde_json::json;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -169,6 +176,85 @@ fn test_route() -> Result<RouteFingerprint, Box<dyn std::error::Error>> {
     }))?)
 }
 
+/// #228 A6 fixture seam: the legacy quarantine wire is admissible only while
+/// it carries a closed, versioned, bounded normalized observation, so the
+/// fixture builds and seals one bound to the wire's own identity, cursor, and
+/// sequence. `quarantined` selects the typed error-class payload the bridge
+/// cites into `error_event_refs`.
+fn normalized_observation(
+    event_id: &str,
+    sequence: u64,
+    quarantined: bool,
+) -> Result<NormalizedHostEventEnvelope, Box<dyn std::error::Error>> {
+    fn digest(bytes: &[u8]) -> Result<LowercaseSha256, serde_json::Error> {
+        serde_json::from_value(serde_json::json!(sha256_hex(bytes)))
+    }
+    let source_bytes = format!("bridge-host-event-source-{event_id}").into_bytes();
+    let raw_source = RawSourceRecord {
+        handle: RestrictedRawSourceHandle::new(format!("restricted:{event_id}"))?,
+        digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: digest(&source_bytes)?,
+        },
+    };
+    let payload = if quarantined {
+        NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+            source_namespace: "bridge-fixture".to_owned(),
+            source_version: None,
+            reason: UnsupportedEventReason::SourceDecodeFailure,
+            detail_ref: None,
+        })
+    } else {
+        NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+            transition: SessionLifecycleTransition::Started,
+            detail_ref: None,
+        })
+    };
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new(event_id)?,
+        cursor: EventCursor::new(format!("cursor-{sequence}"))?,
+        lineage: ProviderObservationLineage::SessionObservation(SessionObservation {
+            session_id: None,
+            native: NativeSession::Native(NativeSessionLocator::new(format!("thread-{event_id}"))?),
+        }),
+        producer_adapter_identity: "bridge-fixture".to_owned(),
+        adapter_contract_version: "bridge-fixture/v1".to_owned(),
+        sequence,
+        causal_predecessors: Vec::new(),
+        payload,
+        admitted_route_digest: None,
+        raw_source: raw_source.clone(),
+        normalization: HostEventNormalizationReceipt {
+            normalizer_identity: "bridge-fixture".to_owned(),
+            normalizer_version: "bridge-fixture/v1".to_owned(),
+            input_handle: raw_source.handle.clone(),
+            input_digest: raw_source.digest.clone(),
+            output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            output_digest: digest(b"bridge-fixture-seal-placeholder")?,
+            omitted_fields: Vec::new(),
+            warnings: Vec::new(),
+            unsupported_disposition: if quarantined {
+                UnsupportedDisposition::UnsupportedMethodQuarantined
+            } else {
+                UnsupportedDisposition::None
+            },
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        observed_at: ClockReading {
+            valid_time_ms: Some(1_700_000_000_000),
+            known_time_ms: Some(1_700_000_000_000),
+            transaction_sequence: None,
+            monotonic_ns: Some(1_000),
+        },
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+    };
+    envelope.seal()?;
+    Ok(envelope)
+}
+
 fn host_event(
     event_id: &str,
     sequence: u64,
@@ -176,7 +262,7 @@ fn host_event(
     normalized: &serde_json::Value,
     parent: Option<&str>,
 ) -> Result<HostEventEnvelope, Box<dyn std::error::Error>> {
-    Ok(serde_json::from_value(json!({
+    let mut wire = json!({
         "event_id": event_id,
         "attempt_id": "attempt-1",
         "sequence": sequence,
@@ -201,7 +287,10 @@ fn host_event(
         "normalized_payload": normalized,
         "parent_event_id": parent,
         "observed_at": "2026-09-15T00:00:00Z"
-    }))?)
+    });
+    wire["normalized"] =
+        serde_json::to_value(normalized_observation(event_id, sequence, kind == "error")?)?;
+    Ok(serde_json::from_value(wire)?)
 }
 
 fn managed_request() -> Result<AttachRequest, Box<dyn std::error::Error>> {
