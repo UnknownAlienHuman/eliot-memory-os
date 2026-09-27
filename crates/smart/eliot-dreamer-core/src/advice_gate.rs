@@ -214,7 +214,7 @@ impl AdviceGate {
         let evidence: Vec<String> = proposal
             .discriminating_evidence
             .iter()
-            .map(|item| item.trim().to_owned())
+            .map(|item| item.split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|item| !item.is_empty())
             .collect();
         if evidence.is_empty() {
@@ -238,9 +238,9 @@ impl AdviceGate {
 
     /// Apply the owner decision. Approval binds a named verifier and a
     /// rollback condition; rejection parks the candidate as `OwnerRejected`
-    /// (the caller then records negative memory via [`Self::record_failure`]).
+    /// and records its reason in negative memory.
     pub fn record_owner_decision(
-        &self,
+        &mut self,
         mut candidate: AdviceCandidate,
         decision: &OwnerDecision,
     ) -> Result<AdviceCandidate, AdviceRejected> {
@@ -260,8 +260,9 @@ impl AdviceGate {
                 candidate.state = AdviceState::OwnerApproved;
                 Ok(candidate)
             }
-            OwnerDecision::Reject { .. } => {
+            OwnerDecision::Reject { reason } => {
                 candidate.state = AdviceState::OwnerRejected;
+                self.record_failure(&candidate, reason);
                 Ok(candidate)
             }
         }
