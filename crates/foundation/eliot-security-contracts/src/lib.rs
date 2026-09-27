@@ -10,7 +10,10 @@ mod surface_types;
 mod validation;
 
 pub use surface_types::*;
-pub use validation::{SecurityContractError, validate_selection_pipeline};
+pub use validation::{
+    SecurityContractError, import_legacy_selection_receipt_v1, selection_member_digest,
+    validate_selection_pipeline,
+};
 
 /// Stable identity of this contract surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.security-contracts";
@@ -62,6 +65,18 @@ mod negative_consumer_fixtures {
 
     fn fence() -> StateFence {
         StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    }
+
+    fn member(member_ref: &str) -> SelectionMember {
+        SelectionMember {
+            member_ref: member_ref.to_owned(),
+            member_revision: format!("{member_ref}-rev-1"),
+            representation_ref: format!("{member_ref}-repr-1"),
+        }
+    }
+
+    fn members(member_refs: &[&str]) -> Vec<SelectionMember> {
+        member_refs.iter().map(|item| member(item)).collect()
     }
 
     fn closure(completeness: ClosureCompleteness) -> DisclosureDependencyClosure {
@@ -173,20 +188,44 @@ mod negative_consumer_fixtures {
 
     #[test]
     fn selection_receipt_rejects_unadmitted_output() {
+        let stage_members = members(&["a"]);
         let receipt = SelectionIntegrityReceipt {
+            schema: SELECTION_INTEGRITY_SCHEMA.to_owned(),
+            contract_version: CONTRACT_VERSION,
             selection_id: "selection-1".to_owned(),
-            initial_candidate_refs: vec!["a".to_owned()],
+            root_context_ref: "root-context-1".to_owned(),
+            recipe_revision: "recipe-rev-1".to_owned(),
+            initial_candidate_digest: selection_member_digest(&stage_members)
+                .expect("membership digest"),
+            initial_candidate_members: stage_members.clone(),
             admitted_candidate_refs: vec!["a".to_owned()],
             rejected_candidate_refs: Vec::new(),
             transformation_stages: vec![SelectionStage {
+                stage_id: "stage-1".to_owned(),
+                ordinal: 0,
+                input_link: None,
                 stage: SelectionStageKind::Summary,
-                input_refs: vec!["a".to_owned()],
-                output_refs: vec!["b".to_owned()],
+                transformer_identity_and_config_revision: "summary-transformer-rev-1".to_owned(),
+                input_digest: selection_member_digest(&stage_members).expect("membership digest"),
+                input_members: stage_members.clone(),
+                output_digest: selection_member_digest(&stage_members).expect("membership digest"),
+                output_members: stage_members.clone(),
+                member_dispositions: vec![SelectionMemberDisposition {
+                    member_ref: "a".to_owned(),
+                    disposition: SelectionMemberDispositionKind::Retained,
+                    reason: None,
+                    derived_output_ref: None,
+                    source_evidence_ref: None,
+                }],
+                suppressed_counterevidence_refs: Vec::new(),
+                budget_or_policy_omission_refs: Vec::new(),
+                untrusted_input_influenced_membership: SelectionInfluenceState::Absent,
+                influence_evidence_refs: Vec::new(),
                 disclosure_closure_ref: "closure-1".to_owned(),
                 state_fence: fence(),
             }],
             final_output_refs: vec!["c".to_owned()],
-            untrusted_structure_changed_membership: false,
+            chain_untrusted_influence: SelectionInfluenceState::Absent,
             state_fence: fence(),
             revision: 1,
         };

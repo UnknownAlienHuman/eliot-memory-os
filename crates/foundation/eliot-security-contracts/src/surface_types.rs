@@ -329,30 +329,179 @@ pub enum PurgeState {
     Blocked,
 }
 
-/// Receipt of candidate-set membership through all selection transformations.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SelectionIntegrityReceipt {
-    pub selection_id: String,
-    pub initial_candidate_refs: Vec<String>,
-    pub admitted_candidate_refs: Vec<String>,
-    pub rejected_candidate_refs: Vec<String>,
-    pub transformation_stages: Vec<SelectionStage>,
-    pub final_output_refs: Vec<String>,
-    pub untrusted_structure_changed_membership: bool,
-    pub state_fence: StateFence,
-    pub revision: u64,
+/// Stable schema identity of the versioned selection-integrity receipt family.
+pub const SELECTION_INTEGRITY_SCHEMA: &str =
+    "eliot.foundation.security-contracts.selection-integrity.v2";
+/// Maximum stages one selection-integrity chain may declare.
+pub const MAX_SELECTION_STAGES: usize = 64;
+/// Maximum members one selection-integrity membership collection may declare.
+pub const MAX_SELECTION_MEMBERS: usize = 4_096;
+/// One-way disposition for a legacy unversioned selection receipt.
+pub const SELECTION_INTEGRITY_LEGACY_V1_DISPOSITION: &str = concat!(
+    "imported-as-unknown: a legacy receipt-level untrusted_structure_changed_membership=false ",
+    "is absence of the old flag only, never proven absence of stage influence; a legacy stage ",
+    "output that was not a legacy stage input is not attributable to any input member and is ",
+    "rejected"
+);
+
+/// Closed untrusted-influence state of one stage or of the whole chain.
+///
+/// Declaration order is the claim-ceiling order: `Absent` is the strongest and
+/// `Unknown` the weakest statement. I12.13 `Selection integrity` makes `unknown`
+/// an admissible finding that lowers the claim ceiling of the dependent packet;
+/// it never becomes `Absent` by assumption, and a later deterministic stage
+/// cannot erase an earlier `Present` or `Unknown`.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SelectionInfluenceState {
+    /// Untrusted input provably did not change this membership.
+    Absent,
+    /// Untrusted input changed this membership and the change is recorded.
+    Present,
+    /// The producer cannot state whether untrusted input changed this membership.
+    Unknown,
 }
 
-/// One selection-transforming stage.
+/// One hashed selection member: identity, revision and representation.
+///
+/// A membership digest binds these three fields in declared order, so it also
+/// preserves the order a ranking or presentation boundary produced. Display
+/// labels and counts are never hashed in their place.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionMember {
+    /// Opaque member identity.
+    pub member_ref: String,
+    /// Exact member revision observed at this stage boundary.
+    pub member_revision: String,
+    /// Exact representation handed to or produced by the transformer.
+    pub representation_ref: String,
+}
+
+/// What one stage did to one member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SelectionMemberDispositionKind {
+    /// Carried forward unchanged into this stage's output membership.
+    Retained,
+    /// Left the membership; a reason is required.
+    Removed,
+    /// Folded into a derived output that took its place in the membership.
+    Derived,
+    /// Introduced during expansion from named admitted source evidence.
+    Admitted,
+}
+
+/// One per-member disposition row.
+///
+/// `Removed` requires `reason`; `Derived` requires `derived_output_ref`; and
+/// `Admitted` requires `source_evidence_ref`. A field that does not belong to
+/// the disposition is absent, never an empty string.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionMemberDisposition {
+    /// The input member, or the newly admitted output member, this row accounts for.
+    pub member_ref: String,
+    /// What the stage did to that member.
+    pub disposition: SelectionMemberDispositionKind,
+    /// Why the member left the membership.
+    pub reason: Option<String>,
+    /// Derived output that took the member's place in the membership.
+    pub derived_output_ref: Option<String>,
+    /// Admitted source evidence that introduced the member.
+    pub source_evidence_ref: Option<String>,
+}
+
+/// How one stage's input membership was derived from earlier stages.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "link", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum SelectionStageLink {
+    /// The input is the complete output membership of the named stage.
+    FromPredecessor {
+        /// Stable identity of the immediately preceding stage.
+        predecessor_stage_id: String,
+    },
+    /// The input is the complete union of the named parents' output memberships.
+    FromJoin {
+        /// Stable identities of every parent stage of the join.
+        parent_stage_ids: Vec<String>,
+    },
+}
+
+/// One immutable selection-transforming stage.
+///
+/// A stage appends to the chain and never overwrites an earlier membership
+/// decision (I12.13 `Selection integrity`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionStage {
+    /// Stable stage identity; content recorded under one identity is immutable.
+    pub stage_id: String,
+    /// Contiguous zero-based position of this stage in the chain.
+    pub ordinal: usize,
+    /// Derivation of the input membership; absent exactly at ordinal zero.
+    pub input_link: Option<SelectionStageLink>,
+    /// Stage category.
     pub stage: SelectionStageKind,
-    pub input_refs: Vec<String>,
-    pub output_refs: Vec<String>,
+    /// Exact transformer identity and configuration revision.
+    pub transformer_identity_and_config_revision: String,
+    /// Input membership in the exact order the transformer received it.
+    pub input_members: Vec<SelectionMember>,
+    /// Lowercase SHA-256 over the canonical input membership.
+    pub input_digest: String,
+    /// Output membership in the exact order the transformer emitted it.
+    pub output_members: Vec<SelectionMember>,
+    /// Lowercase SHA-256 over the canonical output membership.
+    pub output_digest: String,
+    /// Exactly one row per input member, plus one row that explains every
+    /// output member this stage introduced through a `Derived` or `Admitted`
+    /// relation.
+    pub member_dispositions: Vec<SelectionMemberDisposition>,
+    /// Counterevidence or minority items this stage suppressed.
+    pub suppressed_counterevidence_refs: Vec<String>,
+    /// Budget or policy forced omissions this stage made.
+    pub budget_or_policy_omission_refs: Vec<String>,
+    /// Closed untrusted-influence state of this stage.
+    pub untrusted_input_influenced_membership: SelectionInfluenceState,
+    /// Evidence backing a `Present` or `Unknown` influence statement.
+    pub influence_evidence_refs: Vec<String>,
     pub disclosure_closure_ref: String,
     pub state_fence: StateFence,
+}
+
+/// Receipt of candidate-set membership through all selection transformations.
+///
+/// The receipt records history, not permission. A well-formed record of known or
+/// unknown untrusted influence validates so it can be audited; whether that
+/// history may be relied on is a separate policy decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionIntegrityReceipt {
+    /// Closed schema identity of this receipt family.
+    pub schema: String,
+    /// Contract version this receipt was written against.
+    pub contract_version: eliot_contracts::ContractVersion,
+    /// Chain identity of this selection history.
+    pub selection_id: String,
+    /// Shared root context this chain was compiled for.
+    pub root_context_ref: String,
+    /// Exact versioned context recipe revision that produced the chain.
+    pub recipe_revision: String,
+    /// Immutable initial candidate membership in retrieval order.
+    pub initial_candidate_members: Vec<SelectionMember>,
+    /// Lowercase SHA-256 over the canonical initial candidate membership.
+    pub initial_candidate_digest: String,
+    pub admitted_candidate_refs: Vec<String>,
+    pub rejected_candidate_refs: Vec<String>,
+    pub transformation_stages: Vec<SelectionStage>,
+    /// Final membership. Empty is a legitimate all-rejected result.
+    pub final_output_refs: Vec<String>,
+    /// Chain influence ceiling; it may never be weaker than any stage state.
+    pub chain_untrusted_influence: SelectionInfluenceState,
+    pub state_fence: StateFence,
+    pub revision: u64,
 }
 
 /// Stage categories for selection-integrity lineage.
@@ -366,4 +515,36 @@ pub enum SelectionStageKind {
     Summary,
     ContextCompile,
     ToolExport,
+}
+
+/// Exact pre-migration v1 selection receipt wire.
+///
+/// v1 carried one receipt-level `untrusted_structure_changed_membership` Boolean
+/// and stages with no identity, ordinal, digest, per-member disposition or
+/// influence state. Old bytes deserialize here explicitly and are never
+/// reinterpreted as a stage-continuous chain; see
+/// [`SELECTION_INTEGRITY_LEGACY_V1_DISPOSITION`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LegacySelectionIntegrityReceiptV1 {
+    pub selection_id: String,
+    pub initial_candidate_refs: Vec<String>,
+    pub admitted_candidate_refs: Vec<String>,
+    pub rejected_candidate_refs: Vec<String>,
+    pub transformation_stages: Vec<LegacySelectionStageV1>,
+    pub final_output_refs: Vec<String>,
+    pub untrusted_structure_changed_membership: bool,
+    pub state_fence: StateFence,
+    pub revision: u64,
+}
+
+/// Exact pre-migration v1 stage wire, which recorded no member relation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LegacySelectionStageV1 {
+    pub stage: SelectionStageKind,
+    pub input_refs: Vec<String>,
+    pub output_refs: Vec<String>,
+    pub disclosure_closure_ref: String,
+    pub state_fence: StateFence,
 }
