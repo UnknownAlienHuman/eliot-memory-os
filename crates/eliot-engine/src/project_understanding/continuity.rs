@@ -1,10 +1,12 @@
 //! Packet-local continuity for project understanding.
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handle `A7.6`
-//! (Compaction and resume), plus Decision Anchor `ARCH-CORE-01`
-//! (`docs/architecture/A16-01-decision-anchors.md`). Implementation:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I7.15` and `I12.17`.
-//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
+//! Architecture: handle `A7.6`
+//! (`docs/architecture/A07-06-compaction-and-resume.md`, Compaction and
+//! resume), plus Decision Anchor `ARCH-CORE-01`
+//! (`docs/architecture/A16-01-decision-anchors.md`). Implementation: handles
+//! `I7.15` (`docs/architecture/I07-15-route-continuation-and-transfer.md`) and
+//! `I12.17` (`docs/architecture/I12-17-compaction-and-resume.md`). Normative
+//! precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! Normative code: `crates/eliot-engine/src/project_understanding.rs`
 //! (`ProjectUnderstandingCompiler`) and `crates/eliot-types`

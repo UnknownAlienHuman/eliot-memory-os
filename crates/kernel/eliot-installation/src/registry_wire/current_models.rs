@@ -1,12 +1,13 @@
 //! Current-version registry wire DTOs and pure deserialization conversion.
 //!
-//! Architecture A2.3 (`docs/architecture/ELIOT_ARCHITECTURE.md`): this is a
-//! bounded source contract island; the module/package does not own runtime
-//! lifecycle or authority.
-//! Implementation I3.14 keeps declared capability separate from observed
-//! capability, with runtime observation winning current availability. I3.15
-//! keeps durable installation/update transaction ownership with installer/Host
-//! (`docs/architecture/ELIOT_IMPLEMENTATION.md`).
+//! Architecture A2.3 (`docs/architecture/A02-03-modular-architecture.md`):
+//! this is a bounded source contract island; the module/package does not own
+//! runtime lifecycle or authority.
+//! Implementation I3.14 (`docs/architecture/I03-14-registry-revalidation.md`)
+//! keeps declared capability separate from observed capability, with runtime
+//! observation winning current availability. I3.15
+//! (`docs/architecture/I03-15-installation-and-update-transaction.md`) keeps
+//! durable installation/update transaction ownership with installer/Host.
 //!
 //! Ownership: this child owns only current-version wire DTOs, serde
 //! required-field/default decoding, and pure conversion. The parent

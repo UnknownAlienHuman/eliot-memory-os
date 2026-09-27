@@ -1,14 +1,15 @@
 //! Kernel process configuration and its fail-closed builders.
 //!
 //! Architecture traceability:
-//! - `ELIOT_ARCHITECTURE.md :: A13.2. Kernel и failure domains` keeps the
+//! - `A13.2` (`docs/architecture/A13-02-kernel-and-failure-domains.md`) keeps the
 //!   configuration as input to one Kernel lifecycle/failure boundary.
-//! - `ELIOT_ARCHITECTURE.md :: A13.5. Bounded resources и Control Reserve`
+//! - `A13.5` (`docs/architecture/A13-05-bounded-resources-and-control-reserve.md`)
 //!   constrains configuration to the existing bounded control/runtime contour.
-//! - `ELIOT_IMPLEMENTATION.md :: I3.9. Configuration layers` and
+//! - `I3.9` (`docs/architecture/I03-09-configuration-layers.md`) and
 //!   `Appendix C. Default runtime configuration` keep defaults explicit and
 //!   layered, with no hidden environment or provider authority in this type.
-//! - `ELIOT_IMPLEMENTATION.md :: P.3. Kernel control boundary` keeps the
+//! - The R1 Kernel runtime layer
+//!   (`docs/architecture/I-PREFACE-04-runtime-layer-model.md`) keeps the
 //!   resulting configuration at the Kernel boundary; admission and semantics
 //!   remain owned by the existing composition modules.
 

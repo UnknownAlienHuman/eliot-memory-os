@@ -1,12 +1,20 @@
 //! Kernel front-door server proof and authentication.
 //!
-//! Architecture anchors: A12.2 and A12.3,
-//! with ARCH-AUTH-01, ARCH-SEC-01, and ARCH-SEC-02. This module owns only the
+//! Architecture anchors: `A12.2`
+//! (`docs/architecture/A12-02-principal-session-and-visibility.md`) and `A12.3`
+//! (`docs/architecture/A12-03-one-governed-write-path.md`), with ARCH-AUTH-01,
+//! ARCH-SEC-01, and ARCH-SEC-02 resolving through
+//! `docs/architecture/A16-01-decision-anchors.md`. This module owns only the
 //! OS-observed front-door proof and fail-closed authentication mechanics; it
 //! does not create semantic, Store, Governor, or transition authority.
 //!
-//! Implementation anchors: I2.1, I2.23,
-//! I7.5, and I7.14. The proof binds the live process, executable object,
+//! Implementation anchors: `I2.1`
+//! (`docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md`),
+//! `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`),
+//! `I7.5` (`docs/architecture/I07-05-named-pipes.md`), and `I7.14`
+//! (`docs/architecture/I07-14-session-lifecycle.md`). The proof binds the live
+//! process, executable object,
 //! artifact digest, and narrow front-door DACL observation to the connected
 //! pipe while preserving the existing cfg and unknown/failure behavior.
 //!
@@ -16,10 +24,8 @@
 //! This module observes and proves transport identity; it does not issue a
 //! semantic result or Store/Governor authority.
 //!
-//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
-//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
-//! the governing shards are named per anchor above).
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
+//! sharded fragments named per anchor above.
 
 use crate::{
     KernelFrontDoorAclMode, KernelFrontDoorServerExpectation, PEER_SET_GENERIC_ALL_MAPPED,

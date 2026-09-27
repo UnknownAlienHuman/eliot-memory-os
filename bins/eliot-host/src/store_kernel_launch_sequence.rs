@@ -5,10 +5,15 @@
 //! failed observation, or unknown cleanup remains an explicit fail-closed result;
 //! Kernel is never invoked without the Store liveness barrier.
 //!
-//! Architecture anchors: `docs/architecture/ELIOT_ARCHITECTURE.md` §A2.2
-//! (Host Supervisor) and §A2.3 (Host physical lifecycle). Implementation anchors:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` §I0.1 (R0/R1 layer boundary),
-//! §I1.2 (`eliot-host.exe` ownership), and §I1.4 (separate Host-owned process
+//! Architecture anchors: `A2.2` (`docs/architecture/A02-02-roles.md`,
+//! Host Supervisor) and `A2.3`
+//! (`docs/architecture/A02-03-modular-architecture.md`, Host physical
+//! lifecycle). Implementation anchors: `I0.1`
+//! (`docs/architecture/I00-01-three-development-contours.md`, R0/R1 layer
+//! boundary), `I1.2`
+//! (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`,
+//! `eliot-host.exe` ownership), and `I1.4`
+//! (`docs/architecture/I01-04-supervision-tree.md`, separate Host-owned process
 //! branches and fail-closed lineage handling).
 //!
 //! This cell owns no Store semantic or canonical authority, Kernel fencing or

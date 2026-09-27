@@ -5,13 +5,13 @@
 //! filesystem, credential, listener, or `SurrealDB` authority.
 //!
 //! Normative anchors:
-//! - `docs/architecture/ELIOT_ARCHITECTURE.md` A12.2 binds identity at the
-//!   harness/installation boundary and gives unknown identity minimum
-//!   privilege with no Material authority.
-//! - `docs/architecture/ELIOT_IMPLEMENTATION.md` I1.8 assigns identity,
-//!   authority, State Fence, idempotency, ordering, and generation checks to
-//!   Kernel; no component may invent semantics, authorize them, and commit
-//!   them alone.
+//! - `docs/architecture/A12-02-principal-session-and-visibility.md` A12.2 binds
+//!   identity at the harness/installation boundary and gives unknown identity
+//!   minimum privilege with no Material authority.
+//! - `docs/architecture/I01-08-exact-ownership-and-call-paths.md` I1.8 assigns
+//!   identity, authority, State Fence, idempotency, ordering, and generation
+//!   checks to Kernel; no component may invent semantics, authorize them, and
+//!   commit them alone.
 //! - `docs/ARCHITECTURE_CONTRACT.md` owns normative-pair precedence and
 //!   identity.
 

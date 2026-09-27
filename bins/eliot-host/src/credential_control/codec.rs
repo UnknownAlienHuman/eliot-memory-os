@@ -1,11 +1,17 @@
 //! Credential marker and envelope wire codec.
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A2.2`,
-//! `A2.3`, `A12.3`, and `A12.6`, plus Decision Anchors
+//! Architecture: `A2.2` (`docs/architecture/A02-02-roles.md`), `A2.3`
+//! (`docs/architecture/A02-03-modular-architecture.md`), `A12.3`
+//! (`docs/architecture/A12-03-one-governed-write-path.md`), and `A12.6`
+//! (`docs/architecture/A12-06-external-model-routes-and-secrets.md`), plus
+//! Decision Anchors
 //! `docs/architecture/A16-01-decision-anchors.md` `ARCH-AUTH-01`, `ARCH-SEC-02`,
-//! and `ARCH-RES-01`. Implementation:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I1.2`, `I1.4`, `I3.12`,
-//! and `I3.15`. Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
+//! and `ARCH-RES-01`. Implementation: `I1.2`
+//! (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`),
+//! `I1.4` (`docs/architecture/I01-04-supervision-tree.md`), `I3.12`
+//! (`docs/architecture/I03-12-credential-lifecycle.md`), and `I3.15`
+//! (`docs/architecture/I03-15-installation-and-update-transaction.md`).
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This child owns only canonical marker/envelope bytes and their integrity
 //! helpers. It owns no credential authority, filesystem/provider effect,

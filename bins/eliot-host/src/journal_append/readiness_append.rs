@@ -1,11 +1,15 @@
 //! Authenticated readiness journal append mechanism.
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A2.2`,
-//! `A2.3`, and `A12.3`, plus Decision Anchors
+//! Architecture: `A2.2` (`docs/architecture/A02-02-roles.md`), `A2.3`
+//! (`docs/architecture/A02-03-modular-architecture.md`), and `A12.3`
+//! (`docs/architecture/A12-03-one-governed-write-path.md`), plus Decision Anchors
 //! `docs/architecture/A16-01-decision-anchors.md` `ARCH-AUTH-01`, `ARCH-SEC-02`,
-//! and `ARCH-RES-01`. Implementation:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I1.8`, `I1.9`, `I2.15`,
-//! and `I2.23`. Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
+//! and `ARCH-RES-01`. Implementation: `I1.8`
+//! (`docs/architecture/I01-08-exact-ownership-and-call-paths.md`), `I1.9`
+//! (`docs/architecture/I01-09-three-registries-three-owners.md`), `I2.15`
+//! (`docs/architecture/I02-15-hot-path-modularity.md`), and `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`).
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This child owns only the extracted mechanism for constructing and appending
 //! already-authorized authenticated readiness journal records. It owns no

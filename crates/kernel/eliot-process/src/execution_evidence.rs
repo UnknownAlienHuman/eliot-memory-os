@@ -1,9 +1,12 @@
 //! Passive execution/cancellation view and evidence DTOs with local validation/accessors.
 //!
-//! Source anchors: Architecture A5.1 in `docs/architecture/ELIOT_ARCHITECTURE.md`
+//! Source anchors: Architecture A5.1 in
+//! `docs/architecture/A05-01-reality-and-observation.md`
 //! (bounded observations have separate capture-route and evaluation-status characteristics;
-//! verifier-backed is not independent); Architecture A10.8 (verification/finish is
-//! proof-bearing); Implementation I10.8.2 in `docs/architecture/ELIOT_IMPLEMENTATION.md`
+//! verifier-backed is not independent); Architecture A10.8
+//! (`docs/architecture/A10-08-verification-and-finish.md`; verification/finish is
+//! proof-bearing); Implementation I10.8.2 in
+//! `docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md`
 //! (one `ProcessExecutor` facade provides `start`, `inspect`, `cancel`, and `reconcile`,
 //! while ownership remains with Kernel, `eliot-testd`, User Broker, or a supervisor); and
 //! Appendix P.12 in `docs/generated/rust-boundary-interfaces.md` (`inspect` ->

@@ -1,10 +1,16 @@
 //! Runtime-restart pending wire codec.
 //!
-//! Architecture: canonical `ELIOT_ARCHITECTURE.md` §A2.3 (Modular architecture),
-//! §A13.6 (Operational Recovery State), and `ARCH-AUTH-01` (Authority explicit,
-//! scoped and fenced). Implementation: canonical `ELIOT_IMPLEMENTATION.md`
-//! §I1.2 (Host ownership), §I2.19 (Layered module cell), and §I2.23
-//! (Capability-family topology and crate extraction decisions).
+//! Architecture: canonical `A2.3`
+//! (`docs/architecture/A02-03-modular-architecture.md`, Modular architecture),
+//! `A13.6` (`docs/architecture/A13-06-operational-recovery-state.md`,
+//! Operational Recovery State), and `ARCH-AUTH-01`
+//! (`docs/architecture/A16-01-decision-anchors.md`, Authority explicit,
+//! scoped and fenced). Implementation: canonical `I1.2`
+//! (`docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md`,
+//! Host ownership), `I2.19` (`docs/architecture/I02-19-layered-module-cell.md`,
+//! Layered module cell), and `I2.23`
+//! (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`,
+//! Capability-family topology and crate extraction decisions).
 //!
 //! This child owns pending identity construction, canonical wire encoding,
 //! bounded decoding, and validation only. The parent retains path resolution,

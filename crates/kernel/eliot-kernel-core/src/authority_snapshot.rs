@@ -4,12 +4,15 @@
 //! binding, the codec port, and the provider-held sealed-byte result. It does
 //! not own dispatch, process execution, persistence, lifecycle, or transport.
 //!
-//! Normative anchors verified in the pinned source are `A2.2` in
-//! `docs/architecture/ELIOT_ARCHITECTURE.md` (uncovered authority is forbidden
-//! for state/effect changes), `A12.2` in that file (identity binds to `Session`,
-//! `WorkScope`, capabilities, visibility, and `Authority Epoch`), and `I1.8` in
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (Kernel verifies authority and
-//! State Fence while recovery stays within the named ownership paths).
+//! Normative anchors are `A2.2` in
+//! `docs/architecture/A02-02-roles.md` (uncovered authority is forbidden
+//! for state/effect changes), `A12.2` in
+//! `docs/architecture/A12-02-principal-session-and-visibility.md` (identity binds
+//! to `Session`, `WorkScope`, capabilities, visibility, and `Authority Epoch`),
+//! and `I1.8` in
+//! `docs/architecture/I01-08-exact-ownership-and-call-paths.md` (Kernel verifies
+//! authority and State Fence while recovery stays within the named ownership
+//! paths).
 
 use eliot_ors::{EpochLineage, OperationIdentity, RecoveryPayload, StateFenceSnapshot};
 use eliot_platform::SecretReference;

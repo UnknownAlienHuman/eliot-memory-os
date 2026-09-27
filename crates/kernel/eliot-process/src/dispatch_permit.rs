@@ -5,13 +5,17 @@
 //! process execution, lifecycle, daemon/host/watchdog/eliotd, canonical-write,
 //! filesystem, network, credential, or `SurrealDB` authority.
 //!
-//! Normative handles in `docs/architecture/ELIOT_ARCHITECTURE.md`: `A2.2`
-//! requires explicit authority for state/effect changes, and `A12.2` binds
-//! principal, session, capabilities, visibility, and Authority Epoch. In
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md`, `I1.8` assigns Kernel
+//! Normative Architecture handles: `A2.2`
+//! (`docs/architecture/A02-02-roles.md`) requires explicit authority for
+//! state/effect changes, and `A12.2`
+//! (`docs/architecture/A12-02-principal-session-and-visibility.md`) binds
+//! principal, session, capabilities, visibility, and Authority Epoch.
+//! Implementation handles: `I1.8`
+//! (`docs/architecture/I01-08-exact-ownership-and-call-paths.md`) assigns Kernel
 //! verification of identity, authority, State Fence, idempotency, ordering,
-//! and generation; `I6.10` limits Kernel to generic authority/fence decisions
-//! and exact continuation permits. Authority and precedence remain governed by
+//! and generation; `I6.10` (`docs/architecture/I06-10-authority-records.md`)
+//! limits Kernel to generic authority/fence decisions and exact continuation
+//! permits. Authority and precedence remain governed by
 //! `docs/ARCHITECTURE_CONTRACT.md`.
 
 use super::{

@@ -19,10 +19,8 @@
 //! - `I2.23` capability-family topology and crate-extraction decisions
 //!   (`docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md`)
 //!
-//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md`,
-//! `docs/architecture/ELIOT_ARCHITECTURE.md`,
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (compatibility entry points;
-//! the governing shards are named per anchor above).
+//! Normative sources: `docs/ARCHITECTURE_CONTRACT.md` and the canonical
+//! sharded fragments named per anchor above.
 //!
 //! This module states physical Job/process lifecycle only: creation,
 //! suspended launch, consuming validation-before-resume, assignment,
