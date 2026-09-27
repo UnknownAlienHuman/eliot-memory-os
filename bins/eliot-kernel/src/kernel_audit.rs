@@ -112,6 +112,67 @@ pub fn authority_epoch_text(epoch: &EpochId) -> String {
     format!("{}:{}", epoch.lineage_id.as_str(), epoch.sequence)
 }
 
+/// Projects the nonsecret owner-launch reference observed at a binding boundary.
+///
+/// Issue #1807/W7. The accepted and the refused handshake must report the same
+/// owner references under the same key, so one projection serves both arms: a
+/// reader compares `owner_launch` across `session_bound` and `session_rejected`
+/// without having to know which arm produced the record. The projection carries
+/// only the descriptor digest, the generation and the authority epoch — never a
+/// path, nonce, or other secret — and its mere presence is not evidence that the
+/// owner was admitted.
+fn owner_launch_reference(launch: &EliotdLaunchDescriptor) -> serde_json::Value {
+    serde_json::json!({
+        "descriptor_sha256": launch.descriptor_sha256,
+        "generation": launch.generation.value(),
+        "authority_epoch": authority_epoch_text(&launch.authority_epoch),
+    })
+}
+
+/// Projects the nonsecret owner process-start-receipt reference observed at a
+/// binding boundary.
+///
+/// Issue #1807/W7. Shares [`owner_launch_reference`]'s one-arm-one-vocabulary
+/// rule. The `expected_process_binding_ref` is the shared
+/// [`process_binding_reference`] tuple the pipe peer and the start receipt must
+/// agree on; a `None` there stays `null` rather than being replaced by a
+/// reconstructed or inferred reference, because the tuple could not be formed.
+fn owner_process_receipt_reference(receipt: &ProcessStartReceipt) -> serde_json::Value {
+    let physical = receipt.identity().physical();
+    let process_binding_ref = process_binding_reference(
+        physical.process_id(),
+        physical.start_time_100ns(),
+        physical.image_path(),
+    );
+    serde_json::json!({
+        "expected_process_binding_ref": process_binding_ref,
+        "operation_id": receipt.operation_id().as_str(),
+        "generation": receipt.accepted_generation().get(),
+        "authority_epoch": authority_epoch_text(receipt.binding().state_fence().authority_epoch()),
+        "validation_revision": receipt.binding().validation_revision(),
+    })
+}
+
+/// Projects the operation identity a boundary actually admitted for one attempt.
+///
+/// Issue #1807/W7. `operation_authorization` is reported as a fact that names
+/// the exact admitted operation, never as a bare boolean: an authorization
+/// claim without the `(attempt, generation, scope, facet)` tuple it authorizes
+/// is not auditable. Used at the dispatch and submission boundaries, which are
+/// the only boundaries that hold a live [`LocalReadAttempt`].
+fn admitted_operation_authorization(
+    attempt: &LocalReadAttempt,
+    status: &'static str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "attempt_id": attempt.attempt_id,
+        "fencing_generation": attempt.fencing_generation,
+        "scope_id": attempt.scope_id,
+        "facet_method": attempt.facet_method,
+    })
+}
+
 /// Resolves the Kernel-owned audit directory below the canonical work root.
 #[must_use]
 pub fn kernel_audit_dir(work_root: &Path) -> PathBuf {
@@ -880,6 +941,23 @@ impl AuditEventDraft {
     }
 
     /// Returns the outbound-dispatch draft handing one pair to the daemon.
+    ///
+    /// Issue #1807/W7. Carries the same three separately-keyed facts the
+    /// binding events carry, so the already-joined session/envelope/attempt
+    /// lineage states which fact was observed at which stage instead of
+    /// leaving the reader to infer a stage from the event name. The facts ride
+    /// the existing lineage fill; this builds no second join mechanism.
+    ///
+    /// Only this boundary assesses the operation. It is reached after the
+    /// envelope passed route admission and a live fencing-generation claim was
+    /// minted for it, so the admitted operation identity is reported verbatim
+    /// through [`admitted_operation_authorization`] rather than as a bare
+    /// boolean. Authenticated transport is observed here by construction of the
+    /// path, not by the presence of a field: dispatch is reachable only through
+    /// a session whose `bind_session` arm already returned `Ok`, so the same
+    /// authentication fact is recorded again at the stage that consumes it. No
+    /// semantic result exists at dispatch, so acceptance stays `not_reached`:
+    /// an admitted operation is not an accepted result.
     #[must_use]
     pub fn dispatch_daemon_claim(
         envelope: &HostRequestEnvelope,
@@ -899,11 +977,34 @@ impl AuditEventDraft {
                 "fencing_generation": attempt.fencing_generation,
                 "scope_id": attempt.scope_id,
                 "facet_method": attempt.facet_method,
+                "transport_authentication": "observed_at_dispatch_boundary",
+                "operation_authorization": admitted_operation_authorization(
+                    attempt,
+                    "admitted_for_dispatch",
+                ),
+                "semantic_result_acceptance": "not_reached",
             }),
         }
     }
 
     /// Returns the daemon-submitted draft for one result body.
+    ///
+    /// Issue #1807/W7. Same three separately-keyed facts, same lineage join as
+    /// the other attempt-leg events, so the chain states at which stage each
+    /// fact was observed. Authenticated transport is observed here: this event
+    /// is emitted only after the presenting session's authority epoch, module
+    /// generation and State Fence were matched against the queued envelope or
+    /// the stored record, and that match is a live check at this call site.
+    ///
+    /// The authorized operation is reported only when the submitting daemon
+    /// actually carried the admitted attempt identity. A submission body
+    /// without an attempt is reported as `not_carried_on_submission` rather
+    /// than having an authorization reconstructed from the stored record, which
+    /// would be inferring a fact from the presence of a field. Acceptance of the
+    /// result is `not_assessed`: this event records a presented, fence-matched
+    /// result body, and the semantic qualification of that body is a separate
+    /// later step, so authentication here can never promote a model result
+    /// (issue #1809 owns candidate/disclosure qualification).
     #[must_use]
     pub fn result_daemon_submitted(
         session: &Session,
@@ -921,6 +1022,10 @@ impl AuditEventDraft {
         if let Some(attempt) = body.attempt.as_ref() {
             lineage.fill_attempt(attempt);
         }
+        let operation_authorization = body.attempt.as_ref().map_or_else(
+            || serde_json::json!("not_carried_on_submission"),
+            |attempt| admitted_operation_authorization(attempt, "admitted_attempt_identity"),
+        );
         Self {
             kind: AuditEventKind::RESULT_DAEMON_SUBMITTED,
             lineage,
@@ -929,6 +1034,9 @@ impl AuditEventDraft {
                 "request_digest": body.request_sha256,
                 "result_digest": body.result_digest,
                 "fence_digest": stored.fence_digest,
+                "transport_authentication": "observed_at_result_boundary",
+                "operation_authorization": operation_authorization,
+                "semantic_result_acceptance": "not_assessed",
             }),
         }
     }
@@ -1123,18 +1231,53 @@ impl AuditEventDraft {
         }
     }
 
-    /// Returns the session-bound draft for one handshake result.
+    /// Returns the session-bound draft for one accepted handshake.
+    ///
+    /// Issue #1807/W7. Reports the same three separately-keyed facts, the same
+    /// `peer_identity_well_formed` observation and the same nonsecret owner
+    /// references under the same keys as [`Self::session_rejected`], so the
+    /// accepted and the refused handshake are directly comparable. A
+    /// declaration that these fields exist is not live execution evidence: each
+    /// value below states what this boundary actually observed, and every fact
+    /// that was not observed is named as such instead of being inferred from
+    /// the presence of an adjacent field.
+    ///
+    /// This arm is reached only after `Session::establish_with_server` returned
+    /// `Ok`, which is exactly where the OS pipe-admitted peer was validated and
+    /// the client's module generation, artifact hash, launch nonce and
+    /// authority epoch were proven equal to the live server policy. So
+    /// authenticated transport is genuinely observed here. The other two facts
+    /// are not, and the `bind_session` contract states that acceptance never
+    /// implies request admission: no operation is authorized at the binding
+    /// boundary, and no semantic result can exist before a request is even
+    /// admitted. `operation_authorization` therefore stays `not_assessed` and
+    /// `semantic_result_acceptance` stays `not_reached`; a successful
+    /// authentication is never allowed to promote a model result (issue #1809
+    /// owns candidate/disclosure qualification).
     #[must_use]
-    pub fn session_bound(session: &Session) -> Self {
+    pub fn session_bound(
+        session: &Session,
+        peer_identity_well_formed: bool,
+        owner_launch: Option<&EliotdLaunchDescriptor>,
+        owner_process_receipt: Option<&ProcessStartReceipt>,
+    ) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.fill_session(session);
         lineage.controller = Some("kernel".to_owned());
+        let owner_launch = owner_launch.map(owner_launch_reference);
+        let owner_process_receipt = owner_process_receipt.map(owner_process_receipt_reference);
         Self {
             kind: AuditEventKind::SESSION_BOUND,
             lineage,
             body: serde_json::json!({
                 "connection_id": session.connection_id,
                 "session_epoch": session.session_epoch,
+                "peer_identity_well_formed": peer_identity_well_formed,
+                "transport_authentication": "observed_at_binding_boundary",
+                "operation_authorization": "not_assessed",
+                "semantic_result_acceptance": "not_reached",
+                "owner_launch": owner_launch,
+                "owner_process_receipt": owner_process_receipt,
             }),
         }
     }
@@ -1162,29 +1305,9 @@ impl AuditEventDraft {
                 &mut lineage.authority_epoch,
                 &authority_epoch_text(&launch.authority_epoch),
             );
-            serde_json::json!({
-                "descriptor_sha256": launch.descriptor_sha256,
-                "generation": launch.generation.value(),
-                "authority_epoch": authority_epoch_text(&launch.authority_epoch),
-            })
+            owner_launch_reference(launch)
         });
-        let owner_process_receipt = owner_process_receipt.map(|receipt| {
-            let physical = receipt.identity().physical();
-            let process_binding_ref = process_binding_reference(
-                physical.process_id(),
-                physical.start_time_100ns(),
-                physical.image_path(),
-            );
-            serde_json::json!({
-                "expected_process_binding_ref": process_binding_ref,
-                "operation_id": receipt.operation_id().as_str(),
-                "generation": receipt.accepted_generation().get(),
-                "authority_epoch": authority_epoch_text(
-                    receipt.binding().state_fence().authority_epoch()
-                ),
-                "validation_revision": receipt.binding().validation_revision(),
-            })
-        });
+        let owner_process_receipt = owner_process_receipt.map(owner_process_receipt_reference);
         Self {
             kind: AuditEventKind::SESSION_REJECTED,
             lineage,

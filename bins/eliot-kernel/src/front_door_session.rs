@@ -733,7 +733,22 @@ impl KernelComposition {
             Ok(handshake) => {
                 observe_front_door_session("kernel.front_door_handshake_accept", "success");
                 // Issue #1837: durable audit evidence for session transition.
-                self.audit_observe(AuditEventDraft::session_bound(&handshake.session));
+                // Issue #1807/W7: the accepted handshake carries the same
+                // three separately-keyed facts and the same nonsecret owner
+                // references the refused one carries. `peer_identity_well_formed`
+                // and the collected owner evidence were already in hand here and
+                // were being dropped, so the accepted leg — the one that actually
+                // matters — stated no transport, operation or semantic-result
+                // relation at all. Acceptance still implies no request
+                // admission, so the draft keeps `operation_authorization` at
+                // `not_assessed` and `semantic_result_acceptance` at
+                // `not_reached`.
+                self.audit_observe(AuditEventDraft::session_bound(
+                    &handshake.session,
+                    peer_identity_well_formed,
+                    audit_evidence.owner_launch.as_ref(),
+                    audit_evidence.owner_process_receipt.as_ref(),
+                ));
             }
             Err(error) => {
                 observe_front_door_session("kernel.front_door_handshake_reject", "fenced");
