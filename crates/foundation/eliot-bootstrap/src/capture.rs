@@ -219,8 +219,8 @@ fn capture_product_identity_digests(
     })
 }
 
-/// Builds one record per product-identity hash: an observed digest carries
-/// its exact capture route, an unobservable artifact stays UNKNOWN.
+/// Builds records for observed product-identity hashes and unobserved I17.3
+/// dimensions. An unobservable value stays UNKNOWN with its exact capture route.
 fn product_identity_records(identity: &ProductIdentityDigests) -> Vec<EvidenceRecord> {
     let observed: [(&str, &Option<String>, &str); 7] = [
         ("build.lockfile", &identity.lockfile, "file:Cargo.lock"),
@@ -262,6 +262,17 @@ fn product_identity_records(identity: &ProductIdentityDigests) -> Vec<EvidenceRe
             ),
         };
         records.push(evidence(key, value, &evidence_ref, evaluation));
+    }
+    for key in [
+        "identity.active_generations_epochs",
+        "identity.verifier_test_manifest_environment",
+        "identity.installation_receipts",
+    ] {
+        records.push(unavailable_status_record(
+            key,
+            "UNKNOWN",
+            EvidenceEvaluation::Unknown,
+        ));
     }
     records
 }

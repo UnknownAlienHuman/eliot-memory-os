@@ -304,7 +304,11 @@ impl NormativePair {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceRecord {
-    /// Stable domain/field identity.
+    /// Stable domain/field identity. Candidate identity coverage uses the
+    /// `identity.active_generations_epochs`,
+    /// `identity.verifier_test_manifest_environment`, and
+    /// `identity.installation_receipts` keys; an unobserved dimension is an
+    /// explicit `UNKNOWN` record rather than an omitted field.
     pub key: String,
     /// Public observed value; secrets are out of scope for this surface.
     pub value: String,
@@ -313,6 +317,12 @@ pub struct EvidenceRecord {
     /// Evaluation status of the observation.
     pub evaluation: EvidenceEvaluation,
 }
+
+const PRODUCT_IDENTITY_COVERAGE_KEYS: [&str; 3] = [
+    "identity.active_generations_epochs",
+    "identity.verifier_test_manifest_environment",
+    "identity.installation_receipts",
+];
 
 /// Evaluation state of one current-system observation.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -456,6 +466,7 @@ impl CurrentSystemEvidenceSnapshot {
             }
         }
         validate_records(&self.records, "snapshot")?;
+        validate_product_identity_coverage(&self.records, "snapshot")?;
         exact_strings(&self.unavailable_domains, "snapshot", "unavailable_domains")?;
         validate_conformance_coverage(&self.domain_coverage, "snapshot")?;
         validate_support_claim_set(&self.support_rows)
@@ -496,6 +507,38 @@ fn validate_records(records: &[EvidenceRecord], source: &str) -> Result<(), Boot
         }
     }
     Ok(())
+}
+
+fn ensure_product_identity_coverage(records: &mut Vec<EvidenceRecord>, source: &str) {
+    let evidence_ref = format!("bootstrap:unobserved-input:{source}");
+    for key in PRODUCT_IDENTITY_COVERAGE_KEYS {
+        if !records.iter().any(|record| record.key.as_str() == key) {
+            records.push(EvidenceRecord {
+                key: key.to_owned(),
+                value: "UNKNOWN".to_owned(),
+                evidence_ref: evidence_ref.clone(),
+                evaluation: EvidenceEvaluation::Unknown,
+            });
+        }
+    }
+}
+
+fn validate_product_identity_coverage(
+    records: &[EvidenceRecord],
+    source: &str,
+) -> Result<(), BootstrapCompileError> {
+    if PRODUCT_IDENTITY_COVERAGE_KEYS
+        .iter()
+        .all(|key| records.iter().any(|record| record.key.as_str() == *key))
+    {
+        return Ok(());
+    }
+
+    Err(BootstrapCompileError::InvalidExactArray {
+        source_id: source.to_owned(),
+        field: "records",
+        detail: "candidate identity is missing a generation, verifier, or installation coverage record",
+    })
 }
 
 fn conformance_error(source: &str, error: &ConformanceContractError) -> BootstrapCompileError {
@@ -614,14 +657,15 @@ impl CurrentSystemEvidenceCompiler {
             &source_id,
             "unavailable_domains",
         )?;
-        validate_records(&input.records, &source_id)?;
+        let mut records = input.records;
+        ensure_product_identity_coverage(&mut records, &format!("{source_id}@{revision}"));
+        validate_records(&records, &source_id)?;
         let domain_coverage = canonicalize_domain_coverage(input.domain_coverage)
             .map_err(|error| conformance_error(&source_id, &error))?;
         let support_rows = canonicalize_support_claim_set(input.support_rows, &domain_coverage)
             .map_err(|error| conformance_error(&source_id, &error))?;
         enforce_support_ceiling(&support_rows, &domain_coverage, &source_id)?;
 
-        let mut records = input.records;
         records.sort_by(|left, right| left.key.cmp(&right.key));
         let mut unavailable_domains = input.unavailable_domains;
         unavailable_domains.sort();
