@@ -18,7 +18,11 @@
 //!   non-empty affected set, and reports a terminal `Revoked` influence
 //!   state with its invalidation reason;
 //! * closures arrive in strictly increasing `closure_id` order, so the same
-//!   evidence always suppresses the same grants in the same order.
+//!   evidence always suppresses the same grants in the same order;
+//! * no closure identity repeats with changed content: reusing an
+//!   idempotency key with different canonical content is
+//!   [`RevocationHistoryError::IdentityConflict`] and applies nothing
+//!   (I5.27).
 //!
 //! An explicitly empty closure set is a complete denominator (the source
 //! attests zero revocations at the stated revision), never a default. An
@@ -55,6 +59,7 @@ use std::error::Error;
 use std::fmt;
 
 use eliot_contracts::StateFence;
+use eliot_influence::RevocationBounds;
 use eliot_security_contracts::{InfluenceDependencyClosure, InfluenceState, RevocationReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -99,6 +104,13 @@ impl RevocationHistoryEvidence {
     /// `GrantGraph::admit_origin_bound_closure`, which runs before any
     /// suppression is derived.
     ///
+    /// One closure identity presented twice with changed content is
+    /// [`RevocationHistoryError::IdentityConflict`]: the committed result
+    /// is authoritative and nothing is applied. An identical repeat still
+    /// violates the strictly-increasing shape and refuses as unknown, and
+    /// an out-of-order identity refuses as unknown; the refusal set is
+    /// unchanged, only the conflict cause is named.
+    ///
     /// Missing evidence is expressed by passing `None` at the restore
     /// boundary (see [`RevocationHistoryError::MissingHistory`]); this
     /// method validates a supplied input only.
@@ -111,20 +123,69 @@ impl RevocationHistoryEvidence {
         if self.source_revision == 0 {
             return Err(RevocationHistoryError::StaleHistory);
         }
-        let mut previous: Option<&str> = None;
+        let mut previous: Option<&InfluenceDependencyClosure> = None;
         for closure in &self.closures {
             if let Some(previous) = previous
-                && previous >= closure.closure_id.as_str()
+                && previous.closure_id.as_str() >= closure.closure_id.as_str()
             {
+                if previous.closure_id == closure.closure_id
+                    && let Some(field) = conflicted_closure_field(previous, closure)
+                {
+                    return Err(RevocationHistoryError::IdentityConflict(
+                        ClosureIdentityConflict {
+                            closure_id: closure.closure_id.clone(),
+                            field,
+                        },
+                    ));
+                }
                 return Err(RevocationHistoryError::UnknownHistory);
             }
-            previous = Some(closure.closure_id.as_str());
+            previous = Some(closure);
         }
         self.closures
             .iter()
             .map(|closure| ValidatedRevocationClosure::require_current(closure, self))
             .collect()
     }
+}
+
+/// First canonical field on which two closures sharing one `closure_id`
+/// disagree, if any.
+///
+/// Dependent order is spelling, not content: validation absorbs the
+/// dependents into a set and every downstream decision is
+/// order-insensitive, so only the sorted membership is compared.
+/// Anything else — origin, reason, state, fence, or revision — is
+/// committed content under I5.27, and a difference is an identity
+/// conflict, never a merge.
+fn conflicted_closure_field(
+    previous: &InfluenceDependencyClosure,
+    closure: &InfluenceDependencyClosure,
+) -> Option<&'static str> {
+    if previous.root_ref != closure.root_ref {
+        return Some("closure.root_ref");
+    }
+    let mut previous_dependents: Vec<&str> =
+        previous.dependent_refs.iter().map(String::as_str).collect();
+    let mut dependents: Vec<&str> = closure.dependent_refs.iter().map(String::as_str).collect();
+    previous_dependents.sort_unstable();
+    dependents.sort_unstable();
+    if previous_dependents != dependents {
+        return Some("closure.dependent_refs");
+    }
+    if previous.invalidation_reason != closure.invalidation_reason {
+        return Some("closure.invalidation_reason");
+    }
+    if previous.current_influence != closure.current_influence {
+        return Some("closure.current_influence");
+    }
+    if previous.state_fence != closure.state_fence {
+        return Some("closure.state_fence");
+    }
+    if previous.revision != closure.revision {
+        return Some("closure.revision");
+    }
+    None
 }
 
 /// One CURRENT revocation closure with its exact declared reference set.
@@ -294,6 +355,33 @@ impl fmt::Display for OriginTargetMismatch {
     }
 }
 
+/// One closure identity presented twice with changed committed content.
+///
+/// I5.27: idempotency is defined over canonical bytes, so reusing an
+/// idempotency key with different canonical content returns
+/// `IDENTITY_CONFLICT` and performs no transition. The committed result
+/// is authoritative; the second presentation is refused, never merged
+/// and never re-applied under the same identity. The `field` coordinate
+/// names the first canonical field that disagrees, so the refusal stays
+/// bounded and redacted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosureIdentityConflict {
+    /// Stable closure identity presented twice with different content.
+    pub closure_id: String,
+    /// First canonical closure field that disagrees.
+    pub field: &'static str,
+}
+
+impl fmt::Display for ClosureIdentityConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "revocation closure {} reuses its identity with changed content at {}",
+            self.closure_id, self.field
+        )
+    }
+}
+
 /// One committed closure whose affected membership is proven to lie inside
 /// the denominator of exactly one declared [`RevocationOrigin`].
 ///
@@ -317,6 +405,11 @@ pub struct AdmittedRevocationClosure {
     pub denominator: RevocationDenominator,
     /// The closure's own declared affected references, unfiltered.
     pub committed_members: BTreeSet<String>,
+    /// Declared traversal bounds the expected denominator was proven
+    /// complete under. The completeness claim above is meaningless
+    /// without them: a denominator proven whole under wider bounds is a
+    /// different proof.
+    pub bounds: RevocationBounds,
 }
 
 impl AdmittedRevocationClosure {
@@ -327,6 +420,7 @@ impl AdmittedRevocationClosure {
         closure: &ValidatedRevocationClosure,
         origin: RevocationOrigin,
         denominator: RevocationDenominator,
+        bounds: RevocationBounds,
     ) -> Self {
         Self {
             closure_id: closure.closure_id.clone(),
@@ -334,6 +428,7 @@ impl AdmittedRevocationClosure {
             reason: closure.reason,
             denominator,
             committed_members: closure.affected.clone(),
+            bounds,
         }
     }
 }
@@ -385,21 +480,33 @@ pub struct GrantRestoreOutcome {
 /// revision) and unknown inputs (invalid, unordered, or non-revoked
 /// closures) refuse without restoring anything. An origin that resolves to
 /// no entity of the bound graph, or to two, refuses as unknown evidence
-/// rather than guessing a revocation kind from a reference's spelling.
+/// rather than guessing a revocation kind from a reference's spelling, as
+/// does a dependent reference that resolves to nothing in this graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevocationHistoryError {
     /// No revocation-history evidence was supplied.
     MissingHistory,
     /// The evidence fence or revision is not current for this restore.
     StaleHistory,
-    /// A closure is invalid, unordered, or not terminal revocation evidence,
-    /// or its declared origin resolves to no entity of the bound graph, or to
-    /// two.
+    /// A closure is invalid, unordered, or not terminal revocation evidence;
+    /// its declared origin resolves to no entity of the bound graph, or to
+    /// two; or a dependent reference it names resolves to nothing in this
+    /// graph. A lookup miss proves nothing about another graph: an
+    /// unresolvable reference in this graph's committed closure is unknown
+    /// evidence, never a no-op.
     UnknownHistory,
     /// A committed closure names an in-graph target that the one declared
     /// revocation origin cannot reach. Distinct from `TargetDrift`, which
     /// reports a reachable target the closure omitted.
     OriginTargetMismatch(OriginTargetMismatch),
+    /// One closure identity was presented twice in a single evidence input
+    /// with different committed content: changed origin, affected set,
+    /// reason, state, fence, or revision. The committed result is
+    /// authoritative and nothing is applied. Exact replay across restores
+    /// returns the same suppression result by construction; comparing one
+    /// restore against a previous one needs the durable history owner,
+    /// which this pure crate is not.
+    IdentityConflict(ClosureIdentityConflict),
     /// The bounded evaluator rejected a typed request, graph, fence, or
     /// continuation before any suppression could be derived.
     BoundedRevocation(eliot_influence::InfluenceError),
@@ -417,10 +524,13 @@ impl fmt::Display for RevocationHistoryError {
                 "authority revocation history is stale: fence, source revision, or closure revision drifted",
             ),
             Self::UnknownHistory => formatter.write_str(
-                "authority revocation history is unknown: a closure is invalid, unordered, not a terminal revocation, or declares an origin that does not resolve to exactly one entity of this graph",
+                "authority revocation history is unknown: a closure is invalid, unordered, not a terminal revocation, declares an origin that does not resolve to exactly one entity of this graph, or names a dependent reference that resolves to no entity of this graph",
             ),
             Self::OriginTargetMismatch(mismatch) => {
                 write!(formatter, "revocation origin target mismatch: {mismatch}")
+            }
+            Self::IdentityConflict(conflict) => {
+                write!(formatter, "revocation identity conflict: {conflict}")
             }
             Self::BoundedRevocation(error) => {
                 write!(formatter, "bounded revocation evidence refused: {error}")

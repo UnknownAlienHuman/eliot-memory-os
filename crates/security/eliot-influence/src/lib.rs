@@ -3266,9 +3266,9 @@ pub enum InfluenceError {
     /// authority root that any grant in it belongs to, while the closure still
     /// names in-graph grants that suppression would revoke. An in-graph grant
     /// origin and an authority-root origin both stay admissible, and a closure
-    /// naming no in-graph grant still refuses nothing. Before this cause
-    /// existed that input restored unrecheckable; it now refuses, which is
-    /// strictly stricter and is the A0.3 hard boundary "restoration of revoked
+    /// naming no in-graph grant refuses as unknown revocation-history evidence.
+    /// Before this cause existed that input restored unrecheckable; it now refuses,
+    /// which is strictly stricter and is the A0.3 hard boundary "restoration of revoked
     /// influence after recovery" refused by cause.
     ///
     /// The payload is a bounded, redacted static field coordinate.
