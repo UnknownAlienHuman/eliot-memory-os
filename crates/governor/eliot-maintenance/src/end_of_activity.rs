@@ -1,8 +1,8 @@
 //! Versioned end-of-activity maintenance assessment contract.
 //!
-//! This module describes evidence and an assessment outcome. It does not read
-//! persistence owners, evaluate maintenance policy, schedule a wake, or perform
-//! shutdown.
+//! This module describes evidence, an assessment outcome, and the deterministic
+//! decision core. It does not read persistence owners, schedule a wake, or
+//! perform shutdown.
 
 use eliot_contracts::{
     ContractIdentity, ContractVersion, DecisionId, Receipt, RequestId, StateFence,
@@ -479,6 +479,134 @@ impl EndOfActivityMaintenanceAssessment {
         self.request.validate()?;
         self.outcome.validate_for(&self.request)
     }
+}
+
+/// Deterministic decision core of one end-of-activity assessment: the I14.22
+/// decision, the shutdown disposition, and its explicit reason. The owning
+/// evaluator attaches this core to the outcome receipts the persistence
+/// owners issue; the core itself performs no I/O and acquires no lease.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndOfActivityAssessment {
+    /// I14.22 deterministic decision.
+    pub decision: EndOfActivityAssessmentDecision,
+    /// Whether shutdown may continue after this assessment.
+    pub shutdown_may_proceed: bool,
+    /// Explicit reason for the shutdown disposition.
+    pub shutdown_reason: String,
+}
+
+/// Deterministic end-of-activity maintenance assessment (I14.22, MAINT-1..3).
+///
+/// Runs before drain admission when the final observable-use obligation is
+/// about to release its lease. The assessment does not keep ELIOT alive
+/// merely because data exists: only an admitted bounded job or active repair
+/// acquires a new `RuntimeLease`; otherwise work is scheduled, suggested
+/// once or deferred and drain continues. User-session-required maintenance
+/// without an authenticated session defers instead of retaining desktop
+/// credentials or faking execution.
+///
+/// Decision precedence, first match wins:
+///
+/// 1. an admitted bounded job or active repair is running: `START_BOUNDED_JOB`
+///    and shutdown waits for its release;
+/// 2. user-session-required work exists but no authenticated session is
+///    available: `DEFER` with shutdown proceeding and no credential
+///    retention;
+/// 3. user-session-required work exists with a session available but no
+///    admitted job: `SUGGEST_ONCE`, preserving one recommendation while
+///    shutdown proceeds (admission itself stays with the trigger path);
+/// 4. any source has unknown coverage: `DEFER` with shutdown proceeding —
+///    the assessment alone never blocks drain on suspicion, and the lease
+///    census remains the drain gate;
+/// 5. any pending observation, feedback, projection, receipt, debt or due
+///    policy record exists without an admitted job: `DEFER` with shutdown
+///    proceeding;
+/// 6. otherwise no work is admitted: `NO_ACTION` with shutdown proceeding.
+///
+/// Closed sessions, attempts, jobs and effects are completed-activity
+/// evidence, not work, and never change the decision. Eligible service-safe
+/// routes alone are capacity, not work.
+///
+/// # Errors
+///
+/// Returns the request validation error when the evidence request is
+/// malformed. A malformed request assesses nothing.
+pub fn assess_end_of_activity(
+    request: &EndOfActivityMaintenanceAssessmentRequest,
+    user_session_available: bool,
+    bounded_job_admitted: bool,
+) -> Result<EndOfActivityAssessment, EndOfActivityMaintenanceAssessmentValidationError> {
+    request.validate()?;
+    if bounded_job_admitted {
+        return Ok(EndOfActivityAssessment {
+            decision: EndOfActivityAssessmentDecision::StartBoundedJob,
+            shutdown_may_proceed: false,
+            shutdown_reason:
+                "admitted bounded job holds a runtime lease; drain waits for its release".to_owned(),
+        });
+    }
+    if !request.user_session_required_work.records.is_empty() {
+        if user_session_available {
+            return Ok(EndOfActivityAssessment {
+                decision: EndOfActivityAssessmentDecision::SuggestOnce,
+                shutdown_may_proceed: true,
+                shutdown_reason:
+                    "user-session-required maintenance suggested once; drain continues".to_owned(),
+            });
+        }
+        return Ok(EndOfActivityAssessment {
+            decision: EndOfActivityAssessmentDecision::Defer,
+            shutdown_may_proceed: true,
+            shutdown_reason: "user-session-required maintenance deferred without retaining credentials; drain continues"
+                .to_owned(),
+        });
+    }
+    if [
+        &request.activation_scope_set.coverage,
+        &request.closed_sessions.coverage,
+        &request.closed_attempts.coverage,
+        &request.closed_jobs.coverage,
+        &request.closed_effects.coverage,
+        &request.pending_observations.coverage,
+        &request.pending_feedback.coverage,
+        &request.pending_projections.coverage,
+        &request.pending_receipts.coverage,
+        &request.maintenance_debt.coverage,
+        &request.due_policies.coverage,
+        &request.eligible_service_safe_routes.coverage,
+        &request.user_session_required_work.coverage,
+    ]
+    .contains(&&AssessmentSourceCoverage::Unknown)
+    {
+        return Ok(EndOfActivityAssessment {
+            decision: EndOfActivityAssessmentDecision::Defer,
+            shutdown_may_proceed: true,
+            shutdown_reason:
+                "unknown source coverage preserved for a later eligible opportunity; drain continues"
+                    .to_owned(),
+        });
+    }
+    if !request.pending_observations.records.is_empty()
+        || !request.pending_feedback.records.is_empty()
+        || !request.pending_projections.records.is_empty()
+        || !request.pending_receipts.records.is_empty()
+        || !request.maintenance_debt.records.is_empty()
+        || !request.due_policies.records.is_empty()
+    {
+        return Ok(EndOfActivityAssessment {
+            decision: EndOfActivityAssessmentDecision::Defer,
+            shutdown_may_proceed: true,
+            shutdown_reason:
+                "unadmitted work preserved for a later eligible opportunity; drain continues"
+                    .to_owned(),
+        });
+    }
+    Ok(EndOfActivityAssessment {
+        decision: EndOfActivityAssessmentDecision::NoAction,
+        shutdown_may_proceed: true,
+        shutdown_reason: "no admitted work; drain continues".to_owned(),
+    })
 }
 
 /// Fail-closed structural validation failures for the assessment contract.

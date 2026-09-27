@@ -31,11 +31,11 @@ pub use end_of_activity::{
     ActivationScopeReference, AssessmentRecordReference, AssessmentSourceCoverage,
     AssessmentSourceGap, AssessmentSourceRecord, AssessmentSourceSnapshot, ClosedActivityReference,
     END_OF_ACTIVITY_ASSESSMENT_CONTRACT_NAME, END_OF_ACTIVITY_ASSESSMENT_VERSION,
-    EligibleServiceSafeRoute, EndOfActivityAssessmentDecision, EndOfActivityMaintenanceAssessment,
-    EndOfActivityMaintenanceAssessmentOutcome, EndOfActivityMaintenanceAssessmentRequest,
-    EndOfActivityMaintenanceAssessmentValidationError, MaintenanceDebtReference,
-    MaintenanceDuePolicyReference, UserSessionRequiredWorkReference,
-    end_of_activity_assessment_contract_identity,
+    EligibleServiceSafeRoute, EndOfActivityAssessment, EndOfActivityAssessmentDecision,
+    EndOfActivityMaintenanceAssessment, EndOfActivityMaintenanceAssessmentOutcome,
+    EndOfActivityMaintenanceAssessmentRequest, EndOfActivityMaintenanceAssessmentValidationError,
+    MaintenanceDebtReference, MaintenanceDuePolicyReference, UserSessionRequiredWorkReference,
+    assess_end_of_activity, end_of_activity_assessment_contract_identity,
 };
 
 pub use improvement_admission::{
