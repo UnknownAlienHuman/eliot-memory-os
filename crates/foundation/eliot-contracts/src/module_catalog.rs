@@ -33,7 +33,9 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::cell_effective_manifest::state_replacement_compatible;
+use crate::cell_effective_manifest::{
+    development_classification_detail, is_development_classified, state_replacement_compatible,
+};
 use crate::{
     CapabilityCellId, ContractError, ContractVersion, IterationLane, ModuleExecutionContour,
     ModuleReplacementClass, ModuleRuntimeClass, ModuleStateClass, SourceCrateRef,
@@ -268,33 +270,6 @@ impl fmt::Display for ModuleCatalogError {
 
 impl std::error::Error for ModuleCatalogError {}
 
-/// Returns whether the cell carries an explicit development classification.
-///
-/// `development_only` and `development_tool` are the `I2.10` classifications
-/// for generators, admission utilities, fuzzers, simulations, benchmarks, and
-/// migration tooling that is never required by the production runtime. Either
-/// spelling alone is sufficient: a fuzzer needs OS access and keeps the
-/// `native_process` contour while still declaring `development_tool`.
-fn is_development_classified(contour: ModuleExecutionContour, class: ModuleRuntimeClass) -> bool {
-    contour == ModuleExecutionContour::DevelopmentOnly
-        || class == ModuleRuntimeClass::DevelopmentTool
-}
-
-/// Names the development classification a record carries, for the refusal
-/// detail.
-fn development_classification_detail(record: &ModuleCatalogRecord) -> String {
-    let contour = record.execution_contour == ModuleExecutionContour::DevelopmentOnly;
-    let class = record.runtime_class == ModuleRuntimeClass::DevelopmentTool;
-    match (contour, class) {
-        (true, true) => {
-            "the development_only contour and the development_tool runtime class".to_owned()
-        }
-        (true, false) => "the development_only contour".to_owned(),
-        (false, true) => "the development_tool runtime class".to_owned(),
-        (false, false) => "neither development classification".to_owned(),
-    }
-}
-
 /// Validates the recorded execution-selection decision and the coherence of
 /// the five classifications of one record.
 fn validate_record(record: &ModuleCatalogRecord) -> Result<(), ModuleCatalogError> {
@@ -322,7 +297,10 @@ fn validate_record(record: &ModuleCatalogRecord) -> Result<(), ModuleCatalogErro
         return Err(
             ModuleCatalogError::DevelopmentClassifiedProductionRequired {
                 cell,
-                detail: development_classification_detail(record),
+                detail: development_classification_detail(
+                    record.execution_contour,
+                    record.runtime_class,
+                ),
             },
         );
     }
