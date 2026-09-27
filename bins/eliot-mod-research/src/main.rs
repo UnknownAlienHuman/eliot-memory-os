@@ -32,8 +32,9 @@ use eliot_mod_research::evidence::{
 use eliot_mod_research::execution::ProviderBridge;
 use eliot_mod_research::kernel_client::{ResearchKernelClient, ResearchKernelClientError};
 use eliot_mod_research::{
-    BridgeIdentity, RESEARCH_SOURCE_UNAVAILABLE, RawProviderEvidence, ResearchDispatchAuthority,
-    SubmissionRecord, compose_admitted, project_admitted_inquiry,
+    AcquisitionCoverageDegradation, BridgeIdentity, RESEARCH_SOURCE_UNAVAILABLE,
+    RawProviderEvidence, ResearchDispatchAuthority, SubmissionRecord,
+    acquisition_coverage_degradation, compose_admitted, project_admitted_inquiry,
 };
 use eliot_process::{Generation, OperationId};
 use eliot_process_executor::WindowsProcessExecutor;
@@ -67,14 +68,18 @@ fn main() {
             let _ = writeln!(io::stderr(), "{}: {detail}", admission_required_message());
             std::process::exit(EXIT_KERNEL_ADMISSION_REQUIRED);
         }
-        Err(Failure::Degraded(receipt)) => {
+        Err(Failure::Degraded(degradation, receipt)) => {
             // A provider failure is not a Researcher semantic failure and not a
             // fabricated empty result: it is a typed coverage gap carrying the
-            // exact stable code plus the evidence that was retained.
+            // exact stable code, the typed coverage-gap kind the crate's own
+            // conversion produced, and the evidence that was retained. The exit
+            // code is a distinct degraded disposition, so nothing that reads
+            // this line can mistake the run for a process failure.
             let _ = writeln!(
                 io::stderr(),
-                "{RESEARCH_SOURCE_UNAVAILABLE}: reason={} receipt={receipt}",
-                receipt.reason_code
+                "{RESEARCH_SOURCE_UNAVAILABLE}: reason={} coverage_gap={:?} receipt={receipt}",
+                receipt.reason_code,
+                degradation.coverage_gap,
             );
             std::process::exit(EXIT_OPERATION_DEGRADED);
         }
@@ -92,7 +97,16 @@ enum Failure {
     /// process's own dispatch.
     NoAdmission(String),
     /// The operation ran and degraded acquisition coverage only.
-    Degraded(Box<ProviderExecutionReceipt>),
+    ///
+    /// The typed coverage degradation is carried beside the receipt rather than
+    /// being implied by this variant's name, so a degraded exit cannot be
+    /// produced without the classification that says which acquisition gap
+    /// occurred — and, per `A13.11`, no Kernel, Governor or independent work
+    /// state is represented here to be touched.
+    Degraded(
+        AcquisitionCoverageDegradation,
+        Box<ProviderExecutionReceipt>,
+    ),
 }
 
 /// Runs the one bounded operation.
@@ -184,13 +198,19 @@ fn run() -> Result<String, Failure> {
     // that never reached the executor is still an acquisition gap, never a
     // Researcher semantic failure.
     //
+    // The conversion from that retained classification into the typed
+    // acquisition-coverage degradation is the crate's one named conversion, not
+    // an arm of this function. The outcome and the reason code the receipt
+    // carries therefore cannot be a second, privately chosen classification of
+    // the same failure, and the degraded disposition this run exits with is
+    // built from that same record.
+    let failure = bridge.last_failure();
+    let degradation = acquisition_coverage_degradation(failure);
+    //
     // A non-success terminal state is reconciled against the owner that holds
     // the operation before it is reported, so the receipt distinguishes an
     // owner-attested classification from a local guess.
-    let failure = bridge.last_failure();
-    let outcome = failure.map_or(eliot_mod_research::ProviderOutcome::Unknown, |terminal| {
-        terminal.outcome
-    });
+    let outcome = degradation.outcome;
     let reconciliation =
         reconcile_with_owner(&client, &admitted, bridge.last_cancellation(), outcome);
     let no_effect_proven = bridge
@@ -202,9 +222,7 @@ fn run() -> Result<String, Failure> {
         // owner did not confirm is not the same fact as a plain unknown.
         eliot_kernel_service::REASON_CANCELLATION_UNCONFIRMED
     } else {
-        failure.map_or(eliot_kernel_service::REASON_UNKNOWN_OUTCOME, |terminal| {
-            terminal.reason_code
-        })
+        degradation.reason_code
     };
     let receipt = terminal_receipt(
         &admitted,
@@ -226,7 +244,7 @@ fn run() -> Result<String, Failure> {
         &receipt,
         bridge.last_failure(),
     );
-    Err(Failure::Degraded(Box::new(receipt)))
+    Err(Failure::Degraded(degradation, Box::new(receipt)))
 }
 
 /// Reports the `R6` inquiry-governance view of the operation this run performed.
