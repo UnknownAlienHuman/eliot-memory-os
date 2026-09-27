@@ -2181,6 +2181,7 @@ dependencies = [
  "eliot-process",
  "eliot-process-executor",
  "eliot-verifier",
+ "serde",
  "serde_json",
  "thiserror",
 ]
