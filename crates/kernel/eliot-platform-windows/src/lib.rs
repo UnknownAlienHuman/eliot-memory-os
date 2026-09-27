@@ -113,6 +113,7 @@ mod secret_store;
 mod service_registration;
 mod supervision_authority_key;
 mod tcp_listener_owner;
+mod terminal_containment;
 mod user_owned_leases;
 
 use crate::service_registration::{exact_path_text, utf16_text};
@@ -288,6 +289,14 @@ pub use supervision_authority_key::{
 };
 pub use tcp_listener_owner::{
     TcpListenerOwnerError, TcpListenerOwnerObservation, observe_loopback_tcp_listener_owner,
+};
+pub use terminal_containment::{
+    TERMINAL_CONTAINMENT_DETAIL_MAX_BYTES, TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES,
+    TERMINAL_CONTAINMENT_RECORD_BYTES, TERMINAL_CONTAINMENT_RECORD_VERSION,
+    TERMINAL_CONTAINMENT_SITE_MAX_BYTES, TerminalContainmentError, TerminalContainmentReadback,
+    TerminalContainmentRecord, TerminalContainmentSink, TerminalContainmentUnresolved,
+    TerminalSubmission, fail_stop_with_terminal_containment, prepare_terminal_containment,
+    submit_terminal_containment, validate_terminal_containment_readback,
 };
 pub(crate) use user_owned_leases::current_process_sid;
 #[cfg(any(test, feature = "test-support"))]
