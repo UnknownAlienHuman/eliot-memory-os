@@ -8887,6 +8887,18 @@ impl HostComposition {
                     "dead Kernel branch has no durable Kernel record".to_owned(),
                 )
             })?;
+            // I1.9 A1: a Host-managed dependency (Kernel) restarts only when
+            // the valid journal record binds this relaunch's approved
+            // artifact. The durable record carries the artifact approved at
+            // activation; a mismatch refuses the automatic restart as manual
+            // recovery instead of relaunching an unapproved image. The
+            // snapshot above already fails a corrupt journal.
+            if current.approved_artifact_hash != *kernel_artifact {
+                return Err(HostError::RecoveryRequired(
+                    "dead Kernel branch has no durable record binding the approved artifact; manual recovery required"
+                        .to_owned(),
+                ));
+            }
             DurableKernelActivationDriver::resume(&self.journal, current)
                 .fail("kernel-process-observed-dead")?;
         }
