@@ -27,6 +27,11 @@
 //! * the declared event interval must describe exactly the exported events;
 //! * every store write receipt must validate and be compatible with the same
 //!   state fence;
+//! * every source event and projection record validates its own recorded
+//!   checksum against its payload before it is destructured, so a source whose
+//!   retained checksum does not describe its payload is refused instead of
+//!   being re-digested into an internally consistent package that no longer
+//!   preserves the source's integrity claim;
 //! * `eliot-ecxf` then re-proves that every revision and ordering head carries
 //!   that same `state_fence`, that every purge-ledger entry does too, and that
 //!   the fence reachability set equals the residency keys of the exported
@@ -34,10 +39,21 @@
 //!
 //! `layout` materialises the whole package in memory and re-validates the
 //! archive before returning, so every one of those refusals happens before any
-//! filesystem write. Publication is then a single atomic directory rename from
-//! a sibling staging directory: a mid-way failure removes the staging
-//! directory and the destination path never exists, so a partially written
-//! package is not observable (issue #1871, work item W2).
+//! filesystem write. Publication then claims a sibling staging area
+//! exclusively — an exclusive create plus an owner record naming this export
+//! identity and this attempt incarnation — writes the rendered package inside
+//! the claim, and renames the claimed package root onto the destination. The
+//! claim, not the directory name, is the ownership boundary: an occupied or
+//! concurrently claimed path is refused and left untouched, and cleanup removes
+//! only the tree whose owner record still names this invocation (issue #1871,
+//! work item W2).
+//!
+//! The destination comes into existence at that rename, which precedes the
+//! manifest/integrity readback, so publication is not all-or-nothing. A
+//! readback failure after the rename is reported as the typed
+//! [`BackupError::PublishReconciliationRequired`] outcome carrying the export
+//! identity and the published package path, never as proof that nothing was
+//! published.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -222,11 +238,18 @@ pub struct EcxfExportReport {
 /// [`eliot_ecxf::EcxfArchive::build`], renders the package through
 /// [`eliot_ecxf::EcxfArchive::layout`] and publishes the result as one unit.
 ///
-/// Failure is total. Every coherence refusal, every digest mismatch and every
-/// filesystem error happens before the destination path exists, and the
-/// destination is created only by the final atomic rename of a fully written
-/// staging directory, so a failed export never leaves a partially written
-/// package observable.
+/// Every coherence refusal, every source checksum mismatch and every staging
+/// ownership refusal happens before the destination path exists, and the
+/// destination is created only by the final atomic rename of a fully written,
+/// exclusively claimed staging tree, so a failed export never leaves a
+/// partially written package observable.
+///
+/// Publication is not total-failure-only. The manifest and integrity readback
+/// runs after that rename, so a failure there is reported as the typed
+/// [`BackupError::PublishReconciliationRequired`] outcome, which carries this
+/// export identity and the published package path. The caller therefore always
+/// learns whether a package exists; an error is never read as proof that
+/// nothing was published.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear export path: read, prove the fence, build, render, publish, report"
@@ -300,14 +323,21 @@ pub fn export_ecxf_package(
     let files = archive
         .layout(&eliot_ecxf::IdentitySectionCodec)
         .map_err(ecxf_error)?;
-    publish_package(&files, out_dir)?;
-    let manifest_sha256 = readback_digest(out_dir, "manifest.json", &files)?;
+    publish_package(&files, out_dir, &request.export_id)?;
+    // The rename has already made the destination exist, so every refusal from
+    // here on is a publication/reconciliation outcome carrying the published
+    // identity and path, never a claim that nothing was written.
+    let manifest_sha256 = readback_digest(out_dir, "manifest.json", &files, &request.export_id)?;
     if manifest_sha256 != archive.integrity.manifest_sha256 {
-        return Err(BackupError::IntegrityMismatch {
-            subject: "published ECXF manifest".to_owned(),
+        return Err(BackupError::PublishReconciliationRequired {
+            export_id: request.export_id.clone(),
+            package_path: out_dir.display().to_string(),
+            reason:
+                "the published manifest digest disagrees with the archive integrity attestation"
+                    .to_owned(),
         });
     }
-    readback_digest(out_dir, "integrity.json", &files)?;
+    readback_digest(out_dir, "integrity.json", &files, &request.export_id)?;
     Ok(EcxfExportReport {
         export_id: request.export_id.clone(),
         format: eliot_ecxf::FORMAT_VERSION.to_owned(),
@@ -398,6 +428,15 @@ const fn purge_export_state(ledger_entries: usize) -> eliot_ecxf::PurgeExportSta
 /// The record type, record identity and payload cross unchanged; the emitted
 /// record digest is recomputed by `eliot-ecxf` over the same payload, so the
 /// two record types cannot drift apart.
+///
+/// The source's own recorded checksum is validated first, against the source's
+/// own payload, by the existing [`CanonicalRecord::validate`]. Recomputing a
+/// digest over the payload is not a substitute for that: a source record whose
+/// payload was replaced while its checksum was retained would otherwise leave
+/// this function with a freshly valid digest and an export that is internally
+/// consistent while no longer carrying the source's integrity claim. The
+/// refusal happens here, before any filesystem work, and the record type, id
+/// and payload are projected only after the source claim is proven.
 fn canonical_section(
     kind: eliot_ecxf::SectionKind,
     records: Vec<CanonicalRecord>,
@@ -405,6 +444,7 @@ fn canonical_section(
     let records = records
         .into_iter()
         .map(|record| {
+            record.validate()?;
             eliot_ecxf::EcxfRecord::new(record.record_type, record.record_id, record.payload)
                 .map_err(ecxf_error)
         })
@@ -440,46 +480,231 @@ fn section_records(archive: &eliot_ecxf::EcxfArchive, kind: eliot_ecxf::SectionK
 
 /// Publishes the rendered package as one unit.
 ///
-/// The complete package is written into a sibling staging directory and only
-/// then renamed onto `out_dir`. Renaming a fully written directory is the single
-/// observable transition, so the destination path never names a partial
-/// package: any earlier failure removes the staging directory and leaves no
-/// package at all. An existing destination refuses instead of being merged or
-/// overwritten, which keeps the published package exactly the archive this call
-/// produced.
-fn publish_package(files: &BTreeMap<String, Vec<u8>>, out_dir: &Path) -> Result<(), BackupError> {
+/// The complete package is written into a staging area this call claimed
+/// exclusively, and only the package root inside that claim is renamed onto
+/// `out_dir`. Renaming a fully written directory is the single observable
+/// transition, so the destination path never names a partial package.
+///
+/// Ownership of the staging area is the exclusive create plus the owner record
+/// [`StagingClaim::acquire`] writes into it, bound to this export identity and
+/// this attempt incarnation. An occupied path is refused and left untouched —
+/// never erased because its name matches — and cleanup removes only a tree
+/// whose owner record still names this invocation, so a concurrent or
+/// unrelated staging tree can neither be deleted nor overwritten. An existing
+/// destination refuses instead of being merged or overwritten, which keeps the
+/// published package exactly the archive this call produced.
+///
+/// From the rename onwards the package exists on disk, so a claim that cannot
+/// be retired is reported as [`BackupError::PublishReconciliationRequired`]:
+/// the publication happened, the caller's reconciliation is outstanding, and
+/// the error is not a claim that nothing was published.
+fn publish_package(
+    files: &BTreeMap<String, Vec<u8>>,
+    out_dir: &Path,
+    export_id: &str,
+) -> Result<(), BackupError> {
     if out_dir.exists() {
         return Err(BackupError::Interchange(format!(
             "ECXF package path {} already exists; refusing to publish over an existing package",
             out_dir.display()
         )));
     }
-    let staging = staging_dir(out_dir)?;
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging).map_err(|error| {
-            BackupError::Interchange(format!(
-                "cannot clear the staging directory {}: {error}",
-                staging.display()
-            ))
-        })?;
+    let claim = StagingClaim::acquire(out_dir, export_id)?;
+    if let Err(error) = write_tree(&claim.package_root(), files) {
+        return Err(keep_cleanup_failure(error, claim.release()));
     }
-    if let Err(error) = write_tree(&staging, files) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    std::fs::rename(&staging, out_dir).map_err(|error| {
-        BackupError::Interchange(format!(
+    // Only the package root is renamed. The claim directory keeps the owner
+    // record, so the published members are exactly the ones `eliot-ecxf`
+    // rendered — no claim member is ever shipped — while cleanup still has a
+    // record to re-verify before it removes anything.
+    if let Err(error) = std::fs::rename(claim.package_root(), out_dir) {
+        let publish_error = BackupError::Interchange(format!(
             "cannot publish the ECXF package {}: {error}",
             out_dir.display()
-        ))
-    })
+        ));
+        return Err(keep_cleanup_failure(publish_error, claim.release()));
+    }
+    claim
+        .release()
+        .map_err(|error| BackupError::PublishReconciliationRequired {
+            export_id: export_id.to_owned(),
+            package_path: out_dir.display().to_string(),
+            reason: error.to_string(),
+        })
 }
 
-/// Returns the sibling staging directory used to publish `out_dir`.
+/// Name of the directory inside a claimed staging area that holds the rendered
+/// package members. It is the rename source, so the claim directory itself is
+/// never published.
+const STAGING_PACKAGE_DIR: &str = "package";
+
+/// Name of the owner record inside a claimed staging area. The name is outside
+/// the published layout because the record lives in the claim directory, not in
+/// the package root that gets renamed.
+const STAGING_OWNER_FILE: &str = ".ecxf-staging-owner.json";
+
+/// Owner record written into a claimed staging area.
 ///
-/// The name is a pure function of the destination, so a retry after a failed
-/// attempt reuses the same path instead of accumulating staging directories, and
-/// no random or caller-supplied component enters the filesystem layout.
+/// The record is the proof that the directory belongs to one export operation
+/// and one attempt incarnation of it. A record that is absent, unreadable, or
+/// naming a different owner is never treated as ownership by anyone (issue
+/// #1871).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingOwnerRecord {
+    /// Export identity that claimed the staging area.
+    export_id: String,
+    /// Attempt incarnation of that export which claimed it.
+    attempt: String,
+}
+
+/// One staging area claimed exclusively by a single export attempt.
+///
+/// A deterministic directory name is not ownership: two exports to the same
+/// destination would share it, and a pre-existing unrelated directory of the
+/// same name would be indistinguishable from a retry. This claim therefore
+/// combines an exclusive create (the crate's existing ownership boundary, as in
+/// [`isolated_restore`](super::isolated_restore)) with an owner record naming
+/// this export identity and a fresh attempt incarnation, and it re-reads that
+/// record before removing anything.
+#[derive(Debug)]
+struct StagingClaim {
+    /// Claimed directory, created exclusively by this invocation.
+    root: PathBuf,
+    /// Export identity recorded in the owner record.
+    export_id: String,
+    /// Attempt incarnation recorded in the owner record.
+    attempt: String,
+}
+
+impl StagingClaim {
+    /// Claims the sibling staging area of `out_dir` for this export attempt.
+    ///
+    /// `std::fs::create_dir` is the ownership boundary: it fails when the path
+    /// already exists, so an occupied staging path is neither adopted nor
+    /// erased, whatever its name or contents say. The refusal names the
+    /// occupied path so the owner can reconcile it. This includes a path left
+    /// behind by an earlier attempt: a deterministic name is not evidence that
+    /// its previous owner is gone, so a leftover claim is refused rather than
+    /// reclaimed.
+    fn acquire(out_dir: &Path, export_id: &str) -> Result<Self, BackupError> {
+        let claim = Self {
+            root: staging_dir(out_dir)?,
+            export_id: export_id.to_owned(),
+            attempt: fresh_attempt_incarnation()?,
+        };
+        std::fs::create_dir(&claim.root).map_err(|error| {
+            BackupError::Interchange(format!(
+                "cannot claim the ECXF staging directory {}: {error}; the existing path is left untouched",
+                claim.root.display()
+            ))
+        })?;
+        let record = StagingOwnerRecord {
+            export_id: claim.export_id.clone(),
+            attempt: claim.attempt.clone(),
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        // A claim that cannot record its owner is not a claim this invocation
+        // can later prove, so the directory stays in place and the error names
+        // it rather than deleting an unproven tree.
+        std::fs::write(claim.owner_record_path(), bytes).map_err(|error| {
+            BackupError::Interchange(format!(
+                "cannot record the ECXF staging owner in {}: {error}; the claimed directory is left untouched",
+                claim.root.display()
+            ))
+        })?;
+        Ok(claim)
+    }
+
+    /// Returns the directory inside the claim that receives the package members.
+    fn package_root(&self) -> PathBuf {
+        self.root.join(STAGING_PACKAGE_DIR)
+    }
+
+    /// Returns the path of this claim's owner record.
+    fn owner_record_path(&self) -> PathBuf {
+        self.root.join(STAGING_OWNER_FILE)
+    }
+
+    /// Removes the claimed tree, but only after re-proving this invocation owns it.
+    ///
+    /// The owner record is re-read from disk and compared against this claim's
+    /// export identity and attempt incarnation. A record that cannot be read,
+    /// or that names another owner, makes this a refusal instead of a deletion:
+    /// cleanup may remove only the caller's own staging resources.
+    fn release(&self) -> Result<(), BackupError> {
+        let record_path = self.owner_record_path();
+        let bytes = std::fs::read(&record_path).map_err(|error| {
+            BackupError::Interchange(format!(
+                "cannot read the ECXF staging owner record {}: {error}; the directory is left untouched",
+                record_path.display()
+            ))
+        })?;
+        let record: StagingOwnerRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            BackupError::Interchange(format!(
+                "cannot parse the ECXF staging owner record {}: {error}; the directory is left untouched",
+                record_path.display()
+            ))
+        })?;
+        if record.export_id != self.export_id || record.attempt != self.attempt {
+            return Err(BackupError::Interchange(format!(
+                "ECXF staging directory {} is claimed by export {} attempt {}; refusing to remove a tree this attempt does not own",
+                self.root.display(),
+                record.export_id,
+                record.attempt
+            )));
+        }
+        std::fs::remove_dir_all(&self.root).map_err(|error| {
+            BackupError::Interchange(format!(
+                "cannot remove the owned ECXF staging directory {}: {error}",
+                self.root.display()
+            ))
+        })
+    }
+}
+
+/// Mints the fresh local attempt incarnation that identifies one export attempt.
+///
+/// The incarnation must never repeat across attempts, including attempts of the
+/// same export identity by another process, because it is the second half of
+/// the staging ownership proof. It is therefore derived from 128 bits of
+/// process-local randomness rather than from the destination path, the export
+/// identity, a counter or the clock, none of which distinguishes a new attempt
+/// from a dead one that reused the same staging path.
+fn fresh_attempt_incarnation() -> Result<String, BackupError> {
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|error| {
+        BackupError::Interchange(format!(
+            "cannot mint an ECXF export attempt incarnation: {error}"
+        ))
+    })?;
+    Ok(bytes_sha256(&nonce))
+}
+
+/// Keeps a staging cleanup failure visible beside the primary failure it followed.
+///
+/// A cleanup failure is never discarded and never replaces the primary
+/// outcome; it is reported next to it. Both primary failures on this path are
+/// `Interchange` filesystem refusals from `write_tree` or the rename, so
+/// folding the cleanup note into that variant keeps the primary's variant and
+/// message intact and adds the cleanup failure to it.
+fn keep_cleanup_failure(primary: BackupError, cleanup: Result<(), BackupError>) -> BackupError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup_error) => BackupError::Interchange(format!("{primary}; {cleanup_error}")),
+    }
+}
+
+/// Returns the sibling staging path this export claims for `out_dir`.
+///
+/// The name stays a pure function of the destination — no random or
+/// caller-supplied component enters the filesystem layout — so two exports to
+/// the same destination contend for exactly one path and the second is refused
+/// rather than sharing it. The name is not ownership: ownership is the
+/// exclusive create plus the owner record [`StagingClaim::acquire`] writes into
+/// that path, so a path that merely carries the expected name is never
+/// reclaimed or erased.
 fn staging_dir(out_dir: &Path) -> Result<PathBuf, BackupError> {
     let name = out_dir.file_name().ok_or_else(|| {
         BackupError::Interchange("ECXF package path has no directory name".to_owned())
@@ -516,12 +741,35 @@ fn write_tree(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<(), Back
     Ok(())
 }
 
+/// Re-reads one published member and reports this publication's outcome.
+///
+/// The readback runs after the destination exists, so its refusals are
+/// publication/reconciliation outcomes rather than evidence that nothing was
+/// published: every failure becomes [`BackupError::PublishReconciliationRequired`]
+/// carrying the export identity and the published package path, with the exact
+/// readback failure as the reason. The precise typed reason is preserved in that
+/// message instead of being reported as a total failure.
+fn readback_digest(
+    out_dir: &Path,
+    relative: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+    export_id: &str,
+) -> Result<String, BackupError> {
+    observed_member_digest(out_dir, relative, files).map_err(|error| {
+        BackupError::PublishReconciliationRequired {
+            export_id: export_id.to_owned(),
+            package_path: out_dir.display().to_string(),
+            reason: error.to_string(),
+        }
+    })
+}
+
 /// Re-reads one published member and returns the digest of the observed bytes.
 ///
 /// The reported digest is computed over the file that landed, not over the
 /// in-memory member that produced it, and a readback that disagrees with the
 /// rendered package is refused instead of reported (#1141).
-fn readback_digest(
+fn observed_member_digest(
     out_dir: &Path,
     relative: &str,
     files: &BTreeMap<String, Vec<u8>>,
