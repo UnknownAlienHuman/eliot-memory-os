@@ -73,12 +73,22 @@ use eliot_ors::{
     RestoreJournalStreamBinding, StateFenceSnapshot,
 };
 use eliot_platform::PlatformHandle;
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 
 /// Stable identity of the restore-journal stream namespace for admission
 /// bindings. Composition must place this identity in the admission it issues
 /// for the restore streams owned by the operational ORS database (#957).
 pub const RESTORE_JOURNAL_IDENTITY: &str = "kernel-restore-journal-v1";
+/// Instruction taint carried on every restore-journal envelope (I5.5
+/// `instruction_taint`, I5.6 `privacy_origin_taint_metadata`).
+///
+/// A restore-journal row is an immutable locator over sealed, content-addressed
+/// recovery-journal payload bytes written by the restore owner — never text that
+/// any instruction-following consumer may act on, and never model or agent
+/// input (I5.2: "model/Dreamer/agent queries never receive ORS payload
+/// directly"). The value is a fixed property of the stream, not of one row, so
+/// it is a named constant here instead of a literal at the call site.
+pub const RESTORE_JOURNAL_INSTRUCTION_TAINT: InstructionTaint = InstructionTaint::DataOnly;
 /// Owner label identifying the operational ORS database behind restore
 /// streams (evidence + diagnostics reference). The rows live in the
 /// Kernel-owned operational ORS file; this label names that owner, never a
@@ -1263,6 +1273,7 @@ impl OrsRestoreJournal {
                         reason: leak_free(),
                     }
                 })?,
+                instruction_taint: RESTORE_JOURNAL_INSTRUCTION_TAINT,
             },
             authority_epoch: EpochLineage {
                 current: self.epoch.clone(),

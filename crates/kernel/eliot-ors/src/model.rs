@@ -18,7 +18,7 @@ use eliot_runtime_contracts::{
     SupervisionObservationScope, SupervisionOrsMirrorBinding, VerifiedSupervisionLease,
     VerifiedSupervisionLeaseTerminalTransition,
 };
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
@@ -1523,15 +1523,65 @@ pub enum RecoveryPayload {
 /// Version of the opaque canonical request bytes accepted for a root transition.
 pub const ROOT_TRANSITION_REQUEST_VERSION: u16 = 1;
 
-/// Required privacy and visibility metadata that travels with a pending value.
+/// Required privacy, visibility and taint metadata that travels with a
+/// pending value (I5.2, I5.5, I5.6).
+///
+/// I5.2 requires that "original privacy, visibility, taint and retention travel
+/// with the pending payload", I5.5 names `instruction_taint` beside
+/// `privacy_class` on the write envelope, and I5.6 step 8 attaches "instruction
+/// taint/origin/disclosure metadata" before staging. Taint therefore belongs to
+/// the same carried access aggregate as privacy and visibility rather than to a
+/// new top-level envelope key: I5.2's authoritative `RecoveryPayloadEnvelope`
+/// field list admits no separate taint key, and ORS adds none.
+///
+/// `instruction_taint` is a closed scalar, never a set: the reduction from a
+/// transition's per-source assurance is the admission owner's decision, made
+/// before ORS is reached, so this struct records the admitted verdict and never
+/// re-derives or downgrades it. `PrivacyClass` and `InstructionTaint` are
+/// closed enums, so an unknown variant cannot be constructed or deserialized;
+/// the field is required on the wire by `deny_unknown_fields`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryAccessClass {
+    /// Admitted privacy class of the pending payload (I5.5 `privacy_class`).
     pub privacy: PrivacyClass,
+    /// Opaque visibility label; ORS records it without interpretation.
     pub visibility: VisibilityClass,
+    /// Admitted instruction taint of the pending payload (I5.5
+    /// `instruction_taint`, I5.6 `privacy_origin_taint_metadata`).
+    pub instruction_taint: InstructionTaint,
 }
 
-/// Versioned opaque recovery envelope required at the ORS boundary.
+impl RecoveryAccessClass {
+    /// Validates the carried access metadata as one complete aggregate.
+    ///
+    /// Runs the same non-blank/non-control `validate_text` check over the
+    /// wire label that [`RecoveryPayloadEnvelope::validate`] already runs over
+    /// `secret_provider` and `immutable_locator`, so a re-read envelope cannot
+    /// present a partially-validated access class. The two closed enums carry no
+    /// invalid variant to reject; their soundness is closed at deserialization.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(
+            self.visibility.as_str(),
+            "privacy_and_visibility_class.visibility",
+        )
+    }
+}
+
+/// Versioned opaque recovery envelope required at the ORS boundary (I5.2).
+///
+/// The field list is exactly the one I5.2 mandates: contract version,
+/// operation/checkpoint identity, privacy and visibility class, the encrypted
+/// payload or immutable locator, payload hash and length, authority epoch and
+/// state fence, and the created/expiry times. Authority epoch and state fence
+/// are bound to each other by [`Self::validate`], so a staged envelope is
+/// never replayable under a foreign epoch or fence.
+///
+/// Retention is carried by `expires_at_ms` alone. I5.2 requires that original
+/// retention travel with the pending payload, and it names no distinct
+/// retention class, type or field beyond `created_at_and_expires_at`; a separate
+/// retention member would be an invented field, so none is added and
+/// `expires_at_ms` remains the single cleanup horizon.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryPayloadEnvelope {
@@ -1549,6 +1599,11 @@ pub struct RecoveryPayloadEnvelope {
 }
 
 /// Metadata shared by encrypted and immutable-locator recovery envelopes.
+///
+/// Mirrors [`RecoveryPayloadEnvelope`] minus the payload and its derived
+/// digests, so the admitted access aggregate — privacy, visibility and
+/// instruction taint — reaches both constructors unchanged and is validated
+/// once, on the envelope it produces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryEnvelopeContext {
     pub operation_or_checkpoint_id: OperationIdentity,
@@ -1611,11 +1666,20 @@ impl RecoveryPayloadEnvelope {
         Ok(envelope)
     }
 
-    /// Validates version, integrity bindings, fence, epoch lineage, and time bounds.
+    /// Validates version, integrity bindings, carried access class, fence,
+    /// epoch lineage, and time bounds.
+    ///
+    /// The access aggregate is checked as one unit so the admitted instruction
+    /// taint travels under the same gate as privacy and visibility (I5.2,
+    /// I5.5 `instruction_taint`, I5.6 `privacy_origin_taint_metadata`): an
+    /// envelope is refused rather than staged with a partially-validated
+    /// access class. `expires_at_ms` is checked as the retention horizon only
+    /// (I5.2 "cleanup horizon"); no separate retention class exists to check.
     pub fn validate(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
+        self.privacy_and_visibility_class.validate()?;
         validate_digest(&self.payload_sha256, "payload_sha256")?;
         if self.payload_length == 0 {
             return Err(OrsError::InvalidField {
