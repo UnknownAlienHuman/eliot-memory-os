@@ -497,13 +497,15 @@ impl NormalizedSchedule {
         let resolved_local =
             parse_civil_wall_clock(fields[4], "schedule.occurrence_key.resolved_local")?;
         let offset_minutes = parse_utc_offset(fields[5], "schedule.occurrence_key.offset")?;
+        let offset_seconds =
+            parse_canonical_offset_seconds(offset_minutes, "schedule.occurrence_key.offset")?;
         let instant_seconds = parse_utc_instant(fields[6], "schedule.occurrence_key.instant")?;
         let transition =
             parse_transition_window(fields[7], disposition, "schedule.occurrence_key.transition")?;
         require_resolved_instant(
             requested_local,
             resolved_local,
-            offset_minutes,
+            offset_seconds,
             disposition,
             transition,
             instant_seconds,
@@ -512,7 +514,7 @@ impl NormalizedSchedule {
             &self.timezone,
             requested_local.unix_seconds(),
             resolved_local.unix_seconds(),
-            offset_minutes,
+            offset_seconds,
             instant_seconds,
             disposition,
             transition,
@@ -522,7 +524,7 @@ impl NormalizedSchedule {
             zone_database_revision: fields[2].to_owned(),
             requested_local: fields[3].to_owned(),
             resolved_local: fields[4].to_owned(),
-            offset_minutes,
+            offset_seconds,
             instant_seconds,
             disposition,
             source_digest: fields[9].to_owned(),
@@ -559,6 +561,12 @@ pub enum OccurrenceDisposition {
 /// applied offset, the fold or gap disposition, and the immutable compiled
 /// source digest. Kernel validates this evidence; it never resolves a zone,
 /// reads a time zone database, or reads the ambient machine locale.
+///
+/// The applied offset is held in **seconds**, the unit the pinned zone table states
+/// and the unit [`Self::instant_seconds`] is in. The wire field stays an
+/// `ISO-8601` `+HH:MM` value and is converted once, at the parse boundary, so
+/// `requested_local - offset_seconds` is the instant this occurrence resolves to
+/// with no factor applied anywhere above that boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedOccurrence {
     /// Canonical owner-normalized zone identity.
@@ -569,8 +577,9 @@ pub struct NormalizedOccurrence {
     pub requested_local: String,
     /// Valid local civil wall clock after applying the recorded disposition.
     pub resolved_local: String,
-    /// Applied UTC offset in signed minutes east of UTC.
-    pub offset_minutes: i32,
+    /// Applied UTC offset in signed seconds east of UTC, the same canonical unit
+    /// the pinned zone table states and [`Self::instant_seconds`] is counted in.
+    pub offset_seconds: i32,
     /// Resolved UTC instant in seconds since the Unix epoch.
     pub instant_seconds: i64,
     /// Applied fold or gap disposition.
@@ -598,6 +607,13 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// Seconds in one civil hour.
 const SECONDS_PER_HOUR: i64 = 3_600;
 /// Seconds in one civil minute.
+///
+/// The canonical offset unit of this contract is the second, matching the pinned
+/// zone table and the instant column, so this constant never scales a canonical
+/// offset. It appears in exactly two places, both of which are about a civil
+/// *spelling* rather than about an offset: composing a civil wall clock out of its
+/// hour/minute fields, and the single wire-to-canonical conversion in
+/// [`parse_canonical_offset_seconds`].
 const SECONDS_PER_MINUTE: i64 = 60;
 /// Earliest civil year this contract normalizes. Year one keeps the absolute
 /// instant arithmetic below exact, and no automation occurrence is normalized
@@ -611,11 +627,18 @@ const CIVIL_EPOCH_DAY_OFFSET: i64 = 719_468;
 const DAYS_PER_CIVIL_ERA: i64 = 146_097;
 /// Largest civil UTC offset east of UTC in the time zone database, fourteen
 /// hours, so a larger spelled offset names no instant.
+///
+/// This bound is on the *wire*, which is `ISO-8601` `+HH:MM` and therefore
+/// minutes-denominated whatever the canonical unit is, so it stays in minutes and
+/// the wire grammar keeps its own stated limit. The canonical second value it
+/// converts to is bounded separately, by
+/// `user_automation_zones::ZONE_TABLE_OFFSET_SECONDS_RANGE`, rather than by
+/// rescaling this one, which is what would silently widen the accepted range.
 const MAX_CIVIL_UTC_OFFSET_MINUTES: u32 = 14 * 60;
-/// Largest civil offset step one zone transition may apply. The database
-/// contains a whole skipped civil day, so the bound is one full day rather than
-/// one hour.
-const MAX_TRANSITION_STEP_MINUTES: u32 = 24 * 60;
+/// Largest civil offset step one zone transition may apply, in canonical seconds.
+/// The database contains a whole skipped civil day, so the bound is one full day
+/// rather than one hour.
+const MAX_TRANSITION_STEP_SECONDS: u32 = SECONDS_PER_DAY as u32;
 /// Longest accepted zone identity.
 const MAX_ZONE_IDENTITY_BYTES: usize = 64;
 /// Longest accepted pinned zone database revision token.
@@ -797,6 +820,39 @@ fn parse_utc_offset(value: &str, field: &'static str) -> Result<i32, UserAutomat
     })
 }
 
+/// Converts one wire UTC offset from its accepted `ISO-8601` minutes into the
+/// canonical seconds the pinned zone table states.
+///
+/// This is the single place the occurrence wire's unit is converted, and the
+/// canonical unit above it is one: an `ISO-8601` `+HH:MM` offset names whole
+/// minutes, and multiplying by [`SECONDS_PER_MINUTE`] here yields exactly the
+/// second value the table's offset column holds, so
+/// `user_automation_zones::offset_seconds_at` and this contract's own arithmetic
+/// are the same unit and no factor is applied twice. Every wire offset in this
+/// module is read through it — the occurrence's applied offset, both sides of its
+/// recorded transition pair, and the schedule's `start_at`/`end_at` offset — which
+/// is what makes the wire the only place a minutes-denominated value exists.
+///
+/// The multiplication is checked and the result is required to be one the pinned
+/// table could state, so an unrepresentable value is refused instead of wrapping.
+/// `parse_utc_offset` already bounds a wire offset to
+/// [`MAX_CIVIL_UTC_OFFSET_MINUTES`], so in practice the refusal is unreachable from
+/// a well-formed field; it exists so that the bound on the converted value is a
+/// property of the conversion and not an assumption about its input.
+fn parse_canonical_offset_seconds(
+    offset_minutes: i32,
+    field: &'static str,
+) -> Result<i32, UserAutomationError> {
+    let offset_seconds = i64::from(offset_minutes)
+        .checked_mul(SECONDS_PER_MINUTE)
+        .and_then(|seconds| i32::try_from(seconds).ok())
+        .ok_or(UserAutomationError::Invalid(field))?;
+    if !user_automation_zones::ZONE_TABLE_OFFSET_SECONDS_RANGE.contains(&offset_seconds) {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    Ok(offset_seconds)
+}
+
 /// Parses the resolved UTC instant field of one occurrence record.
 ///
 /// The canonical spelling is the civil UTC value with a `Z` suffix, so one
@@ -812,7 +868,10 @@ fn parse_utc_instant(value: &str, field: &'static str) -> Result<i64, UserAutoma
 ///
 /// `start_at` and `end_at` are instants rather than wall clocks, so the offset
 /// is applied here: `2026-01-01T00:00:00+14:00` is correctly later than
-/// `2026-01-01T00:00:00Z` even though it sorts before it as text.
+/// `2026-01-01T00:00:00Z` even though it sorts before it as text. The offset is a
+/// minutes-denominated wire spelling like the occurrence offset, so it reaches
+/// absolute seconds through the same one checked conversion rather than through a
+/// second, unchecked scaling of its own.
 fn parse_civil_instant(value: &str, field: &'static str) -> Result<i64, UserAutomationError> {
     if value.len() < CIVIL_WALL_CLOCK_BYTES + 1 {
         return Err(UserAutomationError::Invalid(field));
@@ -824,7 +883,8 @@ fn parse_civil_instant(value: &str, field: &'static str) -> Result<i64, UserAuto
     } else {
         parse_utc_offset(offset, field)?
     };
-    Ok(civil.unix_seconds() - i64::from(offset_minutes) * SECONDS_PER_MINUTE)
+    let offset_seconds = parse_canonical_offset_seconds(offset_minutes, field)?;
+    Ok(civil.unix_seconds() - i64::from(offset_seconds))
 }
 
 /// Parses the applied fold or gap disposition field of one occurrence record.
@@ -846,8 +906,11 @@ fn parse_occurrence_disposition(
 /// A unique occurrence carries `-`: its local wall clock exists once, so there
 /// is no transition to reproduce. A fold or a gap carries the offsets the pinned
 /// zone revision applies immediately before and after the transition, joined by
-/// `~`. That pair is the exact evidence a replay needs to re-derive the applied
-/// offset without reading a time zone database again, and
+/// `~`. Each side is the wire's `ISO-8601` `+HH:MM` and is converted once, here,
+/// through [`parse_canonical_offset_seconds`], so the pair this returns is in the
+/// canonical seconds [`require_pinned_zone_evidence`] compares against the
+/// table's own `ZoneTransition`. That pair is the exact evidence a replay needs to
+/// re-derive the applied offset without reading a time zone database again, and
 /// [`require_pinned_zone_evidence`] is what turns it into proof: it checks both
 /// boundaries against the transitions the pinned table actually holds between
 /// the two instants, so a recorded offset that the named zone does not apply at
@@ -867,10 +930,10 @@ fn parse_transition_window(
     let Some((before, after)) = value.split_once('~') else {
         return Err(UserAutomationError::Invalid(field));
     };
-    let pre = parse_utc_offset(before, field)?;
-    let post = parse_utc_offset(after, field)?;
+    let pre = parse_canonical_offset_seconds(parse_utc_offset(before, field)?, field)?;
+    let post = parse_canonical_offset_seconds(parse_utc_offset(after, field)?, field)?;
     let step = pre.abs_diff(post);
-    if step == 0 || step > MAX_TRANSITION_STEP_MINUTES {
+    if step == 0 || step > MAX_TRANSITION_STEP_SECONDS {
         return Err(UserAutomationError::Invalid(field));
     }
     Ok(Some((pre, post)))
@@ -905,10 +968,15 @@ fn require_declared_disposition(
 
 /// Checks the disposition's offset side and delegates the shared local/instant
 /// relation to [`validate_occurrence_local_relation`].
+///
+/// `offset_seconds` and the transition pair are already canonical seconds, and
+/// `requested_local`/`resolved_local`/`instant_seconds` are already instant
+/// seconds, so this whole relation is arithmetic in one unit: the local wall clock
+/// less the offset it carries is the instant, with no factor anywhere in it.
 fn require_resolved_instant(
     requested_local: CivilDateTime,
     resolved_local: CivilDateTime,
-    offset_minutes: i32,
+    offset_seconds: i32,
     disposition: OccurrenceDisposition,
     transition: Option<(i32, i32)>,
     instant_seconds: i64,
@@ -916,11 +984,11 @@ fn require_resolved_instant(
     match (disposition, transition) {
         (OccurrenceDisposition::Unique, None) => {}
         (OccurrenceDisposition::FoldFirst, Some((pre, post)))
-            if pre > post && offset_minutes == pre => {}
+            if pre > post && offset_seconds == pre => {}
         (OccurrenceDisposition::FoldSecond, Some((pre, post)))
-            if pre > post && offset_minutes == post => {}
+            if pre > post && offset_seconds == post => {}
         (OccurrenceDisposition::GapShiftForward, Some((pre, post)))
-            if pre < post && offset_minutes == post => {}
+            if pre < post && offset_seconds == post => {}
         _ => {
             return Err(UserAutomationError::Invalid(
                 "schedule.occurrence_key.transition",
@@ -930,7 +998,7 @@ fn require_resolved_instant(
     validate_occurrence_local_relation(
         requested_local,
         resolved_local,
-        offset_minutes,
+        offset_seconds,
         disposition,
         transition,
         instant_seconds,
@@ -942,10 +1010,28 @@ fn require_resolved_instant(
 /// Unique and folded occurrences keep the same local clock; a gap advances the
 /// resolved local by its exact offset step and the requested/pre and
 /// resolved/post equations must reach the same instant.
+///
+/// Every operand is in seconds, and the shift-forward result is the offset step
+/// itself: a gap of one hour shifts the local clock by 3600 seconds because the
+/// offsets differ by 3600 seconds, which is the same number for the same
+/// transition rather than a number reached by re-scaling a different unit.
+///
+/// The sign is the same one the zone table uses, and it is stated here because
+/// getting it backwards is silent rather than loud. An offset is seconds **east**
+/// of UTC, so a local wall clock read as if it were UTC is *ahead* of the instant
+/// it renders by exactly that offset, and `instant = local - offset` everywhere —
+/// here, in `user_automation_zones::classify_local_clock`, and in
+/// [`require_pinned_zone_evidence`], which reads the same relation the other way
+/// round as `local = instant + offset`. The gap arm is the reason this has to hold
+/// on both of its equations: it derives the instant twice, once from the requested
+/// local with the pre-transition offset and once from the resolved local with the
+/// post-transition offset, and the two must be the same number. With the sign
+/// flipped, they differ by twice the gap step and every real gap occurrence is
+/// refused by its own two halves disagreeing.
 fn validate_occurrence_local_relation(
     requested_local: CivilDateTime,
     resolved_local: CivilDateTime,
-    offset_minutes: i32,
+    offset_seconds: i32,
     disposition: OccurrenceDisposition,
     transition: Option<(i32, i32)>,
     instant_seconds: i64,
@@ -960,17 +1046,17 @@ fn validate_occurrence_local_relation(
                     "schedule.occurrence_key.resolved_local",
                 ));
             }
-            requested_seconds - i64::from(offset_minutes) * SECONDS_PER_MINUTE
+            requested_seconds - i64::from(offset_seconds)
         }
         (OccurrenceDisposition::GapShiftForward, Some((pre, post))) if pre < post => {
-            let gap_seconds = i64::from(post - pre) * SECONDS_PER_MINUTE;
+            let gap_seconds = i64::from(post - pre);
             let Some(expected_resolved_seconds) = requested_seconds.checked_add(gap_seconds) else {
                 return Err(UserAutomationError::Invalid(
                     "schedule.occurrence_key.resolved_local",
                 ));
             };
-            let requested_instant_seconds = requested_seconds - i64::from(pre) * SECONDS_PER_MINUTE;
-            let resolved_instant_seconds = resolved_seconds - i64::from(post) * SECONDS_PER_MINUTE;
+            let requested_instant_seconds = requested_seconds - i64::from(pre);
+            let resolved_instant_seconds = resolved_seconds - i64::from(post);
             if resolved_seconds != expected_resolved_seconds
                 || requested_instant_seconds != resolved_instant_seconds
             {
@@ -1017,11 +1103,19 @@ fn validate_occurrence_local_relation(
 /// 5. when a transition pair is recorded, both boundaries must equal the
 ///    offsets the table actually applies on either side of the transition it
 ///    names.
+///
+/// Every offset here is canonical seconds on both sides of the comparison: the
+/// claimed offset and the recorded pair were converted once at the parse
+/// boundary, and `user_automation_zones::offset_seconds_at` and
+/// `user_automation_zones::classify_local_clock` answer in the table's own unit.
+/// There is therefore no unit to reconcile at this boundary at all, which is why
+/// the offset, the local clocks, the transition and the disposition can be checked
+/// against each other rather than merely compared for resemblance.
 fn require_pinned_zone_evidence(
     zone: &str,
     requested_local_unix_seconds: i64,
     resolved_local_unix_seconds: i64,
-    claimed_offset_minutes: i32,
+    claimed_offset_seconds: i32,
     claimed_instant_seconds: i64,
     disposition: OccurrenceDisposition,
     transition: Option<(i32, i32)>,
@@ -1035,16 +1129,14 @@ fn require_pinned_zone_evidence(
             window: ZONE_TABLE_WINDOW_ISO,
         });
     }
-    let applied = user_automation_zones::offset_minutes_at(zone, claimed_instant_seconds)
+    let applied = user_automation_zones::offset_seconds_at(zone, claimed_instant_seconds)
         .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
-    if applied != claimed_offset_minutes {
+    if applied != claimed_offset_seconds {
         return Err(UserAutomationError::ZoneEvidence(
             "schedule.occurrence_key.offset",
         ));
     }
-    if resolved_local_unix_seconds
-        != claimed_instant_seconds + i64::from(applied) * SECONDS_PER_MINUTE
-    {
+    if resolved_local_unix_seconds != claimed_instant_seconds + i64::from(applied) {
         return Err(UserAutomationError::ZoneEvidence(
             "schedule.occurrence_key.resolved_local",
         ));
@@ -1057,10 +1149,10 @@ fn require_pinned_zone_evidence(
             OccurrenceDisposition::Unique,
             user_automation_zones::LocalClockReality::Unique {
                 instant_seconds,
-                offset_minutes,
+                offset_seconds,
             },
         ) => {
-            if instant_seconds != claimed_instant_seconds || offset_minutes != applied {
+            if instant_seconds != claimed_instant_seconds || offset_seconds != applied {
                 return Err(disagree());
             }
             return require_absent_transition(transition);
@@ -1069,12 +1161,12 @@ fn require_pinned_zone_evidence(
             OccurrenceDisposition::FoldFirst,
             user_automation_zones::LocalClockReality::Fold {
                 first_instant_seconds,
-                first_offset_minutes,
+                first_offset_seconds,
                 transition: real,
                 ..
             },
         ) => {
-            if first_instant_seconds != claimed_instant_seconds || first_offset_minutes != applied {
+            if first_instant_seconds != claimed_instant_seconds || first_offset_seconds != applied {
                 return Err(disagree());
             }
             real
@@ -1083,12 +1175,12 @@ fn require_pinned_zone_evidence(
             OccurrenceDisposition::FoldSecond,
             user_automation_zones::LocalClockReality::Fold {
                 second_instant_seconds,
-                second_offset_minutes,
+                second_offset_seconds,
                 transition: real,
                 ..
             },
         ) => {
-            if second_instant_seconds != claimed_instant_seconds || second_offset_minutes != applied
+            if second_instant_seconds != claimed_instant_seconds || second_offset_seconds != applied
             {
                 return Err(disagree());
             }
@@ -1100,13 +1192,13 @@ fn require_pinned_zone_evidence(
                 transition: real,
                 shifted_local_unix_seconds,
                 resolved_instant_seconds,
-                post_offset_minutes,
+                post_offset_seconds,
                 ..
             },
         ) => {
             if shifted_local_unix_seconds != resolved_local_unix_seconds
                 || resolved_instant_seconds != claimed_instant_seconds
-                || post_offset_minutes != applied
+                || post_offset_seconds != applied
             {
                 return Err(disagree());
             }
@@ -1119,7 +1211,7 @@ fn require_pinned_zone_evidence(
             "schedule.occurrence_key.transition",
         ));
     };
-    if pre != real_transition.pre_offset_minutes || post != real_transition.post_offset_minutes {
+    if pre != real_transition.pre_offset_seconds || post != real_transition.post_offset_seconds {
         return Err(UserAutomationError::ZoneEvidence(
             "schedule.occurrence_key.transition",
         ));
@@ -1171,10 +1263,12 @@ fn map_zone_error(
 /// the names an independent implementation of the same data confirmed. So a
 /// spelled pair that names no database zone is refused, and so is a name that
 /// merely resembles one: `America/Nowhere_City` and `Foo/Bar` are absent for
-/// exactly the same reason as each other. A zone the release does define, but
-/// whose pinned offsets this contract's canonical offset unit cannot state
-/// exactly, is absent too, and is refused rather than answered from a truncated
-/// offset.
+/// exactly the same reason as each other. A zone the release does define whose
+/// pinned offset no `ISO-8601` occurrence offset could state is absent for the
+/// same reason, because nothing can be validated against it; that zone is refused
+/// rather than answered from a rounded offset, and a lookup that names it is
+/// refused as `UserAutomationError::SubMinuteZoneOffset` with the exact offset
+/// rather than being told the table does not carry it.
 fn is_canonical_zone_identity(zone: &str) -> bool {
     !zone.is_empty()
         && zone.len() <= MAX_ZONE_IDENTITY_BYTES

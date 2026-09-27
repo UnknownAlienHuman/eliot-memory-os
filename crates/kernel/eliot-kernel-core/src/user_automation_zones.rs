@@ -32,24 +32,40 @@
 //!
 //! # One canonical offset unit
 //!
-//! The table's offset column is written in **seconds**, which is the unit the
-//! `IANA` release and the generator's independent oracle both produce. That wire
-//! unit is not assumed here: the header must declare it as
-//! [`ZONE_TABLE_OFFSET_UNIT`], and a table that does not carry exactly that token
-//! is refused before a single offset is read. A data file whose unit is left to be
-//! inferred from the magnitude of a sample value is how one release's seconds
-//! were read as another release's minutes, which refused valid occurrences and
-//! computed candidate instants with a 60x error.
+//! The canonical offset unit of this module is **seconds**, and the table's offset
+//! column is read in seconds and nothing else. That is the unit the `IANA` release
+//! and the generator's independent oracle both produce, and it is the unit the
+//! instant column is already in, so an offset now *is* the number of seconds that
+//! has to be added to a local wall clock to reach its instant: no factor, no
+//! conversion, nothing to get wrong by a factor of sixty.
 //!
-//! [`offset_seconds_to_minutes`] is the single place the wire unit is converted,
-//! and it converts exactly once, at the parse boundary. Everything above this
-//! module boundary — [`ZoneTransition`], [`LocalClockReality`],
-//! [`offset_minutes_at`] and the occurrence record they are compared against —
-//! holds **minutes**, so multiplying an offset by [`SECONDS_PER_MINUTE`] to reach
-//! an instant is correct as written. The conversion is exact or it is a refusal:
-//! a pinned offset that is not a whole number of minutes (`Africa/Monrovia` was
-//! `-0:44:30` until 1972) is never truncated, and the zone that carries it is
-//! refused by name instead.
+//! The wire unit is not assumed from the magnitude of a sample value either. The
+//! header must declare it as [`ZONE_TABLE_OFFSET_UNIT`], and a table that does not
+//! carry exactly that token is refused before a single offset is read. Leaving the
+//! unit to be inferred is how one release's seconds were read as another release's
+//! minutes, which refused valid occurrences and computed candidate instants with a
+//! 60x error.
+//!
+//! [`ZONE_TABLE_OFFSET_SECONDS_RANGE`] bounds every offset this module reads, and
+//! it is checked per row while the table is parsed. A row stating an offset
+//! outside it is refused by a rule about the value itself, so a column written in a
+//! unit the declared `seconds` cannot represent is caught even if the digest were
+//! re-pinned around it. The bound is signed twenty-four hours, the widest civil
+//! offset the `IANA` database has ever applied, and it is wider than the grammar of
+//! the occurrence wire this evidence is compared against, so admitting the whole
+//! range never widens what an occurrence may claim. A column stating *small*
+//! offsets in another unit is not separable from a seconds column by value alone;
+//! that is what the declared header unit and the pinned digest are for, and neither
+//! is weakened here.
+//!
+//! A zone the table carries whose pinned offset is not a whole number of minutes
+//! (`Africa/Monrovia` was `-0:44:30` until 1972) is exactly representable here,
+//! because the canonical unit *is* seconds. What that offset cannot be expressed as
+//! is an `ISO-8601` `+HH:MM` occurrence offset, so the minute-valued occurrence
+//! wire cannot be validated against it, and the zone is refused by name and with
+//! its exact second value rather than answered from a rounded offset. That refusal
+//! is a property of the occurrence wire, and it is stated here as typed evidence
+//! rather than resolved by changing a unit.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -84,6 +100,27 @@ pub(crate) const ZONE_TABLE_FORMAT: &str = "eliot.user-automation.zone-table.v2"
 /// this token without regenerating the table makes every lookup fail closed.
 pub(crate) const ZONE_TABLE_OFFSET_UNIT: &str = "seconds";
 
+/// Inclusive bound on the magnitude of one canonical offset, in seconds.
+///
+/// This is the canonical offset grammar, and it is enforced on every row of the
+/// table while the table is parsed. A row whose offset lies outside it is refused
+/// as [`ZoneTableError::Integrity`], so a table that states its offsets in a unit
+/// the declared `seconds` cannot represent is caught by a check on the values
+/// themselves and not only by the pinned digest over the whole file.
+///
+/// The bound is signed twenty-four hours. The `IANA` database's own `Zone` line
+/// grammar is a signed time and twenty-four hours east is its exact representable
+/// limit, so no offset the pinned release states is excluded, while a row written
+/// in a finer unit — the release's own fractional seconds, or a seconds column
+/// re-expressed in milliseconds — lands far outside it and is refused.
+///
+/// This bound does not by itself separate a seconds column from a minutes column
+/// for a small offset, because a small minute count is also a legal small second
+/// count. That separation is the declared unit in the header together with the
+/// pinned digest; this bound is the check that a row's *value* is an offset at all,
+/// which is a different question and is asked per row rather than per file.
+pub(crate) const ZONE_TABLE_OFFSET_SECONDS_RANGE: std::ops::RangeInclusive<i32> = -86_400..=86_400;
+
 /// Inclusive first instant of the admitted window: `1970-01-01T00:00:00Z`.
 pub(crate) const ZONE_TABLE_WINDOW_START_SECONDS: i64 = 0;
 
@@ -98,21 +135,43 @@ pub(crate) const ZONE_TABLE_START_SECONDS: i64 = -172_800;
 /// Exclusive last instant the stored offset timeline covers.
 pub(crate) const ZONE_TABLE_END_EXCLUSIVE_SECONDS: i64 = 4_102_617_600;
 
-/// Seconds in one civil minute, used to move between a canonical offset in
-/// minutes and an instant, and to divide the table's wire-denominated offset.
+/// Seconds in one civil minute.
+///
+/// The canonical offset unit of this module is the second, and the table's instant
+/// column is already in seconds, so an offset reaches its instant by addition alone
+/// and this constant is never used to scale one. It appears in exactly one place,
+/// [`is_whole_minute_offset`], and there it decides whether an offset is one the
+/// *occurrence* wire could name — never whether the table may be read.
 const SECONDS_PER_MINUTE: i64 = 60;
 
-/// One pinned offset that the canonical internal unit cannot represent exactly,
+/// Whether one table-stated offset is one the occurrence wire could ever state.
+///
+/// The canonical unit is seconds, so this module stores every offset the pinned
+/// release states exactly, including `Africa/Monrovia`'s `-0:44:30` until 1972.
+/// The occurrence evidence it is compared against is an `ISO-8601` `+HH:MM` value,
+/// which names no such offset, so a zone carrying one can never have an occurrence
+/// validated against it. That is a limit of the wire, and it is decided by
+/// division with a remainder rather than a rounding rule: no offset is ever
+/// approximated to reach an answer.
+fn is_whole_minute_offset(offset_seconds: i32) -> bool {
+    i64::from(offset_seconds) % SECONDS_PER_MINUTE == 0
+}
+
+/// One pinned offset the minute-valued occurrence wire cannot represent exactly,
 /// with the zone that carries it.
 ///
-/// The refusal names both the zone and the raw second value it actually carries,
-/// so the operator is told which zone is unanswerable and what the exact value
-/// was, rather than being handed a silently truncated minute count.
+/// The canonical unit here is seconds, so the value below is stored and reported
+/// exactly as the table states it. What cannot be represented is the *occurrence*
+/// claim it has to be compared against, because an `ISO-8601` `+HH:MM` offset names
+/// no `-0:44:30`. The refusal therefore names both the zone and the exact second
+/// value it carries, so an operator is told which zone is unanswerable and what the
+/// value was, rather than being handed a rounded offset or a membership answer that
+/// says the table does not carry a zone it does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SubMinuteOffset {
     /// The zone whose pinned timeline carries the unconvertible offset.
     pub zone: &'static str,
-    /// The offset exactly as the table states it, in the table's declared unit.
+    /// The offset exactly as the table states it, in seconds.
     pub offset_seconds: i32,
 }
 
@@ -123,10 +182,12 @@ pub(crate) struct SubMinuteOffset {
 /// caller is told.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ZoneTableError {
-    /// The embedded table bytes are not the pinned digest, or are not readable as
-    /// the pinned format. Every lookup fails closed. This is also the refusal for
-    /// a table whose header does not declare the pinned offset unit: a table that
-    /// does not say which unit its offsets are in is not read on assumption.
+    /// The embedded table bytes are not the pinned digest, are not readable as the
+    /// pinned format, or carry an offset outside
+    /// [`ZONE_TABLE_OFFSET_SECONDS_RANGE`]. Every lookup fails closed. This is also
+    /// the refusal for a table whose header does not declare the pinned offset
+    /// unit: a table that does not say which unit its offsets are in is not read on
+    /// assumption.
     Integrity,
     /// The zone is not a member of the pinned table. A withheld zone, a zone the
     /// pinned release does not define, and an invented spelling are all this.
@@ -134,14 +195,16 @@ pub(crate) enum ZoneTableError {
     /// The instant, or an instant the question needs, is outside the table's
     /// coverage. Nothing is extrapolated.
     OutsideCoverage,
-    /// The zone's pinned timeline carries a UTC offset that is not a whole number
-    /// of canonical minutes, so answering it would mean truncating the offset.
+    /// The zone's pinned timeline carries a UTC offset that is not a whole number of
+    /// minutes, so no `ISO-8601` occurrence offset names it.
     ///
     /// The pinned release applies `Africa/Monrovia` at `-0:44:30` until 1972. That
-    /// offset is real and it is carried in the table, but minutes cannot hold it,
-    /// so the zone is refused by name rather than answered from a rounded value.
-    /// Refusing is the same direction this module always fails: no lookup in this
-    /// table returns a value the pinned release does not apply.
+    /// offset is real and the table carries it exactly, but the occurrence wire
+    /// states offsets as `+HH:MM`, so no occurrence in that zone can be validated.
+    /// The zone is refused by name and with the exact offset rather than answered
+    /// from a rounded value, and rather than reported as a zone the table does not
+    /// carry. Refusing is the same direction this module always fails: no lookup in
+    /// this table returns a value the pinned release does not apply.
     SubMinuteOffset(SubMinuteOffset),
 }
 
@@ -151,31 +214,36 @@ pub(crate) struct ZoneTransition {
     /// UTC instant at which the post-transition offset takes effect.
     pub instant_seconds: i64,
     /// Offset in force immediately before `instant_seconds`.
-    pub pre_offset_minutes: i32,
+    pub pre_offset_seconds: i32,
     /// Offset in force at and after `instant_seconds`.
-    pub post_offset_minutes: i32,
+    pub post_offset_seconds: i32,
 }
 
 /// What a local civil wall clock actually is in a named zone.
+///
+/// Every offset here is in seconds and every local wall clock is read as if it
+/// were UTC, so `local_wall_clock - offset` is the instant that renders it and
+/// `local_wall_clock + offset` is that instant shifted back. Both are plain
+/// differences: no factor, and no conversion anywhere in this type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LocalClockReality {
     /// The local wall clock occurs exactly once.
     Unique {
         /// The only instant that renders this local wall clock.
         instant_seconds: i64,
-        /// The offset that instant carries.
-        offset_minutes: i32,
+        /// The offset that instant carries, in seconds.
+        offset_seconds: i32,
     },
     /// The local wall clock occurs twice; the zone repeated it.
     Fold {
         /// The earlier of the two instants.
         first_instant_seconds: i64,
-        /// Offset carried by `first_instant_seconds`.
-        first_offset_minutes: i32,
+        /// Offset carried by `first_instant_seconds`, in seconds.
+        first_offset_seconds: i32,
         /// The later of the two instants.
         second_instant_seconds: i64,
-        /// Offset carried by `second_instant_seconds`.
-        second_offset_minutes: i32,
+        /// Offset carried by `second_instant_seconds`, in seconds.
+        second_offset_seconds: i32,
         /// The real transition that makes this local wall clock ambiguous.
         transition: ZoneTransition,
     },
@@ -189,19 +257,19 @@ pub(crate) enum LocalClockReality {
         /// The instant that shifted local wall clock resolves to, which is the
         /// table's real post-transition instant.
         resolved_instant_seconds: i64,
-        /// Offset carried by `resolved_instant_seconds`.
-        post_offset_minutes: i32,
+        /// Offset carried by `resolved_instant_seconds`, in seconds.
+        post_offset_seconds: i32,
     },
 }
 
 /// One zone's closed offset timeline: the offset at [`ZONE_TABLE_START_SECONDS`]
 /// followed by one entry per instant where the offset changes.
 ///
-/// Every offset in `events` is in canonical minutes, converted once from the
-/// table's declared wire unit. A zone that carries an offset minutes cannot hold
-/// exactly records that raw second value in `sub_minute_offset_seconds` and keeps
-/// no event derived from it, so its timeline is never partially converted and a
-/// truncation can never reach a lookup.
+/// Every offset in `events` is in seconds, exactly as the table states it, so a
+/// timeline is read with no unit conversion at all. A zone that carries an offset
+/// no `ISO-8601` occurrence offset could name records that exact second value in
+/// `sub_minute_offset_seconds` and keeps no event derived from it, so its timeline
+/// is never partially accumulated and a rounded offset can never reach a lookup.
 struct ZoneTimeline {
     name: &'static str,
     sub_minute_offset_seconds: Option<i32>,
@@ -307,12 +375,15 @@ static PINNED_ZONE_TABLE_STATE: OnceLock<Result<ZoneTable, ZoneTableError>> = On
 
 impl ZoneTable {
     /// Parses the embedded bytes, refusing anything that is not the pinned
-    /// format, the pinned release, the pinned offset unit, or structurally
-    /// inconsistent.
+    /// format, the pinned release, the pinned offset unit, outside the canonical
+    /// offset range, or structurally inconsistent.
     ///
-    /// Every declared header number is re-derived from the body and compared, so
-    /// a header that describes a different table than the one below it is refused
-    /// rather than trusted.
+    /// Every declared header number is re-derived from the body and compared, so a
+    /// header that describes a different table than the one below it is refused
+    /// rather than trusted. Every body offset is checked against
+    /// [`ZONE_TABLE_OFFSET_SECONDS_RANGE`] as it is read, so a body that states its
+    /// offsets in another unit is refused by a rule about the values themselves
+    /// rather than only by the digest over the whole file.
     fn parse(bytes: &'static str) -> Result<Self, ZoneTableError> {
         let mut header = TableHeader::default();
         let mut zones: Vec<ZoneTimeline> = Vec::new();
@@ -373,16 +444,21 @@ impl ZoneTable {
     /// [`Self::is_structurally_sound`], which checks that the first event of every
     /// answered zone is rooted at the coverage start.
     ///
-    /// This is also the one place the wire unit is converted. The conversion is
-    /// exact or it is a refusal: a zone that carries an unconvertible offset keeps
-    /// the raw second value, stops accumulating events, and is refused by name at
-    /// lookup, so its timeline is never half converted and no truncation can reach
-    /// a caller.
+    /// This is the parse boundary, and the offset is kept in the unit the table
+    /// declares, which is the module's canonical unit, so no conversion happens
+    /// here or anywhere else. What *is* decided here is whether the row is
+    /// admissible at all: an offset outside [`ZONE_TABLE_OFFSET_SECONDS_RANGE`] is
+    /// refused as [`ZoneTableError::Integrity`], which is a check on the value
+    /// itself and therefore fires for a table whose rows state their offsets in
+    /// the wrong unit even if the bytes were re-pinned around them.
     fn read_offset_line(zone: &mut ZoneTimeline, line: &str) -> Result<bool, ZoneTableError> {
         let (instant, offset) = line.split_once(' ').ok_or(ZoneTableError::Integrity)?;
         let instant = parse_i64(instant)?;
         let offset_seconds = parse_offset_seconds(offset)?;
         if !(ZONE_TABLE_START_SECONDS..ZONE_TABLE_END_EXCLUSIVE_SECONDS).contains(&instant) {
+            return Err(ZoneTableError::Integrity);
+        }
+        if !ZONE_TABLE_OFFSET_SECONDS_RANGE.contains(&offset_seconds) {
             return Err(ZoneTableError::Integrity);
         }
         if zone
@@ -393,9 +469,9 @@ impl ZoneTable {
         }
         let is_rooting_offset = zone.last_line_instant_seconds.is_none();
         zone.last_line_instant_seconds = Some(instant);
-        if let Some(minutes) = offset_seconds_to_minutes(offset_seconds) {
+        if is_whole_minute_offset(offset_seconds) {
             if zone.sub_minute_offset_seconds.is_none() {
-                zone.events.push((instant, minutes));
+                zone.events.push((instant, offset_seconds));
             }
         } else if zone.sub_minute_offset_seconds.is_none() {
             zone.sub_minute_offset_seconds = Some(offset_seconds);
@@ -418,10 +494,10 @@ impl ZoneTable {
         }) && !zones.windows(2).any(|pair| pair[0].name >= pair[1].name)
     }
 
-    /// Returns the closed timeline of one named zone, in canonical minutes.
+    /// Returns the closed timeline of one named zone, in seconds.
     ///
-    /// A zone the pinned table carries but whose canonical timeline cannot be
-    /// built is refused here, by name and with the raw second value it actually
+    /// A zone the pinned table carries but that no `ISO-8601` occurrence offset can
+    /// name is refused here, by name and with the exact second value it actually
     /// carries. That refusal is deliberately distinct from
     /// [`ZoneTableError::UnknownZone`]: the zone exists in the pinned release, and
     /// reporting it as absent would hide a real zone behind a spelling error.
@@ -440,7 +516,7 @@ impl ZoneTable {
         Ok(found.events.as_slice())
     }
 
-    /// Returns the offset in force at `instant_seconds`, in canonical minutes.
+    /// Returns the offset in force at `instant_seconds`, in seconds.
     fn offset_at(&self, zone: &str, instant_seconds: i64) -> Result<i32, ZoneTableError> {
         if !(ZONE_TABLE_START_SECONDS..ZONE_TABLE_END_EXCLUSIVE_SECONDS).contains(&instant_seconds)
         {
@@ -468,16 +544,16 @@ impl ZoneTable {
 /// fold and a gap: the clock resolves through the offset before the transition,
 /// through the offset after it, or through neither.
 ///
-/// `events` is in canonical minutes, so each offset reaches an instant through
-/// [`SECONDS_PER_MINUTE`].
+/// `events` is in seconds, so both the local wall clock and each offset are already
+/// in the unit of an instant and the candidates are plain differences.
 fn bracketing_transition(events: &[(i64, i32)], local_unix_seconds: i64) -> Option<ZoneTransition> {
     for (index, (instant, post)) in events.iter().enumerate().skip(1) {
         let pre = events[index - 1].1;
         if pre == *post {
             continue;
         }
-        let lower = local_unix_seconds - i64::from(*post) * SECONDS_PER_MINUTE;
-        let upper = local_unix_seconds - i64::from(pre) * SECONDS_PER_MINUTE;
+        let lower = local_unix_seconds - i64::from(*post);
+        let upper = local_unix_seconds - i64::from(pre);
         let (first, last) = if lower <= upper {
             (lower, upper)
         } else {
@@ -486,8 +562,8 @@ fn bracketing_transition(events: &[(i64, i32)], local_unix_seconds: i64) -> Opti
         if first < *instant && *instant <= last {
             return Some(ZoneTransition {
                 instant_seconds: *instant,
-                pre_offset_minutes: pre,
-                post_offset_minutes: *post,
+                pre_offset_seconds: pre,
+                post_offset_seconds: *post,
             });
         }
     }
@@ -506,26 +582,11 @@ fn parse_i64(value: &str) -> Result<i64, ZoneTableError> {
     value.parse::<i64>().map_err(|_| ZoneTableError::Integrity)
 }
 
-/// Parses one offset exactly as the table states it, in its declared unit.
+/// Parses one offset exactly as the table states it, in the unit the header
+/// declares. Whether the value is one this module admits is decided by
+/// [`ZONE_TABLE_OFFSET_SECONDS_RANGE`], not by whether it parses.
 fn parse_offset_seconds(value: &str) -> Result<i32, ZoneTableError> {
     value.parse::<i32>().map_err(|_| ZoneTableError::Integrity)
-}
-
-/// Converts one table offset from the table's declared wire unit into the
-/// canonical internal unit, or returns `None` when it does not divide exactly.
-///
-/// This is the only place the wire unit is converted, and it is called only from
-/// the parse boundary. Dividing is not a rounding rule here: a non-zero remainder
-/// is `None`, so the pinned `Africa/Monrovia` `-0:44:30` reaches no lookup as
-/// `-44` or `-45`. Truncating it would put the same unit defect one layer down,
-/// where a zone's answers would silently disagree with the release the table
-/// claims to carry.
-fn offset_seconds_to_minutes(offset_seconds: i32) -> Option<i32> {
-    let seconds = i64::from(offset_seconds);
-    if seconds % SECONDS_PER_MINUTE != 0 {
-        return None;
-    }
-    i32::try_from(seconds / SECONDS_PER_MINUTE).ok()
 }
 
 /// Returns the verified table, verifying the embedded bytes on first use.
@@ -536,9 +597,12 @@ fn offset_seconds_to_minutes(offset_seconds: i32) -> Option<i32> {
 /// byte-identical data and fail every lookup closed. Folding only `CRLF` leaves
 /// the pinned content exact: any other byte difference, and any data difference,
 /// still fails the check. [`ZoneTable::parse`] additionally re-validates the
-/// format, the release, the window and the declared counts, so the digest is a
-/// pin on the data rather than the only thing standing between the table and a
-/// caller.
+/// format, the release, the window, the declared counts and, per row, the canonical
+/// offset range [`ZONE_TABLE_OFFSET_SECONDS_RANGE`], so the digest is a pin on the
+/// data rather than the only thing standing between the table and a caller. A
+/// mismatch between the declared unit and the values the body states is caught by
+/// that per-row range check, not by the digest: re-pinning the digest around
+/// unit-mismatched bytes does not make them admissible.
 fn pinned_table() -> Result<&'static ZoneTable, ZoneTableError> {
     PINNED_ZONE_TABLE_STATE
         .get_or_init(|| {
@@ -563,14 +627,15 @@ pub(crate) fn is_pinned_zone(zone: &str) -> bool {
     pinned_table().is_ok_and(|table| table.timeline(zone).is_ok())
 }
 
-/// Returns the offset in force in `zone` at `instant_seconds`, in minutes east of
+/// Returns the offset in force in `zone` at `instant_seconds`, in seconds east of
 /// UTC.
 ///
-/// The table stores that offset in seconds; the conversion to minutes happened
-/// once, while the table was parsed. The value returned here is therefore the same
-/// unit as [`crate::user_automation::NormalizedOccurrence::offset_minutes`], and
-/// multiplying it by 60 reaches the instant it applies at.
-pub(crate) fn offset_minutes_at(zone: &str, instant_seconds: i64) -> Result<i32, ZoneTableError> {
+/// This is the table's own unit and this module's canonical unit, so the value
+/// returned here is exactly the number the table states, and
+/// `local_wall_clock - offset` reaches the instant that wall clock renders. The
+/// occurrence record is compared against it after its own `ISO-8601` minute offset
+/// has been converted once, at its own parse boundary.
+pub(crate) fn offset_seconds_at(zone: &str, instant_seconds: i64) -> Result<i32, ZoneTableError> {
     pinned_table()?.offset_at(zone, instant_seconds)
 }
 
@@ -579,10 +644,10 @@ pub(crate) fn offset_minutes_at(zone: &str, instant_seconds: i64) -> Result<i32,
 /// `local_unix_seconds` is the local wall clock read as if it were UTC, which is
 /// the same reading the occurrence record's local field already gives. The
 /// distinct offsets the zone actually uses are tried against it, so the answer
-/// is exact rather than a search for one transition. Those offsets are in
-/// canonical minutes, so each candidate instant is
-/// `local_unix_seconds - offset * SECONDS_PER_MINUTE`: the arithmetic below is
-/// minutes in, seconds out, with no unit smuggled through it.
+/// is exact rather than a search for one transition. Those offsets are in seconds,
+/// the same unit as `local_unix_seconds`, so each candidate instant is a plain
+/// difference: seconds in, seconds out, with no unit smuggled through it and no
+/// factor that could be applied twice.
 pub(crate) fn classify_local_clock(
     zone: &str,
     local_unix_seconds: i64,
@@ -593,7 +658,7 @@ pub(crate) fn classify_local_clock(
 
     let mut candidates: Vec<(i64, i32)> = Vec::new();
     for offset in distinct {
-        let instant = local_unix_seconds - i64::from(offset) * SECONDS_PER_MINUTE;
+        let instant = local_unix_seconds - i64::from(offset);
         if table.offset_at(zone, instant)? == offset {
             candidates.push((instant, offset));
         }
@@ -604,22 +669,20 @@ pub(crate) fn classify_local_clock(
         [] => {
             let transition = bracketing_transition(events, local_unix_seconds)
                 .ok_or(ZoneTableError::OutsideCoverage)?;
-            let resolved =
-                local_unix_seconds - i64::from(transition.pre_offset_minutes) * SECONDS_PER_MINUTE;
-            if table.offset_at(zone, resolved)? != transition.post_offset_minutes {
+            let resolved = local_unix_seconds - i64::from(transition.pre_offset_seconds);
+            if table.offset_at(zone, resolved)? != transition.post_offset_seconds {
                 return Err(ZoneTableError::Integrity);
             }
             Ok(LocalClockReality::Gap {
                 transition,
-                shifted_local_unix_seconds: resolved
-                    + i64::from(transition.post_offset_minutes) * SECONDS_PER_MINUTE,
+                shifted_local_unix_seconds: resolved + i64::from(transition.post_offset_seconds),
                 resolved_instant_seconds: resolved,
-                post_offset_minutes: transition.post_offset_minutes,
+                post_offset_seconds: transition.post_offset_seconds,
             })
         }
         [(instant, offset)] => Ok(LocalClockReality::Unique {
             instant_seconds: *instant,
-            offset_minutes: *offset,
+            offset_seconds: *offset,
         }),
         [
             (first_instant, first_offset),
@@ -629,9 +692,9 @@ pub(crate) fn classify_local_clock(
                 .ok_or(ZoneTableError::OutsideCoverage)?;
             Ok(LocalClockReality::Fold {
                 first_instant_seconds: *first_instant,
-                first_offset_minutes: *first_offset,
+                first_offset_seconds: *first_offset,
                 second_instant_seconds: *second_instant,
-                second_offset_minutes: *second_offset,
+                second_offset_seconds: *second_offset,
                 transition,
             })
         }
