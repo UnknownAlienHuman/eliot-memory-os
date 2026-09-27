@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_runtime_contracts::{
     BackpressureDisposition, BottleneckAvailability, BottleneckCoverageState,
-    BottleneckObservationV1, CapacityBottleneck, I14WorkOutcome, NormalWorkClass,
+    BottleneckObservationV1, I14WorkOutcome, NormalWorkClass,
 };
 
 use crate::FRONT_DOOR_BOTTLENECK;
@@ -383,7 +383,9 @@ pub enum WorkAdmissionRefusal {
 }
 
 impl WorkAdmissionRefusal {
-    fn invalid(error: KernelError) -> Self {
+    /// Maps a Kernel identity-validation failure onto the matching admission
+    /// refusal, so an inadmissible identity never reaches the pool.
+    fn invalid(error: &KernelError) -> Self {
         match error {
             KernelError::InvalidField { field, reason } => Self::InvalidRequest { field, reason },
             KernelError::Foundation(_)
@@ -519,9 +521,9 @@ impl WorkPool {
         now_unix_ms: u64,
     ) -> Result<AdmittedWork, WorkAdmissionRefusal> {
         validate_id(&request.work_id, "work_admission.work_id")
-            .map_err(WorkAdmissionRefusal::invalid)?;
+            .map_err(|error| WorkAdmissionRefusal::invalid(&error))?;
         validate_id(&request.owner, "work_admission.owner")
-            .map_err(WorkAdmissionRefusal::invalid)?;
+            .map_err(|error| WorkAdmissionRefusal::invalid(&error))?;
         if request.bytes == 0 {
             return Err(WorkAdmissionRefusal::InvalidRequest {
                 field: "work_admission.bytes",
@@ -683,6 +685,9 @@ impl AdmittedWork {
     /// its pool.
     pub fn start_running(&mut self) -> Result<(), WorkAdmissionRefusal> {
         let mut records = self.pool.lock();
+        // The pool totals are read from the whole record set, so they are
+        // computed before this unit's own record is borrowed mutably.
+        let (_, _, running) = totals(&records);
         let record = records.get_mut(self.work_id.as_str()).ok_or_else(|| {
             WorkAdmissionRefusal::NotAdmitted {
                 class: self.pool.class,
@@ -695,7 +700,6 @@ impl AdmittedWork {
                 work_id: self.work_id.clone(),
             });
         }
-        let (_, _, running) = totals(&records);
         if running >= self.pool.budget.max_concurrency {
             return Err(self.pool.pool_exhausted(
                 &WorkAdmissionRequest {
