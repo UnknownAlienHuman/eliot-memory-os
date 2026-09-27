@@ -24,7 +24,7 @@
 pub const MIGRATION_MAPPING_INCOMPLETE: &str = "MIGRATION_MAPPING_INCOMPLETE";
 
 /// Origin commit the `source_hash` values below were measured at.
-pub const MIGRATION_LEDGER_PIN_COMMIT: &str = "a9a61cfdd3458bdde929b14039920ad09454948d";
+pub const MIGRATION_LEDGER_PIN_COMMIT: &str = "f8811c6f497b19155bd62dea463ae86a3ae35c9c";
 
 /// Per-object migration disposition (`I19.16` `MigrationDisposition`).
 ///
@@ -75,6 +75,32 @@ pub enum ObjectDisposition {
     /// No proven replacement yet; retirement is blocked for this scope.
     Unresolved,
 }
+
+impl ObjectDisposition {
+    /// Recorded disposition word, used in guard failure text.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Migrated => "MIGRATED",
+            Self::Merged => "MERGED",
+            Self::Superseded => "SUPERSEDED",
+            Self::Archived => "ARCHIVED",
+            Self::Rejected => "REJECTED",
+            Self::Unresolved => "UNRESOLVED",
+        }
+    }
+}
+
+/// Closed `I19.16` disposition vocabulary. The startup guard rejects any row
+/// whose disposition is not a member, so extending the enum without updating
+/// this table fails closed instead of silently widening the vocabulary.
+const ALL_OBJECT_DISPOSITIONS: &[ObjectDisposition] = &[
+    ObjectDisposition::Migrated,
+    ObjectDisposition::Merged,
+    ObjectDisposition::Superseded,
+    ObjectDisposition::Archived,
+    ObjectDisposition::Rejected,
+    ObjectDisposition::Unresolved,
+];
 
 /// The full per-object ledger: every active top-level source object of
 /// the four aggregate crates, each with exactly one disposition.
@@ -2102,6 +2128,13 @@ pub const MIGRATION_LEDGER: &[MigrationDisposition] = &[
 /// [`MIGRATION_MAPPING_INCOMPLETE`] blocking code so retirement stays
 /// blocked for exactly the affected scope. Any violation aborts startup.
 pub fn migration_ledger_guard() -> Result<(), String> {
+    if MIGRATION_LEDGER_PIN_COMMIT.len() != 40
+        || !MIGRATION_LEDGER_PIN_COMMIT
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("migration ledger pin commit is not a commit id".to_owned());
+    }
     if MIGRATION_LEDGER.is_empty() {
         return Err("migration ledger names no objects; W2 evidence is missing".to_owned());
     }
@@ -2126,12 +2159,20 @@ pub fn migration_ledger_guard() -> Result<(), String> {
                 row.source_object,
             ));
         }
+        if !ALL_OBJECT_DISPOSITIONS.contains(&row.disposition) {
+            return Err(format!(
+                "migration ledger row {} carries a disposition outside the closed vocabulary",
+                row.source_object,
+            ));
+        }
         let unresolved = row.disposition == ObjectDisposition::Unresolved;
         let blocked = row.cutover_receipt == MIGRATION_MAPPING_INCOMPLETE;
         if unresolved != blocked {
             return Err(format!(
-                "migration ledger row {} must carry the blocking code exactly while unresolved",
+                "migration ledger row {} carries disposition {} but receipt {}; unresolved rows must carry the blocking code",
                 row.source_object,
+                row.disposition.as_str(),
+                row.cutover_receipt,
             ));
         }
         if !unresolved && row.target_hash == "unresolved" {
