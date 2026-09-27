@@ -289,6 +289,8 @@ impl KernelComposition {
         match view.lifecycle() {
             ProcessLifecycle::Exited | ProcessLifecycle::Failed | ProcessLifecycle::Reconciled => {
                 self.reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                    .await?;
+                self.close_restarted_daemon_descendant(gateway, &owner, receipt)
                     .await
             }
             ProcessLifecycle::Running => {
@@ -318,6 +320,8 @@ impl KernelComposition {
                     ));
                 }
                 self.reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                    .await?;
+                self.close_restarted_daemon_descendant(gateway, &owner, receipt)
                     .await
             }
             ProcessLifecycle::Created
@@ -328,6 +332,25 @@ impl KernelComposition {
                 "eliotd previous process is not in a known terminal state".to_owned(),
             )),
         }
+    }
+
+    /// Produces the descendant-closure receipt for one restarted daemon
+    /// generation as durable audit evidence (CHILD-1/CHILD-2, #1918). The
+    /// restart proof above already established tree closure; a close fault
+    /// here fails the restart instead of asserting an unrecorded closure.
+    #[cfg(windows)]
+    async fn close_restarted_daemon_descendant(
+        &self,
+        gateway: &std::sync::Arc<super::process_execution::ProcessExecutionGateway>,
+        owner: &ProcessOwnerBinding,
+        receipt: &ProcessStartReceipt,
+    ) -> Result<(), KernelBuildError> {
+        let closure = gateway
+            .close_registered_descendant(owner, receipt.operation_id().clone())
+            .await
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        self.audit_observe(AuditEventDraft::descendant_closure(&closure));
+        Ok(())
     }
 
     /// Reconciles one already-closed supervised `eliotd` generation by its
