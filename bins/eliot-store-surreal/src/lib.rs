@@ -1298,6 +1298,23 @@ pub fn admit_handshake(
 /// never normalized or fallen back. The recovered authority bytes cannot ride
 /// the frozen `StoreRequest` shape further; authority-byte flow to the plan
 /// uses [`StoreComposition::apply_with_authority`].
+///
+/// # W4: the decoded channel is verified here, but no production frame
+/// # carries it (issue #10)
+///
+/// The `_` in the decode below discards the channel, and on the current
+/// `origin/main` (item 4 determination) that is not a silent hole: the rebind
+/// already ran inside [`decode_request_frame_with_authority`] for any frame
+/// that carries the channel, and it fails closed there before dispatch. The
+/// reason no production frame carries it is that the sole production store
+/// frame builder,
+/// `crates/kernel/eliot-kernel-service/src/store_exchange.rs`, calls
+/// `eliot_store_api::request_frame` rather than
+/// `eliot_store_api::request_frame_with_payload_authority`; that crate is
+/// outside issue #10's storage scope, so no producer is added here. The
+/// production losslessness mechanism and its reachable check are recorded on
+/// `eliot_store_surreal_adapter::client::json_codec` and in
+/// `validate_evidence_record`.
 pub fn validate_request_frame(
     session: &mut StoreEbpSession,
     frame: &Frame,

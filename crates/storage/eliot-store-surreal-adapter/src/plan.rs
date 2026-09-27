@@ -358,6 +358,15 @@ fn payload_authority_records(
 /// parameters is the exact recoverable representation (the legacy path has no
 /// original bytes, only the admitted `Value`). A missing or blank subject
 /// fails closed here instead of persisting an unselectable record.
+///
+/// Issue #10 item 4 (W4): this is the production path's exact-byte
+/// representation, and it is reached on *both* branches of
+/// [`plan_apply_with_payload_authority`] with the all-`None` vector that the
+/// sole production composition entry `StoreComposition::apply` supplies, so
+/// the current named-operation write path does persist versioned,
+/// digest-bound exact bytes for every capture. The vendor coercion boundary
+/// and the read-side re-verification are documented on
+/// `crate::client::json_codec`.
 fn evidence_records(
     transition: &PreparedTransition,
     authorities: &[Option<ExactJsonBytes>],
