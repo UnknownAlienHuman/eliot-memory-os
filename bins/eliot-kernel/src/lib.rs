@@ -2860,7 +2860,7 @@ impl KernelComposition {
     pub(crate) fn admit_material_process_start(
         &self,
         admission: &eliot_process::ProcessExecutionAdmissionRequest,
-    ) -> Result<(), KernelServiceError> {
+    ) -> Result<eliot_kernel_service::HostKernelCandidateBinding, KernelServiceError> {
         let target_generation =
             eliot_contracts::ResourceGeneration::new(admission.state_fence().generation().get())
                 .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
@@ -2868,7 +2868,25 @@ impl KernelComposition {
             admission.state_fence().authority_epoch().clone(),
             target_generation,
         );
-        self.admit_material_authority_for_fence(GovernanceProfile::full(), &target_fence)
+        let candidate = self.validate_material_target_fence(&target_fence)?;
+        if !matches!(
+            GovernanceProfile::full().ceiling(),
+            AuthorityCeiling::Material | AuthorityCeiling::Critical
+        ) {
+            return Err(KernelServiceError::Platform(
+                "material authority refused: governance profile does not permit Material effects"
+                    .to_owned(),
+            ));
+        }
+        self.verify_watchdog_supervision_branch(&candidate, &target_fence)
+            .map_err(|reason| {
+                KernelServiceError::Platform(format!(
+                    "{}: {reason}; Material/Critical work is paused under runtime-degraded-v3 and requires the explicit Human-risk path",
+                    eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
+                ))
+            })?;
+        self.validate_candidate_process_binding(&candidate)?;
+        Ok(candidate)
     }
 
     /// Records one real owner-produced I1.11 evidence item. Out-of-order

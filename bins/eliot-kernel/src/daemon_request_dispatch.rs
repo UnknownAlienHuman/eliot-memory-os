@@ -7427,13 +7427,14 @@ impl KernelComposition {
             generation,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        self.admit_material_process_start(&admission)
+        let outer_binding = self
+            .admit_material_process_start(&admission)
             .map_err(|_| TransportError::SessionFenced)?;
         let proof = self
             .retain_process_path_proof(&admission)
             .map_err(|_| TransportError::SessionFenced)?;
         gateway
-            .start(&owner, admission, proof)
+            .start(&owner, admission, proof, outer_binding)
             .await
             .map_err(|_| TransportError::SessionFenced)
     }

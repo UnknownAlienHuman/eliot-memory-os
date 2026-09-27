@@ -2770,13 +2770,13 @@ async fn spawn_ready_child(
     };
     let owner = launch_owner_binding(kind, inputs.authority_epoch, inputs.generation)?;
     // Material/Critical process start: exact admission-derived target fence.
-    kernel
+    let outer_binding = kernel
         .admit_material_process_start(&admission)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let proof = kernel
         .retain_process_path_proof(&admission)
         .map_err(|error| DispatchLaunchError::Path(error.to_string()))?;
-    match gateway.start(&owner, admission, proof).await {
+    match gateway.start(&owner, admission, proof, outer_binding).await {
         Ok(receipt) => Ok(SpawnOutcome::Started(Box::new(receipt))),
         Err(ProcessExecutionError::UnknownOutcome) => {
             Ok(SpawnOutcome::Unknown(operation_id.clone()))

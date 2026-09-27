@@ -352,6 +352,7 @@ impl ProcessStartPorts for GatewayTestPorts {
         &self,
         _owner: &ProcessOwnerBinding,
         request: Self::Request,
+        _outer_binding: Option<&eliot_kernel_service::HostKernelCandidateBinding>,
     ) -> Result<Self::Receipt, ProcessExecutionError> {
         let pause = {
             let mut state = self.state.lock().expect("test state");
@@ -449,7 +450,7 @@ async fn actual_process_start_orchestration_proves_canonical_ordering() {
     let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
     let owner = gateway_test_owner();
     let admission = gateway_test_admission("gateway-positive");
-    let receipt = run_process_start(&ports, &owner, admission, ())
+    let receipt = run_process_start(&ports, &owner, admission, (), None)
         .await
         .expect("start");
     assert_eq!(receipt.operation_id.as_str(), "gateway-positive");
@@ -504,6 +505,7 @@ async fn stale_completed_restart_never_replays_and_new_attempt_starts_fresh() {
         &owner,
         gateway_test_admission(old_operation.as_str()),
         (),
+        None,
     )
     .await
     .expect("old attempt start");
@@ -513,6 +515,7 @@ async fn stale_completed_restart_never_replays_and_new_attempt_starts_fresh() {
             &owner,
             gateway_test_admission(old_operation.as_str()),
             (),
+            None,
         )
         .await
         .is_err(),
@@ -524,6 +527,7 @@ async fn stale_completed_restart_never_replays_and_new_attempt_starts_fresh() {
         &owner,
         gateway_test_admission(restarted_operation.as_str()),
         (),
+        None,
     )
     .await
     .expect("restarted Kernel gets a fresh exact attempt");
@@ -557,7 +561,7 @@ async fn actual_process_start_orchestration_fails_closed_and_releases_reserved()
         let owner = gateway_test_owner();
         let admission = gateway_test_admission(&format!("gateway-{name}"));
         assert!(
-            run_process_start(&ports, &owner, admission.clone(), ())
+            run_process_start(&ports, &owner, admission.clone(), (), None)
                 .await
                 .is_err()
         );
@@ -584,7 +588,7 @@ async fn actual_process_start_context_failure_explicitly_aborts_and_maps_abort_f
     let owner = gateway_test_owner();
     let admission = gateway_test_admission("gateway-context-failure");
     assert!(matches!(
-        run_process_start(&ports, &owner, admission.clone(), ()).await,
+        run_process_start(&ports, &owner, admission.clone(), (), None).await,
         Err(ProcessExecutionError::UnknownOutcome)
     ));
     assert_eq!(ports.counts(), (1, 0, 0, 0, 0));
@@ -610,7 +614,7 @@ async fn actual_process_start_context_failure_explicitly_aborts_and_maps_abort_f
     ));
     ports.allow_context();
     assert!(
-        run_process_start(&ports, &owner, admission, ())
+        run_process_start(&ports, &owner, admission, (), None)
             .await
             .is_ok(),
         "exact retry after explicit release"
@@ -631,6 +635,7 @@ async fn actual_process_start_orchestration_isolated_for_concurrent_and_duplicat
             &first_owner,
             gateway_test_admission("gateway-concurrent-a"),
             (),
+            None,
         )
         .await
     });
@@ -642,6 +647,7 @@ async fn actual_process_start_orchestration_isolated_for_concurrent_and_duplicat
             &second_owner,
             gateway_test_admission("gateway-concurrent-b"),
             (),
+            None,
         )
         .await
     });
@@ -658,10 +664,17 @@ async fn actual_process_start_orchestration_isolated_for_concurrent_and_duplicat
     let duplicate_ports = paused.clone();
     let duplicate_owner = owner.clone();
     let first = tokio::spawn(async move {
-        run_process_start(&duplicate_ports, &duplicate_owner, first_admission, ()).await
+        run_process_start(
+            &duplicate_ports,
+            &duplicate_owner,
+            first_admission,
+            (),
+            None,
+        )
+        .await
     });
     paused.wait_contexts(1).await;
-    let duplicate = run_process_start(&paused, &owner, duplicate_admission, ()).await;
+    let duplicate = run_process_start(&paused, &owner, duplicate_admission, (), None).await;
     assert!(matches!(
         duplicate,
         Err(ProcessExecutionError::UnknownOutcome)
@@ -686,6 +699,7 @@ async fn actual_process_start_orchestration_abort_cleans_exact_context_path_and_
             &task_owner,
             gateway_test_admission("gateway-cancelled"),
             (),
+            None,
         )
         .await
     });
@@ -703,6 +717,7 @@ async fn actual_process_start_orchestration_abort_cleans_exact_context_path_and_
             &owner,
             gateway_test_admission("gateway-cancelled"),
             (),
+            None,
         )
         .await
         .is_ok()
