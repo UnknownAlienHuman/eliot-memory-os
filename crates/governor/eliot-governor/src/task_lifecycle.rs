@@ -241,9 +241,10 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         source_heads: crate::campaign_task_sources::TaskControllerCampaignSourceHeads,
     ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
         self.check_proposal_identity(identity, &proposal)?;
+        let task_id = proposal.task_id.clone();
         let mut scratch = self.task.clone();
-        let event = scratch.propose(proposal.clone())?;
-        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+        let event = scratch.propose(proposal)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
             TaskLifecycleError::Serialization(
                 "task record is missing after the admitted proposal".to_owned(),
             )
@@ -253,7 +254,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
             identity,
-            operation_id.clone(),
+            operation_id,
             &event,
             &record,
             1,
@@ -278,9 +279,10 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         owner_publications: Vec<CampaignSourcePublication>,
     ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
         self.check_proposal_identity(identity, &proposal)?;
+        let task_id = proposal.task_id.clone();
         let mut scratch = self.task.clone();
-        let event = scratch.propose(proposal.clone())?;
-        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+        let event = scratch.propose(proposal)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
             TaskLifecycleError::Serialization(
                 "task record is missing after the admitted proposal".to_owned(),
             )
@@ -291,7 +293,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
             identity,
-            operation_id.clone(),
+            operation_id,
             &event,
             &record,
             1,
@@ -320,7 +322,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
             identity,
-            operation_id.clone(),
+            operation_id,
             &event,
             &record,
             expected_revision,
@@ -351,7 +353,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
             identity,
-            operation_id.clone(),
+            operation_id,
             &event,
             &record,
             expected_revision,
