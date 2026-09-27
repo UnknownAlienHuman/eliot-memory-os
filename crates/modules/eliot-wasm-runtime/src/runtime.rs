@@ -843,21 +843,32 @@ fn classify_engine_report(
             Some(report.usage),
         );
     }
-    if matches!(report.termination, EngineTermination::Completed)
-        && (derived.result_digest != admission.promotion.expected_result_digest
-            || derived.effect_digest != admission.promotion.expected_effect_digest
-            || derived.state_delta_digest != admission.promotion.expected_state_delta_digest)
-    {
-        return InvocationResult::classified(
-            request,
-            InvocationDisposition::Rejected,
-            Some(RuntimeError::DifferentialMismatch),
-            None,
-            Vec::new(),
-            None,
-            Some(admission.governor.manifest.engine.clone()),
-            Some(report.usage),
-        );
+    // The sealed-reference legs are decided by their single owner,
+    // `classify_reference_divergence` — the same classifier
+    // `WasmRuntime::divergence_report` reads back. The set this branch enforces
+    // and the set the explicit divergence report explains are therefore one
+    // expression, so a leg added to the classifier cannot be reported without
+    // being enforced (or enforced without being reported). Only a completed
+    // termination is compared: its error class is `Ok` by construction, so
+    // result, proposed effects, and observed state delta are the whole
+    // semantic content of the execution.
+    if matches!(report.termination, EngineTermination::Completed) {
+        let reference_divergence = classify_reference_divergence(&derived, &admission.promotion);
+        if !(reference_divergence.result_match
+            && reference_divergence.effects_match
+            && reference_divergence.state_delta_match)
+        {
+            return InvocationResult::classified(
+                request,
+                InvocationDisposition::Rejected,
+                Some(RuntimeError::DifferentialMismatch),
+                None,
+                Vec::new(),
+                None,
+                Some(admission.governor.manifest.engine.clone()),
+                Some(report.usage),
+            );
+        }
     }
     let usage = report.usage.clone();
     let (disposition, error, output, effects, state_delta) =
