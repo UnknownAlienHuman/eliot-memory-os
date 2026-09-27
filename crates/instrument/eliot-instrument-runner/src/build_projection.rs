@@ -1094,10 +1094,10 @@ pub fn restrict_agent_argv(
     argv: &[String],
     origin: CargoOrigin<'_>,
 ) -> Result<Vec<String>, BuildProjectionError> {
-    if let CargoOrigin::Projected(build) = origin {
-        if argv != build.argv.as_slice() {
-            return Err(BuildProjectionError::ProjectedMismatch);
-        }
+    if let CargoOrigin::Projected(build) = origin
+        && argv != build.argv.as_slice()
+    {
+        return Err(BuildProjectionError::ProjectedMismatch);
     }
     if argv.first().is_none_or(|first| first != "cargo") {
         return Err(BuildProjectionError::NotCargo);
