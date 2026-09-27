@@ -15,7 +15,7 @@ use eliot_types::{
     MemoryPressureReport, OPERATOR_IPC_PROTOCOL_VERSION, OPERATOR_SCHEMA_VERSION, OperationsCheck,
     OperationsDoctorReport, PathRef, ProductionCutoverManifest, ProjectId, RedactionProfile,
     RestoreCheck, RestoreMode, RestorePlan, RestoreReceipt, RestoreReport, RestoreRollbackReceipt,
-    RestoreStatus, SCHEMA_VERSION, SemanticCommand, SourceSnapshotInput, TaintClass, TaskId,
+    RestoreStatus, SemanticCommand, SourceSnapshotInput, TaintClass, TaskId,
     ToolObservationRecordCommand, VerificationId, VerificationRecordCommand, VerificationResult,
     VerificationRunInput, Visibility, WriteId, WriteReceiptRef, operator_contract_hash,
 };
@@ -1901,11 +1901,6 @@ impl DoctorService {
         let active_owner_pids = active_runtime_owner_pids(&self.root);
         let latest_backup_age = read_json_if_exists::<BackupManifest>(&latest_manifest)?
             .map(|manifest| (OffsetDateTime::now_utc() - manifest.created_at).whole_seconds());
-        let config_schema_ready =
-            fs::read_to_string(self.repo_root.join("config").join("eliot-governor.toml"))
-                .is_ok_and(|content| {
-                    content.contains(&format!("schema_version = \"{SCHEMA_VERSION}\""))
-                });
         let operator_contract_ready = operator_contract_source_matches(&self.repo_root);
         let unreceipted_imports = unreceipted_import_count(&self.root)?;
         let route_health = endpoint_route_health(&surreal.endpoint);
@@ -1981,12 +1976,6 @@ impl DoctorService {
                 } else {
                     "no latest backup exists yet".to_owned()
                 },
-            },
-            OperationsCheck {
-                name: "schema_contract".to_owned(),
-                passed: config_schema_ready,
-                blocking: true,
-                message: format!("expected schema_version={SCHEMA_VERSION}"),
             },
             OperationsCheck {
                 name: "operator_protocol_contract".to_owned(),
