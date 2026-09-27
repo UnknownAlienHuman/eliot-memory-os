@@ -67,6 +67,19 @@ pub const WASM_HOST_SERVED_FILE_NAME: &str = "eliot-wasm-host.served.json";
 /// name, overwritten by every claim: no accumulation is possible, and a
 /// stale marker (naming a replaced set) never matches the staged identity.
 pub const WASM_HOST_INFLIGHT_FILE_NAME: &str = "eliot-wasm-host.inflight.json";
+/// Durable terminal-result record (#2786 step 7): written atomically after the
+/// served marker above is durable and before physical reclaim, retired only
+/// with its own fully gone set. A crash between publish and reclaim leaves the
+/// exact terminal frame beside the staged bytes, so restart reconciles
+/// terminal-unacknowledged state by returning the original retained result
+/// instead of an identity-only error. Single fixed name, overwritten by every
+/// serve: no accumulation is possible, and a stale record (naming a replaced
+/// set) never matches the staged identity.
+pub const WASM_HOST_SERVED_RESULT_FILE_NAME: &str = "eliot-wasm-host.served-result.json";
+/// Served-result record allocation guard: the retained terminal frame already
+/// fits the governed result budget, and the identity wrapper adds a few
+/// hundred bytes; anything larger is refused before parsing, never truncated.
+pub const SERVED_RESULT_MAX_BYTES: usize = 128 * 1024;
 /// Material envelope wire identity, matched exactly with the publisher.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
 /// Material envelope wire version, matched exactly with the publisher.
@@ -1568,6 +1581,18 @@ pub fn reclaim_claimed_delivery(
     {
         let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_FILE_NAME));
     }
+    // The served-result record retires under the same rule: only with its
+    // own fully gone set, and only when it names exactly this identity. A
+    // partial reclamation keeps the exact retained frame for recovery, and
+    // a record naming another identity is never touched here.
+    if reclamation_gone(&artifact)
+        && reclamation_gone(&input)
+        && reclamation_gone(&material)
+        && let Ok(Some(record)) = read_served_result(install_dir)
+        && record.names(claim.identity())
+    {
+        let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME));
+    }
     ClaimedReclamation::Reclaimed(DeliveryReclamation {
         identity: claim.identity().clone(),
         artifact,
@@ -1876,6 +1901,137 @@ pub fn clear_inflight_marker(
         Ok(Some(_) | None) => true,
         Err(_) => false,
     }
+}
+
+/// Durable terminal-result record: the exact terminal frame this drive served,
+/// bound to its served identity. Decisions match on identity only (see
+/// [`names`](ServedResultRecord::names)); `retained_at_unix_ms` is
+/// informational (wall-clock at write, never a derivation input). The frame
+/// stays an opaque JSON value here: typed interpretation belongs to the
+/// request-loop driver that owns the frame contract, so this module never
+/// depends on driver types.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServedResultRecord {
+    /// Served operation identity.
+    pub operation_id: String,
+    /// Served generation.
+    pub generation: u64,
+    /// Served claim identity.
+    pub claim_id: String,
+    /// Served grant digest (hex).
+    pub grant_digest: String,
+    /// Wall-clock milliseconds when the record was written.
+    pub retained_at_unix_ms: u64,
+    /// Exact retained terminal frame JSON.
+    pub frame: serde_json::Value,
+}
+
+impl ServedResultRecord {
+    /// Captures the served-result record for one claimed identity and frame.
+    #[must_use]
+    pub fn from_identity(
+        identity: &StagedDeliveryIdentity,
+        frame: &serde_json::Value,
+        retained_at_unix_ms: u64,
+    ) -> Self {
+        Self {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+            grant_digest: identity.grant_digest.clone(),
+            retained_at_unix_ms,
+            frame: frame.clone(),
+        }
+    }
+
+    /// Whether this record names exactly the staged identity.
+    #[must_use]
+    pub fn names(&self, identity: &StagedDeliveryIdentity) -> bool {
+        self.operation_id == identity.operation_id
+            && self.generation == identity.generation
+            && self.claim_id == identity.claim_id
+            && self.grant_digest == identity.grant_digest
+    }
+}
+
+/// Reads the durable served-result record, if any. Only an absent record
+/// answers `Ok(None)`; read failures, oversize files, and malformed records
+/// fail closed so callers cannot treat uncertain retained state as a fresh
+/// delivery or as another identity's result.
+pub fn read_served_result(
+    install_dir: &std::path::Path,
+) -> Result<Option<ServedResultRecord>, MaterialError> {
+    let path = install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.len() > SERVED_RESULT_MAX_BYTES as u64 => {
+            return Err(MaterialError::TooLarge);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    }
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(MaterialError::Unreadable(other.kind().to_string())),
+                Ok(_) => Err(MaterialError::Unreadable(error.kind().to_string())),
+            };
+        }
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    };
+    let mut bounded = std::io::Read::take(file, (SERVED_RESULT_MAX_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    if bytes.len() > SERVED_RESULT_MAX_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    let record: ServedResultRecord =
+        serde_json::from_slice(&bytes).map_err(|_| MaterialError::Malformed)?;
+    if record.operation_id.trim().is_empty()
+        || record.claim_id.trim().is_empty()
+        || record.generation == 0
+    {
+        return Err(MaterialError::Malformed);
+    }
+    hex_digest(&record.grant_digest, "served-result-grant-digest")?;
+    Ok(Some(record))
+}
+
+/// Writes the served-result record atomically (process-scoped partial,
+/// flushed, then renamed): the reader never observes partial JSON. The
+/// record must fit [`SERVED_RESULT_MAX_BYTES`]; an oversize frame fails here
+/// rather than truncating. Callers must propagate a write failure and retain
+/// the claimed set for recovery.
+pub fn write_served_result(
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+    frame: &serde_json::Value,
+    retained_at_unix_ms: u64,
+) -> std::io::Result<()> {
+    let record = ServedResultRecord::from_identity(identity, frame, retained_at_unix_ms);
+    let bytes =
+        serde_json::to_vec(&record).map_err(|error| std::io::Error::other(error.to_string()))?;
+    if bytes.len() > SERVED_RESULT_MAX_BYTES {
+        return Err(std::io::Error::other("served-result-too-large"));
+    }
+    let partial = install_dir.join(format!(
+        ".{}.{}.partial",
+        WASM_HOST_SERVED_RESULT_FILE_NAME,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&partial);
+    std::fs::write(&partial, &bytes)?;
+    std::fs::File::open(&partial)?.sync_all()?;
+    std::fs::rename(
+        &partial,
+        install_dir.join(WASM_HOST_SERVED_RESULT_FILE_NAME),
+    )?;
+    Ok(())
 }
 
 /// Whether one staged file is gone: removed by this reclaim, or already
