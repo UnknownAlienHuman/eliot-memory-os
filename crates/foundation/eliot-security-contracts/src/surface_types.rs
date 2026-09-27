@@ -36,6 +36,401 @@ pub struct SourceAssurance {
     pub state_fence: StateFence,
 }
 
+/// Bounded metadata for one assessed source revision and declared scope.
+///
+/// The digest identifies bytes supplied by the caller; this contract does not
+/// retrieve or independently authenticate those bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssessedSourceRevision {
+    pub source_ref: String,
+    pub revision: String,
+    /// Lowercase SHA-256 of the exact source representation assessed.
+    pub digest: String,
+    pub scope: SourceAssessmentScope,
+}
+
+/// Declared included and excluded scope for an assessment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceAssessmentScope {
+    pub scope_ref: String,
+    pub included_refs: Vec<String>,
+    pub excluded_refs: Vec<String>,
+    pub coverage: AssessmentCoverage,
+}
+
+/// Assessment record with independent observations separated from model claims.
+///
+/// This is an evidence and interpretation shape only. It assigns no semantic
+/// truth, quarantine state, incident status, capability, or execution authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSecurityAssessment {
+    pub assessment_ref: String,
+    pub source: AssessedSourceRevision,
+    /// Existing source use, taint, privacy, and effect constraints for this
+    /// observation. Assessment content does not widen these constraints.
+    pub source_assurance: SourceAssurance,
+    /// Features recorded by an independent observation or deterministic rule.
+    pub observed_features: Vec<ObservedSourceFeature>,
+    /// Interpretations proposed by a model, kept distinct from observations.
+    pub model_interpretations: Vec<ModelProposedInterpretation>,
+}
+
+/// Closed inventory of dimensions that a source assessment may describe.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AssessmentDimension {
+    Identity,
+    Integrity,
+    InstructionInjectionRisk,
+    DeceptionRisk,
+    ExfiltrationRisk,
+    PersistenceRisk,
+    SuspiciousPattern,
+    AffectedCapability,
+    SuggestedQuarantine,
+    RequiredProbe,
+    Confidence,
+    Limitation,
+}
+
+const REQUIRED_ASSESSMENT_DIMENSIONS: [AssessmentDimension; 12] = [
+    AssessmentDimension::Identity,
+    AssessmentDimension::Integrity,
+    AssessmentDimension::InstructionInjectionRisk,
+    AssessmentDimension::DeceptionRisk,
+    AssessmentDimension::ExfiltrationRisk,
+    AssessmentDimension::PersistenceRisk,
+    AssessmentDimension::SuspiciousPattern,
+    AssessmentDimension::AffectedCapability,
+    AssessmentDimension::SuggestedQuarantine,
+    AssessmentDimension::RequiredProbe,
+    AssessmentDimension::Confidence,
+    AssessmentDimension::Limitation,
+];
+
+/// Closed value vocabulary for assessment dimensions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum AssessmentValue {
+    Identity(IdentityAssurance),
+    Integrity(IntegrityStatus),
+    InstructionInjectionRisk(RiskSignal),
+    DeceptionRisk(RiskSignal),
+    ExfiltrationRisk(RiskSignal),
+    PersistenceRisk(RiskSignal),
+    SuspiciousPattern(SuspiciousPattern),
+    AffectedCapability(String),
+    SuggestedQuarantine(QuarantineState),
+    RequiredProbe(String),
+    Confidence(AssessmentConfidence),
+    Limitation(String),
+    Unknown(AssessmentDimension),
+}
+
+/// Bounded identity evidence classification; it does not establish identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IdentityAssurance {
+    Attributed,
+    Unverified,
+    Conflicted,
+    Unknown,
+}
+
+/// Signal state without numeric policy thresholds or a truth conclusion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RiskSignal {
+    Observed,
+    NotObserved,
+    Unknown,
+}
+
+/// Suspicious-pattern classes recorded as features, not as semantic findings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SuspiciousPattern {
+    InstructionOverride,
+    AuthorityImpersonation,
+    SecretSolicitation,
+    DataExfiltrationRequest,
+    PersistenceRequest,
+    Obfuscation,
+    Other,
+}
+
+/// Qualitative confidence label; it has no policy threshold semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AssessmentConfidence {
+    Low,
+    Moderate,
+    High,
+    Unknown,
+}
+
+/// Closed coverage/unknown status required for each individual dimension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AssessmentCoverage {
+    Complete,
+    Partial,
+    Unknown,
+    NotApplicable,
+}
+
+/// Interval on an explicitly named source-local clock or revision sequence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssessmentInterval {
+    pub timebase_ref: String,
+    pub start: u64,
+    pub end: Option<u64>,
+}
+
+/// Provenance for a feature recorded independently of a model interpretation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedFeatureOrigin {
+    pub observer_ref: String,
+    pub observation_revision: String,
+    /// Present only when a deterministic rule contributed to the observation.
+    pub rule_ref: Option<String>,
+    /// Present only when a deterministic rule contributed to the observation.
+    pub rule_revision: Option<String>,
+}
+
+/// One independently recorded feature with dimension-local provenance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSourceFeature {
+    pub value: AssessmentValue,
+    pub origin: ObservedFeatureOrigin,
+    pub evidence_handles: Vec<String>,
+    pub observed_interval: AssessmentInterval,
+    pub applicable_interval: AssessmentInterval,
+    pub coverage: AssessmentCoverage,
+}
+
+/// Model provenance. This shape has no rule identity or deterministic flag.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelInterpretationOrigin {
+    pub model_ref: String,
+    pub model_revision: String,
+    pub profile_revision: String,
+}
+
+/// One model-proposed interpretation with dimension-local evidence and limits.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelProposedInterpretation {
+    pub value: AssessmentValue,
+    pub origin: ModelInterpretationOrigin,
+    pub evidence_handles: Vec<String>,
+    pub observed_interval: AssessmentInterval,
+    pub applicable_interval: AssessmentInterval,
+    pub coverage: AssessmentCoverage,
+}
+
+fn assessment_text(value: &str, field: &'static str) -> Result<(), crate::SecurityContractError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(crate::SecurityContractError::InvalidText { field });
+    }
+    Ok(())
+}
+
+fn assessment_digest(value: &str) -> Result<(), crate::SecurityContractError> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(crate::SecurityContractError::InvalidText {
+            field: "source.digest",
+        });
+    }
+    Ok(())
+}
+
+fn assessment_refs(
+    values: &[String],
+    field: &'static str,
+) -> Result<(), crate::SecurityContractError> {
+    if values.is_empty() {
+        return Err(crate::SecurityContractError::EmptyCollection { field });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        assessment_text(value, field)?;
+        if !seen.insert(value) {
+            return Err(crate::SecurityContractError::DuplicateReference { field });
+        }
+    }
+    Ok(())
+}
+
+impl AssessmentInterval {
+    /// Validates an ordered interval within its declared timebase.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the timebase is blank or the end precedes the start.
+    pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
+        assessment_text(&self.timebase_ref, "assessment_interval.timebase_ref")?;
+        if self.end.is_some_and(|end| end < self.start) {
+            return Err(crate::SecurityContractError::InvalidText {
+                field: "assessment_interval.order",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_assessment_value(value: &AssessmentValue) -> Result<(), crate::SecurityContractError> {
+    match value {
+        AssessmentValue::AffectedCapability(reference)
+        | AssessmentValue::RequiredProbe(reference)
+        | AssessmentValue::Limitation(reference) => assessment_text(reference, "assessment.value"),
+        _ => Ok(()),
+    }
+}
+
+fn assessment_value_dimension(value: &AssessmentValue) -> AssessmentDimension {
+    match value {
+        AssessmentValue::Identity(_) => AssessmentDimension::Identity,
+        AssessmentValue::Integrity(_) => AssessmentDimension::Integrity,
+        AssessmentValue::InstructionInjectionRisk(_) => {
+            AssessmentDimension::InstructionInjectionRisk
+        }
+        AssessmentValue::DeceptionRisk(_) => AssessmentDimension::DeceptionRisk,
+        AssessmentValue::ExfiltrationRisk(_) => AssessmentDimension::ExfiltrationRisk,
+        AssessmentValue::PersistenceRisk(_) => AssessmentDimension::PersistenceRisk,
+        AssessmentValue::SuspiciousPattern(_) => AssessmentDimension::SuspiciousPattern,
+        AssessmentValue::AffectedCapability(_) => AssessmentDimension::AffectedCapability,
+        AssessmentValue::SuggestedQuarantine(_) => AssessmentDimension::SuggestedQuarantine,
+        AssessmentValue::RequiredProbe(_) => AssessmentDimension::RequiredProbe,
+        AssessmentValue::Confidence(_) => AssessmentDimension::Confidence,
+        AssessmentValue::Limitation(_) => AssessmentDimension::Limitation,
+        AssessmentValue::Unknown(dimension) => *dimension,
+    }
+}
+
+impl ObservedSourceFeature {
+    /// Validates feature shape and dimension-local observation provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provenance, evidence, interval, or value shape is
+    /// malformed.
+    pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
+        assessment_text(&self.origin.observer_ref, "observed.origin.observer_ref")?;
+        assessment_text(
+            &self.origin.observation_revision,
+            "observed.origin.observation_revision",
+        )?;
+        if self.origin.rule_ref.is_some() != self.origin.rule_revision.is_some() {
+            return Err(crate::SecurityContractError::InvalidText {
+                field: "observed.origin.rule_binding",
+            });
+        }
+        if let Some(reference) = &self.origin.rule_ref {
+            assessment_text(reference, "observed.origin.rule_ref")?;
+        }
+        if let Some(revision) = &self.origin.rule_revision {
+            assessment_text(revision, "observed.origin.rule_revision")?;
+        }
+        assessment_refs(&self.evidence_handles, "observed.evidence_handles")?;
+        self.observed_interval.validate()?;
+        self.applicable_interval.validate()?;
+        validate_assessment_value(&self.value)
+    }
+}
+
+impl ModelProposedInterpretation {
+    /// Validates model proposal shape without accepting model-declared rule authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when model/profile provenance, evidence, interval, or
+    /// value shape is malformed.
+    pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
+        assessment_text(&self.origin.model_ref, "interpretation.origin.model_ref")?;
+        assessment_text(
+            &self.origin.model_revision,
+            "interpretation.origin.model_revision",
+        )?;
+        assessment_text(
+            &self.origin.profile_revision,
+            "interpretation.origin.profile_revision",
+        )?;
+        assessment_refs(&self.evidence_handles, "interpretation.evidence_handles")?;
+        self.observed_interval.validate()?;
+        self.applicable_interval.validate()?;
+        validate_assessment_value(&self.value)
+    }
+}
+
+impl SourceSecurityAssessment {
+    /// Validates the bounded source identity, scope, assurance, and dimension rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source digest, scope, assurance binding, or any
+    /// per-dimension record is malformed.
+    pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
+        assessment_text(&self.assessment_ref, "assessment_ref")?;
+        assessment_text(&self.source.source_ref, "source.source_ref")?;
+        assessment_text(&self.source.revision, "source.revision")?;
+        assessment_digest(&self.source.digest)?;
+        assessment_text(&self.source.scope.scope_ref, "source.scope.scope_ref")?;
+        assessment_refs(
+            &self.source.scope.included_refs,
+            "source.scope.included_refs",
+        )?;
+        if !self.source.scope.excluded_refs.is_empty() {
+            let mut seen = std::collections::BTreeSet::new();
+            for reference in &self.source.scope.excluded_refs {
+                assessment_text(reference, "source.scope.excluded_refs")?;
+                if !seen.insert(reference) {
+                    return Err(crate::SecurityContractError::DuplicateReference {
+                        field: "source.scope.excluded_refs",
+                    });
+                }
+            }
+        }
+        if self.source_assurance.source_ref != self.source.source_ref {
+            return Err(crate::SecurityContractError::InvalidText {
+                field: "source_assurance.source_ref",
+            });
+        }
+        self.source_assurance.validate()?;
+        let mut dimensions = std::collections::BTreeSet::new();
+        for feature in &self.observed_features {
+            feature.validate()?;
+            dimensions.insert(assessment_value_dimension(&feature.value));
+        }
+        for interpretation in &self.model_interpretations {
+            interpretation.validate()?;
+            dimensions.insert(assessment_value_dimension(&interpretation.value));
+        }
+        if REQUIRED_ASSESSMENT_DIMENSIONS
+            .iter()
+            .any(|dimension| !dimensions.contains(dimension))
+        {
+            return Err(crate::SecurityContractError::EmptyCollection {
+                field: "assessment_dimension_records",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Integrity of the source snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
