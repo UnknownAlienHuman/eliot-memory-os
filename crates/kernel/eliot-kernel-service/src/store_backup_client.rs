@@ -14,11 +14,12 @@
 //! `StoreResponse::Backup { response: StoreBackupResponse }`, and capability
 //! `CAPABILITY_STORE_BACKUP`. `StoreBackupResponse` is a closed outcome
 //! enum over #950 types verbatim — it carries no operation/fence envelope,
-//! so each method binds the answer through the exact admitted identity it
-//! carried explicitly (operation id, handle digest, archive digest,
-//! destination identity, or digest pair) plus the outcome-carried fence
-//! where one exists (`Status`). An echoed payload or a matching row count
-//! is never a receipt.
+//! so each method binds the answer to its admitted request: Page compares the
+//! complete handle and requested cursor; Restore/Validate compare the complete
+//! operation identity, isolated destination, archive digest, and requested
+//! member denominator; other outcomes use their operation-specific identity
+//! fields plus the outcome-carried fence where one exists (`Status`). An
+//! echoed payload or a matching row count is never a receipt.
 //!
 //! Every send carries the coherent envelope identity demanded by
 //! `StoreBackupRequest::validate()`: `Begin`/`RestoreBatch`/`Validate` copy
@@ -205,6 +206,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 reason: "cursor does not belong to this snapshot handle",
             });
         }
+        let admitted_handle = handle.clone();
+        let admitted_cursor = cursor.clone();
         // Reads observe the hook without consuming it: a pre-commit crash
         // still refuses before any send, while an armed write fault survives
         // for the admitted write it was armed for.
@@ -212,7 +215,6 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             return Err(StoreError::MissingReceiptEnvelope);
         }
         let admitted_operation_id = handle.operation_id.clone();
-        let admitted_digest = handle.snapshot_digest.clone();
         let idempotency_key = handle.idempotency_key.clone();
         // Coherence rule: `Page` requires the envelope `operation_id` and
         // `idempotency_key` to equal the handle's (a handle carries no
@@ -238,7 +240,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .await;
         match result {
             Ok(StoreResponse::Backup { response }) => {
-                Self::check_backup_page(&admitted_operation_id, &admitted_digest, &response)
+                Self::check_backup_page(&admitted_handle, &admitted_cursor, &response)
             }
             Ok(_) => Err(StoreError::InvalidReceipt),
             Err(error) => Err(error.into_store_error()),
@@ -246,18 +248,15 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     fn check_backup_page(
-        admitted_operation_id: &OperationId,
-        admitted_digest: &str,
+        admitted_handle: &SnapshotHandle,
+        admitted_cursor: &SnapshotCursor,
         response: &StoreBackupResponse,
     ) -> Result<SnapshotPage, StoreError> {
         let StoreBackupResponse::Page { page } = response else {
             return Err(StoreError::InvalidReceipt);
         };
         page.validate()?;
-        if page.handle.operation_id != *admitted_operation_id
-            || page.handle.snapshot_digest != admitted_digest
-            || page.cursor.handle_digest != admitted_digest
-        {
+        if &page.handle != admitted_handle || &page.cursor != admitted_cursor {
             return Err(StoreError::IdentityConflict);
         }
         Ok(page.clone())
@@ -434,7 +433,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// Idempotency key: the admitted batch identity
     /// (`batch.operation.idempotency_key`). A validate/status answer can
     /// never satisfy this call: only the closed `Restored` outcome bound to
-    /// the exact batch identity, archive digest and destination is accepted.
+    /// the exact batch identity, archive digest, destination and member-count
+    /// denominator is accepted.
     pub(super) async fn backup_restore_batch_inner(
         &self,
         ctx: &RequestMeta,
@@ -447,12 +447,13 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         if fault == StoreClientFault::PreCommitCrash {
             return Err(StoreError::MissingReceiptEnvelope);
         }
-        let admitted_operation_id = batch.operation.operation_id.clone();
+        let admitted_operation = batch.operation.clone();
         let admitted_archive_digest = batch.archive_member_digest.clone();
-        let admitted_destination_id = batch.destination.destination_id.clone();
+        let admitted_destination = batch.destination.clone();
+        let admitted_member_count = batch.member_count;
         // Coherence rule: `RestoreBatch` requires the envelope identity to
         // equal the payload's admitted `OperationIdentity` — copied verbatim.
-        let identity = batch.operation.clone();
+        let identity = admitted_operation.clone();
         let idempotency_key = identity.idempotency_key.clone();
         let envelope = StoreBackupRequest {
             context: ctx.clone(),
@@ -473,9 +474,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
                 Self::check_backup_restore(
-                    &admitted_operation_id,
+                    &admitted_operation,
                     &admitted_archive_digest,
-                    &admitted_destination_id,
+                    &admitted_destination,
+                    admitted_member_count,
                     &response,
                 )
             }
@@ -498,7 +500,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// unblock effects. Idempotency key: the admitted batch identity
     /// (`batch.operation.idempotency_key`). Only the closed wire `Validation`
     /// outcome (`RestoreValidationReceipt`) bound to the exact admitted
-    /// batch operation, archive digest, and destination is accepted.
+    /// batch operation, archive digest, destination and member-count
+    /// denominator is accepted.
     pub(super) async fn backup_validate_inner(
         &self,
         ctx: &RequestMeta,
@@ -510,12 +513,13 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         if self.armed_fault() == StoreClientFault::PreCommitCrash {
             return Err(StoreError::MissingReceiptEnvelope);
         }
-        let admitted_operation_id = batch.operation.operation_id.clone();
+        let admitted_operation = batch.operation.clone();
         let admitted_archive_digest = batch.archive_member_digest.clone();
-        let admitted_destination_id = batch.destination.destination_id.clone();
+        let admitted_destination = batch.destination.clone();
+        let admitted_member_count = batch.member_count;
         // Coherence rule: `Validate` requires the envelope identity to equal
         // the payload's admitted `OperationIdentity` — copied verbatim.
-        let identity = batch.operation.clone();
+        let identity = admitted_operation.clone();
         let idempotency_key = identity.idempotency_key.clone();
         let envelope = StoreBackupRequest {
             context: ctx.clone(),
@@ -532,9 +536,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .await;
         match result {
             Ok(StoreResponse::Backup { response }) => Self::check_backup_validate(
-                &admitted_operation_id,
+                &admitted_operation,
                 &admitted_archive_digest,
-                &admitted_destination_id,
+                &admitted_destination,
+                admitted_member_count,
                 &response,
             ),
             Ok(_) => Err(StoreError::InvalidReceipt),
@@ -543,18 +548,20 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     fn check_backup_restore(
-        admitted_operation_id: &OperationId,
+        admitted_operation: &OperationIdentity,
         admitted_archive_digest: &str,
-        admitted_destination_id: &str,
+        admitted_destination: &IsolatedDestination,
+        admitted_member_count: u64,
         response: &StoreBackupResponse,
     ) -> Result<RestoreValidationReceipt, StoreError> {
         let StoreBackupResponse::Restored { receipt } = response else {
             return Err(StoreError::InvalidReceipt);
         };
         receipt.validate()?;
-        if receipt.operation.operation_id != *admitted_operation_id
+        if &receipt.operation != admitted_operation
             || receipt.archive_member_digest != admitted_archive_digest
-            || receipt.destination.destination_id != admitted_destination_id
+            || &receipt.destination != admitted_destination
+            || receipt.denominator_members != admitted_member_count
         {
             return Err(StoreError::IdentityConflict);
         }
@@ -562,18 +569,20 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     fn check_backup_validate(
-        admitted_operation_id: &OperationId,
+        admitted_operation: &OperationIdentity,
         admitted_archive_digest: &str,
-        admitted_destination_id: &str,
+        admitted_destination: &IsolatedDestination,
+        admitted_member_count: u64,
         response: &StoreBackupResponse,
     ) -> Result<RestoreValidationReceipt, StoreError> {
         let StoreBackupResponse::Validation { receipt } = response else {
             return Err(StoreError::InvalidReceipt);
         };
         receipt.validate()?;
-        if receipt.operation.operation_id != *admitted_operation_id
+        if &receipt.operation != admitted_operation
             || receipt.archive_member_digest != admitted_archive_digest
-            || receipt.destination.destination_id != admitted_destination_id
+            || &receipt.destination != admitted_destination
+            || receipt.denominator_members != admitted_member_count
         {
             return Err(StoreError::IdentityConflict);
         }
