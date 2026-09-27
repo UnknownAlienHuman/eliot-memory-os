@@ -300,12 +300,17 @@ fn report_admitted_inquiry(
 /// owner's `verify_echo`. The local admission is built only from fields that
 /// receipt echoes, so a receipt can never widen the executable, generation,
 /// epoch, fence, privacy class, budget, or deadline beyond what the Kernel
-/// admitted under the live authority.
+/// admitted under the live authority; and because it is assembled from those
+/// two independently delivered records, it is then re-bound to the admitted
+/// operation by [`ProviderAdmission::bind_admitted_dispatch`], which compares
+/// every fact the exchange request does not carry against the Kernel's own
+/// attested content by value.
 ///
 /// # Errors
 ///
 /// Returns [`Failure::NoAdmission`] when the admitted material cannot be turned
-/// into a local admission.
+/// into a local admission, or when the sealed record is not the record of the
+/// dispatch that receipt was issued for.
 fn admit(
     admitted: &AdmittedOperation,
     client_receipt: &eliot_kernel_service::ResearchProviderDispatchReceipt,
@@ -332,7 +337,7 @@ fn admit(
             )));
         }
     };
-    ProviderAdmission::new(
+    let admission = ProviderAdmission::new(
         bridge,
         dispatch.config_digest.clone(),
         dispatch.protocol_digest.clone(),
@@ -353,7 +358,22 @@ fn admit(
         dispatch.denominator_digest.clone(),
         admitted.request.coverage_goal.clone(),
     )
-    .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))
+    .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
+    // The record above is assembled from two independently delivered values —
+    // the presented dispatch and the sealed Kernel receipt — so it is bound to
+    // the admitted operation here rather than assumed to be. Every fact the
+    // record carries that the exchange request does not (artifact, config and
+    // protocol digests, Module/Capability Registry references, process
+    // generation, Authority Epoch, State Fence, privacy/data class, budget and
+    // deadline, and the cancellation identity) is compared by value against the
+    // Kernel's own attested content through the wire owner's `verify_echo` and
+    // the field-wise comparison beside it. A record built from one dispatch and
+    // a receipt for another is refused here, before any port, authority, or
+    // executor is constructed.
+    admission
+        .bind_admitted_dispatch(dispatch, client_receipt)
+        .map_err(|error| Failure::NoAdmission(format!("admission refused: {}", error.reason())))?;
+    Ok(admission)
 }
 
 /// Asks the Kernel owner what it still holds for this operation, and records
