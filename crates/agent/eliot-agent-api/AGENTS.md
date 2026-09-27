@@ -37,9 +37,9 @@ Issue #228 records confirmed contract collisions. S4 (route triple) / S5
 (candidate-only result + binding) / S6 (closed host-event envelope) have landed
 in source (`RouteSelectionCandidate` / `AdmittedRouteReceipt` /
 `PhysicalRouteObservationReceipt`; `ResultDisposition` without
-`VerifiedComplete`; `NormalizedHostEventEnvelope` as the single normalized
-host-event wire, with the generic `HostEventEnvelope` quarantine collapsed
-away by #1709). The narrow #228 slice hardens the effect trio to
+`VerifiedComplete`; `NormalizedHostEventEnvelope` as the only normalized
+host-event wire this cell emits, with the ACP-side generic-wire producer
+quarantine deleted by #1709). The narrow #228 slice hardens the effect trio to
 `LowercaseSha256` / `ClockReading` at `CONTRACT_VERSION ==
 "eliot-agent-api/v7"`. Residual cross-lane work (governor `EffectReceipt`
 unification, bridge consumer migration, Finish edge, Product Pulse) remains
@@ -264,13 +264,17 @@ proof.
 ### Generic normalized payload
 
 Landed (S6): producers/consumers use the closed, versioned
-`NormalizedHostEventEnvelope` (`host-event-v7`). #1709 collapsed the generic
-`HostEventEnvelope.normalized_payload: serde_json::Value` quarantine wire: the
-type, its `impl` block, and the deprecated `attempt_id` field are deleted, so
-`NormalizedHostEventEnvelope` is the only normalized host-event shape in this
-crate. No alias, `From` impl, or "accepts both" phase remains; the ACP adapter's
-deprecated `AcpEvent::into_host_event` quarantine conversion is deleted with its
-compatibility test.
+`NormalizedHostEventEnvelope` (`host-event-v7`). #1709 deleted the ACP
+adapter's deprecated `AcpEvent::into_host_event` quarantine conversion and its
+compatibility test, so no producer in this cell can mint the generic wire. The
+generic `HostEventEnvelope` type, its `impl` block and the deprecated
+`attempt_id` field are still present pending #1709's remaining work: their
+remaining consumers (`crates/surfaces/eliot-agent-bridge-core` and
+`crates/eliot-app`) are outside that slice's mutable scope, so the type cannot
+be deleted until they migrate. `NormalizedHostEventEnvelope` is already the
+only wire every producer in this cell emits; do not add a new producer or
+consumer of the generic type, and do not add an alias, a `From` impl or an
+"accepts both" phase.
 
 Historical note: `HostEventEnvelope.normalized_payload: serde_json::Value` was
 not a closed policy/control contract. Do not reintroduce it, and do not add
