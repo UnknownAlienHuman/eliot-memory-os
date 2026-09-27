@@ -102,7 +102,9 @@ use crate::{
 /// The versioned-artifact family rides the same ORS persistence codec as every
 /// other record family: no second codec, no second journal. `validate()` is the
 /// single fail-closed gate that re-establishes the exact canonical
-/// generation-addressed artifact identity and the drain-mark rule on readback.
+/// generation-addressed artifact identity, the row's own recorded I1.12
+/// compatibility verdict and the drain-mark rule on readback, so a restart
+/// re-derives the evidence a rollback is checked against from durable rows.
 impl persistence_codec::PersistedValue for VersionedArtifactEntry {
     const RECORD_TYPE: &'static str = "versioned_artifact_entry";
 

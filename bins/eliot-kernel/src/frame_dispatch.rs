@@ -45,7 +45,9 @@ use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
 use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
 
-const RUNTIME_HEALTH_CAPABILITY: &str = "worker.execute";
+/// Crate-visible so the restart rollback gate (`generation_recovery`) builds the
+/// same durable required-capability set as this handshake path.
+pub(crate) const RUNTIME_HEALTH_CAPABILITY: &str = "worker.execute";
 const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
 
 /// Computes the I1.12 contract-set digest from the live contract identities.
@@ -54,7 +56,11 @@ const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
 /// made from contract shapes rather than artifact/configuration material, so a
 /// successful digest proves the same public surfaces were admitted on both
 /// sides of the carrier.
-fn runtime_contract_set_digest() -> Result<String, TransportError> {
+///
+/// Crate-visible so the restart rollback gate (`generation_recovery`) compares
+/// against the SAME derivation as this handshake path rather than a second
+/// spelling of it that could drift.
+pub(crate) fn runtime_contract_set_digest() -> Result<String, TransportError> {
     let identities = (
         eliot_kernel_core::contract_identity().map_err(|_| TransportError::SessionFenced)?,
         eliot_kernel_service::contract_identity().map_err(|_| TransportError::SessionFenced)?,
