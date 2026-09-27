@@ -1524,6 +1524,8 @@ impl KernelComposition {
             #[cfg(windows)]
             agent_bridge_connections: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]
+            agent_application_sessions: Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
             agent_activation_pending: Mutex::new(agent_activation_pending),
             #[cfg(windows)]
             agent_activation_changed: tokio::sync::Notify::new(),
