@@ -141,13 +141,16 @@ impl ProfileGovernedRoots {
         }
     }
 
-    /// Converts the resolved roots into the crate's installation root contract.
+    /// Converts the resolved roots into the crate's versioned installation
+    /// root binding.
     ///
     /// Path separation, aliasing and profile agreement stay owned by
-    /// [`InstallationRoots::validate`]; this function only supplies the roots the
-    /// I3.1 table produced. The caller supplies the already digest-bound
-    /// [`RuntimeStateRoots`], because those are proved by the Windows adapter
-    /// rather than derived from a profile.
+    /// [`InstallationRoots::validate`]; this function only supplies the roots
+    /// the I3.1 table produced. Both the user configuration and the user cache
+    /// roots are forwarded separately, so the cache root the I3.1 `config|cache`
+    /// pair names survives into downstream use. The caller supplies the
+    /// already digest-bound [`RuntimeStateRoots`], because those are proved by
+    /// the Windows adapter rather than derived from a profile.
     ///
     /// # Errors
     ///
@@ -162,6 +165,7 @@ impl ProfileGovernedRoots {
             self.immutable_binaries,
             self.durable_data,
             self.user_config,
+            self.user_cache,
             runtime_state_roots,
         )
     }
