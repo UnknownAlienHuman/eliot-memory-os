@@ -793,7 +793,7 @@ impl ReservedWriteReconciliation {
     /// must have checked this exact identity against durable store evidence.
     /// Absence of a receipt on its own never reaches here; a read that found
     /// nothing is [`ReservedWriteOutcome::StillUnknown`] and stays there
-    /// ([`ReservedWriteReconciliation::unread`]).
+    /// ([`ReservedWriteReconciliation::still_unknown`]).
     pub fn proven_not_applied(admission: &WriteAdmissionProjection) -> Result<Self, StoreError> {
         admission.validate()?;
         Ok(Self {
@@ -832,6 +832,12 @@ impl ReservedWriteReconciliation {
     /// arms are checked only for consistency with the identity they are
     /// reported under.
     pub fn validate(&self) -> Result<(), StoreError> {
+        if self.finalizes_reservation() {
+            return Err(StoreError::InvalidField {
+                field: "admission.outcome",
+                reason: "reconciliation must not finalize the reservation",
+            });
+        }
         self.admission.validate()?;
         if self.operation_id != self.admission.operation_id {
             return Err(StoreError::IdentityConflict);
