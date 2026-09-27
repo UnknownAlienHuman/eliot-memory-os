@@ -428,11 +428,28 @@ pub struct GrantRecoveryRecord {
 }
 
 impl GrantGraphRecoverySnapshot {
-    /// Validates both the deterministic wire shape and the graph semantics
-    /// that would be enforced when this snapshot is restored.
+    /// Validates deterministic wire shape and internal graph consistency.
+    ///
+    /// This is not owner readback and does not authorize a transition-bearing
+    /// snapshot for restoration. Public graph restore entry points refuse
+    /// snapshots containing admitted root-transition evidence until a current
+    /// owner readback path is available.
     pub fn validate(&self) -> Result<(), AuthorityError> {
         self.validate_wire()?;
         GrantGraphRecoverySnapshot::restore_owned(self).map(|_| ())
+    }
+
+    /// Refuses to treat snapshot-local transition evidence as current owner
+    /// readback. The original records stay in the caller-owned snapshot for
+    /// audit and later reconciliation.
+    fn require_owner_readback_for_restore(&self) -> Result<(), AuthorityError> {
+        if self.admitted_root_transitions.is_empty() {
+            Ok(())
+        } else {
+            Err(AuthorityError::StaleTransitionEvidence(
+                "grant_graph_recovery.root_transition_owner_readback_required",
+            ))
+        }
     }
 
     fn validate_wire(&self) -> Result<(), AuthorityError> {
@@ -500,8 +517,12 @@ impl GrantGraphRecoverySnapshot {
         Ok(())
     }
 
-    /// Restores owned graph state: admitted authority, admitted transition
-    /// evidence, and inert quarantined relations (#2875 item 9, #2962).
+    /// Reconstructs graph state for internal consistency validation:
+    /// admitted authority, admitted transition evidence, and inert
+    /// quarantined relations (#2875 item 9, #2962). Public restore entry
+    /// points separately reject transition-bearing snapshots because this
+    /// helper can check only snapshot-local consistency, not current owner
+    /// readback.
     ///
     /// Grants whose parent edge stays inside one root — or names exact admitted
     /// transition evidence — restore into the authority map. Grants whose
@@ -517,12 +538,12 @@ impl GrantGraphRecoverySnapshot {
     /// reinterpreted. A legacy cross-root child therefore can never restore
     /// as active authority.
     ///
-    /// Admitted transition evidence is NOT re-admitted from its copied fields:
-    /// every row is re-verified by
-    /// [`AdmittedRootTransition::admit_restored`] against the CURRENT grants,
-    /// the CURRENT graph revision, and the fence the child is bound to. An
-    /// evidence row that no longer matches live state migrates its child to
-    /// quarantine rather than activating stale authority.
+    /// The internal consistency pass rechecks every transition row with
+    /// [`AdmittedRootTransition::admit_restored`] against the grants, graph
+    /// revision, and fence carried by this same snapshot. That is not current
+    /// owner readback and cannot authorize restoration. The public restore
+    /// entry points reject transition-bearing snapshots before invoking this
+    /// helper; the original input remains intact for audit and reconciliation.
     #[allow(
         clippy::too_many_lines,
         reason = "restore keeps evidence admission, partitioning, quarantine and revocation in one fail-closed sequence"
@@ -1130,10 +1151,15 @@ impl GrantGraph {
         Ok(snapshot)
     }
 
+    /// Restores graph state from a recovery snapshot.
+    ///
+    /// Snapshots with admitted root-transition records fail closed until a
+    /// current owner readback path can confirm those records.
     pub fn from_recovery_snapshot(
         snapshot: &GrantGraphRecoverySnapshot,
     ) -> Result<Self, AuthorityError> {
         snapshot.validate_wire()?;
+        snapshot.require_owner_readback_for_restore()?;
         GrantGraphRecoverySnapshot::restore_owned(snapshot)
     }
 
@@ -1153,6 +1179,10 @@ impl GrantGraph {
     /// Restores a recovery snapshot under explicit CURRENT revocation-history
     /// evidence, applying all applicable committed revocations before any
     /// grant becomes effective.
+    ///
+    /// Transition-bearing snapshots refuse until their transition evidence is
+    /// confirmed by current owner readback; revocation history is not a
+    /// substitute for that readback.
     ///
     /// `None` history refuses with
     /// [`RevocationHistoryError::MissingHistory`]: unavailable history is
@@ -1218,6 +1248,9 @@ impl GrantGraph {
         }
         snapshot
             .validate_wire()
+            .map_err(RevocationHistoryError::InvalidSnapshot)?;
+        snapshot
+            .require_owner_readback_for_restore()
             .map_err(RevocationHistoryError::InvalidSnapshot)?;
         let evidence = history.ok_or(RevocationHistoryError::MissingHistory)?;
         let closures = evidence.require_current()?;
