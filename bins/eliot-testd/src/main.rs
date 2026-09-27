@@ -223,12 +223,23 @@ fn drive_admitted<E: ProcessExecutor + 'static>(
     executor: &E,
 ) -> i32 {
     // Closed-profile gate: the admitted drive derives its executable
-    // binding from the registry; an unregistered profile or caller argv
-    // never reaches the worker.
-    if !eliot_testd_core::is_admitted_testd_profile(&presented.invocation.profile)
-        || !presented.invocation.arguments.is_empty()
-    {
+    // binding from the registry; an unregistered profile, fixed-argv
+    // caller argv, or an invalid slot suffix never reaches the worker.
+    if !eliot_testd_core::is_admitted_testd_profile(&presented.invocation.profile) {
         return EXIT_ADMITTED_DRIVE_FAILED;
+    }
+    if !presented.invocation.arguments.is_empty() {
+        if !eliot_testd_core::is_slotted_testd_profile(&presented.invocation.profile) {
+            return EXIT_ADMITTED_DRIVE_FAILED;
+        }
+        if eliot_testd_core::parse_testd_slot_suffix(
+            &presented.invocation.profile,
+            &presented.invocation.arguments,
+        )
+        .is_err()
+        {
+            return EXIT_ADMITTED_DRIVE_FAILED;
+        }
     }
     match run_admitted_one_shot(
         composition,

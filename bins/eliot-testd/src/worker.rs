@@ -154,18 +154,28 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
                 .to_owned(),
         ));
     }
-    // Closed-profile Drive gate (issue #20): only the admitted tool-probe
-    // profile drives, and it takes no caller arguments: the fixed argv
-    // comes from the registry binding, never from the invocation.
+    // Closed-profile Drive gate (issue #20): only registered profiles
+    // drive. Fixed-argv profiles take no caller arguments: the fixed argv
+    // comes from the registry binding, never from the invocation. Slotted
+    // profiles (issue #1802, step 4) validate their arguments through the
+    // slot schema; the sealed argv derives from the binding.
     if !eliot_testd_core::is_admitted_testd_profile(&presented.invocation.profile) {
         return Err(TestdError::Contract(
             "testd admits only the closed cargo-test tool-probe profile".to_owned(),
         ));
     }
     if !presented.invocation.arguments.is_empty() {
-        return Err(TestdError::Contract(
-            "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
-        ));
+        if eliot_testd_core::is_slotted_testd_profile(&presented.invocation.profile) {
+            eliot_testd_core::parse_testd_slot_suffix(
+                &presented.invocation.profile,
+                &presented.invocation.arguments,
+            )
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        } else {
+            return Err(TestdError::Contract(
+                "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
+            ));
+        }
     }
     if !presented
         .epoch
@@ -273,7 +283,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         }
     };
     let collector = Arc::new(EvidenceCollector::default());
-    if job.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         let observation = match observe_tool_identity(permit.request()) {
             Ok(observation) => observation,
             Err(error) => {
@@ -297,8 +307,8 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // The consuming start proves nothing about the outcome by itself:
     // `start_claimed` maps every executor failure (including the
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
-    // `inspect` in `observe_and_finish` is the only observation that
-    // dispositions the attempt.
+    // worker-owned `inspect` is the only observation that dispositions the
+    // attempt.
     let start_result = block_on_one_shot(crate::start_claimed_from_store(
         store,
         job,
@@ -418,6 +428,74 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
     let started_at_ms = clock_ms(&started_at).unwrap_or_else(current_clock_ms);
     let deadline_ms =
         started_at_ms.saturating_add(profile_wall_timeout_ms(job.invocation.profile.as_str())?);
+    let outcome = supervise_operation(
+        store,
+        job,
+        lease,
+        executor,
+        collector,
+        SupervisionInput {
+            operation_id,
+            start_note,
+            deadline_ms,
+            lease_ms,
+        },
+    )?;
+
+    if outcome.durable_cancelled || outcome.owner_lost {
+        // A durable cancellation or a replaced fence already removed this
+        // worker's write authority. Physical cancellation above is best
+        // effort; this worker must never write through the cleared/replaced
+        // lease.
+        return Ok(());
+    }
+    let finish_now = current_clock_ms();
+    let current = store
+        .get(&job.job_id)?
+        .ok_or_else(|| TestdError::Corrupt("job disappeared before finish".to_owned()))?;
+    if current.state == JobState::Cancelled && current.lease.is_none() {
+        return Ok(());
+    }
+    if current.state != JobState::Running || current.lease.as_ref() != Some(&*lease) {
+        return Ok(());
+    }
+    if lease.expires_at_ms <= finish_now.saturating_add(SUPERVISION_POLL_INTERVAL_MS) {
+        *lease = store.renew_lease(&job.job_id, &*lease, finish_now, lease_ms)?;
+    }
+    finish_observed_attempt(store, job, lease, collector, &current, outcome, started_at)
+}
+
+struct SupervisionInput {
+    operation_id: OperationId,
+    start_note: Option<String>,
+    deadline_ms: u64,
+    lease_ms: u64,
+}
+
+struct SupervisionOutcome {
+    execution: ExecutionStatus,
+    reason: String,
+    reconcile_note: Option<String>,
+    durable_cancelled: bool,
+    owner_lost: bool,
+}
+
+/// Inspects and reconciles the exact operation while renewing the durable
+/// lease that admitted it.
+fn supervise_operation<E: ProcessExecutor + 'static>(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &mut Lease,
+    executor: &E,
+    collector: &EvidenceCollector,
+    input: SupervisionInput,
+) -> Result<SupervisionOutcome, TestdError> {
+    let SupervisionInput {
+        operation_id,
+        start_note,
+        deadline_ms,
+        lease_ms,
+    } = input;
     let mut execution = ExecutionStatus::Unknown;
     let mut reason =
         "terminal observation did not prove an outcome; reconcile by exact identity".to_owned();
@@ -498,29 +576,39 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
         std::thread::sleep(Duration::from_millis(SUPERVISION_POLL_INTERVAL_MS));
     }
 
-    if durable_cancelled || owner_lost {
-        // A durable cancellation or a replaced fence already removed this
-        // worker's write authority. Physical cancellation above is best
-        // effort; this worker must never write through the cleared/replaced
-        // lease.
-        return Ok(());
-    }
-    let finish_now = current_clock_ms();
-    let current = store
-        .get(&job.job_id)?
-        .ok_or_else(|| TestdError::Corrupt("job disappeared before finish".to_owned()))?;
-    if current.state == JobState::Cancelled && current.lease.is_none() {
-        return Ok(());
-    }
-    if current.state != JobState::Running || current.lease.as_ref() != Some(&*lease) {
-        return Ok(());
-    }
-    if lease.expires_at_ms <= finish_now.saturating_add(SUPERVISION_POLL_INTERVAL_MS) {
-        *lease = store.renew_lease(&job.job_id, &*lease, finish_now, lease_ms)?;
-    }
+    Ok(SupervisionOutcome {
+        execution,
+        reason,
+        reconcile_note,
+        durable_cancelled,
+        owner_lost,
+    })
+}
+
+/// Captures terminal evidence and finishes the already-revalidated attempt.
+fn finish_observed_attempt(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &mut Lease,
+    collector: &EvidenceCollector,
+    current: &TestJob,
+    outcome: SupervisionOutcome,
+    started_at: ClockReading,
+) -> Result<(), TestdError> {
+    let SupervisionOutcome {
+        mut execution,
+        mut reason,
+        reconcile_note,
+        ..
+    } = outcome;
     let finished_at = observation_clock(current_clock_ms());
     let records = collector.snapshot();
-    let synthetic = match capture_inline_previews(collector, &records, finished_at) {
+    let synthetic = match capture_inline_previews(
+        collector,
+        &job.invocation.profile,
+        &records,
+        finished_at,
+    ) {
         Ok(synthetic) => synthetic,
         Err(error) => {
             finish_unknown(
@@ -535,9 +623,9 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
             return Ok(());
         }
     };
-    let source_observation = if current.invocation.profile
-        == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
-    {
+    let source_observation = if eliot_testd_core::is_productive_testd_profile(
+        &current.invocation.profile,
+    ) {
         match current.source_observation_before.as_ref() {
             Some(before) => {
                 match TestdSourceObservation::capture(&current.target_roots.source_root) {
@@ -724,6 +812,7 @@ fn observation_reason(view: &ProcessExecutionView) -> &'static str {
 /// once from normalized evidence.
 fn capture_inline_previews(
     collector: &EvidenceCollector,
+    profile: &str,
     records: &[ProcessEvidence],
     captured_at: ClockReading,
 ) -> Result<Vec<String>, TestdError> {
@@ -744,8 +833,16 @@ fn capture_inline_previews(
             } else {
                 RawArtifactStream::Stderr
             };
+            // Content domains stay disjoint per profile: discovery
+            // stdout is inventory, never run events, so it must never
+            // reach the run-event parser. Literals mirror the nextest
+            // owner's content-type constants without a dependency.
             let content_type = if stream_kind == RawArtifactStream::Stdout {
-                "application/x-nextest-libtest-json-plus"
+                if profile == eliot_testd_core::TESTD_LIST_PROFILE {
+                    "application/x-nextest-list-json"
+                } else {
+                    "application/x-nextest-libtest-json-plus"
+                }
             } else {
                 "text/plain"
             };
@@ -786,8 +883,11 @@ fn profile_wall_timeout_ms(profile: &str) -> Result<u64, TestdError> {
         eliot_testd_core::TESTD_ADMITTED_PROFILE => {
             Ok(eliot_testd_core::TESTD_PROFILE_WALL_TIMEOUT_MS)
         }
-        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE => {
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE | eliot_testd_core::TESTD_SCOPED_PROFILE => {
             Ok(eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS)
+        }
+        eliot_testd_core::TESTD_LIST_PROFILE => {
+            Ok(eliot_testd_core::TESTD_LIST_PROFILE_WALL_TIMEOUT_MS)
         }
         _ => Err(TestdError::Invalid {
             field: "profile",
@@ -1075,6 +1175,7 @@ mod tests {
         let collector = EvidenceCollector::default();
         let synthetic = capture_inline_previews(
             &collector,
+            eliot_testd_core::TESTD_PRODUCTIVE_PROFILE,
             std::slice::from_ref(&evidence),
             observation_clock(current_clock_ms()),
         )

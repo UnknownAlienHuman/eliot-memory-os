@@ -75,12 +75,15 @@ pub use typed_evidence::{
 //   by path.
 // * `fixed_argv` is the complete argv. The probe and productive nextest
 //   profiles take no caller slots, so any invocation-supplied argument is
-//   refused at registration: there is no caller passthrough. A future
-//   profile with typed slots arrives as a new registry entry with its own
-//   slot validation, never by widening these.
+//   refused at registration: there is no caller passthrough. The slotted
+//   list/scoped profiles (issue #1802, step 4) are separate registry
+//   entries with their own slot schema: invocation arguments must parse
+//   as validated slots and the Drive seals exactly the rendered argv,
+//   never raw caller text.
 // * `env_allowlist` is the exact non-secret environment for the child.
-//   The productive libtest-json profile receives only the explicitly
-//   registered feature gate below; no ambient environment is inherited.
+//   Productive nextest profiles, including discovery, receive only the
+//   explicitly registered feature gate below; no ambient environment is
+//   inherited.
 // * the working directory is never stored here: the Drive always uses the
 //   generation root supplied with the admitted material, never a
 //   caller-chosen directory.
@@ -100,6 +103,12 @@ pub use typed_evidence::{
 pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
 /// Separately registered productive nextest profile.
 pub const TESTD_PRODUCTIVE_PROFILE: &str = "cargo-nextest";
+/// Separately registered dev-fast discovery profile (issue #1802, step 4):
+/// `cargo nextest list --message-format json` with validated scope slots.
+pub const TESTD_LIST_PROFILE: &str = "cargo-nextest-list";
+/// Separately registered dev-fast scoped-run profile: the productive
+/// nextest run with validated scope slots.
+pub const TESTD_SCOPED_PROFILE: &str = "cargo-nextest-scoped";
 /// Relative program for the admitted probe, resolved through the platform
 /// tool locator at Drive time. Never absolute, never parent traversal.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
@@ -116,6 +125,17 @@ pub const TESTD_PRODUCTIVE_PROFILE_ARGV: &[&str] = &[
     "--message-format-version",
     "0.1",
 ];
+/// Fixed discovery argv prefix for the list profile. Validated scope slots
+/// render after it; the rendering equals the nextest owner's
+/// `NextestCommand::list` output for the same slots.
+pub const TESTD_LIST_PROFILE_ARGV: &[&str] = &["list", "--message-format", "json"];
+/// Slot flag binding one Cargo package (`--package <name>`).
+pub const TESTD_SLOT_PACKAGE: &str = "--package";
+/// Slot flag binding one binary target (`--bin <name>`).
+pub const TESTD_SLOT_BINARY: &str = "--bin";
+/// Slot flag binding the scoped per-test retry count (`--retries <n>`,
+/// scoped profile only).
+pub const TESTD_SLOT_RETRIES: &str = "--retries";
 /// Exact environment required by nextest 0.9.143's experimental libtest JSON
 /// reporter. The value is owner-registered and is never read from ambient
 /// process state.
@@ -145,6 +165,9 @@ pub const TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 pub const TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 /// Independent descendant ceiling for the productive nextest profile.
 pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
+/// Discovery shares the productive nextest wall timeout and resource
+/// envelope. Keep this name for the Testd worker's existing timeout lookup.
+pub const TESTD_LIST_PROFILE_WALL_TIMEOUT_MS: u64 = TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS;
 
 /// Closed executable binding for one admitted testd profile.
 ///
@@ -198,10 +221,10 @@ impl TestdExecutableBinding {
         // Closed by equality: the admitted program is relative by
         // construction, so absolute paths and parent traversal have no
         // spelling that validates.
-        let expected_program = if self.profile == TESTD_PRODUCTIVE_PROFILE {
-            TESTD_PRODUCTIVE_PROFILE_PROGRAM
-        } else {
+        let expected_program = if self.profile == TESTD_ADMITTED_PROFILE {
             TESTD_PROFILE_PROGRAM
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
         };
         if self.program_path != expected_program {
             return Err(TestdError::Invalid {
@@ -211,11 +234,33 @@ impl TestdExecutableBinding {
         }
         let expected_argv: Vec<String> = if self.profile == TESTD_ADMITTED_PROFILE {
             TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect()
-        } else {
+        } else if self.profile == TESTD_PRODUCTIVE_PROFILE {
             TESTD_PRODUCTIVE_PROFILE_ARGV
                 .iter()
                 .map(ToString::to_string)
                 .collect()
+        } else {
+            // Slotted profiles seal validated slots into argv: the prefix
+            // must match exactly and the suffix must round-trip through
+            // the slot schema, so no unvalidated text can reach the child.
+            let prefix = testd_slotted_prefix(&self.profile).ok_or(TestdError::Invalid {
+                field: "fixed_argv",
+                reason: "the registered profile takes fixed argv; caller arguments are refused",
+            })?;
+            let prefix_len = prefix.len();
+            if self.fixed_argv.len() < prefix_len
+                || self.fixed_argv[..prefix_len]
+                    .iter()
+                    .zip(prefix.iter())
+                    .any(|(observed, expected)| observed != expected)
+            {
+                return Err(TestdError::Invalid {
+                    field: "fixed_argv",
+                    reason: "the registered profile takes fixed argv; caller arguments are refused",
+                });
+            }
+            let slots = parse_testd_slot_suffix(&self.profile, &self.fixed_argv[prefix_len..])?;
+            render_testd_slotted_argv(&self.profile, &slots)?
         };
         if self.fixed_argv != expected_argv {
             return Err(TestdError::Invalid {
@@ -223,15 +268,18 @@ impl TestdExecutableBinding {
                 reason: "the registered profile takes fixed argv; caller arguments are refused",
             });
         }
-        let expected_environment: Vec<(String, String)> =
-            if self.profile == TESTD_PRODUCTIVE_PROFILE {
-                TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
-                    .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let expected_environment: Vec<(String, String)> = if self.profile
+            == TESTD_PRODUCTIVE_PROFILE
+            || self.profile == TESTD_LIST_PROFILE
+            || self.profile == TESTD_SCOPED_PROFILE
+        {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if self.env_allowlist != expected_environment {
             return Err(TestdError::Invalid {
                 field: "env_allowlist",
@@ -263,7 +311,10 @@ impl TestdExecutableBinding {
 }
 
 fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u32) {
-    if profile == TESTD_PRODUCTIVE_PROFILE {
+    if matches!(
+        profile,
+        TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+    ) {
         (
             TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS,
             Some(TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS),
@@ -287,7 +338,32 @@ fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u3
 /// Returns true only for the closed admitted testd profile name.
 #[must_use]
 pub fn is_admitted_testd_profile(profile: &str) -> bool {
-    matches!(profile, TESTD_ADMITTED_PROFILE | TESTD_PRODUCTIVE_PROFILE)
+    matches!(
+        profile,
+        TESTD_ADMITTED_PROFILE
+            | TESTD_PRODUCTIVE_PROFILE
+            | TESTD_LIST_PROFILE
+            | TESTD_SCOPED_PROFILE
+    )
+}
+
+/// Returns true only for the slotted list/scoped profiles, whose
+/// invocations carry validated slot arguments instead of fixed argv.
+#[must_use]
+pub fn is_slotted_testd_profile(profile: &str) -> bool {
+    matches!(profile, TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE)
+}
+
+/// Returns true for the productive nextest profiles whose attempts
+/// require owner-observed tool identity, source observation, and
+/// terminal publication: the unscoped productive run plus the slotted
+/// list/scoped profiles. The harmless probe never qualifies.
+#[must_use]
+pub fn is_productive_testd_profile(profile: &str) -> bool {
+    matches!(
+        profile,
+        TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+    )
 }
 
 /// Resolves the closed binding for one admitted profile.
@@ -296,9 +372,26 @@ pub fn is_admitted_testd_profile(profile: &str) -> bool {
 /// tool file bytes (see [`resolve_testd_tool_digest`] on the bins side);
 /// it is shape-checked here and bound into [`testd_binding_digest`].
 /// An unregistered profile fails with `Invalid` and can never execute.
+/// Slotted profiles resolve with empty slots; callers with slot arguments
+/// use [`testd_profile_binding_with_slots`].
 pub fn testd_profile_binding(
     profile: &str,
     package_artifact_digest: &str,
+) -> Result<TestdExecutableBinding, TestdError> {
+    testd_profile_binding_with_slots(profile, package_artifact_digest, &[])
+}
+
+/// Resolves the closed binding for one admitted profile with validated
+/// slot arguments.
+///
+/// The probe and productive profiles take fixed argv, so any slot
+/// argument is refused for them. The slotted list/scoped profiles parse
+/// the suffix through the slot schema and seal exactly the rendered argv
+/// into the binding; unvalidated text can never reach the child.
+pub fn testd_profile_binding_with_slots(
+    profile: &str,
+    package_artifact_digest: &str,
+    slot_suffix: &[String],
 ) -> Result<TestdExecutableBinding, TestdError> {
     if !is_admitted_testd_profile(profile) {
         return Err(TestdError::Invalid {
@@ -306,21 +399,42 @@ pub fn testd_profile_binding(
             reason: "testd admits only registered probe or productive nextest profiles",
         });
     }
-    let fixed_argv = if profile == TESTD_ADMITTED_PROFILE {
-        TESTD_PROFILE_ARGV
-    } else {
+    let fixed_argv: Vec<String> = if profile == TESTD_ADMITTED_PROFILE {
+        if !slot_suffix.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "fixed_argv",
+                reason: "the registered profile takes fixed argv; caller arguments are refused",
+            });
+        }
+        TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect()
+    } else if profile == TESTD_PRODUCTIVE_PROFILE {
+        if !slot_suffix.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "fixed_argv",
+                reason: "the registered profile takes fixed argv; caller arguments are refused",
+            });
+        }
         TESTD_PRODUCTIVE_PROFILE_ARGV
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        let slots = parse_testd_slot_suffix(profile, slot_suffix)?;
+        render_testd_slotted_argv(profile, &slots)?
     };
     let binding = TestdExecutableBinding {
         profile: profile.to_owned(),
         package_artifact_digest: package_artifact_digest.to_owned(),
-        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
-            TESTD_PRODUCTIVE_PROFILE_PROGRAM.to_owned()
-        } else {
+        program_path: if profile == TESTD_ADMITTED_PROFILE {
             TESTD_PROFILE_PROGRAM.to_owned()
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM.to_owned()
         },
-        fixed_argv: fixed_argv.iter().map(ToString::to_string).collect(),
-        env_allowlist: if profile == TESTD_PRODUCTIVE_PROFILE {
+        fixed_argv,
+        env_allowlist: if profile == TESTD_PRODUCTIVE_PROFILE
+            || profile == TESTD_LIST_PROFILE
+            || profile == TESTD_SCOPED_PROFILE
+        {
             TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -353,6 +467,9 @@ pub fn testd_definition_digest() -> Result<String, TestdError> {
 }
 
 /// Canonical definition digest for one registered testd profile.
+///
+/// Slotted profiles digest with empty slots; callers with slot arguments
+/// use [`testd_definition_digest_for_slots`].
 pub fn testd_definition_digest_for_profile(profile: &str) -> Result<String, TestdError> {
     if !is_admitted_testd_profile(profile) {
         return Err(TestdError::Invalid {
@@ -360,6 +477,43 @@ pub fn testd_definition_digest_for_profile(profile: &str) -> Result<String, Test
             reason: "testd admits only registered probe or productive nextest profiles",
         });
     }
+    let argv: Vec<String> = if profile == TESTD_ADMITTED_PROFILE {
+        TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect()
+    } else if profile == TESTD_PRODUCTIVE_PROFILE {
+        TESTD_PRODUCTIVE_PROFILE_ARGV
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        let slots = parse_testd_slot_suffix(profile, &[])?;
+        render_testd_slotted_argv(profile, &slots)?
+    };
+    canonical_definition_digest(profile, &argv)
+}
+
+/// Canonical definition digest for one slotted profile with validated
+/// slot arguments.
+///
+/// The digest covers the sealed argv rendered from the slots, so the
+/// Kernel front-door mirror agrees on the same suffix without accepting
+/// executable authority from the caller. Fixed-argv profiles are refused
+/// here; they digest through [`testd_definition_digest_for_profile`].
+pub fn testd_definition_digest_for_slots(
+    profile: &str,
+    slot_suffix: &[String],
+) -> Result<String, TestdError> {
+    if !is_slotted_testd_profile(profile) {
+        return Err(TestdError::Invalid {
+            field: "profile",
+            reason: "only the slotted list and scoped profiles take slot arguments",
+        });
+    }
+    let slots = parse_testd_slot_suffix(profile, slot_suffix)?;
+    let argv = render_testd_slotted_argv(profile, &slots)?;
+    canonical_definition_digest(profile, &argv)
+}
+
+fn canonical_definition_digest(profile: &str, argv: &[String]) -> Result<String, TestdError> {
     #[derive(Serialize)]
     struct Canonical<'a> {
         cpu_time_ms: Option<u64>,
@@ -374,14 +528,11 @@ pub fn testd_definition_digest_for_profile(profile: &str) -> Result<String, Test
         wall_timeout_ms: u64,
     }
     let empty: Vec<(String, String)> = Vec::new();
-    let fixed_argv = if profile == TESTD_ADMITTED_PROFILE {
-        TESTD_PROFILE_ARGV
-    } else {
-        TESTD_PRODUCTIVE_PROFILE_ARGV
-    };
-    let argv: Vec<String> = fixed_argv.iter().map(ToString::to_string).collect();
     let limits = profile_limits(profile);
-    let env_allowlist = if profile == TESTD_PRODUCTIVE_PROFILE {
+    let env_allowlist = if profile == TESTD_PRODUCTIVE_PROFILE
+        || profile == TESTD_LIST_PROFILE
+        || profile == TESTD_SCOPED_PROFILE
+    {
         TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -392,14 +543,14 @@ pub fn testd_definition_digest_for_profile(profile: &str) -> Result<String, Test
     let canonical = Canonical {
         cpu_time_ms: limits.1,
         env_allowlist: &env_allowlist,
-        fixed_argv: &argv,
+        fixed_argv: argv,
         max_descendants: limits.5,
         memory_bytes: limits.2,
         profile,
-        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
-            TESTD_PRODUCTIVE_PROFILE_PROGRAM
-        } else {
+        program_path: if profile == TESTD_ADMITTED_PROFILE {
             TESTD_PROFILE_PROGRAM
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
         },
         stderr_bytes: limits.4,
         stdout_bytes: limits.3,
@@ -472,6 +623,312 @@ fn is_binding_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Exact-match marker rendered before scoped filters.
+pub const TESTD_SLOT_EXACT: &str = "--exact";
+/// Separator between nextest options and exact test filters.
+pub const TESTD_SLOT_SEPARATOR: &str = "--";
+
+/// Validated slot values for one slotted nextest profile.
+///
+/// Values originate from the frozen discovery/selection material: package
+/// and binary name admitted Cargo target slots, filters name exact
+/// discovered test identities, and retries carry the declared per-test
+/// policy. Nothing here is caller free text.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TestdNextestSlots {
+    /// Optional Cargo package slot (`--package`).
+    pub package: Option<String>,
+    /// Optional binary target slot (`--bin`).
+    pub binary: Option<String>,
+    /// Declared per-test retry count (`--retries`), scoped runs only.
+    pub retries: Option<u32>,
+    /// Exact discovered test identities, scoped runs only.
+    pub filters: Vec<String>,
+}
+
+/// Fixed argv prefix for one slotted profile, or `None` for the
+/// fixed-argv probe and productive profiles.
+fn testd_slotted_prefix(profile: &str) -> Option<&'static [&'static str]> {
+    if profile == TESTD_LIST_PROFILE {
+        Some(TESTD_LIST_PROFILE_ARGV)
+    } else if profile == TESTD_SCOPED_PROFILE {
+        Some(TESTD_PRODUCTIVE_PROFILE_ARGV)
+    } else {
+        None
+    }
+}
+
+/// Parses one validated slot suffix for a slotted profile.
+///
+/// The grammar is strict order with no unknown token:
+///
+/// ```text
+/// list:   [--package NAME] [--bin NAME]
+/// scoped: [--package NAME] [--bin NAME] [--retries N] [--exact -- FILTER...]
+/// ```
+///
+/// A missing value, a duplicate or out-of-order flag, an unknown token, a
+/// non-canonical retry spelling, or a scoped-only flag on the list profile
+/// fails closed. Fixed-argv profiles are refused here; they never parse
+/// caller arguments.
+pub fn parse_testd_slot_suffix(
+    profile: &str,
+    suffix: &[String],
+) -> Result<TestdNextestSlots, TestdError> {
+    if !is_slotted_testd_profile(profile) {
+        return Err(TestdError::Invalid {
+            field: "invocation.arguments",
+            reason: "the admitted profile takes fixed argv; caller arguments are refused",
+        });
+    }
+    let scoped = profile == TESTD_SCOPED_PROFILE;
+    let mut slots = TestdNextestSlots::default();
+    let mut index = 0;
+    for flag in [TESTD_SLOT_PACKAGE, TESTD_SLOT_BINARY] {
+        if suffix.get(index).is_some_and(|token| token == flag) {
+            let name = suffix.get(index + 1).ok_or(TestdError::Invalid {
+                field: "invocation.arguments",
+                reason: "slot flag is missing its value",
+            })?;
+            validate_slot_name(name)?;
+            if flag == TESTD_SLOT_PACKAGE {
+                slots.package = Some(name.clone());
+            } else {
+                slots.binary = Some(name.clone());
+            }
+            index += 2;
+        }
+    }
+    if scoped
+        && suffix
+            .get(index)
+            .is_some_and(|token| token == TESTD_SLOT_RETRIES)
+    {
+        let token = suffix.get(index + 1).ok_or(TestdError::Invalid {
+            field: "invocation.arguments",
+            reason: "slot flag is missing its value",
+        })?;
+        let retries: u32 = token.parse().map_err(|_| TestdError::Invalid {
+            field: "invocation.arguments",
+            reason: "slot retry count is not a canonical number",
+        })?;
+        if retries.to_string() != *token {
+            return Err(TestdError::Invalid {
+                field: "invocation.arguments",
+                reason: "slot retry count is not a canonical number",
+            });
+        }
+        slots.retries = Some(retries);
+        index += 2;
+    }
+    if scoped
+        && suffix
+            .get(index)
+            .is_some_and(|token| token == TESTD_SLOT_EXACT)
+    {
+        if suffix
+            .get(index + 1)
+            .is_none_or(|token| token != TESTD_SLOT_SEPARATOR)
+        {
+            return Err(TestdError::Invalid {
+                field: "invocation.arguments",
+                reason: "slot filters require the exact separator",
+            });
+        }
+        let filters = &suffix[index + 2..];
+        if filters.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "invocation.arguments",
+                reason: "slot filter set is empty",
+            });
+        }
+        for filter in filters {
+            validate_slot_filter(filter)?;
+        }
+        slots.filters = filters.to_vec();
+        index = suffix.len();
+    }
+    if index != suffix.len() {
+        return Err(TestdError::Invalid {
+            field: "invocation.arguments",
+            reason: "slot suffix carries an unknown, duplicate, or out-of-order token",
+        });
+    }
+    Ok(slots)
+}
+
+/// Renders the complete sealed argv for one slotted profile: the fixed
+/// prefix plus the canonical slot rendering.
+///
+/// Every slot is revalidated here, so the renderer never trusts
+/// pre-validated input. The rendering equals the nextest owner's
+/// `NextestCommand::list` / `run_scoped` output for the same slots.
+pub fn render_testd_slotted_argv(
+    profile: &str,
+    slots: &TestdNextestSlots,
+) -> Result<Vec<String>, TestdError> {
+    let prefix = testd_slotted_prefix(profile).ok_or(TestdError::Invalid {
+        field: "profile",
+        reason: "only the slotted list and scoped profiles take slot arguments",
+    })?;
+    let scoped = profile == TESTD_SCOPED_PROFILE;
+    if let Some(package) = &slots.package {
+        validate_slot_name(package)?;
+    }
+    if let Some(binary) = &slots.binary {
+        validate_slot_name(binary)?;
+    }
+    if !scoped && (slots.retries.is_some() || !slots.filters.is_empty()) {
+        return Err(TestdError::Invalid {
+            field: "invocation.arguments",
+            reason: "retries and filters are scoped-run slots only",
+        });
+    }
+    for filter in &slots.filters {
+        validate_slot_filter(filter)?;
+    }
+    let mut argv: Vec<String> = prefix.iter().map(ToString::to_string).collect();
+    if let Some(package) = &slots.package {
+        argv.push(TESTD_SLOT_PACKAGE.to_owned());
+        argv.push(package.clone());
+    }
+    if let Some(binary) = &slots.binary {
+        argv.push(TESTD_SLOT_BINARY.to_owned());
+        argv.push(binary.clone());
+    }
+    if scoped {
+        if let Some(retries) = slots.retries {
+            argv.push(TESTD_SLOT_RETRIES.to_owned());
+            argv.push(retries.to_string());
+        }
+        if !slots.filters.is_empty() {
+            argv.push(TESTD_SLOT_EXACT.to_owned());
+            argv.push(TESTD_SLOT_SEPARATOR.to_owned());
+            argv.extend(slots.filters.iter().cloned());
+        }
+    }
+    Ok(argv)
+}
+
+/// Encodes validated list slot arguments in canonical order.
+pub fn encode_testd_list_slots(
+    package: Option<&str>,
+    binary: Option<&str>,
+) -> Result<Vec<String>, TestdError> {
+    let mut suffix = Vec::new();
+    if let Some(package) = package {
+        validate_slot_name(package)?;
+        suffix.push(TESTD_SLOT_PACKAGE.to_owned());
+        suffix.push(package.to_owned());
+    }
+    if let Some(binary) = binary {
+        validate_slot_name(binary)?;
+        suffix.push(TESTD_SLOT_BINARY.to_owned());
+        suffix.push(binary.to_owned());
+    }
+    Ok(suffix)
+}
+
+/// Encodes validated scoped slot arguments in canonical order.
+pub fn encode_testd_scoped_slots(
+    package: Option<&str>,
+    binary: Option<&str>,
+    retries: Option<u32>,
+    filters: &[String],
+) -> Result<Vec<String>, TestdError> {
+    let slots = TestdNextestSlots {
+        package: package.map(str::to_owned),
+        binary: binary.map(str::to_owned),
+        retries,
+        filters: filters.to_vec(),
+    };
+    let argv = render_testd_slotted_argv(TESTD_SCOPED_PROFILE, &slots)?;
+    Ok(argv[TESTD_PRODUCTIVE_PROFILE_ARGV.len()..].to_vec())
+}
+
+/// Builds the typed invocation for one slotted discovery submission.
+///
+/// The template supplies request identity, instrument, target, scope, and
+/// clock; this constructor binds the TEST kind, the list profile, and the
+/// validated slot suffix. The result submits through the ordinary
+/// [`TestdStore::submit`] path.
+pub fn testd_list_invocation(
+    template: &InstrumentInvocation,
+    package: Option<&str>,
+    binary: Option<&str>,
+) -> Result<InstrumentInvocation, TestdError> {
+    template
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let arguments = encode_testd_list_slots(package, binary)?;
+    let mut invocation = template.clone();
+    invocation.kind = InstrumentKind::Test;
+    invocation.profile = TESTD_LIST_PROFILE.to_owned();
+    invocation.arguments = arguments;
+    invocation
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    Ok(invocation)
+}
+
+/// Builds the typed invocation for one slotted scoped-run submission.
+///
+/// The template supplies request identity, instrument, target, scope, and
+/// clock; this constructor binds the TEST kind, the scoped profile, and
+/// the validated slot suffix. The result submits through the ordinary
+/// [`TestdStore::submit`] path.
+pub fn testd_scoped_invocation(
+    template: &InstrumentInvocation,
+    package: Option<&str>,
+    binary: Option<&str>,
+    retries: Option<u32>,
+    filters: &[String],
+) -> Result<InstrumentInvocation, TestdError> {
+    template
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let arguments = encode_testd_scoped_slots(package, binary, retries, filters)?;
+    let mut invocation = template.clone();
+    invocation.kind = InstrumentKind::Test;
+    invocation.profile = TESTD_SCOPED_PROFILE.to_owned();
+    invocation.arguments = arguments;
+    invocation
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+    Ok(invocation)
+}
+
+/// Validates one Cargo package/binary slot name.
+///
+/// Admitted names use Cargo's common ASCII package/target characters and
+/// cannot start with `-`. Mirrors the nextest owner's slot validation.
+fn validate_slot_name(value: &str) -> Result<(), TestdError> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+'))
+    {
+        return Err(TestdError::Invalid {
+            field: "invocation.arguments",
+            reason: "slot name is not an admitted Cargo target name",
+        });
+    }
+    validate_text(value, "invocation.arguments")
+}
+
+/// Validates one exact test filter. Filters are passed as individual argv
+/// values after `--`; controls are rejected and no shell command is built.
+fn validate_slot_filter(value: &str) -> Result<(), TestdError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(TestdError::Invalid {
+            field: "invocation.arguments",
+            reason: "slot filter is not an exact discovered test identity",
+        });
+    }
+    Ok(())
 }
 
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
@@ -3326,10 +3783,12 @@ impl TestdStore {
         if !matches!(invocation.kind, InstrumentKind::Test) {
             return Err(TestdError::WrongInstrumentKind);
         }
-        // Closed-profile registration (issue #20): only registered probe or
-        // productive nextest profiles register, and both take no caller
-        // arguments. Fixed argv comes from the registry binding, never from
-        // the invocation.
+        // Closed-profile registration (issue #20): only registered
+        // profiles register. The probe and productive profiles take no
+        // caller arguments: fixed argv comes from the registry binding,
+        // never from the invocation. The slotted list/scoped profiles
+        // (issue #1802, step 4) validate their arguments through the slot
+        // schema instead; the Drive seals exactly the rendered argv.
         if !is_admitted_testd_profile(&invocation.profile) {
             return Err(TestdError::Invalid {
                 field: "invocation.profile",
@@ -3337,10 +3796,14 @@ impl TestdStore {
             });
         }
         if !invocation.arguments.is_empty() {
-            return Err(TestdError::Invalid {
-                field: "invocation.arguments",
-                reason: "the admitted profile takes fixed argv; caller arguments are refused",
-            });
+            if is_slotted_testd_profile(&invocation.profile) {
+                parse_testd_slot_suffix(&invocation.profile, &invocation.arguments)?;
+            } else {
+                return Err(TestdError::Invalid {
+                    field: "invocation.arguments",
+                    reason: "the admitted profile takes fixed argv; caller arguments are refused",
+                });
+            }
         }
         if invocation.request.request_id.as_str() != process.operation_id().as_str() {
             return Err(TestdError::InvalidBinding);

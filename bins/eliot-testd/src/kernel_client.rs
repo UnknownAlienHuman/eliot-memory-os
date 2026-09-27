@@ -1097,11 +1097,12 @@ pub enum TestdDriveOutcome {
     },
 }
 
-/// Closed-profile Drive gate (issue #20): only the admitted tool-probe
-/// profile drives, and it takes no caller arguments: the fixed argv comes
-/// from the registry binding (see `eliot_testd_core`), never from the
-/// invocation. Anything else fails closed before any submit or process
-/// start.
+/// Closed-profile Drive gate (issue #20): only registered profiles
+/// drive. Fixed-argv profiles take no caller arguments: the fixed argv
+/// comes from the registry binding (see `eliot_testd_core`), never from
+/// the invocation. Slotted profiles (issue #1802, step 4) validate their
+/// arguments through the slot schema. Anything else fails closed before
+/// any submit or process start.
 fn check_drive_profile(invocation: &InstrumentInvocation) -> Result<(), TestdIpcError> {
     if !eliot_testd_core::is_admitted_testd_profile(&invocation.profile) {
         return Err(TestdIpcError::Contract(
@@ -1109,9 +1110,14 @@ fn check_drive_profile(invocation: &InstrumentInvocation) -> Result<(), TestdIpc
         ));
     }
     if !invocation.arguments.is_empty() {
-        return Err(TestdIpcError::Contract(
-            "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
-        ));
+        if eliot_testd_core::is_slotted_testd_profile(&invocation.profile) {
+            eliot_testd_core::parse_testd_slot_suffix(&invocation.profile, &invocation.arguments)
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        } else {
+            return Err(TestdIpcError::Contract(
+                "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

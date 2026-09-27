@@ -21,6 +21,7 @@ use eliot_instrument_api::{InstrumentAdmissionGrant, InstrumentAdmissionRequest,
 use eliot_instrument_cargo::CONTRACT_NAME as CARGO_CONTRACT_NAME;
 use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
+use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use thiserror::Error;
 
 use crate::registry::{ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable};
@@ -230,6 +231,8 @@ pub enum InstrumentClass {
     SourceIdentity,
     /// Compilation and build.
     Compiler,
+    /// Source formatting checks.
+    Formatter,
     /// Test execution.
     Test,
     /// Semantic index decoding and projection.
@@ -252,14 +255,16 @@ impl InstrumentClass {
     /// Coarse invocation class this semantic class binds stages under.
     ///
     /// Observation classes bind under `Inspect`, static checks under `Lint`,
-    /// executable test-like harnesses (including concurrency, unsafe, and
-    /// performance rigs) under `Test`, and build compilers under `Build`.
+    /// formatting under `Format`, executable test-like harnesses (including
+    /// concurrency, unsafe, and performance rigs) under `Test`, and build
+    /// compilers under `Build`.
     pub const fn coarse_kind(self) -> InstrumentKind {
         match self {
             Self::SourceIdentity | Self::SemanticIndex | Self::RuntimeDiagnostic => {
                 InstrumentKind::Inspect
             }
             Self::Compiler => InstrumentKind::Build,
+            Self::Formatter => InstrumentKind::Format,
             Self::Test | Self::Concurrency | Self::UnsafeFfi | Self::Performance => {
                 InstrumentKind::Test
             }
@@ -847,7 +852,7 @@ impl InstrumentProfile {
     }
 }
 
-/// Builds the builtin spec set backing the `compiler` and `test` profiles.
+/// Builds the builtin spec set backing the `compiler`, `test`, and `dev-fast` profiles.
 ///
 /// Builtin specs pin the exact executable file, the owning adapter's schema
 /// authority, the isolated-process environment/credential/network classes,
@@ -914,6 +919,25 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_NEXTEST_OUTPUT_BYTES as u64)),
+            max_concurrency: BUILTIN_MAX_CONCURRENCY,
+        })?,
+        InstrumentSpec::new(InstrumentSpecParams {
+            kind: InstrumentKindId::new(
+                ContractId::new(RUSTFMT_INSTRUMENT)?,
+                BUILTIN_KIND_VERSION,
+            )?,
+            class: InstrumentClass::Formatter,
+            revision: BUILTIN_SPEC_VERSION,
+            executable: "cargo".to_owned(),
+            executable_version: None,
+            parser: ContractId::new(RUSTFMT_INSTRUMENT)?,
+            parser_generation: BUILTIN_PARSER_GENERATION,
+            environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            schema: ContractId::new(RUSTFMT_INSTRUMENT)?,
+            argument_template: Vec::new(),
+            credential_policy: credential.clone(),
+            network_policy: network.clone(),
+            limits: ResourceLimits::new(None, Some(MAX_RUSTFMT_OUTPUT_BYTES as u64)),
             max_concurrency: BUILTIN_MAX_CONCURRENCY,
         })?,
     ])
