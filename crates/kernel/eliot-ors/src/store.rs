@@ -1831,6 +1831,22 @@ const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 /// state of a store written before this counter existed; the family's streamed
 /// content root is what additionally binds that state.
 const PROCESS_STREAM_RECOVERY_FAMILY_REVISION: &str = "process_stream_recovery_family_revision";
+/// Durable monotone revision of the versioned-artifact family (issue #1971).
+///
+/// The exact counterpart of [`PROCESS_STREAM_RECOVERY_FAMILY_REVISION`] for the
+/// second cursor-paged row family, with the same three properties and the same
+/// reason for being a SEPARATE key: it is advanced inside the same write
+/// transaction as every durable insert, advance and removal of
+/// `ors_versioned_artifacts_v1` (that is, in `replace_versioned_artifact_rows`,
+/// the family's single write path), so any movement of the family moves this
+/// counter; an in-progress backup compares it against the revision it froze and
+/// refuses a continued export rather than tearing the snapshot; and an absent key
+/// is revision `0`, the legacy state of a store written before this counter
+/// existed, which the family's streamed content root additionally binds. A
+/// separate key rather than a shared one, so a process-stream recovery insert
+/// cannot look like versioned-artifact movement and refuse an unrelated
+/// continuation.
+const VERSIONED_ARTIFACT_FAMILY_REVISION: &str = "versioned_artifact_family_revision";
 
 struct ClosureRowPlan {
     key: String,
@@ -2817,7 +2833,41 @@ impl RedbRecoveryStore {
     pub fn open_backup_process_stream_recovery_family(
         &self,
     ) -> Result<crate::backup_snapshot::OrsFamilyCursor, OrsError> {
-        backup_snapshot::open_process_stream_recovery_family(&self.database)
+        backup_snapshot::open_backup_family(
+            &self.database,
+            crate::backup_snapshot::RowFamilyKind::ProcessStreamRecovery,
+        )
+    }
+
+    /// Opens the typed versioned-artifact family cursor for a backup (issue
+    /// #1971).
+    ///
+    /// The exact mirror of
+    /// [`Self::open_backup_process_stream_recovery_family`], and for the same
+    /// reason it is the ONLY producer of a cursor for this family: it reads the
+    /// durable `versioned_artifact_family_revision` and the family's streamed
+    /// content root under one read transaction, so the frozen snapshot identity
+    /// can never mix two moments. Attach the returned cursor with
+    /// [`crate::backup_snapshot::OrsBackupRequest::with_versioned_artifact_cursor`]
+    /// so the `ors_versioned_artifacts_v1` rows are paged under their own
+    /// generation-addressed total order instead of being dropped from the
+    /// denominator, which is the whole of the W7 remainder for this family.
+    ///
+    /// Opening the cursor is not authority and confers no restore path. The
+    /// family's disposition is `NonrestorableHistorical`, so every exported row
+    /// lands `Forensic` in quarantine triage and no restored installation can
+    /// read a prior installation's generation authority back as its own. I1.6
+    /// ("versioned binaries are never replaced in place while running") and
+    /// I1.12 ("Rollback is allowed only to an artifact compatible with current
+    /// durable formats and epoch lineage") are unaffected: this reads history, it
+    /// does not activate a generation, and it is not a rollback.
+    pub fn open_backup_versioned_artifact_family(
+        &self,
+    ) -> Result<crate::backup_snapshot::OrsFamilyCursor, OrsError> {
+        backup_snapshot::open_backup_family(
+            &self.database,
+            crate::backup_snapshot::RowFamilyKind::VersionedArtifacts,
+        )
     }
 
     /// Triages one backup page as quarantined import outcomes without writing.
@@ -18102,6 +18152,71 @@ impl RedbRecoveryStore {
         Ok(next)
     }
 
+    /// Reads the durable monotone revision of the versioned-artifact family
+    /// (issue #1971).
+    ///
+    /// The single owner of that counter: the family's one write path advances it
+    /// and the backup family cursor observes it. A store written before the
+    /// counter existed reads as revision `0`, which is a real frozen value and
+    /// not an error - the family's streamed content root binds that state.
+    pub(super) fn versioned_artifact_family_revision(
+        read: &redb::ReadTransaction,
+    ) -> Result<u64, OrsError> {
+        let meta = read.open_table(META).map_err(storage)?;
+        let revision = meta
+            .get(VERSIONED_ARTIFACT_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        Ok(revision)
+    }
+
+    /// Advances the versioned-artifact family revision in the caller's open
+    /// write transaction (issue #1971).
+    ///
+    /// Called only when a family row was actually inserted, advanced or removed,
+    /// in the same transaction as that change: an exact re-presentation of the
+    /// same registry that changed nothing must not look like movement to an
+    /// in-progress backup. That is what makes repeated recommits of an unchanged
+    /// registry quiescent for the witness, while a staged candidate, a drain mark,
+    /// a retirement or a removal all move it exactly like any other change.
+    ///
+    /// Cannot be called while the caller still holds the family table open, so
+    /// `replace_versioned_artifact_rows` scopes that borrow and reports whether it
+    /// moved before advancing here.
+    fn advance_versioned_artifact_family_revision(
+        write: &redb::WriteTransaction,
+    ) -> Result<u64, OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = meta
+            .get(VERSIONED_ARTIFACT_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        let next = prior
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: "versioned-artifact family revision counter exhausted".to_owned(),
+            })?;
+        meta.insert(
+            VERSIONED_ARTIFACT_FAMILY_REVISION,
+            next.to_string().as_str(),
+        )
+        .map_err(storage)?;
+        Ok(next)
+    }
+
     fn operational_key(kind: OperationalKind, subject: &crate::OperationIdentity) -> String {
         format!("{}:{}", kind.key_prefix(), subject.as_str())
     }
@@ -19756,6 +19871,11 @@ impl RedbRecoveryStore {
     /// tombstone family. The commit is the durable linearization point, so a
     /// crash before it leaves the prior durable set and a crash after it
     /// reconstructs this one.
+    ///
+    /// It is also where this family's durable revision advances (issue #1971),
+    /// which is what lets a backup continuation holding the family frozen detect
+    /// movement. See [`Self::replace_versioned_artifact_rows`] for the
+    /// unchanged-vs-moved discriminator that decides whether it advances.
     pub fn commit_versioned_artifact_registry(
         &self,
         registry: &VersionedArtifactRegistry,
@@ -19775,30 +19895,71 @@ impl RedbRecoveryStore {
     /// hold. A rollback re-staged candidate and the retained generation it was
     /// re-staged from are two rows under two different keys, which is why the
     /// side is part of the key and not a field inside the row.
+    ///
+    /// This is also where the family's durable revision advances (issue #1971),
+    /// in the SAME transaction as the row changes, which is what lets a backup
+    /// continuation that froze this family detect the movement. The
+    /// unchanged-vs-moved discriminator is the whole point of the shape below:
+    ///
+    /// - a presented row advances the family if and only if the durable bytes
+    ///   under its canonical key differ from the bytes this call would write, and
+    ///   an equal row is not rewritten at all;
+    /// - a removal of a durable key outside `rows` advances the family;
+    /// - therefore an exact re-presentation of the registry that is already
+    ///   durable performs NO durable write and does NOT advance the revision.
+    ///
+    /// The counter would otherwise be worthless in the common case: this is a
+    /// whole-registry publish, so a supervisor that recommits the same registry
+    /// on every cycle would make every backup of a quiescent store look like
+    /// family movement, and an in-progress export would be refused for a change
+    /// that never happened. The family table borrow is scoped so the meta table can
+    /// be opened for the advance once the family write is complete; a transaction
+    /// that has already reported "moved" is not left holding the revision back.
     fn replace_versioned_artifact_rows(
         write: &redb::WriteTransaction,
         rows: &[VersionedArtifactEntry],
     ) -> Result<(), OrsError> {
-        let mut table = write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?;
-        let mut durable_keys: BTreeSet<String> = BTreeSet::new();
-        for row in rows {
-            row.validate()?;
-            let key = row.record_key();
-            let payload = encode(row)?;
-            table
-                .insert(key.as_str(), payload.as_str())
-                .map_err(storage)?;
-            durable_keys.insert(key);
-        }
-        let mut obsolete: Vec<String> = Vec::new();
-        for entry in table.iter().map_err(storage)? {
-            let (key, _) = entry.map_err(storage)?;
-            if !durable_keys.contains(key.value()) {
-                obsolete.push(key.value().to_owned());
+        let moved = {
+            let mut table = write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?;
+            let mut durable_keys: BTreeSet<String> = BTreeSet::new();
+            let mut moved = false;
+            for row in rows {
+                row.validate()?;
+                let key = row.record_key();
+                let payload = encode(row)?;
+                // THE discriminator. `encode` is a pure function of the row, so a
+                // row whose canonical key is already durable with these exact
+                // bytes is an exact re-presentation: it is neither inserted nor
+                // advanced, and it does not move the family revision. Any other
+                // outcome - absent key, or a different generation state, artifact
+                // identity or drain mark under the same key - is a real change.
+                let unchanged = table
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .is_some_and(|value| value.value() == payload.as_str());
+                if !unchanged {
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    moved = true;
+                }
+                durable_keys.insert(key);
             }
-        }
-        for key in &obsolete {
-            table.remove(key.as_str()).map_err(storage)?;
+            let mut obsolete: Vec<String> = Vec::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, _) = entry.map_err(storage)?;
+                if !durable_keys.contains(key.value()) {
+                    obsolete.push(key.value().to_owned());
+                }
+            }
+            for key in &obsolete {
+                table.remove(key.as_str()).map_err(storage)?;
+                moved = true;
+            }
+            moved
+        };
+        if moved {
+            Self::advance_versioned_artifact_family_revision(write)?;
         }
         Ok(())
     }

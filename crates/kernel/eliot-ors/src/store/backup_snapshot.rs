@@ -74,9 +74,9 @@
 //!   the boundary and no row can leave the denominator silently.
 //! - Exhausting the page or byte budget is a resumable `Partial` disposition
 //!   carrying the exact next family cursor, not a permanent refusal.
-//! - The composite pre/post freeze covers operational history *and* the family
-//!   revision and root, and both are folded into the page token and the
-//!   snapshot denominator.
+//! - The composite pre/post freeze covers operational history *and* every
+//!   cursor-paged family's revision and root, and both are folded into the page
+//!   token and the snapshot denominator.
 //! - Retirement advances the durable family revision in the family's one write
 //!   path, so an in-progress export observes it as typed movement.
 //! - No row is compacted: `Active`, `Suspended`, partial, unavailable, unknown
@@ -109,15 +109,45 @@
 //! artifact hash and path — with the `CutoverOwnership` sibling's
 //! `NonrestorableHistorical` disposition, so restore triage lands its rows as
 //! forensics through the generic disposition match and no restored
-//! installation can reactivate old installation-bound generation authority.
-//! The contract discriminator already names it cursor-paged
-//! (`RowFamilyKind::uses_family_cursor`), because its rows carry no operation
-//! order. Page serialization is not wired here yet: a cursor-paged export
-//! needs a durable monotone family revision the family's single write path
-//! advances inside the same transaction as every row change, and the
-//! versioned-artifact commit path has no such counter — the frozen identity,
-//! movement refusal and pre/post witness for this family stay next-phase work
-//! with that write path, not an approximation here.
+//! installation can reactivate old installation-bound generation authority
+//! (I05-27 / ARCH-RES-03: recovery cannot resurrect invalid state). The contract
+//! discriminator already named it cursor-paged
+//! ([`RowFamilyKind::uses_family_cursor`]), because its rows carry no operation
+//! order.
+//!
+//! This completes that registration by giving the family the SAME machinery the
+//! #2884 process-stream recovery family has, by imitation rather than by a second
+//! design. What exists now, once per paged family:
+//! - a durable monotone `versioned_artifact_family_revision` meta counter, read by
+//!   `RedbRecoveryStore::versioned_artifact_family_revision` and advanced by
+//!   `RedbRecoveryStore::advance_versioned_artifact_family_revision` inside the
+//!   SAME write transaction as every durable change to the family — that is, in
+//!   `replace_versioned_artifact_rows`, the family's single write path, which is
+//!   also where the unchanged-vs-moved discriminator lives so an exact
+//!   re-presentation of the same registry advances nothing;
+//! - a streamed content root over `ors_versioned_artifacts_v1` and the frozen
+//!   family identity built from it;
+//! - `RedbRecoveryStore::open_backup_versioned_artifact_family`, the only producer
+//!   of a cursor for this family;
+//! - the movement and cursor-boundary refusals, reusing the existing
+//!   [`OrsError`] variants (see [`family_moved_error`] and
+//!   [`family_cursor_mismatch_error`]) rather than adding a new one;
+//! - a page segment that charges this page's remaining row and byte admission per
+//!   row, and a page that is final only when the operational window AND both
+//!   paged families are closed;
+//! - a second symmetric request cursor / page continuation / snapshot identity,
+//!   folded into the page digest and the snapshot denominator in a fixed order;
+//! - the family's revision and content root folded into
+//!   [`composite_state_digest`], so a versioned-artifact commit during a capture
+//!   is visible to the pre/post witness instead of being invisible to it.
+//!
+//! Attaching the cursor puts those rows inside the exported DENOMINATOR. It
+//! confers no restore path: the family's disposition routes every exported row to
+//! `PerEntryOutcome::Forensic`, and I1.6/I1.12/I14.14 stay exactly where they
+//! were — a versioned binary is never replaced in place while running, and a
+//! rollback is only ever another cutover to an artifact verified compatible with
+//! current durable formats and epoch lineage. Reading a generation out of a backup
+//! is reading history, never acquiring the authority to activate it.
 //!
 //! Issue #953 makes the capture coherent and the page binding self-proving:
 //! - ONE `ReadTransaction` is opened per capture and threaded through the
@@ -174,7 +204,8 @@ use crate::backup_snapshot::{
     validate_import_binding,
 };
 use crate::{
-    OperationalPhase, OrsError, ProcessStreamRecoveryProjection, StreamRecoveryActivation,
+    ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
+    StreamRecoveryActivation, VersionedArtifactEntry,
 };
 
 /// Bounded full-scan cap for the identity-conflict lookup and the canonical
@@ -329,7 +360,8 @@ fn effect_class_for_stream_recovery(activation: StreamRecoveryActivation) -> Sto
     }
 }
 
-/// The family's own order value for one exported recovery entry.
+/// The process-stream recovery family's own order value and effect class for one
+/// exported recovery entry.
 ///
 /// The process-stream recovery family has no operation order, so its entry
 /// `order` is the row's own observation time in Unix milliseconds — a real
@@ -340,18 +372,136 @@ fn effect_class_for_stream_recovery(activation: StreamRecoveryActivation) -> Sto
 /// without dropping or duplicating a row. The projection's fail-closed
 /// `validate()` already rejects a non-positive observation time, so a
 /// non-representable value can only mean the row bypassed that gate.
-fn stream_recovery_entry_order(
+///
+/// Paired with [`effect_class_for_stream_recovery`] in one function for the same
+/// reason [`versioned_artifact_entry`] pairs its own: `order` and `effect_class`
+/// must describe the same decoded row.
+fn stream_recovery_entry(
     projection: &ProcessStreamRecoveryProjection,
-) -> Result<u64, OrsError> {
-    u64::try_from(projection.observed_at_ms).map_err(|_| OrsError::IntegrityProblem {
-        record_type: "process_stream_recovery",
-        reason: "observation time is not a representable backup order".to_owned(),
-    })
+) -> Result<(u64, StoredEffectClass), OrsError> {
+    let order =
+        u64::try_from(projection.observed_at_ms).map_err(|_| OrsError::IntegrityProblem {
+            record_type: "process_stream_recovery",
+            reason: "observation time is not a representable backup order".to_owned(),
+        })?;
+    Ok((
+        order,
+        effect_class_for_stream_recovery(projection.activation),
+    ))
 }
 
-/// One bounded read of the whole process-stream recovery family: the streamed
-/// content root plus the observed size, with nothing retained.
-struct ProcessStreamFamilyRoot {
+/// The versioned-artifact family's own order value and effect class for one
+/// exported registry entry (issue #1971).
+///
+/// The generation is the row's real, durably retained, generation-addressed
+/// identity field, so it is used verbatim as the reporting `order` for the same
+/// reason the process-stream row uses its observation time: a real retained field
+/// rather than a synthesized rank. It is a REPORTING value only — selection is by
+/// the family's own durable-key order through [`OrsFamilyCursor`], which is why
+/// two modules may legitimately share a generation number without dropping or
+/// duplicating a row.
+///
+/// Paired with [`effect_class_for_versioned_artifact`] in one function because a
+/// cursor-paged family is exported through a single per-row shape: an entry's
+/// `order` and `effect_class` are read off the same decoded row and must not be
+/// free to disagree about which row they describe. Total by construction —
+/// [`VersionedArtifactEntry::validate`] has already run through the ORS codec, so
+/// the generation is a stored `u64` and there is no conversion left to fail.
+fn versioned_artifact_entry(entry: &VersionedArtifactEntry) -> (u64, StoredEffectClass) {
+    (
+        entry.artifact.generation,
+        effect_class_for_versioned_artifact(entry.state),
+    )
+}
+
+/// Maps a durable versioned-artifact generation state to its backup effect class
+/// (issue #1971).
+///
+/// A staged candidate is not yet committed for the destination (`Staged`), an
+/// `Active` or `Draining` generation is in-flight installation-bound authority
+/// (`Possible`), and `Retired` is terminal (`Terminal`). `Unknown` is never
+/// produced: an unreadable or codec-incompatible row fails the export rather than
+/// being classified as reconciling, so no backup asserts an unknown outcome it did
+/// not read. `Retired` is listed rather than left to a wildcard because it is
+/// unreachable through the family's own row contract
+/// ([`VersionedArtifactEntry::validate`] refuses it) and must stay unreachable
+/// here too.
+fn effect_class_for_versioned_artifact(state: ArtifactGenerationState) -> StoredEffectClass {
+    match state {
+        ArtifactGenerationState::Staged => StoredEffectClass::Staged,
+        ArtifactGenerationState::Active | ArtifactGenerationState::Draining => {
+            StoredEffectClass::Possible
+        }
+        ArtifactGenerationState::Retired => StoredEffectClass::Terminal,
+    }
+}
+
+/// The durable table-definition type backing one cursor-paged row family.
+///
+/// Named once so [`family_table_definition`] and the read/open paths below state
+/// the same type the store's own family constants are declared with, instead of
+/// restating a lifetime spelling that would have to track redb's generics.
+type FamilyTable = redb::TableDefinition<'static, &'static str, &'static str>;
+
+/// The durable table that backs one cursor-paged row family (issue #1971).
+///
+/// The closed dispatch for the two families [`RowFamilyKind::uses_family_cursor`]
+/// admits. There is no wildcard success arm: a family that gains its own total
+/// order later must be registered here, in its own write path's durable revision
+/// and here, rather than silently falling through to a table this module never
+/// enumerated.
+fn family_table_definition(family: RowFamilyKind) -> Result<FamilyTable, OrsError> {
+    match family {
+        RowFamilyKind::ProcessStreamRecovery => Ok(super::PROCESS_STREAM_RECOVERY),
+        RowFamilyKind::VersionedArtifacts => Ok(super::VERSIONED_ARTIFACTS),
+        _ => Err(OrsError::InvalidField {
+            field: "backup_family",
+            reason: "family is not paged through a typed family cursor",
+        }),
+    }
+}
+
+/// The ORS `record_type` naming one cursor-paged family's own rows.
+///
+/// Used by the per-row export refusals so a refusal names the family that produced
+/// it rather than a generic backup record. Same closed dispatch as
+/// [`family_table_definition`].
+fn family_record_type(family: RowFamilyKind) -> Result<&'static str, OrsError> {
+    match family {
+        RowFamilyKind::ProcessStreamRecovery => Ok("process_stream_recovery"),
+        RowFamilyKind::VersionedArtifacts => Ok("versioned_artifact_entry"),
+        _ => Err(OrsError::InvalidField {
+            field: "backup_family",
+            reason: "family is not paged through a typed family cursor",
+        }),
+    }
+}
+
+/// Reads one cursor-paged family's durable monotone revision (issue #1971).
+///
+/// Each family has its own meta counter and its own single advancing write path,
+/// so this is a dispatch over the store's two family-revision readers rather than
+/// one shared counter: sharing a counter would let a process-stream recovery
+/// insert look like versioned-artifact movement and refuse an unrelated
+/// continuation.
+fn family_revision(read: &ReadTransaction, family: RowFamilyKind) -> Result<u64, OrsError> {
+    match family {
+        RowFamilyKind::ProcessStreamRecovery => {
+            super::RedbRecoveryStore::process_stream_recovery_family_revision(read)
+        }
+        RowFamilyKind::VersionedArtifacts => {
+            super::RedbRecoveryStore::versioned_artifact_family_revision(read)
+        }
+        _ => Err(OrsError::InvalidField {
+            field: "backup_family",
+            reason: "family is not paged through a typed family cursor",
+        }),
+    }
+}
+
+/// One bounded read of one cursor-paged row family: the streamed content root
+/// plus the observed size, with nothing retained.
+struct FamilyRoot {
     /// Chained content root over the family's durable keys and encoded rows.
     root_digest: String,
     /// Retained rows observed.
@@ -360,23 +510,27 @@ struct ProcessStreamFamilyRoot {
     total_bytes: u64,
 }
 
-/// Computes the process-stream recovery family's content root in one streaming
-/// pass.
+/// Computes one cursor-paged family's content root in one streaming pass.
 ///
 /// Each row is folded into an [`OrsFamilyRowChain`] link and then dropped, so
 /// the pass costs a constant amount of memory no matter how many rows the family
 /// retains: a ten-thousand-row family is hashed, not collected. The root binds
 /// the family's total durable-key order and every row's encoded bytes, so it
-/// moves on an insert, an evidence advance and a retirement alike.
+/// moves on an insert, an advance and a removal alike.
+///
+/// The chain is seeded with `family`, so a link is not transferable between
+/// families: the versioned-artifact root and the process-stream recovery root
+/// cannot collide even for byte-identical row content.
 ///
 /// This is the frozen owner snapshot identity, not page enumeration: it runs
 /// once when a family cursor is opened and once per pre/post freeze check, never
 /// once per page. It is bounded by [`IMPORT_SCAN_ROW_CAP`] and fails closed
 /// rather than certifying a truncated family as complete.
-fn stream_recovery_family_root(
+fn family_root(
     table: &redb::ReadOnlyTable<&str, &str>,
-) -> Result<ProcessStreamFamilyRoot, OrsError> {
-    let mut chain = OrsFamilyRowChain::start(RowFamilyKind::ProcessStreamRecovery);
+    family: RowFamilyKind,
+) -> Result<FamilyRoot, OrsError> {
+    let mut chain = OrsFamilyRowChain::start(family);
     let mut row_count: u64 = 0;
     let mut total_bytes: u64 = 0;
     for row in table.iter().map_err(storage)? {
@@ -393,29 +547,30 @@ fn stream_recovery_family_root(
             .ok_or(OrsError::ProjectionLimitExceeded)?;
         chain.advance_row(key.value(), &crate::model::sha256_hex(encoded));
     }
-    Ok(ProcessStreamFamilyRoot {
+    Ok(FamilyRoot {
         root_digest: chain.link().to_owned(),
         row_count,
         total_bytes,
     })
 }
 
-/// Reads the durable family revision and the family's content root under one
-/// read transaction, so the frozen identity can never mix two moments.
-fn process_stream_recovery_family_identity(
+/// Reads one cursor-paged family's durable revision and its content root under
+/// one read transaction, so the frozen identity can never mix two moments.
+fn family_identity(
     read: &ReadTransaction,
+    family: RowFamilyKind,
 ) -> Result<OrsFamilySnapshotIdentity, OrsError> {
-    let family_revision = super::RedbRecoveryStore::process_stream_recovery_family_revision(read)?;
+    let family_revision = family_revision(read, family)?;
     let root = {
         let table = read
-            .open_table(super::PROCESS_STREAM_RECOVERY)
+            .open_table(family_table_definition(family)?)
             .map_err(storage)?;
-        let root = stream_recovery_family_root(&table)?;
+        let root = family_root(&table, family)?;
         drop(table);
         root
     };
     OrsFamilySnapshotIdentity::new(
-        RowFamilyKind::ProcessStreamRecovery,
+        family,
         family_revision,
         root.root_digest,
         root.row_count,
@@ -423,57 +578,123 @@ fn process_stream_recovery_family_identity(
     )
 }
 
-/// Opens the typed family cursor for the live process-stream recovery family.
+/// Opens the typed family cursor for one live cursor-paged row family.
 ///
-/// The one producer of an [`OrsFamilyCursor`]: the cursor can only be born from
-/// the owner's own durable revision and content root, so a caller cannot mint a
-/// family snapshot and therefore cannot choose where a family page starts.
-pub(super) fn open_process_stream_recovery_family(
+/// The one producer of an [`OrsFamilyCursor`] for that family: the cursor can
+/// only be born from the owner's own durable revision and content root, so a
+/// caller cannot mint a family snapshot and therefore cannot choose where that
+/// family's page starts. Two callers, one per family:
+/// `RedbRecoveryStore::open_backup_process_stream_recovery_family` and
+/// `RedbRecoveryStore::open_backup_versioned_artifact_family` (issue #1971).
+pub(super) fn open_backup_family(
     database: &Database,
+    family: RowFamilyKind,
 ) -> Result<OrsFamilyCursor, OrsError> {
     let read = database.begin_read().map_err(storage)?;
-    let identity = process_stream_recovery_family_identity(&read)?;
+    let identity = family_identity(&read, family)?;
     drop(read);
     OrsFamilyCursor::start(identity)
+}
+
+/// The movement refusal for a family that moved after a backup froze it.
+///
+/// NO new [`OrsError`] variant is introduced here (issue #1971). Both `OrsError`
+/// mappings outside `eliot-ors` — `eliot-kernel-service/src/storage_replacement.rs`
+/// and `bins/eliot-kernel/src/backup_restore_ports.rs` — match the enum
+/// EXHAUSTIVELY with no `_` wildcard, so a new variant would not compile outside
+/// this crate and the two files that own those mappings are not this change's to
+/// edit. The process-stream recovery family therefore keeps its own rich typed
+/// variant unchanged, and the versioned-artifact family reuses
+/// [`OrsError::OrderingHeadMismatch`] — the crate's existing typed refusal for a
+/// head/revision that does not match durable ORS state, already the refusal
+/// `check_export_fence` uses for exactly that reason. The same operator action
+/// applies to both: restart this family's export from a freshly opened family
+/// snapshot.
+fn family_moved_error(
+    family: RowFamilyKind,
+    cursor: &OrsFamilyCursor,
+    observed_revision: u64,
+    observed_root_digest: String,
+) -> OrsError {
+    match family {
+        RowFamilyKind::ProcessStreamRecovery => OrsError::ProcessStreamRecoveryFamilyMoved {
+            frozen_revision: cursor.identity.family_revision,
+            observed_revision,
+            frozen_root_digest: cursor.identity.family_root_digest.clone(),
+            observed_root_digest,
+            after_key: cursor.after_key.clone(),
+        },
+        _ => OrsError::OrderingHeadMismatch,
+    }
+}
+
+/// The refusal for a presented cursor that does not name the owner-emitted
+/// durable-key prefix.
+///
+/// Same closed-variant constraint as [`family_moved_error`], and the same reuse
+/// decision: the process-stream recovery family keeps
+/// [`OrsError::ProcessStreamRecoveryFamilyCursorMismatch`], and the
+/// versioned-artifact family reuses [`OrsError::InvalidField`] — the crate's
+/// existing typed refusal for a caller-presented value that does not name
+/// durable state, with the family's own field name so no two refusals read alike.
+fn family_cursor_mismatch_error(
+    family: RowFamilyKind,
+    cursor: &OrsFamilyCursor,
+    expected_after_key: String,
+    expected_emitted_rows: u64,
+) -> OrsError {
+    match family {
+        RowFamilyKind::ProcessStreamRecovery => {
+            OrsError::ProcessStreamRecoveryFamilyCursorMismatch {
+                presented_after_key: cursor.after_key.clone(),
+                presented_emitted_rows: cursor.emitted_rows,
+                expected_after_key,
+                expected_emitted_rows,
+            }
+        }
+        _ => OrsError::InvalidField {
+            field: "backup_versioned_artifact_family_cursor",
+            reason: "cursor must name the owner-emitted durable-key prefix",
+        },
+    }
 }
 
 /// Refuses a family page whose family moved after the backup froze it.
 ///
 /// The check is a comparison against live owner state, the same shape as the
 /// owner-bound snapshot handle in the store API: the frozen revision in the
-/// cursor is compared with the durable revision this write transaction actually
-/// observed, and any difference is [`OrsError::ProcessStreamRecoveryFamilyMoved`]
-/// — the movement/restart disposition. It fires for an insert, an evidence
-/// advance, a revalidation and a retirement alike, because the family's single
-/// write path advances the revision in the same transaction as the row change.
+/// cursor is compared with the durable revision this read transaction actually
+/// observed, and any difference is the family's movement/restart disposition
+/// (see [`family_moved_error`] for which [`OrsError`] carries it). It fires for an
+/// insert, an advance and a removal alike, because each family's single write path
+/// advances its revision in the same transaction as the row change.
 ///
-/// The fast path reads one meta key. The observed content root is recomputed
-/// only on the refusal branch, where the extra pass buys exact evidence for the
+/// The fast path reads one meta key. The observed content root is recomputed only
+/// on the refusal branch, where the extra pass buys exact evidence for the
 /// operator instead of costing every page of a healthy export.
 fn check_family_revision_frozen(
     read: &ReadTransaction,
     cursor: &OrsFamilyCursor,
 ) -> Result<(), OrsError> {
-    let observed_revision =
-        super::RedbRecoveryStore::process_stream_recovery_family_revision(read)?;
+    let family = cursor.identity.family;
+    let observed_revision = family_revision(read, family)?;
     if observed_revision == cursor.identity.family_revision {
         return Ok(());
     }
     let observed_root_digest = {
         let table = read
-            .open_table(super::PROCESS_STREAM_RECOVERY)
+            .open_table(family_table_definition(family)?)
             .map_err(storage)?;
-        let root = stream_recovery_family_root(&table)?;
+        let root = family_root(&table, family)?;
         drop(table);
         root.root_digest
     };
-    Err(OrsError::ProcessStreamRecoveryFamilyMoved {
-        frozen_revision: cursor.identity.family_revision,
+    Err(family_moved_error(
+        family,
+        cursor,
         observed_revision,
-        frozen_root_digest: cursor.identity.family_root_digest.clone(),
         observed_root_digest,
-        after_key: cursor.after_key.clone(),
-    })
+    ))
 }
 
 /// Store-wide fence values the owner can establish at a capture's consistency
@@ -491,6 +712,15 @@ struct StoreFenceObservation {
     /// that never allocated one.
     high_water_order: u64,
     /// Durable monotone revision of the process-stream recovery family.
+    ///
+    /// Named for one family, not for "the family revision": the second
+    /// cursor-paged family (versioned artifacts, issue #1971) has its own counter
+    /// and reaches the page through its own cursor token, which
+    /// [`OrsBackupPage::expected_page_digest`] folds into `page_digest`. The
+    /// composite witness [`composite_state_digest`] folds BOTH families'
+    /// revisions and roots, so widening this observation would not make a
+    /// concurrent versioned-artifact commit any more detectable — it would only
+    /// make one store-wide token mean two independent things.
     family_revision: u64,
 }
 
@@ -593,10 +823,12 @@ fn check_export_fence(
 /// re-derived from live durable state and the walk stops the instant the
 /// presented row count is reached, so the cost is the prefix the owner already
 /// exported and the memory is constant — nothing is collected. A cursor whose
-/// chain, offset or last key disagrees with durable state is
-/// [`OrsError::ProcessStreamRecoveryFamilyCursorMismatch`]; a caller therefore
+/// chain, offset or last key disagrees with durable state is the family's own
+/// boundary refusal (see [`family_cursor_mismatch_error`]); a caller therefore
 /// cannot present a later key under an earlier offset and silently drop the rows
-/// in between out of the denominator.
+/// in between out of the denominator. The family is taken from the cursor itself
+/// and the chain is seeded with it, so the proof is family-scoped and a cursor
+/// cannot be checked against another family's table.
 fn check_family_cursor_boundary(
     table: &redb::ReadOnlyTable<&str, &str>,
     cursor: &OrsFamilyCursor,
@@ -621,32 +853,32 @@ fn check_family_cursor_boundary(
         || chain.link() != cursor.emitted_prefix_digest
         || durable_key != cursor.after_key
     {
-        return Err(OrsError::ProcessStreamRecoveryFamilyCursorMismatch {
-            presented_after_key: cursor.after_key.clone(),
-            presented_emitted_rows: cursor.emitted_rows,
-            expected_after_key: durable_key,
-            expected_emitted_rows: emitted,
-        });
+        return Err(family_cursor_mismatch_error(
+            cursor.identity.family,
+            cursor,
+            durable_key,
+            emitted,
+        ));
     }
     Ok(())
 }
 
-/// Refuses one process-stream recovery row with its own exact identity.
+/// Refuses one cursor-paged family row with its own exact identity.
 ///
 /// A row that will not decode, re-encode, or fit the caller's declared byte
 /// budget is named, not summarised: the export then stops at that row instead
 /// of scanning the remainder of the family to decide what to do with it. The
 /// disposition is [`OrsError::IntegrityProblem`] on the family's own
-/// `record_type`, which is the same typed storage-failure shape an unreadable
-/// operational-history row produces.
-fn stream_recovery_row_refused(record_key: &str, reason: &str) -> OrsError {
+/// `record_type` (resolved once by [`family_record_type`]), which is the same
+/// typed storage-failure shape an unreadable operational-history row produces.
+fn family_row_refused(record_type: &'static str, record_key: &str, reason: &str) -> OrsError {
     OrsError::IntegrityProblem {
-        record_type: "process_stream_recovery",
+        record_type,
         reason: format!("backup row {record_key:?} is not exportable: {reason}"),
     }
 }
 
-/// Builds one bounded process-stream recovery family page segment.
+/// Builds one bounded page segment for one cursor-paged row family.
 ///
 /// Rows are enumerated in the family's own durable-key order from
 /// `cursor.after_key`, and the row and byte budgets are charged per row as the
@@ -654,12 +886,22 @@ fn stream_recovery_row_refused(record_key: &str, reason: &str) -> OrsError {
 /// never holds more than one page of rows plus the one row it declined to emit.
 /// There is deliberately no "read the table, then slice" step.
 ///
-/// `row_budget` and `byte_budget` are this page's remaining admission, after
-/// the operational segment has been charged. `max_bytes` is the caller's whole
-/// declared per-page byte budget, which is what decides whether one row is
-/// exportable at all. `cursor.emitted_rows` and `cursor.emitted_bytes` are
-/// cumulative over the whole family, so they advance the continuation and are
-/// never compared against a per-page budget.
+/// `row_budget` and `byte_budget` are this page's remaining admission, after the
+/// operational segment and any earlier family segment have been charged.
+/// `max_bytes` is the caller's whole declared per-page byte budget, which is what
+/// decides whether one row is exportable at all. `cursor.emitted_rows` and
+/// `cursor.emitted_bytes` are cumulative over the whole family, so they advance
+/// the continuation and are never compared against a per-page budget.
+///
+/// `entry_shape` is the family's own per-row decision — order and effect class
+/// read off one decoded row, together — for a versioned-artifact row or a
+/// process-stream recovery row. It is passed in rather than derived here so one
+/// enumeration serves both families instead of two near-identical copies drifting
+/// apart, and so `order` and `effect_class` can never be read off different rows.
+///
+/// Returns the page's entries, its continuation, and the encoded bytes this
+/// segment charged to the page, so the next family segment on the same page is
+/// admitted from what is actually left rather than from the operational total.
 ///
 /// Dispositions, all non-destructive:
 /// - the boundary is proved against durable state before a single row is read;
@@ -670,14 +912,20 @@ fn stream_recovery_row_refused(record_key: &str, reason: &str) -> OrsError {
 ///   refusal naming that exact row, and the enumeration stops there instead of
 ///   scanning the remainder of the family to decide what to do with it;
 /// - `next` is `None` only when the enumeration reached the end of the family.
-fn stream_recovery_family_segment(
+fn family_segment<E: super::persistence_codec::PersistedValue + serde::Serialize>(
+    family: RowFamilyKind,
     table: &redb::ReadOnlyTable<&str, &str>,
     cursor: &OrsFamilyCursor,
     row_budget: usize,
     byte_budget: u64,
     max_bytes: u64,
-) -> Result<(Vec<OrsBackupEntry>, OrsFamilyContinuation), OrsError> {
+    entry_shape: impl Fn(&E) -> Result<(u64, StoredEffectClass), OrsError>,
+) -> Result<(Vec<OrsBackupEntry>, OrsFamilyContinuation, u64), OrsError> {
     check_family_cursor_boundary(table, cursor)?;
+    // Resolved once, not per refused row: the closed dispatch can only fail for
+    // a family this function was never called with, and it must be refused before
+    // a single row is read rather than from inside the row loop.
+    let record_type = family_record_type(family)?;
     let mut chain = OrsFamilyRowChain::resume(cursor.emitted_prefix_digest.clone());
     let mut entries: Vec<OrsBackupEntry> = Vec::new();
     let mut page_bytes: u64 = 0;
@@ -688,8 +936,8 @@ fn stream_recovery_family_segment(
     // `range` seeks to the exclusive bound instead of walking the table, so a
     // continuation costs the rows it still owes rather than the rows it already
     // exported. The bound is a durable key built from an operation identity and
-    // a stream name, so it is never the empty string a start cursor carries in
-    // order to mean "from the first key".
+    // a stream name (or from a module id and a generation), so it is never the
+    // empty string a start cursor carries in order to mean "from the first key".
     let rows = table
         .range::<&str>((Bound::Excluded(cursor.after_key.as_str()), Bound::Unbounded))
         .map_err(storage)?;
@@ -701,13 +949,13 @@ fn stream_recovery_family_segment(
         let (key, value) = row.map_err(storage)?;
         let record_key = key.value().to_owned();
         let decode_error =
-            |error: OrsError| stream_recovery_row_refused(&record_key, &error.to_string());
-        let projection: ProcessStreamRecoveryProjection =
-            decode(value.value()).map_err(decode_error)?;
-        let encoded = encode(&projection).map_err(decode_error)?;
+            |error: OrsError| family_row_refused(record_type, &record_key, &error.to_string());
+        let row_value: E = decode(value.value()).map_err(decode_error)?;
+        let encoded = encode(&row_value).map_err(decode_error)?;
         let encoded_len = u64::try_from(encoded.len()).map_err(|_| OrsError::PayloadTooLarge)?;
         if encoded_len > max_bytes {
-            return Err(stream_recovery_row_refused(
+            return Err(family_row_refused(
+                record_type,
                 &record_key,
                 &format!(
                     "row encodes to {encoded_len} bytes, above the declared backup byte budget {max_bytes}"
@@ -721,7 +969,7 @@ fn stream_recovery_family_segment(
             family_open = true;
             break;
         }
-        let order = stream_recovery_entry_order(&projection).map_err(decode_error)?;
+        let (order, effect) = entry_shape(&row_value).map_err(decode_error)?;
         page_bytes = charged;
         emitted_rows = emitted_rows
             .checked_add(1)
@@ -733,10 +981,10 @@ fn stream_recovery_family_segment(
         chain.advance_key(&record_key);
         entries.push(OrsBackupEntry {
             record_id: record_key,
-            family: RowFamilyKind::ProcessStreamRecovery,
+            family,
             order,
             payload_digest: crate::model::sha256_hex(encoded.as_bytes()),
-            effect_class: effect_class_for_stream_recovery(projection.activation),
+            effect_class: effect,
         });
     }
     let continuation = OrsFamilyContinuation {
@@ -750,7 +998,7 @@ fn stream_recovery_family_segment(
             emitted_prefix_digest: chain.link().to_owned(),
         }),
     };
-    Ok((entries, continuation))
+    Ok((entries, continuation, page_bytes))
 }
 
 /// Returns true for a 64-character lowercase hex digest; rejects uppercase,
@@ -800,17 +1048,26 @@ fn operational_state_digest(read: &ReadTransaction) -> Result<String, OrsError> 
 /// Deterministic digest over the composite durable state a backup certifies.
 ///
 /// Digesting one table cannot certify a composite snapshot (issue #2884), so
-/// this folds the process-stream recovery family's durable revision and its
-/// streamed content root into the same witness the export already takes for
-/// operational history. Any insert, evidence advance, revalidation or
-/// retirement of a family row moves it, so a multi-page export can no longer
-/// combine operational pages read at one moment with recovery rows read at
-/// another, and a quarantined import page cannot be triaged against a family
-/// that moved underneath it.
+/// this folds each cursor-paged family's durable revision and its streamed
+/// content root into the same witness the export already takes for operational
+/// history. Issue #1971 adds the versioned-artifact family's axis: without it a
+/// registry commit landing between the two observations would move durable ORS
+/// state and leave this digest identical, so the witness would be blind to
+/// exactly the concurrent write the versioned-artifact family cursor is supposed
+/// to detect. Any insert, advance or removal of a family row moves it, so a
+/// multi-page export can no longer combine operational pages read at one moment
+/// with family rows read at another, and a quarantined import page cannot be
+/// triaged against a family that moved underneath it.
 ///
-/// The family axis is a streaming hash chain, so this stays O(1) in the number
+/// Each family axis is a streaming hash chain, so this stays O(1) in the number
 /// of retained family rows; only the pre-existing operational-history half
-/// collects its rows.
+/// collects its rows. The families are named in the material string, so the
+/// versioned-artifact axis cannot be satisfied by the process-stream axis.
+///
+/// SCOPE, unchanged in kind and widened in coverage: this binds the operational
+/// history and BOTH cursor-paged family roots. It still does not bind every
+/// physical ORS table, and adding a third cursor-paged family later would have to
+/// add its own axis here rather than inheriting one of these.
 ///
 /// Issue #953 takes the `read: &ReadTransaction` parameter instead of opening its
 /// own. Opening its own made the witness a moment the caller did not choose: the
@@ -825,52 +1082,184 @@ fn operational_state_digest(read: &ReadTransaction) -> Result<String, OrsError> 
 /// that straddle its work.
 fn composite_state_digest(read: &ReadTransaction) -> Result<String, OrsError> {
     let operational = operational_state_digest(read)?;
-    let family_revision = super::RedbRecoveryStore::process_stream_recovery_family_revision(read)?;
-    let family = process_stream_recovery_family_identity(read)?;
+    let recovery_revision = family_revision(read, RowFamilyKind::ProcessStreamRecovery)?;
+    let recovery = family_identity(read, RowFamilyKind::ProcessStreamRecovery)?;
+    let artifact_revision = family_revision(read, RowFamilyKind::VersionedArtifacts)?;
+    let artifact = family_identity(read, RowFamilyKind::VersionedArtifacts)?;
     let mut material = String::new();
     let _ = write!(
         material,
-        "eliot.ors.composite_state.v1|operational={operational}|family_revision={family_revision}|family_root={}|rows={}|bytes={}",
-        family.family_root_digest, family.family_row_count, family.family_total_bytes
+        "eliot.ors.composite_state.v2|operational={operational}|recovery_family_revision={recovery_revision}|recovery_family_root={}|recovery_rows={}|recovery_bytes={}|artifact_family_revision={artifact_revision}|artifact_family_root={}|artifact_rows={}|artifact_bytes={}",
+        recovery.family_root_digest,
+        recovery.family_row_count,
+        recovery.family_total_bytes,
+        artifact.family_root_digest,
+        artifact.family_row_count,
+        artifact.family_total_bytes
     );
     Ok(crate::model::sha256_hex(material.as_bytes()))
 }
 
-/// Reads this page's process-stream recovery family segment, if the request
-/// carries a family continuation.
+/// Reads this page's segment for one cursor-paged row family, if the request
+/// carries a continuation for that family.
 ///
 /// Three things happen in order and each can refuse before any row is read: the
 /// durable family revision must still equal the frozen one, the family's
 /// remaining row and byte admission for this page is computed from what the
-/// operational segment already spent, and the segment itself proves the cursor
-/// boundary against durable keys. The family shares the page's admission rather
-/// than raising the per-page ceiling, and no family row is compacted to make
-/// room for an operational one.
-fn stream_recovery_family_page(
+/// operational segment and any earlier family segment already spent, and the
+/// segment itself proves the cursor boundary against durable keys. The family
+/// shares the page's admission rather than raising the per-page ceiling, and no
+/// family row is compacted to make room for an operational one.
+///
+/// The family is named by the caller, never inferred: each family reads its own
+/// request slot through [`OrsBackupRequest::family_cursor`] and its own durable
+/// table, so a page can never be assembled by paging one family's rows under the
+/// other family's denominator.
+///
+/// Returns the page's family entries, its continuation (`None` when the request
+/// declared none for this family) and the encoded bytes it charged to the page.
+fn family_page(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
-    operational_entries: usize,
-    operational_bytes: u64,
-) -> Result<(Vec<OrsBackupEntry>, Option<OrsFamilyContinuation>), OrsError> {
-    let Some(cursor) = &request.process_stream_recovery_cursor else {
-        return Ok((Vec::new(), None));
+    family: RowFamilyKind,
+    charged_entries: usize,
+    charged_bytes: u64,
+) -> Result<(Vec<OrsBackupEntry>, Option<OrsFamilyContinuation>, u64), OrsError> {
+    let Some(cursor) = request.family_cursor(family) else {
+        return Ok((Vec::new(), None, 0));
     };
     check_family_revision_frozen(read, cursor)?;
     let row_budget = usize::from(request.page_entries)
-        .checked_sub(operational_entries)
+        .checked_sub(charged_entries)
         .ok_or(OrsError::ProjectionLimitExceeded)?;
     let byte_budget = request
         .max_bytes
-        .checked_sub(operational_bytes)
+        .checked_sub(charged_bytes)
         .ok_or(OrsError::ProjectionLimitExceeded)?;
-    let family = read
-        .open_table(super::PROCESS_STREAM_RECOVERY)
+    let table = read
+        .open_table(family_table_definition(family)?)
         .map_err(storage)?;
-    let segment =
-        stream_recovery_family_segment(&family, cursor, row_budget, byte_budget, request.max_bytes);
-    drop(family);
-    let (entries, continuation) = segment?;
-    Ok((entries, Some(continuation)))
+    let segment = match family {
+        RowFamilyKind::ProcessStreamRecovery => family_segment::<ProcessStreamRecoveryProjection>(
+            family,
+            &table,
+            cursor,
+            row_budget,
+            byte_budget,
+            request.max_bytes,
+            stream_recovery_entry,
+        ),
+        RowFamilyKind::VersionedArtifacts => family_segment::<VersionedArtifactEntry>(
+            family,
+            &table,
+            cursor,
+            row_budget,
+            byte_budget,
+            request.max_bytes,
+            // Wrapped in the family's shared fallible shape even though this
+            // family's own decision is total, so one enumeration serves both.
+            |entry| Ok(versioned_artifact_entry(entry)),
+        ),
+        _ => Err(OrsError::InvalidField {
+            field: "backup_family",
+            reason: "family is not paged through a typed family cursor",
+        }),
+    };
+    drop(table);
+    let (entries, continuation, page_bytes) = segment?;
+    Ok((entries, Some(continuation), page_bytes))
+}
+
+/// One page's cursor-paged family output, merged across every paged family.
+struct PageFamilySegments {
+    /// Entries from every family, in the fixed family order below.
+    entries: Vec<OrsBackupEntry>,
+    /// Process-stream recovery continuation, or `None` when none was declared.
+    recovery: Option<OrsFamilyContinuation>,
+    /// Versioned-artifact continuation, or `None` when none was declared.
+    artifacts: Option<OrsFamilyContinuation>,
+    /// True when ANY declared family still has rows behind its `next`.
+    open: bool,
+}
+
+/// Reads every cursor-paged family's segment for one page (issue #1971).
+///
+/// The two families are read in a FIXED order, so a page is a function of the
+/// request and the durable state alone and not of which family happened to be
+/// read first, and each is charged from what the previous one actually spent, so
+/// running two families can never push a page past `page_entries` or `max_bytes`.
+///
+/// `open` is the conjunction over both families, and it is what
+/// [`export_page_in`]'s `is_last` is computed from. It is computed HERE rather
+/// than at the call site so the two families cannot be enumerated in one order for
+/// the entries and the other order for the finality decision.
+fn family_page_segments(
+    read: &ReadTransaction,
+    request: &OrsBackupRequest,
+    charged_entries: usize,
+    charged_bytes: u64,
+) -> Result<PageFamilySegments, OrsError> {
+    let (recovery_entries, recovery, recovery_bytes) = family_page(
+        read,
+        request,
+        RowFamilyKind::ProcessStreamRecovery,
+        charged_entries,
+        charged_bytes,
+    )?;
+    let spent = charged_bytes
+        .checked_add(recovery_bytes)
+        .ok_or(OrsError::ProjectionLimitExceeded)?;
+    let (artifact_entries, artifacts, artifact_bytes) = family_page(
+        read,
+        request,
+        RowFamilyKind::VersionedArtifacts,
+        charged_entries + recovery_entries.len(),
+        spent,
+    )?;
+    // The running total is read here, so the two family segments together are
+    // asserted to leave the page inside the caller's declared byte budget rather
+    // than the last charge being accumulated and discarded.
+    let page_bytes = spent
+        .checked_add(artifact_bytes)
+        .ok_or(OrsError::ProjectionLimitExceeded)?;
+    if page_bytes > request.max_bytes {
+        return Err(OrsError::ProjectionLimitExceeded);
+    }
+    let open = recovery
+        .as_ref()
+        .is_some_and(OrsFamilyContinuation::family_open)
+        || artifacts
+            .as_ref()
+            .is_some_and(OrsFamilyContinuation::family_open);
+    let mut entries = recovery_entries;
+    entries.extend(artifact_entries);
+    Ok(PageFamilySegments {
+        entries,
+        recovery,
+        artifacts,
+        open,
+    })
+}
+
+/// Binds the next owner-issued cursor for one family to the request.
+///
+/// One dispatch over the request's two named family slots, and it keys on the
+/// cursor's OWN frozen family rather than on the caller's expectation, so the
+/// loop cannot advance one family's slot with the other family's cursor. Each
+/// slot's own setter still refuses a cursor frozen for a different family; this
+/// only chooses which setter to use.
+fn attach_family_cursor(
+    request: OrsBackupRequest,
+    cursor: OrsFamilyCursor,
+) -> Result<OrsBackupRequest, OrsError> {
+    match cursor.identity.family {
+        RowFamilyKind::ProcessStreamRecovery => request.with_process_stream_recovery_cursor(cursor),
+        RowFamilyKind::VersionedArtifacts => request.with_versioned_artifact_cursor(cursor),
+        _ => Err(OrsError::InvalidField {
+            field: "backup_family",
+            reason: "family is not paged through a typed family cursor",
+        }),
+    }
 }
 
 /// Exports one coherent backup page under a single read transaction (issue
@@ -933,13 +1322,16 @@ pub(super) fn export_page(
 /// [`MAX_BACKUP_BYTES`], so the transaction's lifetime is bounded work, not
 /// unbounded wait (A13.9: no unbounded wait may be held).
 ///
-/// The operational-history window is unchanged. The process-stream recovery
-/// family (#269) is not paged on that window: it has no canonical operation
-/// order, so it is paged through the request's own [`OrsFamilyCursor`] in
-/// durable-key order, sharing this page's remaining row and byte budget so the
-/// per-page ceiling is unchanged. `is_last` is the conjunction of the
-/// operational window being exhausted and the family having no continuation
-/// left, so a page that still owes family rows is never final.
+/// The operational-history window is unchanged. Neither cursor-paged family
+/// (#269 process-stream recovery, #1971 versioned artifacts) is paged on that
+/// window: their rows carry no canonical operation order, so each is paged
+/// through its OWN request slot in durable-key order, sharing this page's
+/// remaining row and byte budget so the per-page ceiling is unchanged. Each
+/// family segment is admitted from what the previous one actually spent, so a
+/// page can never exceed `page_entries` or `max_bytes` by running two families.
+/// `is_last` is the conjunction of the operational window being exhausted and
+/// BOTH families having no continuation left, so a page that still owes rows to
+/// either family is never final.
 fn export_page_in(
     read: &ReadTransaction,
     request: &OrsBackupRequest,
@@ -1017,13 +1409,17 @@ fn export_page_in(
             effect_class: effect_class_for_export(record.phase),
         });
     }
-    let (family_segment, family_continuation) =
-        stream_recovery_family_page(read, request, entries.len(), total_bytes)?;
-    entries.extend(family_segment);
-    let family_open = family_continuation
-        .as_ref()
-        .is_some_and(OrsFamilyContinuation::family_open);
-    let is_last = operational_exhausted && !family_open;
+    // Family paging, in a fixed order, each charged from what is actually left
+    // of this page's admission.
+    let families = family_page_segments(read, request, entries.len(), total_bytes)?;
+    // `is_last` is the conjunction over BOTH families: a page that still owes rows
+    // to either one is not final, so page continuity can never hide an unemitted
+    // family tail behind a final page (issue #1971). A family the request declared
+    // no cursor for contributes no continuation, which is `!open` and so does not
+    // block finality — it makes the snapshot partial instead, which
+    // `OrsBackupSnapshot::validate` is what refuses as `Complete`.
+    let is_last = operational_exhausted && !families.open;
+    entries.extend(families.entries);
     // Stamped by the store's own clock at capture, never by the caller, and
     // bounded by the ceiling the contract module enforces on validation. The
     // ordered-positive pair is validated by `validate_binding`, so a page whose
@@ -1040,11 +1436,105 @@ fn export_page_in(
         expires_at_ms,
         page_digest: String::new(),
         is_last,
-        family_continuation,
+        family_continuation: families.recovery,
+        versioned_artifact_continuation: families.artifacts,
     };
     page.page_digest = page.expected_page_digest();
     page.validate_binding()?;
     Ok(page)
+}
+
+/// The page loop's whole output, gathered under the caller's capture
+/// transaction (issue #953, #1971).
+///
+/// Split out of [`export_snapshot`] so the snapshot's pre/post witness ordering
+/// stays readable as the ordering it exists for, and so the family-advance loop
+/// is one function that is only about advancing families. `outstanding_*` are
+/// read from the LAST page, which is the authority on whether each family is
+/// finished even when an earlier page left a continuation open.
+struct SnapshotPages {
+    /// Ordered pages starting at index zero.
+    pages: Vec<OrsBackupPage>,
+    /// Total entries across the pages.
+    entry_count: u64,
+    /// Whether the last page emitted was final.
+    last_page_was_final: bool,
+    /// Exact continuation resuming the process-stream recovery family, if owed.
+    outstanding_recovery: Option<OrsFamilyCursor>,
+    /// Exact continuation resuming the versioned-artifact family, if owed.
+    outstanding_artifact: Option<OrsFamilyCursor>,
+    /// The request as the loop left it, carrying each family's final cursor.
+    continuing: OrsBackupRequest,
+}
+
+/// Paginates one snapshot under the caller's single capture transaction.
+///
+/// The bounded loop of [`export_snapshot`]: at most `max_pages` pages, each built
+/// by [`export_page_in`] through the SAME read transaction, until a page is final
+/// or the page budget is spent. Holding one transaction across the whole loop is
+/// what makes the pages one moment.
+///
+/// Each family advances by EXACTLY the owner-issued cursor its own previous page
+/// ended with, and the advance is dispatched on that cursor's own frozen family,
+/// so one family's next cursor can only ever land in that family's request slot.
+fn export_pages_in(
+    read: &ReadTransaction,
+    request: &OrsBackupRequest,
+    observation: &StoreFenceObservation,
+) -> Result<SnapshotPages, OrsError> {
+    let mut continuing = request.clone();
+    let mut pages: Vec<OrsBackupPage> = Vec::new();
+    let mut entry_count: u64 = 0;
+    let mut last_page_was_final = false;
+    for index in 0..u32::from(request.max_pages) {
+        let page = export_page_in(read, &continuing, index, observation)?;
+        entry_count = entry_count
+            .checked_add(page.entries.len() as u64)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let next_recovery = page
+            .family_continuation
+            .as_ref()
+            .and_then(|continuation| continuation.next.clone());
+        let next_artifact = page
+            .versioned_artifact_continuation
+            .as_ref()
+            .and_then(|continuation| continuation.next.clone());
+        last_page_was_final = page.is_last;
+        pages.push(page);
+        if last_page_was_final {
+            break;
+        }
+        if let Some(next) = next_recovery {
+            continuing = attach_family_cursor(continuing, next)?;
+        }
+        if let Some(next) = next_artifact {
+            continuing = attach_family_cursor(continuing, next)?;
+        }
+    }
+    if pages.is_empty() {
+        return Err(OrsError::ProjectionLimitExceeded);
+    }
+    // The last page is the authority on whether EACH family is finished: a page
+    // that ended a family leaves no continuation for it even when an earlier page
+    // did, so a snapshot is never left claiming an outstanding cursor it has
+    // already emitted past.
+    let outstanding_of = |page: Option<&OrsBackupPage>, family: RowFamilyKind| {
+        page.and_then(|page| match family {
+            RowFamilyKind::ProcessStreamRecovery => page.family_continuation.as_ref(),
+            RowFamilyKind::VersionedArtifacts => page.versioned_artifact_continuation.as_ref(),
+            _ => None,
+        })
+        .and_then(|continuation| continuation.next.clone())
+    };
+    let last = pages.last();
+    Ok(SnapshotPages {
+        outstanding_recovery: outstanding_of(last, RowFamilyKind::ProcessStreamRecovery),
+        outstanding_artifact: outstanding_of(last, RowFamilyKind::VersionedArtifacts),
+        pages,
+        entry_count,
+        last_page_was_final,
+        continuing,
+    })
 }
 
 /// Exports a snapshot by paging with one request until a page is final or the
@@ -1097,14 +1587,15 @@ fn export_page_in(
 /// and the import triage path keeps the same two-separate-transactions form.
 ///
 /// SCOPE OF PROPERTY 2, stated so this is not read as broader than it is:
-/// `composite_state_digest` binds the operational history and the
-/// process-stream recovery family root. It does **not** bind every physical ORS
-/// table. A commit that moves some other table during the capture - a grant
+/// `composite_state_digest` binds the operational history and the root of every
+/// cursor-paged family (issue #1971 adds the versioned-artifact axis to the
+/// process-stream recovery one #2884 added). It does **not** bind every physical
+/// ORS table. A commit that moves some other table during the capture - a grant
 /// closure row, a replay event, a doctor budget, an activation lifecycle, a
 /// campaign record, a bridge-event record, or the meta counters themselves -
 /// does not move this digest and will not trip the witness. That limit is
-/// pre-existing and unchanged by this issue; the two-transaction witness that
-/// existed before behaved identically. It is recorded here because a witness
+/// pre-existing and unchanged in kind by this issue; the two-transaction witness
+/// that existed before behaved identically. It is recorded here because a witness
 /// described without its scope is the same defect as a witness that cannot fire.
 /// The rows with no row-family disposition at all (see the A5 gap: `RowFamilyKind`
 /// enumerates 41 families while roughly 20 physical tables have none) are
@@ -1122,8 +1613,8 @@ fn export_page_in(
 ///
 /// The operational request (fence token, `after_order`, page size) is reused
 /// for every page, but its count-stride windows are not an exact continuation
-/// in the sparse operation-order domain. Only the typed family cursor advances,
-/// by exactly the owner-issued cursor the previous page ended with.
+/// in the sparse operation-order domain. Only the typed family cursors advance,
+/// each by exactly the owner-issued cursor its own previous page ended with.
 ///
 /// When the page budget ends on a non-final page, the exact family cursor is
 /// retained as a `Partial` disposition when one exists. If no family cursor
@@ -1132,12 +1623,13 @@ fn export_page_in(
 /// partial snapshot. This bounded refusal does not make the legacy operational
 /// count-stride windows an exact multi-page continuation; sparse-order coverage
 /// still requires an operational cursor. A request that declared no family
-/// cursor yields `Partial` with the legacy reason when its final page is
-/// otherwise exhausted, because a snapshot with no family denominator is
-/// partial evidence and not an empty complete family. A decode failure reports
-/// [`OrsError::IntegrityProblem`], never fabricated completeness. The
-/// denominator digest binds every exported entry's payload digest together
-/// with the frozen family snapshot identity.
+/// cursor for some cursor-paged family yields `Partial` with the legacy reason
+/// when its final page is otherwise exhausted, because a snapshot with no
+/// denominator for that family is partial evidence and not an empty complete
+/// family. A decode failure reports [`OrsError::IntegrityProblem`], never
+/// fabricated completeness. The denominator digest binds every exported entry's
+/// payload digest together with the frozen identity of every cursor-paged family
+/// this request declared.
 pub(super) fn export_snapshot(
     database: &Database,
     request: &OrsBackupRequest,
@@ -1154,47 +1646,19 @@ pub(super) fn export_snapshot(
     let read = database.begin_read().map_err(storage)?;
     let observation = capture_store_fence(&read)?;
     check_export_fence(request, &observation)?;
-    if let Some(cursor) = &request.process_stream_recovery_cursor {
+    // Every declared family cursor is proved frozen BEFORE the page loop, so a
+    // family that already moved refuses the whole export rather than only the
+    // page that would have read it.
+    if let Some(cursor) = request.family_cursor(RowFamilyKind::ProcessStreamRecovery) {
+        check_family_revision_frozen(&read, cursor)?;
+    }
+    if let Some(cursor) = request.family_cursor(RowFamilyKind::VersionedArtifacts) {
         check_family_revision_frozen(&read, cursor)?;
     }
     // PRE witness, INSIDE the capture snapshot: the composite state as it stood
-    // when the capture began.
+    // when the capture began. It folds both cursor-paged families.
     let frozen_pre = composite_state_digest(&read)?;
-    let mut continuing = request.clone();
-    let mut pages: Vec<OrsBackupPage> = Vec::new();
-    let mut entry_count: u64 = 0;
-    let mut last_page_was_final = false;
-    for index in 0..u32::from(request.max_pages) {
-        let page = export_page_in(&read, &continuing, index, &observation)?;
-        entry_count = entry_count
-            .checked_add(page.entries.len() as u64)
-            .ok_or(OrsError::ProjectionLimitExceeded)?;
-        let next_family = page
-            .family_continuation
-            .as_ref()
-            .and_then(|continuation| continuation.next.clone());
-        last_page_was_final = page.is_last;
-        pages.push(page);
-        if last_page_was_final {
-            break;
-        }
-        // Exactly one owner-issued advance per family page: the next cursor is
-        // the one the previous page ended with, never a recomputed offset.
-        if let Some(next) = next_family {
-            continuing = continuing.with_process_stream_recovery_cursor(next)?;
-        }
-    }
-    if pages.is_empty() {
-        return Err(OrsError::ProjectionLimitExceeded);
-    }
-    // The last page is the authority on whether the family is finished: a page
-    // that ended the family leaves no continuation even when an earlier page
-    // did, so a snapshot is never left claiming an outstanding cursor it has
-    // already emitted past.
-    let outstanding_family = pages
-        .last()
-        .and_then(|page| page.family_continuation.as_ref())
-        .and_then(|continuation| continuation.next.clone());
+    let paged = export_pages_in(&read, request, &observation)?;
     // Release the capture transaction BEFORE observing again. This ordering is
     // the whole point: `frozen_pre` was taken inside that transaction, and the
     // observation below is taken from a NEW snapshot that can include commits the
@@ -1206,7 +1670,15 @@ pub(super) fn export_snapshot(
     let frozen_post = composite_state_digest(&post_read)?;
     drop(post_read);
     check_canonical_frozen(&frozen_pre, &frozen_post)?;
-    if !last_page_was_final && outstanding_family.is_none() {
+    let SnapshotPages {
+        pages,
+        entry_count,
+        last_page_was_final,
+        outstanding_recovery,
+        outstanding_artifact,
+        continuing,
+    } = paged;
+    if !last_page_was_final && outstanding_recovery.is_none() && outstanding_artifact.is_none() {
         // Operational pagination has no exact continuation yet. Refuse this
         // bounded export instead of allowing page-budget exhaustion to be
         // mistaken for an exhausted operational denominator.
@@ -1225,19 +1697,23 @@ pub(super) fn export_snapshot(
                 .ok_or(OrsError::ProjectionLimitExceeded)?;
         }
     }
-    let completeness = if outstanding_family.is_some() {
+    let completeness = if outstanding_recovery.is_some() || outstanding_artifact.is_some() {
         // The page budget ran out with family rows still owed. The exact cursor
         // travels on the snapshot so the caller resumes rather than restarts,
         // and the snapshot stays explicitly partial instead of all-or-nothing.
         BackupCompleteness::Partial {
             reason: format!(
-                "process-stream recovery family is not fully exported; resume with next_process_stream_recovery_cursor (page budget spent: {})",
+                "cursor-paged row families are not fully exported; resume with next_process_stream_recovery_cursor / next_versioned_artifact_cursor (recovery outstanding: {}, versioned artifact outstanding: {}, page budget spent: {})",
+                outstanding_recovery.is_some(),
+                outstanding_artifact.is_some(),
                 !last_page_was_final
             ),
         }
-    } else if continuing.process_stream_recovery_cursor.is_none() {
+    } else if continuing.process_stream_recovery_cursor.is_none()
+        || continuing.versioned_artifact_cursor.is_none()
+    {
         BackupCompleteness::Partial {
-            reason: "no process-stream recovery family denominator was declared; legacy evidence, not an empty complete family"
+            reason: "no process-stream recovery or versioned-artifact family denominator was declared; legacy evidence, not an empty complete family"
                 .to_owned(),
         }
     } else if entry_count > 0 {
@@ -1259,7 +1735,12 @@ pub(super) fn export_snapshot(
             .process_stream_recovery_cursor
             .as_ref()
             .map(|cursor| cursor.identity.clone()),
-        next_process_stream_recovery_cursor: outstanding_family,
+        next_process_stream_recovery_cursor: outstanding_recovery,
+        versioned_artifact_family: continuing
+            .versioned_artifact_cursor
+            .as_ref()
+            .map(|cursor| cursor.identity.clone()),
+        next_versioned_artifact_cursor: outstanding_artifact,
     };
     snapshot.denominator_digest = snapshot.snapshot_digest();
     Ok(snapshot)
@@ -1303,8 +1784,16 @@ pub(super) fn export_snapshot(
 /// because paging the family into more pages raises no authority: the only
 /// durable restore route for it is
 /// `RedbRecoveryStore::import_process_stream_recovery_suspended`, which discards
-/// the incoming activation and always writes suspended recovery evidence. Triage
-/// still never constructs `PerEntryOutcome::Imported`.
+/// the incoming activation and always writes suspended recovery evidence.
+///
+/// A versioned-artifact entry lands `Forensic` here (issue #1971) and nothing
+/// else, because its family's disposition is `NonrestorableHistorical`: an
+/// exported generation row is installation-bound history, so triaging it can
+/// never reactivate a prior installation's generation authority, and no durable
+/// import path for it exists at all (I1.6: a versioned binary is never replaced
+/// in place while running; I1.12: a rollback is only ever an artifact verified
+/// compatible with current durable formats and epoch lineage, which a restored
+/// row is not). Triage still never constructs `PerEntryOutcome::Imported`.
 pub(super) fn import_page_quarantined(
     database: &Database,
     evidence: &Arc<dyn super::CanonicalEvidenceProvider>,
@@ -1320,12 +1809,18 @@ pub(super) fn import_page_quarantined(
     // reports the same `InvalidCursorLimit` the snapshot validator already
     // reported for an oversized page.
     page.validate_binding()?;
-    if page.is_last
-        && page
-            .family_continuation
+    // Same rule as the snapshot validator: a final page must leave NO paged family
+    // open, and `validate_binding` cannot know that from one page alone. Both
+    // continuations are checked because `is_last` is their conjunction (#1971).
+    let family_open = page
+        .family_continuation
+        .as_ref()
+        .is_some_and(OrsFamilyContinuation::family_open)
+        || page
+            .versioned_artifact_continuation
             .as_ref()
-            .is_some_and(OrsFamilyContinuation::family_open)
-    {
+            .is_some_and(OrsFamilyContinuation::family_open);
+    if page.is_last && family_open {
         return Err(OrsError::InvalidField {
             field: "backup_page_is_last",
             reason: "a final page must not leave an open family continuation",
