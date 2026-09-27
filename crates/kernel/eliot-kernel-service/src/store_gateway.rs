@@ -4076,7 +4076,8 @@ fn user_automation_obligation_correlation_projection(
 ) -> HostCorrelationProjection {
     HostCorrelationProjection::KernelOperational {
         domain: match obligation.kind {
-            UserAutomationRuntimeObligationKind::WakeHorizonPublication => {
+            UserAutomationRuntimeObligationKind::WakeHorizonPublication
+            | UserAutomationRuntimeObligationKind::WakeTargetEnumerationReceipt => {
                 HostCorrelationDomain::Request
             }
             UserAutomationRuntimeObligationKind::WakeCancellation => {
