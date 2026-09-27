@@ -9,9 +9,14 @@
 //! [`projection::ReportInputRevision`] references it was read from. Both
 //! surfaces are read-only: neither exposes a canonical write path nor a
 //! completion, acceptance, or `Finish` decision.
+//!
+//! [`product_proof`] carries the terminal product-proof status record at the
+//! ProductProof/FinishService acceptance-owner boundary, reusing the existing
+//! I18.24 outcome and execution vocabularies instead of declaring new ones.
 
 #![forbid(unsafe_code)]
 
+pub mod product_proof;
 pub mod projection;
 
 use std::fmt::Write as _;
