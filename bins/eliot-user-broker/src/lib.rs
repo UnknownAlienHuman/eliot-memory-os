@@ -35,10 +35,11 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
     AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
-    DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest, IssuedOperationIdentity,
-    IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest, LostOperation, OperatorArtifact,
-    OperatorEndpoint, OperatorHandoffRequest, PortError, ProcessPort, ProcessStartOutcome,
-    RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
+    CutoverReceipt, DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest,
+    IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest,
+    LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest, PortError,
+    ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider,
+    UserBroker,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -207,6 +208,22 @@ pub enum BrokerAdmissionRefusal {
     /// than the one already bound to the same operation.
     #[error("BROKER_APPROVAL_HASH_REQUIRED")]
     HumanApprovalRequired,
+    /// A broker-generation cutover stopped because termination of the
+    /// superseded generation's Job Object is not proven, so the candidate is
+    /// not marked active and the transition requires reconciliation. The
+    /// receipt is published durably; it is not a completion.
+    #[error("CUTOVER_REQUIRES_RECONCILIATION")]
+    CutoverRequiresReconciliation,
+    /// A broker-generation cutover stopped because a precondition this broker
+    /// holds no fact for is unmet: no live logon Session, no superseded
+    /// registration in this lineage, or a predecessor that did not move
+    /// strictly forward inside one user Session.
+    #[error("CUTOVER_PRECONDITION_UNMET")]
+    CutoverPreconditionUnmet,
+    /// A broker-generation cutover was attempted after the interactive logon
+    /// Session ended. Logout stops cutover.
+    #[error("CUTOVER_SESSION_GONE")]
+    CutoverSessionGone,
 }
 
 impl BrokerAdmissionRefusal {
@@ -238,6 +255,9 @@ impl BrokerAdmissionRefusal {
             Self::OperatorClientProcessForeign => "BROKER_OPERATOR_CLIENT_PROCESS_FOREIGN",
             Self::HumanPrincipalRequired => "BROKER_HUMAN_PRINCIPAL_REQUIRED",
             Self::HumanApprovalRequired => "BROKER_APPROVAL_HASH_REQUIRED",
+            Self::CutoverRequiresReconciliation => "CUTOVER_REQUIRES_RECONCILIATION",
+            Self::CutoverPreconditionUnmet => "CUTOVER_PRECONDITION_UNMET",
+            Self::CutoverSessionGone => "CUTOVER_SESSION_GONE",
             Self::OperatorHandoffUncomposed => "BROKER_OPERATOR_HANDOFF_UNCOMPOSED",
         }
     }
@@ -1127,6 +1147,8 @@ impl BrokerComposition {
                     operation_cursors: Vec::new(),
                     operation_identities: Vec::new(),
                     retired_operations: Vec::new(),
+                    predecessor_registration: None,
+                    cutover_receipt: None,
                 })
                 .map_err(|error| CompositionError::InvalidConfiguration(error.to_string()))?;
         }
@@ -1821,6 +1843,34 @@ impl BrokerComposition {
             .map_err(Self::classify)
     }
 
+    /// Publishes the registration/cutover receipt for the broker generation
+    /// transition this lineage performed (I14.17, issue #1954).
+    ///
+    /// This changes durable broker state — the receipt and the recorded Session
+    /// binding transfer are written through
+    /// [`UserBroker::publish_cutover_receipt`] before this call returns — so it
+    /// passes the same admitted-role gate as every other state-changing
+    /// request. The operation identity it is bound to is the live registration
+    /// digest, because that digest *is* the transition being published: the
+    /// caller cannot choose it, and the authenticated Human authority must
+    /// already present it as its live Kernel session token.
+    ///
+    /// The receipt is a record, never a completion signal. This owner cannot
+    /// prove termination of the superseded generation's Job Object, so the
+    /// candidate is not marked active and the transition is left for
+    /// reconciliation; see `eliot_user_broker_core::OldJobObjectTermination`.
+    pub fn publish_cutover_receipt(
+        &mut self,
+        authority: Option<&HumanStateAuthority>,
+    ) -> Result<CutoverReceipt, CompositionError> {
+        self.verify_launch_lease()?;
+        let live = self.live_registration()?;
+        self.admit_human_state_change(authority, &live.registration_digest)?;
+        self.broker
+            .publish_cutover_receipt(now_unix_ms()?)
+            .map_err(Self::classify_cutover)
+    }
+
     /// Reconciles a broker-owned operation selected by its admitted operation
     /// identity.  No caller-supplied P-03 request or permit crosses stdin.
     pub fn reconcile(
@@ -1845,6 +1895,36 @@ impl BrokerComposition {
         self.broker
             .admit_control_operation(operation, operation_id, observed_at)
             .map_err(Self::classify)
+    }
+
+    /// Projects one cutover refusal onto the broker's closed admission
+    /// taxonomy.
+    ///
+    /// The three conditions I14.17 makes distinct at the cutover boundary each
+    /// keep their own exact stable code instead of collapsing into the generic
+    /// composition error: a stopped cutover awaiting reconciliation, a cutover
+    /// whose precondition this broker holds no fact for, and a cutover
+    /// attempted after the logon Session ended are three different things to an
+    /// operator deciding what to do next.
+    fn classify_cutover(error: BrokerError) -> CompositionError {
+        let refusal = match &error {
+            BrokerError::CutoverRequiresReconciliation(_) => {
+                Some(BrokerAdmissionRefusal::CutoverRequiresReconciliation)
+            }
+            BrokerError::CutoverPrecondition(_) | BrokerError::SessionBindingNotTransferred => {
+                Some(BrokerAdmissionRefusal::CutoverPreconditionUnmet)
+            }
+            // Logout closed this registration, so there is no logon Session left
+            // to move a binding within.
+            BrokerError::LeaseExpired | BrokerError::StaleLease => {
+                Some(BrokerAdmissionRefusal::CutoverSessionGone)
+            }
+            _ => None,
+        };
+        match refusal {
+            Some(refusal) => refusal.with_platform(error),
+            None => Self::classify(error),
+        }
     }
 
     /// Projects one core refusal onto the broker's closed admission taxonomy.

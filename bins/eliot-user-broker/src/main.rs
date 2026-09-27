@@ -11,7 +11,7 @@ use eliot_user_broker::{
     request_names_notify_image,
 };
 use eliot_user_broker_core::{
-    LaunchRequest, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
+    CutoverReceipt, LaunchRequest, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,6 +71,22 @@ enum Request {
     RedeemOperatorHandoff {
         endpoint: OperatorEndpoint,
         client: OperatorClientBinding,
+    },
+    /// Publication of the registration/cutover receipt for the broker
+    /// generation transition this lineage performed (I14.17).
+    ///
+    /// The request carries only the authenticated Human authority. Both
+    /// generations, both epochs, the transferred Session binding and the
+    /// pre-cutover operation dispositions are read from the broker's own
+    /// durable record, so no caller can name them. It is a durable state
+    /// change and is admitted as one, against the live registration digest.
+    ///
+    /// It is never a completion signal: this broker cannot prove termination
+    /// of the superseded generation's Job Object, so the candidate is not
+    /// marked active and the transition is left for reconciliation.
+    Cutover {
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
     },
     Status,
     Stop,
@@ -383,6 +399,9 @@ fn dispatch(
                 .redeem_operator_handoff(&endpoint, &client)
                 .map(HandoffOutcome::Redeemed),
         ),
+        Request::Cutover { authority } => {
+            dispatch_cutover(composition.publish_cutover_receipt(authority.as_ref()))
+        }
         Request::Status => {
             let mut readiness = serde_json::to_value(composition.readiness())
                 .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
@@ -440,6 +459,35 @@ fn dispatch_launch(
                 },
             }
         }
+    }
+}
+
+/// Projects one cutover publication onto the wire.
+///
+/// There is no success message for this request. The receipt's Job Object
+/// termination state has exactly one inhabitant — the superseded generation's
+/// Job Object identity is a Kernel/N4 contour this broker never infers and the
+/// process executor never returns, so no termination of it is observable from
+/// here — so publication can only ever end in the typed reconciliation refusal
+/// that `composition_rejection` renders.
+///
+/// The `Ok` arm is projected as an explicit non-completion carrying the
+/// receipt's own reason, never as a success: a receipt that cannot claim a
+/// completed cutover must not be able to say that it did, and an operator
+/// reading the wire has to be able to tell a stopped cutover from a finished
+/// one without inspecting the composition.
+fn dispatch_cutover(
+    outcome: Result<CutoverReceipt, eliot_user_broker::CompositionError>,
+) -> Message {
+    match outcome {
+        Err(error) => composition_rejection(&error),
+        Ok(receipt) => Message::Error {
+            code: "BROKER_CUTOVER_NOT_COMPLETED",
+            detail: format!(
+                "cutover receipt published without a proven Job Object termination: {}",
+                receipt.old_job_object_termination.reason()
+            ),
+        },
     }
 }
 
