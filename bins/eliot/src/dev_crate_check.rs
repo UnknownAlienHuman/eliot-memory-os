@@ -45,9 +45,11 @@ const LEDGER_VERBS: [&str; 7] = [
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum DevCommand {
-    /// Per-crate verification surfaces.
-    #[command(subcommand)]
-    Crate(CrateCommand),
+    /// Per-crate Instrument Plane verification surfaces.
+    Crate {
+        #[command(subcommand)]
+        command: CrateCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -754,7 +756,7 @@ fn undeclared_cell_receipt(
 }
 
 pub(crate) fn run(command: DevCommand) -> Result<Value, DevCrateCheckError> {
-    let DevCommand::Crate(command) = command;
+    let DevCommand::Crate { command } = command;
     match command {
         CrateCommand::Check { package, repo_root } => check(&repo_root, &package),
         CrateCommand::Dispositions { repo_root } => {
