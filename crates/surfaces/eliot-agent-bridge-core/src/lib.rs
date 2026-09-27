@@ -13,9 +13,22 @@ use std::future::Future;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::pin::Pin;
 
+// The closed host-event owner (issue #228 A6). `HostEventEnvelope` is the
+// legacy quarantine wire and is admissible only because it carries one of
+// these closed, versioned, bounded observations; every consumer of the wire
+// reads its typed fields from here, never from the wire's generic JSON.
+// Re-exported as a path so downstream bridge fixtures and adapters keep one
+// import root without a second owner.
+pub use eliot_agent_api::host_event;
 pub use eliot_agent_api::{
-    AttemptId, AttemptState, EventCursor, EventId, HostEventEnvelope, HostEventKind,
-    RouteFingerprint, SessionId, TaskId, WorkUnitId,
+    AttemptId, AttemptState, ClockReading, EventCursor, EventId, HOST_EVENT_CONTRACT_VERSION,
+    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventEnvelope, HostEventKind,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventReplayDisposition,
+    LowercaseSha256, NativeSession, NativeSessionLocator, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, ProviderObservationLineage,
+    QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle, RouteFingerprint, SessionId,
+    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
+    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, WorkUnitId,
 };
 use eliot_contracts::{BridgeEventCapacityPressure, BridgeTransportBackpressure, RequestMetadata};
 pub use eliot_observation_contracts::{
@@ -3892,7 +3905,23 @@ impl AgentBridgeCore {
     /// forwarding failure still leaves immutable diagnostic history. Error
     /// events are additionally cited in `error_event_refs` without
     /// affecting any other field.
+    ///
+    /// #228 A6: the citation is taken from the closed, versioned, bounded
+    /// normalized observation the wire carries, validated by its owner
+    /// (`HostEventEnvelope::normalized`) and never from the host-chosen
+    /// `HostEventKind` or the wire's generic `normalized_payload`. The core
+    /// holds no #361 provider-execution binding and no #369 admitted-route
+    /// receipt, so the only admissible lineage is a session observation: a
+    /// wire carrying an execution-unit payload fails closed here instead of
+    /// driving a terminal-reduction input on its own framing. The only
+    /// error-class typed observation such a wire can carry is a provider
+    /// event the owner quarantined instead of normalizing
+    /// ([`NormalizedHostEventPayload::UnsupportedQuarantined`]), so that is
+    /// the only citation this path can make.
     fn observe_host_event(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
+        let normalized = event
+            .normalized()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         if let Some(previous) = self.host_journal.last()
             && event.sequence <= previous.sequence
         {
@@ -3904,9 +3933,12 @@ impl AgentBridgeCore {
             self.host_journal.remove(0);
             self.terminal_coverage = self.terminal_coverage.mark_incomplete_coverage();
         }
-        if event.kind == HostEventKind::Error {
+        if matches!(
+            normalized.payload,
+            NormalizedHostEventPayload::UnsupportedQuarantined(_)
+        ) {
             self.error_event_refs
-                .push(event.event_id.as_str().to_owned());
+                .push(normalized.event_id.as_str().to_owned());
         }
         self.host_journal.push(event.clone());
         Ok(())
