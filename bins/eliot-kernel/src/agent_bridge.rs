@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use super::kernel_audit::AuditEventDraft;
 use super::{
     AGENT_ACTIVATION_CLAIM_LEASE_MS, AGENT_BRIDGE_ACTIVATION_WINDOW_MS,
     ActivationResultDisposition, AgentActivationLifecycle, AgentActivationPending,
@@ -2319,6 +2320,8 @@ impl KernelComposition {
         } else {
             observe_bridge("kernel.bridge_cleanup", "complete");
             observe_bridge("kernel.session_cleanup", "complete");
+            // Issue #1837: durable audit evidence for session transition.
+            self.audit_observe(AuditEventDraft::session_revoked(connection_id));
         }
     }
 

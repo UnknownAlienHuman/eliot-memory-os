@@ -52,6 +52,7 @@
 //! ticket, parent, or operation is `UnknownRequest`; an elapsed absolute
 //! deadline is `Timeout`. No error prose drives routing.
 
+use super::kernel_audit::AuditEventDraft;
 use super::{
     Frame, FrameKind, GovernanceProfile, KernelComposition, KernelFrameAction, MessageType,
     ProtocolPayload, Session, TransportError, activation_deadline_expired, sha256_json,
@@ -593,7 +594,28 @@ impl KernelComposition {
         }
 
         self.note_host_request_operation_under_transition(envelope)?;
+        self.audit_host_request_admission(envelope, &admission_receipt, &admitted);
         Ok((admission_receipt, admitted))
+    }
+
+    /// Appends durable audit evidence for one admitted envelope (issue #1837).
+    ///
+    /// Observational only: the ORS record owns lifecycle state; the chain
+    /// carries the admission, receipt, and (for `Cancellation`) request
+    /// records with full I16.3 lineage.
+    fn audit_host_request_admission(
+        &self,
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+        admitted: &HostRequestRecord,
+    ) {
+        self.audit_observe(AuditEventDraft::queue_envelope_admitted(
+            envelope, receipt, admitted,
+        ));
+        self.audit_observe(AuditEventDraft::receipt_admission_issued(envelope, receipt));
+        if envelope.kind == HostRequestKind::Cancellation {
+            self.audit_observe(AuditEventDraft::cancel_requested(envelope, admitted));
+        }
     }
 
     /// Admits one Watchdog spool intent batch through the fenced named Kernel
@@ -872,19 +894,22 @@ impl KernelComposition {
         // Queue each admitted shape in its own Kernel-owned lane. A packet is
         // never handed to the query queue or selector derivation.
         if record.result_digest.is_none() {
-            match check_local_read_admission(envelope, tool) {
+            let routed_lane = match check_local_read_admission(envelope, tool) {
                 Ok(LocalReadAdmission::Query(_)) => {
                     // Queue admission is part of the same authenticated
                     // operation. Never acknowledge a request whose bounded
                     // query queue could not retain it.
                     self.enqueue_local_read_pair_under_transition(envelope, tool)?;
+                    Some("query")
                 }
                 Ok(LocalReadAdmission::CampaignPacket { .. }) => {
                     self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
+                    Some("campaign-packet")
                 }
                 Err(_) => {
                     if check_task_controller_admission(envelope, tool).is_ok() {
                         self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
+                        Some("task-controller")
                     } else if check_finish_admission(envelope, tool).is_ok() {
                         // #1741 finish lane: the admitted strict finish draft
                         // rides the same invoke-read admission as the query
@@ -892,6 +917,7 @@ impl KernelComposition {
                         // queue, so a finish result can never complete a
                         // query, packet or task-controller claim.
                         self.enqueue_finish_pair_under_transition(envelope, tool)?;
+                        Some("finish")
                     } else if check_local_state_admission(envelope, tool).is_ok() {
                         // #2564 I4 state-carrier seam: validated `eliot.state`
                         // pairs attempt the shared local-read carrier for the
@@ -902,8 +928,17 @@ impl KernelComposition {
                         // mutation); the serve leg that admits state pairs is
                         // #2565's dispatch lane.
                         let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
+                        None
+                    } else {
+                        None
                     }
                 }
+            };
+            // Issue #1837: durable audit evidence for the routing decision.
+            if let Some(lane) = routed_lane {
+                self.audit_observe(AuditEventDraft::route_invoke_read_routed(
+                    envelope, &receipt, lane,
+                ));
             }
         }
         // Coherence gate before serving: a resulted record must carry a
@@ -1167,6 +1202,11 @@ impl KernelComposition {
         for operation_ref in &outstanding {
             fence_one_host_request(self, operation_ref);
         }
+        // Issue #1837: durable audit evidence for orphan cleanup.
+        self.audit_observe(AuditEventDraft::orphan_connection_fenced(
+            connection_id,
+            outstanding.len(),
+        ));
     }
 
     /// Verifies the envelope arrives on a currently retained bridge
@@ -1704,6 +1744,8 @@ impl KernelComposition {
                 finish_attempt: LocalReadAttemptState::default(),
             });
         }
+        // Issue #1837: durable audit evidence for queue admission.
+        self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
         Ok(())
     }
 
@@ -1757,7 +1799,9 @@ impl KernelComposition {
                 if envelope.identity.capability != "eliot.query" {
                     continue;
                 }
-                if !candidate.local_read_attempt.is_owned_by(session) {
+                let previous_generation = candidate.local_read_attempt.generation;
+                let owned_before = candidate.local_read_attempt.is_owned_by(session);
+                if !owned_before {
                     let generation = candidate
                         .local_read_attempt
                         .generation
@@ -1781,6 +1825,18 @@ impl KernelComposition {
                     &candidate.operation_id,
                     &candidate.local_read_attempt,
                 )?;
+                // Issue #1837: durable audit evidence for the fencing-lease
+                // claim and the outbound daemon dispatch.
+                self.audit_observe(AuditEventDraft::lease_claim(
+                    envelope,
+                    session,
+                    &attempt,
+                    previous_generation,
+                    owned_before,
+                ));
+                self.audit_observe(AuditEventDraft::dispatch_daemon_claim(
+                    envelope, session, &attempt,
+                ));
                 return Ok(Some((envelope.clone(), tool.clone(), attempt)));
             }
         }
@@ -1924,6 +1980,11 @@ impl KernelComposition {
     }
 
     fn retire_local_read_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
+        // Issue #1837: durable audit evidence for orphan cleanup.
+        self.audit_observe(AuditEventDraft::orphan_queue_retired(
+            operation_id,
+            request_digest,
+        ));
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return;
         };
@@ -1980,6 +2041,10 @@ impl KernelComposition {
         queue: DaemonReadQueue,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
+        let lane = match queue {
+            DaemonReadQueue::Query => "query",
+            DaemonReadQueue::CampaignPacket => "campaign-packet",
+        };
         let _transition = self.agent_bridge_transition_read()?;
         let _admission_owner = self
             .agent_activation_pending
@@ -2033,6 +2098,14 @@ impl KernelComposition {
                     && attempt.fencing_generation == state.generation =>
             {
                 if !state.is_owned_by(session) {
+                    // Issue #1837: durable audit evidence for quarantine.
+                    self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                        session,
+                        body,
+                        &stored,
+                        lane,
+                        StaleLocalReadReason::OwnerMismatch.as_str(),
+                    ));
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2053,6 +2126,14 @@ impl KernelComposition {
                         .authority_epoch
                         .is_same_authority(&stored.authority_epoch)
                 {
+                    // Issue #1837: durable audit evidence for quarantine.
+                    self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                        session,
+                        body,
+                        &stored,
+                        lane,
+                        StaleLocalReadReason::Superseded.as_str(),
+                    ));
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2066,6 +2147,14 @@ impl KernelComposition {
                 }
             }
             (Some(attempt), Some(state)) => {
+                // Issue #1837: durable audit evidence for quarantine.
+                self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                    session,
+                    body,
+                    &stored,
+                    lane,
+                    StaleLocalReadReason::Superseded.as_str(),
+                ));
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -2078,6 +2167,14 @@ impl KernelComposition {
                 ));
             }
             (presented, current) => {
+                // Issue #1837: durable audit evidence for quarantine.
+                self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                    session,
+                    body,
+                    &stored,
+                    lane,
+                    StaleLocalReadReason::Unclaimed.as_str(),
+                ));
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -2115,7 +2212,7 @@ impl KernelComposition {
                 })
         };
         validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
-        if let Some(envelope) = queued_envelope {
+        if let Some(envelope) = queued_envelope.as_ref() {
             if !session
                 .authority_epoch
                 .is_same_authority(&envelope.state_fence.authority_epoch)
@@ -2145,6 +2242,22 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
+        // Issue #1837: durable audit evidence for the daemon result leg
+        // and the Kernel binding.
+        self.audit_observe(AuditEventDraft::result_daemon_submitted(
+            session,
+            body,
+            &stored,
+            queued_envelope.as_ref(),
+            lane,
+        ));
+        self.audit_observe(AuditEventDraft::result_kernel_bound(
+            session,
+            body,
+            &persisted,
+            queued_envelope.as_ref(),
+            lane,
+        ));
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
@@ -2758,6 +2871,11 @@ impl KernelComposition {
     /// lock/store error is contained because retirement must hold even when
     /// the store is unavailable.
     fn retire_observe_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
+        // Issue #1837: durable audit evidence for orphan cleanup.
+        self.audit_observe(AuditEventDraft::orphan_queue_retired(
+            operation_id,
+            request_digest,
+        ));
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return;
         };
@@ -2794,6 +2912,7 @@ impl KernelComposition {
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
+        let lane = "observe";
         let _transition = self.agent_bridge_transition_read()?;
         let _admission_owner = self
             .agent_activation_pending
@@ -2834,6 +2953,14 @@ impl KernelComposition {
                     && attempt.fencing_generation == state.generation =>
             {
                 if !state.is_owned_by(session) {
+                    // Issue #1837: durable audit evidence for quarantine.
+                    self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                        session,
+                        body,
+                        &stored,
+                        lane,
+                        StaleLocalReadReason::OwnerMismatch.as_str(),
+                    ));
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2850,6 +2977,14 @@ impl KernelComposition {
                         .authority_epoch
                         .is_same_authority(&stored.authority_epoch)
                 {
+                    // Issue #1837: durable audit evidence for quarantine.
+                    self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                        session,
+                        body,
+                        &stored,
+                        lane,
+                        StaleLocalReadReason::Superseded.as_str(),
+                    ));
                     return Ok(LocalReadSubmitDisposition::StaleAttempt(
                         StaleLocalReadObservation {
                             operation_id: body.operation_id.clone(),
@@ -2863,6 +2998,14 @@ impl KernelComposition {
                 }
             }
             (Some(attempt), Some(state)) => {
+                // Issue #1837: durable audit evidence for quarantine.
+                self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                    session,
+                    body,
+                    &stored,
+                    lane,
+                    StaleLocalReadReason::Superseded.as_str(),
+                ));
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -2875,6 +3018,14 @@ impl KernelComposition {
                 ));
             }
             (presented, current) => {
+                // Issue #1837: durable audit evidence for quarantine.
+                self.audit_observe(AuditEventDraft::result_stale_quarantined(
+                    session,
+                    body,
+                    &stored,
+                    lane,
+                    StaleLocalReadReason::Unclaimed.as_str(),
+                ));
                 return Ok(LocalReadSubmitDisposition::StaleAttempt(
                     StaleLocalReadObservation {
                         operation_id: body.operation_id.clone(),
@@ -2908,7 +3059,7 @@ impl KernelComposition {
                 })
                 .and_then(|candidate| candidate.observe_envelope.clone())
         };
-        if let Some(envelope) = queued_envelope {
+        if let Some(envelope) = queued_envelope.as_ref() {
             if !session
                 .authority_epoch
                 .is_same_authority(&envelope.state_fence.authority_epoch)
@@ -2938,6 +3089,22 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
+        // Issue #1837: durable audit evidence for the daemon result leg
+        // and the Kernel binding.
+        self.audit_observe(AuditEventDraft::result_daemon_submitted(
+            session,
+            body,
+            &stored,
+            queued_envelope.as_ref(),
+            lane,
+        ));
+        self.audit_observe(AuditEventDraft::result_kernel_bound(
+            session,
+            body,
+            &persisted,
+            queued_envelope.as_ref(),
+            lane,
+        ));
         // The single completion consumes the attempt use budget: retire the
         // pair so no later claim or submit can reuse this generation.
         self.retire_observe_pair_under_transition(&body.operation_id, &body.request_sha256);

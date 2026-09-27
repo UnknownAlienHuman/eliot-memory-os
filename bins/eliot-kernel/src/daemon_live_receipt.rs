@@ -5,6 +5,8 @@
 //! Ordinary module topology: I2.2 When capability becomes separate crate; I2.23 Capability-family topology — ordinary single-file extraction (<10k LOC) owning only `KernelComposition` live-receipt closure plus inseparable receipt-only helpers with zero external users.
 //! Forbidden authority: must not self-author readiness without authenticated evidence, semantic oracle, or alternate authority; this module remains evidence-gated, renewal-gated, and supervision-checked.
 
+#[cfg(windows)]
+use super::kernel_audit::AuditEventDraft;
 use super::{
     DaemonRuntimeStatus, DaemonSupervisionContour, EliotdLaunchDescriptor, Generation,
     HostKernelCandidateBinding, KernelComposition, KernelControlRequest, KernelReadyReceipt,
@@ -105,6 +107,14 @@ impl KernelComposition {
         ) {
             Ok(receipt) => {
                 observe_live_receipt("kernel.live_receipt.published", "success");
+                // Issue #1837: durable audit evidence for receipt issuance.
+                self.audit_observe(AuditEventDraft::receipt_live_published(
+                    process,
+                    supervision_contour
+                        .incarnation
+                        .supervision_lease_id
+                        .as_str(),
+                ));
                 Ok(receipt)
             }
             Err(error) => {
