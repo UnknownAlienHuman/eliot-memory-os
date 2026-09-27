@@ -85,6 +85,12 @@ pub enum OwnerDecision {
 }
 
 /// Durable negative procedural memory entry for a failed hypothesis family.
+/// A14.3 roles carried here: the exact deterministic trigger is
+/// [`AdviceCandidate::hypothesis_key`], the failed action is the candidate
+/// statement plus class, the outcome is `failure_reason`, and the reopen
+/// condition is "a new discriminator beyond `known_discriminators`".
+/// Violated invariant, scope, and extinction condition have no producer:
+/// neither owner decisions nor verifier outcomes supply them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NegativeMemoryEntry {
@@ -137,12 +143,16 @@ pub enum AdviceRejected {
     DirectMutationForbidden,
 }
 
-/// Pure change-control gate. Holds negative procedural memory; all other
-/// methods are pure transitions over owned records.
+/// Change-control gate. Holds the committed candidate ledger and negative
+/// procedural memory. Records stay durable through the gate's serde snapshot;
+/// the snapshot store owner is external, since this module holds no
+/// filesystem, store, or runtime handles.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdviceGate {
     negative_memory: BTreeMap<String, NegativeMemoryEntry>,
+    #[serde(default)]
+    candidates: BTreeMap<String, AdviceCandidate>,
 }
 
 impl AdviceGate {
@@ -150,12 +160,24 @@ impl AdviceGate {
     pub fn new() -> Self {
         Self {
             negative_memory: BTreeMap::new(),
+            candidates: BTreeMap::new(),
         }
     }
 
     #[must_use]
     pub fn negative_memory(&self) -> &BTreeMap<String, NegativeMemoryEntry> {
         &self.negative_memory
+    }
+
+    #[must_use]
+    pub fn candidates(&self) -> &BTreeMap<String, AdviceCandidate> {
+        &self.candidates
+    }
+
+    /// Read back the latest committed candidate record for a hypothesis.
+    #[must_use]
+    pub fn candidate(&self, hypothesis_key: &str) -> Option<&AdviceCandidate> {
+        self.candidates.get(hypothesis_key)
     }
 
     /// Stable hypothesis key: `<class>:<normalised statement>`.
@@ -193,12 +215,16 @@ impl AdviceGate {
         Ok(())
     }
 
-    /// Admit a proposal as a `Proposed` candidate record.
+    /// Admit a proposal as a `Proposed` candidate record and commit it to
+    /// the durable ledger.
     ///
     /// Rejects blank fields, missing discriminating evidence, and any
     /// re-submission of a negatively-remembered hypothesis that carries no
     /// new discriminator.
-    pub fn propose(&self, proposal: &AdviceProposal) -> Result<AdviceCandidate, AdviceRejected> {
+    pub fn propose(
+        &mut self,
+        proposal: &AdviceProposal,
+    ) -> Result<AdviceCandidate, AdviceRejected> {
         if proposal.statement.trim().is_empty() {
             return Err(AdviceRejected::BlankField("statement"));
         }
@@ -222,7 +248,7 @@ impl AdviceGate {
         }
         let hypothesis_key = Self::hypothesis_key_for(proposal.advice_class, &proposal.statement);
         self.check_negative_block(&hypothesis_key, &evidence)?;
-        Ok(AdviceCandidate {
+        let candidate = AdviceCandidate {
             hypothesis_key,
             statement: proposal.statement.trim().to_owned(),
             advice_class: proposal.advice_class,
@@ -233,12 +259,20 @@ impl AdviceGate {
             verifier: None,
             rollback_plan: None,
             state: AdviceState::Proposed,
-        })
+        };
+        self.commit(&candidate);
+        Ok(candidate)
     }
 
-    /// Apply the owner decision. Approval binds a named verifier and a
-    /// rollback condition; rejection parks the candidate as `OwnerRejected`
-    /// and records its reason in negative memory.
+    /// Commit a candidate record to the durable ledger, keyed by hypothesis.
+    fn commit(&mut self, candidate: &AdviceCandidate) {
+        self.candidates
+            .insert(candidate.hypothesis_key.clone(), candidate.clone());
+    }
+
+    /// Apply the owner decision and commit the resulting record. Approval
+    /// binds a named verifier and a rollback condition; rejection parks the
+    /// candidate as `OwnerRejected` and records its reason in negative memory.
     pub fn record_owner_decision(
         &mut self,
         mut candidate: AdviceCandidate,
@@ -258,11 +292,13 @@ impl AdviceGate {
                 candidate.verifier = Some(verifier.trim().to_owned());
                 candidate.rollback_plan = Some(rollback.trim().to_owned());
                 candidate.state = AdviceState::OwnerApproved;
+                self.commit(&candidate);
                 Ok(candidate)
             }
             OwnerDecision::Reject { reason } => {
                 candidate.state = AdviceState::OwnerRejected;
                 self.record_failure(&candidate, reason);
+                self.commit(&candidate);
                 Ok(candidate)
             }
         }
@@ -298,8 +334,9 @@ impl AdviceGate {
         entry.clone()
     }
 
-    /// Record the named verifier outcome. A pass retains the candidate; a
-    /// failure rolls it back and writes negative procedural memory.
+    /// Record the named verifier outcome and commit the terminal record. A
+    /// pass retains the candidate; a failure rolls it back and writes
+    /// negative procedural memory.
     pub fn record_verifier_outcome(
         &mut self,
         mut candidate: AdviceCandidate,
@@ -313,10 +350,12 @@ impl AdviceGate {
         }
         if passed {
             candidate.state = AdviceState::VerifierRetained;
+            self.commit(&candidate);
             Ok(candidate)
         } else {
             candidate.state = AdviceState::VerifierRolledBack;
             self.record_failure(&candidate, detail);
+            self.commit(&candidate);
             Ok(candidate)
         }
     }
