@@ -36,8 +36,8 @@ use thiserror::Error;
 
 use crate::{
     CanonicalAdmissionOwner, CanonicalAdmissionSnapshot, CanonicalFinishEvidence,
-    CanonicalPlanBinding, CanonicalVerifierExecutionFact, CompositionError, GovernorOwners,
-    KernelPortError, KernelTransitionPort, acceptance_coverage_from_verifier_fact,
+    CanonicalPlanBinding, CanonicalVerifierExecutionFact, CompositionError, DecisionValidity,
+    GovernorOwners, KernelPortError, KernelTransitionPort, acceptance_coverage_from_verifier_fact,
     evaluate_testd_verification_current,
 };
 
@@ -596,6 +596,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         if self.canonical.state_fence() != &fence {
             return Err(FinishError::FenceMismatch.into());
         }
+        // Compare the fence and temporal record immediately before binding the
+        // verifier: a lease/local-clock anomaly refuses the binding and requires
+        // revalidation instead of extending the lease (A5.4).
+        DecisionValidity::new(identity.request.metadata.clock, fence.clone())
+            .validate_for_decision(Some(identity.deadline_unix_ms))
+            .map_err(|error| {
+                FinishAttemptError::Composition(CompositionError::Owner(error.to_string()))
+            })?;
         if identity.request.metadata.task_id.as_ref() != Some(task_id) {
             return Err(FinishError::Canonical(
                 eliot_canonical::CanonicalError::TaskBindingMismatch,
@@ -859,6 +867,15 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         if self.canonical.state_fence() != &fence {
             return Err(FinishError::FenceMismatch.into());
         }
+        // Compare the fence and temporal record immediately before binding
+        // material results: a lease/local-clock anomaly refuses the finish
+        // evidence and requires revalidation instead of extending the lease
+        // (A5.4).
+        DecisionValidity::new(identity.request.metadata.clock, fence.clone())
+            .validate_for_decision(Some(identity.deadline_unix_ms))
+            .map_err(|error| {
+                FinishAttemptError::Composition(CompositionError::Owner(error.to_string()))
+            })?;
         let task_id = TaskId::new(draft.task_id.clone())
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
         if identity.request.metadata.task_id.as_ref() != Some(&task_id) {

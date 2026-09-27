@@ -88,6 +88,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::decision_validity::DecisionValidity;
+
 /// Role label for the `TaskFrame` slot.
 pub const ROLE_TASK_FRAME: &str = "task_frame";
 /// Role label for the `CriticalAttention`/`Conflict` slot.
@@ -344,6 +346,16 @@ impl SevenRoleInputs {
         ]
     }
 
+    /// The named temporal validity + minimal fence record for this assembly.
+    ///
+    /// This is the canonical State Fence and temporal validity record a
+    /// decision receipt carries (A5.4): valid/known/transaction time as
+    /// observations plus only the decision-relevant dependency revisions.
+    #[must_use]
+    pub fn decision_validity(&self) -> DecisionValidity {
+        DecisionValidity::new(self.clock, self.state_fence.clone())
+    }
+
     /// Returns the labels of roles whose source could not be read or
     /// evaluated (`Unavailable`, `Unknown`, `Missing`, `Blocked`).
     ///
@@ -409,6 +421,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         ctx.validate().map_err(|error| {
             ContextInputsError::RequestInvalid(format!("request metadata: {error}"))
         })?;
+        check_assembly_clock(ctx)?;
         if request.dependency_revisions.is_empty() {
             return Err(ContextInputsError::MissingDependencies);
         }
@@ -919,6 +932,24 @@ fn check_text_selector(field: &'static str, value: &str) -> Result<(), ContextIn
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(ContextInputsError::RequestInvalid(format!(
             "{field} must be non-blank text"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a lease/local-clock anomaly at the Active View assembly boundary
+/// (A5.4), using monotonic-compatible timing.
+///
+/// The assembly carries no request lease deadline, so only clock-only
+/// anomalies are detectable here; an anomaly refuses the assembly and
+/// requires revalidation instead of extending any lease.
+fn check_assembly_clock(ctx: &RequestMetadata) -> Result<(), ContextInputsError> {
+    if let Some(anomaly) =
+        DecisionValidity::new(ctx.clock, ctx.state_fence.clone()).detect_clock_anomaly(None)
+    {
+        return Err(ContextInputsError::RequestInvalid(format!(
+            "clock anomaly at active view assembly: {}",
+            anomaly.as_str()
         )));
     }
     Ok(())

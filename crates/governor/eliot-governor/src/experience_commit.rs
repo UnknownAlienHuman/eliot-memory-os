@@ -83,6 +83,7 @@ use eliot_store_api::{
 };
 
 use crate::composition::{CompositionError, GovernorComposition, KernelGenerationPort};
+use crate::decision_validity::DecisionValidity;
 
 /// Closed commit leg plus its deterministic idempotency key.
 struct CommitLeg {
@@ -167,6 +168,15 @@ fn bind_commit_identity(
             "ingress fence does not equal the admitted record fence".to_owned(),
         ));
     }
+    // Compare the fence and temporal record immediately before the material
+    // commit: a lease/local-clock anomaly refuses the capture and requires
+    // revalidation instead of silently extending the lease (A5.4).
+    DecisionValidity::new(
+        identity.request.metadata.clock,
+        identity.request.metadata.state_fence.clone(),
+    )
+    .validate_for_decision(Some(identity.deadline_unix_ms))
+    .map_err(|error| CompositionError::Owner(error.to_string()))?;
     if scope_id.as_str() != record_scope {
         return Err(CompositionError::Owner(
             "transition scope does not equal the admitted record scope".to_owned(),

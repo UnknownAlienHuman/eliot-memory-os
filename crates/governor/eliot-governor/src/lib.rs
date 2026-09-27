@@ -58,6 +58,7 @@ pub use finish_attempt::{
     FinishAttemptError, GovernorFinishAttempt, PreparedFinishDecision, PreparedKernelExchange,
 };
 mod controlboard_projection;
+mod decision_validity;
 mod learning_admission;
 mod learning_closure;
 mod learning_delta_integration;
@@ -102,6 +103,7 @@ pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
 };
+pub use decision_validity::{ClockAnomaly, DecisionValidity, DecisionValidityError};
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
