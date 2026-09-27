@@ -29,8 +29,9 @@ use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
     ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootPrimitiveSpec,
-    InstallerRootProfile, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationRequest,
-    ServiceStartMode, WindowsInstallerRootPrimitive, host_service_security_descriptor_digest,
+    InstallerRootProfile, SERVICE_EXPECTED_GROUP_SID, SERVICE_EXPECTED_OWNER_SID, ServiceAccount,
+    ServiceBootstrapArguments, ServiceRegistrationRequest, ServiceStartMode,
+    WindowsInstallerRootPrimitive, host_service_security_descriptor_digest,
     prepare_protected_directory,
     test_support::{self, ProtectedRootOverride},
     watchdog_service_security_descriptor_digest,
@@ -401,6 +402,12 @@ impl RegistryFixture {
             &serde_json::to_vec(manifest)
                 .unwrap_or_else(|error| panic!("serialize pending manifest bytes: {error}")),
         );
+        // The current registry wire requires the intent-digest and Phase-B
+        // member keys on every pending projection, and registry validation
+        // requires a retained intent digest: without them the fixture reload
+        // fails closed before any grant is observed.
+        let activation_intent_digest =
+            Self::digest(manifest.runtime_launch.authority_generation.value() + 300);
         let reason = if state == "RECOVERY_REQUIRED" {
             Some("fixture recovery proof required".to_owned())
         } else {
@@ -422,9 +429,13 @@ impl RegistryFixture {
             "host_artifact_digest": manifest.host_artifact_digest,
             "runtime_state_roots_digest": manifest.runtime_state_roots_digest,
             "manifest_digest": manifest_digest,
+            "activation_intent_digest": activation_intent_digest,
             "prior_active_generation": prior_active,
             "approval": approval,
+            "phase_b_intent": null,
+            "phase_b_prepared": null,
             "phase_b_agent_bridge_stage_prepared": null,
+            "phase_b_receipt": null,
             "state": state_value,
         })
     }
@@ -517,6 +528,8 @@ impl RegistryFixture {
                 "principal_service": ELIOT_HOST_SERVICE_NAME,
                 "principal_sid": principal_sid,
                 "access_mask": ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                "security_descriptor_owner": SERVICE_EXPECTED_OWNER_SID,
+                "security_descriptor_group": SERVICE_EXPECTED_GROUP_SID,
                 "security_descriptor_digest": security_descriptor_digest,
             })
         } else {
@@ -528,6 +541,8 @@ impl RegistryFixture {
                 "principal_service": ELIOT_HOST_SERVICE_NAME,
                 "principal_sid": principal_sid,
                 "access_mask": ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                "security_descriptor_owner": SERVICE_EXPECTED_OWNER_SID,
+                "security_descriptor_group": SERVICE_EXPECTED_GROUP_SID,
                 "security_descriptor_digest": security_descriptor_digest,
             })
         };
