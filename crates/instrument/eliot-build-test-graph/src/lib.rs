@@ -40,12 +40,19 @@ pub const ADMITTED_BROADER_TIERS: [&str; 5] = ["T0", "T1", "T2", "T3", "T4"];
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 mod derived_cache;
+mod finish_disposition;
 
 pub use derived_cache::{
     ADMITTED_SCHEMA_REVISIONS, ArtifactLineage, CacheCounters, CacheLimits, CacheLookup,
     CacheRejectReason, CacheStoreError, CachedArtifact, DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
     DEFAULT_MAX_REJECTIONS, DERIVED_CACHE_SCHEMA_V1, DerivationOutcome, DerivedCacheIdentity,
     DerivedCacheStore, FreshDerivation, RejectedCacheRecord, RootDisposition, TrustPolicy,
+};
+pub use finish_disposition::{
+    AcceptanceCriticality, AcceptanceOracle, ContractChallenge, ContractChallengeReason,
+    DeclaredAcceptance, DispositionError, EvidenceOutcome, EvidenceProof, EvidenceReceipt,
+    FinishBoundaryResponse, FinishDisposition, OracleObservation, OracleOrigin,
+    ProvenRequiredProof, RequiredProofCompletion, TaskOutcome, apply_finish_boundary,
 };
 
 pub(crate) fn validate_text_shape(value: &str, field: &'static str) -> Result<(), GraphError> {
