@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, OperationId, RequestId, StateFence, TaskId, TaskRevision};
-use eliot_evidence::EvidenceAuthority;
+use eliot_evidence::{Assertability, EvidenceAuthority};
 use eliot_receipts::WorkScope;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -550,7 +550,7 @@ impl EpistemicPositionCandidate {
             &ClaimMap,
         ),
         slices: (&[ConflictSet], &[AssumptionRecord], &[TemporalRecord]),
-    ) -> Result<(), ContractError> {
+    ) -> Result<Assertability, ContractError> {
         let (request, denominator, receipt, map) = inputs;
         let (conflicts, assumptions, temporals) = slices;
         self.validate()?;
@@ -587,7 +587,7 @@ impl EpistemicPositionCandidate {
             true,
             (self.disclosure, self.privacy, self.verifier.as_ref()),
         )?;
-        Ok(())
+        Ok(self.proposed_assertability.arch_assertability())
     }
     fn validate_closed_inputs(
         request: &PositionRequest,
