@@ -1266,7 +1266,7 @@ pub(crate) mod support {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use eliot_research_exchange_api::CoverageGapKind;
+    use eliot_research_exchange_api::{CoverageGapKind, ExternalKnowledgeStage};
 
     use super::support::{
         DIGEST_A, DIGEST_SHORT, DIGEST_UPPER, test_fence, test_identity, test_request,
@@ -1333,8 +1333,14 @@ mod tests {
         let mut researcher = compose_with_bridge(test_identity());
         let result = submit(&mut researcher, test_request());
         assert!(
-            matches!(result, Err(ExchangeError::InvalidTransition)),
-            "bridge gap must surface without fabricating a job"
+            matches!(
+                result,
+                Err(ExchangeError::ExternalKnowledge {
+                    stage: ExternalKnowledgeStage::Submit,
+                    failure: ExternalKnowledgeFailure::SourceUnavailable,
+                })
+            ),
+            "bridge gap must surface as the provider's own unavailable-source outcome at the submit stage, without fabricating a job"
         );
         assert!(
             exchange_snapshot(&researcher).jobs.is_empty(),
@@ -1544,8 +1550,14 @@ mod tests {
         );
         let result = submit(&mut researcher, test_request());
         assert!(
-            matches!(result, Err(ExchangeError::InvalidTransition)),
-            "absent process authority must surface as a gap, never a job"
+            matches!(
+                result,
+                Err(ExchangeError::ExternalKnowledge {
+                    stage: ExternalKnowledgeStage::Submit,
+                    failure: ExternalKnowledgeFailure::SourceUnavailable,
+                })
+            ),
+            "absent process authority must surface as a typed unavailable-source gap at the submit stage, never a job"
         );
         assert!(
             exchange_snapshot(&researcher).jobs.is_empty(),
