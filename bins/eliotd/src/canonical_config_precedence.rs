@@ -22,6 +22,11 @@
 //! The legacy `governor.toml` surface (`bins/eliot`, #1687) adopts nothing:
 //! a present legacy file still fails closed through the legacy rejector,
 //! which now names this canonical surface as the sole typed replacement.
+//!
+//! [`resolve_effective_configuration`] is the production entry point: the
+//! protected daemon config boundary calls it while loading the Host-approved
+//! launch file, so an effective configuration that cannot be resolved refuses
+//! the load and the generation never becomes ready.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -30,6 +35,14 @@ use thiserror::Error;
 ///
 /// A per-job budget limit: smaller narrows cost/authority, larger expands it.
 pub const CANONICAL_SETTING_KEY: &str = "task.budget.per_job";
+
+/// Compiled safe default for [`CANONICAL_SETTING_KEY`], the broadest layer.
+///
+/// The compiled defaults delegate nothing, so this value is the ceiling of the
+/// whole chain: no lower layer can raise the per-job budget above it. A lower
+/// layer that narrows can only delegate expansion back up to a ceiling it
+/// itself inherited.
+pub const COMPILED_SAFE_DEFAULT_PER_JOB_BUDGET: u64 = 64;
 
 /// Canonical precedence order, broadest (index 0) to narrowest (index 6).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -555,6 +568,70 @@ pub fn canonical_layer_json_schema() -> serde_json::Value {
 #[must_use]
 pub fn canonical_layer_json_schema_pretty() -> String {
     serde_json::to_string_pretty(&canonical_layer_json_schema()).unwrap_or_else(|_| "{}".to_owned())
+}
+
+/// One typed I3.9 configuration file as read by the protected config boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PolicyDocument<'a> {
+    /// File name of the document. Its extension selects the typed decoder and
+    /// refuses executable script extensions before any decoding runs.
+    pub file_name: &'a str,
+    /// Exact document bytes as read through the protected config boundary.
+    pub bytes: &'a [u8],
+}
+
+/// Resolves the effective canonical configuration from the I3.9 typed
+/// configuration files and enforces the seven-layer precedence.
+///
+/// [`COMPILED_SAFE_DEFAULT_PER_JOB_BUDGET`] seeds the chain, so a document set
+/// that names no layer still resolves to the compiled safe default. Every
+/// supplied document is classified by [`classify_policy_input`] first, so a
+/// script or non-UTF-8 input is refused before it can act as configuration,
+/// and is then decoded by the typed decoder its extension names: `.toml`
+/// through [`parse_canonical_layer_toml`] and `.json` through
+/// [`parse_canonical_layer_json`]. Any other extension is a schema rejection,
+/// so an untyped file is never read as a fallback configuration source.
+/// [`resolve_canonical_chain`] merges the documents in canonical precedence
+/// order and refuses any lower-layer expansion that no higher layer delegated,
+/// so the returned chain is the effective configuration or the call fails
+/// closed. A document may not claim a layer outside the seven canonical
+/// layers, and two documents may not claim the same layer.
+///
+/// # Errors
+/// Returns [`PrecedenceError`] for script, schema, unknown-layer,
+/// duplicate-layer, or undelegated-expansion input.
+pub fn resolve_effective_configuration(
+    documents: &[PolicyDocument<'_>],
+) -> Result<ResolvedChain, PrecedenceError> {
+    let mut inputs = vec![LayerInput {
+        layer: ConfigLayer::CompiledDefaults,
+        limit: Some(COMPILED_SAFE_DEFAULT_PER_JOB_BUDGET),
+        delegation_ceiling: None,
+    }];
+    for document in documents {
+        let file_name = document.file_name;
+        classify_policy_input(file_name, document.bytes)?;
+        let extension = file_name
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        inputs.push(match extension.as_str() {
+            "json" => parse_canonical_layer_json(document.bytes)?,
+            "toml" => {
+                let text = std::str::from_utf8(document.bytes).map_err(|_| {
+                    PrecedenceError::SchemaRejected("policy input is not UTF-8".to_owned())
+                })?;
+                parse_canonical_layer_toml(text)?
+            }
+            _ => {
+                return Err(PrecedenceError::SchemaRejected(format!(
+                    "unsupported policy file type for {file_name}"
+                )));
+            }
+        });
+    }
+    resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
 }
 
 #[cfg(test)]

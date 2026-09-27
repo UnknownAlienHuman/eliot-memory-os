@@ -518,6 +518,21 @@ pub(super) fn run() -> Result<(), String> {
         &launch.executable_sha256,
     )
     .map_err(|error| error.to_string())?;
+    // I3.9: the load above already resolved and enforced the effective canonical
+    // configuration — a script, an untyped document, or a lower-layer expansion
+    // that no higher layer delegated returns `Err` there, so this line is
+    // reachable only with a resolved chain. It publishes the inspection answer
+    // for the one proven setting chain: the winning value and every contributing
+    // layer in canonical precedence order. It gates nothing and grants nothing;
+    // the refusal is the config load, not this record.
+    let canonical = config.canonical_chain();
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.canonical_config_effective",
+        key = canonical.key(),
+        winning_value = canonical.winning_value(),
+        contributing_layers = ?canonical.contributions(),
+    );
     let kernel = DaemonKernelClient::connect(&config).map_err(|error| error.to_string())?;
     let authority_activation = eliotd::kernel_authority_port(&kernel);
     let mut composition = DaemonComposition::start(
