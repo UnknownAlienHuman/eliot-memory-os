@@ -16,10 +16,11 @@
 //!   `lifecycle_owner`, `runtime_bundle`, `execution_contour`,
 //!   `runtime_class`, `state_class`, `canonical_semantic`,
 //!   `replacement_class`, `iteration_lane`
-//!   bound to a referenced [`ProofLatencyProfileRef`], `proof_entrypoint` and
-//!   `proof_ceiling`, `recovery_boundary`, `contract_digest` and
-//!   `freshness`. A missing non-derivable field is rejected; a crate-derived
-//!   owner spelling is rejected as inferred authority.
+//!   bound to a referenced [`ProofLatencyProfileRef`], `production_required`,
+//!   `proof_entrypoint` and `proof_ceiling`, `recovery_boundary`,
+//!   `contract_digest` and `freshness`. A missing non-derivable field is
+//!   rejected; a crate-derived owner spelling is rejected as inferred
+//!   authority.
 //! * Identity: `manifest_id` binds cell and revision; `manifest_digest` is the
 //!   lowercase SHA-256 hex of the canonical bytes, recomputed by
 //!   [`EffectiveCellManifest::validate`].
@@ -265,6 +266,9 @@ pub struct CellManifestInput {
     /// Development loop lane, bound to `proof_latency_profile`; `None` is
     /// rejected, never crate-defaulted.
     pub iteration_lane: Option<IterationLane>,
+    /// Explicit declaration of whether the production runtime requires this
+    /// capability; `None` is rejected, never inferred.
+    pub production_required: Option<bool>,
     /// Explicit claim of canonical semantic ownership; `I2.10` refuses it for
     /// every hot-replaceable replacement class.
     pub canonical_semantic: CanonicalSemanticOwnership,
@@ -316,6 +320,9 @@ pub struct EffectiveCellManifest {
     pub replacement_class: ModuleReplacementClass,
     /// Development loop lane of the cell.
     pub iteration_lane: IterationLane,
+    /// Explicit declaration of whether the production runtime requires this
+    /// capability.
+    pub production_required: bool,
     /// Referenced proof-latency profile evidencing the lane.
     pub proof_latency_profile: ProofLatencyProfileRef,
     /// Independently invokable proof entrypoint of the cell.
@@ -387,6 +394,22 @@ pub enum CellManifestError {
         cell: String,
         /// Replacement class that makes the cell hot-replaceable.
         replacement: String,
+    },
+    /// A cell that declares itself not production-required carries neither the
+    /// explicit `development_only` contour nor the explicit `development_tool`
+    /// runtime class.
+    DevelopmentClassificationMissing {
+        /// Cell with the missing development classification.
+        cell: String,
+    },
+    /// A cell that declares itself production-required carries a
+    /// `development_only` contour or a `development_tool` runtime class, which
+    /// are never required by the production runtime.
+    DevelopmentClassifiedProductionRequired {
+        /// Cell making the claim.
+        cell: String,
+        /// Which development classification the cell carries.
+        detail: String,
     },
     /// One multi-cell generation call mixes inputs from more than one source
     /// crate. Generation is crate-scoped: one call describes the cells of
@@ -462,6 +485,14 @@ impl fmt::Display for CellManifestError {
                 formatter,
                 "cell '{cell}' is hot-replaceable through '{replacement}' and must not declare canonical_semantic"
             ),
+            Self::DevelopmentClassificationMissing { cell } => write!(
+                formatter,
+                "cell '{cell}' is not production-required and declares neither development_only nor development_tool"
+            ),
+            Self::DevelopmentClassifiedProductionRequired { cell, detail } => write!(
+                formatter,
+                "cell '{cell}' is production-required and declares {detail}"
+            ),
             Self::MixedSourceCrates { crates } => write!(
                 formatter,
                 "multi-cell generation mixes source crates: {}",
@@ -519,6 +550,7 @@ struct EffectiveCellManifestDigestBody<'a> {
     canonical_semantic: &'a CanonicalSemanticOwnership,
     replacement_class: &'a ModuleReplacementClass,
     iteration_lane: &'a IterationLane,
+    production_required: &'a bool,
     proof_latency_profile: &'a ProofLatencyProfileRef,
     proof_entrypoint: &'a ProofEntrypointRef,
     proof_ceiling: &'a ProofCeiling,
@@ -627,6 +659,39 @@ pub(crate) fn state_replacement_compatible(
     )
 }
 
+/// Returns whether the cell carries an explicit development classification.
+///
+/// `development_only` and `development_tool` are the `I2.10` classifications
+/// for generators, admission utilities, fuzzers, simulations, benchmarks, and
+/// migration tooling that is never required by the production runtime. Either
+/// spelling alone is sufficient: a fuzzer needs OS access and keeps the
+/// `native_process` contour while still declaring `development_tool`.
+pub(crate) fn is_development_classified(
+    contour: ModuleExecutionContour,
+    class: ModuleRuntimeClass,
+) -> bool {
+    contour == ModuleExecutionContour::DevelopmentOnly
+        || class == ModuleRuntimeClass::DevelopmentTool
+}
+
+/// Names the development classification a contour/class pair carries, for the
+/// refusal detail.
+pub(crate) fn development_classification_detail(
+    contour: ModuleExecutionContour,
+    class: ModuleRuntimeClass,
+) -> String {
+    let contour = contour == ModuleExecutionContour::DevelopmentOnly;
+    let class = class == ModuleRuntimeClass::DevelopmentTool;
+    match (contour, class) {
+        (true, true) => {
+            "the development_only contour and the development_tool runtime class".to_owned()
+        }
+        (true, false) => "the development_only contour".to_owned(),
+        (false, true) => "the development_tool runtime class".to_owned(),
+        (false, false) => "neither development classification".to_owned(),
+    }
+}
+
 /// Refuses an absent `I2.10` classification.
 ///
 /// The five classifications are explicit declarations of a functional cell; an
@@ -665,6 +730,35 @@ fn check_canonical_semantic_ownership(
         return Err(CellManifestError::HotReplaceableCanonicalSemantic {
             cell: cell.to_owned(),
             replacement: format!("{replacement:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Enforces the `I2.10` coherence of the production-necessity declaration
+/// with the recorded execution contour and runtime class.
+///
+/// A cell that declares itself not production-required carries the explicit
+/// `development_only` contour and/or the explicit `development_tool` runtime
+/// class; a production-required cell carries neither. The declaration and
+/// both classifications are read only from the recorded values, never from a
+/// crate, bundle, source-layer, or runtime-layer name.
+fn check_development_classification(
+    cell: &str,
+    production_required: bool,
+    contour: ModuleExecutionContour,
+    class: ModuleRuntimeClass,
+) -> Result<(), CellManifestError> {
+    let development = is_development_classified(contour, class);
+    if production_required && development {
+        return Err(CellManifestError::DevelopmentClassifiedProductionRequired {
+            cell: cell.to_owned(),
+            detail: development_classification_detail(contour, class),
+        });
+    }
+    if !production_required && !development {
+        return Err(CellManifestError::DevelopmentClassificationMissing {
+            cell: cell.to_owned(),
         });
     }
     Ok(())
@@ -746,6 +840,7 @@ impl EffectiveCellManifest {
             canonical_semantic: &self.canonical_semantic,
             replacement_class: &self.replacement_class,
             iteration_lane: &self.iteration_lane,
+            production_required: &self.production_required,
             proof_latency_profile: &self.proof_latency_profile,
             proof_entrypoint: &self.proof_entrypoint,
             proof_ceiling: &self.proof_ceiling,
@@ -780,7 +875,8 @@ impl EffectiveCellManifest {
     /// is derived from the hosting crate name, delegated execution names a
     /// runtime bundle, the iteration lane is evidenced by its referenced
     /// proof-latency profile, the state/replacement pair is admissible
-    /// under `I2.10`, and a hot-replaceable cell declares no
+    /// under `I2.10`, the production-necessity declaration coheres with the
+    /// development classification, and a hot-replaceable cell declares no
     /// `canonical_semantic` ownership.
     pub fn validate(&self) -> Result<(), CellManifestError> {
         let expected_id = manifest_identity(&self.functional_cell_ref, self.cell_revision);
@@ -814,6 +910,12 @@ impl EffectiveCellManifest {
             self.state_class,
             self.replacement_class,
         )?;
+        check_development_classification(
+            self.functional_cell_ref.as_str(),
+            self.production_required,
+            self.execution_contour,
+            self.runtime_class,
+        )?;
         check_canonical_semantic_ownership(
             self.functional_cell_ref.as_str(),
             self.canonical_semantic,
@@ -826,14 +928,15 @@ impl EffectiveCellManifest {
 /// Generates one effective manifest for one cell input.
 ///
 /// Missing non-derivable declarations (`lifecycle_owner`, `proof_entrypoint`,
-/// and the five classifications `execution_contour`, `runtime_class`,
-/// `state_class`, `replacement_class`, `iteration_lane`) are rejected; a
-/// crate-derived owner spelling is rejected as inferred authority instead of
-/// being accepted as a default. Delegated execution without a named
+/// `production_required`, and the five classifications `execution_contour`,
+/// `runtime_class`, `state_class`, `replacement_class`, `iteration_lane`) are
+/// rejected; a crate-derived owner spelling is rejected as inferred authority
+/// instead of being accepted as a default. Delegated execution without a named
 /// `runtime_bundle`, a lane unevidenced by its referenced proof-latency
-/// profile, an inadmissible `I2.10` state/replacement pair, and a
-/// hot-replaceable cell claiming `canonical_semantic` are rejected
-/// fail-closed as well.
+/// profile, an inadmissible `I2.10` state/replacement pair, a
+/// production-necessity declaration incoherent with the development
+/// classification, and a hot-replaceable cell claiming `canonical_semantic`
+/// are rejected fail-closed as well.
 pub fn generate_effective_manifest(
     input: CellManifestInput,
 ) -> Result<EffectiveCellManifest, CellManifestError> {
@@ -866,6 +969,13 @@ pub fn generate_effective_manifest(
         require_classification(&cell_name, "replacement_class", input.replacement_class)?;
     let iteration_lane =
         require_classification(&cell_name, "iteration_lane", input.iteration_lane)?;
+    let production_required =
+        input
+            .production_required
+            .ok_or_else(|| CellManifestError::MissingField {
+                cell: cell_name.clone(),
+                field: "production_required",
+            })?;
     check_canonical_semantic_ownership(&cell_name, input.canonical_semantic, replacement_class)?;
     check_cross_field_consistency(
         &cell_name,
@@ -876,6 +986,12 @@ pub fn generate_effective_manifest(
         &input.proof_latency_profile,
         state_class,
         replacement_class,
+    )?;
+    check_development_classification(
+        &cell_name,
+        production_required,
+        execution_contour,
+        runtime_class,
     )?;
     let manifest_id = ManifestId::new(manifest_identity(&input.cell, input.cell_revision))
         .map_err(|error| CellManifestError::DigestFailed {
@@ -894,6 +1010,7 @@ pub fn generate_effective_manifest(
         canonical_semantic: input.canonical_semantic,
         replacement_class,
         iteration_lane,
+        production_required,
         proof_latency_profile: input.proof_latency_profile,
         proof_entrypoint,
         proof_ceiling: input.proof_ceiling,
@@ -1026,6 +1143,7 @@ mod tests {
             canonical_semantic: CanonicalSemanticOwnership::NotClaimed,
             replacement_class: Some(ModuleReplacementClass::HostGeneration),
             iteration_lane: Some(IterationLane::Normal),
+            production_required: Some(true),
             proof_latency_profile: ProofLatencyProfileRef::new("eliot-contracts/profile/normal")?,
             proof_entrypoint: Some(ProofEntrypointRef::new("eliot-contracts proof")?),
             proof_ceiling: ProofCeiling::ModuleEdgeProof,
@@ -1150,6 +1268,9 @@ mod tests {
         ] {
             let mut input = valid_input("foundation.host.cell", "foundation-host-owner")?;
             input.runtime_class = Some(class);
+            if class == ModuleRuntimeClass::DevelopmentTool {
+                input.production_required = Some(false);
+            }
             generate_effective_manifest(input).map_err(|error| error.to_string())?;
         }
 
