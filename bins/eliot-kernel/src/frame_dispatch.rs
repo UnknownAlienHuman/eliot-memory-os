@@ -501,23 +501,22 @@ impl KernelComposition {
 
     /// Independent Watchdog branch coverage for the current activation.
     ///
-    /// The projection is a decision over the real branch state, not a
-    /// permanent refusal: a contour whose Watchdog branch verifies is
-    /// `Healthy`, and everything else stays `Unknown` so a supervised claim is
-    /// never projected from lease continuity alone.
+    /// The verification input is the five-part Watchdog branch check for the
+    /// exact target fence; the dimension value itself is projected by
+    /// `eliot_kernel_core::runtime_supervision_coverage`, so this stays a
+    /// decision over the real branch state, not a permanent refusal: a
+    /// contour whose Watchdog branch verifies is `Healthy`, and everything
+    /// else stays `Unknown` so a supervised claim is never projected from
+    /// lease continuity alone.
     fn runtime_supervision_coverage(
         &self,
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         generation: &eliot_runtime_contracts::ModuleGeneration,
     ) -> HealthDimension {
-        if self
-            .verify_watchdog_supervision_branch(candidate, &generation.state_fence)
-            .is_ok()
-        {
-            HealthDimension::Healthy
-        } else {
-            HealthDimension::Unknown
-        }
+        eliot_kernel_core::runtime_supervision_coverage(
+            self.verify_watchdog_supervision_branch(candidate, &generation.state_fence)
+                .is_ok(),
+        )
     }
 
     /// Verifies the independent Watchdog branch for one exact target fence.
