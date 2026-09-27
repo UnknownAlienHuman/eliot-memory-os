@@ -1442,6 +1442,14 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
     /// duplicate still reduces elevation. The first cleanup failure wins so
     /// the primary operation outcome held by the caller is never
     /// overwritten; the caller reports the error instead of success.
+    ///
+    /// A failed prior-thread-token rebind is never discarded. When the thread
+    /// stays bound to the elevated duplicate, this returns
+    /// `Win32 { stage: RestoreThreadToken, .. }` and keeps the guard armed so
+    /// the emergency Drop still fails closed; it reports typed failure rather
+    /// than silently dropping the second cleanup failure. Exactly one
+    /// restoration is attempted: when the rebind already succeeded the guard
+    /// is disarmed, so Drop never rebinds or restores a token twice.
     fn restore_typed(&mut self) -> Result<(), InstallerRootError> {
         if !self.armed {
             return Ok(());
@@ -1458,20 +1466,28 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
                 code,
             });
         }
-        if let Err(code) = self.api.bind_thread_token(self.prior_thread)
-            && failure.is_none()
-        {
-            // ABORT_BOUNDARY_CONVERTED site="installer-root/restore-thread-token" outcome="InstallerRootError::Win32(stage=RestoreThreadToken,code)"
-            failure = Some(InstallerRootError::Win32 {
-                stage: InstallerRootStage::RestoreThreadToken,
-                code,
-            });
+        let rebound = match self.api.bind_thread_token(self.prior_thread) {
+            Ok(()) => true,
+            Err(code) => {
+                // The rebind is the load-bearing unbind. A failure here leaves
+                // the thread bound to the elevated duplicate, so it is
+                // reported on its own terms instead of being masked by an
+                // earlier privilege failure.
+                // ABORT_BOUNDARY_CONVERTED site="installer-root/restore-thread-token" outcome="InstallerRootError::Win32(stage=RestoreThreadToken,code)"
+                failure = Some(InstallerRootError::Win32 {
+                    stage: InstallerRootStage::RestoreThreadToken,
+                    code,
+                });
+                false
+            }
+        };
+        if rebound {
+            self.api.close_token(self.duplicate);
+            if let Some(token) = self.prior_thread {
+                self.api.close_token(token);
+            }
+            self.armed = false;
         }
-        self.api.close_token(self.duplicate);
-        if let Some(token) = self.prior_thread {
-            self.api.close_token(token);
-        }
-        self.armed = false;
         if let Some(error) = failure {
             Err(error)
         } else {
@@ -1492,6 +1508,12 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
     /// no reentrancy, no secrets.
     // ABORT_BOUNDARY site="installer-root/scoped-restore-drop" invariant="token-bound-elevation"
     fn emergency_restore(&mut self) {
+        // Reached when the guard is still armed: either Drop follows a panic
+        // or unwind that skipped the normal path, or a prior explicit
+        // restore_typed() left the thread bound to the elevated duplicate.
+        // The retry is a genuine second attempt only in the second case; the
+        // first case is the single attempt. A successful retry disarms inside
+        // restore_typed(), so this runs once and never closes a handle twice.
         if let Err(error) = self.restore_typed() {
             let (detail, code) = restoration_evidence(error);
             emit_abort_boundary_evidence("installer-root/scoped-restore-drop", detail, code);
@@ -1503,10 +1525,12 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
 #[cfg(windows)]
 impl<A: PrivilegeApi + ?Sized> Drop for ScopedRestorePrivilege<'_, A> {
     fn drop(&mut self) {
-        // Sole emergency path: explicit restore_typed() always disarms, so
-        // an armed Drop means the normal path never completed. Exactly one
-        // restoration attempt; emergency_restore() retains fail-stop only on
-        // failure, after recording bounded containment evidence.
+        // Sole emergency path: an armed Drop means the normal path never
+        // completed, or a failed prior-thread-token rebind left the thread
+        // bound to the elevated duplicate. emergency_restore() attempts exact
+        // restoration, retains fail-stop only on failure, and records bounded
+        // containment evidence first. It neither panics nor unwinds across
+        // FFI, so it stays safe during an in-flight unwind.
         if self.armed {
             self.emergency_restore();
         }
