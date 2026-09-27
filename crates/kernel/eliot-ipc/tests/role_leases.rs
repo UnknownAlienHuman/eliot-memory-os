@@ -8,7 +8,7 @@
 //! candidates but rejects implementation mutation unless a separately
 //! issued, explicitly downgraded role context is active.
 
-use eliot_contracts::{EpochId, EpochLineageId};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_ipc::{
     AgentRole, CapabilityContext, DelegatedAuthority, IndependenceDowngrade, ScopeBinding,
     WorkScopePolicy, op,
@@ -45,7 +45,7 @@ fn binding(work_item: Option<&str>, lease_epoch: u64) -> ScopeBinding {
         work_item_id: work_item.map(str::to_owned),
         route: "agent-swarm".to_owned(),
         governance_revision: "gov-r11".to_owned(),
-        authority_epoch: epoch(3),
+        state_fence: StateFence::new(epoch(3), ResourceGeneration::genesis()),
         lease_epoch,
         issued_at_unix_ms: ISSUED,
         expires_at_unix_ms: EXPIRES,
