@@ -408,8 +408,22 @@ pub enum LearningClosureError {
     Malformed { detail: String },
     #[error("closure candidates never carry promotion output")]
     PromotionOutputForbidden,
+    /// No separate authorized owner receipt is referenced. A `SCOPED_UPDATE_PROMOTED`
+    /// disposition is valid only with the receipt it references (I12.24:289),
+    /// and this cell can hold a reference to one but never its content: the
+    /// receipt type and its content comparison are owned by the non-overlapping
+    /// promotion-input cell, which this cell must not depend on
+    /// (`learning-closure.module.toml`: "this agent has no shared write surface
+    /// with promotion-input implementation"). The reference is therefore a
+    /// canonical, digest-bound member of the stored `owner_receipts` group, and
+    /// the external owner re-validates the receipt itself.
     #[error("a separate authorized owner receipt is required for SCOPED_UPDATE_PROMOTED")]
     PromotionReceiptRequired,
+    /// The presented owner-receipt reference is not one of the closure's own
+    /// stored `owner_receipts_and_expiry` refs (I12.24:286), so the disposition
+    /// does not reference a receipt this closure holds.
+    #[error("the referenced owner receipt is not stored on this closure: {reference}")]
+    UnreferencedOwnerReceipt { reference: String },
 }
 
 /// Assemble one evidence-bound closure candidate.
@@ -1598,6 +1612,23 @@ pub enum ClosureDisposition {
 }
 
 impl ClosureDisposition {
+    /// The complete allowed disposition set, in the order I12.24:283-284
+    /// enumerates it. This is the ONE list of allowed values: [`Self::parse`]
+    /// is driven by it, so a name outside this set can never resolve to a
+    /// disposition, and a disposition can never print a name outside it.
+    pub fn allowed() -> &'static [Self] {
+        &[
+            Self::LocalLearningRetained,
+            Self::ReusableCandidateOpened,
+            Self::ScopedUpdatePromoted,
+            Self::NoReusableDelta,
+            Self::Inconclusive,
+            Self::DeferredOutcome,
+            Self::RejectedTransfer,
+            Self::RolledBack,
+        ]
+    }
+
     /// Canonical issue name for this disposition.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1613,16 +1644,27 @@ impl ClosureDisposition {
     }
 
     /// Parse a canonical name or legacy alias into a disposition.
+    ///
+    /// Returns `None` for any name outside [`Self::allowed`], so a consumer
+    /// that presents a closure reference as a bare string gets a refusal
+    /// rather than a defaulted disposition.
     pub fn parse(s: &str) -> Option<Self> {
+        Self::allowed()
+            .iter()
+            .copied()
+            .find(|disposition| disposition.as_str() == s)
+            .or_else(|| Self::legacy_alias(s))
+    }
+
+    /// Pre-issue aliases for the bounded dispositions this module has always
+    /// emitted. Each resolves to a member of [`Self::allowed`]; nothing else
+    /// is accepted.
+    fn legacy_alias(s: &str) -> Option<Self> {
         match s {
-            "LOCAL_LEARNING_RETAINED" | "task-local-retain" => Some(Self::LocalLearningRetained),
-            "REUSABLE_CANDIDATE_OPENED" => Some(Self::ReusableCandidateOpened),
-            "SCOPED_UPDATE_PROMOTED" => Some(Self::ScopedUpdatePromoted),
-            "NO_REUSABLE_DELTA" => Some(Self::NoReusableDelta),
-            "INCONCLUSIVE" | "inconclusive" | "continue-collect" => Some(Self::Inconclusive),
-            "DEFERRED_OUTCOME" | "repeat-review" => Some(Self::DeferredOutcome),
-            "REJECTED_TRANSFER" | "retire-review" => Some(Self::RejectedTransfer),
-            "ROLLED_BACK" => Some(Self::RolledBack),
+            "task-local-retain" => Some(Self::LocalLearningRetained),
+            "inconclusive" | "continue-collect" => Some(Self::Inconclusive),
+            "repeat-review" => Some(Self::DeferredOutcome),
+            "retire-review" => Some(Self::RejectedTransfer),
             _ => None,
         }
     }
@@ -1842,9 +1884,16 @@ fn learning_debt_digest(debt: &LearningDebt) -> String {
 }
 
 /// Canonical evidence reference groups assembled through existing Meta,
-/// Memory OS and Governor paths. Every group is a list of refs; an empty
-/// group names missing evidence via [`evidence_refs_complete`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Memory OS and Governor paths. Every group is a list of refs; a group that
+/// cannot establish completeness names missing evidence via
+/// [`evidence_refs_complete`].
+///
+/// This type deliberately does NOT derive `Default`. A defaulted field
+/// establishes nothing: a closure assembled from eighteen default-empty arrays
+/// would be indistinguishable from one that stored no evidence at all, which
+/// is exactly the lost learning I12.24:291 says silence hides. There is no
+/// way to build this value except by naming every required ref.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClosureEvidenceRefs {
     pub starting_harness_stack: Vec<String>,
     pub final_harness_stack: Vec<String>,
@@ -1892,11 +1941,20 @@ fn evidence_groups(refs: &ClosureEvidenceRefs) -> [(&'static str, &[String]); 18
     ]
 }
 
-/// List every empty evidence group by field name.
+/// List every evidence group that cannot establish completeness, by field name.
+///
+/// A group is incomplete when it is EMPTY, or when any of its refs is blank.
+/// A blank ref names no canonical record, so a group that holds one has not
+/// stored the evidence I12.24:264-287 requires; the group is named instead of
+/// the blank entry being dropped, because dropping it would store an array
+/// that reads as complete and so hides lost learning exactly as silence does.
+///
+/// Repeated refs within a group are not refused here: they are not missing
+/// evidence, and the stored digest already covers order and multiplicity.
 pub fn evidence_refs_complete(refs: &ClosureEvidenceRefs) -> Vec<String> {
     evidence_groups(refs)
         .into_iter()
-        .filter(|(_, group)| group.is_empty())
+        .filter(|(_, group)| group.is_empty() || group.iter().any(|value| value.trim().is_empty()))
         .map(|(name, _)| name.to_string())
         .collect()
 }
@@ -1929,6 +1987,18 @@ fn evidence_refs_digest(refs: &ClosureEvidenceRefs) -> String {
 /// deserializable, so a value read back from storage MUST be checked with
 /// [`CampaignLearningClosure::verify_integrity`], which recomputes the evidence
 /// and record digests from the record's own contents and refuses any mismatch.
+///
+/// `owner_receipt_ref` is `Some` for exactly one disposition,
+/// `SCOPED_UPDATE_PROMOTED`, and `None` for the other seven. It names the
+/// separate authorized owner receipt this disposition references
+/// (I12.24:289) and MUST be a member of the stored `owner_receipts` evidence
+/// group (I12.24:286), so the reference is canonical and covered by
+/// `evidence_digest`. It is a *reference*, never a permit, an activation, or
+/// any mutation of doctrine, policy or harness state: the receipt's content
+/// and its authorization are the external owner's, and the closure never
+/// performs or infers the promotion it records. The bound candidate's own
+/// handoff still carries `active_permit: None` and `promotion_receipt: None`,
+/// which `ExternalHandoff::validate` enforces.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CampaignLearningClosure {
     closure_id: String,
@@ -1937,6 +2007,7 @@ pub struct CampaignLearningClosure {
     candidate: Box<CampaignLearningClosureCandidate>,
     disposition: ClosureDisposition,
     evidence: ClosureEvidenceRefs,
+    owner_receipt_ref: Option<String>,
     evidence_digest: String,
     digest: String,
 }
@@ -1973,8 +2044,19 @@ impl CampaignLearningClosure {
     }
 
     /// The explicit disposition that closes this episode, read-only.
+    ///
+    /// Always a member of [`ClosureDisposition::allowed`]: the field is
+    /// private, so a value outside that set cannot be constructed here, and
+    /// [`Self::verify_integrity`] re-checks the record's disposition against
+    /// the receipt it is allowed to carry.
     pub fn disposition(&self) -> &ClosureDisposition {
         &self.disposition
+    }
+
+    /// The canonical owner-receipt reference this `SCOPED_UPDATE_PROMOTED`
+    /// closure names, or `None` for every other disposition.
+    pub fn owner_receipt_ref(&self) -> Option<&str> {
+        self.owner_receipt_ref.as_deref()
     }
 
     /// The canonical evidence references this closure stores, read-only.
@@ -1996,20 +2078,48 @@ impl CampaignLearningClosure {
     /// Re-derive this record from its own contents and refuse any mismatch.
     ///
     /// This is the readback gate that makes the stored digests load-bearing
-    /// rather than decorative. An empty evidence group is refused with
-    /// [`LearningClosureError::IncompleteCanonicalEvidence`], naming every one
-    /// of them; `SCOPED_UPDATE_PROMOTED` is refused with
-    /// [`LearningClosureError::PromotionReceiptRequired`] because this record
-    /// cannot bind its separate owner receipt. A tampered accepted disposition,
-    /// evidence digest, record digest, id, task binding or fence binding is
-    /// refused with [`LearningClosureError::IntegrityMismatch`].
+    /// rather than decorative. It refuses, in order:
+    ///
+    /// - an evidence group that cannot establish completeness (empty, or
+    ///   holding a blank ref) with
+    ///   [`LearningClosureError::IncompleteCanonicalEvidence`], naming every
+    ///   one of them;
+    /// - a `SCOPED_UPDATE_PROMOTED` record that names no stored owner receipt
+    ///   ([`LearningClosureError::PromotionReceiptRequired`]) or names one this
+    ///   closure does not hold
+    ///   ([`LearningClosureError::UnreferencedOwnerReceipt`]), and any other
+    ///   disposition that names one
+    ///   ([`LearningClosureError::PromotionOutputForbidden`]) — a closure that
+    ///   records no promotion never carries a promotion receipt reference;
+    /// - a tampered evidence digest, record digest, id, task binding, fence
+    ///   binding or owner-receipt reference with
+    ///   [`LearningClosureError::IntegrityMismatch`].
     ///
     /// The bound candidate's own `digest` is recorded, not recomputed here:
     /// re-deriving it needs the four evidence inputs, the prior history and
-    /// the policy, which this record does not store.
+    /// the policy, which this record does not store. The owner receipt's own
+    /// CONTENT is likewise not re-checked here: this cell must not depend on
+    /// the non-overlapping promotion-input cell that owns the receipt type, so
+    /// the external owner re-validates the receipt through that cell's
+    /// content-comparing guard, and this cell only proves the closure
+    /// references a stored one.
     pub fn verify_integrity(&self) -> Result<(), LearningClosureError> {
         if self.disposition == ClosureDisposition::ScopedUpdatePromoted {
-            return Err(LearningClosureError::PromotionReceiptRequired);
+            let Some(reference) = self.owner_receipt_ref.as_deref() else {
+                return Err(LearningClosureError::PromotionReceiptRequired);
+            };
+            if !self
+                .evidence
+                .owner_receipts
+                .iter()
+                .any(|stored| stored.as_str() == reference)
+            {
+                return Err(LearningClosureError::UnreferencedOwnerReceipt {
+                    reference: reference.to_string(),
+                });
+            }
+        } else if self.owner_receipt_ref.is_some() {
+            return Err(LearningClosureError::PromotionOutputForbidden);
         }
         let groups = evidence_refs_complete(&self.evidence);
         if !groups.is_empty() {
@@ -2027,6 +2137,7 @@ impl CampaignLearningClosure {
             &self.state_fence_ref,
             self.disposition,
             &evidence_digest,
+            self.owner_receipt_ref.as_deref(),
         );
         if digest != self.digest {
             return Err(LearningClosureError::IntegrityMismatch { field: "digest" });
@@ -2055,24 +2166,53 @@ pub enum ClosureRecordAssembly {
     Disposition(LearningClosureDisposition),
 }
 
-/// Caller-supplied closure decision and its canonical evidence references.
+/// Caller-supplied closure decision, its canonical evidence references, and the
+/// separate authorized owner receipt a `SCOPED_UPDATE_PROMOTED` closure must
+/// reference.
+///
+/// `owner_receipt_ref` is a reference, not a receipt: it must be one of the
+/// refs this closure stores in `canonical_evidence_refs.owner_receipts`
+/// (I12.24:286), so the promotion claim is anchored in digest-bound canonical
+/// evidence. It is `None` for the seven dispositions that record no promotion,
+/// and presenting one alongside any of them is refused with
+/// [`LearningClosureError::PromotionOutputForbidden`].
 pub struct ClosureCompletion {
     pub disposition: ClosureDisposition,
     pub canonical_evidence_refs: ClosureEvidenceRefs,
+    pub owner_receipt_ref: Option<String>,
 }
 
 /// Assemble the durable closure record with the canonical evidence it stores.
 ///
 /// The same six typed evidence inputs and the same pure decision core as
 /// [`assemble_campaign_learning_closure`], plus the canonical evidence reference
-/// groups the closure is required to store and exactly one typed disposition,
-/// supplied together as [`ClosureCompletion`].
-/// `ScopedUpdatePromoted` is refused until the record can bind the separate
-/// authorized owner receipt it requires. This entry refuses to produce a
-/// closure whose evidence is incomplete: every empty group is named in
-/// [`LearningClosureError::IncompleteCanonicalEvidence`] instead of being
-/// dropped, because an unnamed empty group hides lost learning exactly as
-/// silence does.
+/// groups the closure is required to store, exactly one disposition from
+/// [`ClosureDisposition::allowed`], and — for `SCOPED_UPDATE_PROMOTED` only —
+/// the reference to the separate authorized owner receipt, supplied together as
+/// [`ClosureCompletion`].
+///
+/// Two refusals are load-bearing here:
+///
+/// - **Incomplete evidence is refused, never defaulted.** Every group that is
+///   empty or that holds a blank ref is named in
+///   [`LearningClosureError::IncompleteCanonicalEvidence`] before anything is
+///   digested or minted, because an unnamed empty group hides lost learning
+///   exactly as silence does (I12.24:291), and a blank ref names no canonical
+///   record at all.
+/// - **A promotion claim must reference an owner receipt this closure holds.**
+///   I12.24:289 — "`SCOPED_UPDATE_PROMOTED` is valid only with the separate
+///   authorized owner receipt it references" — is enforced here as a
+///   reference check: no reference is
+///   [`LearningClosureError::PromotionReceiptRequired`], and a reference this
+///   closure does not store is
+///   [`LearningClosureError::UnreferencedOwnerReceipt`]. The receipt's content
+///   and its authorization belong to the non-overlapping promotion-input cell,
+///   which owns the receipt type and its content comparison; this cell may
+///   not depend on it, and inventing a second copy of that comparison here is
+///   exactly what the module boundary forbids. Recording the disposition still
+///   performs nothing: the bound candidate's handoff keeps
+///   `active_permit`/`promotion_receipt` as `None`, so no global doctrine,
+///   policy or harness state is reachable from here.
 ///
 /// Returns [`ClosureRecordAssembly::Closed`] with the evidence stored on the
 /// record and bound into both `evidence_digest` and the record `digest`, or the
@@ -2089,15 +2229,33 @@ pub fn assemble_campaign_learning_closure_with_evidence(
     let ClosureCompletion {
         disposition,
         canonical_evidence_refs,
+        owner_receipt_ref,
     } = completion;
-    if disposition == ClosureDisposition::ScopedUpdatePromoted {
-        return Err(LearningClosureError::PromotionReceiptRequired);
+    // A closure that records no promotion must not carry a promotion receipt
+    // reference. This is decided before the digest is computed, so a stray
+    // reference can never influence the stored digest even transiently.
+    if disposition != ClosureDisposition::ScopedUpdatePromoted && owner_receipt_ref.is_some() {
+        return Err(LearningClosureError::PromotionOutputForbidden);
     }
     let missing_groups = evidence_refs_complete(&canonical_evidence_refs);
     if !missing_groups.is_empty() {
         return Err(LearningClosureError::IncompleteCanonicalEvidence {
             groups: missing_groups,
         });
+    }
+    if disposition == ClosureDisposition::ScopedUpdatePromoted {
+        let Some(reference) = owner_receipt_ref.as_deref() else {
+            return Err(LearningClosureError::PromotionReceiptRequired);
+        };
+        if !canonical_evidence_refs
+            .owner_receipts
+            .iter()
+            .any(|stored| stored.as_str() == reference)
+        {
+            return Err(LearningClosureError::UnreferencedOwnerReceipt {
+                reference: reference.to_string(),
+            });
+        }
     }
     let task_id = exact_campaign_and_target.task_id.clone();
     let state_fence_ref = exact_campaign_and_target.fence_ref.clone();
@@ -2121,6 +2279,7 @@ pub fn assemble_campaign_learning_closure_with_evidence(
         &state_fence_ref,
         disposition,
         &evidence_digest,
+        owner_receipt_ref.as_deref(),
     );
     Ok(ClosureRecordAssembly::Closed(Box::new(
         CampaignLearningClosure {
@@ -2130,6 +2289,7 @@ pub fn assemble_campaign_learning_closure_with_evidence(
             candidate,
             disposition,
             evidence: canonical_evidence_refs,
+            owner_receipt_ref,
             evidence_digest,
             digest,
         },
@@ -2138,15 +2298,17 @@ pub fn assemble_campaign_learning_closure_with_evidence(
 
 /// Full closure-record digest: the candidate digest (already bound to the four
 /// evidence inputs, prior history and policy), the task and State Fence
-/// binding, the explicit disposition, and the stored canonical evidence
-/// references. Removing or changing any load-bearing group, ref, task, fence or
-/// disposition changes it.
+/// binding, the explicit disposition, the stored canonical evidence
+/// references, and the referenced owner receipt when the disposition records a
+/// promotion. Removing or changing any load-bearing group, ref, task, fence,
+/// disposition or receipt reference changes it.
 fn closure_record_digest(
     candidate: &CampaignLearningClosureCandidate,
     task_id: &str,
     state_fence_ref: &str,
     disposition: ClosureDisposition,
     evidence_digest: &str,
+    owner_receipt_ref: Option<&str>,
 ) -> String {
     let mut hasher = Hasher::new();
     field(&mut hasher, &candidate.candidate_id);
@@ -2157,6 +2319,13 @@ fn closure_record_digest(
     field(&mut hasher, state_fence_ref);
     field(&mut hasher, disposition.as_str());
     field(&mut hasher, evidence_digest);
+    match owner_receipt_ref {
+        Some(reference) => {
+            field(&mut hasher, "owner-receipt-ref");
+            field(&mut hasher, reference);
+        }
+        None => field(&mut hasher, "no-owner-receipt-ref"),
+    }
     hasher.finalize().to_hex().to_string()
 }
 
