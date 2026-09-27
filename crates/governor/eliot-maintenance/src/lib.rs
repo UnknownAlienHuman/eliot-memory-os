@@ -23,8 +23,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod end_of_activity;
 mod improvement_admission;
 pub mod improvement_pipeline;
+
+pub use end_of_activity::{
+    ActivationScopeReference, AssessmentRecordReference, AssessmentSourceCoverage,
+    AssessmentSourceGap, AssessmentSourceRecord, AssessmentSourceSnapshot, ClosedActivityReference,
+    END_OF_ACTIVITY_ASSESSMENT_CONTRACT_NAME, END_OF_ACTIVITY_ASSESSMENT_VERSION,
+    EligibleServiceSafeRoute, EndOfActivityAssessmentDecision, EndOfActivityMaintenanceAssessment,
+    EndOfActivityMaintenanceAssessmentOutcome, EndOfActivityMaintenanceAssessmentRequest,
+    EndOfActivityMaintenanceAssessmentValidationError, MaintenanceDebtReference,
+    MaintenanceDuePolicyReference, UserSessionRequiredWorkReference,
+    end_of_activity_assessment_contract_identity,
+};
 
 pub use improvement_admission::{
     IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE, IMPROVEMENT_PROMOTION_MODULE,
