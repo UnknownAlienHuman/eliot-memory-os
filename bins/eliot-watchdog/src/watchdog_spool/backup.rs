@@ -416,15 +416,32 @@ pub struct WatchdogSpoolFence {
     /// Exact retained member and marker denominator.
     denominator: SpoolCoverageDenominator,
     /// Independently published per-channel coverage of the interval this
-    /// capture was taken in, or `None` when this owner had not closed an
-    /// interval before the capture.
+    /// owner closed **most recently** at the moment of the capture, or `None`
+    /// when no interval is available to carry: none has been closed yet, or a
+    /// supervision tick has one open.
     ///
-    /// This is a second, independent coverage dimension and never a
-    /// replacement for [`Self::denominator`]: the denominator is the exact
-    /// retained-record count and its marker subset, while this is what the
-    /// I8.2 sensor map says was actually observed per channel. Both are
-    /// required for a full-coverage claim, and `None` is unknown coverage,
-    /// never complete coverage.
+    /// This is deliberately not "the interval this capture was taken in". The
+    /// capture covers the retained spool window, whose newest observation is
+    /// the capture anchor; the report covers one supervision tick, which is a
+    /// different and earlier window. One published interval is exactly one
+    /// tick, so the retained report is at most one tick older than the
+    /// capture, and it is retained as the owner's own last coverage
+    /// publication rather than as evidence about the captured window.
+    ///
+    /// It is always an interval that reached its own close. A window a tick
+    /// opened and did not finish is reported to the operator as a named
+    /// `INTERVAL_NOT_CLOSED` omission and is never stored as this owner's last
+    /// publication, so a capture can neither carry it nor read its absence as
+    /// anything but unknown coverage.
+    ///
+    /// It is a second, independent coverage dimension and never a replacement
+    /// for [`Self::denominator`]: the denominator is the exact retained-record
+    /// count and its marker subset, while this is what the I8.2 sensor map
+    /// says was actually observed per channel. The two are validated
+    /// independently and the conjunction this crate performs is in
+    /// `WatchdogComposition::readiness`, which gates
+    /// `WatchdogReadiness::coverage_claimed` on the report the same cell
+    /// published. `None` is unknown coverage, never complete coverage.
     channel_coverage: Option<IntervalCoverageReport>,
     /// Source installation the capture was taken from.
     pub source_installation: String,
@@ -491,26 +508,11 @@ impl WatchdogSpoolFence {
         &self.denominator
     }
 
-    /// Returns the independently published per-channel coverage of this
-    /// capture's interval, when this owner had closed one.
+    /// Returns the independently published per-channel coverage this owner
+    /// last closed before the capture, when it had closed one.
     #[must_use]
     pub(crate) const fn channel_coverage(&self) -> Option<&IntervalCoverageReport> {
         self.channel_coverage.as_ref()
-    }
-
-    /// Whether this fence may be published as fully covered.
-    ///
-    /// The conjunction of the two independent dimensions: the retained-record
-    /// denominator is complete **and** every I8.2 channel was observed
-    /// `CONTINUOUS`. A complete denominator over heartbeats alone therefore
-    /// cannot publish a full-coverage claim while a required channel is blind,
-    /// and an absent channel-coverage report is `false` rather than permissive.
-    #[must_use]
-    pub fn full_coverage_claimed(&self) -> bool {
-        self.denominator.complete
-            && self
-                .channel_coverage()
-                .is_some_and(IntervalCoverageReport::full_coverage_claimed)
     }
 
     /// Re-validates this fence against the evidence it actually holds.
@@ -557,7 +559,7 @@ impl WatchdogSpoolFence {
         self.validate_entries()?;
         self.validate_windows()?;
         self.validate_content()?;
-        if let Some(report) = &self.channel_coverage {
+        if let Some(report) = self.channel_coverage() {
             report.validate()?;
         }
         Ok(())
@@ -1259,7 +1261,8 @@ fn check_capture_params(params: &CaptureFenceParams) -> Result<(), SpoolError> {
 /// interval has been closed yet. It is retained beside the denominator rather
 /// than folded into it: the denominator is the exact retained-record count and
 /// its marker subset, the channel coverage is what the sensor map says was
-/// observed, and `WatchdogSpoolFence::full_coverage_claimed` requires both. A
+/// observed, and the full-coverage conjunction this crate performs is in
+/// `WatchdogComposition::readiness`. A
 /// supplied report is re-validated here and again on every later read, so a
 /// disposition that was not derived from the evidence it carries cannot reach
 /// a reader. The channel coverage is deliberately **not** part of the content
@@ -1278,10 +1281,45 @@ fn check_capture_params(params: &CaptureFenceParams) -> Result<(), SpoolError> {
 /// validation, the entry set is empty, or any entry is expired, missing,
 /// duplicated, conflicting, or malformed. Returns [`SpoolError::Corrupt`]
 /// when a caller binding is unusable or claims canonical/ORS coherence
-/// without exact fence equality, or when a supplied channel-coverage report is
-/// not consistent with the sensor map and its own observed classes. Returns
-/// [`SpoolError::Serialization`] when canonical encoding fails.
+/// without exact fence equality. Returns [`SpoolError::Serialization`] when
+/// canonical encoding fails.
+///
+/// A capture with no channel-coverage report is a complete capture of the
+/// retained-record dimension alone. The four-argument signature is preserved
+/// for exactly that case; the owner that observes I8.2 channels calls
+/// `capture_fence_with_channel_coverage` in this module, which is crate-visible
+/// rather than re-exported because only this crate's own owner-bound port has a
+/// report to supply.
 pub fn capture_fence(
+    header: &WatchdogSpoolHeader,
+    entries: &[WatchdogSpoolEntry],
+    high_water: u64,
+    params: &CaptureFenceParams,
+) -> Result<WatchdogSpoolFence, SpoolError> {
+    capture_fence_with_channel_coverage(header, entries, high_water, params, None)
+}
+
+/// Captures one bounded coherent fence together with this owner's published
+/// I8.2 channel coverage.
+///
+/// Identical to [`capture_fence`] in every retained-record respect. The
+/// supplied report is the second, independent coverage dimension and never a
+/// replacement for the denominator: the denominator is the exact retained-record
+/// count and its marker subset, the report is what the sensor map says was
+/// observed, and the two are validated independently. `None` is retained as
+/// unknown coverage, never as complete coverage.
+///
+/// The channel coverage is deliberately **not** part of the content digest,
+/// which stays derived from the retained entries alone. It is re-validated here
+/// and again on every later page read, so a disposition that was not derived
+/// from the evidence it carries cannot reach a reader.
+///
+/// # Errors
+///
+/// Returns [`SpoolError::Corrupt`] under every condition [`capture_fence`]
+/// documents, plus [`SpoolError::Corrupt`] when the supplied channel-coverage
+/// report is not consistent with the sensor map and its own observed classes.
+pub fn capture_fence_with_channel_coverage(
     header: &WatchdogSpoolHeader,
     entries: &[WatchdogSpoolEntry],
     high_water: u64,

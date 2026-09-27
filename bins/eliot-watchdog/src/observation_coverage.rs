@@ -7,8 +7,10 @@
 //! The two concerns share one file because they are two halves of a single
 //! claim. [`SENSOR_CHANNEL_MAP`] states, per I8.2 channel, the exact target and
 //! `WorkScope`, the competent source, the observation classes that source can
-//! support, the live/replay mechanism, the platform privilege profile, the
-//! declared bound, the coverage limitation, and — from the measured runtime
+//! support, the live/replay mechanism, the platform privilege profile, the bound
+//! on that channel's live evidence inside one published interval (which is
+//! derived from those same classes rather than chosen beside them), the coverage
+//! limitation, and — from the measured runtime
 //! callers of this crate — whether the channel is already wired or still a
 //! missing adapter. [`IntervalCoverageReport`] then publishes what this owner
 //! actually observed for one interval, per channel, and derives each
@@ -16,11 +18,25 @@
 //! recorded. A disposition is never supplied by a caller.
 //!
 //! `CONTINUOUS` is therefore reachable only for a channel the map says is
-//! wired, only for the interval actually observed live, and only when every
-//! class the map supports for that channel was returned. `BLIND` is the
-//! measured known absence of a competent source (a missing adapter); `UNKNOWN`
-//! is a channel whose competent source exists but produced no establishable
-//! sample this interval; `PARTIAL` is a live sample missing a supported class.
+//! wired, only for an interval that reached its own close, and only when every
+//! class the map supports for that channel was returned and none of this
+//! owner's offers for it had to be dropped. `BLIND` is the measured known
+//! absence of a competent source (a missing adapter); `UNKNOWN` is a wired
+//! channel whose coverage of the interval cannot be established, either because
+//! it produced no establishable sample or because the interval it belongs to
+//! never closed; `PARTIAL` is a wired channel with an establishable live sample
+//! that does not account for its whole supported class set, because a supported
+//! class was not returned or because a repeat of a class the interval already
+//! held had to be dropped.
+//!
+//! One published interval is exactly one supervision tick, opened at the top of
+//! the tick and closed at its end, so a sample is never carried across a window
+//! it did not cover. A tick that opens an interval and does not reach its close —
+//! an admission refusal or a lost Host cuts it short — does not have that
+//! interval silently replaced: [`IntervalCoverageCell::begin_interval`] publishes
+//! the abandoned window as a named `INTERVAL_NOT_CLOSED` omission. A skipped
+//! tick is therefore a recorded gap, never a silently discarded publisher and
+//! never a reset interval reported as full coverage.
 //!
 //! I8.2 names a fifth disposition, `JOURNAL_REPLAYED`, for a completely
 //! replayed supported interval. It is deliberately **absent** here: this crate
@@ -34,7 +50,8 @@
 //! Three dimensions stay separate by construction: the per-channel
 //! [`CoverageDisposition`] is the observation mode; the spool's
 //! [`crate::SpoolCoverageDenominator`] is the retained-record denominator, and
-//! the fence's `full_coverage_claimed` requires **both**; the health result
+//! `WatchdogComposition::readiness` claims coverage only when a closed
+//! interval has every channel `CONTINUOUS`; the health result
 //! (absent, PID reuse, image substitution, kernel gap) stays in the existing
 //! `HostObservationState` / `GapRecoveryReason` path and is never folded into a
 //! disposition. A live sample of an unhealthy subject is `CONTINUOUS` coverage
@@ -54,7 +71,7 @@ use crate::SpoolError;
 /// the channel set, the class set, or the record shape increments it, and a
 /// fence whose retained report carries a different revision fails
 /// re-validation instead of being read under the newer meaning.
-pub const SENSOR_MAP_REVISION: u16 = 1;
+pub const SENSOR_MAP_REVISION: u16 = 2;
 
 /// One of the eleven Windows sensors I8.2 enumerates.
 ///
@@ -149,15 +166,17 @@ impl ObservationChannel {
 ///
 /// A class absent from a channel's `supported_classes` cannot be claimed for
 /// that channel at all: the publisher only records classes the map supports,
-/// and the fence re-derivation refuses a record carrying any other.
+/// and the fence re-derivation refuses a record carrying any other. A class this
+/// owner has no source for is absent from the vocabulary entirely rather than
+/// carried as a value nothing can produce: I8.2's process **exit code** has no
+/// retained source in this owner (the channel below observes process identity
+/// only), so there is no exit-identity class to carry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationClass {
     /// Current SCM service state read back from the service itself.
     ServiceState,
     /// PID plus creation time plus image path of an open process handle.
     ProcessIdentity,
-    /// Retained exit code of an exited process.
-    ExitIdentity,
     /// Job Object membership and resource counters.
     ResourceCounter,
     /// A pipe endpoint was reachable.
@@ -170,7 +189,13 @@ pub enum ObservationClass {
     ArtifactDigest,
     /// A service registration/config identity readback.
     ConfigIdentity,
-    /// The Kernel fence answered a live heartbeat.
+    /// The Kernel fence read was accepted and the Watchdog recorded the
+    /// heartbeat in its own spool.
+    ///
+    /// Nothing on the far side "answers" this: the source appends a heartbeat
+    /// record to the Watchdog's own physically separate spool, and the
+    /// acceptance this class reports is that append, not a reply from the
+    /// Kernel. A refused append is not this class at all.
     Liveness,
     /// An approved read-only store probe answered.
     ReadOnlyProbe,
@@ -189,7 +214,6 @@ impl ObservationClass {
         match self {
             Self::ServiceState => "service_state",
             Self::ProcessIdentity => "process_identity",
-            Self::ExitIdentity => "exit_identity",
             Self::ResourceCounter => "resource_counter",
             Self::PipePresence => "pipe_presence",
             Self::AuthenticatedPeer => "authenticated_peer",
@@ -232,19 +256,6 @@ pub enum PlatformPrivilegeProfile {
     HostAdministrator,
 }
 
-/// Declared bound on one channel's evidence inside one published interval.
-///
-/// The bounded supervision tick performs at most one read per channel per
-/// interval, and a journal page is one bounded page per wake, so the declared
-/// ceiling is one observation of the channel per interval for every channel.
-/// A channel with no wired adapter observes zero and is bounded by that fact,
-/// not by a larger allowance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ChannelBounds {
-    /// Maximum observations of this channel one published interval may carry.
-    pub max_observations_per_interval: u32,
-}
-
 /// Measured wiring state of one channel in this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelWiring {
@@ -284,8 +295,6 @@ pub struct ChannelCapability {
     pub mechanism: SensorMechanism,
     /// The Windows security profile the source runs under.
     pub privilege_profile: PlatformPrivilegeProfile,
-    /// Declared bound on this channel's evidence per interval.
-    pub bounds: ChannelBounds,
     /// What this channel still cannot establish, verbatim.
     pub coverage_limitation: &'static str,
     /// Measured wiring state from this crate's actual runtime callers.
@@ -293,6 +302,24 @@ pub struct ChannelCapability {
 }
 
 impl ChannelCapability {
+    /// The bound on this channel's live evidence inside one published
+    /// interval.
+    ///
+    /// Not a chosen number, and deliberately not a per-channel budget: it is
+    /// exactly `supported_classes.len()`. One published interval is exactly
+    /// one tick of the owner's existing `WatchdogConfig::tick_interval`
+    /// cadence, the tick performs at most one read per channel, and a channel
+    /// contributes precisely the classes that one read returned. That is where
+    /// the observation **rate** is bounded, and it is a rate, not a class
+    /// budget — so no class the read did return is ever dropped for being over
+    /// budget, and a channel can reach `CONTINUOUS` as soon as its adapter
+    /// lands. A budget chosen independently here would silently discard evidence
+    /// and would keep binding after the adapter it excludes exists.
+    #[must_use]
+    pub const fn max_observations_per_interval(&self) -> usize {
+        self.supported_classes.len()
+    }
+
     /// True for every I8.2 channel: each one is required for a full-coverage
     /// claim.
     ///
@@ -326,9 +353,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::ServiceState],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "Only the approved Host registration is read. No other ELIOT \
              service is observed, and `Starting`/`Stopping` are classified `Unknown`, never \
              absence.",
@@ -348,12 +372,9 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::ProcessIdentity],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
-        coverage_limitation: "The exit code is not retained, so `ExitIdentity` is absent from the \
-             supported classes and can never be claimed. No `eliotd` process identity is \
-             observed by this owner.",
+        coverage_limitation: "The exit code is not retained by any source in this owner, so no \
+             exit-identity observation class exists here to support and exit identity can never \
+             be claimed. No `eliotd` process identity is observed by this owner.",
         wiring: ChannelWiring::Wired {
             runtime_caller: "watchdog_composition::WatchdogComposition::start_with_shutdown_and_host_and_heartbeat \
                  -> host_identity_observation::LiveHostObservationSource::observe",
@@ -368,9 +389,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::ResourceCounter],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::HostAdministrator,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "No membership or counter is observed, so this interval is blind for \
              the Job branch. The Watchdog holds no Job handle and gains none.",
         wiring: ChannelWiring::MissingAdapter {
@@ -391,9 +409,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         ],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "The fence write in `heartbeat_transport` is this owner producing a \
              heartbeat, not an independent observation of a peer, and it authenticates no peer. \
              `HostIdentityMonitor::observe_identity` is the only peer-binding entry point here and \
@@ -412,9 +427,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::PathChange],
         mechanism: SensorMechanism::JournalReplay,
         privilege_profile: PlatformPrivilegeProfile::HostAdministrator,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "No journal source, cursor, page, or replay exists in this owner, so \
              file-change coverage is blind and the replay half of I8.2's coverage vocabulary is \
              unreachable.",
@@ -435,9 +447,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         ],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "The approved Host image path identity is verified through a \
              `ProtectedPathLease`, but no artifact or configuration hash is computed or recorded, \
              so neither supported class is actually produced and this interval is blind.",
@@ -455,9 +464,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::ReadOnlyProbe],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::HostAdministrator,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "No store probe exists, so the canonical-store branch is blind. This \
              owner correctly holds no SurrealDB SDK, database credential, raw SQL, or \
              database-file access, and gains none to close this gap.",
@@ -476,9 +482,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::Liveness],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "Liveness only. A live answer is never upgraded to semantic or \
              application readiness, and a refused answer is a health gap, not a coverage loss.",
         wiring: ChannelWiring::Wired {
@@ -494,9 +497,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::EventCadence],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "No cadence sample is taken, so hook/intent coverage is blind. A \
              complete file-change replay could not close it either: file changes are event \
              evidence, not tool intent.",
@@ -512,9 +512,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::ListenerBinding],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "No listener is inventoried, so this interval is blind.",
         wiring: ChannelWiring::MissingAdapter {
             reason: "`git grep -n 'TcpListener\\|tcp_listener' -- bins/eliot-watchdog/src` has no \
@@ -530,9 +527,6 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         supported_classes: &[ObservationClass::AuditSignal],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        bounds: ChannelBounds {
-            max_observations_per_interval: 1,
-        },
         coverage_limitation: "No security signal is read. This owner's own event-log diagnostic \
              sink is a typed refusal, so the channel is blind rather than silently empty. The \
              service security-descriptor digests computed at registration are configuration, not \
@@ -619,6 +613,13 @@ pub struct ChannelIntervalCoverage {
     expected_classes: &'static [ObservationClass],
     observed_classes: Vec<ObservationClass>,
     observed_replayed_observations: u32,
+    dropped_samples: u32,
+    /// Whether the tick that opened this interval reached its close.
+    ///
+    /// The samples in an unclosed interval really were taken live inside its
+    /// window, but the window never got an end of its own, so nothing here can
+    /// be a claim about a declared interval.
+    interval_closed: bool,
     disposition: CoverageDisposition,
     gaps: Vec<CoverageGap>,
 }
@@ -657,6 +658,27 @@ impl ChannelIntervalCoverage {
         self.observed_replayed_observations
     }
 
+    /// Live samples this owner offered for this channel and then dropped
+    /// because the interval already held them.
+    ///
+    /// Never silently zero when something was dropped: a non-zero value forces
+    /// a named gap and a disposition below `CONTINUOUS`, so discarded evidence
+    /// is visible in the publication instead of vanishing.
+    #[must_use]
+    pub const fn dropped_samples(&self) -> u32 {
+        self.dropped_samples
+    }
+
+    /// Whether the supervision tick that opened this interval reached its close.
+    ///
+    /// `false` for an interval a tick opened and did not finish: the samples in
+    /// it are real but the window has no declared end, so this record names
+    /// `INTERVAL_NOT_CLOSED` and is `UNKNOWN` rather than coverage of anything.
+    #[must_use]
+    pub const fn interval_closed(&self) -> bool {
+        self.interval_closed
+    }
+
     /// The observation mode of this channel over this interval.
     #[must_use]
     pub const fn disposition(&self) -> CoverageDisposition {
@@ -672,12 +694,15 @@ impl ChannelIntervalCoverage {
     /// Derives the disposition this record must carry.
     ///
     /// This is the single rule the publisher and the fence re-validation share,
-    /// so a record whose stored disposition disagrees with its own samples and
-    /// the map is corrupt rather than a stronger claim.
+    /// so a record whose stored disposition disagrees with its own samples, its
+    /// own interval-close state, and the map is corrupt rather than a stronger
+    /// claim.
     fn derive_disposition(
         capability: &ChannelCapability,
         observed: &[ObservationClass],
         observed_replayed: u32,
+        dropped_samples: u32,
+        interval_closed: bool,
     ) -> (CoverageDisposition, Vec<CoverageGap>) {
         let mut gaps = Vec::new();
         if observed_replayed > 0 {
@@ -694,12 +719,31 @@ impl ChannelIntervalCoverage {
             });
             return (CoverageDisposition::Blind, gaps);
         }
+        // A blind channel keeps its measured truth above; for a wired one, an
+        // interval the tick never closed is checked before its samples, because
+        // the samples are only evidence of a window that never got a declared
+        // end. `end_ms` here is the instant the next tick observed the
+        // omission, not a close the abandoned tick performed.
+        if !interval_closed {
+            gaps.push(CoverageGap {
+                channel: capability.channel,
+                reason: "INTERVAL_NOT_CLOSED",
+            });
+            return (CoverageDisposition::Unknown, gaps);
+        }
         if observed.is_empty() {
             gaps.push(CoverageGap {
                 channel: capability.channel,
                 reason: "NO_ESTABLISHABLE_SAMPLE",
             });
             return (CoverageDisposition::Unknown, gaps);
+        }
+        if dropped_samples > 0 {
+            gaps.push(CoverageGap {
+                channel: capability.channel,
+                reason: "SAMPLE_DROPPED",
+            });
+            return (CoverageDisposition::Partial, gaps);
         }
         if observed.len() < capability.supported_classes.len() {
             gaps.push(CoverageGap {
@@ -730,26 +774,41 @@ impl IntervalCoverageReport {
     /// Publishes the coverage of `interval` for every I8.2 channel.
     ///
     /// `observed` is indexed by [`ObservationChannel`] order and holds the
-    /// classes the bounded tick recorded live for that channel. The record set
-    /// is always exactly one record per I8.2 channel, in map order, so an
-    /// unobserved channel is a named gap rather than a missing term.
+    /// classes the bounded tick recorded live for that channel;
+    /// `dropped_samples` is indexed the same way and counts the offers that
+    /// channel lost. `interval_closed` is `false` for a window a tick opened and
+    /// did not finish; that window is reported as a named omission on every
+    /// wired channel instead of being discarded. The record set is always
+    /// exactly one record per I8.2 channel, in map order, so an unobserved
+    /// channel is a named gap rather than a missing term.
     #[must_use]
     pub fn publish(
         interval: CoverageInterval,
         observed: &[Vec<ObservationClass>; ObservationChannel::COUNT],
+        dropped_samples: &[u32; ObservationChannel::COUNT],
+        interval_closed: bool,
     ) -> Self {
         let records = SENSOR_CHANNEL_MAP
             .iter()
             .map(|capability| {
-                let classes = &observed[capability.channel.index()];
-                let (disposition, gaps) =
-                    ChannelIntervalCoverage::derive_disposition(capability, classes, 0);
+                let index = capability.channel.index();
+                let classes = &observed[index];
+                let dropped = dropped_samples[index];
+                let (disposition, gaps) = ChannelIntervalCoverage::derive_disposition(
+                    capability,
+                    classes,
+                    0,
+                    dropped,
+                    interval_closed,
+                );
                 ChannelIntervalCoverage {
                     channel: capability.channel,
                     expected_source: capability.competent_source,
                     expected_classes: capability.supported_classes,
                     observed_classes: classes.clone(),
                     observed_replayed_observations: 0,
+                    dropped_samples: dropped,
+                    interval_closed,
                     disposition,
                     gaps,
                 }
@@ -778,16 +837,6 @@ impl IntervalCoverageReport {
     #[must_use]
     pub fn records(&self) -> &[ChannelIntervalCoverage] {
         &self.records
-    }
-
-    /// Returns the record of one channel.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `channel` is not an I8.2 channel.
-    #[must_use]
-    pub fn record(&self, channel: ObservationChannel) -> &ChannelIntervalCoverage {
-        &self.records[channel.index()]
     }
 
     /// The channels that keep this interval short of full coverage.
@@ -819,8 +868,9 @@ impl IntervalCoverageReport {
 
     /// True when the report is internally consistent.
     ///
-    /// Re-derives every record from the map and the record's own samples, so a
-    /// stored disposition that disagrees with its evidence is not valid.
+    /// Re-derives every record from the map, the record's own samples, and the
+    /// record's own interval-close state, so a stored disposition that
+    /// disagrees with its evidence is not valid.
     #[must_use]
     pub fn valid(&self) -> bool {
         if self.sensor_map_revision != SENSOR_MAP_REVISION
@@ -834,14 +884,17 @@ impl IntervalCoverageReport {
                 return false;
             }
             let capability = channel_capability(record.channel);
-            if record.observed_replayed_observations
-                > capability.bounds.max_observations_per_interval
-                || record.observed_classes.len()
-                    > capability.bounds.max_observations_per_interval as usize
-                || record
-                    .observed_classes
-                    .iter()
-                    .any(|class| !capability.supports(*class))
+            // Every recorded class must be one the map supports, and no class
+            // may appear twice: a duplicate is the one thing a record set can
+            // carry that the tick never produced, and `SAMPLE_DROPPED` is how
+            // a dropped offer is accounted for instead.
+            if record
+                .observed_classes
+                .iter()
+                .enumerate()
+                .any(|(index, class)| {
+                    !capability.supports(*class) || record.observed_classes[..index].contains(class)
+                })
             {
                 return false;
             }
@@ -849,6 +902,8 @@ impl IntervalCoverageReport {
                 capability,
                 &record.observed_classes,
                 record.observed_replayed_observations,
+                record.dropped_samples,
+                record.interval_closed,
             );
             record.disposition == disposition && record.gaps == gaps
         })
@@ -873,11 +928,49 @@ impl IntervalCoverageReport {
     }
 }
 
+/// What one offered live sample did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordOutcome {
+    /// The class was recorded for this channel in this interval.
+    Recorded,
+    /// The class was already recorded in this interval, so the repeat was
+    /// dropped. The channel's record carries a `SAMPLE_DROPPED` gap and cannot
+    /// reach `CONTINUOUS`.
+    DroppedDuplicate,
+    /// The map does not support this class for this channel, so the offer is
+    /// not evidence for this channel and was not recorded.
+    UnsupportedClass,
+    /// The offer was not kept: no interval was open to record it into, or the
+    /// cell's lock is poisoned. Neither cause leaves a window that could hold
+    /// it, so nothing about the channel is claimed.
+    NotRecorded,
+}
+
+impl RecordOutcome {
+    /// Returns the stable wire name of this outcome.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::DroppedDuplicate => "dropped_duplicate",
+            Self::UnsupportedClass => "unsupported_class",
+            Self::NotRecorded => "not_recorded",
+        }
+    }
+}
+
 /// Accumulates one open interval's live samples, per channel.
+///
+/// One publisher holds exactly one supervision tick. The cell opens a fresh
+/// publisher at the start of every tick and closes it at the end, so a sample
+/// can never be carried across a window it did not cover; a tick that does not
+/// reach its close hands the publisher to
+/// [`record_unclosed`](Self::record_unclosed) instead of dropping it.
 #[derive(Clone, Debug)]
 pub struct IntervalCoveragePublisher {
     start_ms: u64,
     observed: [Vec<ObservationClass>; ObservationChannel::COUNT],
+    dropped_samples: [u32; ObservationChannel::COUNT],
 }
 
 impl IntervalCoveragePublisher {
@@ -887,42 +980,82 @@ impl IntervalCoveragePublisher {
         Self {
             start_ms,
             observed: std::array::from_fn(|_| Vec::new()),
+            dropped_samples: [0; ObservationChannel::COUNT],
         }
     }
 
-    /// Records one live observation class for one channel.
+    /// Records one offered live observation class for one channel.
     ///
-    /// A class the map does not support for that channel is not recorded: it
+    /// A class the map does not support for this channel is not recorded: it
     /// cannot be claimed, so accepting it would let a sample inflate a
-    /// disposition it never earned. Recording the same class twice in one
-    /// interval is likewise ignored, which is what keeps the observation count
-    /// inside the channel's declared bound.
-    pub fn record(&mut self, channel: ObservationChannel, class: ObservationClass) {
+    /// disposition it never earned. A repeat of a class the interval already
+    /// holds is dropped, and the drop is counted so the published record
+    /// carries a `SAMPLE_DROPPED` gap — evidence that was discarded leaves a
+    /// named gap rather than vanishing. The bound is
+    /// [`ChannelCapability::max_observations_per_interval`], which is the
+    /// channel's own `supported_classes` length, so no class the read returned
+    /// is ever dropped for being over budget.
+    pub fn record(
+        &mut self,
+        channel: ObservationChannel,
+        class: ObservationClass,
+    ) -> RecordOutcome {
         let capability = channel_capability(channel);
         if !capability.supports(class) {
-            return;
+            return RecordOutcome::UnsupportedClass;
         }
-        let classes = &mut self.observed[channel.index()];
-        if classes.contains(&class)
-            || classes.len() >= capability.bounds.max_observations_per_interval as usize
-        {
-            return;
+        let index = channel.index();
+        let classes = &mut self.observed[index];
+        if classes.contains(&class) || classes.len() >= capability.max_observations_per_interval() {
+            self.dropped_samples[index] = self.dropped_samples[index].saturating_add(1);
+            return RecordOutcome::DroppedDuplicate;
         }
         classes.push(class);
+        RecordOutcome::Recorded
     }
 
-    /// Closes the open interval and starts the next one at `end_ms`.
+    /// Closes this interval at `end_ms` by the tick that observed it.
     #[must_use]
     pub fn close(self, end_ms: u64) -> IntervalCoverageReport {
+        self.publish_at(end_ms, true)
+    }
+
+    /// Records this interval as one the tick never closed, observed at `end_ms`.
+    ///
+    /// The samples in it were really taken live inside its window, but the tick
+    /// that opened it was cut short before it declared an end — an admission
+    /// refusal or a lost Host — so `end_ms` is only the instant a later tick saw
+    /// the omission, not a close this tick performed. Every wired channel
+    /// therefore carries `INTERVAL_NOT_CLOSED` and none of them is
+    /// `CONTINUOUS`: an interval that was not closed is a named omission, never
+    /// coverage, and it is published rather than discarded.
+    #[must_use]
+    pub fn record_unclosed(self, end_ms: u64) -> IntervalCoverageReport {
+        self.publish_at(end_ms, false)
+    }
+
+    /// Derives this interval's report at `end_ms` with the close state its
+    /// disposition must reflect.
+    fn publish_at(self, end_ms: u64, interval_closed: bool) -> IntervalCoverageReport {
         let interval = CoverageInterval {
             start_ms: self.start_ms,
             end_ms,
         };
-        IntervalCoverageReport::publish(interval, &self.observed)
+        IntervalCoverageReport::publish(
+            interval,
+            &self.observed,
+            &self.dropped_samples,
+            interval_closed,
+        )
     }
 }
 
-/// One closed interval plus whether its blocking channel set changed.
+/// One finished coverage interval plus whether its blocking channel set changed.
+///
+/// "Finished" is not the same as "closed": an interval a tick opened and did not
+/// finish is published through this type too, carrying `INTERVAL_NOT_CLOSED` on
+/// every wired channel, so a skipped tick reaches the operator as a recorded
+/// omission rather than as a silently discarded interval.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntervalCoveragePublication {
     report: IntervalCoverageReport,
@@ -930,7 +1063,7 @@ pub struct IntervalCoveragePublication {
 }
 
 impl IntervalCoveragePublication {
-    /// The closed interval's coverage report.
+    /// This finished interval's coverage report.
     #[must_use]
     pub const fn report(&self) -> &IntervalCoverageReport {
         &self.report
@@ -949,9 +1082,37 @@ impl IntervalCoveragePublication {
 
 #[derive(Debug)]
 struct IntervalCoverageState {
+    /// The interval the next offer of evidence belongs to.
+    ///
+    /// Replaced by [`IntervalCoverageCell::begin_interval`] and consumed by
+    /// [`IntervalCoverageCell::close_interval`], so it is only ever one
+    /// supervision tick's window and never an accumulating buffer.
     publisher: IntervalCoveragePublisher,
+    /// Whether a supervision tick's interval is open in `publisher`.
+    ///
+    /// `false` before the first [`IntervalCoverageCell::begin_interval`] and
+    /// after a close, which is what lets `begin_interval` tell a window nobody
+    /// opened apart from one whose tick did not reach its close.
+    interval_open: bool,
     published: Option<IntervalCoverageReport>,
     last_blocking: Vec<ObservationChannel>,
+}
+
+impl IntervalCoverageState {
+    /// Records one finished interval's report against the blocking set this
+    /// owner reports changes of, and reports whether that set changed.
+    fn record_publication(
+        &mut self,
+        report: IntervalCoverageReport,
+    ) -> IntervalCoveragePublication {
+        let blocking = report.blocking_channels();
+        let blocking_changed = blocking != self.last_blocking;
+        self.last_blocking = blocking;
+        IntervalCoveragePublication {
+            report,
+            blocking_changed,
+        }
+    }
 }
 
 /// The one shared per-interval coverage cell of this owner.
@@ -968,43 +1129,88 @@ pub struct IntervalCoverageCell {
 }
 
 impl IntervalCoverageCell {
-    /// Opens the cell with an interval that starts at `start_ms`.
+    /// Opens the cell before any supervision tick has run.
+    ///
+    /// `start_ms` is the owner clock at construction and seeds the parked
+    /// interval only. The cell establishes no coverage here and refuses every
+    /// offer of evidence until the first [`begin_interval`](Self::begin_interval)
+    /// opens a real tick interval.
     #[must_use]
     pub fn new(start_ms: u64) -> Self {
         Self {
             state: Mutex::new(IntervalCoverageState {
                 publisher: IntervalCoveragePublisher::new(start_ms),
+                interval_open: false,
                 published: None,
                 last_blocking: Vec::new(),
             }),
         }
     }
 
-    /// Records one live observation class for one channel.
-    pub fn record(&self, channel: ObservationChannel, class: ObservationClass) {
-        if let Ok(mut state) = self.state.lock() {
-            state.publisher.record(channel, class);
-        }
+    /// Opens the interval for one supervision tick at `start_ms`.
+    ///
+    /// The tick that opened the previous interval has finished by contract, so
+    /// a publisher still open here belongs to a tick that did **not** reach its
+    /// close. That window is not silently replaced: it is turned into a report
+    /// carrying `INTERVAL_NOT_CLOSED` on every wired channel and returned, so
+    /// the caller publishes the omission instead of dropping the interval.
+    /// `None` means the previous interval was closed, or no tick had opened one,
+    /// or the cell's lock is poisoned.
+    ///
+    /// The last publication is cleared with the new open interval, so a
+    /// skipped tick invalidates the previous publication instead of silently
+    /// widening the window a sample covers, and while an interval is in progress
+    /// `latest` is `None`: an interval in progress establishes no coverage.
+    pub fn begin_interval(&self, start_ms: u64) -> Option<IntervalCoveragePublication> {
+        let mut state = self.state.lock().ok()?;
+        let previous = std::mem::replace(
+            &mut state.publisher,
+            IntervalCoveragePublisher::new(start_ms),
+        );
+        let unclosed = state.interval_open;
+        state.interval_open = true;
+        let publication =
+            unclosed.then(|| state.record_publication(previous.record_unclosed(start_ms)));
+        state.published = None;
+        publication
     }
 
-    /// Closes the open interval at `end_ms` and opens the next one there.
+    /// Records one offered live observation class for one channel.
     ///
-    /// Returns `None` only when the cell's lock is poisoned, which is the
-    /// "coverage cannot be established" outcome and never a full-coverage
-    /// claim.
+    /// An offer made while no interval is open, or against a poisoned cell,
+    /// returns [`RecordOutcome::NotRecorded`], so a caller that reports a
+    /// non-`Recorded` outcome also reports that the evidence was not kept rather
+    /// than staying silent.
+    pub fn record(&self, channel: ObservationChannel, class: ObservationClass) -> RecordOutcome {
+        self.state
+            .lock()
+            .map_or(RecordOutcome::NotRecorded, |mut state| {
+                if !state.interval_open {
+                    return RecordOutcome::NotRecorded;
+                }
+                state.publisher.record(channel, class)
+            })
+    }
+
+    /// Closes the open interval at `end_ms`.
+    ///
+    /// Returns `None` when the cell's lock is poisoned or no interval is open,
+    /// which is the "coverage cannot be established" outcome and never a
+    /// full-coverage claim. Closing an interval a tick opened is what makes its
+    /// end declared; a window left open is not closed here, and is reported as
+    /// an omission by the next [`begin_interval`](Self::begin_interval) instead.
     pub fn close_interval(&self, end_ms: u64) -> Option<IntervalCoveragePublication> {
         let mut state = self.state.lock().ok()?;
+        if !state.interval_open {
+            return None;
+        }
+        state.interval_open = false;
         let publisher =
             std::mem::replace(&mut state.publisher, IntervalCoveragePublisher::new(end_ms));
         let report = publisher.close(end_ms);
-        let blocking = report.blocking_channels();
-        let blocking_changed = blocking != state.last_blocking;
-        state.last_blocking = blocking;
-        state.published = Some(report.clone());
-        Some(IntervalCoveragePublication {
-            report,
-            blocking_changed,
-        })
+        let publication = state.record_publication(report.clone());
+        state.published = Some(report);
+        Some(publication)
     }
 
     /// The most recently closed interval's report, if one has been closed.

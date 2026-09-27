@@ -25,7 +25,10 @@ use crate::backup_control::BackupControlRegistration;
 use crate::current_unix_ms;
 use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::kernel_gap_reason;
-use crate::observation_coverage::{IntervalCoverageCell, ObservationChannel, ObservationClass};
+use crate::observation_coverage::{
+    IntervalCoverageCell, IntervalCoveragePublication, ObservationChannel, ObservationClass,
+    RecordOutcome,
+};
 use crate::report_gap_nonfatal;
 use crate::watchdog_spool::WatchdogSpool;
 use crate::watchdog_spool::backup::{
@@ -38,28 +41,100 @@ mod authority_state;
 use authority_state::WatchdogAuthorityStateCell;
 pub use authority_state::{WatchdogAuthorityState, WatchdogReadiness};
 
-/// Closes the open coverage interval and reports its named gaps once.
+/// Records one offered live coverage sample and reports an offer that was not
+/// kept.
 ///
-/// The per-interval publication itself is consumed by the readiness projection
-/// and by the owner-bound capture path, which read the same cell; this
-/// function only makes the blocking set visible to an operator. The blocking
-/// set is a measured property of the current sensor map, so it is logged when
-/// it changes rather than on every tick, and a poisoned cell publishes nothing
-/// at all — never a claim.
-fn publish_closed_interval_coverage(coverage: &IntervalCoverageCell) {
-    let Some(publication) = coverage.close_interval(current_unix_ms().unwrap_or(0)) else {
-        return;
-    };
-    if publication.blocking_changed() {
-        let report = publication.report();
-        tracing::warn!(
-            event = "watchdog.observation_coverage_gap",
-            observation = "partial",
-            full_coverage = report.full_coverage_claimed(),
-            blocking_channels = ?report.blocking_channels(),
-            "required observation coverage is not full; the listed I8.2 channels are blind or unknown"
+/// An offer that is not [`RecordOutcome::Recorded`] is a duplicate, a class the
+/// map does not support for that channel, or an offer made with no interval open
+/// to hold it. All three are evidence the publication must not lose quietly, so
+/// this traces them; a duplicate also leaves a `SAMPLE_DROPPED` gap on the
+/// channel's own record. The trace is per offer rather than per tick, and one
+/// tick offers each of its channel/class pairs exactly once, so an unchanged
+/// channel produces no such trace at any level.
+fn record_coverage_sample(
+    coverage: &IntervalCoverageCell,
+    channel: ObservationChannel,
+    class: ObservationClass,
+) {
+    let outcome = coverage.record(channel, class);
+    if outcome != RecordOutcome::Recorded {
+        tracing::debug!(
+            event = "watchdog.observation_coverage_sample_not_kept",
+            observation = outcome.as_str(),
+            channel = channel.as_str(),
+            class = class.as_str(),
+            "offered coverage sample was not kept as evidence for this channel"
         );
     }
+}
+
+/// Publishes one finished coverage interval's full per-channel record.
+///
+/// `interval_closed` is `false` for the window a tick opened and did not
+/// finish, which the cell reports as a named omission; both cases reach this
+/// reader, so a skipped tick is published rather than dropped. It restates at
+/// the top level what the cell already decided, and the per-record
+/// `interval_closed` copied into `channels` is the authoritative one.
+///
+/// This is the reader that makes the publication a publication rather than a
+/// write: every field W5 requires to be recorded — expected source and classes,
+/// the declared interval, the live and replayed portions, the dropped samples,
+/// whether the interval closed, the named gaps, the sensor map revision, and
+/// the validity verdict — is read here and emitted, so none of it is
+/// write-only. The set is emitted when the blocking channels change, which is a
+/// measured property of the current sensor map and of the samples the last
+/// interval actually held, so the volume is bounded rather than per-tick; the
+/// readiness projection and the owner-bound capture path read the same cell on
+/// every tick and every capture. A poisoned cell, or a close with no interval
+/// open, publishes nothing at all — never a claim.
+fn publish_interval_coverage(publication: &IntervalCoveragePublication, interval_closed: bool) {
+    if !publication.blocking_changed() {
+        return;
+    }
+    let report = publication.report();
+    let interval = report.interval();
+    let channels: Vec<_> = report
+        .records()
+        .iter()
+        .map(|record| {
+            (
+                record.channel().as_str(),
+                record.disposition().as_str(),
+                record
+                    .observed_classes()
+                    .iter()
+                    .map(|class| ObservationClass::as_str(*class))
+                    .collect::<Vec<_>>(),
+                record.observed_replayed_observations(),
+                record.dropped_samples(),
+                record.interval_closed(),
+                record
+                    .gaps()
+                    .iter()
+                    .map(|gap| (gap.channel.as_str(), gap.reason))
+                    .collect::<Vec<_>>(),
+                record.expected_source(),
+                record
+                    .expected_classes()
+                    .iter()
+                    .map(|class| ObservationClass::as_str(*class))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    tracing::warn!(
+        event = "watchdog.observation_coverage_publication",
+        observation = "published",
+        interval_closed = interval_closed,
+        interval_start_ms = interval.start_ms,
+        interval_end_ms = interval.end_ms,
+        sensor_map_revision = report.sensor_map_revision(),
+        valid = report.valid(),
+        full_coverage = report.full_coverage_claimed(),
+        blocking_channels = ?report.blocking_channels(),
+        channels = ?channels,
+        "one supervision tick's per-channel I8.2 observation coverage published"
+    );
 }
 
 /// Runtime-owned watchdog composition.
@@ -230,6 +305,20 @@ impl WatchdogComposition {
                             () = token.cancelled() => return Ok(()),
                             () = tokio::time::sleep(interval) => {}
                         }
+                        // I8.2 (#1755 W5): one published coverage interval is
+                        // exactly one tick. Opening it here also reports the
+                        // window the previous tick left open — a tick cut short
+                        // by an admission refusal or a lost Host is published
+                        // as a named `INTERVAL_NOT_CLOSED` omission rather than
+                        // silently replaced, so a sample can never be carried
+                        // across a window it did not cover and a skipped tick
+                        // invalidates the last publication instead of widening
+                        // it.
+                        if let Some(abandoned) =
+                            coverage.begin_interval(current_unix_ms().unwrap_or(0))
+                        {
+                            publish_interval_coverage(&abandoned, false);
+                        }
                         // Host liveness is an independent sibling observation.
                         // It must run even when a lease is missing, stale, or
                         // otherwise unavailable during first install/recovery.
@@ -246,13 +335,15 @@ impl WatchdogComposition {
                         // `HostObservationState`; only the coverage disposition
                         // is recorded here.
                         if host_observation.state != HostObservationState::Unknown {
-                            coverage.record(
+                            record_coverage_sample(
+                                &coverage,
                                 ObservationChannel::ScmServiceState,
                                 ObservationClass::ServiceState,
                             );
                         }
                         if host_observation.identity.is_some() {
-                            coverage.record(
+                            record_coverage_sample(
+                                &coverage,
                                 ObservationChannel::ProcessExitIdentity,
                                 ObservationClass::ProcessIdentity,
                             );
@@ -315,6 +406,20 @@ impl WatchdogComposition {
                         }
                         match kernel.supervise(admission.lease()).await {
                             Ok(()) => {
+                                // I8.2 (#1755 W5): the Kernel channel is
+                                // observed live only on this arm, where the
+                                // heartbeat was actually recorded in the
+                                // Watchdog's own spool. Nothing answers on the
+                                // far side, so the accepted append is the whole
+                                // of the evidence, and a refusal below is not
+                                // this class at all — it is reported as the
+                                // health gap it is, and the channel stays
+                                // unobserved.
+                                record_coverage_sample(
+                                    &coverage,
+                                    ObservationChannel::KernelHeartbeat,
+                                    ObservationClass::Liveness,
+                                );
                                 let kernel_epoch =
                                     admission.lease().lease().kernel_epoch.sequence.get();
                                 let watchdog_epoch = admission.watchdog_epoch().value();
@@ -333,16 +438,10 @@ impl WatchdogComposition {
                                     .await;
                             }
                         }
-                        // I8.2 (#1755 W5): the Kernel fence is read once per
-                        // tick whether or not it answers, so the channel was
-                        // observed live. A refusal is a health result, already
-                        // reported as the gap above, and is deliberately not
-                        // folded into the coverage disposition.
-                        coverage.record(
-                            ObservationChannel::KernelHeartbeat,
-                            ObservationClass::Liveness,
-                        );
-                        publish_closed_interval_coverage(&coverage);
+                        if let Some(closed) = coverage.close_interval(current_unix_ms().unwrap_or(0))
+                        {
+                            publish_interval_coverage(&closed, true);
+                        }
                     }
                 }
             },

@@ -375,7 +375,13 @@ impl WatchdogSpool {
                 "watchdog spool backup capture exceeds the bounded work ceiling".to_owned(),
             ));
         }
-        backup::capture_fence(&header, &entries, high_water, &params, channel_coverage)
+        backup::capture_fence_with_channel_coverage(
+            &header,
+            &entries,
+            high_water,
+            &params,
+            channel_coverage,
+        )
     }
 
     /// Imports an isolated-restore step chain as quarantined historical evidence.
