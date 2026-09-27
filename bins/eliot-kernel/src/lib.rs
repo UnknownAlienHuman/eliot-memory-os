@@ -49,6 +49,11 @@ mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
+/// Kernel-owned durable audit evidence (issue #1837; I16): the single
+/// BLAKE3-chained audit chain plus the single Watchdog-domain anchor sink.
+/// Every authority/lifecycle boundary appends through the composition's
+/// one [`KernelAuditChain`] handle; there is no second writer.
+pub mod kernel_audit;
 mod kernel_build_contract;
 mod kernel_config;
 /// Kernel structured diagnostics facade (F-LOG-KERNEL-0, #895): compiled
@@ -90,6 +95,11 @@ pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
     BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
     BlobProbeSuccess, BlobReadyReceipt, BlobRef, BlobStoreController, BlobStoreManifest,
+};
+pub use kernel_audit::{
+    AuditAnchor, AuditAnchorBinding, AuditAssuranceClass, AuditCaptureMode, AuditEventDraft,
+    AuditEventKind, AuditLineage, AuditRecord, ChainVerification, KernelAuditChain,
+    KernelAuditError, kernel_audit_anchor_dir, kernel_audit_chain_path, kernel_audit_dir,
 };
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
 #[cfg(windows)]
@@ -626,6 +636,12 @@ pub struct KernelComposition {
     /// from the assembly store so later owner operations never reopen the
     /// database file or invent a second recovery store.
     p07_ors: Arc<RedbRecoveryStore>,
+    /// The single Kernel-owned durable audit chain (issue #1837; I16).
+    /// Leaf lock: chain appends never acquire another Kernel lock, so
+    /// boundaries may observe while holding queue/session locks. Opened
+    /// once at assembly below the canonical work root; every boundary
+    /// appends through [`KernelComposition::audit_observe`].
+    pub(crate) kernel_audit: Mutex<KernelAuditChain>,
 }
 
 impl KernelComposition {
@@ -2779,6 +2795,8 @@ impl KernelComposition {
             .lock()
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
         coordinator.revoke_supervision_evidence();
+        // Issue #1837: durable audit evidence for lease revocation.
+        self.audit_observe(AuditEventDraft::lease_supervision_revoked());
         Ok(())
     }
 
@@ -3512,6 +3530,11 @@ impl KernelComposition {
             .ok_or(KernelServiceError::ReadinessNotProven)?;
         let snapshot = Self::commit_or_replay_active_supervision(authority, &contour, unix_ms())
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        // Issue #1837: durable audit evidence for lease establishment.
+        self.audit_observe(AuditEventDraft::lease_supervision_established(
+            &snapshot,
+            Some(session),
+        ));
         Ok((contour, snapshot))
     }
 
@@ -3766,6 +3789,8 @@ impl KernelComposition {
             )?;
             (renewed, published)
         };
+        // Issue #1837: durable audit evidence for lease renewal.
+        self.audit_observe(AuditEventDraft::lease_supervision_renewed(&renewed, None));
         Ok((renewed, published))
     }
 
@@ -3980,6 +4005,8 @@ impl KernelComposition {
         coordinator
             .request_shutdown()
             .map_err(ProcessExecutionError::Unavailable)?;
+        // Issue #1837: durable audit evidence for shutdown phases.
+        self.audit_observe(AuditEventDraft::shutdown_drain_requested());
         let drain = self.run_shutdown_drain(&coordinator).await;
         let process_result = self
             .process_gateway
@@ -4000,6 +4027,10 @@ impl KernelComposition {
             coordinator
                 .complete_terminal(ShutdownTerminal::Intentional)
                 .map_err(ProcessExecutionError::Unavailable)?;
+            self.audit_observe(AuditEventDraft::shutdown_terminal_published(
+                "intentional",
+                0,
+            ));
         } else {
             if pending.is_empty() {
                 pending.push(
@@ -4010,9 +4041,14 @@ impl KernelComposition {
                         .to_owned(),
                 );
             }
+            let pending_count = pending.len();
             coordinator
                 .complete_terminal(ShutdownTerminal::Incomplete { pending })
                 .map_err(ProcessExecutionError::Unavailable)?;
+            self.audit_observe(AuditEventDraft::shutdown_terminal_published(
+                "incomplete",
+                pending_count,
+            ));
         }
         coordinator.observe_published_state();
         process_result?;
@@ -4242,6 +4278,11 @@ impl KernelComposition {
         coordinator.commit_drain(decision.clone()).map_err(|_| {
             DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
         })?;
+        // Issue #1837: durable audit evidence for the drain commit.
+        self.audit_observe(AuditEventDraft::shutdown_drain_committed(
+            &decision.generation,
+            decision.authority_epochs_fenced.len(),
+        ));
 
         // Service stop follows linearization; a committed drain without a
         // clean stop is incomplete recovery state, never a silent success.

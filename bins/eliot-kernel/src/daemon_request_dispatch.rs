@@ -3332,6 +3332,8 @@ impl KernelComposition {
             "kernel.daemon.supervision_expired_effects_revoked",
             "success",
         );
+        // Issue #1837: durable audit evidence for lease expiry.
+        self.audit_observe(AuditEventDraft::lease_supervision_expired());
         Ok(())
     }
 

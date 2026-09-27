@@ -16,21 +16,22 @@
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
 use super::{
-    ArtifactId, AuthorityDescriptorContour, AuthorityHandoffBegin, AuthorityHandoffRecord,
-    AuthorityHandoffState, AuthorityPreparationError, AuthoritySnapshotBinding,
-    BlobStoreController, BoundCanonicalOwner, ContractId, DaemonRuntimeState, DaemonRuntimeStatus,
-    DispatchAuthorityId, DispatchSnapshotCodec, GenerationRoute, GenerationRouter,
-    GovernorClosureRestore, HealthVector, IpcImplementation, KernelBackupCapture,
-    KernelBackupRestore, KernelBuildError, KernelComposition, KernelConfig, KernelDispatchKey,
-    KernelError, KernelPathAdmission, KernelService, KernelStoreRebindProductionBoundary,
-    KernelSupervisionLeaseAuthority, ModuleGeneration, ModuleGenerationState,
-    OperationalRecoveryStore, OrsError, OrsGenerationCoordinator, PROTOCOL_VERSION,
-    PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
-    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
-    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
-    StartupCoordinator, StateFence, USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease,
-    UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner,
-    is_lower_sha256, owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    ArtifactId, AuditEventDraft, AuthorityDescriptorContour, AuthorityHandoffBegin,
+    AuthorityHandoffRecord, AuthorityHandoffState, AuthorityPreparationError,
+    AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner, ContractId,
+    DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
+    GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector, IpcImplementation,
+    KernelAuditChain, KernelBackupCapture, KernelBackupRestore, KernelBuildError,
+    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
+    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
+    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
+    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
+    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
+    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
+    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
+    USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
+    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
+    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1420,6 +1421,29 @@ impl KernelComposition {
         // captures consume already-accepted owner evidence per execution,
         // so no live owner channel is opened here.
         let backup_capture = KernelBackupCapture::bind(work_root.clone());
+        // Issue #1837: open the single durable audit chain below the
+        // canonical work root and seal the restart boundary. A corrupt
+        // retained chain fails construction closed: the Kernel never runs
+        // on unverifiable audit history.
+        let mut kernel_audit = KernelAuditChain::open(&work_root)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        if let Some(binding) = config.audit_anchor_binding.as_ref() {
+            kernel_audit
+                .set_anchor_sink(binding)
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        }
+        let prior_head_seq = kernel_audit.head_seq();
+        let prior_head_hash = kernel_audit.head_hash().to_owned();
+        kernel_audit
+            .append(
+                AuditEventDraft::chain_opened(prior_head_seq, &prior_head_hash),
+                unix_ms(),
+            )
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.audit_chain_opened",
+        );
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1433,6 +1457,7 @@ impl KernelComposition {
             p07_owner_digest: Mutex::new(None),
             p07_owner_transition: std::sync::RwLock::new(()),
             p07_ors: Arc::clone(&ors),
+            kernel_audit: Mutex::new(kernel_audit),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
             runtime,

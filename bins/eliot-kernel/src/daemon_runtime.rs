@@ -21,6 +21,7 @@ use eliot_process::{
     ProcessStartReceipt,
 };
 
+use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
     ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
     KernelComposition, daemon_status_proves_ready, eliotd_launch_attempt_identity,
@@ -636,11 +637,18 @@ impl KernelComposition {
             return Err(KernelServiceError::ReadinessNotProven);
         }
         state.status = DaemonRuntimeStatus::Ready;
+        let receipt = state.receipt.clone();
         drop(state);
         #[cfg(windows)]
         self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
         observe_daemon_runtime("kernel.daemon.ready_proven", "success");
+        // Issue #1837: durable audit evidence for process lifecycle.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_READY_PROVEN,
+            receipt.as_ref(),
+            "ready",
+        ));
         Ok(())
     }
 
@@ -663,9 +671,17 @@ impl KernelComposition {
         if state.receipt.is_none() {
             return Err(KernelServiceError::ReadinessNotProven);
         }
+        let receipt = state.receipt.clone();
+        let detail = reason.clone();
         state.status = DaemonRuntimeStatus::Degraded(reason);
         drop(state);
         self.daemon_status_changed.notify_one();
+        // Issue #1837: durable audit evidence for process lifecycle.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_DEGRADED,
+            receipt.as_ref(),
+            &detail,
+        ));
         Ok(())
     }
 
@@ -688,6 +704,7 @@ impl KernelComposition {
             .daemon_runtime
             .lock()
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        let receipt = state.receipt.clone();
         state.status = DaemonRuntimeStatus::Failed(reason.to_owned());
         state.recovery_fenced |= recovery_fenced;
         #[cfg(windows)]
@@ -712,6 +729,12 @@ impl KernelComposition {
                     .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
             service.apply(KernelControlCommand::Degrade(reason_handle))?;
         }
+        // Issue #1837: durable audit evidence for process lifecycle.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_FAILED,
+            receipt.as_ref(),
+            reason,
+        ));
         Ok(())
     }
 }

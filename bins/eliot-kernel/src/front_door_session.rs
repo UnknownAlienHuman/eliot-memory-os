@@ -704,8 +704,10 @@ impl KernelComposition {
         observe_front_door_session("kernel.front_door_handshake_decode", "attempt");
         let result = self.bind_session_inner(connection_id, peer, client);
         match &result {
-            Ok(_) => {
+            Ok(handshake) => {
                 observe_front_door_session("kernel.front_door_handshake_accept", "success");
+                // Issue #1837: durable audit evidence for session transition.
+                self.audit_observe(AuditEventDraft::session_bound(&handshake.session));
             }
             Err(error) => {
                 observe_front_door_session("kernel.front_door_handshake_reject", "fenced");

@@ -11,6 +11,7 @@
 //! Forbidden authority: must not perform semantic planning, must not allow an alternate epoch owner, must not resurrect stale routes; publishes only the ORS-committed candidate via `OrsGenerationCoordinator` and fences on failure.
 
 use super::KernelComposition;
+use super::kernel_audit::AuditEventDraft;
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::KernelServiceError;
@@ -482,6 +483,8 @@ impl KernelComposition {
         match self.apply_generation_cutover_inner(decision) {
             Ok(()) => {
                 observe_generation("kernel.generation.cutover_committed", "success");
+                // Issue #1837: durable audit evidence for epoch transition.
+                self.audit_observe(AuditEventDraft::epoch_cutover_applied(decision));
                 Ok(())
             }
             Err(error) => {
