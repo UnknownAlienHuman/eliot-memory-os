@@ -21,6 +21,12 @@
 //!   cell missing any of `ModuleContractKit`, `CrateContextCapsule`, or
 //!   `ModuleTestCapsule` cannot rise above `CURRENT_UNVERIFIED`, and the
 //!   registry reports the gap instead of promoting the cell.
+//! * The optional executable binding ([`CellCapsuleBinding`], issue #1804)
+//!   records supported execution for the cell: an executable disposition
+//!   names the exact bound capsule digest, while test-only, excluded, and
+//!   unresolved dispositions carry an explicit reason instead. Presence alone
+//!   never establishes a runnable selector; resolution takes only the typed
+//!   capsule revision plus actual discovery.
 
 use std::{fmt, str::FromStr};
 
@@ -28,8 +34,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{
-    ContractError, ContractVersion, ModuleCatalog, ModuleCatalogError, ModuleCatalogRecord,
-    canonical_json_bytes, sha256_hex,
+    CellCapsuleBinding, ContractError, ContractVersion, ModuleCatalog, ModuleCatalogError,
+    ModuleCatalogRecord, ModuleTestCapsuleError, canonical_json_bytes, sha256_hex,
 };
 
 /// Stable contract name for the owner-neutral capability-cell registry family.
@@ -526,6 +532,12 @@ pub struct CapabilityCellRecord {
     pub source_crate: SourceCrateRef,
     /// The mandatory contract/context/test triad manifest for this cell.
     pub manifest: EffectiveMicroModuleManifest,
+    /// Executable capsule binding for this cell (issue #1804). Absent on
+    /// records emitted before the binding existed; a missing binding is
+    /// preserved wire state, and the capsule catalogue reports missing
+    /// capsules as findings with an owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_capsule: Option<CellCapsuleBinding>,
 }
 
 /// Generated, versioned registry of functional capability cells.
@@ -613,6 +625,21 @@ pub enum RegistryDiagnostic {
         /// Cell making the claim.
         cell: String,
         /// Which bundle or effect classes were claimed.
+        detail: String,
+    },
+    /// An executable disposition names no bound capsule digest, or claims
+    /// execution without a present test capsule.
+    MissingCapsule {
+        /// Cell without an executable binding.
+        cell: String,
+        /// Which digest or capsule is missing.
+        detail: String,
+    },
+    /// A non-executable disposition carries an executable capsule binding.
+    CapsuleMismatch {
+        /// Cell with the mismatched binding.
+        cell: String,
+        /// How the disposition contradicts the binding.
         detail: String,
     },
 }
@@ -720,7 +747,8 @@ impl CapabilityCellRegistry {
     /// Returns `Ok(())` only when zero diagnostics exist; any diagnostic —
     /// stale pair or source identity, duplicate or missing owner, missing
     /// proof, undeclared state, inferred authority, unknown replacement
-    /// class, or runtime overclaim — returns `Err` with all findings.
+    /// class, runtime overclaim, or missing/mismatched capsule binding —
+    /// returns `Err` with all findings.
     pub fn validate(&self) -> Result<(), RegistryValidationError> {
         let mut diagnostics = Vec::new();
         if !self.pair_key.is_current() {
@@ -879,6 +907,44 @@ fn validate_record(record: &CapabilityCellRecord, diagnostics: &mut Vec<Registry
         });
     }
     validate_manifest(&cell, &record.manifest, diagnostics);
+    validate_capsule_binding(&cell, record, diagnostics);
+}
+
+fn validate_capsule_binding(
+    cell: &str,
+    record: &CapabilityCellRecord,
+    diagnostics: &mut Vec<RegistryDiagnostic>,
+) {
+    let Some(binding) = &record.executable_capsule else {
+        return;
+    };
+    match binding.validate(cell) {
+        Ok(()) => {}
+        Err(ModuleTestCapsuleError::MissingField { field, .. }) => {
+            diagnostics.push(RegistryDiagnostic::MissingCapsule {
+                cell: cell.to_owned(),
+                detail: format!("executable disposition names no {field}"),
+            });
+        }
+        Err(ModuleTestCapsuleError::BindingMismatch { detail, .. }) => {
+            diagnostics.push(RegistryDiagnostic::CapsuleMismatch {
+                cell: cell.to_owned(),
+                detail,
+            });
+        }
+        Err(other) => {
+            diagnostics.push(RegistryDiagnostic::CapsuleMismatch {
+                cell: cell.to_owned(),
+                detail: other.to_string(),
+            });
+        }
+    }
+    if binding.disposition.is_executable() && !record.manifest.test_capsule.present {
+        diagnostics.push(RegistryDiagnostic::MissingCapsule {
+            cell: cell.to_owned(),
+            detail: "executable disposition without a present module-test-capsule".to_owned(),
+        });
+    }
 }
 
 fn validate_manifest(

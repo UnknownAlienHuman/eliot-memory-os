@@ -20,6 +20,7 @@ use thiserror::Error;
 
 pub mod build_projection;
 pub mod cache_lane;
+pub mod capsule_binding;
 mod dev_fast;
 pub mod process_owner;
 pub mod profile;
@@ -38,6 +39,10 @@ pub use build_projection::{
     restrict_agent_argv,
 };
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
+pub use capsule_binding::{
+    BoundCapsulePlan, CapsuleBindingError, CapsuleRunObservation, assemble_evidence, bind_capsule,
+    ceiling_admits_edge_claim, ceiling_admits_product_claim, nextest_test_filters,
+};
 pub use dev_fast::{
     DEV_FAST_FIRST_PACKAGE, DEV_FAST_PROFILE, DEV_FAST_PROFILE_REVISION, DEV_FAST_SLICE_PARTIAL,
     DEV_FAST_STAGE_CLIPPY, DEV_FAST_STAGE_LIST, DEV_FAST_STAGE_RUN, DEV_FAST_STAGE_RUSTFMT,
