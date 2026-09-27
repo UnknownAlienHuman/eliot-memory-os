@@ -15,6 +15,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod bridge_contract;
 mod bridge_event_capacity;
 mod bridge_event_recovery;
 mod capability_cell_registry;
@@ -23,6 +24,7 @@ mod epoch_identity;
 mod module_catalog;
 mod peer_blackboard;
 
+pub use bridge_contract::*;
 pub use bridge_event_capacity::*;
 pub use bridge_event_recovery::*;
 pub use capability_cell_registry::*;

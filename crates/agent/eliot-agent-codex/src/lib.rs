@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+pub mod bridge_contract;
 pub mod catalogue;
 pub mod preflight;
 

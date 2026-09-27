@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod bridge_contract;
 mod catalogue;
 mod client;
 mod endpoint;
