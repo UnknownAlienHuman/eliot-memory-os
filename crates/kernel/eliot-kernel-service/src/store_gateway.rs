@@ -1197,6 +1197,22 @@ impl KernelStoreGateway {
         .await
     }
 
+    /// Executes one named read while preserving whether failure came from the
+    /// Store API or from gateway validation and fencing.
+    pub async fn execute_named_with_error(
+        &self,
+        request: NamedReadRequest,
+    ) -> Result<NamedReadResponse, NamedReadGatewayError> {
+        execute_named_via_with_error(
+            &self.flight,
+            &self.service,
+            &self.route,
+            &self.store,
+            request,
+        )
+        .await
+    }
+
     /// Reads and authenticates the current UserAutomation owner material through
     /// the active generation-routed Store contour. The UserAutomation adapter
     /// constructs and projects the closed named reads; this gateway remains the
@@ -5051,28 +5067,63 @@ async fn execute_named_via<T>(
 where
     T: EbpStoreTransport + 'static,
 {
-    let _flight = flight.enter()?;
-    if flight.is_fenced() {
-        return Err("canonical-store gateway is fenced for rebind".to_owned());
-    }
-    request.validate().map_err(|error| error.to_string())?;
-    validate_route(service, route, &request.state_fence)?;
-    let response = store
-        .execute_named(request.clone())
+    execute_named_via_with_error(flight, service, route, store, request)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())
+}
+
+async fn execute_named_via_with_error<T>(
+    flight: &GatewayFlight,
+    service: &Mutex<KernelService>,
+    route: &GenerationRoute,
+    store: &EbpCanonicalStoreClient<T>,
+    request: NamedReadRequest,
+) -> Result<NamedReadResponse, NamedReadGatewayError>
+where
+    T: EbpStoreTransport + 'static,
+{
+    let _flight = flight
+        .enter()
+        .map_err(NamedReadGatewayError::GatewayRefusal)?;
     if flight.is_fenced() {
-        return Err("canonical-store gateway is fenced for rebind".to_owned());
+        return Err(NamedReadGatewayError::GatewayRefusal(
+            "canonical-store gateway is fenced for rebind".to_owned(),
+        ));
     }
-    validate_route(service, route, &request.state_fence)?;
-    response.validate().map_err(|error| error.to_string())?;
+    request.validate()?;
+    validate_route(service, route, &request.state_fence)
+        .map_err(NamedReadGatewayError::GatewayRefusal)?;
+    let response = store.execute_named(request.clone()).await?;
+    if flight.is_fenced() {
+        return Err(NamedReadGatewayError::GatewayRefusal(
+            "canonical-store gateway is fenced for rebind".to_owned(),
+        ));
+    }
+    validate_route(service, route, &request.state_fence)
+        .map_err(NamedReadGatewayError::GatewayRefusal)?;
+    response.validate()?;
     if response.operation != request.operation {
-        return Err("Store named-read operation does not match request".to_owned());
+        return Err(NamedReadGatewayError::GatewayRefusal(
+            "Store named-read operation does not match request".to_owned(),
+        ));
     }
     if response.state_fence != request.state_fence {
-        return Err("Store named-read fence does not match request".to_owned());
+        return Err(NamedReadGatewayError::GatewayRefusal(
+            "Store named-read fence does not match request".to_owned(),
+        ));
     }
     Ok(response)
+}
+
+/// Closed failure set for one named Store read through the Kernel gateway.
+#[derive(Debug, thiserror::Error)]
+pub enum NamedReadGatewayError {
+    /// The canonical Store API returned a typed failure.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// Gateway validation, fencing, or route checks refused the read.
+    #[error("{0}")]
+    GatewayRefusal(String),
 }
 
 #[cfg(test)]

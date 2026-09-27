@@ -20,15 +20,16 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
-    AuthenticatedUserAutomationHostExecutionTransport, UserAutomationDueWakeRejection,
-    UserAutomationDueWakeResolution, UserAutomationDurableJobPort, UserAutomationHorizonOutcome,
-    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
-    UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
-    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
-    UserAutomationWakeCancellation, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
-    horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError,
+    UserAutomationDueWakeRejection, UserAutomationDueWakeResolution, UserAutomationDurableJobPort,
+    UserAutomationHorizonOutcome, UserAutomationHorizonPhase, UserAutomationHorizonTrigger,
+    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionTransport, UserAutomationOwnerLookup,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
+    resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -6912,9 +6913,9 @@ impl KernelComposition {
             };
         }
         let gateway = self.retained_store_gateway()?;
-        match gateway.execute_named(operation.request).await {
+        match gateway.execute_named_with_error(operation.request).await {
             Ok(response) => Ok(store_named_response(&response)),
-            Err(error) => Ok(Self::store_error_response_text("store_named", &error)),
+            Err(error) => Ok(Self::store_read_failure_response("store_named", &error)),
         }
     }
 
@@ -7033,9 +7034,11 @@ impl KernelComposition {
         }
         validate_store_session_fence(session, &read.state_fence)?;
         let gateway = self.retained_store_gateway()?;
-        let response = match gateway.execute_named(read).await {
+        let response = match gateway.execute_named_with_error(read).await {
             Ok(response) => response,
-            Err(error) => return Ok(Self::store_error_response_text("local_read", &error)),
+            Err(error) => {
+                return Ok(Self::store_read_failure_response("local_read", &error));
+            }
         };
         if response.operation != NamedReadOperation::GetEvidencePack {
             return Ok(Self::store_error_response_text(
@@ -7851,6 +7854,21 @@ impl KernelComposition {
             "value": { "kind": kind, "value": null },
             "recovery": null,
         })
+    }
+
+    #[cfg(windows)]
+    fn store_read_failure_response(kind: &str, error: &NamedReadGatewayError) -> serde_json::Value {
+        if matches!(error, NamedReadGatewayError::Store(StoreError::Unavailable)) {
+            return serde_json::json!({
+                "status": "error",
+                "code": "DB_UNAVAILABLE",
+                "reason": "Canonical Store is unavailable; named read was not completed.",
+                "value": { "kind": kind, "value": null },
+                "recovery": null,
+            });
+        }
+
+        Self::store_error_response_text(kind, &error.to_string())
     }
 }
 
