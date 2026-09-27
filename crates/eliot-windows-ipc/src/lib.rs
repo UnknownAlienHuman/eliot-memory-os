@@ -40,13 +40,14 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_NOTIFY_CHANGE_ATTRIBUTES,
-    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FindCloseChangeNotification,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+    FILE_GENERIC_READ, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileDispositionInfo, FindCloseChangeNotification,
     FindFirstChangeNotificationW, GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, DeviceIoControl, GetQueuedCompletionStatus, OVERLAPPED,
@@ -568,6 +569,79 @@ impl PinnedFile {
     #[must_use]
     pub const fn identity(&self) -> FileIdentity {
         self.identity
+    }
+}
+
+/// A non-reparse file pinned with delete access for exact-handle retirement.
+///
+/// This is separate from [`PinnedFile`]: ordinary read pins cannot retire a
+/// file. The retained handle denies write and delete sharing until its own
+/// disposition is applied, so a pathname replacement cannot intervene between
+/// identity validation and retirement.
+pub struct RetirablePinnedFile {
+    file: File,
+    identity: FileIdentity,
+}
+
+impl RetirablePinnedFile {
+    /// Opens an existing regular file with read and delete access, without
+    /// following a final-component reparse point.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "retirable path is not a non-reparse file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let identity = file_identity(&file)?;
+        Ok(Self { file, identity })
+    }
+
+    /// Reads the pinned object's bytes for comparison with the owner record.
+    pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        self.file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Returns the identity of the retained file object.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Marks this exact object for deletion and closes the retained handle.
+    /// A failed disposition leaves the object unretired for bounded recovery.
+    pub fn retire(self) -> io::Result<()> {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let disposition_size = u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+            .map_err(|_| io::Error::other("FILE_DISPOSITION_INFO size exceeds DWORD"))?;
+        // SAFETY: this live handle was opened with DELETE access, and the
+        // disposition buffer has the exact FILE_DISPOSITION_INFO layout.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle().cast(),
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                disposition_size,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        drop(self);
+        Ok(())
     }
 }
 
