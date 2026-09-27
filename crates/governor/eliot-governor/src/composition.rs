@@ -7698,6 +7698,7 @@ mod tests {
                 next_sequence: 1,
                 tasks: BTreeMap::new(),
                 events: Vec::new(),
+                professional_execution: BTreeMap::new(),
             }),
             RecoveryOwner::Session => serde_json::to_value(SessionLifecycleSnapshot {
                 next_sequence: 1,
@@ -7837,10 +7838,12 @@ mod tests {
                 from: None,
                 to: TaskState::ActionAuthorized,
                 command: None,
+                professional_execution: None,
                 state_fence: fence.clone(),
                 authority_epoch: fence.authority_epoch.clone(),
                 observed_at: ClockReading::default(),
             }],
+            professional_execution: BTreeMap::new(),
         }
     }
 

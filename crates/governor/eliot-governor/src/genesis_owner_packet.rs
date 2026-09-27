@@ -295,6 +295,7 @@ fn genesis_payload(
             next_sequence: 1,
             tasks: BTreeMap::new(),
             events: Vec::new(),
+            professional_execution: BTreeMap::new(),
         })
         .map_err(|e| CompositionError::Recovery(e.to_string()))?,
         RecoveryOwner::Session => serde_json::to_value(SessionLifecycleSnapshot {

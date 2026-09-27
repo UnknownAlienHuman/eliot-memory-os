@@ -21,11 +21,11 @@
 //! (`crates/governor/eliot-governor/src/observation_reconciliation.rs`,
 //! `recovery_envelope`)) plus the `UpdateTaskState` mutation (AUD-C01:
 //! persists `TransitionClass::TaskControl` with the
-//! `EffectClass::ReversibleMutation` ceiling and carries the six task-control
-//! fields emitted by the Governor task lifecycle envelope
+//! `EffectClass::ReversibleMutation` ceiling and carries the task-control
+//! fields and serialized admitted event emitted by the Governor task lifecycle envelope
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`:
 //! `task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
-//! `actor_ref`) plus the `ApplyEpistemicRevision` mutation (T11.2: persists
+//! `actor_ref`, `task_event_json`) plus the `ApplyEpistemicRevision` mutation (T11.2: persists
 //! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and carries the single `revision` epistemic-revision payload),
 //! plus T11.3 (issue #18) the four cognitive reads `GetTaskState`
@@ -59,7 +59,7 @@
 //! for `CaptureObservation`, the six receipt-bound fields for
 //! `AppendAuditEvent`, the six lifecycle-policy fields for
 //! `ApplyLifecyclePolicy`, the ten problem-leg recovery fields for
-//! `ReconcileRecovery`, the six task-control fields for `UpdateTaskState`
+//! `ReconcileRecovery`, the task-control fields and durable event for `UpdateTaskState`
 //! (`task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
 //! `actor_ref`), and the `subject` / `max_records` evidence-pack
 //! selectors for `GetEvidencePack`, the `task_id` / `max_records` selectors
@@ -93,7 +93,7 @@ use crate::{
 /// as `subject` (reused for the five remaining receipt-bound
 /// `AppendAuditEvent` fields, for the six lifecycle-policy
 /// `ApplyLifecyclePolicy` fields, for the nine remaining problem-leg
-/// `ReconcileRecovery` fields, for the six task-control `UpdateTaskState`
+/// `ReconcileRecovery` fields, for the task-control `UpdateTaskState`
 /// fields, and for the two `GetEvidencePack`
 /// evidence-pack selectors: the exact captured-observation `subject` and the
 /// explicit `max_records` bound carried as its decimal string, mirroring how
@@ -118,7 +118,7 @@ pub enum ParameterShape {
     /// (`problem_id`, `expected_problem_revision` as its decimal string,
     /// `attempt_digest`, `effect_digest`, `operation_manifest_digest`,
     /// `artifact_binding_digest`, `fence_digest`, `observation_record_id`,
-    /// and `observation_request_digest`), for the six task-control
+    /// and `observation_request_digest`), for the task-control
     /// `UpdateTaskState` fields (`task_id`, `event_id`, `from`, `to`,
     /// `expected_revision` as its decimal string, and `actor_ref`; `from` is
     /// optional because the proposing transition carries no predecessor state),
@@ -868,8 +868,9 @@ static COMMIT_EXPERIENCE_PARAMETERS: [ParameterDeclaration; 6] = [
 /// the target state `to`, the owner-checked compare-and-swap base
 /// `expected_revision` as its decimal string (`"1"` on propose, the current
 /// task revision on apply, mirroring how `AppendAuditEvent` carries
-/// `expected_revision`), and the admitted `actor_ref`.
-static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 9] = [
+/// `expected_revision`), the admitted `actor_ref`, and `task_event_json` which
+/// preserves the complete lifecycle command in task history.
+static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
     ParameterDeclaration {
         name: "task_id",
         shape: ParameterShape::Subject,
@@ -899,6 +900,11 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 9] = [
         name: "actor_ref",
         shape: ParameterShape::Subject,
         required: true,
+    },
+    ParameterDeclaration {
+        name: "task_event_json",
+        shape: ParameterShape::Subject,
+        required: false,
     },
     ParameterDeclaration {
         name: "campaign_learning_state_recipe_json",
