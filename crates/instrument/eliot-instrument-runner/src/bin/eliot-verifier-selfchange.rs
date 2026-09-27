@@ -36,7 +36,7 @@
 // `bins/eliot-testd` carry it.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,11 +55,12 @@ use eliot_instrument_runner::{
 };
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
-    EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError, FencingToken, Generation,
-    ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence,
-    ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
-    ProcessIntent, ProcessRequest, ProcessTreeId, ResourceLimits, SessionId,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError, ExitDisposition, ExitStatus,
+    FencingToken, Generation, ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance,
+    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView,
+    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStreamEvidence, ProcessTreeId,
+    ResourceLimits, SessionId, StreamEvaluationStatus, StreamEvidenceGap, StreamParsingStatus,
+    StreamPersistenceStatus, StreamTransportStatus, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{
     DispatchValidationPort, ExecutableObservation, WindowsProcessExecutor,
@@ -69,8 +70,8 @@ use eliot_process_executor::{
     },
 };
 use eliot_verifier::{
-    AxisVerdicts, CanaryRecord, EvidenceDigest, GenerationReceipt, OracleResolution,
-    OuterGuardianRecord, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface,
+    AxisVerdicts, CanaryRecord, ComparisonAxis, EvidenceDigest, GenerationReceipt,
+    OracleResolution, OuterGuardianRecord, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface,
     ShadowComparisonRecord, SpecialCase, SpecialCaseEvidence, VerificationDecision,
     verdict_with_bootstrap,
 };
@@ -332,18 +333,17 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
     // recorded claim: the unchanged external discriminator runs over the
     // identical command first as the last-known-good pass, then again as the
     // candidate's shadow pass over the same raw tool evidence. The two live
-    // observations must agree on the retained evidence digest, which is the
-    // comparison over raw capture, normalized meaning, selection, omissions,
-    // and outcome that I18.31 requires before a cutover.
-    let last_known_good = run_discriminator(&evidence.discriminator, &admission)?;
-    let shadow = run_discriminator(&evidence.discriminator, &admission)?;
-    if last_known_good != shadow {
-        return Err(CliError::Contract(format!(
-            "shadow pass diverged from the last-known-good pass: {} != {}",
-            last_known_good.as_str(),
-            shadow.as_str()
-        )));
-    }
+    // observations are then compared axis by axis, exactly the raw capture,
+    // normalized meaning, selection, omissions, and outcome checks I18.31
+    // requires before a cutover. The passes are NOT required to produce equal
+    // whole-run digests: each pass activates its own one-shot dispatch
+    // authority, so the run's own evidence digest legitimately differs between
+    // them, and that per-activation permit identity is deliberately excluded
+    // from the compared axes (see `compare_axes`).
+    let (last_known_good, last_known_good_pass) =
+        run_discriminator(&evidence.discriminator, &admission)?;
+    let (shadow, shadow_pass) = run_discriminator(&evidence.discriminator, &admission)?;
+    let verdicts = compare_axes(&last_known_good_pass, &shadow_pass);
 
     let mut bootstrap = SelfChangeBootstrap::admit(
         evidence.surface,
@@ -361,17 +361,16 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
         bootstrap.record_special_case(case, digest)?;
     }
 
-    // The comparison covers every `ComparisonAxis` by construction: the clean
-    // verdict is the only accepted one, and `record_comparison` refuses any
-    // non-empty divergence list before the phase can advance. The digest
-    // equality above is this driver's comparison granularity over the retained
-    // run evidence; a mismatch refuses here instead of attributing unknown
-    // axes.
+    // The comparison carries the axes actually computed from the two live
+    // observations, never an assumed clean verdict. `record_comparison` then
+    // refuses closed through [`SelfChangeError::ComparisonDiverged`], naming
+    // exactly the diverging axes, before the phase can advance; the
+    // last-known-good run's own evidence digest is what the record binds.
     let comparison = ShadowComparisonRecord::new(
         evidence.surface,
         evidence.old_generation,
         evidence.candidate_generation,
-        AxisVerdicts::all_matched(),
+        verdicts,
         last_known_good,
     )?;
     bootstrap.record_comparison(comparison)?;
@@ -383,7 +382,7 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
     // stays admitted because this run revokes nothing, which is what keeps
     // rollback capable.
     let mut canary_tasks: u32 = 0;
-    let canary_evidence = run_discriminator(&evidence.discriminator, &admission)?;
+    let (canary_evidence, _canary_pass) = run_discriminator(&evidence.discriminator, &admission)?;
     canary_tasks += 1;
     let canary = CanaryRecord::new(
         evidence.surface,
@@ -415,6 +414,297 @@ fn drive_self_change(bundle: &Path) -> Result<String, CliError> {
         SelfChangeSurface::InstrumentRunner => launch_under_receipt(&evidence, &receipt),
         _ => Ok(cutover_report(&receipt)),
     }
+}
+
+/// The material one really-observed discriminator pass contributes to the
+/// five-axis comparison.
+///
+/// Every field here is what the live run observed on this machine: the
+/// executable bytes and environment projection, the reconciled process
+/// evidence with the terminal exit observation and the per-stream capture and
+/// meaning it carries, and the evidence records the process owner actually
+/// published. Nothing is derived, defaulted, or carried over from the bundle.
+struct DiscriminatorPass {
+    /// Machine-derived executable and environment identity of the child.
+    observed: ChildObservation,
+    /// The reconciled evidence the executor published for this run.
+    evidence: ProcessEvidence,
+    /// Terminal exit observation the executor published, absent when the
+    /// executor published no exit observation. It is held whole rather than
+    /// reduced to its disposition class, so the axes below can read the
+    /// observed exit code and signal off it. Only the stable subset of the
+    /// value is compared; its observation instant is genuine per-pass noise and
+    /// is never read.
+    exit: Option<ExitStatus>,
+    /// Retained evidence record digests, in the order the sink received them.
+    retained: Vec<String>,
+}
+
+/// Computes the I18.31 comparison between the last-known-good pass and the
+/// candidate's shadow pass over the same command.
+///
+/// I18.31 requires the comparison to check raw capture, normalized meaning,
+/// selection, omissions and outcome; it never requires the two passes to mint
+/// equal whole-run digests. So each axis is decided from the value the live
+/// runs actually observed, in [`ComparisonAxis::ALL`] order:
+///
+/// - [`ComparisonAxis::RawCapture`] from `pass.evidence`'s per-stream
+///   `ProcessStreamEvidence::observed_sha256` and `observed_bytes`, in
+///   `ProcessStreamKind` order: the machine hash and length of the bytes the
+///   tool actually wrote to each stream. This is the raw capture itself. The
+///   executable `content_digest` it replaces hashed the program image, which
+///   both passes necessarily shared, so it could never diverge and proved
+///   nothing about the run; it remains in the per-run evidence digest, where
+///   the sealed request binds it.
+/// - [`ComparisonAxis::NormalizedMeaning`] from the same streams'
+///   `ProcessStreamEvidence::parsing` and `::evaluation`: the meaning the
+///   captured bytes were actually attributed, per stream, by the parser and
+///   evaluator that classified them. This is the honest normalized meaning in
+///   hand. `pass.observed.environment_digest` is NOT it: the caller of
+///   `observe_at_path` supplies that value, and this driver supplies it from a
+///   hardcoded empty
+///   `EnvironmentProjection::new(BTreeMap::new(), Vec::new(),
+///   EnvironmentInheritance::None)`, so it is the same constant for every
+///   invocation that has ever existed and carries no comparison signal at all.
+/// - [`ComparisonAxis::Selection`] from `pass.observed.argv` plus the
+///   deterministic `operation_identity` the run sealed: the selection axis is
+///   the operation the pass chose to run, so a pass that selects a different
+///   command, or a different executable for it, diverges here.
+/// - [`ComparisonAxis::Omissions`] from the exact streams each pass actually
+///   published, every `ProcessStreamEvidence::gaps` entry it declared, the
+///   `StreamTransportStatus` and `StreamPersistenceStatus` it recorded per
+///   stream, and how many evidence records the sink retained. The gaps are the
+///   omissions the executor itself recorded (unavailable capture, failed
+///   transport or persistence, cancelled before EOF, an unknown outcome), so
+///   this compares how completely each pass captured the same raw evidence:
+///   a pass that retained a different number of records, or the same records
+///   over a different completeness shape, genuinely retained something the
+///   other pass did not.
+/// - [`ComparisonAxis::Outcome`] from the stable part of the terminal
+///   `ExitStatus` — its `disposition`, its `code`, and its `signal` — plus the
+///   captured bytes and record count the pass produced, which is the outcome
+///   this pass actually reached. A pass that turns exit code 0 into exit code
+///   1, or completion into a signal, diverges here.
+///
+/// Deliberately excluded from every axis, and excluded because each is
+/// genuine per-activation or per-instant noise rather than evidence about the
+/// surface under change: the per-pass dispatch `permit_digest` and the other
+/// per-`DispatchCell` permit fields behind it — `authority_id`, the keyed
+/// `authentication_tag`, and `issued_at_unix_ms`, plus the copies of all of
+/// them inside each retained evidence record; every observation instant, so
+/// `ExitStatus::observed_at_unix_ms` and the view's recorded clock readings;
+/// and, above, the content of each retained evidence record itself, which is
+/// excluded for exactly that reason. That record content is why the retained
+/// volume and the declared omission shape are compared instead of record
+/// digests: each record embeds its own per-pass permit identity, so its digest
+/// differs between two passes by construction even when both observed exactly
+/// the same thing. What IS compared is the part of the same observation that
+/// is stable across the two passes: the per-stream captured-bytes digest and
+/// length, the transport and persistence statuses, the declared gaps, the exit
+/// code and signal, and the retained record count. All of it stays inside each
+/// run's own bound evidence digest as well.
+///
+/// Known limitation, recorded rather than papered over: both passes run the
+/// same `&evidence.discriminator` through the same `run_child`, so this
+/// binary can re-run one implementation twice but cannot load and run a
+/// genuinely different candidate module. I18-31's candidate-runner/module
+/// side is therefore not realized here, and these five axes prove what five
+/// observations of the same command must agree on, not that a changed
+/// implementation was compared against the old one. Realizing that needs a
+/// candidate-load seam that is far outside this driver.
+///
+/// No axis is fabricated: an axis is recorded as diverging only on a real
+/// difference between two observed values, and an empty list means every axis
+/// in [`ComparisonAxis::ALL`] was compared and matched.
+fn compare_axes(last_known_good: &DiscriminatorPass, shadow: &DiscriminatorPass) -> AxisVerdicts {
+    let mut axes = Vec::new();
+    for axis in ComparisonAxis::ALL {
+        let matched = match axis {
+            ComparisonAxis::RawCapture => {
+                pass_raw_capture(last_known_good) == pass_raw_capture(shadow)
+            }
+            ComparisonAxis::NormalizedMeaning => {
+                pass_normalized_meaning(last_known_good) == pass_normalized_meaning(shadow)
+            }
+            ComparisonAxis::Selection => pass_selection(last_known_good) == pass_selection(shadow),
+            ComparisonAxis::Omissions => pass_omissions(last_known_good) == pass_omissions(shadow),
+            ComparisonAxis::Outcome => pass_outcome(last_known_good) == pass_outcome(shadow),
+        };
+        if !matched {
+            axes.push(axis);
+        }
+    }
+    AxisVerdicts::with_divergence(axes)
+}
+
+/// The machine hash and length of the bytes one pass actually captured on each
+/// published stream, in `ProcessStreamKind` order.
+///
+/// The vector is positional rather than counted, so a pass that stopped
+/// publishing a stream, or published one the other pass never captured,
+/// cannot compare equal to it. The digest and the length are the capture
+/// itself: the same command producing different bytes on a stream — extra
+/// output, truncated output, reordered output, output only one pass managed to
+/// keep — is a real, stable difference in what was captured, so it diverges.
+fn pass_raw_capture(pass: &DiscriminatorPass) -> Vec<(String, u64)> {
+    streams(pass)
+        .map(|stream| (stream.observed_sha256().to_owned(), stream.observed_bytes()))
+        .collect()
+}
+
+/// The meaning one pass attributed to the bytes it captured on each published
+/// stream, in `ProcessStreamKind` order.
+///
+/// Parsing and evaluation are the normalized layer over the raw capture: the
+/// two statuses say how the captured bytes were classified downstream. They are
+/// compared per stream, so a pass whose bytes were parsed into a different
+/// meaning, or evaluated to a different verdict, diverges. An absent stream
+/// compares unequal to a present one, which is exactly the intended signal
+/// rather than a missing value.
+fn pass_normalized_meaning(
+    pass: &DiscriminatorPass,
+) -> Vec<(StreamParsingStatus, StreamEvaluationStatus)> {
+    streams(pass)
+        .map(|stream| (stream.parsing(), stream.evaluation()))
+        .collect()
+}
+
+/// The observed selection of one pass: the exact argv it ran and the
+/// deterministic operation identity that argv and executable select.
+///
+/// This is the same identity the sealed request binds, derived the same way, so
+/// a pass that selected a different command — or a different executable for it
+/// — genuinely differs in what it chose to run.
+fn pass_selection(pass: &DiscriminatorPass) -> (Vec<String>, String) {
+    (
+        pass.observed.argv.clone(),
+        operation_identity(&pass.observed.executable_path, &pass.observed.argv),
+    )
+}
+
+/// The omissions of one pass: exactly which streams it published, the exact
+/// gaps, transport, and persistence statuses it declared on each, and how many
+/// evidence records it retained.
+///
+/// The gaps are the omissions the executor itself recorded on the streams it
+/// published (unavailable capture, failed transport or persistence, cancelled
+/// before EOF, an unknown outcome), so comparing them compares how completely
+/// each pass captured the same raw evidence. Gaps and statuses are compared as
+/// the sets the executor recorded them as — a gap set is unordered, so
+/// comparing it as a set cannot manufacture a difference from ordering — while
+/// the stream order itself stays positional, so dropping a stream still
+/// diverges. Nothing here is a completeness claim of this driver's own: a pass
+/// that captured a different volume, retained a different number of records, or
+/// reported a different omission shape, genuinely observed something the other
+/// pass did not.
+fn pass_omissions(
+    pass: &DiscriminatorPass,
+) -> (
+    Vec<BTreeSet<StreamEvidenceGap>>,
+    Vec<(StreamTransportStatus, StreamPersistenceStatus)>,
+    usize,
+) {
+    let declared: Vec<BTreeSet<StreamEvidenceGap>> = streams(pass)
+        .map(|stream| stream.gaps().iter().copied().collect())
+        .collect();
+    let transport: Vec<(StreamTransportStatus, StreamPersistenceStatus)> = streams(pass)
+        .map(|stream| (stream.transport(), stream.persistence()))
+        .collect();
+    (declared, transport, pass.retained.len())
+}
+
+/// The observed outcome of one pass: the stable part of its terminal
+/// [`ExitStatus`] and the evidence volume that outcome arrived with.
+///
+/// The disposition class alone is too coarse for this axis — the most obvious
+/// outcome divergence there is a run that keeps its `Completed` class and still
+/// changes its exit code — so the observed exit code and signal are decoded and
+/// compared too. `observed_at_unix_ms` is the one field deliberately left out:
+/// it is a per-pass wall-clock reading that differs by construction. A pass
+/// that published no exit observation at all is represented as `None`, so it
+/// still diverges from a pass that published a negative result instead.
+fn pass_outcome(pass: &DiscriminatorPass) -> PassOutcome {
+    PassOutcome {
+        exit: pass.exit.as_ref().map(exit_outcome),
+        captured: pass_raw_capture(pass),
+        retained: pass.retained.len(),
+    }
+}
+
+/// The terminal exit fact of one pass that is stable across the two runs.
+///
+/// The exit code and signal come off the executor's own wire value: see
+/// [`exit_outcome`]. `observed_at_unix_ms` is deliberately not a member, because
+/// it is an instant rather than an outcome and no two passes agree on it.
+#[derive(Debug, Eq, PartialEq)]
+struct PassOutcome {
+    /// Terminal disposition, observed exit code, and observed signal; `None`
+    /// when the pass published no exit status at all; and the decode failure
+    /// as text when it published one this driver cannot read. No two different
+    /// runs can share that failure, so an unreadable status is a divergence
+    /// and never a defaulted outcome two runs could match on.
+    exit: Option<Result<ExitOutcome, String>>,
+    /// Machine hash and length of the bytes the pass captured.
+    captured: Vec<(String, u64)>,
+    /// How many evidence records the pass's sink retained.
+    retained: usize,
+}
+
+/// The terminal exit fact read off one published [`ExitStatus`].
+///
+/// `ExitStatus` publishes its disposition through a getter but keeps `code` and
+/// `signal` private, and this crate may not change that type, so the wire value
+/// the type already serialises is decoded here to read the two payload fields
+/// that make the outcome axis more than a disposition class. The decode
+/// requires both keys to be present on that object, and an absent or malformed
+/// one is an `Err`, which the outcome axis scores as a divergence: a status
+/// this driver cannot read is never a defaulted `(None, None)` that two
+/// different runs could share. No field is renamed, re-derived, or otherwise
+/// invented on the way through, and `observed_at_unix_ms` is read past and
+/// discarded rather than compared.
+fn exit_outcome(status: &ExitStatus) -> Result<ExitOutcome, String> {
+    let object: BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(serde_json::to_value(status).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let payload = |key: &str| -> Result<Option<i32>, String> {
+        Ok(match object.get(key) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(raw) => Some(
+                serde_json::from_value::<i32>(raw.clone()).map_err(|error| error.to_string())?,
+            ),
+        })
+    };
+    Ok(ExitOutcome {
+        disposition: status.disposition(),
+        code: payload("code")?,
+        signal: payload("signal")?,
+    })
+}
+
+/// The comparable part of one [`ExitStatus`]: disposition, code, and signal.
+///
+/// The observation instant is absent by construction, so it cannot be compared
+/// even by accident.
+#[derive(Debug, Eq, PartialEq)]
+struct ExitOutcome {
+    /// Physical exit class the executor observed.
+    disposition: ExitDisposition,
+    /// Observed exit code, when the process produced one.
+    code: Option<i32>,
+    /// Observed termination signal, when one ended the process.
+    signal: Option<i32>,
+}
+
+/// The streams one pass actually published, in `ProcessStreamKind` order.
+///
+/// Returns only the streams the evidence really carries, so the caller
+/// compares over the streams that exist rather than over a placeholder for a
+/// missing one. A pass that published a different set of streams therefore
+/// yields a different vector length and genuinely diverges.
+fn streams(pass: &DiscriminatorPass) -> impl Iterator<Item = &ProcessStreamEvidence> {
+    [pass.evidence.stdout(), pass.evidence.stderr()]
+        .into_iter()
+        .flatten()
 }
 
 /// Dispatches the surface's I18.31 special case through the typed mechanic.
@@ -815,18 +1105,29 @@ fn fresh_key_bytes() -> [u8; 32] {
 }
 
 /// Runs the unchanged external discriminator over the real machine and returns
-/// the digest of the retained evidence it produced.
+/// the digest of the retained evidence it produced plus the observed material
+/// the five-axis comparison is computed from.
 ///
 /// The pass really launches the admitted child through the sole
 /// `WindowsProcessExecutor`, really observes it to a terminal lifecycle, and
 /// really reconciles the retained evidence; the returned digest binds exactly
-/// that retained evidence plus the sealed operation identity.
+/// that retained evidence plus the sealed operation identity, while
+/// [`DiscriminatorPass`] carries the observed axes of the same live run.
 fn run_discriminator(
     command: &DiscriminatorCommand,
     admission: &HarnessAdmission,
-) -> Result<EvidenceDigest, CliError> {
+) -> Result<(EvidenceDigest, DiscriminatorPass), CliError> {
     let child = run_child(command, admission)?;
-    Ok(EvidenceDigest::new(child.retained_sha256)?)
+    let digest = EvidenceDigest::new(child.retained_sha256.clone())?;
+    Ok((
+        digest,
+        DiscriminatorPass {
+            observed: child.observation,
+            exit: child.exit_status,
+            retained: child.retained_records,
+            evidence: child.evidence,
+        },
+    ))
 }
 
 /// The machine-derived identity of one really-observed child process.
@@ -850,6 +1151,18 @@ struct Child {
     observation: ChildObservation,
     /// Digest binding the retained terminal evidence of the run.
     retained_sha256: String,
+    /// The reconciled evidence the executor published for the run.
+    evidence: ProcessEvidence,
+    /// Terminal exit status the executor observed for the child. Its
+    /// disposition is the material the run's own evidence digest binds, and
+    /// the whole value is what the five-axis comparison reads.
+    exit_status: Option<ExitStatus>,
+    /// Terminal exit disposition the executor observed for the child, kept
+    /// beside the full status so the evidence-digest material below is the
+    /// same bytes it was before the status was retained whole.
+    exit_disposition: Option<ExitDisposition>,
+    /// The retained evidence record digests, in publication order.
+    retained_records: Vec<String>,
 }
 
 /// Observes one recorded child executable from the machine without launching it.
@@ -895,7 +1208,7 @@ fn run_child(
 ) -> Result<Child, CliError> {
     let executable = resolve_executable(&command.executable)?;
     let observed = observe_child_command(executable.as_path(), command.argv.as_slice())?;
-    let operation = operation_identity(command);
+    let operation = operation_identity(&observed.executable_path, &observed.argv);
     let issued_at_unix_ms = now_unix_ms().max(1);
     let inputs = ChildInputs {
         operation: operation.as_str(),
@@ -927,23 +1240,30 @@ fn run_child(
 
     // The digest binds the observed outcome, not an assertion about it: the
     // executor's own terminal exit disposition plus the retained evidence it
-    // published, so a diverging pass over the same command changes the digest
-    // and fails the comparison above.
+    // published, so a diverging pass over the same command changes the digest.
+    // The permit digest joins only this run's own bound evidence, never the
+    // five-axis comparison: it is minted from a fresh per-`DispatchCell` key
+    // and authority id, so it differs between the two passes by construction
+    // rather than by any difference in what the runs observed.
     let mut child = Child {
         observation: observed,
         retained_sha256: String::new(),
+        exit_status: view.exit().cloned(),
+        exit_disposition: view.exit().map(ExitStatus::disposition),
+        retained_records: sink.retained(),
+        evidence,
     };
     let mut material = format!(
         "self-change-retained\0{}\0{}\0{:?}\0{}\0{}",
         child.observation.content_digest,
         child.observation.environment_digest,
-        view.exit().map(eliot_process::ExitStatus::disposition),
-        evidence.operation_id().as_str(),
+        child.exit_disposition,
+        child.evidence.operation_id().as_str(),
         receipt.permit_digest(),
     );
-    for record in sink.retained() {
+    for record in &child.retained_records {
         material.push('\0');
-        material.push_str(&sha256_hex(record.as_bytes()));
+        material.push_str(record);
     }
     child.retained_sha256 = sha256_hex(material.as_bytes());
     Ok(child)
@@ -1489,13 +1809,15 @@ fn resolve_executable(path: &Path) -> Result<PathBuf, CliError> {
     })
 }
 
-/// The stable operation identity bound to one discriminator command.
-fn operation_identity(command: &DiscriminatorCommand) -> String {
-    let material = format!(
-        "{}\0{}",
-        command.executable.display(),
-        command.argv.join("\u{1}")
-    );
+/// The stable operation identity bound to one observed executable and argv.
+///
+/// Both the sealed request and the selection axis of the five-axis comparison
+/// derive their identity here, so a pass that selected a different command — or
+/// a different executable for it — is the same difference the sealed permit
+/// names. The machine-resolved path is what the child actually runs, so this is
+/// the observed value rather than the recorded one.
+fn operation_identity(executable: &str, argv: &[String]) -> String {
+    let material = format!("{executable}\0{}", argv.join("\u{1}"));
     format!(
         "self-change-discriminator-{}",
         &sha256_hex(material.as_bytes())[..24]
