@@ -19,6 +19,7 @@ use eliot_process::{
 use thiserror::Error;
 
 pub mod cache_lane;
+pub mod execution_envelope;
 pub mod process_owner;
 pub mod profile;
 pub mod profile_run;
@@ -27,6 +28,11 @@ pub mod registry;
 pub mod testd_port;
 
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
+pub use execution_envelope::{
+    BuildMode, EnvelopeError, ExecutionEnvelope, ExecutionEnvelopeAllocator,
+    GOVERNED_TARGET_DIR_ENV, GrantedResource, LANE_RECORD_FILE, LaneAttribution,
+    RuntimeEnvironmentLease, RuntimeResourceClaim, WorkItemRequest,
+};
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
     KernelInstrumentRequestPort, UnprovisionedKernelAdmission,
