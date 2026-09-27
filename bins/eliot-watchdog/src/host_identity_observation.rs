@@ -7,6 +7,7 @@
 //! canonical authority; and spool, composition, self-admission, or SCM
 //! authority. It emits observation evidence only.
 
+use eliot_platform::PlatformHandle;
 #[cfg(test)]
 use eliot_platform_windows::WindowsAdapterError;
 use eliot_platform_windows::{
@@ -441,6 +442,260 @@ pub(super) fn read_host_registration_runtime(
         "attempting read-only SCM registration readback"
     );
     project_service_runtime_inspection(platform.inspect_service_registration_runtime(registration))
+}
+
+/// Upper bound, in seconds, for one Watchdog responsiveness observation
+/// interval. Mirrors the bounded owner-queue guarantee on the Host endpoint
+/// side; a longer wait would outlive the queue and is refused at construction.
+pub const MAX_CHALLENGE_WAIT_SECS: u64 = 30;
+
+/// Bounded, cancellable observation interval for one responsiveness challenge.
+///
+/// Cancellation abandons the wait only: exactly as with the synchronous Event
+/// Log port, abandoning a waiter never interrupts an in-flight OS call, and a
+/// cancelled wait can never produce a responsiveness verdict — classification
+/// of a cancelled wait stays an explicit uncertainty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundedChallengeWait {
+    timeout_secs: u64,
+    cancelled: bool,
+}
+
+impl BoundedChallengeWait {
+    /// Opens a bounded wait. Refuses zero and over-bound intervals so no
+    /// unbounded observation can be constructed.
+    #[must_use]
+    pub const fn new(timeout_secs: u64) -> Option<Self> {
+        if timeout_secs == 0 || timeout_secs > MAX_CHALLENGE_WAIT_SECS {
+            return None;
+        }
+        Some(Self {
+            timeout_secs,
+            cancelled: false,
+        })
+    }
+
+    /// Abandons the wait. In-flight work is not interrupted; the outcome of a
+    /// cancelled wait is always classified as uncertainty, never health.
+    pub const fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+
+    /// Whether this wait was abandoned before a verdict.
+    #[must_use]
+    pub const fn is_cancelled(self) -> bool {
+        self.cancelled
+    }
+
+    /// The bounded interval, in seconds, granted to the owner contour.
+    #[must_use]
+    pub const fn timeout_secs(self) -> u64 {
+        self.timeout_secs
+    }
+}
+
+/// Why a challenge attempt cannot establish responsiveness. Missing
+/// authentication, a denied connection, a changed target, inadequate sensor
+/// coverage, a cancelled wait, or a non-live target stays an explicit
+/// uncertainty — never authenticated health and never automatic restart
+/// eligibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChallengeUncertainty {
+    /// The challenger could not authenticate to the owner path.
+    Unauthenticated,
+    /// The connection was denied before any owner answer.
+    ConnectionDenied,
+    /// The live target changed (or was never live) across the observation.
+    TargetChanged,
+    /// Sensor coverage was inadequate for a competent attempt.
+    InadequateCoverage,
+    /// The target was not live when the attempt completed.
+    TargetNotLive,
+}
+
+/// Outcome of one competently scoped challenge attempt against a validated
+/// live target. A response proves only the declared control property, not
+/// whole-product readiness; only the owner-path correlation validator (Host
+/// endpoint lane) can establish the positive case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChallengeAttemptOutcome {
+    /// The challenge reached the validated live owner contour and the bounded
+    /// wait expired with no correlated answer.
+    CompetentTimeout,
+    /// The attempt never became competent; see the explicit reason.
+    Uncertain(ChallengeUncertainty),
+}
+
+/// Watchdog responsiveness verdict separating liveness from control ownership.
+///
+/// `Running` from the read-only sensor is liveness evidence only, never
+/// control responsiveness: a live Host process whose control loop is stalled
+/// is reported as [`HostResponsiveness::AliveUnresponsive`], never as
+/// healthy. The positive case is established exclusively by the owner-path
+/// challenge/response correlation owned by the Host endpoint lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostResponsiveness {
+    /// The control owner answered the exact challenge within its bound.
+    /// Established only by the owner-path correlation validator.
+    Responsive,
+    /// Validated live target, competently attempted challenge, bounded wait
+    /// expired with no correlated owner answer.
+    AliveUnresponsive,
+    /// No verdict: the reason names what is unknown.
+    Uncertain(ChallengeUncertainty),
+}
+
+impl HostResponsiveness {
+    /// Decides recovery eligibility from this verdict, the
+    /// installation-approved policy, and the durable used-attempt count.
+    ///
+    /// An exhausted (or zero-budget) policy yields [`RecoveryBudgetDecision::Exhausted`]:
+    /// no SCM restart may be requested. `used_attempts` must be read from the
+    /// durable Watchdog journal (`watchdog.redb`) — never invented from a
+    /// constant and never reset by a Watchdog restart — so exhaustion persists
+    /// across restarts. Durable journaling of the decision itself is owned by
+    /// the Watchdog composition/spool lane (STITCH: no caller here by owner
+    /// rule, one writer per shared file).
+    #[must_use]
+    pub fn recovery_eligibility(
+        self,
+        policy: &ApprovedRecoveryPolicy,
+        used_attempts: u64,
+    ) -> RecoveryBudgetDecision {
+        match self {
+            Self::Responsive => RecoveryBudgetDecision::NoRecoveryRequired,
+            Self::Uncertain(_) => RecoveryBudgetDecision::ChallengeUnresolved,
+            Self::AliveUnresponsive => {
+                if used_attempts >= u64::from(policy.max_attempts) {
+                    RecoveryBudgetDecision::Exhausted
+                } else {
+                    RecoveryBudgetDecision::Admitted {
+                        remaining_attempts: u64::from(policy.max_attempts) - used_attempts,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Installation-approved recovery policy binding one SCM recovery operation.
+///
+/// Loaded from the installation's pre-authorized policy (installer lane owns
+/// service configuration and pre-authorization): exact service/installation,
+/// admissible Host owner-epoch lineage, permitted stop/start recipe identity,
+/// failure threshold, budget window, cooldown, concurrent-attempt exclusion,
+/// and audit-failure disposition. The read-only challenge permission must
+/// remain usable while the Host is hung; it cannot require a fresh grant from
+/// the very Host being recovered. Policy loading itself is STITCH (installer
+/// owner, out of scope for this lane).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedRecoveryPolicy {
+    /// Installation under recovery.
+    pub installation: PlatformHandle,
+    /// Exact approved service name (a name alone never authorizes an effect;
+    /// the SCM boundary revalidates registration, identity, and generation).
+    pub service: PlatformHandle,
+    /// Admissible Host owner-epoch lineage digest.
+    pub owner_epoch_digest: PlatformHandle,
+    /// Permitted stop/start recipe identity.
+    pub recipe_digest: PlatformHandle,
+    /// Consecutive responsiveness failures before one recovery attempt.
+    pub failure_threshold: u32,
+    /// Total recovery attempts admitted inside one budget window.
+    /// Zero is a valid policy: it admits nothing, every decision exhausts.
+    pub max_attempts: u32,
+    /// Budget window, in seconds; durable accounting requires a window.
+    pub budget_window_secs: u64,
+    /// Cooldown, in seconds, between two recovery attempts.
+    pub cooldown_secs: u64,
+    /// Whether concurrent recovery attempts must be excluded.
+    pub exclusive_attempt: bool,
+    /// Whether an audit-sink failure refuses effects instead of proceeding.
+    pub audit_failure_refuses_effects: bool,
+}
+
+impl ApprovedRecoveryPolicy {
+    /// Validates policy shape. Digest/handle shape is already enforced by the
+    /// original [`PlatformHandle::new`] validator at construction; this checks
+    /// only the numeric envelope a durable budget needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when no failure can ever be counted
+    /// (`failure_threshold` is zero) or when no durable window exists
+    /// (`budget_window_secs` is zero).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.failure_threshold == 0 {
+            return Err("recovery policy admits no countable failure".to_owned());
+        }
+        if self.budget_window_secs == 0 {
+            return Err("recovery policy has no durable budget window".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Pure recovery-budget decision. Only [`RecoveryBudgetDecision::Admitted`]
+/// permits requesting an SCM effect, and only through the fenced
+/// stop/start-separated operation record owned by the Host-state lane
+/// (`ScmOperationStore`); every other variant forbids effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryBudgetDecision {
+    /// No failure to recover: the owner answered.
+    NoRecoveryRequired,
+    /// One fenced recovery attempt is admitted; the count remaining in the
+    /// current durable window.
+    Admitted {
+        /// Attempts still admitted in this window, excluding this one.
+        remaining_attempts: u64,
+    },
+    /// Budget exhausted (or zero-budget policy): NO restart, no SCM effect.
+    /// Persists across Watchdog restarts via the durable used-attempt count.
+    Exhausted,
+    /// The challenge never resolved; eligibility is unknown, effects refused.
+    ChallengeUnresolved,
+}
+
+impl RecoveryBudgetDecision {
+    /// Whether this decision admits requesting one fenced SCM effect.
+    #[must_use]
+    pub const fn admits_effect(self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+}
+
+impl HostObservation {
+    /// Classifies liveness evidence plus one challenge attempt into a
+    /// responsiveness verdict. The read-only sensor is unchanged: this is a
+    /// pure function of already-observed evidence.
+    ///
+    /// With a validated live target (`Running`) and a competently attempted
+    /// challenge that timed out inside an uncancelled bounded wait, the
+    /// verdict is [`HostResponsiveness::AliveUnresponsive`]. A cancelled wait,
+    /// a non-live target, or an incompetent attempt stays an explicit
+    /// uncertainty. Target identity must be rechecked around the bounded
+    /// interval by the caller; this function classifies one instant only.
+    #[must_use]
+    pub fn responsiveness(
+        &self,
+        wait: &BoundedChallengeWait,
+        attempt: &ChallengeAttemptOutcome,
+    ) -> HostResponsiveness {
+        if wait.is_cancelled() {
+            return HostResponsiveness::Uncertain(ChallengeUncertainty::InadequateCoverage);
+        }
+        match (&self.state, attempt) {
+            (HostObservationState::Running, ChallengeAttemptOutcome::CompetentTimeout) => {
+                HostResponsiveness::AliveUnresponsive
+            }
+            (_, ChallengeAttemptOutcome::Uncertain(reason)) => {
+                HostResponsiveness::Uncertain(*reason)
+            }
+            (_, ChallengeAttemptOutcome::CompetentTimeout) => {
+                HostResponsiveness::Uncertain(ChallengeUncertainty::TargetNotLive)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
