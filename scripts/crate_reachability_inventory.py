@@ -213,6 +213,24 @@ class SourceFileEvidence:
     # is therefore not a source-level construction of the capability.
     raw_identifiers: tuple[str, ...] = ()
 
+    def to_json(self) -> dict[str, Any]:
+        """Project evidence for the report.
+
+        ``raw_identifiers`` stays internal: it exists only to separate documentation
+        references from code constructions and would otherwise dominate the output.
+        """
+        return {
+            "package_key": self.package_key,
+            "package_name": self.package_name,
+            "path": self.path,
+            "scope": self.scope,
+            "sha256": self.sha256,
+            "nonblank_loc": self.nonblank_loc,
+            "public_items": self.public_items,
+            "test_attributes": self.test_attributes,
+            "identifiers": list(self.identifiers),
+        }
+
 
 TEXT_INDICATORS: Final[tuple[tuple[str, str], ...]] = (
     ("NOT_IMPLEMENTED", "NOT_IMPLEMENTED_MARKER"),
@@ -1198,6 +1216,15 @@ def classify_unreachable_packages(
     for record in records:
         if record.package in record_by_package:
             raise InventoryError("DUPLICATE_DECISION_IDENTITY", f"duplicate decision for {record.package!r}")
+        if not isinstance(record.disposition, CrateExtractionDecision):
+            try:
+                record = dataclasses.replace(record, disposition=CrateExtractionDecision(record.disposition))
+            except ValueError as exc:
+                raise InventoryError(
+                    "MALFORMED_DECISION_DATA",
+                    f"{record.package}: disposition must be one of "
+                    f"{[item.value for item in CrateExtractionDecision]}, got {record.disposition!r}",
+                ) from exc
         record_by_package[record.package] = record
 
     orphan_decisions = [
@@ -1206,7 +1233,7 @@ def classify_unreachable_packages(
             "disposition": record.disposition.value,
             "defect": AdmissionDefect.DECISION_FOR_UNKNOWN_PACKAGE.value,
         }
-        for record in records
+        for record in record_by_package.values()
         if record.package not in known_names
     ]
 
@@ -1332,7 +1359,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
     # the aggregate means any edit to a disposition invalidates every row.
     decision_path = _inside(root, root / DECISION_DATA_RELPATH)
     decision_sha = _sha256(_read_bytes(root, decision_path, max_bytes=BOUNDS.max_source_file_bytes))
-    decision_revision, records = load_decision_records(root)
+    _, decision_revision, records = load_decision_records(root)
     as_of = as_of or datetime_now(timezone.utc).date()
     classifications, admission_defects, orphan_decisions = classify_unreachable_packages(
         packages,
@@ -1376,7 +1403,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
                 for disposition in CrateExtractionDecision
             },
         },
-        "source_files": [dataclasses.asdict(item) for item in source_files],
+        "source_files": [item.to_json() for item in source_files],
         "findings": findings,
         "summary": {
             "tracked_manifests": len(manifests),
