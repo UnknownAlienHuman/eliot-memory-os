@@ -553,6 +553,8 @@ fn stage_name(stage: &BlobCapacityStage) -> &'static str {
         BlobCapacityStage::JournalWrite => "JournalWrite",
         BlobCapacityStage::PayloadWrite => "PayloadWrite",
         BlobCapacityStage::MetadataWrite => "MetadataWrite",
+        BlobCapacityStage::FileFlush => "FileFlush",
+        BlobCapacityStage::DirectoryFlush => "DirectoryFlush",
         BlobCapacityStage::PayloadPublication => "PayloadPublication",
         BlobCapacityStage::MetadataPublication => "MetadataPublication",
         BlobCapacityStage::CommitWrite => "CommitWrite",
