@@ -32,8 +32,9 @@ use thiserror::Error;
 pub mod contract_rejection;
 pub use contract_rejection::{
     AdmissionDecision, AdmissionRejection, CORRECTED_RETRY_IDENTITY_RULE, ContractAdmissionJournal,
-    ContractRejectionError, SafeCaptureFallback, StageState, WriteMutationStatus,
-    collect_contract_errors, derive_rejection_id,
+    ContractRejectionError, CorrectionLineageError, RetainedRejection, RetainedRejections,
+    SafeCaptureFallback, StageState, UNPROVEN_CORRECTION_LINEAGE, WriteMutationStatus,
+    collect_contract_errors, derive_corrected_operation_id, derive_rejection_id,
 };
 pub mod epistemic_revision;
 pub mod write_envelope;
