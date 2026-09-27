@@ -26,8 +26,9 @@ mod supervision_lease;
 mod watchdog_admission;
 
 pub use control_reserve::{
-    BottleneckCoverageState, CapacityBottleneck, CapacityClass, CapacityUnit,
-    ControlOperationClass, EmergencyOperationClass, NormalWorkClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckOwnerBinding, CapacityBottleneck,
+    CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit, ControlOperationClass,
+    ControlReserveProfile, EmergencyOperationClass, NormalWorkClass, frozen_bottleneck_owner_map,
 };
 pub use i14_backpressure::{
     AffectedOperationClass, BottleneckAvailability, BottleneckObservationV1,
