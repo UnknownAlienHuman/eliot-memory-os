@@ -2304,7 +2304,7 @@ fn passing_dimension_result(
 ) -> QualityDimensionResult {
     QualityDimensionResult {
         dimension,
-        passed: true,
+        state: QualityDimensionState::Passed,
         evidence: vec![id(evidence)],
         measurements: Vec::new(),
         failed_invariant: None,
@@ -2471,7 +2471,7 @@ fn each_quality_dimension_fails_independently() {
             .iter_mut()
             .find(|result| result.dimension == dimension)
             .expect("dimension present");
-        result.passed = false;
+        result.state = QualityDimensionState::Failed;
         result.failed_invariant = Some(id("failed-invariant"));
         single_failure
             .validate()
@@ -2483,12 +2483,12 @@ fn each_quality_dimension_fails_independently() {
         let failed = single_failure
             .results
             .iter()
-            .filter(|result| !result.passed)
+            .filter(|result| !result.state.is_pass())
             .count();
         assert_eq!(failed, 1, "exactly one dimension fails");
         for result in &single_failure.results {
             if result.dimension != dimension {
-                assert!(result.passed, "sibling dimension must stay passed");
+                assert!(result.state.is_pass(), "sibling dimension must stay passed");
                 assert_eq!(result.failed_invariant, None);
                 assert!(result.unknown_evidence.is_empty());
             }
@@ -2521,7 +2521,7 @@ fn unknown_mandatory_quality_evidence_prevents_complete_quality() {
     // Unknown evidence on an explicit failure validates structurally but
     // never reports a complete valid quality outcome.
     let mut unknown_fail = baseline.clone();
-    unknown_fail.results[0].passed = false;
+    unknown_fail.results[0].state = QualityDimensionState::Failed;
     unknown_fail.results[0].failed_invariant = None;
     unknown_fail.results[0].unknown_evidence = vec![id("unknown-evidence")];
     unknown_fail
@@ -2532,7 +2532,7 @@ fn unknown_mandatory_quality_evidence_prevents_complete_quality() {
     // A failure with neither a failed invariant nor unknown evidence is
     // rejected instead of silently counting as covered.
     let mut bare_failure = baseline.clone();
-    bare_failure.results[0].passed = false;
+    bare_failure.results[0].state = QualityDimensionState::Failed;
     bare_failure.results[0].evidence = Vec::new();
     assert_eq!(
         bare_failure.validate(),
@@ -2547,7 +2547,7 @@ fn unknown_mandatory_quality_evidence_prevents_complete_quality() {
             .iter_mut()
             .find(|result| result.dimension == dimension)
             .expect("dimension present");
-        result.passed = false;
+        result.state = QualityDimensionState::Failed;
         result.unknown_evidence = vec![id("unknown-evidence")];
         assert_ne!(candidate.all_pass(), Ok(true));
     }
@@ -2562,13 +2562,17 @@ fn no_scalar_weighted_or_average_quality_compensation_path() {
 
     // Eleven passes cannot compensate for one explicit failure.
     let mut one_failed = baseline.clone();
-    one_failed.results[0].passed = false;
+    one_failed.results[0].state = QualityDimensionState::Failed;
     one_failed.results[0].failed_invariant = Some(id("failed-invariant"));
     assert!(!one_failed.all_pass().expect("one failure evaluated"));
 
     // Extra evidence on the eleven passing dimensions cannot flip the failure.
     let mut padded = one_failed.clone();
-    for result in padded.results.iter_mut().filter(|result| result.passed) {
+    for result in padded
+        .results
+        .iter_mut()
+        .filter(|result| result.state.is_pass())
+    {
         result.evidence.push(id("extra-evidence"));
     }
     padded.validate().expect("padded evidence validates");

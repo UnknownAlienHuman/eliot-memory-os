@@ -235,7 +235,7 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
             .into_iter()
             .map(|dimension| QualityDimensionResult {
                 dimension,
-                passed: true,
+                state: QualityDimensionState::Passed,
                 evidence: vec![id("quality-evidence")],
                 measurements: Vec::new(),
                 failed_invariant: None,
@@ -1995,12 +1995,12 @@ fn each_quality_dimension_fails_independently() {
     assert_eq!(base.results.len(), 12);
     for index in 0..12 {
         let mut failed = base.clone();
-        failed.results[index].passed = false;
+        failed.results[index].state = QualityDimensionState::Failed;
         failed.results[index].failed_invariant = Some(id("failed-invariant"));
         failed.results[index].unknown_evidence.clear();
         for (other, result) in failed.results.iter().enumerate() {
             if other != index {
-                assert!(result.passed, "other eleven stay unchanged");
+                assert!(result.state.is_pass(), "other eleven stay unchanged");
             }
         }
         let result = assemble_active_view(
@@ -2013,7 +2013,7 @@ fn each_quality_dimension_fails_independently() {
         match result {
             Err(AssemblyError::QualityIncomplete(scorecard)) => {
                 assert_eq!(scorecard.results.len(), 12);
-                assert!(!scorecard.results[index].passed);
+                assert!(!scorecard.results[index].state.is_pass());
             }
             other => panic!("dimension {index} must block complete, got {other:?}"),
         }
@@ -2026,7 +2026,7 @@ fn unknown_mandatory_quality_blocks_complete() {
     let value = admitted();
     let context = value.binding.clone();
     let mut unknown = quality(&context);
-    unknown.results[0].passed = false;
+    unknown.results[0].state = QualityDimensionState::Failed;
     unknown.results[0].failed_invariant = None;
     unknown.results[0].unknown_evidence = vec![id("unknown-evidence")];
     let result = assemble_active_view(
@@ -2059,7 +2059,7 @@ fn no_scalar_weighted_average_compensation() {
     for result in compensated.results.iter_mut().skip(1) {
         result.evidence.push(id("extra-evidence"));
     }
-    compensated.results[0].passed = false;
+    compensated.results[0].state = QualityDimensionState::Failed;
     compensated.results[0].failed_invariant = Some(id("failed-invariant"));
     compensated.results[0].unknown_evidence.clear();
     assert!(
@@ -2112,7 +2112,7 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
     assert!(matches!(upstream, Err(AssemblyError::Incomplete(_))));
 
     let mut failed_quality = quality(&complete_context);
-    failed_quality.results[0].passed = false;
+    failed_quality.results[0].state = QualityDimensionState::Failed;
     failed_quality.results[0].failed_invariant = Some(id("failed-invariant"));
     failed_quality.results[0].unknown_evidence.clear();
     let material = assemble_active_view(

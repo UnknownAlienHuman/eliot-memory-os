@@ -2,7 +2,7 @@
 
 use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
-    QualityScorecard, SerializedContextMeasurement,
+    QualityOperation, QualityScorecard, SerializedContextMeasurement,
 };
 
 use crate::{AssemblyError, bounds, measurement, render};
@@ -122,7 +122,7 @@ where
         }
         return Err(error.into());
     }
-    if !quality.results.iter().all(|result| result.passed) {
+    if quality.suitability(QualityOperation::Compile, &[]).is_err() {
         return Err(AssemblyError::QualityIncomplete(Box::new(quality)));
     }
     let expected_fence_digest =
