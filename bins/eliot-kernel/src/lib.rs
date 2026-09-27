@@ -3974,8 +3974,11 @@ impl KernelComposition {
     /// runtime shutdown still proceeds. Host carries the linearized decision
     /// into `DrainCommitRecord`; Watchdog observes it through the journal.
     pub async fn shutdown(&self) -> Result<ShutdownOutcome, ProcessExecutionError> {
-        let coordinator = coordinator_for(&self.work_root);
-        coordinator.request_shutdown();
+        let coordinator =
+            coordinator_for(&self.work_root).map_err(ProcessExecutionError::Unavailable)?;
+        coordinator
+            .request_shutdown()
+            .map_err(ProcessExecutionError::Unavailable)?;
         let drain = self.run_shutdown_drain(&coordinator).await;
         let process_result = self
             .process_gateway
@@ -3993,7 +3996,9 @@ impl KernelComposition {
             pending.push("runtime-orphans-retained".to_owned());
         }
         if drain.is_ok() && pending.is_empty() {
-            coordinator.complete_terminal(ShutdownTerminal::Intentional);
+            coordinator
+                .complete_terminal(ShutdownTerminal::Intentional)
+                .map_err(ProcessExecutionError::Unavailable)?;
         } else {
             if pending.is_empty() {
                 pending.push(
@@ -4004,7 +4009,9 @@ impl KernelComposition {
                         .to_owned(),
                 );
             }
-            coordinator.complete_terminal(ShutdownTerminal::Incomplete { pending });
+            coordinator
+                .complete_terminal(ShutdownTerminal::Incomplete { pending })
+                .map_err(ProcessExecutionError::Unavailable)?;
         }
         coordinator.observe_published_state();
         process_result?;
@@ -4023,9 +4030,6 @@ impl KernelComposition {
         coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
     ) -> Result<DrainCommitDecision, DrainHalt> {
         let generation = coordinator.drain_generation();
-        let resumed_note = coordinator
-            .recovery_interrupted()
-            .then_some(":resumed-interrupted");
         let record = |phase: ShutdownPhase, evidence: String| {
             coordinator
                 .record_phase(phase, evidence)
@@ -4037,15 +4041,12 @@ impl KernelComposition {
         match self.apply_control(KernelControlCommand::Drain) {
             Ok(state) => record(
                 ShutdownPhase::AdmissionsClosed,
-                format!(
-                    "service-drain-admitted:{state}{}",
-                    resumed_note.unwrap_or("")
-                ),
+                format!("service-drain-admitted:{state}"),
             )?,
             Err(_) => match self.service_state() {
                 Ok(KernelServiceState::Draining | KernelServiceState::Stopped) => record(
                     ShutdownPhase::AdmissionsClosed,
-                    format!("service-already-draining{}", resumed_note.unwrap_or("")),
+                    "service-already-draining".to_owned(),
                 )?,
                 _ => return Err(DrainHalt::new("admissions-close-rejected")),
             },
@@ -4085,13 +4086,16 @@ impl KernelComposition {
             .pending_rebind_receipts()
             .map_err(|_| DrainHalt::new("ors-rebind-scan-failed"))?
         {
-            coordinator.register_pending_receipt(identity);
+            coordinator
+                .register_pending_receipt(identity)
+                .map_err(|_| DrainHalt::new("durable-pending-receipt-unavailable"))?;
         }
         let remainder = coordinator
             .reconcile_pending_to_deadline(DRAIN_RECEIPT_DEADLINE, || {
-                self.pending_rebind_receipts().unwrap_or_default()
+                self.pending_rebind_receipts()
             })
-            .await;
+            .await
+            .map_err(|_| DrainHalt::new("durable-receipt-reconciliation-unavailable"))?;
         if !remainder.is_empty() {
             return Err(DrainHalt::with_pending(
                 "receipt-reconciliation-incomplete",

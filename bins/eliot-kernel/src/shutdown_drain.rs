@@ -35,7 +35,10 @@
 //! is made by this slice.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +57,19 @@ const DRAIN_STATE_VERSION: u32 = 1;
 
 /// Poll interval for the bounded receipt-reconciliation wait.
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+static DRAIN_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn durable_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)?;
+    File::open(destination)?.sync_all()?;
+    #[cfg(unix)]
+    {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
 
 /// F-LOG-KERNEL-4 style observation for the shutdown boundary: fixed event
 /// plus bounded outcome only, never digests, epochs, or owner error strings.
@@ -252,6 +268,7 @@ struct DurableDrainState {
     pending: Vec<String>,
 }
 
+#[derive(Clone)]
 struct CoordinatorState {
     generation: String,
     requested: bool,
@@ -307,51 +324,123 @@ fn registry() -> &'static Mutex<BTreeMap<PathBuf, Arc<ShutdownDrainCoordinator>>
     REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
+    if durable.version != DRAIN_STATE_VERSION {
+        return Err("shutdown state version is unsupported".to_owned());
+    }
+    if durable.generation.trim().is_empty() {
+        return Err("shutdown state generation is empty".to_owned());
+    }
+
+    let mut phases = BTreeMap::new();
+    for (order, evidence) in &durable.phases {
+        if usize::from(*order) >= ShutdownPhase::ORDERED.len() || evidence.trim().is_empty() {
+            return Err("shutdown state contains invalid phase evidence".to_owned());
+        }
+        if phases.insert(*order, evidence).is_some() {
+            return Err("shutdown state contains duplicate phase evidence".to_owned());
+        }
+    }
+    if let Some(last_order) = phases.keys().next_back().copied()
+        && (0..=last_order).any(|order| !phases.contains_key(&order))
+    {
+        return Err("shutdown state phases are not an ordered prefix".to_owned());
+    }
+    if phases.contains_key(&ShutdownPhase::IntentionalPublished.order())
+        && durable.committed.is_none()
+    {
+        return Err("shutdown state publishes before drain linearization".to_owned());
+    }
+
+    if let Some(committed) = &durable.committed {
+        if !durable.requested
+            || durable.cancelled
+            || committed.generation != durable.generation
+            || ShutdownPhase::PRE_COMMIT
+                .iter()
+                .any(|phase| !phases.contains_key(&phase.order()))
+        {
+            return Err("shutdown state has an invalid drain commit".to_owned());
+        }
+        if durable.terminal.is_none() && !durable.pending.is_empty() {
+            return Err("committed shutdown has pending work without a terminal".to_owned());
+        }
+    }
+
+    if let Some(terminal) = &durable.terminal {
+        if !durable.requested {
+            return Err("shutdown state has a terminal without a request".to_owned());
+        }
+        if matches!(terminal, ShutdownTerminal::Intentional)
+            && (durable.committed.is_none()
+                || durable.cancelled
+                || !durable.pending.is_empty()
+                || ShutdownPhase::ORDERED
+                    .iter()
+                    .any(|phase| !phases.contains_key(&phase.order())))
+        {
+            return Err("shutdown state has an invalid intentional terminal".to_owned());
+        }
+    } else if !durable.requested
+        && (durable.cancelled || durable.committed.is_some() || !phases.is_empty())
+    {
+        return Err("shutdown state has drain progress without a request".to_owned());
+    }
+    Ok(())
+}
+
 /// Returns the process-wide coordinator for one Kernel `work_root`,
 /// recovering durable state from a previous process when present.
-pub(crate) fn coordinator_for(work_root: &Path) -> Arc<ShutdownDrainCoordinator> {
+pub(crate) fn coordinator_for(work_root: &Path) -> Result<Arc<ShutdownDrainCoordinator>, String> {
     let path = work_root.join(".eliot").join(DRAIN_STATE_FILE);
     let mut guard = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = guard.get(&path) {
-        return Arc::clone(existing);
+        return Ok(Arc::clone(existing));
     }
-    let coordinator = Arc::new(ShutdownDrainCoordinator::load(path.clone()));
+    let coordinator = Arc::new(ShutdownDrainCoordinator::load(path.clone())?);
     guard.insert(path, Arc::clone(&coordinator));
-    coordinator
+    Ok(coordinator)
 }
 
 impl ShutdownDrainCoordinator {
-    fn load(path: PathBuf) -> Self {
-        let mut state = CoordinatorState::fresh(fresh_generation());
-        let persisted: Option<DurableDrainState> = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .filter(|durable: &DurableDrainState| durable.version == DRAIN_STATE_VERSION);
-        if let Some(durable) = persisted {
-            state.generation = durable.generation;
-            state.requested = durable.requested;
-            state.cancelled = durable.cancelled;
-            state.phases = durable.phases.into_iter().collect();
-            state.committed = durable.committed;
-            state.terminal = durable.terminal;
-            state.pending = durable.pending.into_iter().collect();
-            // Requested without a terminal means a previous process died
-            // mid-drain: an interrupted drain, not an intentional stop.
-            // Pending work is already retained above; nothing is discarded.
-            state.recovered_interrupted = state.requested && state.terminal.is_none();
-            if state.recovered_interrupted {
-                observe_shutdown("kernel.shutdown.interrupted_recovered", "recovered");
+    fn load(path: PathBuf) -> Result<Self, String> {
+        let mut state = match fs::read(&path) {
+            Ok(bytes) => {
+                let durable: DurableDrainState = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("shutdown state is unreadable: {error}"))?;
+                validate_durable_state(&durable)?;
+                let mut state = CoordinatorState::fresh(durable.generation);
+                state.requested = durable.requested;
+                state.cancelled = durable.cancelled;
+                state.phases = durable.phases.into_iter().collect();
+                state.committed = durable.committed;
+                state.terminal = durable.terminal;
+                state.pending = durable.pending.into_iter().collect();
+                state
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                CoordinatorState::fresh(fresh_generation())
+            }
+            Err(error) => {
+                return Err(format!("shutdown state cannot be read: {error}"));
+            }
+        };
+        // Requested without a terminal means a previous process died
+        // mid-drain: an interrupted drain, not an intentional stop.
+        // Pending work is already retained above; nothing is discarded.
+        state.recovered_interrupted = state.requested && state.terminal.is_none();
+        if state.recovered_interrupted {
+            observe_shutdown("kernel.shutdown.interrupted_recovered", "recovered");
         }
-        Self {
+        Ok(Self {
             path,
             state: Mutex::new(state),
-        }
+        })
     }
 
-    fn persist_locked(&self, state: &CoordinatorState) {
+    fn persist_state(&self, state: &CoordinatorState) -> Result<(), String> {
         let durable = DurableDrainState {
             version: DRAIN_STATE_VERSION,
             generation: state.generation.clone(),
@@ -366,19 +455,51 @@ impl ShutdownDrainCoordinator {
             terminal: state.terminal.clone(),
             pending: state.pending.iter().cloned().collect(),
         };
-        let payload = serde_json::to_vec(&durable).unwrap_or_default();
-        if payload.is_empty() {
-            observe_shutdown("kernel.shutdown.persist_failed", "rejected");
-            return;
-        }
-        let tmp = self.path.with_extension("json.tmp");
+        let payload = match serde_json::to_vec(&durable) {
+            Ok(payload) => payload,
+            Err(error) => {
+                observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+                return Err(format!("shutdown state serialization failed: {error}"));
+            }
+        };
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let stored = std::fs::create_dir_all(parent)
-            .and_then(|()| std::fs::write(&tmp, &payload))
-            .and_then(|()| std::fs::rename(&tmp, &self.path));
-        if stored.is_err() {
+        if let Err(error) = fs::create_dir_all(parent) {
             observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+            return Err(format!(
+                "shutdown state directory cannot be created: {error}"
+            ));
         }
+
+        let (temp_path, mut temp_file) = loop {
+            let sequence = DRAIN_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temp_path = parent.join(format!(
+                "kernel-shutdown-drain-{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => break (temp_path, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+                    return Err(format!("shutdown state staging failed: {error}"));
+                }
+            }
+        };
+        let write_result = temp_file
+            .write_all(&payload)
+            .and_then(|()| temp_file.sync_all());
+        drop(temp_file);
+        let stored = write_result.and_then(|()| durable_replace(&temp_path, &self.path));
+        if let Err(error) = stored {
+            let _ = fs::remove_file(&temp_path);
+            observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+            return Err(format!("shutdown state persistence failed: {error}"));
+        }
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CoordinatorState> {
@@ -387,26 +508,26 @@ impl ShutdownDrainCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records the shutdown request. Returns true only for the first request
-    /// of a drain generation; repeats and resumes return false.
-    pub(crate) fn request_shutdown(&self) -> bool {
+    /// Records the shutdown request. Returns true for a new generation,
+    /// including recovery of an interrupted drain; live repeats return false.
+    pub(crate) fn request_shutdown(&self) -> Result<bool, String> {
         let mut state = self.lock();
-        if state.requested && state.terminal.is_none() {
-            return false;
+        if state.requested && state.terminal.is_none() && !state.recovered_interrupted {
+            return Ok(false);
         }
-        // A previous incomplete terminal retains its pending work into the
-        // fresh generation instead of discarding it.
-        let carried = state
-            .terminal
-            .as_ref()
-            .map_or_else(Vec::new, ShutdownTerminal::pending);
-        let generation = fresh_generation();
-        *state = CoordinatorState::fresh(generation);
-        state.requested = true;
-        state.pending = carried.into_iter().collect();
-        self.persist_locked(&state);
+        // An interrupted generation cannot replay prior phase evidence as
+        // current work. Start a fresh generation and retain unresolved work.
+        let mut carried = state.pending.clone();
+        if let Some(terminal) = &state.terminal {
+            carried.extend(terminal.pending());
+        }
+        let mut candidate = CoordinatorState::fresh(fresh_generation());
+        candidate.requested = true;
+        candidate.pending = carried;
+        self.persist_state(&candidate)?;
+        *state = candidate;
         observe_shutdown("kernel.shutdown.requested", "admitted");
-        true
+        Ok(true)
     }
 
     /// Current drain generation identity (linearization correlation).
@@ -414,13 +535,8 @@ impl ShutdownDrainCoordinator {
         self.lock().generation.clone()
     }
 
-    /// True when a previous process left a requested-but-unterminated drain.
-    pub(crate) fn recovery_interrupted(&self) -> bool {
-        self.lock().recovered_interrupted
-    }
-
     /// Records one ordered phase with its evidence. Phases must arrive in
-    /// order; repeats overwrite evidence idempotently. Only
+    /// order; identical repeats are idempotent. Only
     /// `IntentionalPublished` may follow the linearization point.
     ///
     /// # Errors
@@ -455,29 +571,65 @@ impl ShutdownDrainCoordinator {
                 ));
             }
         }
-        state.phases.insert(phase.order(), evidence);
-        self.persist_locked(&state);
+        if phase == ShutdownPhase::IntentionalPublished && state.committed.is_none() {
+            return Err("intentional publication before drain linearization".to_owned());
+        }
+        if let Some(existing) = state.phases.get(&phase.order()) {
+            if existing != &evidence {
+                return Err("phase evidence cannot be rewritten".to_owned());
+            }
+            return Ok(());
+        }
+        let mut candidate = state.clone();
+        candidate.phases.insert(phase.order(), evidence);
+        self.persist_state(&candidate)?;
+        *state = candidate;
         Ok(())
     }
 
     /// Registers one pending receipt/operation that must resolve before the
     /// canonical-drain gate completes.
-    pub(crate) fn register_pending_receipt(&self, identity: String) {
+    pub(crate) fn register_pending_receipt(&self, identity: String) -> Result<(), String> {
         let mut state = self.lock();
-        if !identity.trim().is_empty() {
-            state.pending.insert(identity);
-            self.persist_locked(&state);
+        if identity.trim().is_empty() {
+            return Ok(());
         }
+        if state.committed.is_some() || state.terminal.is_some() {
+            return Err("pending receipt registration after drain commit".to_owned());
+        }
+        if state.pending.contains(&identity) {
+            return Ok(());
+        }
+        let mut candidate = state.clone();
+        candidate.pending.insert(identity);
+        self.persist_state(&candidate)?;
+        *state = candidate;
+        Ok(())
     }
 
     /// Marks one pending receipt/operation resolved. Resolution normally
     /// arrives through [`Self::reconcile_pending_to_deadline`]'s rescan;
     /// this covers resolvers that already hold the exact identity.
-    pub(crate) fn resolve_pending_receipt(&self, identity: &str) {
+    pub(crate) fn resolve_pending_receipt(&self, identity: &str) -> Result<(), String> {
         let mut state = self.lock();
-        if state.pending.remove(identity) {
-            self.persist_locked(&state);
+        let terminal_pending = matches!(
+            &state.terminal,
+            Some(ShutdownTerminal::Incomplete { pending })
+                if pending
+                    .iter()
+                    .any(|pending_identity| pending_identity == identity)
+        );
+        if !state.pending.contains(identity) && !terminal_pending {
+            return Ok(());
         }
+        let mut candidate = state.clone();
+        candidate.pending.remove(identity);
+        if let Some(ShutdownTerminal::Incomplete { pending }) = &mut candidate.terminal {
+            pending.retain(|pending_identity| pending_identity != identity);
+        }
+        self.persist_state(&candidate)?;
+        *state = candidate;
+        Ok(())
     }
 
     /// Currently unresolved pending receipts/operations.
@@ -502,24 +654,39 @@ impl ShutdownDrainCoordinator {
     pub(crate) async fn reconcile_pending_to_deadline(
         &self,
         deadline: Duration,
-        mut rescan: impl FnMut() -> Vec<String>,
-    ) -> Vec<String> {
+        mut rescan: impl FnMut() -> Result<Vec<String>, String>,
+    ) -> Result<Vec<String>, String> {
         let start = Instant::now();
         loop {
-            let mut merged: BTreeSet<String> = self.pending_receipts().into_iter().collect();
-            merged.extend(rescan());
-            // Drop registry entries the rescan proves resolved elsewhere.
-            let keep = merged.clone();
-            {
+            let baseline: BTreeSet<String> = self.pending_receipts().into_iter().collect();
+            let rescanned: BTreeSet<String> = rescan()?
+                .into_iter()
+                .filter(|identity| !identity.trim().is_empty())
+                .collect();
+            let merged = {
                 let mut state = self.lock();
-                state.pending.retain(|identity| keep.contains(identity));
-            }
+                if state.committed.is_some() || state.terminal.is_some() {
+                    return Err("receipt reconciliation after drain commit".to_owned());
+                }
+                let mut candidate = state.clone();
+                // Only remove entries present in the snapshot being rescanned;
+                // concurrent registrations remain pending for the next tick.
+                for identity in baseline.difference(&rescanned) {
+                    candidate.pending.remove(identity);
+                }
+                candidate.pending.extend(rescanned.iter().cloned());
+                if candidate.pending != state.pending {
+                    self.persist_state(&candidate)?;
+                    *state = candidate;
+                }
+                state.pending.clone()
+            };
             if merged.is_empty() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             if start.elapsed() >= deadline {
                 observe_shutdown("kernel.shutdown.receipt_deadline_expired", "incomplete");
-                return merged.into_iter().collect();
+                return Ok(merged.into_iter().collect());
             }
             tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
         }
@@ -566,8 +733,10 @@ impl ShutdownDrainCoordinator {
         if decision.generation != state.generation {
             return Err("drain decision carries a foreign generation".to_owned());
         }
-        state.committed = Some(decision);
-        self.persist_locked(&state);
+        let mut candidate = state.clone();
+        candidate.committed = Some(decision);
+        self.persist_state(&candidate)?;
+        *state = candidate;
         observe_shutdown("kernel.shutdown.drain_committed", "committed");
         Ok(())
     }
@@ -577,23 +746,33 @@ impl ShutdownDrainCoordinator {
     /// the caller must await a fresh generation (`QueueNextGeneration`);
     /// a pre-drain lease or handle presented after linearization is stale
     /// (`RejectStale`). Without an active drain the request proceeds.
-    pub(crate) fn classify_wake(&self, lease_generation: Option<&str>) -> DrainWakeDisposition {
+    pub(crate) fn classify_wake(
+        &self,
+        lease_generation: Option<&str>,
+    ) -> Result<DrainWakeDisposition, String> {
         let mut state = self.lock();
-        if !state.requested || state.terminal.is_some() {
-            return DrainWakeDisposition::Proceed;
+        if !state.requested {
+            return Ok(DrainWakeDisposition::Proceed);
         }
-        let Some(committed) = state.committed.as_ref() else {
-            state.cancelled = true;
-            self.persist_locked(&state);
+        if let Some(committed) = state.committed.as_ref() {
+            return Ok(match lease_generation {
+                Some(presented) if presented == committed.generation => {
+                    DrainWakeDisposition::RejectStale
+                }
+                _ => DrainWakeDisposition::QueueNextGeneration,
+            });
+        }
+        if state.terminal.is_some() {
+            return Ok(DrainWakeDisposition::QueueNextGeneration);
+        }
+        if !state.cancelled {
+            let mut candidate = state.clone();
+            candidate.cancelled = true;
+            self.persist_state(&candidate)?;
+            *state = candidate;
             observe_shutdown("kernel.shutdown.drain_cancelled_by_wake", "cancelled");
-            return DrainWakeDisposition::CancelDrain;
-        };
-        match lease_generation {
-            Some(presented) if presented == committed.generation => {
-                DrainWakeDisposition::RejectStale
-            }
-            _ => DrainWakeDisposition::QueueNextGeneration,
         }
+        Ok(DrainWakeDisposition::CancelDrain)
     }
 
     /// Handles one activation request arriving during shutdown: cancels
@@ -601,40 +780,65 @@ impl ShutdownDrainCoordinator {
     /// activation so the caller re-establishes a fresh generation. The Kernel
     /// service independently fences `Activate` from `Draining`; this records
     /// the race disposition for evidence.
-    pub(crate) fn on_activate_request(&self) -> DrainWakeDisposition {
+    pub(crate) fn on_activate_request(&self) -> Result<DrainWakeDisposition, String> {
         self.classify_wake(None)
     }
 
     /// Records the durable terminal. The first terminal wins; `Incomplete`
     /// retains its pending work. Intentional requires a prior linearization.
-    pub(crate) fn complete_terminal(&self, terminal: ShutdownTerminal) {
+    pub(crate) fn complete_terminal(&self, terminal: ShutdownTerminal) -> Result<(), String> {
         let mut state = self.lock();
-        if state.terminal.is_some() {
-            return;
+        if let Some(existing) = &state.terminal {
+            return if existing == &terminal {
+                Ok(())
+            } else {
+                Err("drain generation already has a different terminal".to_owned())
+            };
         }
-        if matches!(terminal, ShutdownTerminal::Intentional) && state.committed.is_none() {
-            state.terminal = Some(ShutdownTerminal::Incomplete {
-                pending: state.pending.iter().cloned().collect(),
-            });
-            self.persist_locked(&state);
-            observe_shutdown("kernel.shutdown.terminal_intentional_denied", "incomplete");
-            return;
+        if !state.requested {
+            return Err("no shutdown requested".to_owned());
         }
-        if let ShutdownTerminal::Incomplete { pending } = &terminal {
-            for identity in pending {
-                if !identity.trim().is_empty() {
-                    state.pending.insert(identity.clone());
+        let mut candidate = state.clone();
+        let (terminal, event) = match terminal {
+            ShutdownTerminal::Intentional => {
+                if candidate.committed.is_none() {
+                    return Err("intentional terminal before drain linearization".to_owned());
                 }
+                if candidate.cancelled {
+                    return Err("cancelled drain cannot complete intentionally".to_owned());
+                }
+                if !candidate
+                    .phases
+                    .contains_key(&ShutdownPhase::IntentionalPublished.order())
+                {
+                    return Err("intentional publication phase is missing".to_owned());
+                }
+                if !candidate.pending.is_empty() {
+                    return Err("pending work prevents intentional terminal".to_owned());
+                }
+                (
+                    ShutdownTerminal::Intentional,
+                    "kernel.shutdown.terminal_intentional",
+                )
             }
-        }
-        let event = if matches!(terminal, ShutdownTerminal::Intentional) {
-            "kernel.shutdown.terminal_intentional"
-        } else {
-            "kernel.shutdown.terminal_incomplete"
+            ShutdownTerminal::Incomplete { pending } => {
+                candidate.pending.extend(
+                    pending
+                        .into_iter()
+                        .filter(|identity| !identity.trim().is_empty()),
+                );
+                let retained = candidate.pending.iter().cloned().collect();
+                (
+                    ShutdownTerminal::Incomplete { pending: retained },
+                    "kernel.shutdown.terminal_incomplete",
+                )
+            }
         };
-        state.terminal = Some(terminal);
-        self.persist_locked(&state);
+        candidate.terminal = Some(terminal);
+        self.persist_state(&candidate)?;
+        *state = candidate;
         observe_shutdown(event, "recorded");
+        Ok(())
     }
 
     /// Read-only bounded drain disposition for the Kernel operational view.
@@ -758,8 +962,8 @@ mod shutdown_drain_tests {
     #[tokio::test]
     async fn normal_shutdown_records_ordered_phases_and_linearizes_to_intentional() {
         let root = test_work_root("normal");
-        let coordinator = coordinator_for(&root);
-        assert!(coordinator.request_shutdown());
+        let coordinator = coordinator_for(&root).expect("new drain coordinator loads");
+        assert!(coordinator.request_shutdown().expect("shutdown persists"));
 
         // Out-of-order phases are rejected: the receipt gate cannot precede
         // admission closure.
@@ -775,7 +979,9 @@ mod shutdown_drain_tests {
 
         // Receipt reconciliation gate: a pending receipt blocks linearization
         // until the bounded wait proves it resolved.
-        coordinator.register_pending_receipt("rebind-op-1".to_owned());
+        coordinator
+            .register_pending_receipt("rebind-op-1".to_owned())
+            .expect("pending receipt persists");
         assert!(
             coordinator
                 .commit_drain(test_decision(&coordinator.drain_generation()))
@@ -783,15 +989,18 @@ mod shutdown_drain_tests {
         );
         let held = coordinator
             .reconcile_pending_to_deadline(Duration::from_millis(20), || {
-                vec!["rebind-op-1".to_owned()]
+                Ok(vec!["rebind-op-1".to_owned()])
             })
-            .await;
+            .await
+            .expect("receipt rescan succeeds");
         assert_eq!(held, vec!["rebind-op-1".to_owned()]);
-        coordinator.resolve_pending_receipt("rebind-op-1");
+        coordinator
+            .resolve_pending_receipt("rebind-op-1")
+            .expect("resolved receipt persists");
         let cleared = coordinator
-            .reconcile_pending_to_deadline(Duration::from_millis(20), Vec::<String>::new)
+            .reconcile_pending_to_deadline(Duration::from_millis(20), || Ok(Vec::new()))
             .await;
-        assert!(cleared.is_empty());
+        assert!(cleared.expect("receipt rescan succeeds").is_empty());
 
         coordinator
             .commit_drain(test_decision(&coordinator.drain_generation()))
@@ -821,7 +1030,9 @@ mod shutdown_drain_tests {
         assert!(ShutdownDrainCoordinator::check_lease_zero(false).is_ok());
         assert!(ShutdownDrainCoordinator::check_lease_zero(true).is_err());
 
-        coordinator.complete_terminal(ShutdownTerminal::Intentional);
+        coordinator
+            .complete_terminal(ShutdownTerminal::Intentional)
+            .expect("intentional terminal persists");
         let publication = coordinator.publication();
         assert_eq!(publication.phases_completed.len(), 8);
         assert!(publication.committed);
@@ -847,31 +1058,40 @@ mod shutdown_drain_tests {
     #[tokio::test]
     async fn deadline_expiry_yields_incomplete_and_wake_race_fenced() {
         let root = test_work_root("race");
-        let coordinator = coordinator_for(&root);
-        assert!(coordinator.request_shutdown());
+        let coordinator = coordinator_for(&root).expect("new drain coordinator loads");
+        assert!(coordinator.request_shutdown().expect("shutdown persists"));
 
         // A wake arriving before linearization cancels the drain.
         assert_eq!(
-            coordinator.on_activate_request(),
+            coordinator
+                .on_activate_request()
+                .expect("wake classification persists"),
             DrainWakeDisposition::CancelDrain
         );
         assert_eq!(
-            coordinator.classify_wake(None),
+            coordinator
+                .classify_wake(None)
+                .expect("wake classification persists"),
             DrainWakeDisposition::CancelDrain
         );
 
         // Deadline expiry with pending work retains the pending list instead
         // of discarding it.
-        coordinator.register_pending_receipt("rebind-op-9".to_owned());
+        coordinator
+            .register_pending_receipt("rebind-op-9".to_owned())
+            .expect("pending receipt persists");
         let remainder = coordinator
             .reconcile_pending_to_deadline(Duration::from_millis(30), || {
-                vec!["rebind-op-9".to_owned()]
+                Ok(vec!["rebind-op-9".to_owned()])
             })
-            .await;
+            .await
+            .expect("receipt rescan succeeds");
         assert_eq!(remainder, vec!["rebind-op-9".to_owned()]);
-        coordinator.complete_terminal(ShutdownTerminal::Incomplete { pending: remainder });
+        coordinator
+            .complete_terminal(ShutdownTerminal::Incomplete { pending: remainder })
+            .expect("incomplete terminal persists");
         // Cancelled, unlinearized drain can never complete as intentional.
-        coordinator.complete_terminal(ShutdownTerminal::Intentional);
+        let _ = coordinator.complete_terminal(ShutdownTerminal::Intentional);
         let publication = coordinator.publication();
         assert_eq!(publication.terminal.as_deref(), Some("incomplete-shutdown"));
         assert_eq!(publication.pending, vec!["rebind-op-9".to_owned()]);
@@ -880,23 +1100,29 @@ mod shutdown_drain_tests {
         // the committed generation is stale; anything else awaits a fresh
         // generation.
         let root2 = test_work_root("race-committed");
-        let committed = coordinator_for(&root2);
-        assert!(committed.request_shutdown());
+        let committed = coordinator_for(&root2).expect("second drain coordinator loads");
+        assert!(committed.request_shutdown().expect("shutdown persists"));
         record_pre_commit(&committed);
         let generation = committed.drain_generation();
         committed
             .commit_drain(test_decision(&generation))
             .expect("linearization");
         assert_eq!(
-            committed.classify_wake(Some(&generation)),
+            committed
+                .classify_wake(Some(&generation))
+                .expect("wake classification is read-only after commit"),
             DrainWakeDisposition::RejectStale
         );
         assert_eq!(
-            committed.classify_wake(Some("drain-foreign-generation")),
+            committed
+                .classify_wake(Some("drain-foreign-generation"))
+                .expect("wake classification is read-only after commit"),
             DrainWakeDisposition::QueueNextGeneration
         );
         assert_eq!(
-            committed.on_activate_request(),
+            committed
+                .on_activate_request()
+                .expect("wake classification is read-only after commit"),
             DrainWakeDisposition::QueueNextGeneration
         );
         let _ = std::fs::remove_dir_all(&root);
