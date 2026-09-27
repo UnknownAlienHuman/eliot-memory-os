@@ -48,7 +48,9 @@
 //! 10. lane currency: the bound work-unit/attempt/lease triple must appear in
 //!     the current envelope lanes, and the matched lane must carry the same
 //!     external route receipt. Lease and attempt identity must match the
-//!     route receipt and supplied envelope exactly. Expiry cannot be checked
+//!     route receipt and supplied envelope exactly, and the lane's recorded
+//!     routing digest must equal the receipt's admitted candidate digest, so
+//!     a receipt crossed into a foreign lane fails. Expiry cannot be checked
 //!     without a time-bound field from the external receipt owner.
 //!
 //! The output is structurally candidate-only: `candidate_only` is true,
@@ -600,9 +602,12 @@ fn check_bound_slot(
 
 /// The bound work-unit/attempt/lease triple must appear in the supplied
 /// envelope lanes, the matched lane must carry the exact external route
-/// receipt, and the lane route must equal the bound route. A triple the
-/// supplied envelope does not admit — rotated or foreign — fails closed;
-/// this compiler does not mint replacements or establish envelope freshness.
+/// receipt, the lane's recorded routing digest must equal the receipt's
+/// admitted candidate digest (the S5 admit invariant), and the lane route
+/// must equal the bound route. A triple the supplied envelope does not
+/// admit — rotated or foreign — fails closed, as does a receipt crossed
+/// into a lane admitted for another candidate; this compiler does not mint
+/// replacements or establish envelope freshness.
 fn check_lane_currency(
     bound: &SwarmBoundSlot,
     admission: &ProviderAdmissionReceipt,
@@ -619,6 +624,11 @@ fn check_lane_currency(
     };
     if lane_route != &bound.admitted_route {
         return Err(SwarmAdmissionBindError::StaleGeneration);
+    }
+    if lane.routing_receipt_digest != lane_route.candidate_digest {
+        return Err(SwarmAdmissionBindError::InvalidField(
+            "admission.route_identity",
+        ));
     }
     if lane.route != bound.route {
         return Err(SwarmAdmissionBindError::InvalidField("admission.route"));
