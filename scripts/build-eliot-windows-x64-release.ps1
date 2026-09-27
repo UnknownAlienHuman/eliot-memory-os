@@ -4081,11 +4081,162 @@ This bundle is intentionally unsigned. Before public distribution:
         throw 'staged RELEASE.json does not reference the retained excluded-disposition gate receipt'
     }
     $dispositionRecheck = Assert-ExcludedDispositionReceipt $repo $sourceCommit $dispositionReceipt
+    # Issue #1855: the declared product outcome is the staged product surface a
+    # passing build must never promote on its own: RELEASE.json release
+    # readiness plus the runtime manifest installation approval.
+    function Get-DeclaredProductOutcome([string]$Bundle) {
+        $declaredRelease = Get-Content -LiteralPath (Join-Path $Bundle 'RELEASE.json') -Raw | ConvertFrom-Json
+        $declaredRuntime = Get-Content -LiteralPath (Join-Path $Bundle 'runtime/RUNTIME_ARTIFACTS.json') -Raw | ConvertFrom-Json
+        return [ordered]@{
+            signed = [bool]$declaredRelease.signed
+            signature_policy = [string]$declaredRelease.signature_policy
+            signature_evidence = [string]$declaredRelease.signature_evidence
+            public_distribution_ready = [bool]$declaredRelease.public_distribution_ready
+            installation_approval = [string]$declaredRuntime.installation_approval
+        }
+    }
+
+    function New-VerifiedBuildClaimBoundary {
+        param(
+            [string] $SourceCommit,
+            [string] $TargetTriple,
+            [string] $CargoLockSha256,
+            [string] $RustToolchainSha256,
+            [object[]] $VerifiedRuntimeArtifacts,
+            [object] $ReleaseIdentity,
+            [string] $FeaturesPolicy,
+            [string[]] $BuildArgvTemplate,
+            [string] $Version,
+            [string] $PayloadManifestSha256,
+            [string] $ChecksumManifestSha256,
+            [object] $BundleVerification,
+            [object] $DeclaredProductOutcomeBefore,
+            [object] $DeclaredProductOutcomeAfter
+        )
+
+        # Issue #1855: a passing build that leaves the declared product outcome
+        # unchanged must raise a Mechanism Review trigger instead of implying a
+        # product or release claim.
+        $buildPassed = [string]$BundleVerification.status -ceq 'VERIFIED_UNSIGNED'
+        $productOutcomeUnchanged =
+            [string]$DeclaredProductOutcomeBefore.signed -ceq [string]$DeclaredProductOutcomeAfter.signed -and
+            [string]$DeclaredProductOutcomeBefore.signature_policy -ceq [string]$DeclaredProductOutcomeAfter.signature_policy -and
+            [string]$DeclaredProductOutcomeBefore.signature_evidence -ceq [string]$DeclaredProductOutcomeAfter.signature_evidence -and
+            [string]$DeclaredProductOutcomeBefore.public_distribution_ready -ceq [string]$DeclaredProductOutcomeAfter.public_distribution_ready -and
+            [string]$DeclaredProductOutcomeBefore.installation_approval -ceq [string]$DeclaredProductOutcomeAfter.installation_approval
+        $mechanismReviewTrigger = 'NONE'
+        if ($buildPassed -and $productOutcomeUnchanged) {
+            $mechanismReviewTrigger = 'MECHANISM_REVIEW_REQUIRED'
+        }
+
+        return [ordered]@{
+            build = [ordered]@{
+                claim = 'source-build'
+                label = 'BUILD_PASS'
+                source_commit = $SourceCommit
+                profile = 'release'
+                target_triple = $TargetTriple
+                cargo_lock_sha256 = $CargoLockSha256
+                rust_toolchain_sha256 = $RustToolchainSha256
+                features_policy = $FeaturesPolicy
+                build_argv_template = @($BuildArgvTemplate)
+                admission_gate = [ordered]@{
+                    claim = 'build-only-admission'
+                    path = 'crates/eliot-engine/src/cached_derivation.rs'
+                    symbol = 'CachedDerivationService::admitted_entry'
+                    probe = 'CachedDerivationService::validate_admission'
+                    policy = 'only BUILD derivations are cacheable'
+                }
+                identity_manifest = [ordered]@{
+                    path = [string]$ReleaseIdentity.path
+                    sha256 = [string]$ReleaseIdentity.sha256
+                    bytes = [int64]$ReleaseIdentity.bytes
+                }
+                artifacts = @($VerifiedRuntimeArtifacts | ForEach-Object {
+                        [ordered]@{
+                            package = [string]$_.package
+                            binary = [string]$_.binary
+                            role = [string]$_.role
+                            path = [string]$_.path
+                            sha256 = [string]$_.sha256
+                            bytes = [int64]$_.bytes
+                        }
+                    })
+            }
+            assembly = [ordered]@{
+                claim = 'bundle-assembly'
+                label = 'ASSEMBLY_COMPLETE'
+                source_commit = $SourceCommit
+                version = $Version
+                payload_manifest_sha256 = $PayloadManifestSha256
+                checksum_manifest_sha256 = $ChecksumManifestSha256
+            }
+            bundle_verification = [ordered]@{
+                claim = 'bundle-verifier'
+                label = 'BUNDLE_VERIFIER_PASS'
+                verifier = 'Test-ReleaseBundle'
+                status = [string]$BundleVerification.status
+                verified_file_count = [int]$BundleVerification.files
+            }
+            installed_runtime = [ordered]@{
+                claim = 'installed-runtime'
+                label = 'INSTALLED_RUNTIME_UNKNOWN'
+                status = 'UNKNOWN'
+            }
+            product_verifier = [ordered]@{
+                claim = 'product-verifier'
+                label = 'VERIFIER_NOT_EXECUTED'
+                status = 'NOT_EXECUTED'
+            }
+            task_acceptance = [ordered]@{
+                claim = 'task-acceptance'
+                label = 'TARGET'
+                product_status = 'NOT_ACCEPTED / UNVERIFIED'
+            }
+            release_eligibility = [ordered]@{
+                claim = 'release-eligibility'
+                label = 'TARGET'
+                release_ready = $false
+                architecture_complete = $false
+            }
+            mechanism_review = [ordered]@{
+                claim = 'mechanism-review'
+                label = 'MECHANISM_REVIEW_TRIGGER'
+                trigger = $mechanismReviewTrigger
+                reason = 'local PASS with unchanged product outcome'
+                build_passed = $buildPassed
+                product_outcome_unchanged = $productOutcomeUnchanged
+                declared_product_outcome_before = $DeclaredProductOutcomeBefore
+                declared_product_outcome_after = $DeclaredProductOutcomeAfter
+            }
+        }
+    }
+
+    $declaredProductOutcomeBefore = Get-DeclaredProductOutcome $bundle
     $verification = Test-ReleaseBundle $bundle $GovernorRetirementApproval
+    $releaseIdentity = @($hashes | Where-Object { $_.path -eq 'RELEASE.json' })[0]
     $plan.status = 'STAGED_UNSIGNED'
     $plan.verification = $verification
     $plan.excluded_dispositions = $dispositionReceipt
     $plan.excluded_dispositions_recheck = $dispositionRecheck
+    $manifestPath = Join-Path $bundle 'SHA256SUMS.json'
+    $verifiedManifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $declaredProductOutcomeAfter = Get-DeclaredProductOutcome $bundle
+    $plan.claim_boundary = New-VerifiedBuildClaimBoundary `
+        -SourceCommit $sourceCommit `
+        -TargetTriple ([string]$stageToolchain.target_triple) `
+        -CargoLockSha256 ([string]$stageToolchain.cargo_lock.sha256) `
+        -RustToolchainSha256 ([string]$stageToolchain.rust_toolchain.sha256) `
+        -VerifiedRuntimeArtifacts $verifiedRuntimeArtifacts `
+        -ReleaseIdentity $releaseIdentity `
+        -FeaturesPolicy ([string]$stageToolchain.build.features_policy) `
+        -BuildArgvTemplate @($stageToolchain.build.build_argv_template) `
+        -Version $Version `
+        -PayloadManifestSha256 ([string]$stagedPayloadManifestHash) `
+        -ChecksumManifestSha256 $verifiedManifestSha256 `
+        -BundleVerification $verification `
+        -DeclaredProductOutcomeBefore $declaredProductOutcomeBefore `
+        -DeclaredProductOutcomeAfter $declaredProductOutcomeAfter
     $plan | ConvertTo-Json -Depth 5
 }
 finally {
