@@ -39,8 +39,9 @@
 //! admitted remote RPC/WebSocket path; the schema generation matches the
 //! bridge expectation; canonical writes are admitted; the record's qualified
 //! fallback line is anchored to a QUALIFIED ARTIFACT — the fallback version
-//! lies inside the line, is not older than the active generation, and its
-//! recorded digest is coherent with the active artifact; and the recorded
+//! lies inside the line and equals the active generation, so the active store
+//! is exactly the latest locally qualified fallback; its recorded digest is
+//! coherent with the active artifact; and the recorded
 //! I0.5 evidence-snapshot content address has been verified against the
 //! snapshot document actually installed beside the decision record. Anything
 //! else is an explicit maintenance (non-writer) verdict.
@@ -488,11 +489,11 @@ fn startup_report(
 ///
 /// The fallback line is anchored to a qualified ARTIFACT, not to a label: the
 /// record must name the exact qualified fallback version and its digest, the
-/// version must lie inside the line, must not be older than the admitted
-/// generation, and the two artifacts must be coherent. Refusing a fallback
-/// older than the admitted generation is what makes "3.2.x is never promoted
-/// merely because it is the target" a qualification decision rather than an
-/// accident of the compiled pin. The recorded I0.5 evidence-snapshot identity
+/// version must lie inside the line and equal the active generation, and the
+/// two artifacts must be coherent. Requiring equality makes the active store
+/// exactly the latest locally qualified fallback: a newer or older fallback
+/// means this generation is not the one qualified for canonical writes. The
+/// recorded I0.5 evidence-snapshot identity
 /// must additionally have been verified against the installed document; that
 /// observed qualification is passed in as `evidence_verification`, and an
 /// unresolved or refused one is maintenance, never admission.
@@ -549,7 +550,13 @@ fn evaluate_failure(
                 record.qualified_fallback_version, record.active_version
             ));
         }
-        Some(Ordering::Equal | Ordering::Greater) => {}
+        Some(Ordering::Greater) => {
+            return Some(format!(
+                "active generation {} is older than the latest locally qualified fallback {}; only the latest locally qualified fallback may admit canonical writes",
+                record.active_version, record.qualified_fallback_version
+            ));
+        }
+        Some(Ordering::Equal) => {}
     }
     let same_generation = record.qualified_fallback_version == record.active_version;
     let same_artifact = normalize_digest(&record.qualified_fallback_sha256)
