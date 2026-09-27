@@ -24,6 +24,16 @@
 //! fingerprint is absent from the registry invalidation set. Time therefore
 //! flows into every admission decision through the explicit `now` parameter,
 //! so positive evidence can go stale in a running daemon.
+//!
+//! Supersession is decided by the evidence retained for a key, not by arrival
+//! order: the registry holds one record per `(skill_id, scope_fingerprint)`,
+//! and an insertion replaces it only when its own `observed_at` is strictly
+//! newer. A delayed replay is refused whole, so it displaces no record and
+//! clears no invalidation; and an invalidation is cleared only by a fresh
+//! requalification of the same key, so a known restriction or an applied
+//! scope change is not erased by an unrelated record. The retained bound
+//! therefore never lets stale evidence look current, and an empty registry
+//! still refuses rather than admits.
 
 #![forbid(unsafe_code)]
 
@@ -312,6 +322,22 @@ impl CapabilityEvidenceRecord {
         self.observed_at <= now && self.expires_at.is_none_or(|expires| now < expires)
     }
 
+    /// Returns true when this record's own status and source could admit
+    /// production work on any scope: `probe_passed` or `observed` from an
+    /// admissible evidence source.
+    ///
+    /// This is the single definition of qualifying evidence, shared by
+    /// [`is_fresh_positive_for`](Self::is_fresh_positive_for) and by
+    /// [`CapabilityRegistry::insert`], so the status/source rule that admits
+    /// a route and the status/source rule that requalifies a stale scope
+    /// cannot drift apart.
+    fn is_qualifying_evidence(&self) -> bool {
+        matches!(
+            self.status,
+            CapabilityStatus::ProbePassed | CapabilityStatus::Observed
+        ) && self.source.is_admissible_evidence()
+    }
+
     /// Returns true when this record is a fresh exact-fingerprint positive
     /// that may admit production work: `probe_passed` or `observed` from an
     /// admissible evidence source, time-fresh at `now`, on a scope the
@@ -328,11 +354,7 @@ impl CapabilityEvidenceRecord {
             && self.scope_fingerprint.exact_match(scope)
             && !invalidated.contains(&self.scope_fingerprint)
             && self.is_time_fresh(now)
-            && matches!(
-                self.status,
-                CapabilityStatus::ProbePassed | CapabilityStatus::Observed
-            )
-            && self.source.is_admissible_evidence()
+            && self.is_qualifying_evidence()
     }
 
     /// Returns true when this record restricts production work on an exact
@@ -410,7 +432,8 @@ pub struct CapabilityRegistry {
     /// Derived staleness: scope fingerprints invalidated by an applied
     /// scope change. Records are never mutated in place; freshness is
     /// derived from this set plus `observed_at`/`expires_at` at admission
-    /// time.
+    /// time. Only [`insert`](Self::insert) removes an entry, and only for a
+    /// fresh requalification of the same key.
     invalidated_scopes: HashSet<RouteScopeFingerprint>,
 }
 
@@ -424,21 +447,50 @@ impl CapabilityRegistry {
         }
     }
 
-    /// Inserts one evidence record, superseding any earlier record for the
-    /// same skill and scope fingerprint.
+    /// Inserts one evidence record for its `(skill_id, scope_fingerprint)`
+    /// key, superseding the record already retained for that key.
     ///
-    /// Re-probing the same skill/scope replaces the earlier record instead
-    /// of appending: a later `broken` supersedes the earlier `probe_passed`
-    /// (and a later passing re-probe supersedes the `broken`, re-qualifying
-    /// the scope). Insertion beyond [`MAX_CAPABILITY_EVIDENCE_RECORDS`]
-    /// evicts the oldest record first. A fresh record for an invalidated
-    /// scope re-qualifies that scope.
+    /// Supersession is decided by the evidence retained for the key, never by
+    /// arrival order. A record whose `observed_at` is not newer than the
+    /// retained record for the same key is a delayed replay and is refused
+    /// whole: it displaces nothing and clears no invalidation, so a delayed
+    /// old `probe_passed` can neither replace a newer `broken` record nor
+    /// revive the scope that record restricted. Re-probing the same
+    /// skill/scope with strictly newer evidence therefore supersedes: a later
+    /// `broken` supersedes the earlier `probe_passed`, and a later passing
+    /// re-probe supersedes the `broken`.
+    ///
+    /// A scope-wide invalidation is cleared only by a fresh requalification of
+    /// the same key — newer evidence that could itself admit that exact scope
+    /// (see [`CapabilityEvidenceRecord::is_fresh_positive_for`]). An insertion
+    /// that opens a new key never revives a scope another capability's
+    /// evidence invalidated, so a scope-wide invalidation is not cleared by an
+    /// unrelated capability insertion on the same fingerprint. A retained
+    /// restriction or an applied scope change therefore stays stale until the
+    /// evidence it staled is requalified, not until any record arrives.
+    ///
+    /// Insertion beyond [`MAX_CAPABILITY_EVIDENCE_RECORDS`] evicts the oldest
+    /// record first.
     pub fn insert(&mut self, record: CapabilityEvidenceRecord) {
-        self.records.retain(|existing| {
-            existing.skill_id != record.skill_id
-                || existing.scope_fingerprint != record.scope_fingerprint
-        });
-        self.invalidated_scopes.remove(&record.scope_fingerprint);
+        if let Some(retained) = self.records.iter().position(|existing| {
+            existing.skill_id == record.skill_id
+                && existing.scope_fingerprint == record.scope_fingerprint
+        }) {
+            // `observed_at` is the evidence source's own observation instant
+            // for this exact scope, so comparing two records of one key orders
+            // those two pieces of evidence. It is not a freshness decision:
+            // freshness still runs at admission time against the caller's `now`
+            // through `is_time_fresh`, which refuses a future-dated record. A
+            // backdated replay only makes a record look older, so it can never
+            // win this comparison.
+            if record.observed_at <= self.records[retained].observed_at {
+                return;
+            }
+            self.records.remove(retained);
+            if record.is_qualifying_evidence() {
+                self.invalidated_scopes.remove(&record.scope_fingerprint);
+            }
+        }
         self.records.push(record);
         while self.records.len() > MAX_CAPABILITY_EVIDENCE_RECORDS {
             self.records.remove(0);
