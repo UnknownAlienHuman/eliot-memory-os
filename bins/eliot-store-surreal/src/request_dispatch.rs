@@ -35,6 +35,10 @@ use crate::Request;
 use crate::Response;
 use crate::StoreComposition;
 use crate::StoreCompositionError;
+use crate::diagnostics::{
+    BoundedEventLog, BridgeBoundary, BridgeIdentity, dispatch_boundary, emit_attempted,
+    emit_dispatch_outcome, emit_received, operation_name, report_events,
+};
 
 fn sanitized_owned_reference(value: Option<String>) -> Option<String> {
     let text = value.filter(|text| !text.is_empty())?;
@@ -396,7 +400,43 @@ pub trait StoreDispatchBackend: Send + Sync {
 }
 
 pub async fn dispatch<B: StoreDispatchBackend + ?Sized>(backend: &B, request: Request) -> Response {
-    backend.dispatch_request(request).await
+    let mut events = BoundedEventLog::new();
+    let response = dispatch_with_log(backend, request, &mut events).await;
+    report_events(&events);
+    response
+}
+
+/// Dispatches one closed request while recording its bridge observation into
+/// the caller-owned log: receipt and bridge-handoff at [`Dispatch`], then the
+/// classified outcome at the request's owning result boundary with the
+/// response identity merged over the request identity.
+///
+/// The returned [`Response`] is byte-identical to [`dispatch`]: emission is
+/// observability-only and changes no validation, ordering, idempotency,
+/// failure mapping, or response bytes. Tests inject a scoped
+/// [`BoundedEventLog`]; production reports the retained events to the
+/// installed startup sink.
+///
+/// [`Dispatch`]: BridgeBoundary::Dispatch
+pub async fn dispatch_with_log<B: StoreDispatchBackend + ?Sized>(
+    backend: &B,
+    request: Request,
+    events: &mut BoundedEventLog,
+) -> Response {
+    let operation = operation_name(&request);
+    let boundary = dispatch_boundary(&request);
+    let received_identity = BridgeIdentity::from_request(&request);
+    emit_received(
+        events,
+        BridgeBoundary::Dispatch,
+        operation,
+        &received_identity,
+    );
+    emit_attempted(events, operation, &received_identity);
+    let response = backend.dispatch_request(request).await;
+    let identity = received_identity.merge(&BridgeIdentity::from_response(&response));
+    emit_dispatch_outcome(events, boundary, operation, &identity, &response);
+    response
 }
 
 impl StoreDispatchBackend for StoreComposition {
