@@ -1666,6 +1666,19 @@ struct KernelMcpForwardingPort {
     shared: SharedTransport,
 }
 
+/// Typed refusal for a contested reconciliation-import commit (issue #2799):
+/// the retained transport owner is already borrowed, so nothing was
+/// committed on either half of the import and the caller retries the same
+/// import. Silent success after a skipped ack-cache update is forbidden on
+/// this path.
+fn reconciliation_import_borrow_refusal() -> ProviderFailure {
+    ProviderFailure::new(
+        "eliot-kernel-front-door",
+        "reconciliation import refused: retained transport owner is mutably borrowed; core \
+         recovery state, owner ack bases, and held receipts are unchanged; retry the import",
+    )
+}
+
 impl KernelMcpForwardingPort {
     /// Runs the validated continuity/recovery binding check for one
     /// forwarding call against the single retained transport owner.
@@ -1804,35 +1817,6 @@ impl KernelMcpForwardingPort {
             return;
         }
         held.insert(sequence);
-    }
-
-    /// Records the owner-confirmed acked base only after core import accepted
-    /// the verified reconcile reply, then prunes the held sequences it confirms.
-    ///
-    /// Owner confirmation is a receipt, not local inference: only sequences
-    /// at or below the confirmed base leave the held set, and the
-    /// contiguous frontier always resumes above it.
-    fn note_owner_acked(&mut self, stream_id: &str, acked: u64) {
-        let Ok(mut owner) = self.shared.try_borrow_mut() else {
-            return;
-        };
-        let known = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
-        if acked > known {
-            owner.owner_acked.insert(stream_id.to_owned(), acked);
-        }
-        let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
-        let empty = if let Some(held) = owner.delivered_sequences.get_mut(stream_id) {
-            let confirmed: Vec<u64> = held.range(..=base).copied().collect();
-            for sequence in confirmed {
-                held.remove(&sequence);
-            }
-            held.is_empty()
-        } else {
-            false
-        };
-        if empty {
-            owner.delivered_sequences.remove(stream_id);
-        }
     }
 
     /// Builds the exact contiguous consumed frontier justified by the
@@ -2120,22 +2104,85 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         decode_reconciliation_outcome(binding, &facts, &value, Vec::new(), Some(request))
     }
 
+    /// Jointly commits the transport half of one validated reconciliation
+    /// import (issue #2799): the exact proposed owner ack bases plus
+    /// held-sequence pruning restricted to those confirmed bases.
+    ///
+    /// The core calls this after its candidate recovery window applied off
+    /// to the side and before the candidate publishes. Preparation runs on
+    /// one short immutable snapshot: owner confirmation is a receipt, not
+    /// local inference, so bases only rise and only sequences at or below
+    /// the confirmed base leave the held set; a lower cursor prunes only
+    /// its proven prefix and never rolls state backward. All allocation
+    /// happens before the mutable borrow is acquired; the commit itself
+    /// swaps two prepared maps, which cannot fail.
+    ///
+    /// A borrow conflict or stale continuity commits nothing and returns a
+    /// typed refusal naming the preserved state and the retry/recovery
+    /// directive. Ack bases stay keyed by stream text here (BLOCKED-BY
+    /// #2798: owner/window/revision/incarnation namespacing must land
+    /// before a same-named replacement stream stops inheriting the
+    /// predecessor cursor), and no outstanding-offer state exists to retire
+    /// (BLOCKED-BY #2800: prepared/outstanding/confirmed consumed
+    /// frontiers must land before this commit can retire them jointly).
     fn reconciliation_imported(
         &mut self,
         binding: &AttachBinding,
         result: &ReconciliationPortResult,
-    ) {
-        // Core calls this only after its staged recovery window was accepted.
-        // Keep an additional live transport check so an adapter cannot apply
-        // a cache receipt after its connection has been replaced.
-        if self.check_continuity(binding).is_err() {
-            return;
-        }
-        if let Some(window) = result.window() {
-            for stream in window.stream_facts() {
-                self.note_owner_acked(stream.stream_id(), stream.acked_cursor());
+    ) -> Result<(), ProviderFailure> {
+        let Some(window) = result.window() else {
+            return Ok(());
+        };
+        // Typed continuity precheck before any snapshot work.
+        self.check_continuity(binding)?;
+        let (mut owner_acked, mut delivered_sequences) = {
+            let owner = self
+                .shared
+                .try_borrow()
+                .map_err(|_| reconciliation_import_borrow_refusal())?;
+            (owner.owner_acked.clone(), owner.delivered_sequences.clone())
+        };
+        // Pure projection from the immutable snapshot: every allocation on
+        // this path happens here, before the owner is acquired for commit.
+        for stream in window.stream_facts() {
+            let known = owner_acked.get(stream.stream_id()).copied().unwrap_or(0);
+            let base = known.max(stream.acked_cursor());
+            if base != known {
+                owner_acked.insert(stream.stream_id().to_owned(), base);
+            }
+            if let Some(held) = delivered_sequences.get_mut(stream.stream_id()) {
+                let confirmed: Vec<u64> = held.range(..=base).copied().collect();
+                for sequence in confirmed {
+                    held.remove(&sequence);
+                }
+                if held.is_empty() {
+                    delivered_sequences.remove(stream.stream_id());
+                }
             }
         }
+        let mut owner = self
+            .shared
+            .try_borrow_mut()
+            .map_err(|_| reconciliation_import_borrow_refusal())?;
+        // Recheck continuity against live state under the held borrow: the
+        // shared precheck above cannot run here because it would observe
+        // this commit's own mutable borrow as contention. A mismatch
+        // commits nothing.
+        let live = owner.activated_session.as_deref().unwrap_or("");
+        if live.is_empty() || live != binding.session_id().as_str() {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "reconciliation import refused: presented attach session is not the retained \
+                 kernel-issued session (foreign, stale, or pre-activation binding); core \
+                 recovery state, owner ack bases, and held receipts are unchanged; reconnect \
+                 must present the validated continuity binding",
+            ));
+        }
+        // One infallible bounded swap; no parsing, allocation, owner call,
+        // validation, or other fallible work follows on this path.
+        owner.owner_acked = owner_acked;
+        owner.delivered_sequences = delivered_sequences;
+        Ok(())
     }
 }
 
@@ -3988,7 +4035,8 @@ mod tests {
                 &mut self,
                 _binding: &AttachBinding,
                 _result: &eliot_agent_bridge_core::ReconciliationPortResult,
-            ) {
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
             }
         }
 
@@ -4467,7 +4515,8 @@ mod tests {
                 &mut self,
                 _binding: &AttachBinding,
                 _result: &eliot_agent_bridge_core::ReconciliationPortResult,
-            ) {
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
             }
         }
 

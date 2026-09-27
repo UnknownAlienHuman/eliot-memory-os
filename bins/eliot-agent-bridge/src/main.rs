@@ -5236,7 +5236,8 @@ mod tests {
                 &mut self,
                 _binding: &AttachBinding,
                 _result: &eliot_agent_bridge_core::ReconciliationPortResult,
-            ) {
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
             }
         }
 
