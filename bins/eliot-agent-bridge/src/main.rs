@@ -29,7 +29,9 @@ use eliot_mcp::{
 };
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
-use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
+use eliot_protocol::{
+    AgentActivationResolutionDisposition, EventEnvelope, HARD_STRUCTURED_RESPONSE_BYTES,
+};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
@@ -2601,20 +2603,41 @@ fn write_mcp_frame(frame: &Value) -> StdioWriteReceipt {
             cause: StdioBreakCause::SerializeFailed,
         };
     };
-    framed.push(b'\n');
-    if framed.len() > MAX_OUTPUT_FRAME_BYTES {
+    if framed.len() > HARD_STRUCTURED_RESPONSE_BYTES {
         emit_error(
             "STDOUT_RESPONSE_TOO_LARGE",
             &format!(
-                "framed MCP response exceeds {MAX_OUTPUT_FRAME_BYTES} bytes for {STDIO_OUTPUT_PROFILE_ID}; emission refused"
+                "MCP structured response exceeds {HARD_STRUCTURED_RESPONSE_BYTES} bytes for {STDIO_OUTPUT_PROFILE_ID}; emission refused"
             ),
         );
+        let id = match frame.get("id") {
+            Some(Value::String(id)) => Some(JsonRpcId::Str(id.clone())),
+            Some(Value::Number(id)) => id.as_i64().map(JsonRpcId::Int),
+            _ => None,
+        };
+        let refusal = render_error(
+            id.as_ref(),
+            WIRE_INTERNAL_ERROR,
+            "structured MCP response exceeds the inline size ceiling",
+            serde_json::json!({
+                "disposition": "STDOUT_RESPONSE_TOO_LARGE",
+                "limit_bytes": HARD_STRUCTURED_RESPONSE_BYTES,
+                "actual_bytes": framed.len(),
+            }),
+        );
+        if let Ok(mut bounded) = serde_json::to_vec(&refusal)
+            && bounded.len() <= HARD_STRUCTURED_RESPONSE_BYTES
+        {
+            bounded.push(b'\n');
+            return emit_framed_bytes(bounded);
+        }
         return StdioWriteReceipt {
             bytes: 0,
             flushed: false,
             cause: StdioBreakCause::OutputTooLarge,
         };
     }
+    framed.push(b'\n');
     emit_framed_bytes(framed)
 }
 
