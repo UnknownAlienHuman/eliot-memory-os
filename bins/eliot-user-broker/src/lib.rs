@@ -40,7 +40,7 @@ use eliot_user_broker_core::{
     OperatorEndpoint, OperatorHandoffRequest, PortError, ProcessPort, ProcessStartOutcome,
     RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -179,6 +179,34 @@ pub enum BrokerAdmissionRefusal {
     /// refused rather than narrowed.
     #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
     OperatorHandoffNotAdmitted,
+    /// A presented Kernel session token is not the live registration digest:
+    /// the binding was issued under a superseded Kernel session, or the live
+    /// registration lease already elapsed. A fresh binding is required.
+    #[error("STALE_AUTHORITY_EPOCH")]
+    OperatorSessionTokenStale,
+    /// A presented Windows SID/logon Session is not the installation/SID/
+    /// Session tuple this broker was admitted for. Another principal's
+    /// binding is refused, never adopted.
+    #[error("BROKER_REGISTRATION_IDENTITY_FOREIGN")]
+    OperatorBindingCrossSession,
+    /// The OS-observed image of the redeeming client process is not the
+    /// installation-approved Operator artifact this binding was issued for.
+    #[error("BROKER_OPERATOR_CLIENT_PROCESS_FOREIGN")]
+    OperatorClientProcessForeign,
+    /// A state-changing request carries no authenticated Human principal, or
+    /// names a principal that is not the Windows SID this broker session was
+    /// admitted for.
+    #[error("BROKER_HUMAN_PRINCIPAL_REQUIRED")]
+    HumanPrincipalRequired,
+    /// A state-changing request names a role or capability outside the exact
+    /// set granted by the redeemed Kernel-backed binding.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    HumanCapabilityNotGranted,
+    /// A state-changing request carries no exact Kernel-canonicalized
+    /// approval hash, carries a malformed one, or names a different hash
+    /// than the one already bound to the same operation.
+    #[error("BROKER_APPROVAL_HASH_REQUIRED")]
+    HumanApprovalRequired,
 }
 
 impl BrokerAdmissionRefusal {
@@ -188,20 +216,28 @@ impl BrokerAdmissionRefusal {
         match self {
             Self::ProcessIdentityUnprovable => "BROKER_PROCESS_IDENTITY_UNPROVABLE",
             Self::ProcessIdentityChanged => "BROKER_PROCESS_IDENTITY_CHANGED",
-            Self::RegistrationIdentityForeign => "BROKER_REGISTRATION_IDENTITY_FOREIGN",
+            Self::RegistrationIdentityForeign | Self::OperatorBindingCrossSession => {
+                "BROKER_REGISTRATION_IDENTITY_FOREIGN"
+            }
             Self::OperationOutcomeUnreconciled => "BROKER_OPERATION_OUTCOME_UNRECONCILED",
             Self::IntroductionOperationNotGranted
             | Self::IntroductionResourceNotGranted
             | Self::IntroductionEffectCeilingExceeded
             | Self::IntroductionRequired
             | Self::IntroductionCredentialUnnamed
-            | Self::OperatorHandoffNotAdmitted => "CAPABILITY_INTRODUCTION_REQUIRED",
+            | Self::OperatorHandoffNotAdmitted
+            | Self::HumanCapabilityNotGranted => "CAPABILITY_INTRODUCTION_REQUIRED",
             Self::IntroductionExpired => "CAPABILITY_GRANT_REVOKED",
             Self::OperationIdRetired => "IDENTITY_CONFLICT",
             Self::RetiredOperation => "UNKNOWN_OUTCOME",
             Self::OperatorHandoffReplayed => "RESOURCE_LEASE_REPLAYED",
             Self::OperatorHandoffExpired => "DEADLINE_EXCEEDED",
-            Self::OperatorHandoffStaleGeneration => "STALE_AUTHORITY_EPOCH",
+            Self::OperatorSessionTokenStale | Self::OperatorHandoffStaleGeneration => {
+                "STALE_AUTHORITY_EPOCH"
+            }
+            Self::OperatorClientProcessForeign => "BROKER_OPERATOR_CLIENT_PROCESS_FOREIGN",
+            Self::HumanPrincipalRequired => "BROKER_HUMAN_PRINCIPAL_REQUIRED",
+            Self::HumanApprovalRequired => "BROKER_APPROVAL_HASH_REQUIRED",
             Self::OperatorHandoffUncomposed => "BROKER_OPERATOR_HANDOFF_UNCOMPOSED",
         }
     }
@@ -213,6 +249,154 @@ impl BrokerAdmissionRefusal {
             refusal: self,
             detail: detail.to_string(),
         }
+    }
+}
+
+/// Maximum wire length of one presented identity/authority text field. This
+/// mirrors the `WinUI` `OperatorIdentityFields.MaxFieldChars` bound so both
+/// ends of the binding refuse the same oversized values.
+const AUTHORITY_FIELD_LIMIT: usize = 512;
+
+/// OS-observed client evidence presented with one issued handoff at
+/// redemption (I11.8 binding: Windows SID/session identity, client process
+/// identity, fresh short-lived Kernel challenge/session token). Every field
+/// is validated against the Kernel-backed session binding this broker
+/// recorded when it issued the handoff; nothing here is trusted on receipt.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorClientBinding {
+    /// OS process id of the redeeming `WinUI` client, observed by the pipe
+    /// server from the live connection — never self-reported authority.
+    pub client_process_id: u32,
+    /// Windows SID the client proved for that process.
+    pub windows_sid: String,
+    /// Interactive logon Session the client proved for that process.
+    pub interactive_session_id: String,
+    /// Kernel session token the client's binding was issued under: the live
+    /// Kernel-issued registration digest, never a caller-minted value.
+    pub kernel_session_token: String,
+}
+
+/// Explicit authenticated Human authority for one broker state-changing
+/// request (I11.3 human roles, I11.8 authentication: explicit principal,
+/// role/capability, and the exact Kernel-canonicalized approval hash). The
+/// broker admits the shape and the binding; exact approval semantics stay
+/// Kernel-canonicalized through the typed Kernel path the request is then
+/// dispatched on.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HumanStateAuthority {
+    /// Authenticated Human principal: the Windows SID of the interactive
+    /// user this broker session was admitted for.
+    pub principal: String,
+    /// Interactive logon Session the principal acts in.
+    pub interactive_session_id: String,
+    /// Requested Human role; must equal the role the redeemed binding
+    /// granted.
+    pub role: String,
+    /// Requested capabilities; every entry must have been granted by the
+    /// redeemed binding — a capability outside the grant is refused.
+    pub capabilities: Vec<String>,
+    /// Exact Kernel-canonicalized approval hash (lowercase SHA-256) for the
+    /// critical action this request performs.
+    pub approval_hash: String,
+    /// Live Kernel session token this request is bound to.
+    pub kernel_session_token: String,
+}
+
+/// One Kernel-backed Operator session binding recorded when the broker
+/// issues a handoff (I11.8). The Kernel session token is the live
+/// Kernel-issued registration digest: short-lived, refreshed by the
+/// heartbeat loop, and stable only while the Kernel session is live — every
+/// redemption and state-changing request re-proves it against the live
+/// registration and its lease horizon. Rows are process-memory only, so a
+/// broker restart discards every binding and a restarted UI must acquire a
+/// fresh one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OperatorSessionBinding {
+    kernel_session_token: String,
+    windows_sid: String,
+    interactive_session_id: String,
+    role: String,
+    capabilities: Vec<String>,
+    redeemed: bool,
+}
+
+fn is_bounded_text(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= AUTHORITY_FIELD_LIMIT
+        && !value.chars().any(char::is_control)
+}
+
+fn is_exact_approval_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+impl OperatorClientBinding {
+    fn validate(&self) -> Result<(), CompositionError> {
+        if self.client_process_id == 0 {
+            return Err(BrokerAdmissionRefusal::OperatorClientProcessForeign
+                .with_platform("redeeming client process id is not observable"));
+        }
+        if !is_bounded_text(&self.windows_sid) {
+            return Err(BrokerAdmissionRefusal::OperatorBindingCrossSession
+                .with_platform("redeeming client SID is not a bounded identity value"));
+        }
+        if !is_bounded_text(&self.interactive_session_id) {
+            return Err(BrokerAdmissionRefusal::OperatorBindingCrossSession
+                .with_platform("redeeming client session is not a bounded identity value"));
+        }
+        if !is_bounded_text(&self.kernel_session_token) {
+            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
+                .with_platform("redeeming client session token is not a bounded token value"));
+        }
+        Ok(())
+    }
+}
+
+impl HumanStateAuthority {
+    fn validate(&self) -> Result<(), CompositionError> {
+        if !is_bounded_text(&self.principal) {
+            return Err(
+                BrokerAdmissionRefusal::HumanPrincipalRequired.with_platform(
+                    "state-changing request carries no bounded authenticated principal",
+                ),
+            );
+        }
+        if !is_bounded_text(&self.interactive_session_id) {
+            return Err(BrokerAdmissionRefusal::OperatorBindingCrossSession
+                .with_platform("state-changing request session is not a bounded identity value"));
+        }
+        if !is_bounded_text(&self.role) {
+            return Err(BrokerAdmissionRefusal::HumanCapabilityNotGranted
+                .with_platform("state-changing request carries no bounded role"));
+        }
+        if self.capabilities.is_empty() {
+            return Err(BrokerAdmissionRefusal::HumanCapabilityNotGranted
+                .with_platform("state-changing request carries no capability set"));
+        }
+        for capability in &self.capabilities {
+            if !is_bounded_text(capability) {
+                return Err(BrokerAdmissionRefusal::HumanCapabilityNotGranted
+                    .with_platform("state-changing request capability is not a bounded value"));
+            }
+        }
+        if !is_exact_approval_hash(&self.approval_hash) {
+            return Err(BrokerAdmissionRefusal::HumanApprovalRequired.with_platform(
+                "state-changing request carries no exact Kernel-canonicalized approval hash",
+            ));
+        }
+        if !is_bounded_text(&self.kernel_session_token) {
+            return Err(
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                    "state-changing request session token is not a bounded token value",
+                ),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -847,6 +1031,19 @@ pub struct BrokerComposition {
     process_binding: Option<BrokerProcessBinding>,
     registration_digest: Option<String>,
     identity_issuer: IssuerHandle,
+    /// Kernel-backed Operator session bindings keyed by issued handoff
+    /// nonce (I11.8). Each row pins the live Kernel-issued registration
+    /// digest the handoff was issued under, the bound SID/Session tuple,
+    /// and the exact granted role/capability set.
+    /// Process-memory only: a broker restart discards every row, so a
+    /// restarted UI can only redeem a freshly issued binding.
+    operator_session_bindings: BTreeMap<String, OperatorSessionBinding>,
+    /// Exact approval hashes bound to broker state-changing operations,
+    /// keyed by operation identity (launch idempotency key or control
+    /// operation id). One operation owns exactly one approved hash: a
+    /// conflicting hash for the same operation is refused. Process-memory
+    /// only, alongside the session bindings above.
+    approval_bindings: BTreeMap<String, String>,
     /// Broker-retained normal Notify launch authority: the verified installed
     /// `eliot-notify.exe` reference resolved from the installer-published
     /// declaration at startup. This is what makes the notification adapter
@@ -998,6 +1195,8 @@ impl BrokerComposition {
             process_binding: Some(process_binding),
             registration_digest,
             identity_issuer: issuer,
+            operator_session_bindings: BTreeMap::new(),
+            approval_bindings: BTreeMap::new(),
             notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
                 reason: "NOT_STAGED",
             }),
@@ -1284,6 +1483,14 @@ impl BrokerComposition {
     /// minted by the core authority. The caller's `request` may name only the
     /// role and the capability set, and any widening is refused.
     ///
+    /// I11.8 additionally binds every issued handoff to the fresh
+    /// short-lived Kernel session: the live Kernel-issued registration
+    /// digest is recorded against the issued nonce together with the bound
+    /// SID/Session tuple and the exact granted role/capability set.
+    /// Redemption and every later state-changing request must still present
+    /// that live token inside its lease horizon; a superseded session is
+    /// stale, never continuous.
+    ///
     /// It is deliberately not a heartbeat: an expired or fenced registration
     /// makes the handoff unavailable rather than being refreshed here, so a dead
     /// broker cannot mint one.
@@ -1294,9 +1501,33 @@ impl BrokerComposition {
         self.verify_launch_lease()?;
         let artifact = self.operator_artifact()?;
         let observed_at = now_unix_ms()?;
-        self.broker
+        let live = self.live_registration()?;
+        let endpoint = self
+            .broker
             .issue_operator_handoff(request, &artifact, observed_at)
-            .map_err(Self::classify_operator_handoff)
+            .map_err(Self::classify_operator_handoff)?;
+        let binding = self.launch_binding.as_ref().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorHandoffUncomposed
+                .with_platform("protected launch configuration is not composed")
+        })?;
+        // Redeemed rows from a superseded Kernel session can never be
+        // presented again, so they leave the ledger; unredeemed rows stay so
+        // a late redemption reports stale rather than unknown.
+        let live_token = live.registration_digest.clone();
+        self.operator_session_bindings
+            .retain(|_, row| !row.redeemed || row.kernel_session_token == live_token);
+        self.operator_session_bindings.insert(
+            endpoint.handoff_nonce.clone(),
+            OperatorSessionBinding {
+                kernel_session_token: live.registration_digest.clone(),
+                windows_sid: binding.registration.windows_sid.clone(),
+                interactive_session_id: binding.registration.interactive_session_id.clone(),
+                role: endpoint.role.clone(),
+                capabilities: endpoint.capabilities.clone(),
+                redeemed: false,
+            },
+        );
+        Ok(endpoint)
     }
 
     /// Redeems one issued Operator handoff exactly once and returns the
@@ -1308,16 +1539,222 @@ impl BrokerComposition {
     /// expiry is `DEADLINE_EXCEEDED`, and an endpoint naming a superseded
     /// registration epoch or logon Session is `STALE_AUTHORITY_EPOCH`. It
     /// resolves and returns an artifact identity; it starts nothing.
+    ///
+    /// I11.8 redemption additionally proves the binding the `WinUI` client
+    /// presents: the caller's `client` evidence must name the live Kernel
+    /// session token this nonce was issued under (stale tokens are refused
+    /// before any state change), the bound Windows SID/Session tuple
+    /// (cross-session presentation is refused), and an OS-observed client
+    /// process whose running image is the installation-approved Operator
+    /// artifact. The endpoint's own role/capability set must equal the
+    /// granted set exactly: a capability outside the grant is refused rather
+    /// than narrowed.
     pub fn redeem_operator_handoff(
         &mut self,
         endpoint: &OperatorEndpoint,
+        client: &OperatorClientBinding,
     ) -> Result<OperatorArtifact, CompositionError> {
         self.verify_launch_lease()?;
         let artifact = self.operator_artifact()?;
         let now = now_unix_ms()?;
+        client.validate()?;
+        let Some(row) = self
+            .operator_session_bindings
+            .get(&endpoint.handoff_nonce)
+            .cloned()
+        else {
+            // A nonce this process never issued (including every nonce from
+            // before a restart, whose rows died with the previous process)
+            // keeps the core single-use/expiry semantics below.
+            return self
+                .broker
+                .consume_operator_handoff(endpoint, &artifact, now)
+                .map_err(Self::classify_operator_handoff);
+        };
+        if row.redeemed {
+            return self
+                .broker
+                .consume_operator_handoff(endpoint, &artifact, now)
+                .map_err(Self::classify_operator_handoff);
+        }
+        let live = self.live_registration()?;
+        if client.kernel_session_token != row.kernel_session_token
+            || live.registration_digest != row.kernel_session_token
+        {
+            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
+                .with_platform("redeemed handoff does not present the live Kernel session token"));
+        }
+        if client.windows_sid != row.windows_sid
+            || client.interactive_session_id != row.interactive_session_id
+        {
+            return Err(
+                BrokerAdmissionRefusal::OperatorBindingCrossSession.with_platform(
+                    "redeemed handoff presents a foreign Windows SID/session identity",
+                ),
+            );
+        }
+        if endpoint.role != row.role || endpoint.capabilities != row.capabilities {
+            return Err(
+                BrokerAdmissionRefusal::OperatorHandoffNotAdmitted.with_platform(
+                    "redeemed handoff names a role/capability set outside the granted binding",
+                ),
+            );
+        }
+        Self::observe_operator_client(client.client_process_id, &artifact)?;
+        if let Some(stored) = self
+            .operator_session_bindings
+            .get_mut(&endpoint.handoff_nonce)
+        {
+            stored.redeemed = true;
+        }
         self.broker
             .consume_operator_handoff(endpoint, &artifact, now)
             .map_err(Self::classify_operator_handoff)
+    }
+
+    /// Returns the live Kernel-issued registration this broker currently
+    /// holds: admitted, `Active`, and inside its lease horizon. Anything
+    /// else carries no session authority, so no handoff may be issued or
+    /// redeemed and no state change may be admitted against it.
+    fn live_registration(&self) -> Result<RegistrationReceipt, CompositionError> {
+        let now = now_unix_ms()?;
+        let live = self.broker.registration().cloned().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorHandoffStaleGeneration
+                .with_platform("broker holds no live Kernel registration")
+        })?;
+        if live.status != RegistrationStatus::Active || now >= live.expires_at {
+            return Err(BrokerAdmissionRefusal::OperatorHandoffStaleGeneration
+                .with_platform("broker Kernel registration is not live"));
+        }
+        Ok(live)
+    }
+
+    /// Proves the redeeming `WinUI` client process from OS evidence: the
+    /// process id is opened and observed live, and its running image must be
+    /// exactly the installation-approved Operator artifact. A pid alone is
+    /// never identity — Windows reuses ids — so the observation, not the
+    /// presented number, decides.
+    fn observe_operator_client(
+        client_process_id: u32,
+        artifact: &OperatorArtifact,
+    ) -> Result<(), CompositionError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (client_process_id, artifact);
+            return Err(BrokerAdmissionRefusal::OperatorClientProcessForeign
+                .with_platform("client process observation requires Windows"));
+        }
+        #[cfg(windows)]
+        {
+            let observed =
+                eliot_platform_windows::observe_named_pipe_peer_process(client_process_id)
+                    .map_err(|error| {
+                        BrokerAdmissionRefusal::OperatorClientProcessForeign
+                            .with_platform(error.to_string())
+                    })?;
+            if !eliot_platform_windows::ordinal_eq_str(observed.image_path(), &artifact.executable)
+            {
+                return Err(
+                    BrokerAdmissionRefusal::OperatorClientProcessForeign.with_platform(
+                        "redeeming client process image is not the approved Operator artifact",
+                    ),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    /// Admits one broker state-changing request under an explicit
+    /// authenticated Human authority (I11.3 roles, I11.8 authentication).
+    /// Every check runs before any state change, and the admitted request is
+    /// then dispatched on the existing typed Kernel path, where approval
+    /// semantics stay Kernel-canonicalized:
+    ///
+    /// * the principal must be present and must be the Windows SID this
+    ///   broker session was admitted for (omitted or foreign principals are
+    ///   refused);
+    /// * the presented Kernel session token must be the live registration
+    ///   digest inside its lease horizon (missing or stale tokens refused);
+    /// * the presented SID/Session must equal the bound tuple
+    ///   (cross-session requests refused);
+    /// * the presented role/capabilities must be covered by a redeemed
+    ///   Kernel-backed binding for that live session (capability expansion
+    ///   refused);
+    /// * the presented approval hash must be one exact lowercase SHA-256,
+    ///   and an operation owns exactly one hash: a conflicting hash for the
+    ///   same `operation_key` is refused.
+    pub fn admit_human_state_change(
+        &mut self,
+        authority: Option<&HumanStateAuthority>,
+        operation_key: &str,
+    ) -> Result<(), CompositionError> {
+        let authority = authority.ok_or_else(|| {
+            BrokerAdmissionRefusal::HumanPrincipalRequired
+                .with_platform("state-changing request carries no authenticated Human principal")
+        })?;
+        authority.validate()?;
+        if operation_key.trim().is_empty() || operation_key.chars().any(char::is_control) {
+            return Err(BrokerAdmissionRefusal::HumanApprovalRequired
+                .with_platform("state-changing request carries no bounded operation identity"));
+        }
+        let binding = self.launch_binding.as_ref().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorHandoffUncomposed
+                .with_platform("protected launch configuration is not composed")
+        })?;
+        if authority.principal != binding.registration.windows_sid {
+            return Err(
+                BrokerAdmissionRefusal::HumanPrincipalRequired.with_platform(
+                    "state-changing request principal is not the admitted session SID",
+                ),
+            );
+        }
+        if authority.interactive_session_id != binding.registration.interactive_session_id {
+            return Err(BrokerAdmissionRefusal::OperatorBindingCrossSession
+                .with_platform("state-changing request session is not the admitted session"));
+        }
+        let live = self.live_registration()?;
+        if authority.kernel_session_token != live.registration_digest {
+            return Err(
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                    "state-changing request does not present the live Kernel session token",
+                ),
+            );
+        }
+        let granted = self.operator_session_bindings.values().find(|row| {
+            row.redeemed
+                && row.kernel_session_token == live.registration_digest
+                && row.windows_sid == authority.principal
+                && row.interactive_session_id == authority.interactive_session_id
+        });
+        let Some(granted) = granted else {
+            return Err(
+                BrokerAdmissionRefusal::HumanCapabilityNotGranted.with_platform(
+                    "no redeemed Kernel-backed binding grants authority for this session",
+                ),
+            );
+        };
+        if authority.role != granted.role
+            || authority
+                .capabilities
+                .iter()
+                .any(|capability| !granted.capabilities.contains(capability))
+        {
+            return Err(
+                BrokerAdmissionRefusal::HumanCapabilityNotGranted.with_platform(
+                    "state-changing request names a role/capability outside the granted binding",
+                ),
+            );
+        }
+        if let Some(bound) = self.approval_bindings.get(operation_key)
+            && bound != &authority.approval_hash
+        {
+            return Err(BrokerAdmissionRefusal::HumanApprovalRequired.with_platform(
+                "state-changing request approval hash conflicts with the hash bound to this operation",
+            ));
+        }
+        self.approval_bindings
+            .insert(operation_key.to_owned(), authority.approval_hash.clone());
+        Ok(())
     }
 
     /// The installation-approved Operator image from the retained protected
