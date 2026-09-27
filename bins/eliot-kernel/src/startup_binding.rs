@@ -30,6 +30,12 @@ pub(crate) struct KernelStartupBinding {
     host_process_image: String,
     pub(crate) receipt_root: PathBuf,
     pub(crate) kernel_ors_root: PathBuf,
+    /// I16.10 (issue #1837): the Watchdog failure-domain root that receives
+    /// the periodic digest anchor. Injected by the Host with the same launch
+    /// contour and under the same `runtime_state_roots_digest` as the two
+    /// roots above, so the anchor sink can never be a root the digest does not
+    /// cover.
+    pub(crate) watchdog_state_root: PathBuf,
     pub(crate) runtime_state_roots_digest: String,
     generation_config_digest: String,
     pub(crate) installation_id: String,
@@ -46,6 +52,7 @@ impl KernelStartupBinding {
             std::env::var("ELIOT_HOST_PROCESS_IMAGE").ok(),
             std::env::var("ELIOT_KERNEL_RECEIPT_ROOT").ok(),
             std::env::var("ELIOT_KERNEL_ORS_ROOT").ok(),
+            std::env::var("ELIOT_KERNEL_WATCHDOG_STATE_ROOT").ok(),
             std::env::var("ELIOT_RUNTIME_STATE_ROOTS_DIGEST").ok(),
             std::env::var("ELIOT_GENERATION_CONFIG_DIGEST").ok(),
             std::env::var("ELIOT_HOST_INSTALLATION").ok(),
@@ -61,6 +68,7 @@ impl KernelStartupBinding {
         host_process_image: Option<String>,
         receipt_root: Option<String>,
         kernel_ors_root: Option<String>,
+        watchdog_state_root: Option<String>,
         runtime_state_roots_digest: Option<String>,
         generation_config_digest: Option<String>,
         installation_id: Option<String>,
@@ -105,6 +113,11 @@ impl KernelStartupBinding {
         };
         let receipt_root = exact_root(receipt_root, "Kernel receipt root")?;
         let kernel_ors_root = exact_root(kernel_ors_root, "Kernel ORS root")?;
+        // I16.10 (issue #1837): the Watchdog failure-domain root is a launch
+        // value, never an optional one. Without it the Kernel could only
+        // anchor inside its own work root, which is exactly the history the
+        // anchor exists to preserve.
+        let watchdog_state_root = exact_root(watchdog_state_root, "Watchdog state root")?;
         let runtime_state_roots_digest = runtime_state_roots_digest
             .filter(|value| {
                 value.len() == 64
@@ -143,6 +156,7 @@ impl KernelStartupBinding {
             host_process_image,
             receipt_root,
             kernel_ors_root,
+            watchdog_state_root,
             runtime_state_roots_digest,
             generation_config_digest,
             installation_id,
@@ -785,7 +799,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn exact_startup_values() -> [Option<String>; 10] {
+    fn exact_startup_values() -> [Option<String>; 11] {
         [
             Some(KERNEL_CONTROL_PIPE.to_owned()),
             Some("41".to_owned()),
@@ -793,6 +807,7 @@ mod tests {
             Some(r"C:\eliot\eliot-host.exe".to_owned()),
             Some(r"C:\ProgramData\Eliot\installations\a\host".to_owned()),
             Some(r"C:\ProgramData\Eliot\installations\a\kernel\state".to_owned()),
+            Some(r"C:\ProgramData\Eliot\installations\a\watchdog".to_owned()),
             Some("a".repeat(64)),
             Some("b".repeat(64)),
             Some("installation-a".to_owned()),
@@ -801,7 +816,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn parse_startup_values(values: &[Option<String>; 10]) -> Result<KernelStartupBinding, String> {
+    fn parse_startup_values(values: &[Option<String>; 11]) -> Result<KernelStartupBinding, String> {
         KernelStartupBinding::parse(
             values[0].clone(),
             values[1].clone(),
@@ -813,6 +828,7 @@ mod tests {
             values[7].clone(),
             values[8].clone(),
             values[9].clone(),
+            values[10].clone(),
         )
     }
 

@@ -1428,8 +1428,13 @@ impl KernelComposition {
         let mut kernel_audit = KernelAuditChain::open(&work_root)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         if let Some(binding) = config.audit_anchor_binding.as_ref() {
+            // I16.10 (issue #1837): production binds the installer-owned
+            // Watchdog failure-domain root in `main`; the same-domain default
+            // stays a legitimate configuration only while that injection is
+            // absent. `set_anchor_sink` proves the bound directory is
+            // physically outside the work root before accepting it.
             kernel_audit
-                .set_anchor_sink(binding)
+                .set_anchor_sink(binding, &work_root)
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         }
         let prior_head_seq = kernel_audit.head_seq();

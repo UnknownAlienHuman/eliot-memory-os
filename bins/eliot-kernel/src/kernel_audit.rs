@@ -13,12 +13,15 @@
 //! previous/current link per record, and one anchor directory holding
 //! periodic digest anchors. Anchors store a digest, never semantic memory
 //! (A13.8). The anchor sink defaults to
-//! `<work-root>/kernel-audit/anchors/`; Host may inject a Watchdog-failure-
-//! domain directory through [`AuditAnchorBinding`] (mirroring the
-//! Host-owned eliotd receipt root), in which case that directory is the
-//! sink. There is no second writer, no parallel chain, and no alternate
-//! anchor mechanism: every boundary below appends through the composition's
-//! one [`KernelAuditChain`] handle.
+//! `<work-root>/kernel-audit/anchors/`; the Host injects the installer-owned
+//! `RuntimeStateRoots::watchdog_state_root` through [`AuditAnchorBinding`]
+//! (mirroring the Host-owned eliotd receipt root), and the production launch
+//! path always does, so in every running Kernel the periodic anchor lands in
+//! the Watchdog failure domain rather than beside the chain it anchors. That
+//! default remains a legitimate configuration for a caller that binds no
+//! Watchdog domain. There is no second writer, no parallel chain, and no
+//! alternate anchor mechanism: every boundary below appends through the
+//! composition's one [`KernelAuditChain`] handle.
 //!
 //! Event posture is uniform and observational: `audit_observe` appends are
 //! best-effort and never change an authority decision. The durable ORS
@@ -1789,16 +1792,44 @@ impl KernelAuditChain {
 
     /// Points the single anchor sink at a Host-injected Watchdog-domain dir.
     ///
+    /// I16.10 requires the periodic digest anchor to be copied to the
+    /// Watchdog failure domain, so the bound directory is proved physically
+    /// separate from the chain it anchors before it becomes the sink: a sink
+    /// equal to or below the Kernel work root is rejected rather than
+    /// silently collapsing back to the same-domain default. Both sides are
+    /// canonicalized first so the containment check cannot be defeated by
+    /// Windows path casing or a non-canonical declared root.
+    ///
     /// # Errors
     ///
-    /// Returns [`KernelAuditError`] when the bound directory is not
-    /// readable; the Kernel never creates the foreign directory.
+    /// Returns [`KernelAuditError::NotDirectory`] when the bound directory is
+    /// not readable, [`KernelAuditError::Io`] when either side cannot be
+    /// canonicalized, [`KernelAuditError::AnchorMismatch`] when the bound
+    /// directory lies inside the Kernel work root, and any error from
+    /// resuming the retained anchor hash. The Kernel never creates the
+    /// foreign directory.
     pub fn set_anchor_sink(
         &mut self,
         binding: &AuditAnchorBinding,
+        kernel_work_root: &Path,
     ) -> Result<(), KernelAuditError> {
         if !binding.dir().is_dir() {
             return Err(KernelAuditError::NotDirectory);
+        }
+        let anchor_dir =
+            std::fs::canonicalize(binding.dir()).map_err(|error| KernelAuditError::Io {
+                path: binding.dir().to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        let work_root =
+            std::fs::canonicalize(kernel_work_root).map_err(|error| KernelAuditError::Io {
+                path: kernel_work_root.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        if anchor_dir.starts_with(&work_root) {
+            return Err(KernelAuditError::AnchorMismatch {
+                reason: "anchor_sink_inside_kernel_work_root",
+            });
         }
         self.anchor_dir = binding.dir().to_path_buf();
         self.resume_anchor_hash()

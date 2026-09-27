@@ -272,7 +272,7 @@ impl HostJobBranches {
         arguments: &[eliot_platform::PlatformHandle],
         working_directory: &Path,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
-        receipt_binding: Option<(&Path, &Path, &PlatformHandle)>,
+        receipt_binding: Option<(&Path, &Path, &Path, &PlatformHandle)>,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         // WORK_UNIT_CASE: 978/1 — launch requested, distinct from process/readiness.
         // WORK_UNIT_CASE: 978/4 — request precedes process identity and admitted launch.
@@ -524,6 +524,43 @@ impl HostJobBranches {
         result
     }
 
+    /// Resolves the Watchdog failure-domain anchor sink for the Kernel audit
+    /// chain.
+    ///
+    /// I16.10 ("Periodic digest anchor is copied to Watchdog failure domain")
+    /// and A13.8 ("External integrity anchors … help detect rollback or
+    /// history rewriting") both require the periodic anchor to survive loss or
+    /// rollback of the Kernel work root, and I8.1 puts the Watchdog's spool in
+    /// its own physically separate root. The sink is therefore the
+    /// installer-owned `RuntimeStateRoots::watchdog_state_root` verbatim — not
+    /// a Kernel-derived or Host-invented path. It is a proven claim, not a
+    /// name: `validate_for_config` has just re-proved the fixed
+    /// `<installation_root>/watchdog` topology, whole-component separation from
+    /// `kernel_work_root`, and the `roots_digest` that covers this field.
+    ///
+    /// The Kernel never creates the bound directory (`AuditAnchorBinding::new`
+    /// in the Kernel audit chain), so a missing Watchdog root fails the launch
+    /// closed here instead of quietly leaving the anchor in the Kernel failure
+    /// domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::ProcessContour`] when the installer-owned
+    /// Watchdog state root is not an existing directory.
+    pub(super) fn watchdog_anchor_root(
+        launch: &RuntimeLaunchDescriptor,
+    ) -> Result<&Path, HostError> {
+        let root = Path::new(launch.runtime_state_roots.watchdog_state_root.as_str());
+        if !root.is_dir() {
+            // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+            host_launch_observe("host.launch typed rejection");
+            return Err(HostError::ProcessContour(
+                "installer-owned Watchdog state root is not an existing directory".to_owned(),
+            ));
+        }
+        Ok(root)
+    }
+
     /// Starts the approved Kernel and Store images in separate Job Objects.
     /// Both images are pinned and validated while suspended, then resumed only
     /// after the generation identity has been accepted.
@@ -691,6 +728,11 @@ impl HostJobBranches {
         }
         let (kernel_working_directory, store_working_directory) =
             Self::approved_working_directories(launch, portable_root.as_ref(), &config_path)?;
+        // I16.10 (issue #1837): bind the periodic digest-anchor sink to the
+        // Watchdog failure domain on this launch. Resolved from the validated
+        // `RuntimeStateRoots`, so it is derived from the real installer-owned
+        // Watchdog root rather than supplied as a plausible-looking path.
+        let watchdog_anchor_root = Self::watchdog_anchor_root(launch)?;
         // T6-D2 front-door anchor (issue #461): inject the sealed
         // digest-bound Doctor executable path into the stored 22-value
         // contour so the Kernel receives the exact 24-value launch options.
@@ -766,6 +808,7 @@ impl HostJobBranches {
                     Some((
                         Path::new(launch.runtime_state_roots.host_state_root.as_str()),
                         Path::new(launch.runtime_state_roots.kernel_ors_root.as_str()),
+                        watchdog_anchor_root,
                         &launch.runtime_state_roots.roots_digest,
                     )),
                 )
