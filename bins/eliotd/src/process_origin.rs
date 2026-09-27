@@ -61,6 +61,10 @@ pub enum ProcessOriginError {
     /// The operation is observe-only and must never be packaged for the Kernel.
     #[error("process-origin denied: probes observe only and are never forwarded")]
     ObserveOnly,
+    /// A read-only operation was offered where a Kernel control operation class
+    /// is required. The refused operation is named by its own variant label.
+    #[error("process-origin denied: {0} is read-only and has no destructive-control class")]
+    NotAControlOperation(&'static str),
 }
 
 impl From<eliot_process::ContractError> for ProcessOriginError {
@@ -136,18 +140,31 @@ impl ProcessControlOperation {
     }
 }
 
-impl From<ProcessControlOperation> for OriginControlOperation {
-    fn from(operation: ProcessControlOperation) -> Self {
+/// Explicitly fallible mapping from a requested operation to its Kernel
+/// control class.
+///
+/// Only the four control classes map. `ReadStatus` and `ProbeObserve` are
+/// observation answers: I03-04 states that the same ambiguous origin may permit
+/// a read-only status and still forbid shutdown/mutation, and the Kernel's
+/// [`OriginControlOperation`] has no read-only variant for them to become. This
+/// conversion therefore refuses them with
+/// [`ProcessOriginError::NotAControlOperation`] instead of naming a
+/// destructive class on their behalf, so no observe-only operation can reach
+/// a control request — including the most destructive one.
+impl TryFrom<ProcessControlOperation> for OriginControlOperation {
+    type Error = ProcessOriginError;
+
+    fn try_from(operation: ProcessControlOperation) -> Result<Self, Self::Error> {
         match operation {
-            ProcessControlOperation::Kill => Self::Kill,
-            ProcessControlOperation::Mutate => Self::Mutate,
-            ProcessControlOperation::Adopt => Self::Adopt,
-            ProcessControlOperation::AttachCredential => Self::AttachCredential,
-            ProcessControlOperation::ReadStatus | ProcessControlOperation::ProbeObserve => {
-                // Unreachable through `request_origin_control`, which rejects
-                // observe-only operations first; the mapping defaults
-                // fail-closed to the narrowest control class if misused.
-                Self::Kill
+            ProcessControlOperation::Kill => Ok(Self::Kill),
+            ProcessControlOperation::Mutate => Ok(Self::Mutate),
+            ProcessControlOperation::Adopt => Ok(Self::Adopt),
+            ProcessControlOperation::AttachCredential => Ok(Self::AttachCredential),
+            ProcessControlOperation::ReadStatus => {
+                Err(ProcessOriginError::NotAControlOperation("ReadStatus"))
+            }
+            ProcessControlOperation::ProbeObserve => {
+                Err(ProcessOriginError::NotAControlOperation("ProbeObserve"))
             }
         }
     }
@@ -414,6 +431,10 @@ pub fn gate_process_control(
 /// evaluated exclusively by the Kernel-owned
 /// [`OriginChallengeAuthority::issue`] and [`OriginChallengeAuthority::decide`].
 /// This function holds no key and mints nothing.
+///
+/// The operation class is bound by an explicitly fallible conversion, so an
+/// observe-only operation can never be packaged as a control request here even
+/// if the forwardability check above were ever weakened.
 pub fn request_origin_control(
     evidence: &ProcessOriginEvidence,
     physical: &PhysicalProcessBinding,
@@ -432,7 +453,7 @@ pub fn request_origin_control(
         evidence.origin_digest.clone(),
         generation,
         evidence.state_fence.clone(),
-        OriginControlOperation::from(operation),
+        OriginControlOperation::try_from(operation)?,
         request_nonce.to_owned(),
     )
     .map_err(ProcessOriginError::from)
