@@ -49,6 +49,8 @@ mod kernel_authority_port;
 mod notify_fallback_ensure;
 pub mod notify_launch_callin;
 mod operation_identity;
+#[cfg(windows)]
+mod own_generation_job;
 mod protected_launch_config;
 use kernel_authority_port::KernelAuthorityPort;
 pub use notify_fallback_ensure::{
@@ -224,6 +226,15 @@ pub enum BrokerAdmissionRefusal {
     /// Session ended. Logout stops cutover.
     #[error("CUTOVER_SESSION_GONE")]
     CutoverSessionGone,
+    /// This broker process generation could not create and own a Job Object it
+    /// can prove: the durable name is not a valid object-manager name, a Job
+    /// Object already held this generation's name, Windows refused to admit
+    /// this process to the Job Object it had just created, or the admitted
+    /// assignment resolved to a different process. `I1.6` puts the broker in
+    /// its own Job Object, so a generation that cannot prove that contour is
+    /// refused rather than left running in a job it does not own.
+    #[error("BROKER_GENERATION_JOB_UNOWNABLE")]
+    GenerationJobUnownable,
 }
 
 impl BrokerAdmissionRefusal {
@@ -259,6 +270,7 @@ impl BrokerAdmissionRefusal {
             Self::CutoverPreconditionUnmet => "CUTOVER_PRECONDITION_UNMET",
             Self::CutoverSessionGone => "CUTOVER_SESSION_GONE",
             Self::OperatorHandoffUncomposed => "BROKER_OPERATOR_HANDOFF_UNCOMPOSED",
+            Self::GenerationJobUnownable => "BROKER_GENERATION_JOB_UNOWNABLE",
         }
     }
 
@@ -1038,6 +1050,12 @@ pub struct BrokerReadiness<'a> {
     pub registration_state: &'static str,
     pub missing_providers: Vec<RequiredProvider>,
     pub snapshot: String,
+    /// The durable identity of the Job Object this broker process generation
+    /// created and assigned itself to, bound to this generation by its process
+    /// id and observed start instant. A surviving Job Object of the same
+    /// durable name can never be a contour this generation joined, because
+    /// creation refuses an existing name rather than opening it.
+    pub generation_job: Option<&'a str>,
 }
 
 pub struct BrokerComposition {
@@ -1049,6 +1067,32 @@ pub struct BrokerComposition {
     /// The live process identity this broker admitted itself as. Re-observed
     /// on every authenticated operation; see [`Self::verify_launch_lease`].
     process_binding: Option<BrokerProcessBinding>,
+    /// The Job Object this broker process generation created and assigned
+    /// itself to, bound to `process_binding` by construction.
+    ///
+    /// Creation is exclusive — the durable name carries this generation's
+    /// process id and observed start instant, and `CreateJobObjectW` refuses a
+    /// name that already exists — but exclusive creation is not handle
+    /// ownership. The job's DACL is `D:P(A;;GA;;;SY)(A;;GA;;;OW)`, so a
+    /// `LocalSystem` process or another process running as this same user can
+    /// open that name and hold its own handle. This field is therefore the
+    /// handle *this* generation created, not proof that it is the only handle
+    /// in existence; while any other handle is open the kill-on-close limit
+    /// does not fire on this field's release at all.
+    ///
+    /// It contains THIS broker process, so the invariant is: no path may drop
+    /// the composition while it still owes a diagnostic. Dropping the
+    /// composition releases this handle, which fires the kill-on-close limit
+    /// installed before the handle was ever returned, and that termination
+    /// happens inside `drop`. In `main` that is now the intended exit for the
+    /// failed-`Ready`-write, unwritable-response, and stdin-EOF paths, and for
+    /// the clean `Stop` path — the last of which therefore exits through
+    /// kill-on-close instead of returning from `main`, and whose exit code is
+    /// consequently the kernel's, not the process's own. The heartbeat-failure
+    /// path deliberately does not drop the composition, so its
+    /// `BROKER_HEARTBEAT_REJECTED` line is still written first.
+    #[cfg(windows)]
+    generation_job: own_generation_job::OwnedGenerationJob,
     registration_digest: Option<String>,
     identity_issuer: IssuerHandle,
     /// Kernel-backed Operator session bindings keyed by issued handoff
@@ -1208,6 +1252,22 @@ impl BrokerComposition {
         }
         drop(identity);
         let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
+        // The broker is its own failure domain: this process generation creates
+        // one Job Object for itself and is assigned to it. Creation refuses an
+        // existing name, so the contour is created here rather than joined, and
+        // a generation that cannot create it, or cannot be assigned to the one
+        // it just created, is refused.
+        //
+        // This is deliberately the LAST fallible statement in this function.
+        // From the moment this process is a member of a job carrying
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, dropping that job terminates
+        // this process, so no `?` may follow: an error raised after this point
+        // would drop the job on the way out and kill the broker inside the
+        // error path, before the refusal could be reported. The only statement
+        // after it is the `Ok(Self { .. })` construction, which cannot fail.
+        #[cfg(windows)]
+        let generation_job =
+            own_generation_job::create_owned_generation_job(&process_binding.identity)?;
         Ok(Self {
             broker,
             snapshot,
@@ -1215,6 +1275,8 @@ impl BrokerComposition {
             launch_binding,
             launch_lease,
             process_binding: Some(process_binding),
+            #[cfg(windows)]
+            generation_job,
             registration_digest,
             identity_issuer: issuer,
             operator_session_bindings: BTreeMap::new(),
@@ -1226,6 +1288,12 @@ impl BrokerComposition {
     }
 
     pub fn readiness(&self) -> BrokerReadiness<'_> {
+        // The Job Object identity is a Windows-only fact; the field stays
+        // present on every build so the readiness shape does not fork.
+        #[cfg(windows)]
+        let generation_job = Some(self.generation_job.identity().name());
+        #[cfg(not(windows))]
+        let generation_job: Option<&str> = None;
         BrokerReadiness {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
@@ -1236,6 +1304,7 @@ impl BrokerComposition {
                 vec![RequiredProvider::G01Authority, RequiredProvider::P03Process]
             },
             snapshot: self.snapshot.display().to_string(),
+            generation_job,
         }
     }
 
