@@ -18,6 +18,10 @@ pub const MAX_ROLLING_GENERATIONS: u32 = 64;
 /// Largest accepted rolling generation size, in bytes.
 pub const MAX_ROLLING_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Largest accepted rolling writer-queue depth, in records, before admission
+/// starts dropping and the visible dropped-records gauge advances.
+pub const MAX_ROLLING_QUEUED_RECORDS: usize = 1024;
+
 /// Largest accepted `OpenMetrics` series cardinality.
 ///
 /// I16.1 requires bounded metric labels; the family-wide bound below is the
@@ -140,10 +144,11 @@ impl RollingLogPolicy {
             self.max_generations,
             MAX_ROLLING_GENERATIONS,
         )?;
-        if self.max_buffered_records == 0 {
+        if self.max_buffered_records == 0 || self.max_buffered_records > MAX_ROLLING_QUEUED_RECORDS
+        {
             return Err(ObservabilityConfigError::OutOfBound {
                 field: "max_buffered_records",
-                max: u64::MAX,
+                max: MAX_ROLLING_QUEUED_RECORDS as u64,
             });
         }
         if self.file_stem.trim().is_empty() {

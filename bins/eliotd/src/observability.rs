@@ -16,9 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_observability_runtime::{
-    ObservabilityConfig, RollingLogPolicy, RuntimeProfile, SpoolPolicy,
-};
+use eliot_observability_runtime::{ObservabilityConfig, RollingLogPolicy, RuntimeProfile};
 
 /// Stable operational-log stem for this process. The generation name carries
 /// the exit code, so a fresh process start is distinguishable from a rolling
@@ -35,8 +33,10 @@ const OPERATIONAL_LOG_GENERATIONS: u32 =
     eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS;
 
 /// Bounded writer-queue depth, in records, before admission starts dropping and
-/// the visible dropped-records gauge advances (I16.11 forbids hidden loss).
-const OPERATIONAL_LOG_QUEUED_RECORDS: usize = 1024;
+/// the visible dropped-records gauge advances (I16.11 forbids hidden loss), at
+/// the crate's own declared ceiling.
+const OPERATIONAL_LOG_QUEUED_RECORDS: usize =
+    eliot_observability_runtime::config::MAX_ROLLING_QUEUED_RECORDS;
 
 /// Returns the process observability configuration for this daemon.
 #[must_use]
@@ -53,7 +53,7 @@ pub(super) fn daemon_config() -> ObservabilityConfig {
         },
         // `system_service` uses the Windows Event Log as its last resort, so
         // no protected spool is configured here.
-        spool: protected_spool(RuntimeProfile::SystemService),
+        spool: None,
         // No canonical `OpenMetrics` bind address and no approved OTLP
         // collector endpoint exist in the tree, so both stay at the crate's
         // own disabled default; I16.2 requires the OTLP bridge to stay
@@ -74,21 +74,4 @@ pub(super) fn daemon_config() -> ObservabilityConfig {
 fn state_root() -> PathBuf {
     eliot_platform_windows::protected_program_data_path(eliotd::PROTECTED_STATE_RELATIVE)
         .unwrap_or_else(|_| Path::new(eliotd::PROTECTED_STATE_RELATIVE).to_path_buf())
-}
-
-/// The protected event-spool policy for a profile that needs one.
-///
-/// A `system_service` profile has the Windows Event Log as its last resort and
-/// therefore needs no spool; the other two profiles receive one beside the
-/// daemon state root.
-fn protected_spool(profile: RuntimeProfile) -> Option<SpoolPolicy> {
-    if profile == RuntimeProfile::SystemService {
-        return None;
-    }
-    Some(SpoolPolicy {
-        directory: state_root().join("spool"),
-        file_stem: "critical-events".to_owned(),
-        max_generations: eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS,
-        max_record_bytes: eliot_observability_runtime::config::MAX_SPOOL_RECORD_BYTES,
-    })
 }

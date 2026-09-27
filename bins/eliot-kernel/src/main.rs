@@ -75,8 +75,10 @@ const OPERATIONAL_LOG_GENERATIONS: u32 =
     eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS;
 
 /// Bounded writer-queue depth, in records, before admission starts dropping and
-/// the visible dropped-records gauge advances (I16.11 forbids hidden loss).
-const OPERATIONAL_LOG_QUEUED_RECORDS: usize = 1024;
+/// the visible dropped-records gauge advances (I16.11 forbids hidden loss), at
+/// the crate's own declared ceiling.
+const OPERATIONAL_LOG_QUEUED_RECORDS: usize =
+    eliot_observability_runtime::config::MAX_ROLLING_QUEUED_RECORDS;
 
 /// Bounded protected spool generation count, at the same declared ceiling.
 const OPERATIONAL_SPOOL_GENERATIONS: u32 =
