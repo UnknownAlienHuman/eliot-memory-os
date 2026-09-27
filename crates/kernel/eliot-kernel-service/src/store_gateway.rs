@@ -645,6 +645,32 @@ impl KernelStoreGateway {
         self.flight.fence_and_drain(timeout).await
     }
 
+    /// Refuses a mutating Store or ORS effect while this Kernel candidate is
+    /// in `shadow_no_authority` (I14.16 step 4).
+    ///
+    /// Every mutating entry point calls this as its *first* gated step, before
+    /// any ORS reservation, scope advance, or Store send. It exists because
+    /// [`Self::apply`] and [`Self::apply_reserved`] do not reach
+    /// `acquire_admission` until after their staging work, so a
+    /// `shadow_no_authority` candidate could otherwise write ORS rows before
+    /// the lease gate refused the send. Read-only inspection
+    /// ([`Self::execute_named`], [`Self::receipt`], [`Self::recovery`]) is
+    /// deliberately not gated: I14.16 step 3 permits immutable/read-only
+    /// inspection and compatibility checks in this phase.
+    ///
+    /// The refusal is the crate's existing [`KernelServiceError::AdmissionClosed`]
+    /// carrying the exact current state, flattened to this module's `String`
+    /// error the way every other gateway refusal is.
+    fn refuse_shadow_mutation(&self) -> Result<(), String> {
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+        service
+            .admit_shadow_effect()
+            .map_err(|error| error.to_string())
+    }
+
     /// Applies one already prepared transition after fixed Kernel admission.
     pub async fn apply(
         &self,
@@ -657,6 +683,7 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        self.refuse_shadow_mutation()?;
         // 1927: authenticate the caller before plan admission (I5.6 step 1),
         // mirroring `apply_reserved_admission`.
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
@@ -815,6 +842,12 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        // I14.16 step 4: the shadow refusal precedes the ORS `stage_and_reserve`
+        // write below. The normal admission lease is only acquired later, at
+        // the bounded send window, so without this gate a
+        // `shadow_no_authority` candidate would stage and reserve ORS rows
+        // before the lease gate refused the Store send.
+        self.refuse_shadow_mutation()?;
         apply_reserved_admission(context, &transition)?;
         {
             let view = CanonicalRequestView::from_apply(
@@ -1010,6 +1043,10 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        // I14.16 step 4: cancelling a reservation is an ORS mutation, so a
+        // `shadow_no_authority` candidate refuses it before the owner and
+        // protected lease are taken below.
+        self.refuse_shadow_mutation()?;
         let commit_ors = self.commit_ors.clone().ok_or_else(|| {
             "reserved writes require the composition-bound ORS; nothing to cancel".to_owned()
         })?;
@@ -3225,6 +3262,9 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        // I14.16 step 4: a `shadow_no_authority` candidate performs no Store
+        // write. The gate precedes the normal admission lease below.
+        self.refuse_shadow_mutation()?;
         context.validate().map_err(|error| error.to_string())?;
         request
             .validate_for_context(context)
@@ -3366,6 +3406,17 @@ impl KernelStoreGateway {
         let _flight = self.flight.enter()?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        // I14.16 step 4: a `shadow_no_authority` candidate performs no Store
+        // write. The gate reuses this module's own
+        // [`dreamer_operation_effect`] classification, so a permitted
+        // `Status` read stays available (the read-only inspection I14.16 step
+        // 3 allows) while every ledger mutation is refused before the durable
+        // recovery state is read and before the retained-commit
+        // classification, so a shadow candidate cannot stage, classify or
+        // reconcile a mutation.
+        if dreamer_operation_effect(&request.operation) == DreamerOperationEffect::Mutation {
+            self.refuse_shadow_mutation()?;
         }
         context.validate().map_err(|error| error.to_string())?;
         request.validate().map_err(|error| error.to_string())?;
