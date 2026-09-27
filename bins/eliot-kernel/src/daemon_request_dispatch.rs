@@ -5362,7 +5362,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let request: GenerationCutoverRequest =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let outcome = self
             .apply_authenticated_generation_cutover(
                 &request,
