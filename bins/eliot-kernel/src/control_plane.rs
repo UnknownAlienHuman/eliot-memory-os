@@ -323,7 +323,9 @@ impl KernelComposition {
             // Post-linearization activation cannot reuse the drained
             // generation; the caller re-establishes a fresh generation
             // through the reconcile path.
-            let disposition = coordinator_for(&self.work_root).on_activate_request();
+            let disposition = coordinator_for(&self.work_root)
+                .and_then(|coordinator| coordinator.on_activate_request())
+                .map_err(|_| TransportError::SessionFenced)?;
             observe_control(
                 "kernel.control.drain_disposition_observed",
                 disposition_code(disposition),
@@ -371,10 +373,14 @@ impl KernelComposition {
                         self.verify_store_rebind_publication_complete(&receipt)?;
                         // A reconciled commit resolves the matching drain-gate
                         // receipt when a shutdown is waiting on it.
-                        coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
-                            "store-rebind:{}",
-                            query.operation_id.as_str()
-                        ));
+                        coordinator_for(&self.work_root)
+                            .and_then(|coordinator| {
+                                coordinator.resolve_pending_receipt(&format!(
+                                    "store-rebind:{}",
+                                    query.operation_id.as_str()
+                                ))
+                            })
+                            .map_err(|_| TransportError::SessionFenced)?;
                         Some(receipt)
                     }
                     Some(record)
@@ -401,10 +407,14 @@ impl KernelComposition {
                                 self.rollback_store_rebind_if_exact_query(query)?;
                                 // The abort removed the staged row, resolving
                                 // the matching drain-gate receipt if any.
-                                coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
-                                    "store-rebind:{}",
-                                    query.operation_id.as_str()
-                                ));
+                                coordinator_for(&self.work_root)
+                                    .and_then(|coordinator| {
+                                        coordinator.resolve_pending_receipt(&format!(
+                                            "store-rebind:{}",
+                                            query.operation_id.as_str()
+                                        ))
+                                    })
+                                    .map_err(|_| TransportError::SessionFenced)?;
                                 None
                             }
                             (_, Some(after))
@@ -434,10 +444,14 @@ impl KernelComposition {
                                 self.verify_store_rebind_publication_complete(&receipt)?;
                                 // A reconciled commit resolves the matching
                                 // drain-gate receipt when a shutdown waits.
-                                coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
-                                    "store-rebind:{}",
-                                    query.operation_id.as_str()
-                                ));
+                                coordinator_for(&self.work_root)
+                                    .and_then(|coordinator| {
+                                        coordinator.resolve_pending_receipt(&format!(
+                                            "store-rebind:{}",
+                                            query.operation_id.as_str()
+                                        ))
+                                    })
+                                    .map_err(|_| TransportError::SessionFenced)?;
                                 Some(receipt)
                             }
                             _ => return Err(TransportError::SessionFenced),
@@ -745,7 +759,14 @@ impl KernelComposition {
     /// the request even when admission closure wins the race.
     #[must_use]
     pub fn request_shutdown(&self) -> bool {
-        let _ = coordinator_for(&self.work_root).request_shutdown();
+        let Ok(coordinator) = coordinator_for(&self.work_root) else {
+            observe_control("kernel.control.drain_request_failed", "unavailable");
+            return false;
+        };
+        if coordinator.request_shutdown().is_err() {
+            observe_control("kernel.control.drain_request_failed", "unavailable");
+            return false;
+        }
         let view = self.activation_operational_view();
         observe_control(
             "kernel.control.drain_requested_observed",
