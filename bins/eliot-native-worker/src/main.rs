@@ -238,7 +238,12 @@ where
             return deny_invalid_material(&format!("admitted epoch is not projectable: {error}"));
         }
     };
-    match block_on(worker.serve_stdio_governed(&material.action_envelopes, &fence, &epoch)) {
+    match block_on(worker.serve_stdio_governed(
+        &material.action_envelopes,
+        &material.admission.claim().work_scope_id,
+        &fence,
+        &epoch,
+    )) {
         Ok(_) => 0,
         Err(error) => {
             emit(ADMITTED_DRIVE_FAILED, &error.to_string());
@@ -1642,6 +1647,7 @@ mod tests {
                 &mut reader,
                 &mut writer,
                 &[],
+                &material.admission.claim().work_scope_id,
                 &fence_json,
                 &epoch_json,
             )),
@@ -1677,6 +1683,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &serve,
+            &material.admission.claim().work_scope_id,
             &fence_json,
             &epoch_json,
         ))
@@ -2136,6 +2143,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &material.action_envelopes,
+            &material.admission.claim().work_scope_id,
             &fence_json,
             &epoch_json,
         ))
