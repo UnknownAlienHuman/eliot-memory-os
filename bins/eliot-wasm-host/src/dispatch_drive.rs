@@ -14,6 +14,8 @@
 //! → P03 seating and reap (A3 execution join)
 //! → verdict evaluation (evaluate_lifecycle_verdicts,
 //!   evaluate_seated_verdicts)
+//! → conformance comparison against the declared core reference
+//!   (conformance_record)
 //! ```
 //!
 //! This module implements the non-dependent seam now: drive errors, the
@@ -34,14 +36,17 @@
 
 use std::path::Path;
 
+use eliot_governor::{CONFORMANCE_COMPONENT, PromotionExpectations};
 use eliot_runtime_contracts::{HealthDimension, HealthVector};
 use eliot_security_contracts::PrivacyClass;
-use eliot_wasm_runtime::lifecycle::InFlightDisposition;
+use eliot_wasm_runtime::lifecycle::{
+    CoreOutcome, DeterministicEchoCore, ErrorClass, InFlightDisposition, SemanticCore,
+};
 use eliot_wasm_runtime::{
-    ArtifactAccessLimits, CancellationPolicy, CapabilityId, EpochPolicy, ExecutionContour,
-    InvocationDisposition, InvocationId, InvocationLimits, InvocationRequest, InvocationResult,
-    OwnerId, Revision, RuntimeError, Sha256Digest, TrapClass, VerificationVerdict, WasmRuntime,
-    WorkScopeRef, WorkUnitId,
+    ArtifactAccessLimits, CancellationPolicy, CapabilityId, EffectProposal, EpochPolicy,
+    ExecutionContour, InvocationDisposition, InvocationId, InvocationLimits, InvocationRequest,
+    InvocationResult, OwnerId, Revision, RuntimeError, Sha256Digest, TrapClass,
+    VerificationVerdict, WasmRuntime, WorkScopeRef, WorkUnitId,
 };
 
 use crate::cli_contract::Profile;
@@ -139,6 +144,130 @@ pub struct DispatchDriveResponse {
     pub verdicts: LifecycleVerdicts,
     /// Seated trap/cancel/drain/rollback verdicts for the same run.
     pub seated: SeatedVerdicts,
+    /// WASM-versus-declared-core-reference conformance comparison for the
+    /// registered deterministic component, on the admitted input and seed.
+    /// `None` for every other component: its declared reference is an
+    /// owner-supplied digest set with no reference values to compare field
+    /// by field, so no comparison is claimed.
+    pub conformance: Option<ConformanceRecord>,
+}
+
+/// WASM-versus-declared-core-reference conformance comparison for one
+/// registered deterministic component and fixed seed/input.
+///
+/// Every compared value is carried by value on both sides: the observed
+/// WASM result bytes, error class, proposed effects, and observed state
+/// delta, next to the declared core reference's own four. A digest of an
+/// expected value, or the identity of a prior run, names a reference; it is
+/// not a comparison and never appears here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConformanceRecord {
+    /// Registered component identity the comparison covers.
+    pub component_id: String,
+    /// Fixed seed both legs were produced under.
+    pub seed: u64,
+    /// Result bytes observed from the WASM contour.
+    pub wasm_result: Vec<u8>,
+    /// Result bytes the declared core reference produced.
+    pub reference_result: Vec<u8>,
+    /// Error class observed from the WASM contour.
+    pub wasm_error_class: ErrorClass,
+    /// Error class the declared core reference produced.
+    pub reference_error_class: ErrorClass,
+    /// Effects the WASM contour proposed.
+    pub wasm_effects: Vec<EffectProposal>,
+    /// Effects the declared core reference proposed.
+    pub reference_effects: Vec<EffectProposal>,
+    /// State delta the WASM contour observed.
+    pub wasm_state_delta: Vec<u8>,
+    /// State delta the declared core reference produced.
+    pub reference_state_delta: Vec<u8>,
+}
+
+impl ConformanceRecord {
+    /// Holds exactly when every carried leg compares equal. One differing
+    /// value fails the whole record; no leg is ever partially accepted.
+    fn holds(&self) -> bool {
+        self.wasm_result == self.reference_result
+            && self.wasm_error_class == self.reference_error_class
+            && self.wasm_effects == self.reference_effects
+            && self.wasm_state_delta == self.reference_state_delta
+    }
+}
+
+/// Collapses one classified disposition into the cross-backend error class
+/// the comparison uses. The stable classification is the host's own reading
+/// of the actual termination; nothing here re-decides it.
+fn observed_error_class(disposition: InvocationDisposition) -> ErrorClass {
+    match disposition {
+        InvocationDisposition::Succeeded => ErrorClass::Ok,
+        InvocationDisposition::Rejected => ErrorClass::Rejected,
+        InvocationDisposition::Unavailable => ErrorClass::Unavailable,
+        InvocationDisposition::Unknown => ErrorClass::Unknown,
+    }
+}
+
+/// Builds the conformance comparison carried by the activation record.
+///
+/// The declared reference is the runtime-independent semantic core itself —
+/// [`DeterministicEchoCore`] has no Wasmtime, process, or I/O dependency —
+/// invoked over the exact admitted input bytes and the owner-set seed. The
+/// derived reference is first bound to the owner-declared promotion digests,
+/// so what is compared is the DECLARED reference and not a core chosen here:
+/// a declared reference that is not this core's own output for that input and
+/// seed cannot be compared field by field and fails closed instead of being
+/// reported as agreeing.
+///
+/// The comparison is built from one execution, so no determinism or resource
+/// envelope leg is claimed: neither appears in the record rather than being
+/// reported as matching.
+///
+/// Any component other than the registered conformance component yields
+/// `None` — non-corpus semantic admission stays Governor/Kernel-owned and
+/// carries no reference values here.
+fn conformance_record(
+    result: &InvocationResult,
+    output: &[u8],
+    material: &ValidatedDispatchMaterial,
+) -> Result<Option<ConformanceRecord>, DriveError> {
+    let denied = || DriveError::Admission {
+        field: "conformance",
+    };
+    if material.ceilings.component_id != CONFORMANCE_COMPONENT {
+        return Ok(None);
+    }
+    let seed = material.work.deterministic_seed;
+    let reference: CoreOutcome =
+        DeterministicEchoCore::new(CONFORMANCE_COMPONENT).invoke(&material.input_bytes, seed);
+    let declared =
+        PromotionExpectations::for_component(CONFORMANCE_COMPONENT, &material.input_bytes, seed)
+            .map_err(|_| denied())?;
+    if declared.corpus_digest != material.promotion.corpus_digest
+        || declared.expected_result_digest != material.promotion.expected_result_digest
+        || declared.expected_effect_digest != material.promotion.expected_effect_digest
+        || declared.expected_state_delta_digest != material.promotion.expected_state_delta_digest
+    {
+        return Err(denied());
+    }
+    // An unobserved state delta is not an empty one: it cannot satisfy the
+    // comparison, so the record is refused rather than built from absence.
+    let wasm_state_delta = result.observed_state_delta.as_deref().ok_or_else(denied)?;
+    let record = ConformanceRecord {
+        component_id: material.ceilings.component_id.clone(),
+        seed,
+        wasm_result: output.to_vec(),
+        reference_result: reference.result.clone(),
+        wasm_error_class: observed_error_class(result.receipt.disposition),
+        reference_error_class: reference.error_class,
+        wasm_effects: result.proposed_effects.clone(),
+        reference_effects: reference.effects.clone(),
+        wasm_state_delta: wasm_state_delta.to_vec(),
+        reference_state_delta: reference.state_delta.clone(),
+    };
+    if !record.holds() {
+        return Err(denied());
+    }
+    Ok(Some(record))
 }
 
 /// Lifecycle outcome verdicts (A13.3 promotion path) evaluated from the
@@ -644,11 +773,16 @@ pub fn assemble_owner_records(
 /// measured metering; differential and promotion denials surface as
 /// admission taxonomy (owner-data mismatch, never fabricated output);
 /// every other verdict fails closed with unknown outcome preserved.
-/// Lifecycle and seated verdicts evaluate over the same retained result.
+/// Lifecycle and seated verdicts evaluate over the same retained result,
+/// and the registered conformance component additionally carries the
+/// WASM-versus-declared-core-reference comparison on the response.
 ///
 /// # Errors
 ///
-/// Returns [`DriveError`] when the result is not a measured success.
+/// Returns [`DriveError`] when the result is not a measured success, or
+/// when the registered conformance component's result does not match its
+/// declared core reference on result/error class, proposed effects, or
+/// state delta.
 pub(crate) fn map_invocation_result(
     result: &InvocationResult,
     material: &ValidatedDispatchMaterial,
@@ -693,6 +827,7 @@ pub(crate) fn map_invocation_result(
     let ticks = usage
         .epoch_ticks
         .ok_or(DriveError::Execution { stage: "metering" })?;
+    let conformance = conformance_record(result, &output, material)?;
     Ok(DispatchDriveResponse {
         operation_id: material.operation_id.clone(),
         component_id: material.ceilings.component_id.clone(),
@@ -707,6 +842,7 @@ pub(crate) fn map_invocation_result(
         epoch_ticks: ticks,
         verdicts: evaluate_lifecycle_verdicts(result),
         seated: evaluate_seated_verdicts(result),
+        conformance,
     })
 }
 

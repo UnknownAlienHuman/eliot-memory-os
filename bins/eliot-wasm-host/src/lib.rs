@@ -58,9 +58,9 @@ pub use contour::{
     check_admitted_request, experimental_manifest,
 };
 pub use dispatch_drive::{
-    DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts,
-    OwnerRecords, SeatedVerdicts, assemble_owner_records, drive_admission, drive_dispatch,
-    evaluate_lifecycle_verdicts, evaluate_seated_verdicts, guest_exec_argv,
+    ConformanceRecord, DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT,
+    LifecycleVerdicts, OwnerRecords, SeatedVerdicts, assemble_owner_records, drive_admission,
+    drive_dispatch, evaluate_lifecycle_verdicts, evaluate_seated_verdicts, guest_exec_argv,
 };
 pub use dispatch_material::{
     DISPATCH_MATERIAL_MAX_BYTES, DispatchMaterialInput, MaterialError, ValidatedAssuranceInput,
