@@ -146,7 +146,7 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
-/// Typed refusal kind answered by the four P-07 authority arms (`#1110`).
+/// Typed refusal kind answered by the P-07 authority arms (`#1110`).
 /// Refusals are completed application answers, never missing frames or receipts.
 const P07_AUTHORITY_REFUSAL_KIND: &str = "authority_operation_refused";
 /// I7.20 dispositions emitted only where the P-07 variant establishes a
@@ -3128,20 +3128,31 @@ impl KernelComposition {
                 }
                 let owner = self.retained_p07_owner()?;
                 let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
-                let receipt = eliot_authority::P07AuthorityPort::activate_root_transition(
+                // A decided port refusal is a completed application answer, not
+                // a lost acknowledgement: it is answered with its exact typed
+                // cause, I7.20 classification and snapshot, like the four
+                // lifecycle arms, instead of collapsing to one bare transport
+                // code that the daemon can only read as a generic failure.
+                match eliot_authority::P07AuthorityPort::activate_root_transition(
                     bound.port(),
                     &request,
-                )
-                .map_err(|error| map_p07_port_error(&error).transport)?;
-                receipt
-                    .validate(&request)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                let value =
-                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
-                Ok(serde_json::json!({
-                    "kind": ROOT_TRANSITION_RECEIPT_KIND,
-                    "value": value,
-                }))
+                ) {
+                    Ok(receipt) => {
+                        receipt
+                            .validate(&request)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        let value = serde_json::to_value(&receipt)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(serde_json::json!({
+                            "kind": ROOT_TRANSITION_RECEIPT_KIND,
+                            "value": value,
+                        }))
+                    }
+                    Err(refusal) => Ok(p07_refusal_response(
+                        ACTIVATE_ROOT_TRANSITION_OPERATION,
+                        &refusal,
+                    )),
+                }
             }
             "publish_wasm_dispatch_bundle" => {
                 self.wasm_dispatch_bundle_operation(session, payload.clone())
