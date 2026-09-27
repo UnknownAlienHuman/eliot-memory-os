@@ -1168,7 +1168,11 @@ impl ManagedDependencyRecord {
     /// an incomplete observation and provider failure are not observations, and
     /// a terminal observed process state is not liveness either. Nothing here
     /// consults `state`, a stop record, or any other dependency's outcome.
-    fn observed_liveness(&self) -> bool {
+    /// Host-side readers use this predicate as the liveness dimension for a
+    /// managed dependency (I1.9); it never answers store-bridge semantic
+    /// readiness, which comes from independent version/schema/transaction
+    /// probes and cannot substitute for this observation.
+    pub fn observed_liveness(&self) -> bool {
         match &self.outcome {
             PortOutcome::Known(process) => {
                 process.health.liveness == HealthDimension::Healthy && !process.state.is_terminal()
