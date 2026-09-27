@@ -304,7 +304,11 @@ impl CapabilityEvidenceRecord {
 
     /// Returns true when this record is time-fresh at `now`: observed
     /// no later than now, with no reached expiry.
-    fn is_time_fresh(&self, now: u64) -> bool {
+    ///
+    /// Exposed so the route registry reuses the same time predicate when it
+    /// reports why a route was refused, instead of re-deriving freshness.
+    #[must_use]
+    pub fn is_time_fresh(&self, now: u64) -> bool {
         self.observed_at <= now && self.expires_at.is_none_or(|expires| now < expires)
     }
 
