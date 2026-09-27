@@ -13,10 +13,16 @@ use eliot_agent_bridge::{
     BridgeRunner, FeedAdmissionOutcome, Profile, SettledPlanAdmission, admit_producer_feed,
 };
 use eliot_agent_bridge_core::{
-    ActivationPortOutcome, ActivationPortResult, AttachBinding, AttachRequest, ConnectionId,
-    CoverageGap, DemandId, EventEnvelope, EventPortOutcome, FencingToken, Generation,
-    HostActivationPort, HostEventEnvelope, McpForwardingPort, PrincipalId, ProviderFailure,
-    ProviderReadiness, ReconciliationPortOutcome, SessionId, TaskId, WorkUnitId,
+    ActivationPortOutcome, ActivationPortResult, AttachBinding, AttachRequest, ClockReading,
+    ConnectionId, CoverageGap, DemandId, EventCursor, EventEnvelope, EventId, EventPortOutcome,
+    FencingToken, Generation, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
+    HostActivationPort, HostEventDeliveryDisposition, HostEventEnvelope,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, McpForwardingPort,
+    NativeSession, NativeSessionLocator, NormalizationCoverage, NormalizedHostEventEnvelope,
+    NormalizedHostEventPayload, PrincipalId, ProviderFailure, ProviderObservationLineage,
+    ProviderReadiness, QualifiedSourceDigest, RawSourceRecord, ReconciliationPortOutcome,
+    RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation, SessionLifecycleTransition,
+    SessionObservation, TaskId, UnsupportedDisposition, WorkUnitId,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_integration_coverage::{
@@ -125,8 +131,72 @@ fn attached_runner(session: &str) -> BridgeRunner {
     runner
 }
 
+/// #228 A6 fixture seam: the legacy quarantine wire is admissible only while
+/// it carries a closed, versioned, bounded normalized observation bound to the
+/// wire's own identity, cursor, and sequence.
+fn normalized_observation(hook_id: &str) -> Result<NormalizedHostEventEnvelope, String> {
+    fn digest(bytes: &[u8]) -> Result<LowercaseSha256, String> {
+        serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(bytes)))
+            .map_err(|error| error.to_string())
+    }
+    let source_bytes = format!("bridge-caller-source-{hook_id}").into_bytes();
+    let raw_source = RawSourceRecord {
+        handle: RestrictedRawSourceHandle::new(format!("restricted:{hook_id}"))
+            .map_err(|error| error.to_string())?,
+        digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: digest(&source_bytes)?,
+        },
+    };
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new(hook_id).map_err(|error| error.to_string())?,
+        cursor: EventCursor::new("cursor-caller-1").map_err(|error| error.to_string())?,
+        lineage: ProviderObservationLineage::SessionObservation(SessionObservation {
+            session_id: None,
+            native: NativeSession::Native(
+                NativeSessionLocator::new(format!("thread-{hook_id}"))
+                    .map_err(|error| error.to_string())?,
+            ),
+        }),
+        producer_adapter_identity: "bridge-fixture".to_owned(),
+        adapter_contract_version: "bridge-fixture/v1".to_owned(),
+        sequence: 1,
+        causal_predecessors: Vec::new(),
+        payload: NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+            transition: SessionLifecycleTransition::Started,
+            detail_ref: None,
+        }),
+        admitted_route_digest: None,
+        raw_source: raw_source.clone(),
+        normalization: HostEventNormalizationReceipt {
+            normalizer_identity: "bridge-fixture".to_owned(),
+            normalizer_version: "bridge-fixture/v1".to_owned(),
+            input_handle: raw_source.handle.clone(),
+            input_digest: raw_source.digest.clone(),
+            output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            output_digest: digest(b"bridge-caller-seal-placeholder")?,
+            omitted_fields: Vec::new(),
+            warnings: Vec::new(),
+            unsupported_disposition: UnsupportedDisposition::None,
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        observed_at: ClockReading {
+            valid_time_ms: Some(1_700_000_000_000),
+            known_time_ms: Some(1_700_000_000_000),
+            transaction_sequence: None,
+            monotonic_ns: Some(1_000),
+        },
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+    };
+    envelope.seal().map_err(|error| error.to_string())?;
+    Ok(envelope)
+}
+
 fn hook_event(hook_id: &str) -> HostEventEnvelope {
-    serde_json::from_value(serde_json::json!({
+    let mut wire = serde_json::json!({
         "event_id": hook_id,
         "attempt_id": "attempt-caller-1",
         "sequence": 1,
@@ -151,8 +221,12 @@ fn hook_event(hook_id: &str) -> HostEventEnvelope {
         "normalized_payload": {},
         "parent_event_id": null,
         "observed_at": "2026-09-21T00:00:00Z"
-    }))
-    .expect("valid hook fixture")
+    });
+    wire["normalized"] = serde_json::to_value(
+        normalized_observation(hook_id).expect("valid normalized observation"),
+    )
+    .expect("normalized observation serializes");
+    serde_json::from_value(wire).expect("valid hook fixture")
 }
 
 fn live_derivation() -> GovernorCoverageDerivation {
