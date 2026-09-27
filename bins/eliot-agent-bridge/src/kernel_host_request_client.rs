@@ -26,7 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     ClockReading, HostCorrelationDomain, HostCorrelationProjection, HostJsonRpcCorrelationId,
-    ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
+    HostRequestLogicalKind, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key, sha256_hex,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_mcp::{
@@ -93,18 +94,6 @@ const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydra
 const AGENT_HOST_REQUEST_RESOLVE_OPERATION: &str = "agent_host_request_resolve";
 /// Canonical prefix of the kernel-derived opaque operation handle.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
-/// Logical-key kind marker for invocation replay (issue #2571).
-///
-/// Mirrors the `host_request_kind_marker` mapping in
-/// `crates/kernel/eliot-ors/src/store.rs`; the literals must change
-/// together.
-const LOGICAL_KIND_INVOCATION: &str = "invocation";
-/// Logical-key kind marker for cancellation intent (issue #2571).
-///
-/// Mirrors the `host_request_kind_marker` mapping in
-/// `crates/kernel/eliot-ors/src/store.rs`; the literals must change
-/// together.
-const LOGICAL_KIND_CANCELLATION: &str = "cancellation";
 /// Filler capability carried only on handle-form resolve envelopes
 /// (issue #2571).
 ///
@@ -263,7 +252,10 @@ impl ParentLink {
 /// task/scope authority of its own. The logical key is scoped to the
 /// authenticated session and typed projection; task, scope, payload and
 /// parent are compared as the owner's durable commitment, so a changed
-/// binding conflicts instead of creating a second operation.
+/// binding conflicts instead of creating a second operation. The key bytes
+/// come from the shared canonical encoder
+/// (`eliot_contracts::host_request_logical_key`): the bridge owns no key
+/// recipe of its own.
 fn logical_invocation_key(
     projection: &HostCorrelationProjection,
     session: &str,
@@ -272,47 +264,24 @@ fn logical_invocation_key(
         return Err(request_failure());
     }
     reject_kernel_operational_correlation(projection)?;
-    projection_key(LOGICAL_KIND_INVOCATION, session, projection)
+    projection.validate().map_err(|_| request_failure())?;
+    host_request_logical_key(HostRequestLogicalKind::Invocation, session, projection)
+        .map_err(|_| request_failure())
 }
 
 /// Derives the logical key for one cancellation intent.
 ///
 /// The cancellation's typed projection and session identify its retained
 /// intent. Its original parent handle and commitment are checked against the
-/// owner result; they do not alter the logical key.
+/// owner result; they do not alter the logical key. Key bytes come from the
+/// shared canonical encoder: the bridge owns no key recipe of its own.
 fn logical_cancellation_key(
     projection: &HostCorrelationProjection,
     session: &str,
 ) -> Result<String, PortFailure> {
-    projection_key(LOGICAL_KIND_CANCELLATION, session, projection)
-}
-
-fn legacy_presence_key(kind: &str, session: &str, occurrence: &str) -> String {
-    sha256_hex(
-        format!(
-            "eliot.host-request.legacy-presence.v1\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}"
-        )
-        .as_bytes(),
-    )
-}
-
-/// Builds the stable owner identity key for a marked client occurrence.
-/// Payload/tool/task bindings intentionally stay in ORS's commitment compare,
-/// so a retry with the same typed occurrence and changed bytes conflicts after
-/// process restart instead of claiming a second logical key.
-fn projection_key(
-    kind_marker: &str,
-    session: &str,
-    projection: &HostCorrelationProjection,
-) -> Result<String, PortFailure> {
     projection.validate().map_err(|_| request_failure())?;
-    let encoded = serde_json::to_string(projection).map_err(|_| request_failure())?;
-    Ok(sha256_hex(
-        format!(
-            "eliot.host-request.logical.v2\x1fkind={kind_marker}\x1fsession={session}\x1fprojection={encoded}"
-        )
-        .as_bytes(),
-    ))
+    host_request_logical_key(HostRequestLogicalKind::Cancellation, session, projection)
+        .map_err(|_| request_failure())
 }
 ///
 /// Minimal tolerant view of the kernel-returned durable record.
@@ -921,7 +890,11 @@ impl KernelHostRequestClient {
         };
         let capability = request.tool.canonical_name();
         for occurrence in candidates {
-            let legacy_key = legacy_presence_key("INVOCATION", session_id, &occurrence);
+            let legacy_key = host_request_legacy_presence_key(
+                HostRequestLogicalKind::Invocation,
+                session_id,
+                &occurrence,
+            );
             let resolve_label = resolve_request_label(&occurrence);
             let resolve_envelope = build_resolve_envelope(
                 &resolve_label,
@@ -1263,7 +1236,11 @@ impl KernelHostRequestClient {
             }
         };
         for occurrence in candidates {
-            let key = legacy_presence_key("CANCELLATION", session_id, &occurrence);
+            let key = host_request_legacy_presence_key(
+                HostRequestLogicalKind::Cancellation,
+                session_id,
+                &occurrence,
+            );
             let label = resolve_request_label(&occurrence);
             let envelope = build_resolve_envelope(
                 &label,
@@ -2304,16 +2281,12 @@ fn verify_resolved_key_commitment(
     {
         return Err(limitation());
     }
-    let marker = match kind.as_str() {
-        "INVOCATION" => LOGICAL_KIND_INVOCATION,
-        "CANCELLATION" => LOGICAL_KIND_CANCELLATION,
-        _ => return Err(limitation()),
-    };
+    let kind = HostRequestLogicalKind::parse(kind).ok_or_else(limitation)?;
     if expected.projection.occurrence_text() != *occurrence {
         return Err(limitation());
     }
     let recomputed =
-        projection_key(marker, session, expected.projection).map_err(|_| limitation())?;
+        host_request_logical_key(kind, session, expected.projection).map_err(|_| limitation())?;
     if recomputed != expected.key {
         return Err(limitation());
     }

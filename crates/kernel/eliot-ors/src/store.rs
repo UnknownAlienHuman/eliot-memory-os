@@ -4,7 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{HostCorrelationProjection, HostJsonRpcCorrelationId, canonical_json_bytes};
+use eliot_contracts::{
+    HostCorrelationProjection, HostJsonRpcCorrelationId, HostRequestLogicalKind,
+    canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key,
+};
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
@@ -1708,23 +1711,45 @@ fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u
 /// (session continuity, client occurrence, parent/task/scope binding,
 /// capability, payload commitment) tuple — to the exact winning operation
 /// (`operation_id`, `request_digest`). Written atomically in the same `RedDB`
-/// write transaction as the winning operation row, never updated, never
-/// deleted: an expired or terminal operation keeps its key bound forever, so
-/// an old key can never be reused as a new effect. Historical unmarked rows
-/// are represented only by a separately versioned presence marker; this
-/// primary link never infers or returns their operation identity.
+/// write transaction as the winning operation row. The index denominator is
+/// one entry per staged operation: a link lives exactly as long as its
+/// winner row stays unretired, and retirement swaps the link for a tombstone
+/// under exact terminal evidence (see
+/// [`RedbRecoveryStore::retire_host_request_logical_key`]) instead of
+/// deleting it, so a retired key can never be reused as a new effect and a
+/// retired lookup answers the typed recovery limitation instead of absence.
+/// Tombstones are never deleted. Historical unmarked rows are represented
+/// only by a separately versioned presence marker; this primary link never
+/// infers or returns their operation identity. Record/byte ceilings and a
+/// numeric replay horizon are not declared by the current contract: growth is
+/// bounded only by staged operations, and fresh stages beyond legitimate
+/// history fail closed through the typed errors below rather than through a
+/// capacity counter.
 const HOST_REQUEST_LOGICAL_KEYS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_logical_keys_v1");
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_KEY: &str = "host_request_legacy_presence_schema";
 const HOST_REQUEST_LEGACY_PRESENCE_SCHEMA_V1: &str = "eliot.ors.host-request-legacy-presence.v1";
-/// Authenticated owner namespace for every logical host-request key
-/// (issue #2571).
+/// Format marker carried by every logical host-request tombstone (issue #2571).
 ///
-/// The namespace names the Kernel-admitted application-continuity domain:
-/// keys are only ever derived from Kernel-issued session continuity plus the
-/// client occurrence and commitment, never from bare text, a principal
-/// alone, or a connection/deadline. The Bridge carries the identical literal
-/// as its key-domain contract; the two must change together.
+/// Versioned so a future retirement contour can be told apart from this one
+/// without reinterpreting stored bytes; unknown markers fail closed at
+/// validation instead of decoding as a link.
+const HOST_REQUEST_LOGICAL_TOMBSTONE_V1: &str = "eliot.ors.host-request-logical-tombstone.v1";
+/// Retired owner namespace of the historical (v1) logical host-request key
+/// encoding (issue #2571).
+///
+/// The v1 recipe bound the same session/occurrence/commitment components
+/// without a typed projection. It survives only inside this owner for
+/// recompute/validation of pre-existing unmarked rows
+/// ([`RedbRecoveryStore::host_request_logical_key_v1_retired`]) and never
+/// stages new keys: unmarked invocations/cancellations are refused at every
+/// staging entry, and the resolve entry answers them as
+/// `legacy_correlation_unresolved`, never as an operation. The current key
+/// domain lives in the shared canonical contract
+/// (`eliot_contracts::HOST_REQUEST_LOGICAL_KEY_NAMESPACE`, version
+/// `eliot_contracts::HOST_REQUEST_LOGICAL_KEY_VERSION`) consumed through
+/// `eliot_contracts::host_request_logical_key` by both the Bridge and this
+/// owner; this literal is not shared and must not be reactivated.
 const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
 /// Explicit admitted-unbound marker for parent/task/scope key components.
 ///
@@ -2437,17 +2462,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// the returned `(operation_id, request_digest)` with its candidate: an
     /// equal identity staged (or exactly replays) this candidate and may
     /// advance it; a different identity is another transport's winner and
-    /// must be returned without dispatch. Storage failure is `Err` and never
-    /// absence.
+    /// must be returned without dispatch. A retired key fails with the typed
+    /// recovery limitation instead of staging again. Storage failure is `Err`
+    /// and never absence.
     fn resolve_or_stage_host_request(
         &self,
         record: &crate::HostRequestRecord,
     ) -> Result<crate::HostRequestRecord, OrsError>;
     /// Loads one host-request operation by logical key (issue #2571).
     ///
-    /// `Ok(None)` means no operation was ever staged under this key in this
-    /// store — including pre-index legacy rows, which are never inferred and
-    /// stay reachable only by exact operation/request identity. Any storage
+    /// `Ok(None)` means no operation was ever staged under this exact marked
+    /// key in this store — including pre-index legacy rows, which are never
+    /// inferred and stay reachable only by exact operation/request identity,
+    /// and excluding staging permission, which every staging entry decides
+    /// separately against the legacy-presence index. A retired key is `Err`
+    /// with the typed recovery limitation, never absence. Any storage
     /// or integrity failure is `Err` and can never become absence or
     /// authorize a fresh operation.
     fn load_host_request_by_logical_key(
@@ -2990,6 +3019,42 @@ impl persistence_codec::PersistedValue for HostRequestLogicalLink {
     const RECORD_TYPE: &'static str = "host_request_logical_link";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
+        crate::model::validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
+        crate::model::validate_digest(&self.request_digest, "host_request_request_digest")?;
+        Ok(())
+    }
+}
+
+/// Durable retirement marker for one logical host-request key (issue #2571).
+///
+/// A tombstone replaces the winning-operation link under the same key when
+/// the winner reaches the exact terminal state (see
+/// [`RedbRecoveryStore::retire_host_request_logical_key`]). It carries the
+/// retired operation identity so the limitation stays bound to this
+/// operation: later lookups answer
+/// [`OrsError::HostRequestLegacyCorrelationUnresolved`] — the typed recovery
+/// limitation the kernel translates instead of absence — and a retired key
+/// is never reusable. Tombstones are never deleted; the operation row is
+/// kept beside them until a result-acknowledgement contract admits row
+/// compaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostRequestLogicalTombstone {
+    tombstone: String,
+    operation_id: OperationIdentity,
+    request_digest: String,
+}
+
+impl persistence_codec::PersistedValue for HostRequestLogicalTombstone {
+    const RECORD_TYPE: &'static str = "host_request_logical_tombstone";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        if self.tombstone != HOST_REQUEST_LOGICAL_TOMBSTONE_V1 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "logical tombstone carries an unsupported format marker".to_owned(),
+            });
+        }
         crate::model::validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
         crate::model::validate_digest(&self.request_digest, "host_request_request_digest")?;
         Ok(())
@@ -4660,22 +4725,38 @@ impl RedbRecoveryStore {
         }
     }
 
+    /// Derives the canonical legacy-presence key for one historical
+    /// occurrence (issue #2571).
+    ///
+    /// The recipe is owned by the shared canonical contract
+    /// (`eliot_contracts::host_request_legacy_presence_key`); this wrapper
+    /// only maps the owner-local kind into the shared closed family so the
+    /// kernel resolve entry keeps its existing signature. Non-eligible
+    /// kinds keep the historical miss-guarantee preimage byte-for-byte: such
+    /// a key is never adopted or staged, so it always misses.
     pub fn host_request_legacy_presence_key(
         kind: crate::HostRequestKind,
         session: &str,
         occurrence: &str,
     ) -> String {
-        let kind = match kind {
-            crate::HostRequestKind::Invocation => "INVOCATION",
-            crate::HostRequestKind::Cancellation => "CANCELLATION",
-            _ => "INVALID",
-        };
-        crate::model::sha256_hex(
-            format!(
-                "eliot.host-request.legacy-presence.v1\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}"
-            )
-            .as_bytes(),
-        )
+        match kind {
+            crate::HostRequestKind::Invocation => host_request_legacy_presence_key(
+                HostRequestLogicalKind::Invocation,
+                session,
+                occurrence,
+            ),
+            crate::HostRequestKind::Cancellation => host_request_legacy_presence_key(
+                HostRequestLogicalKind::Cancellation,
+                session,
+                occurrence,
+            ),
+            _ => crate::model::sha256_hex(
+                format!(
+                    "eliot.host-request.legacy-presence.v1\x1fkind=INVALID\x1fsession={session}\x1foccurrence={occurrence}"
+                )
+                .as_bytes(),
+            ),
+        }
     }
 
     /// Refuses a typed request when a prior unmarked row could have used any
@@ -4791,9 +4872,11 @@ impl RedbRecoveryStore {
     /// without a Kernel-issued session, yields `Ok(None)` and fails closed
     /// at the resolve entry instead of staging anonymously.
     ///
-    /// The Bridge derives the identical key from its envelope fields; the
-    /// canonical component order, separator, markers, and digest are part of
-    /// the shared recovery contract and must change on both sides together.
+    /// The current key bytes come from the shared canonical contract
+    /// (`eliot_contracts::host_request_logical_key`), consumed identically
+    /// by the Bridge resolve queries and by this owner: there is one
+    /// executable recipe, so presenter and owner cannot drift. Unmarked rows
+    /// keep the retired v1 encoding below for recompute/validation only.
     pub fn host_request_logical_key_for_record(
         record: &crate::HostRequestRecord,
     ) -> Result<Option<String>, OrsError> {
@@ -4808,7 +4891,7 @@ impl RedbRecoveryStore {
         };
         record.validate()?;
         match &record.correlation_projection {
-            None => Ok(Some(Self::host_request_logical_key(
+            None => Ok(Some(Self::host_request_logical_key_v1_retired(
                 record.kind,
                 session.as_str(),
                 record.request_id.as_str(),
@@ -4820,21 +4903,139 @@ impl RedbRecoveryStore {
             )?)),
             Some(projection) => {
                 let kind = match record.kind {
-                    crate::HostRequestKind::Invocation => "INVOCATION",
-                    crate::HostRequestKind::Cancellation => "CANCELLATION",
+                    crate::HostRequestKind::Invocation => HostRequestLogicalKind::Invocation,
+                    crate::HostRequestKind::Cancellation => HostRequestLogicalKind::Cancellation,
                     _ => return Ok(None),
                 };
-                let projection = serde_json::to_string(projection)
-                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
-                Ok(Some(crate::model::sha256_hex(
-                    format!(
-                        "eliot.host-request.logical.v2\x1fkind={kind}\x1fsession={}\x1fprojection={projection}",
-                        session.as_str()
-                    )
-                    .as_bytes(),
-                )))
+                Ok(Some(
+                    host_request_logical_key(kind, session.as_str(), projection)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                ))
             }
         }
+    }
+
+    /// Decodes one logical-index value stored under a claimed key (issue #2571).
+    ///
+    /// A live link decodes to its winning-operation pointer. A tombstone is
+    /// not a link and never becomes absence: it answers the typed recovery
+    /// limitation, so a retired key can neither resolve nor stage again. The
+    /// limitation rides the existing
+    /// [`OrsError::HostRequestLegacyCorrelationUnresolved`] class — the
+    /// kernel translates exactly this class into the explicit
+    /// `legacy_correlation_unresolved` limitation at submit and resolve
+    /// instead of absence or a fresh stage — because the exhaustive
+    /// ORS-refusal classifier outside this crate cannot name a new class
+    /// without its own owner change. Both causes share one contract meaning:
+    /// this correlation cannot be resolved to a live operation, so do not
+    /// stage under it. A malformed value fails closed as an integrity
+    /// problem through the shared codec.
+    fn decode_host_request_logical_link(value: &str) -> Result<HostRequestLogicalLink, OrsError> {
+        let is_tombstone = serde_json::from_str::<serde_json::Value>(value)
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "host_request_logical_index_value",
+                reason: error.to_string(),
+            })?
+            .as_object()
+            .is_some_and(|object| object.contains_key("tombstone"));
+        if !is_tombstone {
+            return decode(value);
+        }
+        let _marker: HostRequestLogicalTombstone = decode(value)?;
+        Err(OrsError::HostRequestLegacyCorrelationUnresolved)
+    }
+
+    /// Retires one logical host-request key under exact terminal evidence
+    /// (issue #2571).
+    ///
+    /// In one owner write transaction the winner row is loaded and proven:
+    /// the link must decode to the row's exact operation identity, the row
+    /// must recompute to the presented key, and the row state must be
+    /// exactly `Terminal` — the absorbing state in which no effect or result
+    /// can still be unresolved. Any other state, a missing row, or a
+    /// divergent binding refuses the retirement instead of retiring it. The
+    /// link value is then replaced by a tombstone under the same key: the
+    /// key stays non-reusable and later lookups answer the typed recovery
+    /// limitation instead of absence. The operation row is kept; retiring
+    /// the row itself awaits a result-acknowledgement contract. Retiring an
+    /// already-retired key succeeds idempotently.
+    pub fn retire_host_request_logical_key(&self, logical_key: &str) -> Result<(), OrsError> {
+        crate::model::validate_digest(logical_key, "host_request_logical_key")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut links = write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            let link = {
+                let Some(guard) = links.get(logical_key).map_err(storage)? else {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_logical_key",
+                        reason: "no logical link is staged under this key",
+                    });
+                };
+                match Self::decode_host_request_logical_link(guard.value()) {
+                    Ok(link) => link,
+                    // The limitation class is returned only for tombstones by
+                    // the decoder above, so an already-retired key succeeds
+                    // idempotently here.
+                    Err(OrsError::HostRequestLegacyCorrelationUnresolved) => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+            let winner: crate::HostRequestRecord = operations
+                .get(row_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link points at a missing host-request row".to_owned(),
+                })?;
+            winner.validate()?;
+            if winner.operation_id != link.operation_id
+                || winner.request_digest != link.request_digest
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link diverges from its host-request row".to_owned(),
+                });
+            }
+            let recomputed =
+                Self::host_request_logical_key_for_record(&winner)?.ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_link",
+                        reason: "linked host-request row carries no logical key".to_owned(),
+                    }
+                })?;
+            if recomputed != logical_key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link diverges from its host-request row".to_owned(),
+                });
+            }
+            if winner.state != crate::HostRequestState::Terminal {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_state",
+                    reason: "logical-key retirement requires the exact terminal state",
+                });
+            }
+            let marker = HostRequestLogicalTombstone {
+                tombstone: HOST_REQUEST_LOGICAL_TOMBSTONE_V1.to_owned(),
+                operation_id: winner.operation_id.clone(),
+                request_digest: winner.request_digest.clone(),
+            };
+            persistence_codec::PersistedValue::validate_persisted(&marker)?;
+            let payload = encode(&marker)?;
+            links
+                .insert(logical_key, payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(())
     }
 
     /// Atomically claims one logical host-request key or returns its durable
@@ -4880,7 +5081,7 @@ impl RedbRecoveryStore {
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
                 .map_err(storage)?;
             if let Some(link_value) = links.get(logical_key.as_str()).map_err(storage)? {
-                let link: HostRequestLogicalLink = decode(link_value.value())?;
+                let link = Self::decode_host_request_logical_link(link_value.value())?;
                 let winner = {
                     let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
                     let row_key =
@@ -5184,7 +5385,7 @@ impl RedbRecoveryStore {
             links
                 .get(logical_key)
                 .map_err(storage)?
-                .map(|value| decode::<HostRequestLogicalLink>(value.value()))
+                .map(|value| Self::decode_host_request_logical_link(value.value()))
                 .transpose()?
         };
         let Some(link) = link else {
@@ -5337,12 +5538,15 @@ impl RedbRecoveryStore {
 
     /// Loads one host-request operation by logical key (issue #2571).
     ///
-    /// `Ok(None)` is authoritatively absent: no operation was ever staged
-    /// under this key in this store. Pre-index legacy rows are never
-    /// inferred and stay reachable only by exact operation/request identity.
-    /// A dangling or divergent link fails closed as an integrity problem;
-    /// storage failure fails closed as storage — neither can become absence
-    /// or authorize a fresh operation.
+    /// `Ok(None)` is absent for this exact marked key only: no operation
+    /// was ever staged under it in this store. Absence is not a license to
+    /// stage — pre-index legacy rows are never inferred and stay reachable
+    /// only by exact operation/request identity, so every staging entry
+    /// additionally refuses when a legacy presence marker covers the
+    /// presented occurrence. A retired key answers the typed recovery
+    /// limitation, never absence. A dangling or divergent link fails closed
+    /// as an integrity problem; storage failure fails closed as storage —
+    /// neither can become absence or authorize a fresh operation.
     pub fn load_host_request_by_logical_key(
         &self,
         logical_key: &str,
@@ -5356,7 +5560,7 @@ impl RedbRecoveryStore {
             links
                 .get(logical_key)
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| Self::decode_host_request_logical_link(value.value()))
                 .transpose()?
         };
         let Some(link) = link else {
@@ -5389,7 +5593,11 @@ impl RedbRecoveryStore {
         Ok(Some(record))
     }
 
-    /// Returns the closed kind marker carried in every logical key.
+    /// Returns the historical kind marker carried in retired v1 logical keys.
+    ///
+    /// Used only by [`Self::host_request_logical_key_v1_retired`]; the
+    /// current recipe's markers live in the shared canonical contract
+    /// (`eliot_contracts::HostRequestLogicalKind`).
     const fn host_request_kind_marker(kind: crate::HostRequestKind) -> &'static str {
         match kind {
             crate::HostRequestKind::Activation => "activation",
@@ -5400,7 +5608,16 @@ impl RedbRecoveryStore {
         }
     }
 
-    /// Encodes one canonical logical key and returns its SHA-256.
+    /// Recomputes the retired v1 logical key for one pre-existing unmarked
+    /// row (issue #2571).
+    ///
+    /// Historical encoding only: the v1 recipe bound the session,
+    /// occurrence, parent, task, scope, capability, and payload commitment
+    /// without a typed projection. It runs solely to recompute/validate keys
+    /// of rows staged before the typed-projection index; no staging entry
+    /// accepts unmarked invocations/cancellations, so it can never mint a
+    /// new key. The current recipe is owned by the shared canonical
+    /// contract (`eliot_contracts::host_request_logical_key`).
     ///
     /// Components are joined with a control separator that validated text
     /// can never contain, then digested to a fixed-size key: no separator
@@ -5409,9 +5626,9 @@ impl RedbRecoveryStore {
     /// collide with the explicit unbound marker.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the logical key binds every commitment component explicitly so no binding is implicit at the call site"
+        reason = "the retired v1 key binds every historical commitment component explicitly so no binding is implicit at the call site"
     )]
-    fn host_request_logical_key(
+    fn host_request_logical_key_v1_retired(
         kind: crate::HostRequestKind,
         session: &str,
         occurrence: &str,
@@ -5480,14 +5697,23 @@ impl RedbRecoveryStore {
     /// Validates every logical link against its operation row (issue #2571).
     ///
     /// Every primary link must decode, point at an existing validated row,
-    /// and recompute to its own key. Presence entries are separately checked
-    /// against source rows by the versioned adoption routine below; neither
-    /// index is repaired by selecting an operation winner.
+    /// and recompute to its own key. Tombstones must decode to the retired
+    /// operation identity; when the retired row is still present it must be
+    /// exactly terminal and recompute to the tombstone key, otherwise the
+    /// retirement is rejected — a tombstone whose row is legitimately
+    /// compacted validates by shape alone. Presence entries are separately
+    /// checked against source rows by the versioned adoption routine below;
+    /// no index is repaired by selecting an operation winner.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "logical-index validation keeps link, tombstone, and presence coherence against the operation row together"
+    )]
     fn validate_host_request_logical_index(write: &redb::WriteTransaction) -> Result<(), OrsError> {
         let links = write
             .open_table(HOST_REQUEST_LOGICAL_KEYS)
             .map_err(storage)?;
         let mut pending = Vec::new();
+        let mut retired = Vec::new();
         for entry in links.iter().map_err(storage)? {
             let (key, value) = entry.map_err(storage)?;
             let parsed: serde_json::Value =
@@ -5514,6 +5740,15 @@ impl RedbRecoveryStore {
                         reason: "presence index key diverges from its stored facts".to_owned(),
                     });
                 }
+                continue;
+            }
+            if parsed.as_object().is_some_and(|object| {
+                object.contains_key("tombstone")
+                    && object.contains_key("operation_id")
+                    && object.contains_key("request_digest")
+            }) {
+                let marker: HostRequestLogicalTombstone = decode(value.value())?;
+                retired.push((key.value().to_owned(), marker));
                 continue;
             }
             let link: HostRequestLogicalLink = decode(value.value())?;
@@ -5544,6 +5779,45 @@ impl RedbRecoveryStore {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "host_request_logical_link",
                     reason: "logical link diverges from its host-request row".to_owned(),
+                });
+            }
+        }
+        for (key, marker) in retired {
+            let row_key = format!(
+                "{}::{}",
+                marker.operation_id.as_str(),
+                marker.request_digest
+            );
+            let Some(stored) = operations.get(row_key.as_str()).map_err(storage)? else {
+                continue;
+            };
+            let record: crate::HostRequestRecord = decode(stored.value())?;
+            record.validate()?;
+            if record.operation_id != marker.operation_id
+                || record.request_digest != marker.request_digest
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_tombstone",
+                    reason: "logical tombstone diverges from its host-request row".to_owned(),
+                });
+            }
+            if record.state != crate::HostRequestState::Terminal {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_tombstone",
+                    reason: "logical tombstone retires a non-terminal host-request row".to_owned(),
+                });
+            }
+            let recomputed =
+                Self::host_request_logical_key_for_record(&record)?.ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_tombstone",
+                        reason: "retired host-request row carries no logical key".to_owned(),
+                    }
+                })?;
+            if recomputed != key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_tombstone",
+                    reason: "logical tombstone diverges from its host-request row".to_owned(),
                 });
             }
         }
