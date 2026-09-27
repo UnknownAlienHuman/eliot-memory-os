@@ -272,7 +272,7 @@ struct ActivatedReadDescriptor {
 /// consumer-side per I12-26, mirroring the `GetMailbox` split where the
 /// Governor facade requires a caller scope while catalogue rows stay
 /// scope-free).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 19] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 20] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -368,11 +368,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 19] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetBlackboardItem,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 19] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 20] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -393,6 +398,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 19] {
         ACTIVATED_READS[16].operation,
         ACTIVATED_READS[17].operation,
         ACTIVATED_READS[18].operation,
+        ACTIVATED_READS[19].operation,
     ]
 }
 
@@ -427,10 +433,13 @@ struct ActivatedMutationDescriptor {
 /// `CommitExperienceBank` and `CommitAgentFeedback` persist `Candidate`
 /// through the `CaptureCandidate` family (issue #223: Store-owned durable
 /// experience-bank/feedback rows with the closed experience typed
-/// contract). All fifteen address no scope, mirroring the scope-free read
+/// contract); `ApplyBlackboardItem` persists `Candidate` through the same
+/// family (issue #1822: a Kernel-admitted typed candidate revision with its
+/// closed blackboard contract). All sixteen address no store scope,
+/// mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 16] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -517,6 +526,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 15] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CommitAgentFeedback,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyBlackboardItem,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
@@ -845,6 +860,9 @@ pub fn validate_transition_against_catalogue(
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
             }
+            NamedMutationOperation::ApplyBlackboardItem => {
+                validate_blackboard_transition(transition, &command.parameters)?;
+            }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
             }
@@ -856,6 +874,24 @@ pub fn validate_transition_against_catalogue(
         {
             return Err(StoreError::PayloadTooLarge);
         }
+    }
+    Ok(())
+}
+
+fn validate_blackboard_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let revision =
+        crate::decode_blackboard_item(NamedMutationOperation::ApplyBlackboardItem, parameters)?;
+    if revision.record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(revision.record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "blackboard.task_id",
+            reason: "must match the prepared transition task",
+        });
     }
     Ok(())
 }

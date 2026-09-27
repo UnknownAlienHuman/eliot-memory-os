@@ -6133,6 +6133,7 @@ impl KernelComposition {
         if operation.transition.state_fence != operation.context.state_fence {
             return Err(TransportError::SessionFenced);
         }
+        super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
         for head in &operation.expected_revision_heads {
             if let Err(error) = head.validate() {
                 return Ok(Self::store_error_response_text(

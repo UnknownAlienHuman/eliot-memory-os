@@ -385,6 +385,9 @@ async fn named_read_payload(
         NamedReadOperation::GetAgentFeedbackRange => {
             experience_feedback_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetBlackboardItem => {
+            blackboard_item_payload(db, &adapter.config, query, state_fence).await
+        }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -392,6 +395,68 @@ async fn named_read_payload(
             operation: format!("{other:?}"),
         }),
     }
+}
+
+const READ_BLACKBOARD_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blackboard_namespace AND key = $blackboard_key LIMIT 1;";
+
+/// Reads the exact current task/item head from durable recovery-owner rows.
+/// The referenced candidate is returned as a typed Store payload; messages
+/// carry only its ID handle through their own owner path.
+async fn blackboard_item_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let task_id = query
+        .parameters
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let item_id = query
+        .parameters
+        .get("item_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let head_key = super::surreal_blackboard::item_head_key(task_id, item_id)?;
+    let mut bindings = Map::new();
+    bindings.insert("blackboard_namespace".to_owned(), json!(head_key.namespace));
+    bindings.insert("blackboard_key".to_owned(), json!(head_key.key));
+    let mut response = client::query(
+        db,
+        config,
+        "read.blackboard_item",
+        READ_BLACKBOARD_ITEM_HEAD,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<eliot_store_api::RecoveryRecord>(&mut response, 0)?;
+    let Some(head) = rows.first() else {
+        return Ok(Value::Null);
+    };
+    if head.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    if head.namespace != head_key.namespace
+        || head.key != head_key.key
+        || head.schema != eliot_store_api::BLACKBOARD_ITEM_SCHEMA_V1
+        || head.revision == 0
+        || head.revision > i64::MAX as u64
+        || eliot_store_api::sha256_hex(&head.payload) != head.value_digest
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let record: eliot_store_api::BlackboardItemRecord = serde_json::from_slice(&head.payload)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    record.validate().map_err(AdapterError::Store)?;
+    if record.task_id.to_string() != task_id
+        || record.item_id != item_id
+        || record.revision != head.revision
+        || record.state_fence != *state_fence
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    to_value(&record)
 }
 
 #[derive(serde::Deserialize)]

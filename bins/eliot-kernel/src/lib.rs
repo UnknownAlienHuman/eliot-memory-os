@@ -45,6 +45,8 @@ mod backup_capture;
 mod backup_capture_ports;
 mod backup_restore;
 mod backup_restore_ports;
+#[cfg(windows)]
+mod blackboard;
 mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
