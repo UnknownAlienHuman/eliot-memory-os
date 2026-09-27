@@ -51,20 +51,37 @@ use crate::BridgeRunner;
 /// Named gap: Governor/authority `ActionGate` evaluation wiring (issue
 /// #2898, step 9). Until a Governor-owned evaluation implements the port,
 /// the composition serves [`UnconfiguredActionGate`], which fails every
-/// gate closed to a durable-observation-only `recorded` response. Policy
-/// is never decided inside the HTTP handler and `recorded` is never
-/// promoted to `allow`.
+/// gate closed to a durable-observation-only `recorded` response. The
+/// absent narrow adapter is a Governor/authority-owned `ActionGate`
+/// implementor that evaluates [`ActionGateRequest`](eliot_agent_opencode::ActionGateRequest)
+/// — the exact retained event/effect/session/fence plus current policy
+/// revision — and echoes the evaluated request hash in its decision; no
+/// such implementor exists in the tree. Policy is never decided inside the
+/// HTTP handler and `recorded` is never promoted to `allow`.
 pub const OPENCODE_ACTION_GATE_GAP: &str = "OPENCODE_ACTION_GATE_EVALUATION";
+
+/// Named gap: durable effect-decision persistence (issue #2898, step 10).
+/// The ingress binds each evaluated decision to its exact request hash and
+/// replays or conflicts decision identity through
+/// [`classify_decision_replay`](eliot_agent_opencode::classify_decision_replay),
+/// but no durable decision record exists: an exact retry after a lost
+/// response re-drives `ActionGate::decide` once the Governor evaluation is
+/// wired. The missing piece is a durable decision record under the ORS
+/// bridge-event route owner (operation/event ID, request/effect digest,
+/// task/scope/fence, generations, policy/authority revision, decision,
+/// expiry, receipt commitment, reconciliation owner) consulted before any
+/// second evaluation.
+pub const OPENCODE_DECISION_STORE_GAP: &str = "OPENCODE_DECISION_PERSISTENCE";
 
 /// Current-introduction holder for the bridge process.
 ///
 /// The User Broker mints introductions; the bridge composition installs
-/// the current one here with [`BridgeIntroductionStore::install`], retires
-/// rotated entries with [`BridgeIntroductionStore::revoke`], and refreshes
-/// live session facts with [`BridgeIntroductionStore::observe_session`].
-/// Rotation, listener death, bridge restart, logout, and revocation
-/// invalidate the old introduction here before another request is
-/// admitted.
+/// the current one here with [`BridgeIntroductionStore::install`] (which
+/// retires the replaced entry), retires out-of-band revocations with
+/// [`BridgeIntroductionStore::revoke`], and refreshes live session facts
+/// with [`BridgeIntroductionStore::observe_session`]. Rotation, listener
+/// death, bridge restart, logout, and revocation invalidate the old
+/// introduction here before another request is admitted.
 #[derive(Clone, Debug, Default)]
 pub struct BridgeIntroductionStore {
     current: Option<OpenCodeBridgeIntroduction>,
@@ -81,10 +98,27 @@ impl BridgeIntroductionStore {
     }
 
     /// Installs the current introduction, replacing any previous one. The
-    /// caller revokes the replaced introduction first when rotation must
-    /// invalidate it before another request.
+    /// replaced introduction's revocation id is retired as part of the
+    /// install, so endpoint replacement and rotation invalidate the old
+    /// introduction before another request by construction: even a holder
+    /// of the previous value fails the live revocation check.
     pub fn install(&mut self, introduction: OpenCodeBridgeIntroduction) {
-        self.current = Some(introduction);
+        if let Some(previous) = self.current.replace(introduction) {
+            self.revoked.insert(previous.revocation_id);
+        }
+    }
+
+    /// Rotates to a new introduction and refreshes the live session facts
+    /// together. Runs on the bridge thread between requests: the replaced
+    /// introduction is revoked by [`BridgeIntroductionStore::install`]
+    /// before the new facts admit traffic under the new generation.
+    pub fn rotate(
+        &mut self,
+        introduction: OpenCodeBridgeIntroduction,
+        facts: OpenCodeSessionFacts,
+    ) {
+        self.install(introduction);
+        self.observe_session(facts);
     }
 
     /// Retires one revocation id. Revoked introductions fail closed even
