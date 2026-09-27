@@ -25,7 +25,7 @@ The documentation is a routed contract graph, not a book-shaped prompt.
 6. Re-run the reader when the changed path, causal property, authority boundary,
    or evidence scope expands.
 
-Current normative pair: `sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea`.
+Current normative pair: `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`.
 
 ## Fail-closed cases
 

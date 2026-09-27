@@ -74,59 +74,59 @@ Resolve task-specific documentation through [`ROUTES.md`](ROUTES.md). Use this i
 | `A9.3` | [A9.3. Dreamer and Concilium](A09-03-dreamer-and-concilium.md#a93-dreamer-and-concilium) | 1569 | 480 |
 | `A9.4` | [A9.4. Launching Agents and Swarms](A09-04-launching-agents-and-swarms.md#a94-launching-agents-and-swarms) | 1586 | 594 |
 | `A9.5` | [A9.5. Interfaces and Outputs](A09-05-interfaces-and-outputs.md#a95-interfaces-and-outputs) | 1605 | 674 |
-| `A9.6` | [A9.6. Remote Dreamer](A09-06-remote-dreamer.md#a96-remote-dreamer) | 1640 | 469 |
-| `A10` | [A10. Harness, Agents, Concilium, and Swarm](A10-harness-agents-concilium-and-swarm.md#a10-harness-agents-concilium-and-swarm) | 1655 | 46 |
-| `A10.1` | [A10.1. Agent Interaction Loop](A10-01-agent-interaction-loop.md#a101-agent-interaction-loop) | 1657 | 1318 |
-| `A10.2` | [A10.2. Impact and Authority](A10-02-impact-and-authority.md#a102-impact-and-authority) | 1676 | 807 |
-| `A10.3` | [A10.3. Action Model](A10-03-action-model.md#a103-action-model) | 1692 | 958 |
-| `A10.4` | [A10.4. Delegation](A10-04-delegation.md#a104-delegation) | 1718 | 1980 |
-| `A10.5` | [A10.5. Concilium and Conflicts](A10-05-concilium-and-conflicts.md#a105-concilium-and-conflicts) | 1743 | 603 |
-| `A10.6` | [A10.6. Agent Swarm and Pipeline Work](A10-06-agent-swarm-and-pipeline-work.md#a106-agent-swarm-and-pipeline-work) | 1764 | 2977 |
-| `A10.7` | [A10.7. Long-Running Work](A10-07-long-running-work.md#a107-long-running-work) | 1821 | 1225 |
-| `A10.8` | [A10.8. Verification and Finish](A10-08-verification-and-finish.md#a108-verification-and-finish) | 1844 | 751 |
-| `A11` | [A11. Human Control and System Configuration](A11-human-control-and-system-configuration.md#a11-human-control-and-system-configuration) | 1866 | 47 |
-| `A11.1` | [A11.1. Human Authority and Fallibility](A11-01-human-authority-and-fallibility.md#a111-human-authority-and-fallibility) | 1868 | 418 |
-| `A11.2` | [A11.2. Initial Setup](A11-02-initial-setup.md#a112-initial-setup) | 1883 | 1057 |
-| `A11.3` | [A11.3. Capability Registry](A11-03-capability-registry.md#a113-capability-registry) | 1906 | 660 |
-| `A11.4` | [A11.4. ControlBoardView](A11-04-controlboardview.md#a114-controlboardview) | 1923 | 785 |
-| `A11.5` | [A11.5. Notifications](A11-05-notifications.md#a115-notifications) | 1945 | 904 |
-| `A12` | [A12. Security, Provenance, and Bounded Influence](A12-security-provenance-and-bounded-influence.md#a12-security-provenance-and-bounded-influence) | 1961 | 52 |
-| `A12.1` | [A12.1. Security Assumes Breach](A12-01-security-assumes-breach.md#a121-security-assumes-breach) | 1963 | 691 |
-| `A12.2` | [A12.2. Principal, Session, and Visibility](A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility) | 1984 | 546 |
-| `A12.3` | [A12.3. One Governed Write Path](A12-03-one-governed-write-path.md#a123-one-governed-write-path) | 1996 | 876 |
-| `A12.4` | [A12.4. Source Assurance and Injection](A12-04-source-assurance-and-injection.md#a124-source-assurance-and-injection) | 2013 | 1082 |
-| `A12.5` | [A12.5. Origin-Bound Influence](A12-05-origin-bound-influence.md#a125-origin-bound-influence) | 2036 | 924 |
-| `A12.6` | [A12.6. External Model Routes and Secrets](A12-06-external-model-routes-and-secrets.md#a126-external-model-routes-and-secrets) | 2054 | 1190 |
-| `A12.7` | [A12.7. Skills, Guards, and Challenge](A12-07-skills-guards-and-challenge.md#a127-skills-guards-and-challenge) | 2075 | 599 |
-| `A12.8` | [A12.8. Privacy Erasure](A12-08-privacy-erasure.md#a128-privacy-erasure) | 2092 | 628 |
-| `A13` | [A13. Resilience, Recovery, and Observability](A13-resilience-recovery-and-observability.md#a13-resilience-recovery-and-observability) | 2101 | 48 |
-| `A13.1` | [A13.1. Let It Fail Locally](A13-01-let-it-fail-locally.md#a131-let-it-fail-locally) | 2103 | 912 |
-| `A13.2` | [A13.2. Kernel and Failure Domains](A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains) | 2131 | 1051 |
-| `A13.3` | [A13.3. Module Supervision and Doctor](A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor) | 2150 | 2232 |
-| `A13.4` | [A13.4. Problem Lifecycle](A13-04-problem-lifecycle.md#a134-problem-lifecycle) | 2205 | 601 |
-| `A13.5` | [A13.5. Bounded Resources and Control Reserve](A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve) | 2221 | 1059 |
-| `A13.6` | [A13.6. Operational Recovery State](A13-06-operational-recovery-state.md#a136-operational-recovery-state) | 2252 | 796 |
-| `A13.7` | [A13.7. Backups, Restore, and Migration](A13-07-backups-restore-and-migration.md#a137-backups-restore-and-migration) | 2268 | 1196 |
-| `A13.8` | [A13.8. Integrity](A13-08-integrity.md#a138-integrity) | 2299 | 523 |
-| `A13.9` | [A13.9. Concurrency and Durable Execution](A13-09-concurrency-and-durable-execution.md#a139-concurrency-and-durable-execution) | 2317 | 1363 |
-| `A13.10` | [A13.10. Observability and Diagnostic Brief](A13-10-observability-and-diagnostic-brief.md#a1310-observability-and-diagnostic-brief) | 2344 | 1926 |
-| `A13.11` | [A13.11. Degradation by Subtraction](A13-11-degradation-by-subtraction.md#a1311-degradation-by-subtraction) | 2375 | 1809 |
-| `A13.12` | [A13.12. Recovery as Learning](A13-12-recovery-as-learning.md#a1312-recovery-as-learning) | 2396 | 561 |
-| `A14` | [A14. Learning, Meta, and System Development](A14-learning-meta-and-system-development.md#a14-learning-meta-and-system-development) | 2415 | 47 |
-| `A14.1` | [A14.1. Learning Levels](A14-01-learning-levels.md#a141-learning-levels) | 2417 | 1906 |
-| `A14.2` | [A14.2. Consolidation and Reconsolidation](A14-02-consolidation-and-reconsolidation.md#a142-consolidation-and-reconsolidation) | 2441 | 612 |
-| `A14.3` | [A14.3. Negative Memory and Extinction](A14-03-negative-memory-and-extinction.md#a143-negative-memory-and-extinction) | 2462 | 455 |
-| `A14.4` | [A14.4. Forgetting and Memory Ecology](A14-04-forgetting-and-memory-ecology.md#a144-forgetting-and-memory-ecology) | 2470 | 1148 |
-| `A14.5` | [A14.5. Meta-Learning](A14-05-meta-learning.md#a145-meta-learning) | 2505 | 3225 |
-| `A14.6` | [A14.6. Evaluation](A14-06-evaluation.md#a146-evaluation) | 2549 | 1181 |
-| `A14.7` | [A14.7. Cost Authority](A14-07-cost-authority.md#a147-cost-authority) | 2565 | 724 |
-| `A14.8` | [A14.8. Development Doctrine](A14-08-development-doctrine.md#a148-development-doctrine) | 2581 | 3740 |
-| `A14.9` | [A14.9. Architecture Coherence Review](A14-09-architecture-coherence-review.md#a149-architecture-coherence-review) | 2640 | 1186 |
-| `A15` | [A15. End-to-End Scenarios](A15-end-to-end-scenarios.md#a15-end-to-end-scenarios) | 2663 | 5566 |
-| `A16` | [A16. Core Architectural Decisions](A16-core-architectural-decisions.md#a16-core-architectural-decisions) | 2701 | 37 |
-| `A16.1` | [A16.1. Decision Anchors](A16-01-decision-anchors.md#a161-decision-anchors) | 2703 | 5642 |
-| `A16.2` | [A16.2. Anti-Patterns](A16-02-anti-patterns.md#a162-anti-patterns) | 2773 | 2498 |
-| `A16.3` | [A16.3. Final Formula](A16-03-final-formula.md#a163-final-formula) | 2815 | 1084 |
+| `A9.6` | [A9.6. Remote Dreamer](A09-06-remote-dreamer.md#a96-remote-dreamer) | 1640 | 1326 |
+| `A10` | [A10. Harness, Agents, Concilium, and Swarm](A10-harness-agents-concilium-and-swarm.md#a10-harness-agents-concilium-and-swarm) | 1659 | 46 |
+| `A10.1` | [A10.1. Agent Interaction Loop](A10-01-agent-interaction-loop.md#a101-agent-interaction-loop) | 1661 | 1318 |
+| `A10.2` | [A10.2. Impact and Authority](A10-02-impact-and-authority.md#a102-impact-and-authority) | 1680 | 807 |
+| `A10.3` | [A10.3. Action Model](A10-03-action-model.md#a103-action-model) | 1696 | 958 |
+| `A10.4` | [A10.4. Delegation](A10-04-delegation.md#a104-delegation) | 1722 | 1980 |
+| `A10.5` | [A10.5. Concilium and Conflicts](A10-05-concilium-and-conflicts.md#a105-concilium-and-conflicts) | 1747 | 603 |
+| `A10.6` | [A10.6. Agent Swarm and Pipeline Work](A10-06-agent-swarm-and-pipeline-work.md#a106-agent-swarm-and-pipeline-work) | 1768 | 2977 |
+| `A10.7` | [A10.7. Long-Running Work](A10-07-long-running-work.md#a107-long-running-work) | 1825 | 1225 |
+| `A10.8` | [A10.8. Verification and Finish](A10-08-verification-and-finish.md#a108-verification-and-finish) | 1848 | 751 |
+| `A11` | [A11. Human Control and System Configuration](A11-human-control-and-system-configuration.md#a11-human-control-and-system-configuration) | 1870 | 47 |
+| `A11.1` | [A11.1. Human Authority and Fallibility](A11-01-human-authority-and-fallibility.md#a111-human-authority-and-fallibility) | 1872 | 418 |
+| `A11.2` | [A11.2. Initial Setup](A11-02-initial-setup.md#a112-initial-setup) | 1887 | 1057 |
+| `A11.3` | [A11.3. Capability Registry](A11-03-capability-registry.md#a113-capability-registry) | 1910 | 660 |
+| `A11.4` | [A11.4. ControlBoardView](A11-04-controlboardview.md#a114-controlboardview) | 1927 | 785 |
+| `A11.5` | [A11.5. Notifications](A11-05-notifications.md#a115-notifications) | 1949 | 904 |
+| `A12` | [A12. Security, Provenance, and Bounded Influence](A12-security-provenance-and-bounded-influence.md#a12-security-provenance-and-bounded-influence) | 1965 | 52 |
+| `A12.1` | [A12.1. Security Assumes Breach](A12-01-security-assumes-breach.md#a121-security-assumes-breach) | 1967 | 691 |
+| `A12.2` | [A12.2. Principal, Session, and Visibility](A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility) | 1988 | 546 |
+| `A12.3` | [A12.3. One Governed Write Path](A12-03-one-governed-write-path.md#a123-one-governed-write-path) | 2000 | 876 |
+| `A12.4` | [A12.4. Source Assurance and Injection](A12-04-source-assurance-and-injection.md#a124-source-assurance-and-injection) | 2017 | 1082 |
+| `A12.5` | [A12.5. Origin-Bound Influence](A12-05-origin-bound-influence.md#a125-origin-bound-influence) | 2040 | 924 |
+| `A12.6` | [A12.6. External Model Routes and Secrets](A12-06-external-model-routes-and-secrets.md#a126-external-model-routes-and-secrets) | 2058 | 1190 |
+| `A12.7` | [A12.7. Skills, Guards, and Challenge](A12-07-skills-guards-and-challenge.md#a127-skills-guards-and-challenge) | 2079 | 599 |
+| `A12.8` | [A12.8. Privacy Erasure](A12-08-privacy-erasure.md#a128-privacy-erasure) | 2096 | 628 |
+| `A13` | [A13. Resilience, Recovery, and Observability](A13-resilience-recovery-and-observability.md#a13-resilience-recovery-and-observability) | 2105 | 48 |
+| `A13.1` | [A13.1. Let It Fail Locally](A13-01-let-it-fail-locally.md#a131-let-it-fail-locally) | 2107 | 912 |
+| `A13.2` | [A13.2. Kernel and Failure Domains](A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains) | 2135 | 1051 |
+| `A13.3` | [A13.3. Module Supervision and Doctor](A13-03-module-supervision-and-doctor.md#a133-module-supervision-and-doctor) | 2154 | 2232 |
+| `A13.4` | [A13.4. Problem Lifecycle](A13-04-problem-lifecycle.md#a134-problem-lifecycle) | 2209 | 601 |
+| `A13.5` | [A13.5. Bounded Resources and Control Reserve](A13-05-bounded-resources-and-control-reserve.md#a135-bounded-resources-and-control-reserve) | 2225 | 1059 |
+| `A13.6` | [A13.6. Operational Recovery State](A13-06-operational-recovery-state.md#a136-operational-recovery-state) | 2256 | 796 |
+| `A13.7` | [A13.7. Backups, Restore, and Migration](A13-07-backups-restore-and-migration.md#a137-backups-restore-and-migration) | 2272 | 1196 |
+| `A13.8` | [A13.8. Integrity](A13-08-integrity.md#a138-integrity) | 2303 | 523 |
+| `A13.9` | [A13.9. Concurrency and Durable Execution](A13-09-concurrency-and-durable-execution.md#a139-concurrency-and-durable-execution) | 2321 | 1363 |
+| `A13.10` | [A13.10. Observability and Diagnostic Brief](A13-10-observability-and-diagnostic-brief.md#a1310-observability-and-diagnostic-brief) | 2348 | 1926 |
+| `A13.11` | [A13.11. Degradation by Subtraction](A13-11-degradation-by-subtraction.md#a1311-degradation-by-subtraction) | 2379 | 1809 |
+| `A13.12` | [A13.12. Recovery as Learning](A13-12-recovery-as-learning.md#a1312-recovery-as-learning) | 2400 | 561 |
+| `A14` | [A14. Learning, Meta, and System Development](A14-learning-meta-and-system-development.md#a14-learning-meta-and-system-development) | 2419 | 47 |
+| `A14.1` | [A14.1. Learning Levels](A14-01-learning-levels.md#a141-learning-levels) | 2421 | 1906 |
+| `A14.2` | [A14.2. Consolidation and Reconsolidation](A14-02-consolidation-and-reconsolidation.md#a142-consolidation-and-reconsolidation) | 2445 | 612 |
+| `A14.3` | [A14.3. Negative Memory and Extinction](A14-03-negative-memory-and-extinction.md#a143-negative-memory-and-extinction) | 2466 | 455 |
+| `A14.4` | [A14.4. Forgetting and Memory Ecology](A14-04-forgetting-and-memory-ecology.md#a144-forgetting-and-memory-ecology) | 2474 | 1148 |
+| `A14.5` | [A14.5. Meta-Learning](A14-05-meta-learning.md#a145-meta-learning) | 2509 | 3225 |
+| `A14.6` | [A14.6. Evaluation](A14-06-evaluation.md#a146-evaluation) | 2553 | 1181 |
+| `A14.7` | [A14.7. Cost Authority](A14-07-cost-authority.md#a147-cost-authority) | 2569 | 724 |
+| `A14.8` | [A14.8. Development Doctrine](A14-08-development-doctrine.md#a148-development-doctrine) | 2585 | 3740 |
+| `A14.9` | [A14.9. Architecture Coherence Review](A14-09-architecture-coherence-review.md#a149-architecture-coherence-review) | 2644 | 1186 |
+| `A15` | [A15. End-to-End Scenarios](A15-end-to-end-scenarios.md#a15-end-to-end-scenarios) | 2667 | 5566 |
+| `A16` | [A16. Core Architectural Decisions](A16-core-architectural-decisions.md#a16-core-architectural-decisions) | 2705 | 37 |
+| `A16.1` | [A16.1. Decision Anchors](A16-01-decision-anchors.md#a161-decision-anchors) | 2707 | 5642 |
+| `A16.2` | [A16.2. Anti-Patterns](A16-02-anti-patterns.md#a162-anti-patterns) | 2777 | 2498 |
+| `A16.3` | [A16.3. Final Formula](A16-03-final-formula.md#a163-final-formula) | 2819 | 1084 |
 | `I0` | [I0. Status, compatibility matrix, and change policy](I00-status-compatibility-matrix-and-change-policy.md#i0-status-compatibility-matrix-and-change-policy) | 414 | 55 |
 | `I0.1` | [I0.1. Three development contours](I00-01-three-development-contours.md#i01-three-development-contours) | 416 | 643 |
 | `I0.2` | [I0.2. Current compatibility baseline](I00-02-current-compatibility-baseline.md#i02-current-compatibility-baseline) | 430 | 9413 |
@@ -258,371 +258,371 @@ Resolve task-specific documentation through [`ROUTES.md`](ROUTES.md). Use this i
 | `I7.2` | [I7.2. Frame](I07-02-frame.md#i72-frame) | 7036 | 2519 |
 | `I7.3` | [I7.3. Handshake](I07-03-handshake.md#i73-handshake) | 7103 | 548 |
 | `I7.4` | [I7.4. Module lifecycle messages](I07-04-module-lifecycle-messages.md#i74-module-lifecycle-messages) | 7128 | 325 |
-| `I7.5` | [I7.5. Named pipes](I07-05-named-pipes.md#i75-named-pipes) | 7148 | 1366 |
-| `I7.6` | [I7.6. MCP surface](I07-06-mcp-surface.md#i76-mcp-surface) | 7175 | 3338 |
-| `I7.7` | [I7.7. MCP versions and stateless core](I07-07-mcp-versions-and-stateless-core.md#i77-mcp-versions-and-stateless-core) | 7226 | 1693 |
-| `I7.8` | [I7.8. Agent interaction loop](I07-08-agent-interaction-loop.md#i78-agent-interaction-loop) | 7236 | 735 |
-| `I7.9` | [I7.9. Strict finish input and outcomes](I07-09-strict-finish-input-and-outcomes.md#i79-strict-finish-input-and-outcomes) | 7254 | 2036 |
-| `I7.10` | [I7.10. Reactive delivery](I07-10-reactive-delivery.md#i710-reactive-delivery) | 7313 | 2460 |
-| `I7.11` | [I7.11. Context payload profiles and Decision Safety Floor](I07-11-context-payload-profiles-and-decision-safety-floor.md#i711-context-payload-profiles-and-decision-safety-floor) | 7351 | 2213 |
-| `I7.12` | [I7.12. Short Skills](I07-12-short-skills.md#i712-short-skills) | 7386 | 2947 |
-| `I7.13` | [I7.13. Skill validation and promotion](I07-13-skill-validation-and-promotion.md#i713-skill-validation-and-promotion) | 7453 | 1157 |
-| `I7.14` | [I7.14. Session lifecycle](I07-14-session-lifecycle.md#i714-session-lifecycle) | 7486 | 611 |
-| `I7.15` | [I7.15. Route Continuation and transfer](I07-15-route-continuation-and-transfer.md#i715-route-continuation-and-transfer) | 7504 | 2567 |
-| `I7.16` | [I7.16. Host integration coverage and Governance Profile](I07-16-host-integration-coverage-and-governance-profile.md#i716-host-integration-coverage-and-governance-profile) | 7559 | 1691 |
-| `I7.17` | [I7.17. Convenience surfaces](I07-17-convenience-surfaces.md#i717-convenience-surfaces) | 7591 | 2711 |
-| `I7.18` | [I7.18. Read/resources surface](I07-18-readresources-surface.md#i718-readresources-surface) | 7654 | 499 |
-| `I7.19` | [I7.19. Reactive context sequence](I07-19-reactive-context-sequence.md#i719-reactive-context-sequence) | 7673 | 448 |
-| `I7.20` | [I7.20. Agent-facing error contract](I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract) | 7689 | 5499 |
-| `I7.21` | [I7.21. Default agent role capability profiles](I07-21-default-agent-role-capability-profiles.md#i721-default-agent-role-capability-profiles) | 7757 | 4840 |
-| `I7.22` | [I7.22. Host runtime identity, discovery and conformance](I07-22-host-runtime-identity-discovery-and-conformance.md#i722-host-runtime-identity-discovery-and-conformance) | 7783 | 1459 |
-| `I7.23` | [I7.23. Raw and normalized host events](I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events) | 7815 | 3176 |
-| `I7.24` | [I7.24. Tool surface economy and cognitive exposure](I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure) | 7866 | 5786 |
-| `I7.25` | [I7.25. Skill lifecycle, interaction and execution evidence](I07-25-skill-lifecycle-interaction-and-execution-evidence.md#i725-skill-lifecycle-interaction-and-execution-evidence) | 7966 | 2538 |
-| `I7.26` | [I7.26. Reversible payload budget and omission handles](I07-26-reversible-payload-budget-and-omission-handles.md#i726-reversible-payload-budget-and-omission-handles) | 8009 | 2160 |
-| `I7.27` | [I7.27. Evidence execution, parsing, evaluation and independence](I07-27-evidence-execution-parsing-evaluation-and-independence.md#i727-evidence-execution-parsing-evaluation-and-independence) | 8062 | 1973 |
-| `I7.28` | [I7.28. Agent, Human and route feedback contract](I07-28-agent-human-and-route-feedback-contract.md#i728-agent-human-and-route-feedback-contract) | 8087 | 4666 |
-| `I7.29` | [I7.29. PortableSkillPackage](I07-29-portableskillpackage.md#i729-portableskillpackage) | 8152 | 4111 |
-| `I8` | [I8. Watchdog implementation contract](I08-watchdog-implementation-contract.md#i8-watchdog-implementation-contract) | 8209 | 40 |
-| `I8.1` | [I8.1. Process and authority](I08-01-process-and-authority.md#i81-process-and-authority) | 8211 | 1909 |
-| `I8.2` | [I8.2. Independent observation routes](I08-02-independent-observation-routes.md#i82-independent-observation-routes) | 8241 | 1531 |
-| `I8.3` | [I8.3. Deterministic supervision loop](I08-03-deterministic-supervision-loop.md#i83-deterministic-supervision-loop) | 8275 | 1507 |
-| `I8.4` | [I8.4. Interaction heartbeat](I08-04-interaction-heartbeat.md#i84-interaction-heartbeat) | 8294 | 1391 |
-| `I8.5` | [I8.5. Hook/plugin health](I08-05-hookplugin-health.md#i85-hookplugin-health) | 8339 | 844 |
-| `I8.6` | [I8.6. Bypass detection](I08-06-bypass-detection.md#i86-bypass-detection) | 8371 | 922 |
-| `I8.7` | [I8.7. Security Source Assurance](I08-07-security-source-assurance.md#i87-security-source-assurance) | 8388 | 700 |
-| `I8.8` | [I8.8. Prompt/tool/memory injection signals](I08-08-prompttoolmemory-injection-signals.md#i88-prompttoolmemory-injection-signals) | 8410 | 955 |
-| `I8.9` | [I8.9. Signals](I08-09-signals.md#i89-signals) | 8437 | 374 |
-| `I8.9.1` | [I8.9.1. Risk accumulation, model escalation and flexible response](I08-09-01-risk-accumulation-model-escalation-and-flexible-response.md#i891-risk-accumulation-model-escalation-and-flexible-response) | 8458 | 2620 |
-| `I8.10` | [I8.10. Containment](I08-10-containment.md#i810-containment) | 8506 | 1228 |
-| `I8.11` | [I8.11. Watchdog Agents](I08-11-watchdog-agents.md#i811-watchdog-agents) | 8524 | 1095 |
-| `I8.12` | [I8.12. Restart budgets](I08-12-restart-budgets.md#i812-restart-budgets) | 8558 | 424 |
-| `I8.13` | [I8.13. Watchdog failure](I08-13-watchdog-failure.md#i813-watchdog-failure) | 8577 | 957 |
-| `I8.14` | [I8.14. Watchdog observables](I08-14-watchdog-observables.md#i814-watchdog-observables) | 8593 | 398 |
-| `I8.15` | [I8.15. Watchdog generation replacement](I08-15-watchdog-generation-replacement.md#i815-watchdog-generation-replacement) | 8610 | 1130 |
-| `I8.16` | [I8.16. Development drift supervision](I08-16-development-drift-supervision.md#i816-development-drift-supervision) | 8628 | 1338 |
-| `I8.17` | [I8.17. Ingress taint before transformation](I08-17-ingress-taint-before-transformation.md#i817-ingress-taint-before-transformation) | 8649 | 812 |
-| `I8.18` | [I8.18. System feedback, memory/context health and maintenance debt](I08-18-system-feedback-memorycontext-health-and-maintenance-debt.md#i818-system-feedback-memorycontext-health-and-maintenance-debt) | 8664 | 1309 |
-| `I9` | [I9. Dreamer implementation contract](I09-dreamer-implementation-contract.md#i9-dreamer-implementation-contract) | 8689 | 39 |
-| `I9.1` | [I9.1. Process model](I09-01-process-model.md#i91-process-model) | 8691 | 958 |
-| `I9.2` | [I9.2. Dreamer service responsibilities](I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities) | 8708 | 612 |
-| `I9.3` | [I9.3. Job classes](I09-03-job-classes.md#i93-job-classes) | 8727 | 5178 |
-| `I9.4` | [I9.4. Dreamer input bundle](I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle) | 8873 | 4114 |
-| `I9.5` | [I9.5. Dream Packet](I09-05-dream-packet.md#i95-dream-packet) | 8976 | 554 |
-| `I9.6` | [I9.6. Curation candidate](I09-06-curation-candidate.md#i96-curation-candidate) | 8999 | 414 |
-| `I9.7` | [I9.7. Memory transformation validation](I09-07-memory-transformation-validation.md#i97-memory-transformation-validation) | 9018 | 555 |
-| `I9.8` | [I9.8. Background policy](I09-08-background-policy.md#i98-background-policy) | 9034 | 2476 |
-| `I9.9` | [I9.9. Agent/swarm launch and no-lost-child contract](I09-09-agentswarm-launch-and-no-lost-child-contract.md#i99-agentswarm-launch-and-no-lost-child-contract) | 9071 | 5350 |
-| `I9.10` | [I9.10. Model routing](I09-10-model-routing.md#i910-model-routing) | 9130 | 370 |
-| `I9.11` | [I9.11. Clarification routing](I09-11-clarification-routing.md#i911-clarification-routing) | 9147 | 395 |
-| `I9.12` | [I9.12. Human interaction](I09-12-human-interaction.md#i912-human-interaction) | 9163 | 932 |
-| `I9.13` | [I9.13. Remote Dreamer gateway](I09-13-remote-dreamer-gateway.md#i913-remote-dreamer-gateway) | 9181 | 850 |
-| `I9.14` | [I9.14. Researcher boundary](I09-14-researcher-boundary.md#i914-researcher-boundary) | 9210 | 552 |
-| `I9.15` | [I9.15. Dreamer failure](I09-15-dreamer-failure.md#i915-dreamer-failure) | 9224 | 781 |
-| `I9.16` | [I9.16. Dreamer quality and job economics](I09-16-dreamer-quality-and-job-economics.md#i916-dreamer-quality-and-job-economics) | 9237 | 1040 |
-| `I9.17` | [I9.17. Dreamer as ELIOT maintenance agent](I09-17-dreamer-as-eliot-maintenance-agent.md#i917-dreamer-as-eliot-maintenance-agent) | 9257 | 1128 |
-| `I10` | [I10. Agent and tool integrations](I10-agent-and-tool-integrations.md#i10-agent-and-tool-integrations) | 9274 | 36 |
-| `I10.1` | [I10.1. Bridge doctrine](I10-01-bridge-doctrine.md#i101-bridge-doctrine) | 9276 | 380 |
-| `I10.2` | [I10.2. Bridge acceptance checklist](I10-02-bridge-acceptance-checklist.md#i102-bridge-acceptance-checklist) | 9290 | 544 |
-| `I10.3` | [I10.3. Bridge types](I10-03-bridge-types.md#i103-bridge-types) | 9310 | 1767 |
-| `I10.4` | [I10.4. Codex App Server profile](I10-04-codex-app-server-profile.md#i104-codex-app-server-profile) | 9351 | 2219 |
-| `I10.5` | [I10.5. Claude routes](I10-05-claude-routes.md#i105-claude-routes) | 9383 | 1003 |
-| `I10.6` | [I10.6. OpenCode HTTP/SSE profile](I10-06-opencode-httpsse-profile.md#i106-opencode-httpsse-profile) | 9407 | 900 |
-| `I10.7` | [I10.7. ACP, Antigravity and generic profiles](I10-07-acp-antigravity-and-generic-profiles.md#i107-acp-antigravity-and-generic-profiles) | 9424 | 2136 |
-| `I10.8` | [I10.8. Instrument Plane, canonical verification and code intelligence](I10-08-instrument-plane-canonical-verification-and-code-intelligence.md#i108-instrument-plane-canonical-verification-and-code-intelligence) | 9475 | 74 |
-| `I10.8.1` | [I10.8.1. Purpose and ownership](I10-08-01-purpose-and-ownership.md#i1081-purpose-and-ownership) | 9477 | 1687 |
-| `I10.8.2` | [I10.8.2. IP0 — one Windows ProcessExecutor](I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0--one-windows-processexecutor) | 9509 | 3853 |
-| `I10.8.3` | [I10.8.3. IP1 — typed, extensible instrument contracts](I10-08-03-ip1-typed-extensible-instrument-contracts.md#i1083-ip1--typed-extensible-instrument-contracts) | 9559 | 2675 |
-| `I10.8.4` | [I10.8.4. IP2 — InstrumentRunner](I10-08-04-ip2-instrumentrunner.md#i1084-ip2--instrumentrunner) | 9625 | 2333 |
-| `I10.8.5` | [I10.8.5. IP3 — streaming evidence and normalization](I10-08-05-ip3-streaming-evidence-and-normalization.md#i1085-ip3--streaming-evidence-and-normalization) | 9679 | 1401 |
-| `I10.8.6` | [I10.8.6. Negative-result contract](I10-08-06-negative-result-contract.md#i1086-negative-result-contract) | 9718 | 670 |
-| `I10.8.7` | [I10.8.7. IP4 — instrument profiles](I10-08-07-ip4-instrument-profiles.md#i1087-ip4--instrument-profiles) | 9741 | 1903 |
-| `I10.8.8` | [I10.8.8. IP5 — Rust understanding stack](I10-08-08-ip5-rust-understanding-stack.md#i1088-ip5--rust-understanding-stack) | 9780 | 1635 |
-| `I10.8.9` | [I10.8.9. Agent-facing projection](I10-08-09-agent-facing-projection.md#i1089-agent-facing-projection) | 9815 | 1217 |
-| `I10.8.10` | [I10.8.10. Migration from overlapping verification paths](I10-08-10-migration-from-overlapping-verification-paths.md#i10810-migration-from-overlapping-verification-paths) | 9830 | 1205 |
-| `I10.8.11` | [I10.8.11. Instrument failure and replacement](I10-08-11-instrument-failure-and-replacement.md#i10811-instrument-failure-and-replacement) | 9853 | 864 |
-| `I10.8.12` | [I10.8.12. Source ownership and first crate extraction wave](I10-08-12-source-ownership-and-first-crate-extraction-wave.md#i10812-source-ownership-and-first-crate-extraction-wave) | 9881 | 2745 |
-| `I10.8.13` | [I10.8.13. Durable Instrument job lifecycle](I10-08-13-durable-instrument-job-lifecycle.md#i10813-durable-instrument-job-lifecycle) | 9955 | 1399 |
-| `I10.8.14` | [I10.8.14. Build artifact and evidence reuse](I10-08-14-build-artifact-and-evidence-reuse.md#i10814-build-artifact-and-evidence-reuse) | 10007 | 966 |
-| `I10.8.15` | [I10.8.15. IP7 — isolated `eliot-testd` execution plane](I10-08-15-ip7-isolated-eliot-testd-execution-plane.md#i10815-ip7--isolated-eliot-testd-execution-plane) | 10034 | 1723 |
-| `I10.8.16` | [I10.8.16. IP8 — component build and generation promotion service](I10-08-16-ip8-component-build-and-generation-promotion-service.md#i10816-ip8--component-build-and-generation-promotion-service) | 10083 | 1051 |
-| `I10.8.17` | [I10.8.17. Code-intelligence capability planes and query semantics](I10-08-17-code-intelligence-capability-planes-and-query-semantics.md#i10817-code-intelligence-capability-planes-and-query-semantics) | 10106 | 3453 |
-| `I10.8.18` | [I10.8.18. Derived-index reference path, impact directives and source views](I10-08-18-derived-index-reference-path-impact-directives-and-source-views.md#i10818-derived-index-reference-path-impact-directives-and-source-views) | 10211 | 4271 |
-| `I10.8.19` | [I10.8.19. Code-intelligence adapter arbitration and RepoWise pilot](I10-08-19-code-intelligence-adapter-arbitration-and-repowise-pilot.md#i10819-code-intelligence-adapter-arbitration-and-repowise-pilot) | 10324 | 4039 |
-| `I10.9` | [I10.9. Git bridge](I10-09-git-bridge.md#i109-git-bridge) | 10406 | 615 |
-| `I10.10` | [I10.10. LSP and diagnostics](I10-10-lsp-and-diagnostics.md#i1010-lsp-and-diagnostics) | 10421 | 566 |
-| `I10.11` | [I10.11. External model bridges](I10-11-external-model-bridges.md#i1011-external-model-bridges) | 10435 | 11141 |
-| `I10.12` | [I10.12. Cloud and laboratory modules](I10-12-cloud-and-laboratory-modules.md#i1012-cloud-and-laboratory-modules) | 10634 | 334 |
-| `I10.13` | [I10.13. Professional applications](I10-13-professional-applications.md#i1013-professional-applications) | 10648 | 313 |
-| `I10.14` | [I10.14. Bridge updates](I10-14-bridge-updates.md#i1014-bridge-updates) | 10664 | 323 |
-| `I10.15` | [I10.15. Agent Execution Fabric and durable swarm](I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm) | 10679 | 25823 |
-| `I10.16` | [I10.16. Governed integration of candidate implementations](I10-16-governed-integration-of-candidate-implementations.md#i1016-governed-integration-of-candidate-implementations) | 11081 | 2095 |
-| `I10.17` | [I10.17. Adapter subsystem](I10-17-adapter-subsystem.md#i1017-adapter-subsystem) | 11119 | 4719 |
-| `I10.18` | [I10.18. Mailbox, blackboard, live peer delivery and anchored review](I10-18-mailbox-blackboard-live-peer-delivery-and-anchored-review.md#i1018-mailbox-blackboard-live-peer-delivery-and-anchored-review) | 11213 | 5734 |
-| `I10.19` | [I10.19. Provider memory feeds](I10-19-provider-memory-feeds.md#i1019-provider-memory-feeds) | 11362 | 445 |
-| `I10.20` | [I10.20. Professional workflow bridges](I10-20-professional-workflow-bridges.md#i1020-professional-workflow-bridges) | 11377 | 1213 |
-| `I10.21` | [I10.21. ChangeMonitor and evolving anchors](I10-21-changemonitor-and-evolving-anchors.md#i1021-changemonitor-and-evolving-anchors) | 11396 | 2581 |
-| `I10.22` | [I10.22. Professional execution safeguards and abandonment](I10-22-professional-execution-safeguards-and-abandonment.md#i1022-professional-execution-safeguards-and-abandonment) | 11449 | 1066 |
-| `I10.23` | [I10.23. MessagingBridge](I10-23-messagingbridge.md#i1023-messagingbridge) | 11465 | 4570 |
-| `I11` | [I11. Human control plane and notifications](I11-human-control-plane-and-notifications.md#i11-human-control-plane-and-notifications) | 11517 | 46 |
-| `I11.1` | [I11.1. First UI](I11-01-first-ui.md#i111-first-ui) | 11519 | 1875 |
-| `I11.2` | [I11.2. ControlBoardView](I11-02-controlboardview.md#i112-controlboardview) | 11540 | 1500 |
-| `I11.3` | [I11.3. Human actions and role authority](I11-03-human-actions-and-role-authority.md#i113-human-actions-and-role-authority) | 11568 | 1437 |
-| `I11.4` | [I11.4. Dreamer/Watchdog conversation and operator intent](I11-04-dreamerwatchdog-conversation-and-operator-intent.md#i114-dreamerwatchdog-conversation-and-operator-intent) | 11584 | 1799 |
-| `I11.5` | [I11.5. Persistent notifications](I11-05-persistent-notifications.md#i115-persistent-notifications) | 11615 | 655 |
-| `I11.6` | [I11.6. Windows notifications](I11-06-windows-notifications.md#i116-windows-notifications) | 11647 | 1259 |
-| `I11.7` | [I11.7. Notification behavior](I11-07-notification-behavior.md#i117-notification-behavior) | 11667 | 949 |
-| `I11.8` | [I11.8. Authentication](I11-08-authentication.md#i118-authentication) | 11691 | 913 |
-| `I11.9` | [I11.9. Accessibility and ordinary-user design](I11-09-accessibility-and-ordinary-user-design.md#i119-accessibility-and-ordinary-user-design) | 11697 | 357 |
-| `I11.10` | [I11.10. Human attention, approval and telemetry evaluation](I11-10-human-attention-approval-and-telemetry-evaluation.md#i1110-human-attention-approval-and-telemetry-evaluation) | 11709 | 2125 |
-| `I11.11` | [I11.11. Project launcher, environment manager and ordinary-user workflow](I11-11-project-launcher-environment-manager-and-ordinary-user-workflow.md#i1111-project-launcher-environment-manager-and-ordinary-user-workflow) | 11748 | 2773 |
-| `I11.12` | [I11.12. UserAutomation](I11-12-userautomation.md#i1112-userautomation) | 11793 | 5110 |
-| `I12` | [I12. Understanding, memory classification, curation and retrieval](I12-understanding-memory-classification-curation-and-retrieval.md#i12-understanding-memory-classification-curation-and-retrieval) | 11855 | 69 |
-| `I12.1` | [I12.1. State model](I12-01-state-model.md#i121-state-model) | 11857 | 533 |
-| `I12.2` | [I12.2. Capture path](I12-02-capture-path.md#i122-capture-path) | 11873 | 743 |
-| `I12.3` | [I12.3. Classification pipeline](I12-03-classification-pipeline.md#i123-classification-pipeline) | 11901 | 765 |
-| `I12.4` | [I12.4. Core record families](I12-04-core-record-families.md#i124-core-record-families) | 11930 | 1420 |
-| `I12.5` | [I12.5. Epistemic status](I12-05-epistemic-status.md#i125-epistemic-status) | 11953 | 1865 |
-| `I12.6` | [I12.6. Cue binding](I12-06-cue-binding.md#i126-cue-binding) | 11991 | 1595 |
-| `I12.7` | [I12.7. Cue Index](I12-07-cue-index.md#i127-cue-index) | 12025 | 698 |
-| `I12.8` | [I12.8. Exact-first orientation](I12-08-exact-first-orientation.md#i128-exact-first-orientation) | 12049 | 291 |
-| `I12.9` | [I12.9. Graph layer](I12-09-graph-layer.md#i129-graph-layer) | 12062 | 403 |
-| `I12.10` | [I12.10. CodeCortex implementation](I12-10-codecortex-implementation.md#i1210-codecortex-implementation) | 12088 | 3486 |
-| `I12.11` | [I12.11. Concept Pyramid](I12-11-concept-pyramid.md#i1211-concept-pyramid) | 12179 | 536 |
-| `I12.12` | [I12.12. Current Epistemic Position Resolver](I12-12-current-epistemic-position-resolver.md#i1212-current-epistemic-position-resolver) | 12195 | 1052 |
-| `I12.13` | [I12.13. Context Compiler](I12-13-context-compiler.md#i1213-context-compiler) | 12226 | 7524 |
-| `I12.14` | [I12.14. Hot path](I12-14-hot-path.md#i1214-hot-path) | 12390 | 1911 |
-| `I12.15` | [I12.15. Bounded spreading activation](I12-15-bounded-spreading-activation.md#i1215-bounded-spreading-activation) | 12449 | 395 |
-| `I12.16` | [I12.16. Context consistency](I12-16-context-consistency.md#i1216-context-consistency) | 12464 | 460 |
-| `I12.17` | [I12.17. Compaction and resume](I12-17-compaction-and-resume.md#i1217-compaction-and-resume) | 12479 | 569 |
-| `I12.18` | [I12.18. Prediction and calibration](I12-18-prediction-and-calibration.md#i1218-prediction-and-calibration) | 12507 | 1464 |
-| `I12.19` | [I12.19. Negative memory](I12-19-negative-memory.md#i1219-negative-memory) | 12550 | 439 |
-| `I12.20` | [I12.20. Influence revocation](I12-20-influence-revocation.md#i1220-influence-revocation) | 12570 | 984 |
-| `I12.21` | [I12.21. Memory ecology, residual experience and transfer](I12-21-memory-ecology-residual-experience-and-transfer.md#i1221-memory-ecology-residual-experience-and-transfer) | 12588 | 7538 |
-| `I12.22` | [I12.22. Theory Portfolio and practical weighting](I12-22-theory-portfolio-and-practical-weighting.md#i1222-theory-portfolio-and-practical-weighting) | 12732 | 1349 |
-| `I12.23` | [I12.23. Architecture and Implementation Knowledge pipeline](I12-23-architecture-and-implementation-knowledge-pipeline.md#i1223-architecture-and-implementation-knowledge-pipeline) | 12774 | 3316 |
-| `I12.24` | [I12.24. Meta-learning and improvement delivery](I12-24-meta-learning-and-improvement-delivery.md#i1224-meta-learning-and-improvement-delivery) | 12849 | 21832 |
-| `I12.25` | [I12.25. Canonical cognitive record semantics](I12-25-canonical-cognitive-record-semantics.md#i1225-canonical-cognitive-record-semantics) | 13164 | 928 |
-| `I12.26` | [I12.26. Memory admission and retrieval trace](I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace) | 13181 | 4258 |
-| `I12.27` | [I12.27. Metacognitive projections](I12-27-metacognitive-projections.md#i1227-metacognitive-projections) | 13266 | 627 |
-| `I12.28` | [I12.28. Concept and behavioral build artifacts](I12-28-concept-and-behavioral-build-artifacts.md#i1228-concept-and-behavioral-build-artifacts) | 13281 | 2339 |
-| `I12.29` | [I12.29. Calibration aggregation and staleness](I12-29-calibration-aggregation-and-staleness.md#i1229-calibration-aggregation-and-staleness) | 13349 | 603 |
-| `I12.30` | [I12.30. Memory trajectory error registry](I12-30-memory-trajectory-error-registry.md#i1230-memory-trajectory-error-registry) | 13361 | 404 |
-| `I12.31` | [I12.31. Rationale and handoff](I12-31-rationale-and-handoff.md#i1231-rationale-and-handoff) | 13381 | 2239 |
-| `I12.32` | [I12.32. Context Economy Ledger](I12-32-context-economy-ledger.md#i1232-context-economy-ledger) | 13427 | 3483 |
-| `I12.33` | [I12.33. Understanding Evaluation Job](I12-33-understanding-evaluation-job.md#i1233-understanding-evaluation-job) | 13501 | 1257 |
-| `I12.34` | [I12.34. Cognitive proof ladder and ecological field proof](I12-34-cognitive-proof-ladder-and-ecological-field-proof.md#i1234-cognitive-proof-ladder-and-ecological-field-proof) | 13520 | 3146 |
-| `I12.35` | [I12.35. Multimodal, object and workflow continuity](I12-35-multimodal-object-and-workflow-continuity.md#i1235-multimodal-object-and-workflow-continuity) | 13573 | 1438 |
-| `I12.36` | [I12.36. Memory threat handling and Environment Runbooks](I12-36-memory-threat-handling-and-environment-runbooks.md#i1236-memory-threat-handling-and-environment-runbooks) | 13604 | 2124 |
-| `I12.37` | [I12.37. Governed SessionEpisode and typed source ingestion](I12-37-governed-sessionepisode-and-typed-source-ingestion.md#i1237-governed-sessionepisode-and-typed-source-ingestion) | 13641 | 4915 |
-| `I12.38` | [I12.38. Causal influence status](I12-38-causal-influence-status.md#i1238-causal-influence-status) | 13781 | 936 |
-| `I13` | [I13. Conflict and attention contract](I13-conflict-and-attention-contract.md#i13-conflict-and-attention-contract) | 13804 | 40 |
-| `I13.1` | [I13.1. Conflict types](I13-01-conflict-types.md#i131-conflict-types) | 13806 | 436 |
-| `I13.2` | [I13.2. Conflict Set](I13-02-conflict-set.md#i132-conflict-set) | 13819 | 1638 |
-| `I13.3` | [I13.3. Conflict Directive](I13-03-conflict-directive.md#i133-conflict-directive) | 13858 | 489 |
-| `I13.4` | [I13.4. Concilium runtime](I13-04-concilium-runtime.md#i134-concilium-runtime) | 13882 | 985 |
-| `I13.5` | [I13.5. State/revision conflicts](I13-05-staterevision-conflicts.md#i135-staterevision-conflicts) | 13903 | 345 |
-| `I13.6` | [I13.6. Instruction conflict](I13-06-instruction-conflict.md#i136-instruction-conflict) | 13913 | 779 |
-| `I13.7` | [I13.7. Critical Attention](I13-07-critical-attention.md#i137-critical-attention) | 13928 | 452 |
-| `I13.8` | [I13.8. Attention ownership](I13-08-attention-ownership.md#i138-attention-ownership) | 13950 | 417 |
-| `I13.9` | [I13.9. Problem Registry](I13-09-problem-registry.md#i139-problem-registry) | 13965 | 1859 |
-| `I13.10` | [I13.10. Incident promotion](I13-10-incident-promotion.md#i1310-incident-promotion) | 14006 | 457 |
-| `I13.11` | [I13.11. Diagnostic Brief](I13-11-diagnostic-brief.md#i1311-diagnostic-brief) | 14022 | 379 |
-| `I14` | [I14. Queueing, backpressure and degraded behavior](I14-queueing-backpressure-and-degraded-behavior.md#i14-queueing-backpressure-and-degraded-behavior) | 14043 | 53 |
-| `I14.1` | [I14.1. Work classes](I14-01-work-classes.md#i141-work-classes) | 14045 | 218 |
-| `I14.2` | [I14.2. Default queue profiles](I14-02-default-queue-profiles.md#i142-default-queue-profiles) | 14061 | 752 |
-| `I14.3` | [I14.3. Control Reserve](I14-03-control-reserve.md#i143-control-reserve) | 14078 | 1178 |
-| `I14.4` | [I14.4. Backpressure responses](I14-04-backpressure-responses.md#i144-backpressure-responses) | 14110 | 549 |
-| `I14.5` | [I14.5. Recovery Directive](I14-05-recovery-directive.md#i145-recovery-directive) | 14124 | 392 |
-| `I14.6` | [I14.6. Durable work, admission and execution axes](I14-06-durable-work-admission-and-execution-axes.md#i146-durable-work-admission-and-execution-axes) | 14144 | 2769 |
-| `I14.7` | [I14.7. Task outcome mapping](I14-07-task-outcome-mapping.md#i147-task-outcome-mapping) | 14206 | 762 |
-| `I14.8` | [I14.8. Fair and portfolio-aware scheduling](I14-08-fair-and-portfolio-aware-scheduling.md#i148-fair-and-portfolio-aware-scheduling) | 14220 | 782 |
-| `I14.9` | [I14.9. Poison operations](I14-09-poison-operations.md#i149-poison-operations) | 14235 | 712 |
-| `I14.10` | [I14.10. Supervision strategies and restart intensity](I14-10-supervision-strategies-and-restart-intensity.md#i1410-supervision-strategies-and-restart-intensity) | 14250 | 1604 |
-| `I14.11` | [I14.11. Canonical store outage](I14-11-canonical-store-outage.md#i1411-canonical-store-outage) | 14281 | 480 |
-| `I14.12` | [I14.12. Memory pressure](I14-12-memory-pressure.md#i1412-memory-pressure) | 14294 | 340 |
-| `I14.13` | [I14.13. Idle drain and cancellation](I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation) | 14308 | 370 |
-| `I14.14` | [I14.14. Module hot replacement](I14-14-module-hot-replacement.md#i1414-module-hot-replacement) | 14325 | 4405 |
-| `I14.15` | [I14.15. Daemon hot replacement](I14-15-daemon-hot-replacement.md#i1415-daemon-hot-replacement) | 14411 | 1375 |
-| `I14.16` | [I14.16. Kernel and Host update](I14-16-kernel-and-host-update.md#i1416-kernel-and-host-update) | 14429 | 2582 |
-| `I14.17` | [I14.17. User Broker update and reattachment](I14-17-user-broker-update-and-reattachment.md#i1417-user-broker-update-and-reattachment) | 14470 | 897 |
-| `I14.18` | [I14.18. Dynamic library policy](I14-18-dynamic-library-policy.md#i1418-dynamic-library-policy) | 14487 | 386 |
-| `I14.19` | [I14.19. WASM components](I14-19-wasm-components.md#i1419-wasm-components) | 14501 | 5868 |
-| `I14.20` | [I14.20. Canonical runtime lifecycle vocabulary](I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary) | 14627 | 11840 |
-| `I14.21` | [I14.21. Unknown commit recovery](I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery) | 14924 | 370 |
-| `I14.22` | [I14.22. Maintenance jobs](I14-22-maintenance-jobs.md#i1422-maintenance-jobs) | 14935 | 6921 |
-| `I14.23` | [I14.23. Safe shutdown](I14-23-safe-shutdown.md#i1423-safe-shutdown) | 15030 | 849 |
-| `I14.24` | [I14.24. Local failure containment matrix](I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix) | 15047 | 11976 |
-| `I14.25` | [I14.25. Doctor implementation contract](I14-25-doctor-implementation-contract.md#i1425-doctor-implementation-contract) | 15101 | 4258 |
-| `I14.26` | [I14.26. Recovery View contract](I14-26-recovery-view-contract.md#i1426-recovery-view-contract) | 15199 | 1774 |
-| `I14.27` | [I14.27. Capability Blueprint and independent instance lifecycle](I14-27-capability-blueprint-and-independent-instance-lifecycle.md#i1427-capability-blueprint-and-independent-instance-lifecycle) | 15238 | 2660 |
-| `I14.28` | [I14.28. Effect-specific lifecycle and empirical resource profiles](I14-28-effect-specific-lifecycle-and-empirical-resource-profiles.md#i1428-effect-specific-lifecycle-and-empirical-resource-profiles) | 15314 | 2002 |
-| `I14.29` | [I14.29. Stage-local recovery, progress clocks and parkable resources](I14-29-stage-local-recovery-progress-clocks-and-parkable-resources.md#i1429-stage-local-recovery-progress-clocks-and-parkable-resources) | 15362 | 4323 |
-| `I15` | [I15. Security and bypass resistance](I15-security-and-bypass-resistance.md#i15-security-and-bypass-resistance) | 15483 | 39 |
-| `I15.1` | [I15.1. Threat model](I15-01-threat-model.md#i151-threat-model) | 15485 | 481 |
-| `I15.2` | [I15.2. Principal and Session binding](I15-02-principal-and-session-binding.md#i152-principal-and-session-binding) | 15502 | 342 |
-| `I15.3` | [I15.3. Least privilege processes](I15-03-least-privilege-processes.md#i153-least-privilege-processes) | 15519 | 794 |
-| `I15.4` | [I15.4. Secrets](I15-04-secrets.md#i154-secrets) | 15533 | 2299 |
-| `I15.5` | [I15.5. Source assurance](I15-05-source-assurance.md#i155-source-assurance) | 15568 | 356 |
-| `I15.6` | [I15.6. Instruction/data separation](I15-06-instructiondata-separation.md#i156-instructiondata-separation) | 15589 | 359 |
-| `I15.7` | [I15.7. Bounded influence](I15-07-bounded-influence.md#i157-bounded-influence) | 15600 | 1061 |
-| `I15.8` | [I15.8. Direct write protection](I15-08-direct-write-protection.md#i158-direct-write-protection) | 15614 | 349 |
-| `I15.9` | [I15.9. Source admission and executable supply chain](I15-09-source-admission-and-executable-supply-chain.md#i159-source-admission-and-executable-supply-chain) | 15625 | 2670 |
-| `I15.10` | [I15.10. Sandboxing](I15-10-sandboxing.md#i1510-sandboxing) | 15684 | 433 |
-| `I15.11` | [I15.11. Agent worktrees](I15-11-agent-worktrees.md#i1511-agent-worktrees) | 15700 | 328 |
-| `I15.12` | [I15.12. External model data firewall](I15-12-external-model-data-firewall.md#i1512-external-model-data-firewall) | 15714 | 454 |
-| `I15.13` | [I15.13. Remote Dreamer security](I15-13-remote-dreamer-security.md#i1513-remote-dreamer-security) | 15738 | 272 |
-| `I15.14` | [I15.14. Privacy erasure](I15-14-privacy-erasure.md#i1514-privacy-erasure) | 15752 | 461 |
-| `I15.15` | [I15.15. Break-glass](I15-15-break-glass.md#i1515-break-glass) | 15769 | 335 |
-| `I15.16` | [I15.16. Security testing](I15-16-security-testing.md#i1516-security-testing) | 15785 | 394 |
-| `I15.17` | [I15.17. Agent-generated Rust build threat model](I15-17-agent-generated-rust-build-threat-model.md#i1517-agent-generated-rust-build-threat-model) | 15804 | 1732 |
-| `I15.18` | [I15.18. Disclosure, delegation and facet security](I15-18-disclosure-delegation-and-facet-security.md#i1518-disclosure-delegation-and-facet-security) | 15841 | 2662 |
-| `I15.19` | [I15.19. Authenticated origin and supply-chain evidence](I15-19-authenticated-origin-and-supply-chain-evidence.md#i1519-authenticated-origin-and-supply-chain-evidence) | 15914 | 941 |
-| `I16` | [I16. Observability, metrics and reports](I16-observability-metrics-and-reports.md#i16-observability-metrics-and-reports) | 15933 | 43 |
-| `I16.1` | [I16.1. Four surfaces](I16-01-four-surfaces.md#i161-four-surfaces) | 15935 | 343 |
-| `I16.2` | [I16.2. Rust observability stack](I16-02-rust-observability-stack.md#i162-rust-observability-stack) | 15953 | 449 |
-| `I16.3` | [I16.3. Composite run trace context](I16-03-composite-run-trace-context.md#i163-composite-run-trace-context) | 15967 | 662 |
-| `I16.4` | [I16.4. Required operational events](I16-04-required-operational-events.md#i164-required-operational-events) | 15987 | 833 |
-| `I16.5` | [I16.5. Metrics groups](I16-05-metrics-groups.md#i165-metrics-groups) | 16005 | 3584 |
-| `I16.6` | [I16.6. Performance views](I16-06-performance-views.md#i166-performance-views) | 16120 | 2721 |
-| `I16.7` | [I16.7. Problem-oriented logging and Diagnostic Brief](I16-07-problem-oriented-logging-and-diagnostic-brief.md#i167-problem-oriented-logging-and-diagnostic-brief) | 16193 | 1220 |
-| `I16.8` | [I16.8. Reports](I16-08-reports.md#i168-reports) | 16225 | 491 |
-| `I16.9` | [I16.9. Retention and telemetry cost](I16-09-retention-and-telemetry-cost.md#i169-retention-and-telemetry-cost) | 16246 | 1911 |
-| `I16.10` | [I16.10. Audit integrity](I16-10-audit-integrity.md#i1610-audit-integrity) | 16293 | 206 |
-| `I16.11` | [I16.11. No hidden telemetry failure](I16-11-no-hidden-telemetry-failure.md#i1611-no-hidden-telemetry-failure) | 16297 | 302 |
-| `I16.12` | [I16.12. Trace completeness](I16-12-trace-completeness.md#i1612-trace-completeness) | 16313 | 526 |
-| `I16.13` | [I16.13. Influence tracking](I16-13-influence-tracking.md#i1613-influence-tracking) | 16331 | 766 |
-| `I16.14` | [I16.14. Required report inputs](I16-14-required-report-inputs.md#i1614-required-report-inputs) | 16364 | 308 |
-| `I16.15` | [I16.15. Architecture, Implementation and donor coverage reports](I16-15-architecture-implementation-and-donor-coverage-reports.md#i1615-architecture-implementation-and-donor-coverage-reports) | 16379 | 2945 |
-| `I16.16` | [I16.16. No-progress, loop and external telemetry projections](I16-16-no-progress-loop-and-external-telemetry-projections.md#i1616-no-progress-loop-and-external-telemetry-projections) | 16447 | 1003 |
-| `I16.17` | [I16.17. Instrument Plane observability](I16-17-instrument-plane-observability.md#i1617-instrument-plane-observability) | 16467 | 1294 |
-| `I16.18` | [I16.18. Wait-for graph and Failure Capsule](I16-18-wait-for-graph-and-failure-capsule.md#i1618-wait-for-graph-and-failure-capsule) | 16502 | 1247 |
-| `I16.19` | [I16.19. Reasoning telemetry and step-outcome attribution](I16-19-reasoning-telemetry-and-step-outcome-attribution.md#i1619-reasoning-telemetry-and-step-outcome-attribution) | 16532 | 2078 |
-| `I16.20` | [I16.20. Derived-intelligence, disclosure and capability metrics](I16-20-derived-intelligence-disclosure-and-capability-metrics.md#i1620-derived-intelligence-disclosure-and-capability-metrics) | 16585 | 1245 |
-| `I16.21` | [I16.21. Telemetry purpose, minimization and privacy-benefit gate](I16-21-telemetry-purpose-minimization-and-privacy-benefit-gate.md#i1621-telemetry-purpose-minimization-and-privacy-benefit-gate) | 16617 | 932 |
-| `I16.22` | [I16.22. Contract and documentation burden](I16-22-contract-and-documentation-burden.md#i1622-contract-and-documentation-burden) | 16633 | 1090 |
-| `I16.23` | [I16.23. ELIOT self-quality and feedback observability](I16-23-eliot-self-quality-and-feedback-observability.md#i1623-eliot-self-quality-and-feedback-observability) | 16659 | 3742 |
-| `I17` | [I17. Development sequence](I17-development-sequence.md#i17-development-sequence) | 16736 | 29 |
-| `I17.1` | [I17.1. Development doctrine](I17-01-development-doctrine.md#i171-development-doctrine) | 16738 | 1760 |
-| `I17.2` | [I17.2. Current recovery priority and promotion gate](I17-02-current-recovery-priority-and-promotion-gate.md#i172-current-recovery-priority-and-promotion-gate) | 16770 | 3101 |
-| `I17.3` | [I17.3. Canonical Product Identity](I17-03-canonical-product-identity.md#i173-canonical-product-identity) | 16807 | 776 |
-| `I17.4` | [I17.4. Causal Change Unit](I17-04-causal-change-unit.md#i174-causal-change-unit) | 16825 | 949 |
-| `I17.5` | [I17.5. Mechanism Review](I17-05-mechanism-review.md#i175-mechanism-review) | 16857 | 627 |
-| `I17.6` | [I17.6. Operational Spine Proof 1 and later Product Benefit Evaluation](I17-06-operational-spine-proof-1-and-later-product-benefit-evaluation.md#i176-operational-spine-proof-1-and-later-product-benefit-evaluation) | 16882 | 4148 |
-| `I17.7` | [I17.7. Memory rehabilitation gate](I17-07-memory-rehabilitation-gate.md#i177-memory-rehabilitation-gate) | 16972 | 1967 |
-| `I17.8` | [I17.8. Delivery Depth D0 — replaceable runtime and process-grounding skeleton](I17-08-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton.md#i178-delivery-depth-d0--replaceable-runtime-and-process-grounding-skeleton) | 17006 | 2061 |
-| `I17.9` | [I17.9. Delivery Depth D1 — canonicalized product and verification spine](I17-09-delivery-depth-d1-canonicalized-product-and-verification-spine.md#i179-delivery-depth-d1--canonicalized-product-and-verification-spine) | 17036 | 922 |
-| `I17.10` | [I17.10. Delivery Depth D2 — hot modules, independent proofs and replacement](I17-10-delivery-depth-d2-hot-modules-independent-proofs-and-replacement.md#i1710-delivery-depth-d2--hot-modules-independent-proofs-and-replacement) | 17055 | 533 |
-| `I17.11` | [I17.11. Delivery Depth D3 — grounded Smart understanding](I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding) | 17069 | 2436 |
-| `I17.12` | [I17.12. Delivery Depth D4 — resilient Meta](I17-12-delivery-depth-d4-resilient-meta.md#i1712-delivery-depth-d4--resilient-meta) | 17099 | 603 |
-| `I17.13` | [I17.13. Delivery Depth D5 — advanced portfolio, swarm and research](I17-13-delivery-depth-d5-advanced-portfolio-swarm-and-research.md#i1713-delivery-depth-d5--advanced-portfolio-swarm-and-research) | 17112 | 1041 |
-| `I17.14` | [I17.14. Agent Work Unit over a FunctionalCapabilityCell](I17-14-agent-work-unit-over-a-functionalcapabilitycell.md#i1714-agent-work-unit-over-a-functionalcapabilitycell) | 17125 | 2065 |
-| `I17.15` | [I17.15. Agent Task Compiler and development waves](I17-15-agent-task-compiler-and-development-waves.md#i1715-agent-task-compiler-and-development-waves) | 17167 | 1994 |
-| `I17.16` | [I17.16. Real-use development and live improvement](I17-16-real-use-development-and-live-improvement.md#i1716-real-use-development-and-live-improvement) | 17215 | 1014 |
-| `I17.17` | [I17.17. Stop conditions against overengineering](I17-17-stop-conditions-against-overengineering.md#i1717-stop-conditions-against-overengineering) | 17233 | 1114 |
-| `I17.18` | [I17.18. Execution Fabric Proof 2 — one component through all contours](I17-18-execution-fabric-proof-2-one-component-through-all-contours.md#i1718-execution-fabric-proof-2--one-component-through-all-contours) | 17254 | 1648 |
-| `I17.19` | [I17.19. Donor adoption order](I17-19-donor-adoption-order.md#i1719-donor-adoption-order) | 17286 | 1875 |
-| `I18` | [I18. Testing and Instrumental Grounding strategy](I18-testing-and-instrumental-grounding-strategy.md#i18-testing-and-instrumental-grounding-strategy) | 17330 | 52 |
-| `I18.1` | [I18.1. Purpose, proof scope and canonical owner](I18-01-purpose-proof-scope-and-canonical-owner.md#i181-purpose-proof-scope-and-canonical-owner) | 17332 | 2292 |
-| `I18.2` | [I18.2. Discriminator-first repair](I18-02-discriminator-first-repair.md#i182-discriminator-first-repair) | 17395 | 1036 |
-| `I18.3` | [I18.3. Impact graph and selection](I18-03-impact-graph-and-selection.md#i183-impact-graph-and-selection) | 17420 | 1722 |
-| `I18.4` | [I18.4. Test tiers](I18-04-test-tiers.md#i184-test-tiers) | 17463 | 1888 |
-| `I18.5` | [I18.5. Composition and proxy resistance](I18-05-composition-and-proxy-resistance.md#i185-composition-and-proxy-resistance) | 17489 | 1186 |
-| `I18.6` | [I18.6. Canonical InstrumentRunner, test discovery and `dev-fast`](I18-06-canonical-instrumentrunner-test-discovery-and-dev-fast.md#i186-canonical-instrumentrunner-test-discovery-and-dev-fast) | 17517 | 2271 |
-| `I18.7` | [I18.7. Independently testable capability cell contract](I18-07-independently-testable-capability-cell-contract.md#i187-independently-testable-capability-cell-contract) | 17590 | 2744 |
-| `I18.8` | [I18.8. Instrument Plane self-tests and fault contracts](I18-08-instrument-plane-self-tests-and-fault-contracts.md#i188-instrument-plane-self-tests-and-fault-contracts) | 17637 | 1554 |
-| `I18.9` | [I18.9. Hard Boundary discriminators](I18-09-hard-boundary-discriminators.md#i189-hard-boundary-discriminators) | 17697 | 742 |
-| `I18.10` | [I18.10. Cognitive and memory product tests](I18-10-cognitive-and-memory-product-tests.md#i1810-cognitive-and-memory-product-tests) | 17720 | 1171 |
-| `I18.11` | [I18.11. Swarm tests](I18-11-swarm-tests.md#i1811-swarm-tests) | 17741 | 2103 |
-| `I18.12` | [I18.12. Canary, holdout and real-use evaluation](I18-12-canary-holdout-and-real-use-evaluation.md#i1812-canary-holdout-and-real-use-evaluation) | 17795 | 844 |
-| `I18.13` | [I18.13. Full release gate](I18-13-full-release-gate.md#i1813-full-release-gate) | 17804 | 596 |
-| `I18.14` | [I18.14. Test retirement](I18-14-test-retirement.md#i1814-test-retirement) | 17823 | 406 |
-| `I18.15` | [I18.15. Development success and counter-metrics](I18-15-development-success-and-counter-metrics.md#i1815-development-success-and-counter-metrics) | 17838 | 2021 |
-| `I18.16` | [I18.16. Host/route conformance](I18-16-hostroute-conformance.md#i1816-hostroute-conformance) | 17890 | 912 |
-| `I18.17` | [I18.17. Route/recipe evaluation](I18-17-routerecipe-evaluation.md#i1817-routerecipe-evaluation) | 17898 | 931 |
-| `I18.18` | [I18.18. Code-intelligence admission suite](I18-18-code-intelligence-admission-suite.md#i1818-code-intelligence-admission-suite) | 17923 | 3073 |
-| `I18.19` | [I18.19. Specialized instrument profiles](I18-19-specialized-instrument-profiles.md#i1819-specialized-instrument-profiles) | 17994 | 512 |
-| `I18.20` | [I18.20. Test-strength escalation](I18-20-test-strength-escalation.md#i1820-test-strength-escalation) | 18014 | 1949 |
-| `I18.21` | [I18.21. Local and CI parity](I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity) | 18056 | 564 |
-| `I18.22` | [I18.22. Flake, hang and recurrence handling](I18-22-flake-hang-and-recurrence-handling.md#i1822-flake-hang-and-recurrence-handling) | 18071 | 535 |
-| `I18.23` | [I18.23. Agent development test protocol](I18-23-agent-development-test-protocol.md#i1823-agent-development-test-protocol) | 18089 | 1074 |
-| `I18.24` | [I18.24. Failure, partial coverage and unknown](I18-24-failure-partial-coverage-and-unknown.md#i1824-failure-partial-coverage-and-unknown) | 18115 | 716 |
-| `I18.25` | [I18.25. Evolution of the testing system](I18-25-evolution-of-the-testing-system.md#i1825-evolution-of-the-testing-system) | 18130 | 546 |
-| `I18.26` | [I18.26. Parallel build and test execution for agent swarms](I18-26-parallel-build-and-test-execution-for-agent-swarms.md#i1826-parallel-build-and-test-execution-for-agent-swarms) | 18146 | 2639 |
-| `I18.27` | [I18.27. Oracle ownership and test-change governance](I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance) | 18210 | 826 |
-| `I18.28` | [I18.28. Test-selection validation and sentinel lanes](I18-28-test-selection-validation-and-sentinel-lanes.md#i1828-test-selection-validation-and-sentinel-lanes) | 18226 | 1738 |
-| `I18.31` | [I18.31. Verification-system self-change bootstrap](I18-31-verification-system-self-change-bootstrap.md#i1831-verification-system-self-change-bootstrap) | 18272 | 2584 |
-| `I18.32` | [I18.32. Stateful test environments](I18-32-stateful-test-environments.md#i1832-stateful-test-environments) | 18329 | 1445 |
-| `I18.33` | [I18.33. Crate fleet build and verification economics](I18-33-crate-fleet-build-and-verification-economics.md#i1833-crate-fleet-build-and-verification-economics) | 18363 | 5028 |
-| `I18.38` | [I18.38. Agent-context and crate-size falsification suite](I18-38-agent-context-and-crate-size-falsification-suite.md#i1838-agent-context-and-crate-size-falsification-suite) | 18434 | 2092 |
-| `I18.39` | [I18.39. OTP-style supervision and hot-replacement fault suite](I18-39-otp-style-supervision-and-hot-replacement-fault-suite.md#i1839-otp-style-supervision-and-hot-replacement-fault-suite) | 18478 | 1739 |
-| `I18.40` | [I18.40. Crate-topology self-improvement tests](I18-40-crate-topology-self-improvement-tests.md#i1840-crate-topology-self-improvement-tests) | 18543 | 1047 |
-| `I18.41` | [I18.41. Deterministic simulation and replay](I18-41-deterministic-simulation-and-replay.md#i1841-deterministic-simulation-and-replay) | 18574 | 1751 |
-| `I18.42` | [I18.42. Component conformance and promotion tests](I18-42-component-conformance-and-promotion-tests.md#i1842-component-conformance-and-promotion-tests) | 18634 | 761 |
-| `I18.43` | [I18.43. Agent behavior evaluation](I18-43-agent-behavior-evaluation.md#i1843-agent-behavior-evaluation) | 18656 | 3736 |
-| `I18.44` | [I18.44. Build sandbox, supply-chain and cache tests](I18-44-build-sandbox-supply-chain-and-cache-tests.md#i1844-build-sandbox-supply-chain-and-cache-tests) | 18726 | 659 |
-| `I18.45` | [I18.45. Failure Capsule and wait-for diagnostics tests](I18-45-failure-capsule-and-wait-for-diagnostics-tests.md#i1845-failure-capsule-and-wait-for-diagnostics-tests) | 18743 | 642 |
-| `I18.46` | [I18.46. Retry, load, soak and overload proof](I18-46-retry-load-soak-and-overload-proof.md#i1846-retry-load-soak-and-overload-proof) | 18759 | 1022 |
-| `I18.47` | [I18.47. Evaluator, benchmark, budget and credit-assignment integrity](I18-47-evaluator-benchmark-budget-and-credit-assignment-integrity.md#i1847-evaluator-benchmark-budget-and-credit-assignment-integrity) | 18788 | 8166 |
-| `I18.49` | [I18.49. Active conformance obligations](I18-49-active-conformance-obligations.md#i1849-active-conformance-obligations) | 18909 | 1472 |
-| `I18.51` | [I18.51. External falsification and regression ledger](I18-51-external-falsification-and-regression-ledger.md#i1851-external-falsification-and-regression-ledger) | 18943 | 1466 |
-| `I18.52` | [I18.52. Donor-specific fault corpora](I18-52-donor-specific-fault-corpora.md#i1852-donor-specific-fault-corpora) | 18964 | 1085 |
-| `I18.53` | [I18.53. Activity, cold-start, feedback, maintenance and descendant closure suite](I18-53-activity-cold-start-feedback-maintenance-and-descendant-closure-suite.md#i1853-activity-cold-start-feedback-maintenance-and-descendant-closure-suite) | 18979 | 3471 |
-| `I19` | [I19. Migration from current implementation and documents](I19-migration-from-current-implementation-and-documents.md#i19-migration-from-current-implementation-and-documents) | 19022 | 60 |
-| `I19.1` | [I19.1. Migration doctrine](I19-01-migration-doctrine.md#i191-migration-doctrine) | 19024 | 413 |
-| `I19.2` | [I19.2. Current forensic baseline and refresh rule](I19-02-current-forensic-baseline-and-refresh-rule.md#i192-current-forensic-baseline-and-refresh-rule) | 19038 | 1651 |
-| `I19.3` | [I19.3. Component disposition](I19-03-component-disposition.md#i193-component-disposition) | 19077 | 1189 |
-| `I19.4` | [I19.4. Documentation transition](I19-04-documentation-transition.md#i194-documentation-transition) | 19101 | 389 |
-| `I19.5` | [I19.5. Recovery and runtime transition order](I19-05-recovery-and-runtime-transition-order.md#i195-recovery-and-runtime-transition-order) | 19114 | 1484 |
-| `I19.6` | [I19.6. Data migration](I19-06-data-migration.md#i196-data-migration) | 19160 | 539 |
-| `I19.7` | [I19.7. Session/task migration](I19-07-sessiontask-migration.md#i197-sessiontask-migration) | 19176 | 302 |
-| `I19.8` | [I19.8. Hook/plugin migration](I19-08-hookplugin-migration.md#i198-hookplugin-migration) | 19192 | 1342 |
-| `I19.9` | [I19.9. Test migration](I19-09-test-migration.md#i199-test-migration) | 19222 | 337 |
-| `I19.10` | [I19.10. Cutover criteria](I19-10-cutover-criteria.md#i1910-cutover-criteria) | 19236 | 308 |
-| `I19.11` | [I19.11. Rollback](I19-11-rollback.md#i1911-rollback) | 19249 | 201 |
-| `I19.12` | [I19.12. Migration completion](I19-12-migration-completion.md#i1912-migration-completion) | 19253 | 238 |
-| `I19.13` | [I19.13. Donor contract extraction](I19-13-donor-contract-extraction.md#i1913-donor-contract-extraction) | 19269 | 2138 |
-| `I19.14` | [I19.14. Old-object compatibility map](I19-14-old-object-compatibility-map.md#i1914-old-object-compatibility-map) | 19317 | 1828 |
-| `I19.15` | [I19.15. Documentation authority cutover and deletion gate](I19-15-documentation-authority-cutover-and-deletion-gate.md#i1915-documentation-authority-cutover-and-deletion-gate) | 19361 | 2301 |
-| `I19.16` | [I19.16. Object-level migration disposition and authority cutover](I19-16-object-level-migration-disposition-and-authority-cutover.md#i1916-object-level-migration-disposition-and-authority-cutover) | 19403 | 944 |
-| `I20` | [I20. Future replacement points](I20-future-replacement-points.md#i20-future-replacement-points) | 19421 | 34 |
-| `I20.1` | [I20.1. Replacement principle](I20-01-replacement-principle.md#i201-replacement-principle) | 19423 | 354 |
-| `I20.2` | [I20.2. Replacement matrix](I20-02-replacement-matrix.md#i202-replacement-matrix) | 19438 | 1480 |
-| `I20.3` | [I20.3. Linux adaptation](I20-03-linux-adaptation.md#i203-linux-adaptation) | 19456 | 282 |
-| `I20.4` | [I20.4. Multi-node/distributed future](I20-04-multi-nodedistributed-future.md#i204-multi-nodedistributed-future) | 19471 | 331 |
-| `I20.5` | [I20.5. Researcher providers and external federation](I20-05-researcher-providers-and-external-federation.md#i205-researcher-providers-and-external-federation) | 19482 | 2187 |
-| `I20.6` | [I20.6. WASM module tier](I20-06-wasm-module-tier.md#i206-wasm-module-tier) | 19507 | 860 |
-| `I20.7` | [I20.7. Cloud execution](I20-07-cloud-execution.md#i207-cloud-execution) | 19535 | 175 |
-| `I20.8` | [I20.8. Distinct adaptation contracts](I20-08-distinct-adaptation-contracts.md#i208-distinct-adaptation-contracts) | 19539 | 2673 |
-| `I20.9` | [I20.9. Architecture evolution trigger](I20-09-architecture-evolution-trigger.md#i209-architecture-evolution-trigger) | 19578 | 479 |
-| `I20.10` | [I20.10. Deferred donor experiments](I20-10-deferred-donor-experiments.md#i2010-deferred-donor-experiments) | 19594 | 2967 |
-| `I20.11` | [I20.11. Final implementation formula](I20-11-final-implementation-formula.md#i2011-final-implementation-formula) | 19647 | 971 |
-| `I21` | [I21. Researcher plane, inquiry discipline and evidence grade](I21-researcher-plane-inquiry-discipline-and-evidence-grade.md#i21-researcher-plane-inquiry-discipline-and-evidence-grade) | 19663 | 64 |
-| `I21.1` | [I21.1. Researcher is a plane, not a future module](I21-01-researcher-is-a-plane-not-a-future-module.md#i211-researcher-is-a-plane-not-a-future-module) | 19665 | 2426 |
-| `I21.2` | [I21.2. Evidence grade](I21-02-evidence-grade.md#i212-evidence-grade) | 19696 | 2257 |
-| `I21.3` | [I21.3. Inquiry protocol selection](I21-03-inquiry-protocol-selection.md#i213-inquiry-protocol-selection) | 19731 | 1664 |
-| `I21.4` | [I21.4. Confirmatory and exploratory lanes](I21-04-confirmatory-and-exploratory-lanes.md#i214-confirmatory-and-exploratory-lanes) | 19758 | 1686 |
-| `I21.5` | [I21.5. Inquiry obligations and acceptance certificates](I21-05-inquiry-obligations-and-acceptance-certificates.md#i215-inquiry-obligations-and-acceptance-certificates) | 19779 | 1743 |
-| `I21.6` | [I21.6. Source portfolio, coverage denominator and CoverageReceipt](I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md#i216-source-portfolio-coverage-denominator-and-coveragereceipt) | 19807 | 1423 |
-| `I21.7` | [I21.7. Reference firewall and unsupported precision](I21-07-reference-firewall-and-unsupported-precision.md#i217-reference-firewall-and-unsupported-precision) | 19840 | 1943 |
-| `I21.8` | [I21.8. Evidence freeze, synthesis and claim audit](I21-08-evidence-freeze-synthesis-and-claim-audit.md#i218-evidence-freeze-synthesis-and-claim-audit) | 19873 | 1836 |
-| `I21.9` | [I21.9. Inquiry dispositions and reopen](I21-09-inquiry-dispositions-and-reopen.md#i219-inquiry-dispositions-and-reopen) | 19910 | 733 |
-| `I21.10` | [I21.10. Local search provider](I21-10-local-search-provider.md#i2110-local-search-provider) | 19928 | 1307 |
-| `I21.11` | [I21.11. Research federation provider](I21-11-research-federation-provider.md#i2111-research-federation-provider) | 19944 | 4649 |
-| `I21.12` | [I21.12. Research debts](I21-12-research-debts.md#i2112-research-debts) | 20003 | 992 |
-| `I21.13` | [I21.13. Failure, degradation and honest closure](I21-13-failure-degradation-and-honest-closure.md#i2113-failure-degradation-and-honest-closure) | 20020 | 880 |
-| `APPENDIX-A` | [Appendix A. ModuleGeneration lifecycle projection](APPENDIX-A-modulegeneration-lifecycle-projection.md#appendix-a-modulegeneration-lifecycle-projection) | 20034 | 1526 |
-| `APPENDIX-B` | [Appendix B. Core EBP service profiles](APPENDIX-B-core-ebp-service-profiles.md#appendix-b-core-ebp-service-profiles) | 20064 | 1368 |
-| `APPENDIX-C` | [Appendix C. Default runtime configuration](APPENDIX-C-default-runtime-configuration.md#appendix-c-default-runtime-configuration) | 20084 | 1381 |
-| `APPENDIX-D` | [Appendix D. Reason codes and directive dispositions](APPENDIX-D-reason-codes-and-directive-dispositions.md#appendix-d-reason-codes-and-directive-dispositions) | 20104 | 1069 |
-| `APPENDIX-E` | [Appendix E. First convergence backlog](APPENDIX-E-first-convergence-backlog.md#appendix-e-first-convergence-backlog) | 20123 | 588 |
-| `APPENDIX-G` | [Appendix G. Research Gate families](APPENDIX-G-research-gate-families.md#appendix-g-research-gate-families) | 20140 | 2365 |
-| `APPENDIX-H` | [Appendix H. Full Architecture conformance map](APPENDIX-H-full-architecture-conformance-map.md#appendix-h-full-architecture-conformance-map) | 20177 | 8378 |
-| `APPENDIX-I` | [Appendix I. Dependency selection and containment](APPENDIX-I-dependency-selection-and-containment.md#appendix-i-dependency-selection-and-containment) | 20251 | 4667 |
-| `APPENDIX-J` | [Appendix J. Developer commands](APPENDIX-J-developer-commands.md#appendix-j-developer-commands) | 20306 | 1176 |
-| `APPENDIX-K` | [Appendix K. Legacy and target contract inventory pointer](APPENDIX-K-legacy-and-target-contract-inventory-pointer.md#appendix-k-legacy-and-target-contract-inventory-pointer) | 20325 | 1279 |
-| `APPENDIX-L` | [Appendix L. Donor retirement evidence pointer](APPENDIX-L-donor-retirement-evidence-pointer.md#appendix-l-donor-retirement-evidence-pointer) | 20348 | 647 |
-| `APPENDIX-M` | [Appendix M. Legacy compatibility evidence pointer](APPENDIX-M-legacy-compatibility-evidence-pointer.md#appendix-m-legacy-compatibility-evidence-pointer) | 20354 | 349 |
-| `APPENDIX-N` | [Appendix N. First SurrealDB physical schema profile](APPENDIX-N-first-surrealdb-physical-schema-profile.md#appendix-n-first-surrealdb-physical-schema-profile) | 20358 | 1675 |
-| `APPENDIX-O` | [Appendix O. Initial empirical profiles and candidate defaults](APPENDIX-O-initial-empirical-profiles-and-candidate-defaults.md#appendix-o-initial-empirical-profiles-and-candidate-defaults) | 20381 | 11903 |
-| `APPENDIX-P` | [Appendix P. Rust public boundary interfaces](APPENDIX-P-rust-public-boundary-interfaces.md#appendix-p-rust-public-boundary-interfaces) | 20611 | 1612 |
+| `I7.5` | [I7.5. Named pipes](I07-05-named-pipes.md#i75-named-pipes) | 7148 | 2029 |
+| `I7.6` | [I7.6. MCP surface](I07-06-mcp-surface.md#i76-mcp-surface) | 7180 | 3338 |
+| `I7.7` | [I7.7. MCP versions and stateless core](I07-07-mcp-versions-and-stateless-core.md#i77-mcp-versions-and-stateless-core) | 7231 | 1693 |
+| `I7.8` | [I7.8. Agent interaction loop](I07-08-agent-interaction-loop.md#i78-agent-interaction-loop) | 7241 | 735 |
+| `I7.9` | [I7.9. Strict finish input and outcomes](I07-09-strict-finish-input-and-outcomes.md#i79-strict-finish-input-and-outcomes) | 7259 | 2036 |
+| `I7.10` | [I7.10. Reactive delivery](I07-10-reactive-delivery.md#i710-reactive-delivery) | 7318 | 2460 |
+| `I7.11` | [I7.11. Context payload profiles and Decision Safety Floor](I07-11-context-payload-profiles-and-decision-safety-floor.md#i711-context-payload-profiles-and-decision-safety-floor) | 7356 | 2213 |
+| `I7.12` | [I7.12. Short Skills](I07-12-short-skills.md#i712-short-skills) | 7391 | 2947 |
+| `I7.13` | [I7.13. Skill validation and promotion](I07-13-skill-validation-and-promotion.md#i713-skill-validation-and-promotion) | 7458 | 1157 |
+| `I7.14` | [I7.14. Session lifecycle](I07-14-session-lifecycle.md#i714-session-lifecycle) | 7491 | 611 |
+| `I7.15` | [I7.15. Route Continuation and transfer](I07-15-route-continuation-and-transfer.md#i715-route-continuation-and-transfer) | 7509 | 2567 |
+| `I7.16` | [I7.16. Host integration coverage and Governance Profile](I07-16-host-integration-coverage-and-governance-profile.md#i716-host-integration-coverage-and-governance-profile) | 7564 | 1691 |
+| `I7.17` | [I7.17. Convenience surfaces](I07-17-convenience-surfaces.md#i717-convenience-surfaces) | 7596 | 2711 |
+| `I7.18` | [I7.18. Read/resources surface](I07-18-readresources-surface.md#i718-readresources-surface) | 7659 | 499 |
+| `I7.19` | [I7.19. Reactive context sequence](I07-19-reactive-context-sequence.md#i719-reactive-context-sequence) | 7678 | 448 |
+| `I7.20` | [I7.20. Agent-facing error contract](I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract) | 7694 | 5499 |
+| `I7.21` | [I7.21. Default agent role capability profiles](I07-21-default-agent-role-capability-profiles.md#i721-default-agent-role-capability-profiles) | 7762 | 4840 |
+| `I7.22` | [I7.22. Host runtime identity, discovery and conformance](I07-22-host-runtime-identity-discovery-and-conformance.md#i722-host-runtime-identity-discovery-and-conformance) | 7788 | 1459 |
+| `I7.23` | [I7.23. Raw and normalized host events](I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events) | 7820 | 3176 |
+| `I7.24` | [I7.24. Tool surface economy and cognitive exposure](I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure) | 7871 | 5786 |
+| `I7.25` | [I7.25. Skill lifecycle, interaction and execution evidence](I07-25-skill-lifecycle-interaction-and-execution-evidence.md#i725-skill-lifecycle-interaction-and-execution-evidence) | 7971 | 2538 |
+| `I7.26` | [I7.26. Reversible payload budget and omission handles](I07-26-reversible-payload-budget-and-omission-handles.md#i726-reversible-payload-budget-and-omission-handles) | 8014 | 2160 |
+| `I7.27` | [I7.27. Evidence execution, parsing, evaluation and independence](I07-27-evidence-execution-parsing-evaluation-and-independence.md#i727-evidence-execution-parsing-evaluation-and-independence) | 8067 | 1973 |
+| `I7.28` | [I7.28. Agent, Human and route feedback contract](I07-28-agent-human-and-route-feedback-contract.md#i728-agent-human-and-route-feedback-contract) | 8092 | 4666 |
+| `I7.29` | [I7.29. PortableSkillPackage](I07-29-portableskillpackage.md#i729-portableskillpackage) | 8157 | 4111 |
+| `I8` | [I8. Watchdog implementation contract](I08-watchdog-implementation-contract.md#i8-watchdog-implementation-contract) | 8214 | 40 |
+| `I8.1` | [I8.1. Process and authority](I08-01-process-and-authority.md#i81-process-and-authority) | 8216 | 1909 |
+| `I8.2` | [I8.2. Independent observation routes](I08-02-independent-observation-routes.md#i82-independent-observation-routes) | 8246 | 1531 |
+| `I8.3` | [I8.3. Deterministic supervision loop](I08-03-deterministic-supervision-loop.md#i83-deterministic-supervision-loop) | 8280 | 1507 |
+| `I8.4` | [I8.4. Interaction heartbeat](I08-04-interaction-heartbeat.md#i84-interaction-heartbeat) | 8299 | 1391 |
+| `I8.5` | [I8.5. Hook/plugin health](I08-05-hookplugin-health.md#i85-hookplugin-health) | 8344 | 844 |
+| `I8.6` | [I8.6. Bypass detection](I08-06-bypass-detection.md#i86-bypass-detection) | 8376 | 922 |
+| `I8.7` | [I8.7. Security Source Assurance](I08-07-security-source-assurance.md#i87-security-source-assurance) | 8393 | 700 |
+| `I8.8` | [I8.8. Prompt/tool/memory injection signals](I08-08-prompttoolmemory-injection-signals.md#i88-prompttoolmemory-injection-signals) | 8415 | 955 |
+| `I8.9` | [I8.9. Signals](I08-09-signals.md#i89-signals) | 8442 | 374 |
+| `I8.9.1` | [I8.9.1. Risk accumulation, model escalation and flexible response](I08-09-01-risk-accumulation-model-escalation-and-flexible-response.md#i891-risk-accumulation-model-escalation-and-flexible-response) | 8463 | 2620 |
+| `I8.10` | [I8.10. Containment](I08-10-containment.md#i810-containment) | 8511 | 1228 |
+| `I8.11` | [I8.11. Watchdog Agents](I08-11-watchdog-agents.md#i811-watchdog-agents) | 8529 | 1095 |
+| `I8.12` | [I8.12. Restart budgets](I08-12-restart-budgets.md#i812-restart-budgets) | 8563 | 424 |
+| `I8.13` | [I8.13. Watchdog failure](I08-13-watchdog-failure.md#i813-watchdog-failure) | 8582 | 957 |
+| `I8.14` | [I8.14. Watchdog observables](I08-14-watchdog-observables.md#i814-watchdog-observables) | 8598 | 398 |
+| `I8.15` | [I8.15. Watchdog generation replacement](I08-15-watchdog-generation-replacement.md#i815-watchdog-generation-replacement) | 8615 | 1130 |
+| `I8.16` | [I8.16. Development drift supervision](I08-16-development-drift-supervision.md#i816-development-drift-supervision) | 8633 | 1338 |
+| `I8.17` | [I8.17. Ingress taint before transformation](I08-17-ingress-taint-before-transformation.md#i817-ingress-taint-before-transformation) | 8654 | 812 |
+| `I8.18` | [I8.18. System feedback, memory/context health and maintenance debt](I08-18-system-feedback-memorycontext-health-and-maintenance-debt.md#i818-system-feedback-memorycontext-health-and-maintenance-debt) | 8669 | 1309 |
+| `I9` | [I9. Dreamer implementation contract](I09-dreamer-implementation-contract.md#i9-dreamer-implementation-contract) | 8694 | 39 |
+| `I9.1` | [I9.1. Process model](I09-01-process-model.md#i91-process-model) | 8696 | 958 |
+| `I9.2` | [I9.2. Dreamer service responsibilities](I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities) | 8713 | 612 |
+| `I9.3` | [I9.3. Job classes](I09-03-job-classes.md#i93-job-classes) | 8732 | 5178 |
+| `I9.4` | [I9.4. Dreamer input bundle](I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle) | 8878 | 4114 |
+| `I9.5` | [I9.5. Dream Packet](I09-05-dream-packet.md#i95-dream-packet) | 8981 | 554 |
+| `I9.6` | [I9.6. Curation candidate](I09-06-curation-candidate.md#i96-curation-candidate) | 9004 | 414 |
+| `I9.7` | [I9.7. Memory transformation validation](I09-07-memory-transformation-validation.md#i97-memory-transformation-validation) | 9023 | 555 |
+| `I9.8` | [I9.8. Background policy](I09-08-background-policy.md#i98-background-policy) | 9039 | 2476 |
+| `I9.9` | [I9.9. Agent/swarm launch and no-lost-child contract](I09-09-agentswarm-launch-and-no-lost-child-contract.md#i99-agentswarm-launch-and-no-lost-child-contract) | 9076 | 5350 |
+| `I9.10` | [I9.10. Model routing](I09-10-model-routing.md#i910-model-routing) | 9135 | 370 |
+| `I9.11` | [I9.11. Clarification routing](I09-11-clarification-routing.md#i911-clarification-routing) | 9152 | 395 |
+| `I9.12` | [I9.12. Human interaction](I09-12-human-interaction.md#i912-human-interaction) | 9168 | 932 |
+| `I9.13` | [I9.13. Remote Dreamer gateway](I09-13-remote-dreamer-gateway.md#i913-remote-dreamer-gateway) | 9186 | 3108 |
+| `I9.14` | [I9.14. Researcher boundary](I09-14-researcher-boundary.md#i914-researcher-boundary) | 9220 | 552 |
+| `I9.15` | [I9.15. Dreamer failure](I09-15-dreamer-failure.md#i915-dreamer-failure) | 9234 | 781 |
+| `I9.16` | [I9.16. Dreamer quality and job economics](I09-16-dreamer-quality-and-job-economics.md#i916-dreamer-quality-and-job-economics) | 9247 | 1040 |
+| `I9.17` | [I9.17. Dreamer as ELIOT maintenance agent](I09-17-dreamer-as-eliot-maintenance-agent.md#i917-dreamer-as-eliot-maintenance-agent) | 9267 | 1128 |
+| `I10` | [I10. Agent and tool integrations](I10-agent-and-tool-integrations.md#i10-agent-and-tool-integrations) | 9284 | 36 |
+| `I10.1` | [I10.1. Bridge doctrine](I10-01-bridge-doctrine.md#i101-bridge-doctrine) | 9286 | 380 |
+| `I10.2` | [I10.2. Bridge acceptance checklist](I10-02-bridge-acceptance-checklist.md#i102-bridge-acceptance-checklist) | 9300 | 544 |
+| `I10.3` | [I10.3. Bridge types](I10-03-bridge-types.md#i103-bridge-types) | 9320 | 1767 |
+| `I10.4` | [I10.4. Codex App Server profile](I10-04-codex-app-server-profile.md#i104-codex-app-server-profile) | 9361 | 2219 |
+| `I10.5` | [I10.5. Claude routes](I10-05-claude-routes.md#i105-claude-routes) | 9393 | 1003 |
+| `I10.6` | [I10.6. OpenCode HTTP/SSE profile](I10-06-opencode-httpsse-profile.md#i106-opencode-httpsse-profile) | 9417 | 900 |
+| `I10.7` | [I10.7. ACP, Antigravity and generic profiles](I10-07-acp-antigravity-and-generic-profiles.md#i107-acp-antigravity-and-generic-profiles) | 9434 | 2136 |
+| `I10.8` | [I10.8. Instrument Plane, canonical verification and code intelligence](I10-08-instrument-plane-canonical-verification-and-code-intelligence.md#i108-instrument-plane-canonical-verification-and-code-intelligence) | 9485 | 74 |
+| `I10.8.1` | [I10.8.1. Purpose and ownership](I10-08-01-purpose-and-ownership.md#i1081-purpose-and-ownership) | 9487 | 1687 |
+| `I10.8.2` | [I10.8.2. IP0 — one Windows ProcessExecutor](I10-08-02-ip0-one-windows-processexecutor.md#i1082-ip0--one-windows-processexecutor) | 9519 | 3853 |
+| `I10.8.3` | [I10.8.3. IP1 — typed, extensible instrument contracts](I10-08-03-ip1-typed-extensible-instrument-contracts.md#i1083-ip1--typed-extensible-instrument-contracts) | 9569 | 2675 |
+| `I10.8.4` | [I10.8.4. IP2 — InstrumentRunner](I10-08-04-ip2-instrumentrunner.md#i1084-ip2--instrumentrunner) | 9635 | 2333 |
+| `I10.8.5` | [I10.8.5. IP3 — streaming evidence and normalization](I10-08-05-ip3-streaming-evidence-and-normalization.md#i1085-ip3--streaming-evidence-and-normalization) | 9689 | 1401 |
+| `I10.8.6` | [I10.8.6. Negative-result contract](I10-08-06-negative-result-contract.md#i1086-negative-result-contract) | 9728 | 670 |
+| `I10.8.7` | [I10.8.7. IP4 — instrument profiles](I10-08-07-ip4-instrument-profiles.md#i1087-ip4--instrument-profiles) | 9751 | 1903 |
+| `I10.8.8` | [I10.8.8. IP5 — Rust understanding stack](I10-08-08-ip5-rust-understanding-stack.md#i1088-ip5--rust-understanding-stack) | 9790 | 1635 |
+| `I10.8.9` | [I10.8.9. Agent-facing projection](I10-08-09-agent-facing-projection.md#i1089-agent-facing-projection) | 9825 | 1217 |
+| `I10.8.10` | [I10.8.10. Migration from overlapping verification paths](I10-08-10-migration-from-overlapping-verification-paths.md#i10810-migration-from-overlapping-verification-paths) | 9840 | 1205 |
+| `I10.8.11` | [I10.8.11. Instrument failure and replacement](I10-08-11-instrument-failure-and-replacement.md#i10811-instrument-failure-and-replacement) | 9863 | 864 |
+| `I10.8.12` | [I10.8.12. Source ownership and first crate extraction wave](I10-08-12-source-ownership-and-first-crate-extraction-wave.md#i10812-source-ownership-and-first-crate-extraction-wave) | 9891 | 2745 |
+| `I10.8.13` | [I10.8.13. Durable Instrument job lifecycle](I10-08-13-durable-instrument-job-lifecycle.md#i10813-durable-instrument-job-lifecycle) | 9965 | 1399 |
+| `I10.8.14` | [I10.8.14. Build artifact and evidence reuse](I10-08-14-build-artifact-and-evidence-reuse.md#i10814-build-artifact-and-evidence-reuse) | 10017 | 966 |
+| `I10.8.15` | [I10.8.15. IP7 — isolated `eliot-testd` execution plane](I10-08-15-ip7-isolated-eliot-testd-execution-plane.md#i10815-ip7--isolated-eliot-testd-execution-plane) | 10044 | 1723 |
+| `I10.8.16` | [I10.8.16. IP8 — component build and generation promotion service](I10-08-16-ip8-component-build-and-generation-promotion-service.md#i10816-ip8--component-build-and-generation-promotion-service) | 10093 | 1051 |
+| `I10.8.17` | [I10.8.17. Code-intelligence capability planes and query semantics](I10-08-17-code-intelligence-capability-planes-and-query-semantics.md#i10817-code-intelligence-capability-planes-and-query-semantics) | 10116 | 3453 |
+| `I10.8.18` | [I10.8.18. Derived-index reference path, impact directives and source views](I10-08-18-derived-index-reference-path-impact-directives-and-source-views.md#i10818-derived-index-reference-path-impact-directives-and-source-views) | 10221 | 4271 |
+| `I10.8.19` | [I10.8.19. Code-intelligence adapter arbitration and RepoWise pilot](I10-08-19-code-intelligence-adapter-arbitration-and-repowise-pilot.md#i10819-code-intelligence-adapter-arbitration-and-repowise-pilot) | 10334 | 4039 |
+| `I10.9` | [I10.9. Git bridge](I10-09-git-bridge.md#i109-git-bridge) | 10416 | 615 |
+| `I10.10` | [I10.10. LSP and diagnostics](I10-10-lsp-and-diagnostics.md#i1010-lsp-and-diagnostics) | 10431 | 566 |
+| `I10.11` | [I10.11. External model bridges](I10-11-external-model-bridges.md#i1011-external-model-bridges) | 10445 | 11141 |
+| `I10.12` | [I10.12. Cloud and laboratory modules](I10-12-cloud-and-laboratory-modules.md#i1012-cloud-and-laboratory-modules) | 10644 | 334 |
+| `I10.13` | [I10.13. Professional applications](I10-13-professional-applications.md#i1013-professional-applications) | 10658 | 313 |
+| `I10.14` | [I10.14. Bridge updates](I10-14-bridge-updates.md#i1014-bridge-updates) | 10674 | 323 |
+| `I10.15` | [I10.15. Agent Execution Fabric and durable swarm](I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm) | 10689 | 25823 |
+| `I10.16` | [I10.16. Governed integration of candidate implementations](I10-16-governed-integration-of-candidate-implementations.md#i1016-governed-integration-of-candidate-implementations) | 11091 | 2095 |
+| `I10.17` | [I10.17. Adapter subsystem](I10-17-adapter-subsystem.md#i1017-adapter-subsystem) | 11129 | 4719 |
+| `I10.18` | [I10.18. Mailbox, blackboard, live peer delivery and anchored review](I10-18-mailbox-blackboard-live-peer-delivery-and-anchored-review.md#i1018-mailbox-blackboard-live-peer-delivery-and-anchored-review) | 11223 | 5734 |
+| `I10.19` | [I10.19. Provider memory feeds](I10-19-provider-memory-feeds.md#i1019-provider-memory-feeds) | 11372 | 445 |
+| `I10.20` | [I10.20. Professional workflow bridges](I10-20-professional-workflow-bridges.md#i1020-professional-workflow-bridges) | 11387 | 1213 |
+| `I10.21` | [I10.21. ChangeMonitor and evolving anchors](I10-21-changemonitor-and-evolving-anchors.md#i1021-changemonitor-and-evolving-anchors) | 11406 | 2581 |
+| `I10.22` | [I10.22. Professional execution safeguards and abandonment](I10-22-professional-execution-safeguards-and-abandonment.md#i1022-professional-execution-safeguards-and-abandonment) | 11459 | 1066 |
+| `I10.23` | [I10.23. MessagingBridge](I10-23-messagingbridge.md#i1023-messagingbridge) | 11475 | 4570 |
+| `I11` | [I11. Human control plane and notifications](I11-human-control-plane-and-notifications.md#i11-human-control-plane-and-notifications) | 11527 | 46 |
+| `I11.1` | [I11.1. First UI](I11-01-first-ui.md#i111-first-ui) | 11529 | 1875 |
+| `I11.2` | [I11.2. ControlBoardView](I11-02-controlboardview.md#i112-controlboardview) | 11550 | 1500 |
+| `I11.3` | [I11.3. Human actions and role authority](I11-03-human-actions-and-role-authority.md#i113-human-actions-and-role-authority) | 11578 | 1437 |
+| `I11.4` | [I11.4. Dreamer/Watchdog conversation and operator intent](I11-04-dreamerwatchdog-conversation-and-operator-intent.md#i114-dreamerwatchdog-conversation-and-operator-intent) | 11594 | 1799 |
+| `I11.5` | [I11.5. Persistent notifications](I11-05-persistent-notifications.md#i115-persistent-notifications) | 11625 | 655 |
+| `I11.6` | [I11.6. Windows notifications](I11-06-windows-notifications.md#i116-windows-notifications) | 11657 | 1259 |
+| `I11.7` | [I11.7. Notification behavior](I11-07-notification-behavior.md#i117-notification-behavior) | 11677 | 949 |
+| `I11.8` | [I11.8. Authentication](I11-08-authentication.md#i118-authentication) | 11701 | 913 |
+| `I11.9` | [I11.9. Accessibility and ordinary-user design](I11-09-accessibility-and-ordinary-user-design.md#i119-accessibility-and-ordinary-user-design) | 11707 | 357 |
+| `I11.10` | [I11.10. Human attention, approval and telemetry evaluation](I11-10-human-attention-approval-and-telemetry-evaluation.md#i1110-human-attention-approval-and-telemetry-evaluation) | 11719 | 2125 |
+| `I11.11` | [I11.11. Project launcher, environment manager and ordinary-user workflow](I11-11-project-launcher-environment-manager-and-ordinary-user-workflow.md#i1111-project-launcher-environment-manager-and-ordinary-user-workflow) | 11758 | 2773 |
+| `I11.12` | [I11.12. UserAutomation](I11-12-userautomation.md#i1112-userautomation) | 11803 | 5110 |
+| `I12` | [I12. Understanding, memory classification, curation and retrieval](I12-understanding-memory-classification-curation-and-retrieval.md#i12-understanding-memory-classification-curation-and-retrieval) | 11865 | 69 |
+| `I12.1` | [I12.1. State model](I12-01-state-model.md#i121-state-model) | 11867 | 533 |
+| `I12.2` | [I12.2. Capture path](I12-02-capture-path.md#i122-capture-path) | 11883 | 743 |
+| `I12.3` | [I12.3. Classification pipeline](I12-03-classification-pipeline.md#i123-classification-pipeline) | 11911 | 765 |
+| `I12.4` | [I12.4. Core record families](I12-04-core-record-families.md#i124-core-record-families) | 11940 | 1420 |
+| `I12.5` | [I12.5. Epistemic status](I12-05-epistemic-status.md#i125-epistemic-status) | 11963 | 1865 |
+| `I12.6` | [I12.6. Cue binding](I12-06-cue-binding.md#i126-cue-binding) | 12001 | 1595 |
+| `I12.7` | [I12.7. Cue Index](I12-07-cue-index.md#i127-cue-index) | 12035 | 698 |
+| `I12.8` | [I12.8. Exact-first orientation](I12-08-exact-first-orientation.md#i128-exact-first-orientation) | 12059 | 291 |
+| `I12.9` | [I12.9. Graph layer](I12-09-graph-layer.md#i129-graph-layer) | 12072 | 403 |
+| `I12.10` | [I12.10. CodeCortex implementation](I12-10-codecortex-implementation.md#i1210-codecortex-implementation) | 12098 | 3486 |
+| `I12.11` | [I12.11. Concept Pyramid](I12-11-concept-pyramid.md#i1211-concept-pyramid) | 12189 | 536 |
+| `I12.12` | [I12.12. Current Epistemic Position Resolver](I12-12-current-epistemic-position-resolver.md#i1212-current-epistemic-position-resolver) | 12205 | 1052 |
+| `I12.13` | [I12.13. Context Compiler](I12-13-context-compiler.md#i1213-context-compiler) | 12236 | 7524 |
+| `I12.14` | [I12.14. Hot path](I12-14-hot-path.md#i1214-hot-path) | 12400 | 1911 |
+| `I12.15` | [I12.15. Bounded spreading activation](I12-15-bounded-spreading-activation.md#i1215-bounded-spreading-activation) | 12459 | 395 |
+| `I12.16` | [I12.16. Context consistency](I12-16-context-consistency.md#i1216-context-consistency) | 12474 | 460 |
+| `I12.17` | [I12.17. Compaction and resume](I12-17-compaction-and-resume.md#i1217-compaction-and-resume) | 12489 | 569 |
+| `I12.18` | [I12.18. Prediction and calibration](I12-18-prediction-and-calibration.md#i1218-prediction-and-calibration) | 12517 | 1464 |
+| `I12.19` | [I12.19. Negative memory](I12-19-negative-memory.md#i1219-negative-memory) | 12560 | 439 |
+| `I12.20` | [I12.20. Influence revocation](I12-20-influence-revocation.md#i1220-influence-revocation) | 12580 | 984 |
+| `I12.21` | [I12.21. Memory ecology, residual experience and transfer](I12-21-memory-ecology-residual-experience-and-transfer.md#i1221-memory-ecology-residual-experience-and-transfer) | 12598 | 7538 |
+| `I12.22` | [I12.22. Theory Portfolio and practical weighting](I12-22-theory-portfolio-and-practical-weighting.md#i1222-theory-portfolio-and-practical-weighting) | 12742 | 1349 |
+| `I12.23` | [I12.23. Architecture and Implementation Knowledge pipeline](I12-23-architecture-and-implementation-knowledge-pipeline.md#i1223-architecture-and-implementation-knowledge-pipeline) | 12784 | 3316 |
+| `I12.24` | [I12.24. Meta-learning and improvement delivery](I12-24-meta-learning-and-improvement-delivery.md#i1224-meta-learning-and-improvement-delivery) | 12859 | 21832 |
+| `I12.25` | [I12.25. Canonical cognitive record semantics](I12-25-canonical-cognitive-record-semantics.md#i1225-canonical-cognitive-record-semantics) | 13174 | 928 |
+| `I12.26` | [I12.26. Memory admission and retrieval trace](I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace) | 13191 | 4258 |
+| `I12.27` | [I12.27. Metacognitive projections](I12-27-metacognitive-projections.md#i1227-metacognitive-projections) | 13276 | 627 |
+| `I12.28` | [I12.28. Concept and behavioral build artifacts](I12-28-concept-and-behavioral-build-artifacts.md#i1228-concept-and-behavioral-build-artifacts) | 13291 | 2339 |
+| `I12.29` | [I12.29. Calibration aggregation and staleness](I12-29-calibration-aggregation-and-staleness.md#i1229-calibration-aggregation-and-staleness) | 13359 | 603 |
+| `I12.30` | [I12.30. Memory trajectory error registry](I12-30-memory-trajectory-error-registry.md#i1230-memory-trajectory-error-registry) | 13371 | 404 |
+| `I12.31` | [I12.31. Rationale and handoff](I12-31-rationale-and-handoff.md#i1231-rationale-and-handoff) | 13391 | 2239 |
+| `I12.32` | [I12.32. Context Economy Ledger](I12-32-context-economy-ledger.md#i1232-context-economy-ledger) | 13437 | 3483 |
+| `I12.33` | [I12.33. Understanding Evaluation Job](I12-33-understanding-evaluation-job.md#i1233-understanding-evaluation-job) | 13511 | 1257 |
+| `I12.34` | [I12.34. Cognitive proof ladder and ecological field proof](I12-34-cognitive-proof-ladder-and-ecological-field-proof.md#i1234-cognitive-proof-ladder-and-ecological-field-proof) | 13530 | 3146 |
+| `I12.35` | [I12.35. Multimodal, object and workflow continuity](I12-35-multimodal-object-and-workflow-continuity.md#i1235-multimodal-object-and-workflow-continuity) | 13583 | 1438 |
+| `I12.36` | [I12.36. Memory threat handling and Environment Runbooks](I12-36-memory-threat-handling-and-environment-runbooks.md#i1236-memory-threat-handling-and-environment-runbooks) | 13614 | 2124 |
+| `I12.37` | [I12.37. Governed SessionEpisode and typed source ingestion](I12-37-governed-sessionepisode-and-typed-source-ingestion.md#i1237-governed-sessionepisode-and-typed-source-ingestion) | 13651 | 4915 |
+| `I12.38` | [I12.38. Causal influence status](I12-38-causal-influence-status.md#i1238-causal-influence-status) | 13791 | 936 |
+| `I13` | [I13. Conflict and attention contract](I13-conflict-and-attention-contract.md#i13-conflict-and-attention-contract) | 13814 | 40 |
+| `I13.1` | [I13.1. Conflict types](I13-01-conflict-types.md#i131-conflict-types) | 13816 | 436 |
+| `I13.2` | [I13.2. Conflict Set](I13-02-conflict-set.md#i132-conflict-set) | 13829 | 1638 |
+| `I13.3` | [I13.3. Conflict Directive](I13-03-conflict-directive.md#i133-conflict-directive) | 13868 | 489 |
+| `I13.4` | [I13.4. Concilium runtime](I13-04-concilium-runtime.md#i134-concilium-runtime) | 13892 | 985 |
+| `I13.5` | [I13.5. State/revision conflicts](I13-05-staterevision-conflicts.md#i135-staterevision-conflicts) | 13913 | 345 |
+| `I13.6` | [I13.6. Instruction conflict](I13-06-instruction-conflict.md#i136-instruction-conflict) | 13923 | 779 |
+| `I13.7` | [I13.7. Critical Attention](I13-07-critical-attention.md#i137-critical-attention) | 13938 | 452 |
+| `I13.8` | [I13.8. Attention ownership](I13-08-attention-ownership.md#i138-attention-ownership) | 13960 | 417 |
+| `I13.9` | [I13.9. Problem Registry](I13-09-problem-registry.md#i139-problem-registry) | 13975 | 1859 |
+| `I13.10` | [I13.10. Incident promotion](I13-10-incident-promotion.md#i1310-incident-promotion) | 14016 | 457 |
+| `I13.11` | [I13.11. Diagnostic Brief](I13-11-diagnostic-brief.md#i1311-diagnostic-brief) | 14032 | 379 |
+| `I14` | [I14. Queueing, backpressure and degraded behavior](I14-queueing-backpressure-and-degraded-behavior.md#i14-queueing-backpressure-and-degraded-behavior) | 14053 | 53 |
+| `I14.1` | [I14.1. Work classes](I14-01-work-classes.md#i141-work-classes) | 14055 | 218 |
+| `I14.2` | [I14.2. Default queue profiles](I14-02-default-queue-profiles.md#i142-default-queue-profiles) | 14071 | 752 |
+| `I14.3` | [I14.3. Control Reserve](I14-03-control-reserve.md#i143-control-reserve) | 14088 | 1178 |
+| `I14.4` | [I14.4. Backpressure responses](I14-04-backpressure-responses.md#i144-backpressure-responses) | 14120 | 549 |
+| `I14.5` | [I14.5. Recovery Directive](I14-05-recovery-directive.md#i145-recovery-directive) | 14134 | 392 |
+| `I14.6` | [I14.6. Durable work, admission and execution axes](I14-06-durable-work-admission-and-execution-axes.md#i146-durable-work-admission-and-execution-axes) | 14154 | 2769 |
+| `I14.7` | [I14.7. Task outcome mapping](I14-07-task-outcome-mapping.md#i147-task-outcome-mapping) | 14216 | 762 |
+| `I14.8` | [I14.8. Fair and portfolio-aware scheduling](I14-08-fair-and-portfolio-aware-scheduling.md#i148-fair-and-portfolio-aware-scheduling) | 14230 | 782 |
+| `I14.9` | [I14.9. Poison operations](I14-09-poison-operations.md#i149-poison-operations) | 14245 | 712 |
+| `I14.10` | [I14.10. Supervision strategies and restart intensity](I14-10-supervision-strategies-and-restart-intensity.md#i1410-supervision-strategies-and-restart-intensity) | 14260 | 1604 |
+| `I14.11` | [I14.11. Canonical store outage](I14-11-canonical-store-outage.md#i1411-canonical-store-outage) | 14291 | 480 |
+| `I14.12` | [I14.12. Memory pressure](I14-12-memory-pressure.md#i1412-memory-pressure) | 14304 | 340 |
+| `I14.13` | [I14.13. Idle drain and cancellation](I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation) | 14318 | 370 |
+| `I14.14` | [I14.14. Module hot replacement](I14-14-module-hot-replacement.md#i1414-module-hot-replacement) | 14335 | 4405 |
+| `I14.15` | [I14.15. Daemon hot replacement](I14-15-daemon-hot-replacement.md#i1415-daemon-hot-replacement) | 14421 | 1375 |
+| `I14.16` | [I14.16. Kernel and Host update](I14-16-kernel-and-host-update.md#i1416-kernel-and-host-update) | 14439 | 2582 |
+| `I14.17` | [I14.17. User Broker update and reattachment](I14-17-user-broker-update-and-reattachment.md#i1417-user-broker-update-and-reattachment) | 14480 | 897 |
+| `I14.18` | [I14.18. Dynamic library policy](I14-18-dynamic-library-policy.md#i1418-dynamic-library-policy) | 14497 | 386 |
+| `I14.19` | [I14.19. WASM components](I14-19-wasm-components.md#i1419-wasm-components) | 14511 | 5868 |
+| `I14.20` | [I14.20. Canonical runtime lifecycle vocabulary](I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary) | 14637 | 11840 |
+| `I14.21` | [I14.21. Unknown commit recovery](I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery) | 14934 | 370 |
+| `I14.22` | [I14.22. Maintenance jobs](I14-22-maintenance-jobs.md#i1422-maintenance-jobs) | 14945 | 6921 |
+| `I14.23` | [I14.23. Safe shutdown](I14-23-safe-shutdown.md#i1423-safe-shutdown) | 15040 | 849 |
+| `I14.24` | [I14.24. Local failure containment matrix](I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix) | 15057 | 11976 |
+| `I14.25` | [I14.25. Doctor implementation contract](I14-25-doctor-implementation-contract.md#i1425-doctor-implementation-contract) | 15111 | 4258 |
+| `I14.26` | [I14.26. Recovery View contract](I14-26-recovery-view-contract.md#i1426-recovery-view-contract) | 15209 | 1774 |
+| `I14.27` | [I14.27. Capability Blueprint and independent instance lifecycle](I14-27-capability-blueprint-and-independent-instance-lifecycle.md#i1427-capability-blueprint-and-independent-instance-lifecycle) | 15248 | 2660 |
+| `I14.28` | [I14.28. Effect-specific lifecycle and empirical resource profiles](I14-28-effect-specific-lifecycle-and-empirical-resource-profiles.md#i1428-effect-specific-lifecycle-and-empirical-resource-profiles) | 15324 | 2002 |
+| `I14.29` | [I14.29. Stage-local recovery, progress clocks and parkable resources](I14-29-stage-local-recovery-progress-clocks-and-parkable-resources.md#i1429-stage-local-recovery-progress-clocks-and-parkable-resources) | 15372 | 4323 |
+| `I15` | [I15. Security and bypass resistance](I15-security-and-bypass-resistance.md#i15-security-and-bypass-resistance) | 15493 | 39 |
+| `I15.1` | [I15.1. Threat model](I15-01-threat-model.md#i151-threat-model) | 15495 | 481 |
+| `I15.2` | [I15.2. Principal and Session binding](I15-02-principal-and-session-binding.md#i152-principal-and-session-binding) | 15512 | 342 |
+| `I15.3` | [I15.3. Least privilege processes](I15-03-least-privilege-processes.md#i153-least-privilege-processes) | 15529 | 794 |
+| `I15.4` | [I15.4. Secrets](I15-04-secrets.md#i154-secrets) | 15543 | 2299 |
+| `I15.5` | [I15.5. Source assurance](I15-05-source-assurance.md#i155-source-assurance) | 15578 | 356 |
+| `I15.6` | [I15.6. Instruction/data separation](I15-06-instructiondata-separation.md#i156-instructiondata-separation) | 15599 | 359 |
+| `I15.7` | [I15.7. Bounded influence](I15-07-bounded-influence.md#i157-bounded-influence) | 15610 | 1061 |
+| `I15.8` | [I15.8. Direct write protection](I15-08-direct-write-protection.md#i158-direct-write-protection) | 15624 | 349 |
+| `I15.9` | [I15.9. Source admission and executable supply chain](I15-09-source-admission-and-executable-supply-chain.md#i159-source-admission-and-executable-supply-chain) | 15635 | 2670 |
+| `I15.10` | [I15.10. Sandboxing](I15-10-sandboxing.md#i1510-sandboxing) | 15694 | 433 |
+| `I15.11` | [I15.11. Agent worktrees](I15-11-agent-worktrees.md#i1511-agent-worktrees) | 15710 | 328 |
+| `I15.12` | [I15.12. External model data firewall](I15-12-external-model-data-firewall.md#i1512-external-model-data-firewall) | 15724 | 454 |
+| `I15.13` | [I15.13. Remote Dreamer security](I15-13-remote-dreamer-security.md#i1513-remote-dreamer-security) | 15748 | 2830 |
+| `I15.14` | [I15.14. Privacy erasure](I15-14-privacy-erasure.md#i1514-privacy-erasure) | 15774 | 461 |
+| `I15.15` | [I15.15. Break-glass](I15-15-break-glass.md#i1515-break-glass) | 15791 | 335 |
+| `I15.16` | [I15.16. Security testing](I15-16-security-testing.md#i1516-security-testing) | 15807 | 394 |
+| `I15.17` | [I15.17. Agent-generated Rust build threat model](I15-17-agent-generated-rust-build-threat-model.md#i1517-agent-generated-rust-build-threat-model) | 15826 | 1732 |
+| `I15.18` | [I15.18. Disclosure, delegation and facet security](I15-18-disclosure-delegation-and-facet-security.md#i1518-disclosure-delegation-and-facet-security) | 15863 | 2662 |
+| `I15.19` | [I15.19. Authenticated origin and supply-chain evidence](I15-19-authenticated-origin-and-supply-chain-evidence.md#i1519-authenticated-origin-and-supply-chain-evidence) | 15936 | 941 |
+| `I16` | [I16. Observability, metrics and reports](I16-observability-metrics-and-reports.md#i16-observability-metrics-and-reports) | 15955 | 43 |
+| `I16.1` | [I16.1. Four surfaces](I16-01-four-surfaces.md#i161-four-surfaces) | 15957 | 343 |
+| `I16.2` | [I16.2. Rust observability stack](I16-02-rust-observability-stack.md#i162-rust-observability-stack) | 15975 | 449 |
+| `I16.3` | [I16.3. Composite run trace context](I16-03-composite-run-trace-context.md#i163-composite-run-trace-context) | 15989 | 662 |
+| `I16.4` | [I16.4. Required operational events](I16-04-required-operational-events.md#i164-required-operational-events) | 16009 | 833 |
+| `I16.5` | [I16.5. Metrics groups](I16-05-metrics-groups.md#i165-metrics-groups) | 16027 | 3584 |
+| `I16.6` | [I16.6. Performance views](I16-06-performance-views.md#i166-performance-views) | 16142 | 2721 |
+| `I16.7` | [I16.7. Problem-oriented logging and Diagnostic Brief](I16-07-problem-oriented-logging-and-diagnostic-brief.md#i167-problem-oriented-logging-and-diagnostic-brief) | 16215 | 1220 |
+| `I16.8` | [I16.8. Reports](I16-08-reports.md#i168-reports) | 16247 | 491 |
+| `I16.9` | [I16.9. Retention and telemetry cost](I16-09-retention-and-telemetry-cost.md#i169-retention-and-telemetry-cost) | 16268 | 1911 |
+| `I16.10` | [I16.10. Audit integrity](I16-10-audit-integrity.md#i1610-audit-integrity) | 16315 | 206 |
+| `I16.11` | [I16.11. No hidden telemetry failure](I16-11-no-hidden-telemetry-failure.md#i1611-no-hidden-telemetry-failure) | 16319 | 302 |
+| `I16.12` | [I16.12. Trace completeness](I16-12-trace-completeness.md#i1612-trace-completeness) | 16335 | 526 |
+| `I16.13` | [I16.13. Influence tracking](I16-13-influence-tracking.md#i1613-influence-tracking) | 16353 | 766 |
+| `I16.14` | [I16.14. Required report inputs](I16-14-required-report-inputs.md#i1614-required-report-inputs) | 16386 | 308 |
+| `I16.15` | [I16.15. Architecture, Implementation and donor coverage reports](I16-15-architecture-implementation-and-donor-coverage-reports.md#i1615-architecture-implementation-and-donor-coverage-reports) | 16401 | 2945 |
+| `I16.16` | [I16.16. No-progress, loop and external telemetry projections](I16-16-no-progress-loop-and-external-telemetry-projections.md#i1616-no-progress-loop-and-external-telemetry-projections) | 16469 | 1003 |
+| `I16.17` | [I16.17. Instrument Plane observability](I16-17-instrument-plane-observability.md#i1617-instrument-plane-observability) | 16489 | 1294 |
+| `I16.18` | [I16.18. Wait-for graph and Failure Capsule](I16-18-wait-for-graph-and-failure-capsule.md#i1618-wait-for-graph-and-failure-capsule) | 16524 | 1247 |
+| `I16.19` | [I16.19. Reasoning telemetry and step-outcome attribution](I16-19-reasoning-telemetry-and-step-outcome-attribution.md#i1619-reasoning-telemetry-and-step-outcome-attribution) | 16554 | 2078 |
+| `I16.20` | [I16.20. Derived-intelligence, disclosure and capability metrics](I16-20-derived-intelligence-disclosure-and-capability-metrics.md#i1620-derived-intelligence-disclosure-and-capability-metrics) | 16607 | 1245 |
+| `I16.21` | [I16.21. Telemetry purpose, minimization and privacy-benefit gate](I16-21-telemetry-purpose-minimization-and-privacy-benefit-gate.md#i1621-telemetry-purpose-minimization-and-privacy-benefit-gate) | 16639 | 932 |
+| `I16.22` | [I16.22. Contract and documentation burden](I16-22-contract-and-documentation-burden.md#i1622-contract-and-documentation-burden) | 16655 | 1090 |
+| `I16.23` | [I16.23. ELIOT self-quality and feedback observability](I16-23-eliot-self-quality-and-feedback-observability.md#i1623-eliot-self-quality-and-feedback-observability) | 16681 | 3742 |
+| `I17` | [I17. Development sequence](I17-development-sequence.md#i17-development-sequence) | 16758 | 29 |
+| `I17.1` | [I17.1. Development doctrine](I17-01-development-doctrine.md#i171-development-doctrine) | 16760 | 1760 |
+| `I17.2` | [I17.2. Current recovery priority and promotion gate](I17-02-current-recovery-priority-and-promotion-gate.md#i172-current-recovery-priority-and-promotion-gate) | 16792 | 3101 |
+| `I17.3` | [I17.3. Canonical Product Identity](I17-03-canonical-product-identity.md#i173-canonical-product-identity) | 16829 | 776 |
+| `I17.4` | [I17.4. Causal Change Unit](I17-04-causal-change-unit.md#i174-causal-change-unit) | 16847 | 949 |
+| `I17.5` | [I17.5. Mechanism Review](I17-05-mechanism-review.md#i175-mechanism-review) | 16879 | 627 |
+| `I17.6` | [I17.6. Operational Spine Proof 1 and later Product Benefit Evaluation](I17-06-operational-spine-proof-1-and-later-product-benefit-evaluation.md#i176-operational-spine-proof-1-and-later-product-benefit-evaluation) | 16904 | 4148 |
+| `I17.7` | [I17.7. Memory rehabilitation gate](I17-07-memory-rehabilitation-gate.md#i177-memory-rehabilitation-gate) | 16994 | 1967 |
+| `I17.8` | [I17.8. Delivery Depth D0 — replaceable runtime and process-grounding skeleton](I17-08-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton.md#i178-delivery-depth-d0--replaceable-runtime-and-process-grounding-skeleton) | 17028 | 2061 |
+| `I17.9` | [I17.9. Delivery Depth D1 — canonicalized product and verification spine](I17-09-delivery-depth-d1-canonicalized-product-and-verification-spine.md#i179-delivery-depth-d1--canonicalized-product-and-verification-spine) | 17058 | 922 |
+| `I17.10` | [I17.10. Delivery Depth D2 — hot modules, independent proofs and replacement](I17-10-delivery-depth-d2-hot-modules-independent-proofs-and-replacement.md#i1710-delivery-depth-d2--hot-modules-independent-proofs-and-replacement) | 17077 | 533 |
+| `I17.11` | [I17.11. Delivery Depth D3 — grounded Smart understanding](I17-11-delivery-depth-d3-grounded-smart-understanding.md#i1711-delivery-depth-d3--grounded-smart-understanding) | 17091 | 2436 |
+| `I17.12` | [I17.12. Delivery Depth D4 — resilient Meta](I17-12-delivery-depth-d4-resilient-meta.md#i1712-delivery-depth-d4--resilient-meta) | 17121 | 603 |
+| `I17.13` | [I17.13. Delivery Depth D5 — advanced portfolio, swarm and research](I17-13-delivery-depth-d5-advanced-portfolio-swarm-and-research.md#i1713-delivery-depth-d5--advanced-portfolio-swarm-and-research) | 17134 | 1041 |
+| `I17.14` | [I17.14. Agent Work Unit over a FunctionalCapabilityCell](I17-14-agent-work-unit-over-a-functionalcapabilitycell.md#i1714-agent-work-unit-over-a-functionalcapabilitycell) | 17147 | 2065 |
+| `I17.15` | [I17.15. Agent Task Compiler and development waves](I17-15-agent-task-compiler-and-development-waves.md#i1715-agent-task-compiler-and-development-waves) | 17189 | 1994 |
+| `I17.16` | [I17.16. Real-use development and live improvement](I17-16-real-use-development-and-live-improvement.md#i1716-real-use-development-and-live-improvement) | 17237 | 1014 |
+| `I17.17` | [I17.17. Stop conditions against overengineering](I17-17-stop-conditions-against-overengineering.md#i1717-stop-conditions-against-overengineering) | 17255 | 1114 |
+| `I17.18` | [I17.18. Execution Fabric Proof 2 — one component through all contours](I17-18-execution-fabric-proof-2-one-component-through-all-contours.md#i1718-execution-fabric-proof-2--one-component-through-all-contours) | 17276 | 1648 |
+| `I17.19` | [I17.19. Donor adoption order](I17-19-donor-adoption-order.md#i1719-donor-adoption-order) | 17308 | 1875 |
+| `I18` | [I18. Testing and Instrumental Grounding strategy](I18-testing-and-instrumental-grounding-strategy.md#i18-testing-and-instrumental-grounding-strategy) | 17352 | 52 |
+| `I18.1` | [I18.1. Purpose, proof scope and canonical owner](I18-01-purpose-proof-scope-and-canonical-owner.md#i181-purpose-proof-scope-and-canonical-owner) | 17354 | 2292 |
+| `I18.2` | [I18.2. Discriminator-first repair](I18-02-discriminator-first-repair.md#i182-discriminator-first-repair) | 17417 | 1036 |
+| `I18.3` | [I18.3. Impact graph and selection](I18-03-impact-graph-and-selection.md#i183-impact-graph-and-selection) | 17442 | 1722 |
+| `I18.4` | [I18.4. Test tiers](I18-04-test-tiers.md#i184-test-tiers) | 17485 | 1888 |
+| `I18.5` | [I18.5. Composition and proxy resistance](I18-05-composition-and-proxy-resistance.md#i185-composition-and-proxy-resistance) | 17511 | 1186 |
+| `I18.6` | [I18.6. Canonical InstrumentRunner, test discovery and `dev-fast`](I18-06-canonical-instrumentrunner-test-discovery-and-dev-fast.md#i186-canonical-instrumentrunner-test-discovery-and-dev-fast) | 17539 | 2271 |
+| `I18.7` | [I18.7. Independently testable capability cell contract](I18-07-independently-testable-capability-cell-contract.md#i187-independently-testable-capability-cell-contract) | 17612 | 2744 |
+| `I18.8` | [I18.8. Instrument Plane self-tests and fault contracts](I18-08-instrument-plane-self-tests-and-fault-contracts.md#i188-instrument-plane-self-tests-and-fault-contracts) | 17659 | 1554 |
+| `I18.9` | [I18.9. Hard Boundary discriminators](I18-09-hard-boundary-discriminators.md#i189-hard-boundary-discriminators) | 17719 | 742 |
+| `I18.10` | [I18.10. Cognitive and memory product tests](I18-10-cognitive-and-memory-product-tests.md#i1810-cognitive-and-memory-product-tests) | 17742 | 1171 |
+| `I18.11` | [I18.11. Swarm tests](I18-11-swarm-tests.md#i1811-swarm-tests) | 17763 | 2103 |
+| `I18.12` | [I18.12. Canary, holdout and real-use evaluation](I18-12-canary-holdout-and-real-use-evaluation.md#i1812-canary-holdout-and-real-use-evaluation) | 17817 | 844 |
+| `I18.13` | [I18.13. Full release gate](I18-13-full-release-gate.md#i1813-full-release-gate) | 17826 | 596 |
+| `I18.14` | [I18.14. Test retirement](I18-14-test-retirement.md#i1814-test-retirement) | 17845 | 406 |
+| `I18.15` | [I18.15. Development success and counter-metrics](I18-15-development-success-and-counter-metrics.md#i1815-development-success-and-counter-metrics) | 17860 | 2021 |
+| `I18.16` | [I18.16. Host/route conformance](I18-16-hostroute-conformance.md#i1816-hostroute-conformance) | 17912 | 912 |
+| `I18.17` | [I18.17. Route/recipe evaluation](I18-17-routerecipe-evaluation.md#i1817-routerecipe-evaluation) | 17920 | 931 |
+| `I18.18` | [I18.18. Code-intelligence admission suite](I18-18-code-intelligence-admission-suite.md#i1818-code-intelligence-admission-suite) | 17945 | 3073 |
+| `I18.19` | [I18.19. Specialized instrument profiles](I18-19-specialized-instrument-profiles.md#i1819-specialized-instrument-profiles) | 18016 | 512 |
+| `I18.20` | [I18.20. Test-strength escalation](I18-20-test-strength-escalation.md#i1820-test-strength-escalation) | 18036 | 1949 |
+| `I18.21` | [I18.21. Local and CI parity](I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity) | 18078 | 564 |
+| `I18.22` | [I18.22. Flake, hang and recurrence handling](I18-22-flake-hang-and-recurrence-handling.md#i1822-flake-hang-and-recurrence-handling) | 18093 | 535 |
+| `I18.23` | [I18.23. Agent development test protocol](I18-23-agent-development-test-protocol.md#i1823-agent-development-test-protocol) | 18111 | 1074 |
+| `I18.24` | [I18.24. Failure, partial coverage and unknown](I18-24-failure-partial-coverage-and-unknown.md#i1824-failure-partial-coverage-and-unknown) | 18137 | 716 |
+| `I18.25` | [I18.25. Evolution of the testing system](I18-25-evolution-of-the-testing-system.md#i1825-evolution-of-the-testing-system) | 18152 | 546 |
+| `I18.26` | [I18.26. Parallel build and test execution for agent swarms](I18-26-parallel-build-and-test-execution-for-agent-swarms.md#i1826-parallel-build-and-test-execution-for-agent-swarms) | 18168 | 2639 |
+| `I18.27` | [I18.27. Oracle ownership and test-change governance](I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance) | 18232 | 826 |
+| `I18.28` | [I18.28. Test-selection validation and sentinel lanes](I18-28-test-selection-validation-and-sentinel-lanes.md#i1828-test-selection-validation-and-sentinel-lanes) | 18248 | 1738 |
+| `I18.31` | [I18.31. Verification-system self-change bootstrap](I18-31-verification-system-self-change-bootstrap.md#i1831-verification-system-self-change-bootstrap) | 18294 | 2584 |
+| `I18.32` | [I18.32. Stateful test environments](I18-32-stateful-test-environments.md#i1832-stateful-test-environments) | 18351 | 1445 |
+| `I18.33` | [I18.33. Crate fleet build and verification economics](I18-33-crate-fleet-build-and-verification-economics.md#i1833-crate-fleet-build-and-verification-economics) | 18385 | 5028 |
+| `I18.38` | [I18.38. Agent-context and crate-size falsification suite](I18-38-agent-context-and-crate-size-falsification-suite.md#i1838-agent-context-and-crate-size-falsification-suite) | 18456 | 2092 |
+| `I18.39` | [I18.39. OTP-style supervision and hot-replacement fault suite](I18-39-otp-style-supervision-and-hot-replacement-fault-suite.md#i1839-otp-style-supervision-and-hot-replacement-fault-suite) | 18500 | 1739 |
+| `I18.40` | [I18.40. Crate-topology self-improvement tests](I18-40-crate-topology-self-improvement-tests.md#i1840-crate-topology-self-improvement-tests) | 18565 | 1047 |
+| `I18.41` | [I18.41. Deterministic simulation and replay](I18-41-deterministic-simulation-and-replay.md#i1841-deterministic-simulation-and-replay) | 18596 | 1751 |
+| `I18.42` | [I18.42. Component conformance and promotion tests](I18-42-component-conformance-and-promotion-tests.md#i1842-component-conformance-and-promotion-tests) | 18656 | 761 |
+| `I18.43` | [I18.43. Agent behavior evaluation](I18-43-agent-behavior-evaluation.md#i1843-agent-behavior-evaluation) | 18678 | 3736 |
+| `I18.44` | [I18.44. Build sandbox, supply-chain and cache tests](I18-44-build-sandbox-supply-chain-and-cache-tests.md#i1844-build-sandbox-supply-chain-and-cache-tests) | 18748 | 659 |
+| `I18.45` | [I18.45. Failure Capsule and wait-for diagnostics tests](I18-45-failure-capsule-and-wait-for-diagnostics-tests.md#i1845-failure-capsule-and-wait-for-diagnostics-tests) | 18765 | 642 |
+| `I18.46` | [I18.46. Retry, load, soak and overload proof](I18-46-retry-load-soak-and-overload-proof.md#i1846-retry-load-soak-and-overload-proof) | 18781 | 1022 |
+| `I18.47` | [I18.47. Evaluator, benchmark, budget and credit-assignment integrity](I18-47-evaluator-benchmark-budget-and-credit-assignment-integrity.md#i1847-evaluator-benchmark-budget-and-credit-assignment-integrity) | 18810 | 8166 |
+| `I18.49` | [I18.49. Active conformance obligations](I18-49-active-conformance-obligations.md#i1849-active-conformance-obligations) | 18931 | 1472 |
+| `I18.51` | [I18.51. External falsification and regression ledger](I18-51-external-falsification-and-regression-ledger.md#i1851-external-falsification-and-regression-ledger) | 18965 | 1466 |
+| `I18.52` | [I18.52. Donor-specific fault corpora](I18-52-donor-specific-fault-corpora.md#i1852-donor-specific-fault-corpora) | 18986 | 1085 |
+| `I18.53` | [I18.53. Activity, cold-start, feedback, maintenance and descendant closure suite](I18-53-activity-cold-start-feedback-maintenance-and-descendant-closure-suite.md#i1853-activity-cold-start-feedback-maintenance-and-descendant-closure-suite) | 19001 | 3471 |
+| `I19` | [I19. Migration from current implementation and documents](I19-migration-from-current-implementation-and-documents.md#i19-migration-from-current-implementation-and-documents) | 19044 | 60 |
+| `I19.1` | [I19.1. Migration doctrine](I19-01-migration-doctrine.md#i191-migration-doctrine) | 19046 | 413 |
+| `I19.2` | [I19.2. Current forensic baseline and refresh rule](I19-02-current-forensic-baseline-and-refresh-rule.md#i192-current-forensic-baseline-and-refresh-rule) | 19060 | 1651 |
+| `I19.3` | [I19.3. Component disposition](I19-03-component-disposition.md#i193-component-disposition) | 19099 | 1189 |
+| `I19.4` | [I19.4. Documentation transition](I19-04-documentation-transition.md#i194-documentation-transition) | 19123 | 389 |
+| `I19.5` | [I19.5. Recovery and runtime transition order](I19-05-recovery-and-runtime-transition-order.md#i195-recovery-and-runtime-transition-order) | 19136 | 1484 |
+| `I19.6` | [I19.6. Data migration](I19-06-data-migration.md#i196-data-migration) | 19182 | 539 |
+| `I19.7` | [I19.7. Session/task migration](I19-07-sessiontask-migration.md#i197-sessiontask-migration) | 19198 | 302 |
+| `I19.8` | [I19.8. Hook/plugin migration](I19-08-hookplugin-migration.md#i198-hookplugin-migration) | 19214 | 1342 |
+| `I19.9` | [I19.9. Test migration](I19-09-test-migration.md#i199-test-migration) | 19244 | 337 |
+| `I19.10` | [I19.10. Cutover criteria](I19-10-cutover-criteria.md#i1910-cutover-criteria) | 19258 | 308 |
+| `I19.11` | [I19.11. Rollback](I19-11-rollback.md#i1911-rollback) | 19271 | 201 |
+| `I19.12` | [I19.12. Migration completion](I19-12-migration-completion.md#i1912-migration-completion) | 19275 | 238 |
+| `I19.13` | [I19.13. Donor contract extraction](I19-13-donor-contract-extraction.md#i1913-donor-contract-extraction) | 19291 | 2138 |
+| `I19.14` | [I19.14. Old-object compatibility map](I19-14-old-object-compatibility-map.md#i1914-old-object-compatibility-map) | 19339 | 1828 |
+| `I19.15` | [I19.15. Documentation authority cutover and deletion gate](I19-15-documentation-authority-cutover-and-deletion-gate.md#i1915-documentation-authority-cutover-and-deletion-gate) | 19383 | 2301 |
+| `I19.16` | [I19.16. Object-level migration disposition and authority cutover](I19-16-object-level-migration-disposition-and-authority-cutover.md#i1916-object-level-migration-disposition-and-authority-cutover) | 19425 | 944 |
+| `I20` | [I20. Future replacement points](I20-future-replacement-points.md#i20-future-replacement-points) | 19443 | 34 |
+| `I20.1` | [I20.1. Replacement principle](I20-01-replacement-principle.md#i201-replacement-principle) | 19445 | 354 |
+| `I20.2` | [I20.2. Replacement matrix](I20-02-replacement-matrix.md#i202-replacement-matrix) | 19460 | 1480 |
+| `I20.3` | [I20.3. Linux adaptation](I20-03-linux-adaptation.md#i203-linux-adaptation) | 19478 | 282 |
+| `I20.4` | [I20.4. Multi-node/distributed future](I20-04-multi-nodedistributed-future.md#i204-multi-nodedistributed-future) | 19493 | 331 |
+| `I20.5` | [I20.5. Researcher providers and external federation](I20-05-researcher-providers-and-external-federation.md#i205-researcher-providers-and-external-federation) | 19504 | 2187 |
+| `I20.6` | [I20.6. WASM module tier](I20-06-wasm-module-tier.md#i206-wasm-module-tier) | 19529 | 860 |
+| `I20.7` | [I20.7. Cloud execution](I20-07-cloud-execution.md#i207-cloud-execution) | 19557 | 175 |
+| `I20.8` | [I20.8. Distinct adaptation contracts](I20-08-distinct-adaptation-contracts.md#i208-distinct-adaptation-contracts) | 19561 | 2673 |
+| `I20.9` | [I20.9. Architecture evolution trigger](I20-09-architecture-evolution-trigger.md#i209-architecture-evolution-trigger) | 19600 | 479 |
+| `I20.10` | [I20.10. Deferred donor experiments](I20-10-deferred-donor-experiments.md#i2010-deferred-donor-experiments) | 19616 | 2967 |
+| `I20.11` | [I20.11. Final implementation formula](I20-11-final-implementation-formula.md#i2011-final-implementation-formula) | 19669 | 971 |
+| `I21` | [I21. Researcher plane, inquiry discipline and evidence grade](I21-researcher-plane-inquiry-discipline-and-evidence-grade.md#i21-researcher-plane-inquiry-discipline-and-evidence-grade) | 19685 | 64 |
+| `I21.1` | [I21.1. Researcher is a plane, not a future module](I21-01-researcher-is-a-plane-not-a-future-module.md#i211-researcher-is-a-plane-not-a-future-module) | 19687 | 2426 |
+| `I21.2` | [I21.2. Evidence grade](I21-02-evidence-grade.md#i212-evidence-grade) | 19718 | 2257 |
+| `I21.3` | [I21.3. Inquiry protocol selection](I21-03-inquiry-protocol-selection.md#i213-inquiry-protocol-selection) | 19753 | 1664 |
+| `I21.4` | [I21.4. Confirmatory and exploratory lanes](I21-04-confirmatory-and-exploratory-lanes.md#i214-confirmatory-and-exploratory-lanes) | 19780 | 1686 |
+| `I21.5` | [I21.5. Inquiry obligations and acceptance certificates](I21-05-inquiry-obligations-and-acceptance-certificates.md#i215-inquiry-obligations-and-acceptance-certificates) | 19801 | 1743 |
+| `I21.6` | [I21.6. Source portfolio, coverage denominator and CoverageReceipt](I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md#i216-source-portfolio-coverage-denominator-and-coveragereceipt) | 19829 | 1423 |
+| `I21.7` | [I21.7. Reference firewall and unsupported precision](I21-07-reference-firewall-and-unsupported-precision.md#i217-reference-firewall-and-unsupported-precision) | 19862 | 1943 |
+| `I21.8` | [I21.8. Evidence freeze, synthesis and claim audit](I21-08-evidence-freeze-synthesis-and-claim-audit.md#i218-evidence-freeze-synthesis-and-claim-audit) | 19895 | 1836 |
+| `I21.9` | [I21.9. Inquiry dispositions and reopen](I21-09-inquiry-dispositions-and-reopen.md#i219-inquiry-dispositions-and-reopen) | 19932 | 733 |
+| `I21.10` | [I21.10. Local search provider](I21-10-local-search-provider.md#i2110-local-search-provider) | 19950 | 1307 |
+| `I21.11` | [I21.11. Research federation provider](I21-11-research-federation-provider.md#i2111-research-federation-provider) | 19966 | 4649 |
+| `I21.12` | [I21.12. Research debts](I21-12-research-debts.md#i2112-research-debts) | 20025 | 992 |
+| `I21.13` | [I21.13. Failure, degradation and honest closure](I21-13-failure-degradation-and-honest-closure.md#i2113-failure-degradation-and-honest-closure) | 20042 | 880 |
+| `APPENDIX-A` | [Appendix A. ModuleGeneration lifecycle projection](APPENDIX-A-modulegeneration-lifecycle-projection.md#appendix-a-modulegeneration-lifecycle-projection) | 20056 | 1526 |
+| `APPENDIX-B` | [Appendix B. Core EBP service profiles](APPENDIX-B-core-ebp-service-profiles.md#appendix-b-core-ebp-service-profiles) | 20086 | 1368 |
+| `APPENDIX-C` | [Appendix C. Default runtime configuration](APPENDIX-C-default-runtime-configuration.md#appendix-c-default-runtime-configuration) | 20106 | 1381 |
+| `APPENDIX-D` | [Appendix D. Reason codes and directive dispositions](APPENDIX-D-reason-codes-and-directive-dispositions.md#appendix-d-reason-codes-and-directive-dispositions) | 20126 | 1069 |
+| `APPENDIX-E` | [Appendix E. First convergence backlog](APPENDIX-E-first-convergence-backlog.md#appendix-e-first-convergence-backlog) | 20145 | 588 |
+| `APPENDIX-G` | [Appendix G. Research Gate families](APPENDIX-G-research-gate-families.md#appendix-g-research-gate-families) | 20162 | 2365 |
+| `APPENDIX-H` | [Appendix H. Full Architecture conformance map](APPENDIX-H-full-architecture-conformance-map.md#appendix-h-full-architecture-conformance-map) | 20199 | 8378 |
+| `APPENDIX-I` | [Appendix I. Dependency selection and containment](APPENDIX-I-dependency-selection-and-containment.md#appendix-i-dependency-selection-and-containment) | 20273 | 4667 |
+| `APPENDIX-J` | [Appendix J. Developer commands](APPENDIX-J-developer-commands.md#appendix-j-developer-commands) | 20328 | 1176 |
+| `APPENDIX-K` | [Appendix K. Legacy and target contract inventory pointer](APPENDIX-K-legacy-and-target-contract-inventory-pointer.md#appendix-k-legacy-and-target-contract-inventory-pointer) | 20347 | 1279 |
+| `APPENDIX-L` | [Appendix L. Donor retirement evidence pointer](APPENDIX-L-donor-retirement-evidence-pointer.md#appendix-l-donor-retirement-evidence-pointer) | 20370 | 647 |
+| `APPENDIX-M` | [Appendix M. Legacy compatibility evidence pointer](APPENDIX-M-legacy-compatibility-evidence-pointer.md#appendix-m-legacy-compatibility-evidence-pointer) | 20376 | 349 |
+| `APPENDIX-N` | [Appendix N. First SurrealDB physical schema profile](APPENDIX-N-first-surrealdb-physical-schema-profile.md#appendix-n-first-surrealdb-physical-schema-profile) | 20380 | 1675 |
+| `APPENDIX-O` | [Appendix O. Initial empirical profiles and candidate defaults](APPENDIX-O-initial-empirical-profiles-and-candidate-defaults.md#appendix-o-initial-empirical-profiles-and-candidate-defaults) | 20403 | 11903 |
+| `APPENDIX-P` | [Appendix P. Rust public boundary interfaces](APPENDIX-P-rust-public-boundary-interfaces.md#appendix-p-rust-public-boundary-interfaces) | 20633 | 1612 |

@@ -5,17 +5,19 @@ third normative book.
 
 ## Accepted sharded normative pair
 
-The 2026-08-28 adopted Architecture semantic byte stream is unchanged.
-The Implementation byte stream is updated to incorporate the owner-approved
-I9.4 amendment (#1980 / #1983). Each stream is reconstructed deterministically
+The 2026-08-28 adopted Architecture semantic byte stream is updated to
+incorporate the owner-approved Cloudflare single-owner access-boundary
+amendment (#1376). The Implementation byte stream is updated to incorporate
+the owner-approved I9.4 amendment (#1980 / #1983) and the same #1376 access
+boundary. Each stream is reconstructed deterministically
 from ordered fragments and verified against its reconstructed SHA-256 digest.
 
 | Authority | Canonical manifest and entry | Revision | Edition | Reconstructed SHA-256 |
 |---|---|---|---|---|
-| Intent, theory, invariants, and Hard Boundaries | [`docs/architecture/architecture/manifest.json`](architecture/architecture/manifest.json) · [bounded index](architecture/architecture/README.md) | `4.5-draft` | `2026-08-28` | `C6932EAF26935E752EEFB4DE591AFC91EA1A7180BE5A8FF0005554B8029BAC1A` |
-| Target owners, contracts, defaults, failure behavior, and migration | [`docs/architecture/implementation/manifest.json`](architecture/implementation/manifest.json) · [bounded index](architecture/implementation/README.md) | `0.29-draft` | `2026-08-28` | `40B0908A637F46BA6C7C51DB08E008673F9232ED74D510D3A4F38489D05D4E89` |
+| Intent, theory, invariants, and Hard Boundaries | [`docs/architecture/architecture/manifest.json`](architecture/architecture/manifest.json) · [bounded index](architecture/architecture/README.md) | `4.5-draft` | `2026-08-28` | `A3C5B2028D9DF89A53CD565F8FF493484BE74078E4EFD7B534C0F1C3169577C7` |
+| Target owners, contracts, defaults, failure behavior, and migration | [`docs/architecture/implementation/manifest.json`](architecture/implementation/manifest.json) · [bounded index](architecture/implementation/README.md) | `0.29-draft` | `2026-08-28` | `EAD4CEFF2DB254E4202C8FA7AE167225A6F65B720C222075ADA61FC45FC407A4` |
 
-The machine-bindable adoption receipt is [`docs/normative-pair.toml`](normative-pair.toml). Its pair key is `sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea`, computed deterministically from the unchanged Architecture digest and the updated Implementation digest.
+The machine-bindable adoption receipt is [`docs/normative-pair.toml`](normative-pair.toml). Its pair key is `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`, computed deterministically from the updated Architecture digest and the updated Implementation digest.
 
 The historical paths [`docs/architecture/ELIOT_ARCHITECTURE.md`](architecture/ELIOT_ARCHITECTURE.md) and [`docs/architecture/ELIOT_IMPLEMENTATION.md`](architecture/ELIOT_IMPLEMENTATION.md) are compact compatibility maps. They preserve incoming file and heading links,
 but agents must not load them as the documentation payload.

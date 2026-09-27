@@ -3,8 +3,8 @@
 
 The adopted `Implementation` byte stream is split into 504 bounded Markdown fragments.
 
-- Original SHA-256: `40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89`
-- Original bytes: `1003351`
+- Original SHA-256: `ead4ceff2db254e4202c8fa7ae167225a6f65b720c222075ada61fc45fc407a4`
+- Original bytes: `1008830`
 - Manifest: [`manifest.json`](manifest.json)
 - Stable compatibility path: [`../ELIOT_IMPLEMENTATION.md`](../ELIOT_IMPLEMENTATION.md)
 - Do not read this entire index as task context. Resolve a route first.
@@ -173,7 +173,7 @@ Use [`../READING_PROTOCOL.md`](../READING_PROTOCOL.md), [`../ROUTES.md`](../ROUT
 - [I7.2. Frame](../I07-02-frame.md#i72-frame) — `I7.2` (2519 bytes)
 - [I7.3. Handshake](../I07-03-handshake.md#i73-handshake) — `I7.3` (548 bytes)
 - [I7.4. Module lifecycle messages](../I07-04-module-lifecycle-messages.md#i74-module-lifecycle-messages) — `I7.4` (325 bytes)
-- [I7.5. Named pipes](../I07-05-named-pipes.md#i75-named-pipes) — `I7.5` (1366 bytes)
+- [I7.5. Named pipes](../I07-05-named-pipes.md#i75-named-pipes) — `I7.5` (2029 bytes)
 - [I7.6. MCP surface](../I07-06-mcp-surface.md#i76-mcp-surface) — `I7.6` (3338 bytes)
 - [I7.7. MCP versions and stateless core](../I07-07-mcp-versions-and-stateless-core.md#i77-mcp-versions-and-stateless-core) — `I7.7` (1693 bytes)
 - [I7.8. Agent interaction loop](../I07-08-agent-interaction-loop.md#i78-agent-interaction-loop) — `I7.8` (735 bytes)
@@ -237,7 +237,7 @@ Use [`../READING_PROTOCOL.md`](../READING_PROTOCOL.md), [`../ROUTES.md`](../ROUT
 - [I9.10. Model routing](../I09-10-model-routing.md#i910-model-routing) — `I9.10` (370 bytes)
 - [I9.11. Clarification routing](../I09-11-clarification-routing.md#i911-clarification-routing) — `I9.11` (395 bytes)
 - [I9.12. Human interaction](../I09-12-human-interaction.md#i912-human-interaction) — `I9.12` (932 bytes)
-- [I9.13. Remote Dreamer gateway](../I09-13-remote-dreamer-gateway.md#i913-remote-dreamer-gateway) — `I9.13` (850 bytes)
+- [I9.13. Remote Dreamer gateway](../I09-13-remote-dreamer-gateway.md#i913-remote-dreamer-gateway) — `I9.13` (3108 bytes)
 - [I9.14. Researcher boundary](../I09-14-researcher-boundary.md#i914-researcher-boundary) — `I9.14` (552 bytes)
 - [I9.15. Dreamer failure](../I09-15-dreamer-failure.md#i915-dreamer-failure) — `I9.15` (781 bytes)
 - [I9.16. Dreamer quality and job economics](../I09-16-dreamer-quality-and-job-economics.md#i916-dreamer-quality-and-job-economics) — `I9.16` (1040 bytes)
@@ -410,7 +410,7 @@ Use [`../READING_PROTOCOL.md`](../READING_PROTOCOL.md), [`../ROUTES.md`](../ROUT
 - [I15.10. Sandboxing](../I15-10-sandboxing.md#i1510-sandboxing) — `I15.10` (433 bytes)
 - [I15.11. Agent worktrees](../I15-11-agent-worktrees.md#i1511-agent-worktrees) — `I15.11` (328 bytes)
 - [I15.12. External model data firewall](../I15-12-external-model-data-firewall.md#i1512-external-model-data-firewall) — `I15.12` (454 bytes)
-- [I15.13. Remote Dreamer security](../I15-13-remote-dreamer-security.md#i1513-remote-dreamer-security) — `I15.13` (272 bytes)
+- [I15.13. Remote Dreamer security](../I15-13-remote-dreamer-security.md#i1513-remote-dreamer-security) — `I15.13` (2830 bytes)
 - [I15.14. Privacy erasure](../I15-14-privacy-erasure.md#i1514-privacy-erasure) — `I15.14` (461 bytes)
 - [I15.15. Break-glass](../I15-15-break-glass.md#i1515-break-glass) — `I15.15` (335 bytes)
 - [I15.16. Security testing](../I15-16-security-testing.md#i1516-security-testing) — `I15.16` (394 bytes)
