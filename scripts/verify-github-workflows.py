@@ -27,6 +27,9 @@ Enforces that:
 8. Referenced local scripts exist on disk.
 9. Workflow pip installs consume only the hash-locked
    scripts/requirements-verification.txt with --require-hashes.
+10. Workflow dotnet restores run with --locked-mode against the checked-in
+   packages.lock.json files, so graph drift or a lock-mutating restore fails
+   instead of silently resolving a new graph.
 """
 
 from __future__ import annotations
@@ -669,12 +672,51 @@ def check_pip_install_lock(root: Path) -> list[Finding]:
     return findings
 
 
+def check_dotnet_restore_lock(root: Path) -> list[Finding]:
+    """Every workflow dotnet restore must run in locked mode.
+
+    A restore without --locked-mode may silently resolve a new dependency
+    graph or mutate the checked-in packages.lock.json instead of failing on
+    drift, so it cannot satisfy the NuGet lock contract (issue #1225 step
+    4). Quoted prose and trailing comments are not gate invocations: string
+    literals (for example a checker asserting on the 'dotnet restore'
+    marker) and '#' comments are stripped before matching, so only real
+    restore commands are judged.
+    """
+    findings: list[Finding] = []
+    for wf_path in iter_workflow_files(root):
+        rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
+        try:
+            lines = wf_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line_no, line in enumerate(lines, start=1):
+            if "dotnet restore" not in line:
+                continue
+            code = re.sub(r'"[^"]*"', "", line)
+            code = re.sub(r"'[^']*'", "", code)
+            code = code.split("#", 1)[0]
+            if "dotnet restore" not in code:
+                continue
+            if "--locked-mode" not in code:
+                findings.append(
+                    Finding(
+                        "GWF-012",
+                        rel_path,
+                        line_no,
+                        "dotnet restore must use --locked-mode against the checked-in packages.lock.json",
+                    )
+                )
+    return findings
+
+
 def verify_all(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(check_workflows(root))
     findings.extend(check_action_pin_divergence(root))
     findings.extend(check_python_requirements(root))
     findings.extend(check_nuget_lock(root))
+    findings.extend(check_dotnet_restore_lock(root))
     findings.extend(check_pip_install_lock(root))
     return findings
 
