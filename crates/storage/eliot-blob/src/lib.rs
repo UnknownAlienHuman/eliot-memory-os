@@ -588,16 +588,12 @@ fn acquire_root_lease(
         process_id,
         heartbeat_unix_ms: now_unix_ms(),
     };
-    write_lease_record(&mut file, &record).map_err(|error| {
-        native_capacity_error(
-            &error,
+    write_lease_record(&mut file, &record).map_err(|failure| {
+        lease_record_capacity_error(
+            &failure,
             BlobCapacityStage::RootLeaseCreate,
-            BlobCapacityIdentity::RootLease {
-                root_id: redacted_root_id(root_id),
-                lease_id: Some(redacted_root_id(&token)),
-            },
-            None,
-            BlobCapacityEffect::PartialWriteUnknown,
+            root_id,
+            Some(&token),
         )
         .unwrap_or_else(|| BlobError::Provider("write Blob root lease failed".to_owned()))
     })?;
@@ -720,12 +716,95 @@ fn open_owned_root_lease(
         })
 }
 
-fn write_lease_record(file: &mut fs::File, record: &RootLeaseRecord) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&bytes)?;
-    file.sync_all()
+/// Which physical phase of one native lease-record write failed.
+///
+/// I5.12 orders "flush and fsync ciphertext plus metadata" as a step of its own,
+/// *before* the atomic rename, so a native `fsync` failure and a native write
+/// failure are two different observations carrying two different certainties.
+/// `std::io::Error` erases that distinction, so it is recovered here — at the
+/// only place in this crate that performs a native file sync itself. Every
+/// other durability boundary is owned by a platform port, which reports its own
+/// stage through the wrapped-port rule in
+/// [`bind_platform_capacity_with_effect`]. Issue #864: "file sync failure
+/// remains distinct from write failure".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaseRecordPhase {
+    /// The record did not provably reach the file in full.
+    Write,
+    /// Every byte reached the file; only the file's own durability boundary
+    /// (`File::sync_all`) failed.
+    FileSync,
+}
+
+/// One failed lease-record write, retaining the phase that failed beside the
+/// untouched `std::io::Error` so [`native_capacity_cause`] still reads the
+/// typed `raw_os_error` from its proper target namespace and no diagnostic
+/// string is ever parsed for a code.
+struct LeaseRecordFailure {
+    phase: LeaseRecordPhase,
+    error: std::io::Error,
+}
+
+fn write_lease_record(
+    file: &mut fs::File,
+    record: &RootLeaseRecord,
+) -> Result<(), LeaseRecordFailure> {
+    let bytes = serde_json::to_vec(record).map_err(|error| LeaseRecordFailure {
+        phase: LeaseRecordPhase::Write,
+        error: std::io::Error::other(error),
+    })?;
+    let mut write = || -> std::io::Result<()> {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&bytes)?;
+        Ok(())
+    };
+    write().map_err(|error| LeaseRecordFailure {
+        phase: LeaseRecordPhase::Write,
+        error,
+    })?;
+    file.sync_all().map_err(|error| LeaseRecordFailure {
+        phase: LeaseRecordPhase::FileSync,
+        error,
+    })
+}
+
+/// Maps one failed native lease-record write onto the capacity evidence its
+/// phase actually supports.
+///
+/// A `Write` failure may have left a partial record staged, so the byte
+/// progress stays unknown — it is never restated as the encoded length, which
+/// would read as committed bytes. A `FileSync` failure happened *after* every
+/// byte was written: the record is staged and may already be durable, so the
+/// observation is a possible mutation of the lease rather than a partial write,
+/// and the two certainties stay on independent axes (issue #864: "failure
+/// cause and effect certainty are independent"). Neither phase is a directory
+/// or publication flush: the containing-directory entry was installed by the
+/// earlier exclusive `create_new` in [`open_owned_root_lease`], not by this
+/// record write, so `DirectoryFlush` is never asserted here.
+fn lease_record_capacity_error(
+    failure: &LeaseRecordFailure,
+    stage: BlobCapacityStage,
+    root_id: &str,
+    lease_id: Option<&str>,
+) -> Option<BlobError> {
+    let (stage, effect) = match failure.phase {
+        LeaseRecordPhase::Write => (stage, BlobCapacityEffect::PartialWriteUnknown),
+        LeaseRecordPhase::FileSync => (
+            BlobCapacityStage::FileFlush,
+            BlobCapacityEffect::PossibleMutation,
+        ),
+    };
+    native_capacity_error(
+        &failure.error,
+        stage,
+        BlobCapacityIdentity::RootLease {
+            root_id: redacted_root_id(root_id),
+            lease_id: lease_id.map(redacted_root_id),
+        },
+        None,
+        effect,
+    )
 }
 
 fn native_capacity_cause(error: &std::io::Error) -> Option<BlobCapacityCause> {
@@ -1012,6 +1091,16 @@ fn retain_cleanup_evidence(cleanup_error: BlobError, primary: BlobError) -> Blob
         return primary;
     };
     let BlobError::StorageCapacity { failure } = cleanup_error else {
+        // The cleanup demonstrably failed; it simply did not fail on capacity,
+        // so it carries no capacity evidence to retain. Leaving the slot at its
+        // `NotApplicable` default would report a cleanup that provably did not
+        // happen as one that never applied, collapsing the success/failure/
+        // unknown distinction issue #864 requires. `Failed` without evidence is
+        // the honest row and already validates (`validate_capacity_cleanup`
+        // only requires stage and evidence to be supplied together).
+        if primary.cleanup == BlobCapacityCleanup::NotApplicable {
+            primary.cleanup = BlobCapacityCleanup::Failed;
+        }
         return BlobError::StorageCapacity { failure: primary };
     };
     primary.cleanup = BlobCapacityCleanup::Unknown;
@@ -1132,22 +1221,18 @@ fn heartbeat_root_lease(lease: &Weak<RootLeaseState>, stop: &Arc<AtomicBool>) {
             process_id: lease.process_id,
             heartbeat_unix_ms: now_unix_ms(),
         };
-        if let Err(error) = write_lease_record(file, &record) {
-            let failure = native_capacity_error(
-                &error,
+        if let Err(write_failure) = write_lease_record(file, &record) {
+            let failure = lease_record_capacity_error(
+                &write_failure,
                 BlobCapacityStage::RootLeaseHeartbeat,
-                BlobCapacityIdentity::RootLease {
-                    root_id: redacted_root_id(&lease.root_id),
-                    lease_id: Some(redacted_root_id(&lease.token)),
-                },
-                None,
-                BlobCapacityEffect::PartialWriteUnknown,
+                &lease.root_id,
+                Some(&lease.token),
             )
             .unwrap_or_else(|| {
                 BlobError::Provider(format!(
                     "Blob root lease heartbeat write failed: kind={:?};raw_os_error={:?}",
-                    error.kind(),
-                    error.raw_os_error()
+                    write_failure.error.kind(),
+                    write_failure.error.raw_os_error()
                 ))
             });
             if let Ok(mut retained) = lease.heartbeat_failure.lock() {
@@ -2264,7 +2349,32 @@ where
             Ok(claim) => claim,
             Err(error) => {
                 Self::release_construction_claim(&service_key, os_owner.as_ref());
-                return Err(error);
+                // Lease creation is the one platform call the service never
+                // binds. Binding it here keeps the typed cause, native code and
+                // stage the port actually reported, names the owner-issued
+                // root/lease identity the service holds, and redacts it exactly
+                // as the native lease path does so no host path travels inside
+                // a capacity record (issue #864: "no raw sensitive filesystem
+                // path"; "wrapped ports must preserve typed cause/code and
+                // stage before conversion to text"). The effect is NOT
+                // overridden: only the port observed whether the lease file
+                // exists. A composite that cannot validate falls back to the
+                // port's own error rather than discarding it, and construction
+                // still fails, so an exhausted lease can never issue healthy
+                // root, ready, write or GC evidence.
+                let bound = bind_platform_capacity_with_effect(
+                    error.clone(),
+                    BlobCapacityStage::RootLeaseCreate,
+                    BlobCapacityIdentity::RootLease {
+                        root_id: redacted_root_id(lease.root_id.as_str()),
+                        lease_id: Some(redacted_root_id(lease.lease_id.as_str())),
+                    },
+                    None,
+                );
+                return Err(match bound {
+                    Ok(bound) => bound,
+                    Err(InvalidCapacityEvidence) => error,
+                });
             }
         };
         if let Err(error) = claim.validate(&lease) {
