@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
+use std::path::Path;
 use std::time::Duration;
+
+use eliot_observability_runtime::{
+    ObservabilityConfig, RollingLogPolicy, RuntimeProfile, SpoolPolicy,
+};
 
 #[cfg(windows)]
 use eliot_ipc::NamedPipeServer;
@@ -19,6 +24,90 @@ use eliot_store_surreal::{
 
 mod launch_mode;
 use launch_mode::{LaunchMode, control_frame, parse_launch_mode, prepare_launch};
+
+/// Stable operational-log stem for this process. The generation name carries
+/// the exit code, so a fresh process start is distinguishable from a rolling
+/// rotation without any second naming scheme.
+const OPERATIONAL_LOG_STEM: &str = "eliot-store-surreal";
+
+/// Bounded operational-log generation size, in bytes, at the crate's own
+/// declared ceiling (`eliot-observability-runtime::config::MAX_ROLLING_BYTES`).
+const OPERATIONAL_LOG_GENERATION_BYTES: u64 =
+    eliot_observability_runtime::config::MAX_ROLLING_BYTES;
+
+/// Bounded operational-log generation count, at the same declared ceiling.
+const OPERATIONAL_LOG_GENERATIONS: u32 =
+    eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS;
+
+/// Bounded writer-queue depth, in records, before admission starts dropping and
+/// the visible dropped-records gauge advances (I16.11 forbids hidden loss).
+const OPERATIONAL_LOG_QUEUED_RECORDS: usize = 1024;
+
+/// Derives the process observability configuration from the launch contour and
+/// the loaded `StoreLaunchConfig`.
+///
+/// `config.runtime_launch` is the `RuntimeLaunchDescriptor` the installer
+/// materialized into `generation.json` and that `load_config` already
+/// validated in this binary; it carries the digest-bound
+/// `RuntimeStateRoots` for the exact installation, so the operational log and
+/// the protected event spool land under roots this process is already bound
+/// to. The profile is that same `RuntimeStateRoots::profile`, not an
+/// assumption: the store bridge is launched by the Host as the
+/// `LocalService` account against the `SystemService` roots in the production
+/// contour, and a portable-dev launch resolves to the `PortableDev` roots.
+///
+/// `metrics_listen` and `otlp_endpoint` stay at the crate's own `None`: no
+/// canonical `OpenMetrics` bind address and no approved OTLP collector
+/// endpoint exist in the tree, and I16.2 requires the OTLP bridge to stay
+/// disabled by default.
+fn observability_config(config: &eliot_store_surreal::StoreLaunchConfig) -> ObservabilityConfig {
+    let roots = &config.runtime_launch.runtime_state_roots;
+    let profile = match roots.profile {
+        eliot_installation::InstallationProfile::SystemService => RuntimeProfile::SystemService,
+        eliot_installation::InstallationProfile::UserMode => RuntimeProfile::UserMode,
+        eliot_installation::InstallationProfile::PortableDev => RuntimeProfile::Portable,
+    };
+    let ors_root = Path::new(roots.kernel_ors_root.as_str());
+    ObservabilityConfig {
+        profile,
+        rolling_log: RollingLogPolicy {
+            directory: ors_root.join("logs"),
+            file_stem: OPERATIONAL_LOG_STEM.to_owned(),
+            max_bytes_per_generation: OPERATIONAL_LOG_GENERATION_BYTES,
+            max_generations: OPERATIONAL_LOG_GENERATIONS,
+            max_buffered_records: OPERATIONAL_LOG_QUEUED_RECORDS,
+            exit_code: 0,
+        },
+        // `system_service` uses the Windows Event Log as its last resort, so
+        // only the two spool profiles get a protected event spool.
+        spool: match profile {
+            RuntimeProfile::SystemService => None,
+            RuntimeProfile::UserMode | RuntimeProfile::Portable => Some(SpoolPolicy {
+                directory: ors_root.join("spool"),
+                file_stem: "critical-events".to_owned(),
+                max_generations: eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS,
+                max_record_bytes: eliot_observability_runtime::config::MAX_SPOOL_RECORD_BYTES,
+            }),
+        },
+        metrics_listen: None,
+        otlp_endpoint: None,
+    }
+}
+
+/// Installs the shared observability runtime from the loaded launch config.
+///
+/// The Store bridge has no initialized telemetry sink before the launch config
+/// is loaded, so the install happens at the first point where the installation
+/// roots are known — immediately after `prepare_launch` and before the
+/// provider is composed, connected, or the pipe is served. A loaded
+/// configuration is mandatory (this binary cannot reach any live work without
+/// one), so a refused observability configuration is reported through the same
+/// fail-closed launch error path the rest of the launch uses.
+fn install_observability(config: &eliot_store_surreal::StoreLaunchConfig) -> Result<(), String> {
+    eliot_observability_runtime::install(&observability_config(config))
+        .map(|_| ())
+        .map_err(|error| format!("observability runtime install: {error}"))
+}
 
 #[tokio::main]
 // This standalone service has no initialized telemetry sink before startup;
@@ -544,6 +633,10 @@ async fn run() -> Result<(), String> {
     let Some(config) = prepared? else {
         return Ok(());
     };
+    // Issue #1836 (W1): the installation roots are known now, so the shared
+    // observability runtime is installed before the provider is composed,
+    // connected, or the authenticated pipe is served.
+    install_observability(&config)?;
     enforce_store_compatibility(&config)?;
     let composed = StoreComposition::new(&config);
     report_stage_outcome(

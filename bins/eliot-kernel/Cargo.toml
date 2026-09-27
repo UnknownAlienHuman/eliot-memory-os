@@ -40,6 +40,10 @@ eliot-observability = { path = "../../crates/instrument/eliot-observability", ve
 # eliot-kernel runtime root (issue #15), and its closure (eliot-contracts,
 # eliot-platform-windows, serde, serde_json, thiserror, tracing,
 # tracing-subscriber) adds no forbidden reach.
+#
+# Issue #1836 (W1): the same edge, and the reason this composition root
+# installs the shared observability runtime from `main` before any live work
+# starts.
 eliot-observability-runtime.workspace = true
 eliot-ors.workspace = true
 eliot-process-executor.workspace = true
