@@ -1,13 +1,15 @@
 //! Provider-neutral observability contracts for the Instrument Plane.
 //!
 //! Logs, metrics, durable audit and reports remain distinct surfaces.  This
-//! crate describes operational events, bounded metric samples and correlated
-//! instrument-run telemetry; it does not execute processes, persist canonical
-//! audit, export secrets, or turn activity metrics into semantic proof.
+//! crate describes operational events, bounded metric samples, correlated
+//! instrument-run telemetry and the append-only observable-influence ledger; it
+//! does not execute processes, persist canonical audit, export secrets, or
+//! turn activity metrics into semantic proof.
 
 #![forbid(unsafe_code)]
 
 pub mod field_policy;
+pub mod influence;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1110,6 +1112,8 @@ pub fn contract_identity() -> Result<ContractIdentity, ObservabilityError> {
             "instrument_run_telemetry": schemars::schema_for!(InstrumentRunTelemetry),
             "observability_gap": schemars::schema_for!(ObservabilityGap),
             "snapshot": schemars::schema_for!(ObservabilitySnapshot),
+            "influence_observation": schemars::schema_for!(influence::InfluenceObservation),
+            "influence_entry": schemars::schema_for!(influence::InfluenceEntry),
         }),
     )
     .map_err(ObservabilityError::Foundation)
