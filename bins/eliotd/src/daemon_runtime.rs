@@ -81,7 +81,7 @@ use eliotd::{
     DaemonStatus, FinishSubmitOutcome, KernelContextReadClient, LocalReadSubmitOutcome,
     MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome, PROTOCOL_VERSION,
     SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome, forward_admitted_local_read,
-    serve_admitted_observe, serve_finish_claim, terminal_for_invalid_ticket,
+    serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -3344,11 +3344,9 @@ async fn run_finish_poll(
     let Some(claimed) = claimed else {
         return Ok(FinishPollOutcome::IdleBackoff);
     };
-    let mut guard = composition.lock().await;
-    let body = Box::pin(eliotd::serve_finish_claim(&mut guard, claimed))
+    let body = Box::pin(eliotd::serve_finish_claim(kernel, &composition, claimed))
         .await
         .map_err(|error| format!("daemon finish dispatch: {error}"))?;
-    drop(guard);
     match kernel.submit_finish_result_async(&body).await {
         Ok(FinishSubmitOutcome::Accepted) => Ok(FinishPollOutcome::Accepted),
         Ok(FinishSubmitOutcome::Expired) => Ok(FinishPollOutcome::Expired),

@@ -462,16 +462,12 @@ fn derive_finish_request_identity(
     draft
         .validate()
         .map_err(|error| format!("claimed finish draft is invalid: {error}"))?;
-    let fence = StateFence::new(
-        envelope.state_fence.authority_epoch.clone(),
-        envelope.state_fence.resource_generation,
-    );
     let fence = StateFence {
         task_revision: Some(
             eliot_contracts::TaskRevision::new(draft.expected_task_revision)
                 .map_err(|error| format!("claimed finish revision is invalid: {error}"))?,
         ),
-        ..fence
+        ..envelope.state_fence.clone()
     };
     let session_id = envelope
         .identity
@@ -531,6 +527,14 @@ pub fn parse_finish_claimed_pair(
         .validate()
         .map_err(|error| format!("Kernel finish envelope is invalid: {error}"))?;
     let tool = decode("tool")?;
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|error| format!("Kernel finish tool bytes are not envelope-bound: {error}"))?;
     let arguments = tool
         .get("arguments")
         .cloned()
@@ -548,10 +552,11 @@ pub fn parse_finish_claimed_pair(
     let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
         .map_err(|error| format!("Kernel finish operation id does not decode: {error}"))?;
     let expected_operation = host_request_operation_id(&envelope);
+    let expected_identity = derive_finish_request_identity(&draft, &envelope)?;
     let request_identity = match pair.get("identity") {
         Some(value) => serde_json::from_value(value.clone())
             .map_err(|error| format!("Kernel finish identity does not decode: {error}"))?,
-        None => derive_finish_request_identity(&draft, &envelope)?,
+        None => expected_identity.clone(),
     };
     request_identity
         .validate()
@@ -561,14 +566,31 @@ pub fn parse_finish_claimed_pair(
         || envelope.identity.capability != "eliot.finish"
         || envelope.identity.payload_schema_id != eliot_protocol::FINISH_INVOKE_PAYLOAD_SCHEMA_ID
         || tool_name != Some("eliot.finish")
-        || request_identity.request.state_fence != envelope.state_fence
-        || request_identity.request.metadata.state_fence != envelope.state_fence
+        || !envelope
+            .state_fence
+            .is_compatible_with(&request_identity.request.state_fence)
+        || request_identity.request.state_fence != expected_identity.request.state_fence
+        || request_identity.request.metadata.request_id != envelope.identity.request_id
+        || request_identity.request.metadata.session_id
+            != expected_identity.request.metadata.session_id
         || request_identity
             .request
             .metadata
             .task_id
             .as_ref()
             .is_none_or(|task| task.as_str() != draft.task_id.as_str())
+        || envelope
+            .identity
+            .task_id
+            .as_deref()
+            .is_some_and(|task| task != draft.task_id)
+        || request_identity.idempotency_key != envelope.identity.idempotency_key
+        || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+        || request_identity.cancellation_id != envelope.identity.cancellation_id
+        || request_identity.request.metadata.product_id
+            != expected_identity.request.metadata.product_id
+        || request_identity.request.metadata.source_id
+            != expected_identity.request.metadata.source_id
         || request_identity
             .request
             .metadata

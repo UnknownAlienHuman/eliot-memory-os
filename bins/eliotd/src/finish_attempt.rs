@@ -1,19 +1,22 @@
 //! Production `eliot.finish` claim servicing for the current daemon (issue #1741).
 //!
 //! Kernel owns admission, queue ownership, and the fenced attempt
-//! capability. This adapter decodes the digest-bound strict finish draft,
-//! delegates evaluation to the single Governor finish owner
-//! ([`GovernorComposition::finish_attempt`]), and submits the exact typed
-//! result through Kernel. The Finish service rehydrates current durable state;
-//! a caller-supplied proof never reaches the derivation.
+//! capability. This adapter decodes the digest-bound strict candidate draft,
+//! prepares the Governor-owned evidence and decision legs, exchanges each
+//! immutable leg with the composition lock released, and revalidates each
+//! completed leg against the live owner before continuing. It returns the
+//! exact typed result body for the runtime to submit through Kernel. The Finish
+//! service rehydrates current durable state; proof-like extra fields fail the
+//! strict draft decode and never reach the service.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_governor::FinishAttemptError;
 use eliot_protocol::FinishResultBody;
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{DaemonComposition, daemon_kernel_client::FinishClaimedInvocation};
+use crate::{DaemonComposition, DaemonKernelClient, daemon_kernel_client::FinishClaimedInvocation};
 
 /// Rejection content for one refused finish attempt. Every Governor or
 /// decode failure is projected as a typed rejected response body; a refusal
@@ -87,20 +90,31 @@ fn finish_result_body(
     Ok(body)
 }
 
+fn rejected_finish_result(
+    claimed: &FinishClaimedInvocation,
+    error: FinishAttemptError,
+) -> Result<FinishResultBody, String> {
+    let content = serde_json::to_value(rejection(&error.to_string()))
+        .map_err(|error| format!("finish rejection projection failed: {error}"))?;
+    let response = finish_response_json(claimed, "PLAN_GAP", &content, ProofCeiling::Observation)?;
+    finish_result_body(claimed, response)
+}
+
 /// Serves one exact Kernel-claimed `eliot.finish` candidate.
 ///
 /// The draft is decoded authoritatively here (`deny_unknown_fields`: the strict
 /// candidate set and nothing else) and evaluated by the Governor finish
-/// owner against rehydrated canonical state. A caller-supplied
-/// `completion_proof` reaches the Finish service, which rejects it with
-/// `CallerProofRejected`; no weaker path exists.
+/// owner against rehydrated canonical state. A proof-like extra field fails
+/// strict candidate deserialization before the Governor Finish service is
+/// called; no weaker path exists.
 #[allow(
     clippy::large_futures,
     clippy::too_many_lines,
     reason = "the claim boundary preserves one exact owner evaluation and one fenced result body"
 )]
 pub async fn serve_finish_claim(
-    composition: &mut DaemonComposition,
+    kernel: &DaemonKernelClient,
+    composition: &std::sync::Arc<tokio::sync::Mutex<DaemonComposition>>,
     claimed: FinishClaimedInvocation,
 ) -> Result<FinishResultBody, String> {
     let arguments = claimed
@@ -110,31 +124,60 @@ pub async fn serve_finish_claim(
         .ok_or_else(|| "claimed finish pair omits the admitted draft".to_owned())?;
     let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
         .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
-    let outcome = composition
-        .finish_attempt(
-            &claimed.request_identity,
-            claimed.operation_id.clone(),
-            draft,
-        )
-        .await;
-    match outcome {
-        Ok(receipt) => {
-            let content = serde_json::to_value(&receipt)
-                .map_err(|error| format!("finish decision projection failed: {error}"))?;
-            let response = finish_response_json(
-                &claimed,
-                "CANDIDATE",
-                &content,
-                ProofCeiling::ScopedVerification,
-            )?;
-            finish_result_body(&claimed, response)
+
+    // Plan the evidence exchange while the composition is borrowed, then run
+    // Kernel IO with no composition lock held.
+    let evidence = {
+        let guard = composition.lock().await;
+        guard.prepare_finish_evidence(&claimed.request_identity, &claimed.operation_id, &draft)
+    };
+    let evidence = match evidence {
+        Ok(evidence) => evidence,
+        Err(error) => return rejected_finish_result(&claimed, error),
+    };
+    if let Some(prepared) = evidence.as_ref() {
+        if let Err(error) = prepared.exchange(kernel).await {
+            return rejected_finish_result(&claimed, error);
         }
-        Err(error) => {
-            let content = serde_json::to_value(rejection(&error.to_string()))
-                .map_err(|error| format!("finish rejection projection failed: {error}"))?;
-            let response =
-                finish_response_json(&claimed, "PLAN_GAP", &content, ProofCeiling::Observation)?;
-            finish_result_body(&claimed, response)
+        let accepted = {
+            let guard = composition.lock().await;
+            guard.accept_prepared_finish_exchange(prepared)
+        };
+        if let Err(error) = accepted {
+            return rejected_finish_result(&claimed, error);
         }
     }
+
+    // This refreshes the owner and derives the exact decision exchange from
+    // the image published by the evidence leg. Its transport is also unlocked.
+    let decision = {
+        let mut guard = composition.lock().await;
+        guard.prepare_finish_decision(&claimed.request_identity, &claimed.operation_id, draft)
+    };
+    let decision = match decision {
+        Ok(decision) => decision,
+        Err(error) => return rejected_finish_result(&claimed, error),
+    };
+    if let Some(prepared) = decision.exchange() {
+        if let Err(error) = prepared.exchange(kernel).await {
+            return rejected_finish_result(&claimed, error);
+        }
+        let accepted = {
+            let guard = composition.lock().await;
+            guard.accept_prepared_finish_exchange(prepared)
+        };
+        if let Err(error) = accepted {
+            return rejected_finish_result(&claimed, error);
+        }
+    }
+    let receipt = decision.into_decision();
+    let content = serde_json::to_value(&receipt)
+        .map_err(|error| format!("finish decision projection failed: {error}"))?;
+    let response = finish_response_json(
+        &claimed,
+        "CANDIDATE",
+        &content,
+        ProofCeiling::ScopedVerification,
+    )?;
+    finish_result_body(&claimed, response)
 }

@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
     CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
-    FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
-    KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
+    GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
+    KernelGenerationSnapshotProvider, PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -47,6 +47,7 @@ pub mod campaign_task_controller;
 pub use campaign_context_owner::build_context_owner_publications;
 pub use campaign_evaluation_owner::build_product_evaluation_publications;
 pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publications;
+pub use daemon_kernel_client::FinishSubmitOutcome;
 pub use finish_attempt::serve_finish_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;
@@ -1164,6 +1165,49 @@ impl DaemonComposition {
     // through the Governor finish owner, and `accept_prepared_exchange`
     // re-checks the pre-commit fence before the receipt is admitted.
 
+    /// Prepares the Governor-owned finish-evidence exchange without transporting it.
+    ///
+    /// Runtime callers hold the composition lock only for this synchronous phase,
+    /// then exchange the immutable plan through Kernel after releasing the lock.
+    pub fn prepare_finish_evidence(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_finish_evidence(identity, operation_id, draft)
+    }
+
+    /// Revalidates one exchanged finish leg against the live Governor owner.
+    pub fn accept_prepared_finish_exchange(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        self.governor.accept_prepared_exchange(prepared)
+    }
+
+    /// Refreshes canonical state and prepares the Governor-owned finish decision.
+    ///
+    /// The returned exchange is immutable and must be transported with the
+    /// composition lock released; the decision is projected only after it is
+    /// revalidated by [`Self::accept_prepared_finish_exchange`].
+    pub fn prepare_finish_decision(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<PreparedFinishDecision, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_finish_decision(identity, operation_id, draft)
+    }
+
     /// Returns the admitted Kernel snapshot.
     #[must_use]
     pub fn kernel_snapshot(&self) -> &eliot_governor::KernelGenerationSnapshot {
@@ -1945,31 +1989,6 @@ impl DaemonComposition {
         Ok(task_lifecycle_adapters::ForwardingTaskLifecycle::new(
             self.governor.task_lifecycle(),
         ))
-    }
-
-    /// Runs one strict finish candidate through the Governor finish owner
-    /// (issue #1741).
-    ///
-    /// The composed form of the evidence publish, decision derivation and
-    /// decision persist legs, for the caller that holds `&mut self` and
-    /// accepts that borrow across the exchanges. The identity and operation
-    /// are the exact Kernel-claimed pair; the draft is the exact admitted
-    /// strict candidate. The Finish service rehydrates current durable state —
-    /// never caller proof — and a stale fence, unknown task revision,
-    /// unexecuted verifier or caller-supplied proof fails closed in the
-    /// Governor owner before any decision exists.
-    pub async fn finish_attempt(
-        &mut self,
-        identity: &RequestIdentity,
-        operation_id: OperationId,
-        draft: FinishAttemptDraft,
-    ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
-        if self.readiness() != CompositionReadiness::Ready {
-            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
-        }
-        self.governor
-            .finish_attempt(identity, operation_id, draft)
-            .await
     }
 
     /// Borrows the single Governor Skill lifecycle owner as the provider-neutral
