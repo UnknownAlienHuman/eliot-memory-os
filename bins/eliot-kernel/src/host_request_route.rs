@@ -4561,9 +4561,12 @@ pub(crate) fn host_request_envelope_from_payload(
     Ok(envelope)
 }
 
-/// Converts only failures whose semantic owner and safe next step are exact at
-/// this validated request boundary. Unknown transport/commit outcomes and
-/// backpressure retain their existing transport behavior.
+/// Converts the failure families whose semantic owner and safe next step are
+/// exact at this validated request boundary into the canonical agent-facing
+/// envelope. Unknown transport/commit outcomes (I/O, protocol, unknown
+/// outcome, plan gaps, invalid limits or pipe names) retain their existing
+/// transport behavior because no exact Kernel semantic owner exists for them
+/// here.
 fn host_request_failure_response(
     operation: &str,
     envelope: &HostRequestEnvelope,
@@ -4608,6 +4611,52 @@ fn host_request_failure_response(
                     operation_identity,
                 )
             }
+            // A rehydrate or resolve that references an operation identity the
+            // Kernel does not retain is the same unknown-reference class as the
+            // cancellation parent above: the caller named an identity that is
+            // not present, so the exact request bytes are invalid for this
+            // Kernel state.
+            TransportError::UnknownRequest => (
+                AgentResponseDisposition::InvalidRequest,
+                "INVALID_ARGUMENT",
+                "the referenced operation identity is not present in Kernel host-request state",
+                "verify the exact operation handle against the retained operation, and submit no replacement until the referenced operation is settled",
+                "the authenticated Kernel session bound to this host request",
+                operation_identity,
+            ),
+            // The retained Session or its state fence went stale while the
+            // validated request was being served: the caller must reconnect
+            // and reconcile rather than resubmit changed bytes.
+            TransportError::SessionFenced => (
+                AgentResponseDisposition::StaleOrConflict,
+                "STALE_STATE_FENCE",
+                "the retained Kernel session or state fence is stale for this host request",
+                "reconnect through the authenticated Kernel session and reconcile the exact operation before resubmitting",
+                "the authenticated Kernel session bound to this host request",
+                operation_identity,
+            ),
+            // The host-request lane shed this request under capacity pressure.
+            // The agent-facing caller learns the exact capacity reason instead
+            // of a silent transport drop.
+            TransportError::Backpressure => (
+                AgentResponseDisposition::UnavailableOrCapacity,
+                "BUSY",
+                "the Kernel host-request lane is at capacity and shed this request",
+                "wait for host-request capacity to release, then resubmit the exact request bytes through the authenticated Kernel session",
+                "the authenticated Kernel session bound to this host request",
+                operation_identity,
+            ),
+            // The validated request did not produce a bounded result before its
+            // deadline; the caller reconciles the exact operation before any
+            // retry.
+            TransportError::Timeout => (
+                AgentResponseDisposition::UnavailableOrCapacity,
+                "DEADLINE_EXCEEDED",
+                "the Kernel did not return a bounded result before the host-request deadline",
+                "reconcile the exact operation through the authenticated Kernel session before resubmitting",
+                "the authenticated Kernel session bound to this host request",
+                operation_identity,
+            ),
             _ => return Ok(None),
         };
 
