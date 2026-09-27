@@ -1,0 +1,475 @@
+//! Canonical open I7.20 reason-code registry used by transport mapping and its
+//! generated human-readable projection.
+
+/// One canonical reason code and its stable I7.20 agent-facing group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentReasonCode {
+    /// Stable catalogue group.
+    pub group: &'static str,
+    /// Exact additive reason-code token.
+    pub code: &'static str,
+}
+
+/// Current canonical I7.20 reason-code set, grouped as in the contract.
+///
+/// Keep this table as the single source for bridge mapping and
+/// `docs/generated/reason-codes.md` (`python scripts/generate_reason_codes.py`).
+pub const AGENT_REASON_CODES: &[AgentReasonCode] = &[
+    AgentReasonCode {
+        group: "request/identity",
+        code: "INVALID_ARGUMENT",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "AUTHENTICATION_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "WORKSCOPE_UNAUTHENTICATED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "SCAN_PRIVACY_BOUNDARY_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "IDENTITY_CONFLICT",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "TASK_SELECTION_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "TASK_SCOPE_INCOMPATIBLE",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "DISPATCH_PERMIT_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "DRY_RUN_UNSUPPORTED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "PROCESS_OWNERSHIP_UNPROVEN",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "RESOURCE_LEASE_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "RESOURCE_IDENTITY_CHANGED",
+    },
+    AgentReasonCode {
+        group: "request/identity",
+        code: "RESOURCE_LEASE_REPLAYED",
+    },
+    AgentReasonCode {
+        group: "authority/policy",
+        code: "AUTHORITY_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "authority/policy",
+        code: "POLICY_DENIED",
+    },
+    AgentReasonCode {
+        group: "authority/policy",
+        code: "ACTION_LEASE_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "authority/policy",
+        code: "WRITESET_VIOLATION",
+    },
+    AgentReasonCode {
+        group: "authority/policy",
+        code: "IMPACT_ESCALATION_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "STALE_STATE_FENCE",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "STALE_AUTHORITY_EPOCH",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "STALE_PROJECTION",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "OBSERVATION_GAP",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "SCOPE_CONFLICT",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "CONFLICT_OPEN",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "CRITICAL_ATTENTION_OPEN",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "SEQUENCE_GAP_OPEN",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "TRANSITION_DIGEST_MISMATCH",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "AMBIGUOUS_RESULT",
+    },
+    AgentReasonCode {
+        group: "state/conflict",
+        code: "DESCENDANT_CLOSURE_INCOMPLETE",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "NEEDS_REASONING_CANDIDATE",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "CUE_BINDING_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "PACKET_REFRESH_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "PROBE_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "NOT_ONBOARDED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "CAPSULE_STALE",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "VERIFIER_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "VERIFIER_STALE",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "VERIFICATION_NOT_EXECUTED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "LEGACY_FINISH_INPUT_REJECTED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "DECISION_CONTEXT_INCOMPLETE",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "CONTEXT_PROFILE_UNVALIDATED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "TRACE_INCOMPLETE",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "REFERENCE_NOT_ALLOWED",
+    },
+    AgentReasonCode {
+        group: "cognition/proof",
+        code: "UNSUPPORTED_PRECISION",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "CAPABILITY_UNVERIFIED",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "CAPABILITY_DEGRADED",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "CAPABILITY_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "SUPERVISION_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "CAPABILITY_GRANT_REVOKED",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "CAPABILITY_INTRODUCTION_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "ROUTE_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "ROUTE_MISMATCH",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "RESEARCH_SOURCE_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "EXTERNAL_ATTACH_RECONCILIATION_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "ADAPTER_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "ADAPTER_INCOMPATIBLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "RUNTIME_FAILED",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "CANCELLATION_UNCONFIRMED",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "ENVIRONMENT_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "PROTOCOL_INCOMPATIBLE",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "NO_PROGRESS",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "TRANSLATION_LOSS_FORBIDDEN",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "STREAM_SEMANTIC_ORDER_VIOLATION",
+    },
+    AgentReasonCode {
+        group: "route/integration",
+        code: "MODEL_ATTEMPT_UNKNOWN_OUTCOME",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "INSTRUMENT_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "INSTRUMENT_FAILED",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "INSTRUMENT_PARSER_INCOMPATIBLE",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "INSTRUMENT_EVIDENCE_INCOMPLETE",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "INSTRUMENT_OUTPUT_TRUNCATED",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "PROCESS_TREE_CLEANUP_FAILED",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "TESTD_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "TESTD_JOB_FAILED",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "BUILD_SANDBOX_UNPROVEN",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "COMPONENT_INTERFACE_INCOMPATIBLE",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "COMPONENT_CAPABILITY_DENIED",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "COMPONENT_TRAP",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "COMPONENT_DIVERGENCE",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "COMPONENT_MIGRATION_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "SIMULATION_REPLAY_MISMATCH",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "GENERATION_PROMOTION_BLOCKED",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "NEGATIVE_RESULT_UNPROVEN",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "EVIDENCE_STALE",
+    },
+    AgentReasonCode {
+        group: "instrument/evidence",
+        code: "EVIDENCE_COVERAGE_PARTIAL",
+    },
+    AgentReasonCode {
+        group: "testing",
+        code: "TEST_INVENTORY_STALE",
+    },
+    AgentReasonCode {
+        group: "testing",
+        code: "TEST_POLICY_INCOMPLETE",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "BUSY",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "STATE_CHURN",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "DEADLINE_EXCEEDED",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "STORAGE_BACKPRESSURE",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "ACCEPTED_PENDING",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "DB_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "DEFERRED_CAPACITY",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "PROVIDER_QUOTA",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "BUDGET_EXHAUSTED",
+    },
+    AgentReasonCode {
+        group: "capacity/availability",
+        code: "MODULE_QUARANTINED",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "PRIVACY_DENIED",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "DISCLOSURE_CLOSURE_INCOMPLETE",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "OMITTED_SOURCE_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "SOURCE_QUARANTINED",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "ORIGIN_AUTHENTICATION_FAILED",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "EXECUTABLE_DEPENDENCY_UNAPPROVED",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "MIGRATION_MAPPING_INCOMPLETE",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "UNKNOWN_COMMIT",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "UNKNOWN_OUTCOME",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "RECOVERY_REQUIRED",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "RECOVERY_LOCK_UNAVAILABLE",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "CUTOVER_BLOCKED_INFLIGHT_EFFECT",
+    },
+    AgentReasonCode {
+        group: "security/recovery",
+        code: "INCIDENT_LOCKDOWN",
+    },
+];
+
+/// Kernel↔bridge legacy transport names and their canonical I7.20 aliases.
+pub const BRIDGE_REASON_CODE_ALIASES: &[(&str, &str)] = &[
+    ("TASK_SELECTION_REQUIRED", "TASK_SELECTION_REQUIRED"),
+    ("SCOPE_SELECTION_REQUIRED", "TASK_SCOPE_INCOMPATIBLE"),
+    ("SCOPE_AMBIGUOUS", "AMBIGUOUS_RESULT"),
+    ("NOT_READY", "DEFERRED_CAPACITY"),
+    ("STALE_FENCE", "STALE_STATE_FENCE"),
+    ("FAILED_INTERNAL", "RUNTIME_FAILED"),
+    ("SEMANTIC_RESOLUTION_UNAVAILABLE", "UNKNOWN_OUTCOME"),
+];
+
+/// Projects a known legacy transport name through the designated bridge alias table.
+#[must_use]
+pub fn bridge_reason_code_alias(legacy_code: &str) -> Option<&'static str> {
+    BRIDGE_REASON_CODE_ALIASES
+        .iter()
+        .find_map(|(legacy, canonical)| (*legacy == legacy_code).then_some(*canonical))
+}
+
+/// Looks up one known registry code while leaving open-code decoding to the wire types.
+#[must_use]
+pub fn agent_reason_code(code: &str) -> Option<&'static AgentReasonCode> {
+    AGENT_REASON_CODES.iter().find(|entry| entry.code == code)
+}

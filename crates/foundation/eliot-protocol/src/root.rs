@@ -12,6 +12,12 @@ pub use protocol_v1::*;
 
 pub mod activation_resolution_v1;
 
+mod reason_codes;
+pub use reason_codes::{
+    AGENT_REASON_CODES, AgentReasonCode, BRIDGE_REASON_CODE_ALIASES, agent_reason_code,
+    bridge_reason_code_alias,
+};
+
 mod activation_resolution;
 pub use activation_resolution::{
     AGENT_ACTIVATION_CLAIM_WIRE_ID, AGENT_ACTIVATION_CLAIM_WIRE_VERSION, AGENT_ACTIVATION_OWNER_ID,
