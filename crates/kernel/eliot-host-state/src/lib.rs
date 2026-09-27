@@ -37,13 +37,14 @@ pub use journal::{
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{
-    ActivationState, AppliedOperation, CleanMarker, CutoverIntentRecord, CutoverIntentState,
-    DependencyLifecycleBudget, DependencyRecord, DependencyResourceBudget, DependencyState,
-    DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord, EpochEvidence,
-    EpochRetirementRecord, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
-    HostObservationRecord, HostState, HostStateRecord, IdempotencyIdentity,
-    ImmutableProcessManifest, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
-    KernelRecord, LifecycleTimestamps, ManagedDependencyRecord, NonceState, OneTimeNonceState,
+    ActivationState, AppliedOperation, CanonicalStoreWriteRefusal, CleanMarker,
+    CutoverIntentRecord, CutoverIntentState, DependencyLifecycleBudget, DependencyRecord,
+    DependencyResourceBudget, DependencyState, DrainCommitRecord, DrainRecord, DrainState,
+    EliotActivationRecord, EpochEvidence, EpochRetirementRecord, FailureRecoveryDirective,
+    HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord, HostState,
+    HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
+    KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
+    ManagedDependencyRecord, NonceState, OneTimeNonceState,
     PREDECESSOR_RETIREMENT_RELATION_CONTRACT, PredecessorRetirementRelation,
     PriorKernelDisposition, PriorKernelSource, ReadinessApprovedContour, ReadinessEvidence,
     RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
