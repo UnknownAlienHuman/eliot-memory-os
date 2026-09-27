@@ -2471,8 +2471,8 @@ impl KernelComposition {
         // Both legs sealed in the chain retire the pre-persist spool. Any
         // missing leg keeps it for reconcile (a later `audit_chain_records`
         // completes the chain from it); a failed persist likewise leaves the
-        // spool in place so reconcile can still evidence the submission
-        // while the binding stays absent, accurately.
+        // spool in place, and reconcile drops it once the ORS record proves
+        // no completion, so the chain never carries an unproven binding.
         if submitted_ok && bound_ok {
             self.clear_pending_result_binding(&body.operation_id);
         }
