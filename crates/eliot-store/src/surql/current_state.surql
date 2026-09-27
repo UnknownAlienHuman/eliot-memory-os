@@ -39,12 +39,15 @@ LET $resolved = $claims.map(|$claim| {
 });
 LET $verified = $resolved[WHERE status = 'verified'
   AND failed_verification = false
+  AND visibility != 'private'
   AND lifecycle_state IN ['active', 'restored']];
 LET $supported = $resolved[WHERE status = 'supported'
   AND failed_verification = false
+  AND visibility != 'private'
   AND lifecycle_state IN ['active', 'restored']];
 LET $weak = $resolved[WHERE status = 'candidate'
   AND failed_verification = false
+  AND visibility != 'private'
   AND lifecycle_state IN ['active', 'restored']];
 LET $contested = $resolved[WHERE (failed_verification = true OR status = 'contested')
   AND lifecycle_state IN ['active', 'restored']];
