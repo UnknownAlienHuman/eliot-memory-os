@@ -200,6 +200,35 @@ pub async fn serve_finish_claim(
     if arguments.get(LEGACY_FINISH_PROOF_MEMBER).is_some() {
         return rejected_legacy_finish_proof(&claimed);
     }
+    // Issue #1782 (I11.11 line 42, I14.24 line 23): "Any request to continue
+    // Material work before that disposition returns
+    // `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED`", and "deny proof/finish and
+    // further Material work until reconciliation". The gate runs before strict
+    // draft decoding and before any evidence is prepared or exchanged, so an
+    // unreconciled attach of an already-running external agent can neither
+    // reach the Governor Finish owner nor produce a decision receipt. The
+    // refusal is the submitted typed result body the lane already uses, so the
+    // claimed candidate is consumed instead of stalling the queue, and it
+    // carries the stable I7.20 route/integration reason code verbatim.
+    let attach_refusal = {
+        let guard = composition.lock().await;
+        guard
+            .admit_material_continuation_after_attach(
+                eliot_workscope::RequestedEffect::MaterialEffect,
+            )
+            .err()
+            .map(|error| error.to_string())
+    };
+    if let Some(detail) = attach_refusal {
+        return rejected_finish_result_with_detail(
+            &claimed,
+            &detail,
+            (
+                AgentResponseDisposition::Denied,
+                crate::external_attach_reconciliation::EXTERNAL_ATTACH_RECONCILIATION_REQUIRED,
+            ),
+        );
+    }
     let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
         .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
 
