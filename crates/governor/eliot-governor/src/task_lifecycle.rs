@@ -54,10 +54,10 @@ use eliot_learning_contracts::{
 use eliot_store_api::{
     CONTRACT_VERSION, CampaignSourcePublication, EffectClass, EventProjectionRelationIntents,
     NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, ScopeId, SecurityContext, StoreEvidenceHandles,
-    StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
-    StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
-    WriteReceiptStatus,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RevisionHeadExpectation, ScopeId,
+    SecurityContext, StoreEvidenceHandles, StoreFailure, StoreFailureDisposition,
+    StoreFailureIdentityContext, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
+    StoreRetryDirective, TransitionClass, WriteReceipt, WriteReceiptStatus,
 };
 use eliot_task::{
     TaskCommand, TaskCommandContext, TaskError, TaskLifecycleEvent, TaskLifecycleOwner,
@@ -72,6 +72,66 @@ use crate::{
         TaskControllerCampaignSources, build_task_controller_campaign_sources,
     },
 };
+
+/// One canonical task transition prepared while the Governor composition is
+/// borrowed, ready to exchange through Kernel without retaining that borrow.
+/// The transition and its exact CAS heads are derived together from the
+/// admitted envelope; callers cannot substitute either after preparation.
+#[derive(Clone, Debug)]
+pub struct PreparedTaskTransition {
+    identity: eliot_protocol::RequestIdentity,
+    operation_id: OperationId,
+    transition: PreparedTransition,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    fence: StateFence,
+    manifest_digest: OperationManifestDigest,
+    failure_context: StoreFailureIdentityContext,
+}
+
+impl PreparedTaskTransition {
+    /// Exchanges the exact prepared transition and reconciles an unknown
+    /// acknowledgement against its original operation identity.
+    pub async fn exchange<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        let receipt = match port
+            .apply_prepared(
+                &self.identity,
+                self.transition.clone(),
+                self.expected_revision_heads.clone(),
+                self.expected_ordering_heads.clone(),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(KernelPortError::Unknown(_)) => match port.receipt(self.operation_id.clone()).await
+            {
+                Ok(Some(receipt)) => receipt,
+                Ok(None) | Err(KernelPortError::Unknown(_)) => {
+                    let failure =
+                        StoreFailure::from_provider_unknown_outcome(&self.failure_context)
+                            .map_err(|error| {
+                                TaskLifecycleError::Serialization(error.to_string())
+                            })?;
+                    return Err(TaskLifecycleError::Store(Box::new(failure)));
+                }
+                Err(other) => return Err(TaskLifecycleError::Kernel(other)),
+            },
+            Err(other) => return Err(TaskLifecycleError::Kernel(other)),
+        };
+        check_committed_receipt(
+            &receipt,
+            &self.operation_id,
+            &self.fence,
+            &self.identity.idempotency_key,
+            &self.manifest_digest,
+            &self.failure_context,
+        )?;
+        Ok(receipt)
+    }
+}
 
 /// Production adapter manifest name from the Surreal adapter.
 const PRODUCTION_MANIFEST_NAME: &str = "eliot.storage.store-surreal-adapter";
@@ -169,6 +229,239 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             kernel,
         }
     }
+
+    /// Prepares a recipe-bearing proposal using source heads read before the
+    /// caller acquires a composition lock. No Kernel I/O is performed here.
+    pub fn prepare_propose_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        source_heads: crate::campaign_task_sources::TaskControllerCampaignSourceHeads,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        self.check_proposal_identity(identity, &proposal)?;
+        let mut scratch = self.task.clone();
+        let event = scratch.propose(proposal.clone())?;
+        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted proposal".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            1,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            None,
+        )?;
+        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+    }
+
+    /// Prepares a recipe-bearing proposal with the complete authenticated
+    /// owner publication matrix. Source reads and publication assembly happen
+    /// before this synchronous guarded step.
+    pub fn prepare_propose_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        source_heads: crate::campaign_task_sources::TaskControllerCampaignSourceHeads,
+        owner_publications: Vec<CampaignSourcePublication>,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        self.check_proposal_identity(identity, &proposal)?;
+        let mut scratch = self.task.clone();
+        let event = scratch.propose(proposal.clone())?;
+        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted proposal".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications(&sources, owner_publications)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            1,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+    }
+
+    /// Prepares a recipe-bearing guarded command using source heads read
+    /// before the caller acquires a composition lock. Owner validation and
+    /// the task revision compare-and-swap remain in this guarded step.
+    pub fn prepare_apply_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        source_heads: crate::campaign_task_sources::TaskControllerCampaignSourceHeads,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        let (event, record, expected_revision) = self.checked_apply(identity, guarded)?;
+        let manifest_digest = production_manifest_digest()?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            None,
+        )?;
+        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+    }
+
+    /// Prepares a recipe-bearing guarded command with complete authenticated
+    /// owner publications. Its base revision is checked against the live
+    /// owner before an immutable canonical transition is returned.
+    pub fn prepare_apply_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        source_heads: crate::campaign_task_sources::TaskControllerCampaignSourceHeads,
+        owner_publications: Vec<CampaignSourcePublication>,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        let (event, record, expected_revision) = self.checked_apply(identity, guarded)?;
+        let manifest_digest = production_manifest_digest()?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications(&sources, owner_publications)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+    }
+
+    fn check_proposal_identity(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        proposal: &TaskProposal,
+    ) -> Result<(), TaskLifecycleError> {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&proposal.context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        Ok(())
+    }
+
+    fn checked_apply(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        guarded: GuardedTaskCommand,
+    ) -> Result<(TaskLifecycleEvent, TaskRecord, u64), TaskLifecycleError> {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let current = self
+            .task
+            .task(&task_id)
+            .ok_or_else(|| TaskLifecycleError::Owner(TaskError::TaskNotFound(task_id.clone())))?;
+        let expected_revision = context
+            .state_fence
+            .task_revision
+            .map_or(current.revision, TaskRevision::value);
+        let mut scratch = self.task.clone();
+        let event = scratch.apply(task_id.clone(), context, command)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted transition".to_owned(),
+            )
+        })?;
+        Ok((event, record, expected_revision))
+    }
+}
+
+/// Derives one immutable Canonical task transition from the exact admitted
+/// envelope. This mirrors `CanonicalAdmissionOwner::commit`'s identity
+/// binding checks while deliberately stopping before Kernel I/O.
+fn prepare_task_exchange(
+    canonical: &CanonicalAdmissionOwner,
+    identity: &eliot_protocol::RequestIdentity,
+    envelope: CanonicalWriteEnvelope,
+    manifest_digest: OperationManifestDigest,
+) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+    identity.validate().map_err(|error| {
+        TaskLifecycleError::Composition(CompositionError::Provider(error.to_string()))
+    })?;
+    if envelope.request != identity.request.metadata {
+        return Err(TaskLifecycleError::Composition(CompositionError::Provider(
+            "admitted request binding does not match the Canonical envelope request".to_owned(),
+        )));
+    }
+    if envelope.idempotency_key != identity.idempotency_key {
+        return Err(TaskLifecycleError::Composition(CompositionError::Provider(
+            "admitted idempotency key does not match the Canonical envelope".to_owned(),
+        )));
+    }
+    let transition = canonical.prepare(&envelope)?;
+    if transition.identity.idempotency_key != identity.idempotency_key
+        || transition.state_fence != identity.request.metadata.state_fence
+    {
+        return Err(TaskLifecycleError::Composition(CompositionError::Provider(
+            "immutable transition does not agree with the admitted request identity".to_owned(),
+        )));
+    }
+    let operation_id = envelope.operation_id;
+    let failure_context = store_failure_ctx(identity, &operation_id);
+    Ok(PreparedTaskTransition {
+        identity: identity.clone(),
+        operation_id,
+        transition,
+        expected_revision_heads: envelope.expected_revision_heads,
+        expected_ordering_heads: envelope.expected_ordering_heads,
+        fence: canonical.state_fence().clone(),
+        manifest_digest,
+        failure_context,
+    })
 }
 
 /// Reconstructs the production adapter manifest digest.

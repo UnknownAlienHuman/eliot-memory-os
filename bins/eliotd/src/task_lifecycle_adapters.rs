@@ -35,8 +35,8 @@
 #![forbid(unsafe_code)]
 
 use eliot_governor::{
-    GovernorTaskLifecycle, GuardedTaskCommand, KernelTransitionPort, TaskControllerCampaignSources,
-    TaskLifecycleError, TaskProposal, TaskRecord,
+    GovernorTaskLifecycle, GuardedTaskCommand, KernelTransitionPort, PreparedTaskTransition,
+    TaskControllerCampaignSources, TaskLifecycleError, TaskProposal, TaskRecord,
 };
 use eliot_learning_contracts::LearningStateViewRecipe;
 
@@ -58,6 +58,87 @@ impl<'a, P: ?Sized> ForwardingTaskLifecycle<'a, P> {
 }
 
 impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
+    /// Builds a canonical proposal transition without performing Kernel I/O.
+    pub fn prepare_propose_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        source_heads: eliot_governor::TaskControllerCampaignSourceHeads,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        self.inner.prepare_propose_task_with_learning_state_recipe(
+            identity,
+            operation_id,
+            proposal,
+            recipe,
+            source_heads,
+        )
+    }
+
+    /// Builds a canonical proposal transition with authenticated owner
+    /// publications, without performing Kernel I/O.
+    pub fn prepare_propose_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        source_heads: eliot_governor::TaskControllerCampaignSourceHeads,
+        owner_publications: Vec<eliot_store_api::CampaignSourcePublication>,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        self.inner
+            .prepare_propose_task_with_complete_campaign_sources(
+                identity,
+                operation_id,
+                proposal,
+                recipe,
+                source_heads,
+                owner_publications,
+            )
+    }
+
+    /// Builds a canonical guarded-command transition without performing
+    /// Kernel I/O.
+    pub fn prepare_apply_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        source_heads: eliot_governor::TaskControllerCampaignSourceHeads,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        self.inner.prepare_apply_task_with_learning_state_recipe(
+            identity,
+            operation_id,
+            guarded,
+            recipe,
+            source_heads,
+        )
+    }
+
+    /// Builds a guarded-command transition with authenticated owner
+    /// publications, without performing Kernel I/O.
+    pub fn prepare_apply_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        source_heads: eliot_governor::TaskControllerCampaignSourceHeads,
+        owner_publications: Vec<eliot_store_api::CampaignSourcePublication>,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        self.inner
+            .prepare_apply_task_with_complete_campaign_sources(
+                identity,
+                operation_id,
+                guarded,
+                recipe,
+                source_heads,
+                owner_publications,
+            )
+    }
+
     /// Forwards one authenticated task record read to the Governor owner.
     pub fn view(
         &self,

@@ -9,7 +9,8 @@
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
-    CampaignOwnerSourceInput, GuardedTaskCommand, TaskCommand, TaskCommandContext, TaskProposal,
+    CampaignOwnerSourceInput, GuardedTaskCommand, KernelTransitionPort, PreparedTaskTransition,
+    TaskCommand, TaskCommandContext, TaskProposal,
 };
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
@@ -29,6 +30,40 @@ use crate::{
     DaemonComposition, KernelContextReadClient,
     daemon_kernel_client::TaskControllerClaimedInvocation,
 };
+
+/// Task Controller input fully decoded and all required campaign reads
+/// completed before the daemon borrows the shared composition.
+pub struct PreparedTaskControllerClaim {
+    claimed: TaskControllerClaimedInvocation,
+    recipe: LearningStateViewRecipe,
+    source_heads: eliot_governor::TaskControllerCampaignSourceHeads,
+    owner_publications: Option<Vec<CampaignSourcePublication>>,
+    action: PreparedTaskControllerAction,
+}
+
+enum PreparedTaskControllerAction {
+    Propose(TaskProposal),
+    Apply(GuardedTaskCommand),
+}
+
+/// Either a bounded rejection body or an owned claim ready for guarded
+/// semantic preparation.
+pub enum TaskControllerClaimPreparation {
+    Rejected(TaskControllerResultBody),
+    Ready(PreparedTaskControllerClaim),
+}
+
+/// Canonical task plan plus the exact claim which will carry its result.
+pub struct PreparedTaskControllerExecution {
+    claimed: TaskControllerClaimedInvocation,
+    transition: PreparedTaskTransition,
+}
+
+pub enum TaskControllerTransitionPreparation {
+    Rejected(TaskControllerResultBody),
+    Failed(String),
+    Ready(PreparedTaskControllerExecution),
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,43 +227,39 @@ fn task_controller_rejection(
     )
 }
 
-/// Serve one exact Kernel-claimed Task Controller invocation.
-///
-/// The caller has already parsed and capability-bound the invocation and the
-/// Kernel-issued attempt. The recipe is validated here at the Governor
-/// boundary. When a complete owner bundle is requested, non-Task-Controller
-/// rows are re-read through the authenticated Kernel campaign-source route;
-/// caller-supplied owner rows and heads are rejected. Every native-input or
-/// transition failure is projected as a typed rejected result body; malformed
-/// caller material must not terminate the daemon or escape as an untyped poll
-/// error.
-#[allow(
-    clippy::large_futures,
-    clippy::too_many_lines,
-    reason = "the claim boundary preserves one exact owner transition and one fenced result body"
-)]
-pub async fn serve_task_controller_claim(
-    composition: &DaemonComposition,
+/// Decodes one claim and performs every external campaign read before the
+/// caller borrows the shared composition. Owner-specific checks still happen
+/// under that composition through `prepare_task_controller_transition`.
+pub async fn prepare_task_controller_claim(
     reads: &KernelContextReadClient,
+    kernel: &dyn KernelTransitionPort,
     claimed: TaskControllerClaimedInvocation,
-) -> Result<TaskControllerResultBody, String> {
+) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
     let recipe: LearningStateViewRecipe =
         match serde_json::from_value(invocation.learning_state_view_recipe.clone()) {
             Ok(recipe) => recipe,
-            Err(_) => return task_controller_rejection(&claimed, "invalid_recipe"),
+            Err(_) => {
+                return Ok(TaskControllerClaimPreparation::Rejected(
+                    task_controller_rejection(&claimed, "invalid_recipe")?,
+                ));
+            }
         };
     if recipe.validate().is_err()
         || recipe.binding.task_id.as_str() != invocation.task_id.as_str()
         || recipe.binding.scope.as_str() != invocation.work_scope_id
         || recipe.binding.state_fence != claimed.envelope.state_fence
     {
-        return task_controller_rejection(&claimed, "invalid_recipe");
+        return Ok(TaskControllerClaimPreparation::Rejected(
+            task_controller_rejection(&claimed, "invalid_recipe")?,
+        ));
     }
     let complete_owner_publications = match invocation.campaign_owner_materials.as_ref() {
         Some(materials) => {
             if reject_caller_owner_material(materials).is_err() {
-                return task_controller_rejection(&claimed, "invalid_owner_materials");
+                return Ok(TaskControllerClaimPreparation::Rejected(
+                    task_controller_rejection(&claimed, "invalid_owner_materials")?,
+                ));
             }
             match read_authenticated_owner_publications(
                 reads,
@@ -238,95 +269,158 @@ pub async fn serve_task_controller_claim(
             .await
             {
                 Ok(publications) => Some(publications),
-                Err(_) => return task_controller_rejection(&claimed, "owner_read_unavailable"),
+                Err(_) => {
+                    return Ok(TaskControllerClaimPreparation::Rejected(
+                        task_controller_rejection(&claimed, "owner_read_unavailable")?,
+                    ));
+                }
             }
         }
         None => None,
     };
 
-    let Ok(lifecycle) = composition.task_lifecycle() else {
-        return task_controller_rejection(&claimed, "owner_not_ready");
-    };
-    let outcome: Result<eliot_store_api::WriteReceipt, String> = match invocation.action {
+    let action = match invocation.action {
         TaskControllerAction::Propose => {
             let proposal: TaskProposal = match serde_json::from_value(invocation.task_input.clone())
             {
                 Ok(proposal) => proposal,
-                Err(_) => return task_controller_rejection(&claimed, "invalid_task_input"),
+                Err(_) => {
+                    return Ok(TaskControllerClaimPreparation::Rejected(
+                        task_controller_rejection(&claimed, "invalid_task_input")?,
+                    ));
+                }
             };
             if proposal.task_id != invocation.task_id {
-                return task_controller_rejection(&claimed, "invalid_task_input");
+                return Ok(TaskControllerClaimPreparation::Rejected(
+                    task_controller_rejection(&claimed, "invalid_task_input")?,
+                ));
             }
-            if let Some(publications) = complete_owner_publications {
-                lifecycle
-                    .propose_task_with_complete_campaign_sources(
-                        &claimed.request_identity,
-                        claimed.operation_id.clone(),
-                        proposal,
-                        recipe,
-                        publications,
-                    )
-                    .await
-                    .map_err(|_error| "transition_rejected".to_owned())
-            } else {
-                lifecycle
-                    .propose_task_with_learning_state_recipe(
-                        &claimed.request_identity,
-                        claimed.operation_id.clone(),
-                        proposal,
-                        recipe,
-                    )
-                    .await
-                    .map_err(|_error| "transition_rejected".to_owned())
-            }
+            PreparedTaskControllerAction::Propose(proposal)
         }
         TaskControllerAction::Apply => {
             let input: ApplyTaskInput = match serde_json::from_value(invocation.task_input.clone())
             {
                 Ok(input) => input,
-                Err(_) => return task_controller_rejection(&claimed, "invalid_task_input"),
+                Err(_) => {
+                    return Ok(TaskControllerClaimPreparation::Rejected(
+                        task_controller_rejection(&claimed, "invalid_task_input")?,
+                    ));
+                }
             };
-            if let Some(publications) = complete_owner_publications {
-                lifecycle
-                    .apply_task_with_complete_campaign_sources(
-                        &claimed.request_identity,
-                        claimed.operation_id.clone(),
-                        GuardedTaskCommand {
-                            task_id: invocation.task_id.clone(),
-                            context: input.context,
-                            command: input.command,
-                        },
-                        recipe,
-                        publications,
-                    )
-                    .await
-                    .map_err(|_error| "transition_rejected".to_owned())
-            } else {
-                lifecycle
-                    .apply_task_with_learning_state_recipe(
-                        &claimed.request_identity,
-                        claimed.operation_id.clone(),
-                        GuardedTaskCommand {
-                            task_id: invocation.task_id.clone(),
-                            context: input.context,
-                            command: input.command,
-                        },
-                        recipe,
-                    )
-                    .await
-                    .map_err(|_error| "transition_rejected".to_owned())
-            }
+            PreparedTaskControllerAction::Apply(GuardedTaskCommand {
+                task_id: invocation.task_id.clone(),
+                context: input.context,
+                command: input.command,
+            })
         }
     };
+    let source_heads = match kernel
+        .campaign_source_heads(
+            &invocation.task_id,
+            recipe.binding.scope.as_str(),
+            &claimed.envelope.state_fence,
+        )
+        .await
+    {
+        Ok(heads) => heads,
+        Err(_) => {
+            return Ok(TaskControllerClaimPreparation::Rejected(
+                task_controller_rejection(&claimed, "transition_rejected")?,
+            ));
+        }
+    };
+    Ok(TaskControllerClaimPreparation::Ready(
+        PreparedTaskControllerClaim {
+            claimed,
+            recipe,
+            source_heads,
+            owner_publications: complete_owner_publications,
+            action,
+        },
+    ))
+}
 
-    match outcome {
-        Ok(receipt) => task_controller_result_body(
-            &claimed,
-            json!({
-                "status": "committed",
-                "receipt": receipt,
-            }),
-        ),
-        Err(reason) => task_controller_rejection(&claimed, &reason),
+/// Applies the owned semantic preparation synchronously against the current
+/// composition. No external I/O is performed while the caller holds its lock.
+pub fn prepare_task_controller_transition(
+    composition: &DaemonComposition,
+    prepared: PreparedTaskControllerClaim,
+) -> TaskControllerTransitionPreparation {
+    let PreparedTaskControllerClaim {
+        claimed,
+        recipe,
+        source_heads,
+        owner_publications,
+        action,
+    } = prepared;
+    let Ok(lifecycle) = composition.task_lifecycle() else {
+        return match task_controller_rejection(&claimed, "owner_not_ready") {
+            Ok(body) => TaskControllerTransitionPreparation::Rejected(body),
+            Err(error) => TaskControllerTransitionPreparation::Failed(error),
+        };
+    };
+    let transition = match (action, owner_publications) {
+        (PreparedTaskControllerAction::Propose(proposal), Some(publications)) => lifecycle
+            .prepare_propose_task_with_complete_campaign_sources(
+                &claimed.request_identity,
+                claimed.operation_id.clone(),
+                proposal,
+                recipe,
+                source_heads,
+                publications,
+            ),
+        (PreparedTaskControllerAction::Propose(proposal), None) => lifecycle
+            .prepare_propose_task_with_learning_state_recipe(
+                &claimed.request_identity,
+                claimed.operation_id.clone(),
+                proposal,
+                recipe,
+                source_heads,
+            ),
+        (PreparedTaskControllerAction::Apply(guarded), Some(publications)) => lifecycle
+            .prepare_apply_task_with_complete_campaign_sources(
+                &claimed.request_identity,
+                claimed.operation_id.clone(),
+                guarded,
+                recipe,
+                source_heads,
+                publications,
+            ),
+        (PreparedTaskControllerAction::Apply(guarded), None) => lifecycle
+            .prepare_apply_task_with_learning_state_recipe(
+                &claimed.request_identity,
+                claimed.operation_id.clone(),
+                guarded,
+                recipe,
+                source_heads,
+            ),
+    };
+    match transition {
+        Ok(transition) => {
+            TaskControllerTransitionPreparation::Ready(PreparedTaskControllerExecution {
+                claimed,
+                transition,
+            })
+        }
+        Err(_) => match task_controller_rejection(&claimed, "transition_rejected") {
+            Ok(body) => TaskControllerTransitionPreparation::Rejected(body),
+            Err(error) => TaskControllerTransitionPreparation::Failed(error),
+        },
     }
+}
+
+/// Exchanges the exact owned task transition after the composition guard has
+/// been released, preserving the canonical receipt reconciliation contract.
+pub async fn exchange_task_controller_transition(
+    kernel: &dyn KernelTransitionPort,
+    execution: PreparedTaskControllerExecution,
+) -> Result<TaskControllerResultBody, String> {
+    let receipt = match execution.transition.exchange(kernel).await {
+        Ok(receipt) => receipt,
+        Err(_) => return task_controller_rejection(&execution.claimed, "transition_rejected"),
+    };
+    task_controller_result_body(
+        &execution.claimed,
+        json!({ "status": "committed", "receipt": receipt }),
+    )
 }
