@@ -2969,9 +2969,19 @@ pub(crate) fn snapshot_owner_maintenance_tick(now_ms: u64) -> Result<(), StoreEr
 /// and its deadline stays in the index, so skipping never forgets it.
 fn run_expiry_pass(states: &mut CaptureRegistry, now_ms: u64, keep: Option<&str>) {
     // The work this pass performs is itself a charged dimension, so an
-    // unbounded sweep cannot hide inside the accounting: the charge is taken
-    // before any step and returned when the pass ends. A saturated cleanup
-    // dimension is a refusal, never a silent full pass.
+    // unbounded sweep cannot hide inside the accounting: the whole
+    // allowance is taken before any step and the whole allowance is
+    // returned when the pass ends. A saturated cleanup dimension is a
+    // refusal, never a silent full pass.
+    //
+    // The returned amount is the *reserved* allowance, not the steps this
+    // pass happened to perform. Steps are the bound the loop enforces, not
+    // a transfer that outlives the pass, so nothing holds the charge once
+    // the pass is over. Returning only `steps` would leave the unspent
+    // remainder charged forever, and the first pass — which in a fresh
+    // process finds no due deadline and performs none — would saturate the
+    // dimension before any work was done, so every later pass, tick, page
+    // and close would be refused at the guard above.
     if states
         .budget
         .reserve(BudgetDimension::CleanupSteps, BUDGET_MAX_CLEANUP_STEPS)
@@ -3002,7 +3012,9 @@ fn run_expiry_pass(states: &mut CaptureRegistry, now_ms: u64, keep: Option<&str>
             states.expiry.insert(deadline);
         }
     }
-    states.budget.release(BudgetDimension::CleanupSteps, steps);
+    states
+        .budget
+        .release(BudgetDimension::CleanupSteps, BUDGET_MAX_CLEANUP_STEPS);
 }
 
 /// Performs the accounted payload-to-terminal transition for one retired
