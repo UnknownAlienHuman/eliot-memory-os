@@ -793,6 +793,9 @@ impl PromotionGate {
         if self.evidence_refs.is_empty() || self.independent_route_count == 0 {
             return Err(SkillError::IndependentEvidenceRequired);
         }
+        for reference in &self.evidence_refs {
+            text(reference, "gate.evidence_ref")?;
+        }
         // The route count is bound to evidence identities, never a bare
         // number: more claimed independent routes than evidence references
         // fails closed.
