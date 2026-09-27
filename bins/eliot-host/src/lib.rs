@@ -4428,26 +4428,31 @@ impl HostJobBranches {
     ) -> Result<BranchLiveness, String> {
         match child {
             Some(child) => {
-                let process = child.evidence().process();
-                if !child
-                    .job_processes()
-                    .map_err(|error| error.to_string())?
-                    .iter()
-                    .any(|observed| observed == process)
-                {
-                    return Err(
-                        "Job observation does not contain the exact launched process".to_owned(),
-                    );
-                }
                 match child.observe().map_err(|error| error.to_string())? {
                     eliot_platform_windows::RunningJobObservation::Running { active_processes }
                         if active_processes > 0 =>
                     {
+                        let process = child.evidence().process();
+                        if !child
+                            .job_processes()
+                            .map_err(|error| error.to_string())?
+                            .iter()
+                            .any(|observed| observed == process)
+                        {
+                            return Err(
+                                "Job observation does not contain the exact launched process"
+                                    .to_owned(),
+                            );
+                        }
                         Ok(BranchLiveness::Live)
                     }
                     eliot_platform_windows::RunningJobObservation::Running { .. } => {
                         Err("running observation reports zero active processes".to_owned())
                     }
+                    // A root-exit observation from the retained Job handle
+                    // routes this branch into cleanup even if member-history
+                    // readback cannot re-observe the root. Replacement still
+                    // requires terminal evidence for the whole Job lineage.
                     eliot_platform_windows::RunningJobObservation::RootExited { .. }
                     | eliot_platform_windows::RunningJobObservation::Exited { .. } => {
                         Ok(BranchLiveness::Dead)
@@ -4575,6 +4580,12 @@ impl HostJobBranches {
                 "approved generation material changed; bounded cutover is required".to_owned(),
             ));
         }
+        if self.approved_generation.as_ref() != Some(generation) {
+            return Err(HostError::ProcessContour(
+                "approved Kernel generation changed; existing recovery decision is required"
+                    .to_owned(),
+            ));
+        }
         let profile = self
             .launch
             .as_ref()
@@ -4659,12 +4670,20 @@ impl HostJobBranches {
                 let Some(child) = kernel.as_mut() else {
                     return Ok(());
                 };
-                child
-                    .terminate_in_place(0xE017_0001)
-                    .map(|_| {
+                let process = child.evidence().process().clone();
+                let job = child.job_identity().clone();
+                match child.terminate_in_place(0xE017_0001) {
+                    Ok(terminated)
+                        if terminated.job_empty()
+                            && terminated.root_reaped()
+                            && terminated.process() == &process
+                            && terminated.job_identity() == &job =>
+                    {
                         kernel.take();
-                    })
-                    .map_err(|_| ())
+                        Ok(())
+                    }
+                    Ok(_) | Err(_) => Err(()),
+                }
             },
             || {
                 self.relaunch_kernel(
@@ -7263,6 +7282,7 @@ impl HostComposition {
                 "unsupported runtime-control operation".to_owned(),
             ));
         }
+
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(existing) = self.runtime_restarts.get(&key).cloned() {
             return Ok(existing);
@@ -7270,6 +7290,18 @@ impl HostComposition {
         if has_runtime_restart_pending(self.launch_options.host_state_root(), &key)? {
             return Err(HostError::RecoveryRequired(
                 "Kernel restart intent is pending and outcome is unknown; reconcile required"
+                    .to_owned(),
+            ));
+        }
+        let active_manifest = self
+            .registry
+            .active()
+            .ok_or_else(|| HostError::ProcessContour("no active manifest".to_owned()))?
+            .manifest
+            .clone();
+        if self.jobs.approved_generation.as_ref() != Some(&active_manifest.generation) {
+            return Err(HostError::ProcessContour(
+                "Kernel restart target differs from the retained approved generation; recovery decision required"
                     .to_owned(),
             ));
         }
@@ -7389,12 +7421,6 @@ impl HostComposition {
                 "Prior kernel disposition does not match durable terminated evidence".to_owned(),
             ));
         }
-        let active_manifest = self
-            .registry
-            .active()
-            .ok_or_else(|| HostError::ProcessContour("no active manifest".to_owned()))?
-            .manifest
-            .clone();
         let (kernel_artifact, _) = active_manifest
             .host_child_artifact_digests()
             .map_err(|e| HostError::ProcessContour(e.to_string()))?;
