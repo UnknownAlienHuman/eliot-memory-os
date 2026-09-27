@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::compatibility_handshake::{
     AcceptedCompatibilityEvidence, HANDSHAKE_ENVELOPE_VERSION, expected_seal_tag,
 };
-use super::process_health::{CapabilityReadiness, ProcessHealthStatus};
+use super::process_health::{CapabilityHealth, CapabilityReadiness, ProcessHealthStatus};
 use crate::error::{KernelError, KernelResult};
 
 /// Architecture digest from the accepted normative-pair receipt.
@@ -167,6 +167,24 @@ impl KernelRuntimeHealthEvidence {
     #[must_use]
     pub fn capability_readiness(&self) -> &[CapabilityReadiness] {
         &self.capability_readiness
+    }
+
+    /// Publishes every declared capability's own capability-scoped health
+    /// result against this carrier's process observation.
+    ///
+    /// I1.10 requires that a component be `READY` only for the capabilities
+    /// whose required dimensions pass. Each result is computed from that
+    /// capability's declared dimensions and their independently observed
+    /// values, so the readiness decision consults the real per-capability
+    /// dimension results; a capability whose freshness is not healthy is
+    /// published as not current with its failing dimension named, rather than
+    /// silently advertising a current capability.
+    #[must_use]
+    pub fn capability_health(&self) -> Vec<CapabilityHealth> {
+        self.capability_readiness
+            .iter()
+            .map(|readiness| self.process_health.capability_health(readiness))
+            .collect()
     }
 
     /// Returns the authenticated authority epoch.

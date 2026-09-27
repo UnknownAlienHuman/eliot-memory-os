@@ -11,7 +11,8 @@
 //! - the runtime generation route table and cutover decisions
 //!   ([`GenerationRouter`], [`CutoverDecision`]);
 //! - the I1.10 process-health projection kept separate from generation and
-//!   cutover state ([`ProcessHealthStatus`], [`CapabilityReadiness`]);
+//!   cutover state ([`ProcessHealthStatus`], [`CapabilityReadiness`],
+//!   [`CapabilityHealth`]);
 //! - the bounded control reserve and synchronous front door
 //!   ([`ControlReserve`], [`FrontDoor`]);
 //! - the role-filtered recovery view ([`RecoveryViewBuilder`]).
@@ -87,7 +88,8 @@ pub use module::notification_state::{
     ResolutionAuthorization, ResolutionRef,
 };
 pub use module::process_health::{
-    CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
+    CapabilityHealth, CapabilityReadiness, HealthDimensionKind, HealthDimensionOutcome,
+    ProcessHealthStatus, ProcessHealthVector,
 };
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
 pub use module::runtime_health::{

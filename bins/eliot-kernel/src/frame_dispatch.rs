@@ -121,6 +121,75 @@ fn observe_frame(event: &'static str, outcome: &'static str) {
     );
 }
 
+/// Publishes one capability-scoped health result on the Kernel diagnostics
+/// plane.
+///
+/// The observation carries the fixed dimension vocabulary, each dimension's own
+/// observed result, and one bounded capability label. The process identity, the
+/// authority epoch and the cutover record stay in the authenticated carrier;
+/// this makes the per-capability dimension vector and a visible stale/not-fresh
+/// condition observable without exporting authority or secret material into
+/// logs (I15.4, I07.20).
+fn observe_runtime_capability_health(capability: &eliot_kernel_core::CapabilityHealth) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    use eliot_runtime_contracts::HealthDimension;
+
+    let capability_bound = bound_field(capability.capability());
+    let dimension_name = |kind: &HealthDimensionKind| -> &'static str {
+        match kind {
+            HealthDimensionKind::Liveness => "LIVENESS",
+            HealthDimensionKind::Readiness => "READINESS",
+            HealthDimensionKind::Freshness => "FRESHNESS",
+            HealthDimensionKind::Compatibility => "COMPATIBILITY",
+            HealthDimensionKind::Integrity => "INTEGRITY",
+            HealthDimensionKind::Capacity => "CAPACITY",
+            HealthDimensionKind::SupervisionCoverage => "SUPERVISION_COVERAGE",
+        }
+    };
+    let dimension_result = |outcome: &eliot_kernel_core::HealthDimensionOutcome| -> &'static str {
+        match outcome.observed {
+            HealthDimension::Unknown => "UNKNOWN",
+            HealthDimension::Healthy => "HEALTHY",
+            HealthDimension::Degraded => "DEGRADED",
+            HealthDimension::Failed => "FAILED",
+        }
+    };
+    // Every declared dimension is published with its own result, so one
+    // unhealthy dimension is visible instead of being hidden behind a summary.
+    let dimensions: Vec<String> = capability
+        .required()
+        .iter()
+        .map(|outcome| {
+            format!(
+                "{}={}",
+                dimension_name(&outcome.dimension),
+                dimension_result(outcome)
+            )
+        })
+        .collect();
+    let failing: Vec<&str> = capability.failing().iter().map(dimension_name).collect();
+    let current_bound = bound_field(if capability.is_current() {
+        "current"
+    } else {
+        "not_current"
+    });
+    let stale_bound = bound_field(if capability.is_stale() {
+        "stale"
+    } else {
+        "fresh"
+    });
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = "kernel.health.capability_projected",
+        outcome = current_bound.text(),
+        capability = capability_bound.text(),
+        dimensions = dimensions.join(","),
+        failing = failing.join(","),
+        freshness = stale_bound.text(),
+        "capability-scoped health observation"
+    );
+}
+
 /// Stable name of the route one admitted action actually took.
 ///
 /// I16.5 asks for requested-vs-actual route, so the actual route is named in one
@@ -313,11 +382,18 @@ impl KernelComposition {
             cutover_state,
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        // I1.10: a component is `READY` only for the capabilities whose
+        // required dimensions pass. `worker.execute` dispatches work against the
+        // admitted generation's derived state, so freshness is a required
+        // dimension here: a live process whose graph is not current must not
+        // advertise this capability, and the resulting not-fresh result is
+        // published with the failing dimension rather than silently dropped.
         let capability_readiness = CapabilityReadiness::new(
             RUNTIME_HEALTH_CAPABILITY,
             vec![
                 HealthDimensionKind::Liveness,
                 HealthDimensionKind::Readiness,
+                HealthDimensionKind::Freshness,
                 HealthDimensionKind::Compatibility,
                 HealthDimensionKind::Integrity,
                 HealthDimensionKind::Capacity,
@@ -337,12 +413,23 @@ impl KernelComposition {
             super::dispatch_launch::doctor_repair_advertised(),
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        // I1.10: the carrier is published with the capability-scoped result the
+        // producer actually observes, and it is read back from the validated
+        // carrier rather than recomputed. This is the production binding of the
+        // readiness decision to the per-capability dimension results: an
+        // alive-but-not-fresh process still gets a published carrier, but that
+        // carrier names `worker.execute` as not current with `FRESHNESS` as the
+        // failing dimension, so a consumer can never read a current capability
+        // out of a stale process.
+        for capability in evidence.capability_health() {
+            observe_runtime_capability_health(&capability);
+        }
         Ok(evidence)
     }
 
-    /// Only an ORS record for this authenticated daemon generation and epoch
-    /// can complete the carrier's independent cutover state. An empty, stale,
-    /// unrelated, or unreadable projection remains explicitly Preparing.
+    /// Reads route-switch status from the durable cutover record for this
+    /// authenticated daemon generation and epoch. An empty, stale, unrelated,
+    /// or unreadable projection remains explicitly Preparing.
     ///
     /// A durable `GenerationCutoverRecord` carries only a bare epoch sequence,
     /// so it can never establish the lineage of the presented
@@ -352,6 +439,15 @@ impl KernelComposition {
     /// holds. Two lineages at the same sequence are unrelated, and a record
     /// from a superseded lineage stays historical instead of completing a
     /// restore that minted a new one.
+    ///
+    /// The state is read FROM the matched cutover record itself and is never
+    /// inferred from the process state or the generation state. The newest
+    /// matching record wins, so a later cutover for the same generation is the
+    /// current route-switch status rather than an older one. A committed record
+    /// is reported as `Reconciling` rather than `Completed`: the ORS route
+    /// projection publishes the committed linearization point, and the
+    /// terminal `COMPLETED` transition is the reconciler's to record, so this
+    /// projection never claims a completion the record does not contain.
     fn runtime_cutover_state(
         &self,
         generation: eliot_contracts::ResourceGeneration,
@@ -378,16 +474,26 @@ impl KernelComposition {
         else {
             return GenerationCutoverState::Preparing;
         };
-        if cutovers.iter().any(|snapshot| {
-            let record = snapshot.record();
-            record.route_scope == RUNTIME_HEALTH_ROUTE_SCOPE
-                && record.state == GenerationCutoverState::Committed
-                && record.new_generation == generation
-                && record.new_epoch.value() == authority_epoch.sequence.get()
-        }) {
-            GenerationCutoverState::Completed
-        } else {
-            GenerationCutoverState::Preparing
+        match cutovers
+            .iter()
+            .filter(|snapshot| {
+                let record = snapshot.record();
+                record.route_scope == RUNTIME_HEALTH_ROUTE_SCOPE
+                    && record.new_generation == generation
+                    && record.new_epoch.value() == authority_epoch.sequence.get()
+            })
+            .max_by_key(|snapshot| snapshot.operation_order())
+        {
+            // The record is the owner of route-switch status, so its own state
+            // is projected verbatim. `Committed` is the ORS linearization point
+            // the published route projection exposes; reporting it as
+            // `Reconciling` keeps the projection honest that reconciliation has
+            // not been recorded as terminal on this record.
+            Some(snapshot) => match snapshot.record().state {
+                GenerationCutoverState::Committed => GenerationCutoverState::Reconciling,
+                state => state,
+            },
+            None => GenerationCutoverState::Preparing,
         }
     }
 
