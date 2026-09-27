@@ -1443,8 +1443,9 @@ fn validate_committed_projection_publications(
 /// exact subject/scope. All `SurrealQL` stays in `apply`/`schema` modules;
 /// this boundary carries store-api types only (plus the local intent/outcome
 /// model in `atomic_write`, since the neutral purge port is defined in a
-/// parallel subtask and is not yet on this base; the adapter never imports
-/// `eliot-erasure`).
+/// parallel subtask and is not yet on this base; the canonical erasure path
+/// lives in `eliot-store-api` `erasure_admission` and `ErasureIntentRecord`,
+/// not in a separate crate).
 ///
 /// `record_surreal_erasure_intent` validates and freezes the intent: in the
 /// live path the returned intent is the durable row the atomic transaction
