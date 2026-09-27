@@ -41,7 +41,9 @@ use crate::types::{RuntimeError, Sha256Digest};
 /// There is no "pass because it built" variant: a receipt that does not
 /// reference every required class for its contour is `Incomplete`, never a
 /// pass.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PromotionDisposition {
     /// Every evidence class required for this component's contour count is
@@ -76,7 +78,9 @@ impl PromotionDisposition {
 /// This is the recorded inventory fact a receipt is evaluated against, not a
 /// request. A component with one contour states so and requires no
 /// cross-contour evidence.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ContourCount {
     /// Exactly one contour: no cross-contour conformance corpus exists or is
@@ -92,7 +96,11 @@ impl ContourCount {
     /// component is actually served on.
     #[must_use]
     pub const fn of(backends: usize) -> Self {
-        if backends > 1 { Self::Multi } else { Self::Single }
+        if backends > 1 {
+            Self::Multi
+        } else {
+            Self::Single
+        }
     }
 }
 
@@ -105,7 +113,9 @@ impl ContourCount {
 /// contours as they serve a component. [`ComponentBackend::PureCore`] names the
 /// pure reference core, which is a conformance reference rather than a
 /// dispatch contour.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ComponentBackend {
     /// The pure reference core (no engine, no process, no I/O).
@@ -180,7 +190,9 @@ impl EngineCompatibility {
 /// component that exports and imports no state states that fact explicitly
 /// rather than leaving the class absent, so an absent class always means "not
 /// run" and never "nothing to do".
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MigrationDisposition {
     /// The component exports and imports no state; there is nothing to
@@ -303,7 +315,10 @@ impl CrossContourEvidence {
             Some("cancellation_and_trap_contained")
         } else if !self.deterministic_replay.unwrap_or(false) {
             Some("deterministic_replay")
-        } else if !self.migration.is_some_and(MigrationDisposition::admits_promotion) {
+        } else if !self
+            .migration
+            .is_some_and(MigrationDisposition::admits_promotion)
+        {
             Some("migration")
         } else if !self.shadow_divergence_resolved.unwrap_or(false) {
             Some("shadow_divergence_resolved")
@@ -460,7 +475,10 @@ impl ComponentPromotionReceipt {
         let ComponentContourEvidence::MultiContour(evidence) = &self.evidence else {
             return true;
         };
-        match (&evidence.engine_compatibility, &self.host_engine_compatibility) {
+        match (
+            &evidence.engine_compatibility,
+            &self.host_engine_compatibility,
+        ) {
             (Some(produced), Some(host)) => produced != host,
             _ => true,
         }
