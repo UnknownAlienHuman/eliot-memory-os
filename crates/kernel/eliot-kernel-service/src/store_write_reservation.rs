@@ -156,6 +156,8 @@ pub const RESERVATION_VISIBILITY: &str = "owner-only";
 /// Reason label recorded when a send resolves to a still-unknown outcome.
 pub const UNKNOWN_OUTCOME_REASON: &str = "store-unknown-outcome";
 
+const STARTUP_RESERVATION_SCAN_SOURCE: &str = "ors.pending_reservations";
+
 /// Typed failure for reserved-write binding, dispatch, and reconciliation.
 ///
 /// Every variant preserves the operation identity it refuses; no variant
@@ -1399,41 +1401,75 @@ pub struct StartupUnknownOperation {
 /// Step-6 readiness verdict over a startup reconciliation report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupReconciliationReadiness {
-    /// No pending, no unknown, scan complete: Kernel may record step 6.
+    /// The ORS pending-reservation scan is exhausted and has no unresolved rows.
+    /// This reservation-only result does not certify the complete W5 startup gate.
     Ready,
-    /// Remainder exists or the scan truncated: step 6 stays absent and
-    /// ordinary admission stays fenced.
+    /// A reservation remains unresolved or the bounded reservation scan did not
+    /// reach exhaustion.
     Blocked,
 }
 
-/// Bounded startup reconciliation report (I1.11 step 6).
+/// Bounded reconciliation report for the ORS pending-reservation source only.
 ///
 /// Produced by [`reconcile_pending_at_startup`] from the persisted ORS
-/// recovery projection plus exact canonical Store receipt observations.
+/// reservation recovery pages plus exact canonical Store receipt observations.
 /// A missing or ambiguous receipt leaves its token unresolved and
-/// reported; nothing is synthesized, retried, or released to pass.
+/// reported; nothing is synthesized, retried, or released to pass. This does
+/// not enumerate checkpoint/inbox obligations or retained Problems, open or
+/// integrity-check the protected ORS root, rebuild projections, or certify the
+/// full W5 startup readiness gate.
 #[derive(Clone, Debug)]
 pub struct StartupReconciliation {
     /// Live fence the scan ran under; Kernel matches it exactly.
     pub fence: StateFence,
-    /// Digest over fence, counts and sorted reported identities.
+    /// Digest over the fence, source, cursor coverage and every returned
+    /// reservation identity/outcome.
     pub digest: String,
-    /// Reservations examined (bounded by the caller limit).
+    /// Number of nonterminal reservation rows returned and examined, bounded by
+    /// `scan_limit`.
     pub scanned: u64,
+    /// Exact source covered by this report: `ors.pending_reservations`.
+    pub scan_source: &'static str,
+    /// Exclusive starting cursor used for the first page.
+    pub cursor_start_after_order: u64,
+    /// Last reservation order returned by the scan, if any.
+    pub last_reservation_order: Option<u64>,
+    /// ORS continuation cursor when the whole-scan bound stopped traversal.
+    pub next_after_order: Option<u64>,
+    /// Whole-scan ceiling supplied by the caller; receipt lookups never exceed
+    /// this count. Individual page sizes also respect the ORS page ceiling.
+    pub scan_limit: u16,
     /// Unresolved non-unknown operations.
     pub pending: Vec<StartupPendingOperation>,
     /// Ambiguous operations that must stay unresolved.
     pub unknown: Vec<StartupUnknownOperation>,
-    /// True when the recovery scan truncated: the report is partial and
-    /// step 6 is blocked regardless of the listed sets.
+    /// True when more pending reservations exist after the whole-scan bound;
+    /// the reservation-only readiness verdict is blocked.
     pub truncated: bool,
 }
 
 impl StartupReconciliation {
-    /// Step-6 verdict: `Ready` only on a complete scan with empty pending
-    /// and unknown sets; anything else (including truncation) is `Blocked`.
+    /// Returns the verdict for this reservation scan only: `Ready` requires
+    /// source/cursor consistency, exhaustion, and empty pending/unknown sets.
+    /// This must not be used as the complete W5 startup readiness gate because
+    /// other durable obligation sources are not covered here.
     pub fn readiness(&self) -> StartupReconciliationReadiness {
-        if !self.truncated && self.pending.is_empty() && self.unknown.is_empty() {
+        let cursor_coverage_is_consistent = self.scan_source == STARTUP_RESERVATION_SCAN_SOURCE
+            && self.scan_limit > 0
+            && self.cursor_start_after_order == 0
+            && self.scanned <= u64::from(self.scan_limit)
+            && (self.scanned == 0) == self.last_reservation_order.is_none()
+            && if self.truncated {
+                self.next_after_order.is_some()
+                    && self.next_after_order == self.last_reservation_order
+            } else {
+                self.next_after_order.is_none()
+            };
+        if cursor_coverage_is_consistent
+            && !self.truncated
+            && self.pending.is_empty()
+            && self.unknown.is_empty()
+        {
             StartupReconciliationReadiness::Ready
         } else {
             StartupReconciliationReadiness::Blocked
@@ -1520,11 +1556,156 @@ fn reservation_state_name(state: ReservationState) -> &'static str {
     }
 }
 
+fn startup_reservation_scan_entry(
+    token: &WriterReservationToken,
+    state: ReservationState,
+    outcome: &str,
+) -> String {
+    let mut entry = String::new();
+    append_startup_digest_field(&mut entry, token.operation_id.as_str());
+    append_startup_digest_field(&mut entry, token.reservation_id.as_str());
+    append_startup_digest_field(&mut entry, &token.reservation_order.to_string());
+    append_startup_digest_field(&mut entry, reservation_state_name(state));
+    append_startup_digest_field(&mut entry, token.recovery_owner.as_str());
+    append_startup_digest_field(&mut entry, token.writer_epoch.current.lineage_id.as_str());
+    append_startup_digest_field(&mut entry, &token.writer_epoch.current.epoch.to_string());
+    match &token.writer_epoch.predecessor {
+        Some(predecessor) => {
+            append_startup_digest_field(&mut entry, "predecessor");
+            append_startup_digest_field(&mut entry, predecessor.lineage_id.as_str());
+            append_startup_digest_field(&mut entry, &predecessor.epoch.to_string());
+        }
+        None => append_startup_digest_field(&mut entry, "no-predecessor"),
+    }
+    append_startup_digest_field(&mut entry, &token.state_fence.sha256);
+    append_startup_digest_field(
+        &mut entry,
+        &token.state_fence.observed_authority_epoch.to_string(),
+    );
+    append_startup_digest_field(&mut entry, &token.prepared_transition_sha256);
+    let mut scope_bindings: Vec<_> = token.scopes.iter().collect();
+    scope_bindings.sort_unstable_by(|left, right| left.scope.as_str().cmp(right.scope.as_str()));
+    append_startup_digest_field(&mut entry, &scope_bindings.len().to_string());
+    for scope in scope_bindings {
+        append_startup_digest_field(&mut entry, scope.scope.as_str());
+        append_startup_digest_field(&mut entry, &scope.reserved_sequence.to_string());
+        append_startup_digest_field(&mut entry, &scope.expected_head.sequence.to_string());
+        append_startup_digest_field(&mut entry, &scope.expected_head.head_sha256);
+        match &scope.expected_head.revision_head {
+            Some(revision_head) => {
+                append_startup_digest_field(&mut entry, "revision-head");
+                append_startup_digest_field(&mut entry, revision_head);
+            }
+            None => append_startup_digest_field(&mut entry, "no-revision-head"),
+        }
+    }
+    append_startup_digest_field(&mut entry, outcome);
+    entry
+}
+
+fn append_startup_digest_field(encoded: &mut String, value: &str) {
+    encoded.push_str(&value.len().to_string());
+    encoded.push(':');
+    encoded.push_str(value);
+}
+
+fn startup_reservation_scan_integrity_error(reason: impl Into<String>) -> ReservationWriteError {
+    ReservationWriteError::Ors(eliot_ors::OrsError::IntegrityProblem {
+        record_type: "startup_reservation_cursor",
+        reason: reason.into(),
+    })
+}
+
+struct StartupReservationPageScan {
+    cursor_start_after_order: u64,
+    scanned: u16,
+    last_reservation_order: Option<u64>,
+    next_after_order: Option<u64>,
+    truncated: bool,
+    records: Vec<ReservationRecord>,
+}
+
+fn scan_startup_reservation_pages(
+    owner: &CompositionReservation,
+    limit: u16,
+) -> Result<StartupReservationPageScan, ReservationWriteError> {
+    let cursor_start_after_order = 0;
+    let mut after_order = cursor_start_after_order;
+    let mut scanned = 0u16;
+    let mut last_reservation_order = None;
+    let mut next_after_order = None;
+    let mut truncated = false;
+    let mut records = Vec::new();
+
+    loop {
+        let remaining = limit - scanned;
+        let page_limit = remaining.min(eliot_ors::MAX_RECOVERY_PAGE);
+        let cursor = RecoveryCursor::new(after_order, page_limit)?;
+        let page = owner.ors.recover_page(cursor)?;
+        let page_record_count = page.records.len();
+        if page_record_count > usize::from(page_limit) {
+            return Err(startup_reservation_scan_integrity_error(format!(
+                "page returned {page_record_count} rows for limit {page_limit}"
+            )));
+        }
+
+        let mut page_last_order = None;
+        for record in &page.records {
+            let order = record.token.reservation_order;
+            if order <= after_order || page_last_order.is_some_and(|previous| order <= previous) {
+                return Err(startup_reservation_scan_integrity_error(format!(
+                    "reservation order {order} did not advance exclusive cursor {after_order}"
+                )));
+            }
+            page_last_order = Some(order);
+        }
+
+        if let Some(next) = page.next_after_order
+            && (page_record_count != usize::from(page_limit)
+                || page_last_order != Some(next)
+                || next <= after_order)
+        {
+            return Err(startup_reservation_scan_integrity_error(format!(
+                "continuation cursor {next} does not match the last row of a full page after {after_order}"
+            )));
+        }
+
+        let page_covered = u16::try_from(page_record_count).map_err(|_| {
+            startup_reservation_scan_integrity_error("page row count exceeds the bounded counter")
+        })?;
+        scanned += page_covered;
+        if page_last_order.is_some() {
+            last_reservation_order = page_last_order;
+        }
+        records.extend(page.records);
+
+        match page.next_after_order {
+            Some(next) if scanned == limit => {
+                truncated = true;
+                next_after_order = Some(next);
+                break;
+            }
+            Some(next) => after_order = next,
+            None => break,
+        }
+    }
+
+    Ok(StartupReservationPageScan {
+        cursor_start_after_order,
+        scanned,
+        last_reservation_order,
+        next_after_order,
+        truncated,
+        records,
+    })
+}
+
 /// Reconciles persisted pending/unknown ORS reservations against exact
-/// canonical Store receipts at startup (I1.11 step 6).
+/// canonical Store receipts at startup. This helper covers only the ORS
+/// pending-reservation source; it is not a complete W5 startup gate.
 ///
-/// For every non-terminal reservation in one bounded recovery page, this
-/// observes the exact Store receipt by operation identity: a committed
+/// For every non-terminal reservation up to the caller's whole-scan `limit`,
+/// this observes the exact Store receipt by operation identity: a committed
 /// (or terminally not-applied, receipt-proven) answer reconciles and
 /// finalizes through the real receipt path, so resolved work leaves no
 /// trace in the report. Records minted under a different writer epoch
@@ -1535,20 +1716,23 @@ fn reservation_state_name(state: ReservationState) -> &'static str {
 /// reported honestly: unknown outcomes stay unresolved, and a failed
 /// check is an error, never a synthetic empty report.
 ///
-/// Bounds: at most `limit` reservations are examined and at most one
-/// Store receipt is observed per examined reservation. A truncated scan
-/// sets `truncated` and blocks regardless of the listed sets.
+/// Bounds: `limit` is the whole-scan ceiling, not a page size. Each ORS request
+/// is additionally capped at `MAX_RECOVERY_PAGE`; no more than `limit` rows are
+/// collected and no more than `limit` Store receipts are observed. A continued
+/// cursor at that ceiling sets `truncated`, records exact reservation cursor
+/// coverage and blocks this scan verdict. ORS corruption and malformed,
+/// missing, repeated or non-progressing continuation pages fail closed.
 pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
     owner: &CompositionReservation,
     fence: &StateFence,
     store: &EbpCanonicalStoreClient<T>,
     limit: u16,
 ) -> Result<StartupReconciliation, ReservationWriteError> {
-    let page = recovery_page(owner, limit)?;
-    let truncated = page.next_after_order.is_some();
+    let scan = scan_startup_reservation_pages(owner, limit)?;
     let mut pending = Vec::new();
     let mut unknown = Vec::new();
-    for record in &page.records {
+    let mut scan_entries = Vec::with_capacity(scan.records.len());
+    for record in &scan.records {
         let token = &record.token;
         let operation_id = token.operation_id.as_str().to_owned();
         let mut scopes: Vec<String> = token
@@ -1559,6 +1743,16 @@ pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
         scopes.sort_unstable();
         let recovery_owner = token.recovery_owner.as_str().to_owned();
         let entry = reconcile_one_record(owner, store, record).await?;
+        let outcome_for_digest = match &entry {
+            StartupRecordOutcome::Resolved => "resolved".to_owned(),
+            StartupRecordOutcome::Pending { reason } => format!("pending:{reason}"),
+            StartupRecordOutcome::Unknown { reason } => format!("unknown:{reason}"),
+        };
+        scan_entries.push(startup_reservation_scan_entry(
+            token,
+            record.state,
+            &outcome_for_digest,
+        ));
         match entry {
             StartupRecordOutcome::Resolved => {}
             StartupRecordOutcome::Pending { reason } => pending.push(StartupPendingOperation {
@@ -1579,47 +1773,40 @@ pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
             }),
         }
     }
-    let scanned = page.records.len() as u64;
-    let mut entries: Vec<String> = pending
-        .iter()
-        .map(|item| {
-            format!(
-                "{}|{}|{}|{}",
-                item.operation_id,
-                item.reservation_order,
-                reservation_state_name(item.state),
-                item.recovery_owner
-            )
-        })
-        .chain(unknown.iter().map(|item| {
-            format!(
-                "{}|{}|{}|{}",
-                item.operation_id,
-                item.reservation_order,
-                reservation_state_name(item.state),
-                item.recovery_owner
-            )
-        }))
-        .collect();
-    entries.sort_unstable();
-    let digest = sha256_hex(
-        format!(
-            "{}|{}|{}|{}|{}|{}",
-            fence.authority_epoch.lineage_id.as_str(),
-            fence.authority_epoch.sequence.get(),
-            fence.resource_generation.value(),
-            scanned,
-            truncated,
-            entries.join(","),
-        )
-        .as_bytes(),
-    );
+    let scanned = u64::from(scan.scanned);
+    let mut digest_input = String::new();
+    for field in [
+        STARTUP_RESERVATION_SCAN_SOURCE.to_owned(),
+        fence.authority_epoch.lineage_id.as_str().to_owned(),
+        fence.authority_epoch.sequence.get().to_string(),
+        fence.resource_generation.value().to_string(),
+        scan.cursor_start_after_order.to_string(),
+        scan.last_reservation_order
+            .map_or_else(|| "none".to_owned(), |order| order.to_string()),
+        scan.next_after_order
+            .map_or_else(|| "none".to_owned(), |order| order.to_string()),
+        scanned.to_string(),
+        limit.to_string(),
+        scan.truncated.to_string(),
+        scan_entries.len().to_string(),
+    ] {
+        append_startup_digest_field(&mut digest_input, &field);
+    }
+    for entry in &scan_entries {
+        append_startup_digest_field(&mut digest_input, entry);
+    }
+    let digest = sha256_hex(digest_input.as_bytes());
     Ok(StartupReconciliation {
         fence: fence.clone(),
         digest,
         scanned,
+        scan_source: STARTUP_RESERVATION_SCAN_SOURCE,
+        cursor_start_after_order: scan.cursor_start_after_order,
+        last_reservation_order: scan.last_reservation_order,
+        next_after_order: scan.next_after_order,
+        scan_limit: limit,
         pending,
         unknown,
-        truncated,
+        truncated: scan.truncated,
     })
 }
