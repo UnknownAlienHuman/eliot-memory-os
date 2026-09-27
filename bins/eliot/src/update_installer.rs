@@ -209,11 +209,13 @@ pub struct InstallUpdateRequest<'a> {
     pub install_root: &'a Path,
     /// Optional exact path of an executable the operator declares as running.
     ///
-    /// This is an independent fact from the observed running state in
-    /// [`UpdateRecord::running_target`]: the two are computed from different
-    /// sources and neither is a layer over the other. Nothing currently
-    /// branches on `running_target`; activation, which is where the observation
-    /// would have to be enforced, is owned outside this module.
+    /// The exact path-identity refusal in
+    /// [`running_binary_would_be_overwritten`] reads this path, and the live
+    /// snapshot search behind [`UpdateRecord::running_target`] additionally
+    /// covers its basename when it differs from the staged executable name.
+    /// The two mechanisms stay independent: nothing branches on
+    /// `running_target`, and activation — where the observation would have to
+    /// be enforced — is owned outside this module.
     pub running_executable: Option<&'a Path>,
     /// Package metadata for the update.
     pub package: &'a PackageMetadata,
@@ -365,16 +367,17 @@ pub fn observe_running_executable(
 /// The running executable is never overwritten. Before any filesystem effect
 /// the running state of the update target is **observed** from a live process
 /// snapshot ([`observe_running_executable`]) and carried into the returned
-/// [`UpdateRecord`]. The observed target is the *would-be staged* executable
-/// `<installed_dir>/<package>.exe` — a file that does not exist yet — so the
-/// search covers the package's conventional executable name, not the file name
-/// of the copy that is actually live. Neither
-/// `request.running_executable` (the operator-declared live path) nor
+/// [`UpdateRecord`]. The staged executable `<installed_dir>/<package>.exe` —
+/// a file that does not exist yet — is always searched by basename. When
+/// `request.running_executable` names a different file name, its basename is
+/// searched too, so the operator-declared live copy is observed rather than
+/// assumed; a snapshot failure for either name refuses with
+/// [`UpdateInstallerError::RunningObservationFailed`]. `NotRunning` still
+/// proves only that no live process carries a searched basename, and
 /// `request.previous_version_dir` (where the running copy usually lives) is
-/// consulted for the observation, so a live copy stored under a different file
-/// name is reported as `NotRunning`. The observation is recorded, not enforced:
-/// nothing here branches on it, and activation — the point at which it would
-/// have to gate — is owned outside this module.
+/// not consulted. The observation is recorded, not enforced: nothing here
+/// branches on it, and activation — the point at which it would have to
+/// gate — is owned outside this module.
 ///
 /// Separately and independently, when `request.running_executable` resolves to
 /// the staged executable path or its parent versioned directory, installation
@@ -417,7 +420,18 @@ pub fn install_update(
     let executable_path = installed_dir.join(staged_executable_name(&request.package.name));
     // Detect before staging and before any filesystem effect: the running
     // state is read from a live process snapshot, not supplied by the caller.
-    let running_target = observe_running_executable(&executable_path)?;
+    // The staged executable name is always searched; the operator-declared
+    // live path contributes its basename too when it names a different file,
+    // so a live copy stored under another file name is still observed.
+    let mut running_target = observe_running_executable(&executable_path)?;
+    if let Some(running) = request.running_executable
+        && running.file_name() != executable_path.file_name()
+    {
+        let declared = observe_running_executable(running)?;
+        if matches!(declared, RunningTargetObservation::Running { .. }) {
+            running_target = declared;
+        }
+    }
     if let Some(running) = request.running_executable
         && running_binary_would_be_overwritten(running, &executable_path)
     {
