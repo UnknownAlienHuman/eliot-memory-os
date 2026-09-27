@@ -40,6 +40,7 @@ work-unit crate:
     python scripts/verify-work-unit.py --crate {{crate}} --root .
 # Crates that live outside the workspace and outside `exclude`, so no other gate
 # covers them. Runs fmt, clippy and tests for each.
+[env("CARGO_NET_OFFLINE", "true")]
 standalone-crates:
     python scripts/verify-standalone-crates.py --root .
 
@@ -99,14 +100,17 @@ opencode-plugin:
     node --test integrations/opencode/tests/eliot-plugin.test.mjs
     Get-Content integrations/opencode/plugin-bridge-contract.json -Raw | ConvertFrom-Json | Out-Null
 
+[env("CARGO_NET_OFFLINE", "true")]
 metadata:
     cargo metadata --locked --no-deps --format-version 1 | Out-Null
 
+[env("CARGO_NET_OFFLINE", "true")]
 fmt-check:
     cargo fmt --all -- --check
 
+[env("CARGO_NET_OFFLINE", "true")]
 check:
-    cargo check --locked --workspace --all-targets
+    cargo check --locked --workspace --all-targets --offline
 
 clippy:
     cargo clippy --locked --workspace --all-targets -- -D warnings
