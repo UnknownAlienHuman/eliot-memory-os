@@ -108,7 +108,9 @@ impl From<WindowsAdapterError> for InstallationAuthorityKeyError {
             }
             WindowsAdapterError::Unavailable | WindowsAdapterError::NotFound => Self::MissingRoot,
             WindowsAdapterError::InvalidInput => Self::InvalidPath,
-            WindowsAdapterError::Failed | WindowsAdapterError::Timeout => Self::Io,
+            WindowsAdapterError::Failed
+            | WindowsAdapterError::Timeout
+            | WindowsAdapterError::RevertToSelf { .. } => Self::Io,
         }
     }
 }
@@ -541,9 +543,9 @@ fn map_windows_error(error: WindowsAdapterError) -> InstallationAuthorityKeyErro
             InstallationAuthorityKeyError::MissingOrMalformed
         }
         WindowsAdapterError::InvalidInput => InstallationAuthorityKeyError::InvalidPath,
-        WindowsAdapterError::Timeout | WindowsAdapterError::Failed => {
-            InstallationAuthorityKeyError::Io
-        }
+        WindowsAdapterError::Timeout
+        | WindowsAdapterError::Failed
+        | WindowsAdapterError::RevertToSelf { .. } => InstallationAuthorityKeyError::Io,
     }
 }
 
