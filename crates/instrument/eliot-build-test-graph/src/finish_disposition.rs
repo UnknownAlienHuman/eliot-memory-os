@@ -160,7 +160,10 @@ pub enum DispositionError {
 /// Owner and origin are required at construction: there is no oracle without
 /// an accountable owner and a named source of authority, and no defaulted
 /// value that could mint either by assertion.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+// `Deserialize` is absent so that an owner and an origin cannot be minted by
+// deserializing an untrusted acceptance document; both are required at
+// construction by the checked constructor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct AcceptanceOracle {
     proof_id: String,
     owner: String,
@@ -420,7 +423,11 @@ impl ProvenRequiredProof {
 /// proof is `UNKNOWN`, `PARTIAL`, or `BLOCKED` (`I18.24`) — including a
 /// passing crate-local receipt alongside a required live proof that is
 /// `BLOCKED`.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+// `Deserialize` is deliberately absent: a derived impl would rebuild this
+// value straight from untrusted bytes and hand every caller a `Pass` for a
+// required proof that was never proven, which is the promotion this boundary
+// exists to refuse.  A value read back from storage is re-proved instead.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct RequiredProofCompletion {
     required: Vec<ProvenRequiredProof>,
 }
@@ -474,7 +481,10 @@ impl RequiredProofCompletion {
 /// The oracle set is declared here.  It is never derived from what a verifier
 /// happened to check, and it is never widened by a run that observed more
 /// proofs than acceptance required.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+// `Deserialize` is absent for the same reason as on `AcceptanceOracle`: the
+// declared oracle set is authority, and only the checked constructor may
+// establish it.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct DeclaredAcceptance {
     authority: String,
     oracles: Vec<AcceptanceOracle>,
@@ -549,7 +559,10 @@ impl DeclaredAcceptance {
 /// [`RequiredProofCompletion`], which exists only when every declared required
 /// oracle is proven.  A non-passing or unobserved required proof therefore
 /// yields [`TaskOutcome::NotPassed`] with that proof named.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+// As with `RequiredProofCompletion`, `Deserialize` is deliberately absent so
+// no byte stream can mint a `Pass`.  A disposition read back from storage is
+// re-derived through `apply_finish_boundary`, never trusted as-is.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum TaskOutcome {
     /// Every declared required oracle is proven in its declared scope.
     Pass {
@@ -676,7 +689,10 @@ impl ContractChallenge {
 /// It names the acceptance authority it acted under, the origin of every
 /// declared oracle it applied, the receipt it read, and the task outcome.  A
 /// disposition is a `FinishService` value; no receipt can carry one.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+// `Deserialize` is absent for the same reason as on `TaskOutcome`: this type
+// embeds the outcome, so a derived impl would restore a `Pass` for evidence
+// that was never proven.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FinishDisposition {
     receipt_id: String,
     authority: String,
@@ -720,7 +736,10 @@ impl FinishDisposition {
 
 /// What the boundary returns: either a disposition, or the challenge that
 /// replaced it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+// `Deserialize` is absent because this response carries the disposition, and
+// the disposition must be re-derived through the boundary rather than read
+// back as a trusted verdict.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum FinishBoundaryResponse {
     /// A disposition was derived from the evidence.
     Disposition(FinishDisposition),
