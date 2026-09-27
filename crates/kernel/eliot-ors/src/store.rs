@@ -393,12 +393,12 @@ const MAX_BRIDGE_ACK_BATCH: usize = 1024;
 /// stream position binding that position to exactly one logical event.
 /// Keyed by `{owner_namespace}::{sequence:020}` (zero-padded so the byte
 /// order is the numeric order); the value is the bound `event_id`. Written
-/// atomically in the same ORS transaction as the event row, never updated,
-/// never deleted: a compacted position keeps its binding forever, so one
-/// admitted position identifies exactly one logical event for the life of
-/// the stream incarnation. Only owner-checked rows are indexed; legacy
-/// ownerless rows keep their existing scan-checked invariant and are never
-/// inferred into this index.
+/// atomically in the same ORS transaction as the event row and never updated.
+/// The mapping remains an internal consistency check above the compacted
+/// boundary; once exact replay evidence expires below that boundary, requests
+/// receive the retired disposition without learning or comparing this ID.
+/// Only owner-checked rows are indexed; legacy ownerless rows keep their
+/// existing scan-checked invariant and are never inferred into this index.
 const BRIDGE_EVENT_POSITIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_positions_v1");
 /// Retained bridge-event replay commitments (issue #2730): the original
@@ -1103,9 +1103,10 @@ impl persistence_codec::PersistedValue for BridgeEventReplayCommitment {
 /// One ordered bridge-event position binding (issue #2730, item 1).
 ///
 /// The value names the exactly one logical event admitted at
-/// `{owner_namespace}::{sequence:020}`. Written once with its event row,
-/// never updated, never deleted — including across compaction — so a
-/// position can never be reused by another event.
+/// `{owner_namespace}::{sequence:020}`. Written once with its event row and
+/// never updated. Above the compacted boundary it detects a conflicting or
+/// torn binding; below the boundary, after exact replay evidence expires, the
+/// retired disposition prevents reuse without exposing the old identity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventPosition {
@@ -10802,13 +10803,13 @@ impl RedbRecoveryStore {
     /// event ID nor its bytes: when the request names a position at or
     /// below the retained compacted boundary with no exact evidence left,
     /// the explicit retired/unverifiable recovery disposition returns with
-    /// `fresh: false`, never a fabricated duplicate or fresh insertion.
-    /// Changed content under a live or committed identity, a position
-    /// admitted under a different event, or a torn position binding with
-    /// no retained evidence fails closed. Returns `Ok(None)` only for a
-    /// genuinely new identity at a free position above the boundary; the
-    /// caller still runs the pending-handoff compatibility check before
-    /// any record/cursor mutation.
+    /// `fresh: false`, without consulting the old position binding. Changed
+    /// content under a live or committed identity, a position admitted under
+    /// a different event above the boundary, or a torn position binding above
+    /// the boundary fails closed. Returns `Ok(None)` only for a genuinely new
+    /// identity at a free position above the boundary; the caller still runs
+    /// the pending-handoff compatibility check before any record/cursor
+    /// mutation.
     fn check_bridge_retained_replay_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -10845,23 +10846,12 @@ impl RedbRecoveryStore {
                 row.last_compacted_sequence,
             )
         });
-        // The admitted position identifies exactly one logical event: a
-        // different occupant rejects this request before any mutation,
-        // even below the compacted boundary. A same-identity occupant
-        // with no retained row or commitment is noted here and resolved
-        // against the boundary below.
-        let torn_position = match Self::position_event_in(write, access, stage.sequence)? {
-            None => false,
-            Some(occupant) if occupant != stage.event_id => {
-                return Err(OrsError::DuplicateConflict);
-            }
-            Some(_) => true,
-        };
         if stage.sequence <= compacted {
             // Below the retained compacted boundary with no exact
             // evidence: retired, never a new event — including when the
-            // position index still names this same identity (its
-            // commitment may have expired under bound pressure).
+            // internal position index retains an event ID whose commitment
+            // may have expired under bounded pressure. Do not consult that
+            // mapping or claim which old event occupied this position.
             let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
             return Ok(Some(Self::bridge_event_retired_outcome(
                 stage,
@@ -10872,9 +10862,19 @@ impl RedbRecoveryStore {
                 handoff.as_deref(),
             )));
         }
+        // Above the compacted boundary, the position mapping remains exact
+        // evidence: reject a different occupant, and retain a same-identity
+        // binding for the torn-row/commitment check below.
+        let torn_position = match Self::position_event_in(write, access, stage.sequence)? {
+            None => false,
+            Some(occupant) if occupant != stage.event_id => {
+                return Err(OrsError::DuplicateConflict);
+            }
+            Some(_) => true,
+        };
         if torn_position {
             // Above the boundary the position must resolve to retained
-            // evidence: a binding with no row and no commitment is a torn
+            // event/commitment evidence: a binding with neither is a torn
             // write — fail closed and preserve it instead of guessing.
             return Err(OrsError::IntegrityProblem {
                 record_type: "bridge_event_position",
