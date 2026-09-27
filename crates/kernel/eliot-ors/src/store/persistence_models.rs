@@ -45,6 +45,7 @@ pub(super) enum OperationalKind {
     AuthorityRevocation,
     CapabilityGrant,
     CapabilityIntroduction,
+    RootTransition,
 }
 
 impl OperationalKind {
@@ -63,6 +64,7 @@ impl OperationalKind {
             Self::AuthorityRevocation => "authority_revocation",
             Self::CapabilityGrant => "capability_grant",
             Self::CapabilityIntroduction => "capability_introduction",
+            Self::RootTransition => "root_transition",
         }
     }
 }

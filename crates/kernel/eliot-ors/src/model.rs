@@ -1512,7 +1512,16 @@ pub enum RecoveryPayload {
     ImmutableLocator {
         locator: PlatformHandle,
     },
+    /// Exact versioned canonical bytes for one root-transition commit. ORS
+    /// stores and hashes these bytes without interpreting their meaning.
+    CanonicalRequest {
+        contract_version: u16,
+        bytes: Vec<u8>,
+    },
 }
+
+/// Version of the opaque canonical request bytes accepted for a root transition.
+pub const ROOT_TRANSITION_REQUEST_VERSION: u16 = 1;
 
 /// Required privacy and visibility metadata that travels with a pending value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1642,6 +1651,12 @@ impl RecoveryPayloadEnvelope {
             }
             RecoveryPayload::ImmutableLocator { locator } => {
                 validate_text(locator.as_str(), "immutable_locator")?;
+            }
+            RecoveryPayload::CanonicalRequest { .. } => {
+                return Err(OrsError::InvalidField {
+                    field: "recovery_payload",
+                    reason: "canonical requests are only valid for root-transition commits",
+                });
             }
         }
         Ok(())
@@ -1800,6 +1815,30 @@ impl OperationalRecordInput {
         Ok(value)
     }
 
+    fn canonical_request(
+        context: OperationalRecordContext,
+        bytes: Vec<u8>,
+        payload_sha256: String,
+    ) -> Result<Self, OrsError> {
+        let payload_length = u64::try_from(bytes.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        let value = Self {
+            record_id: context.record_id,
+            subject_id: context.subject_id,
+            authority_epoch: context.authority_epoch,
+            state_fence: context.state_fence,
+            payload: RecoveryPayload::CanonicalRequest {
+                contract_version: ROOT_TRANSITION_REQUEST_VERSION,
+                bytes,
+            },
+            payload_sha256,
+            payload_length,
+            created_at_ms: context.created_at_ms,
+            cleanup_after_ms: context.cleanup_after_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), OrsError> {
         self.authority_epoch.validate()?;
         self.state_fence.validate()?;
@@ -1829,6 +1868,21 @@ impl OperationalRecordInput {
             RecoveryPayload::ImmutableLocator { locator } => {
                 validate_text(locator.as_str(), "operational_immutable_locator")?;
             }
+            RecoveryPayload::CanonicalRequest {
+                contract_version,
+                bytes,
+            } => {
+                if *contract_version != ROOT_TRANSITION_REQUEST_VERSION {
+                    return Err(OrsError::UnsupportedContractVersion(*contract_version));
+                }
+                let length = u64::try_from(bytes.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+                if length > crate::MAX_INLINE_RECOVERY_BYTES {
+                    return Err(OrsError::PayloadTooLarge);
+                }
+                if length != self.payload_length || sha256_hex(bytes) != self.payload_sha256 {
+                    return Err(OrsError::PayloadIntegrityMismatch);
+                }
+            }
         }
         if self
             .cleanup_after_ms
@@ -1837,6 +1891,120 @@ impl OperationalRecordInput {
             return Err(OrsError::InvalidExpiry);
         }
         Ok(())
+    }
+}
+
+/// Immutable canonical root-transition request bytes presented by the
+/// authenticated Kernel boundary. ORS checks their digest and identity
+/// metadata, persists them opaquely, and grants no semantic authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RootTransitionCommit(OperationalRecordInput);
+
+impl RootTransitionCommit {
+    /// Validates and binds one exact canonical request to its operation and
+    /// transition identities, authority epoch, and State Fence metadata.
+    pub fn new(
+        context: OperationalRecordContext,
+        canonical_request_bytes: Vec<u8>,
+        canonical_request_sha256: String,
+    ) -> Result<Self, OrsError> {
+        validate_digest(&canonical_request_sha256, "root_transition_request_sha256")?;
+        let input = OperationalRecordInput::canonical_request(
+            context,
+            canonical_request_bytes,
+            canonical_request_sha256,
+        )?;
+        Ok(Self(input))
+    }
+
+    pub(crate) fn from_record(record: OperationalRecordInput) -> Result<Self, OrsError> {
+        let commit = Self(record);
+        commit.validate()?;
+        Ok(commit)
+    }
+
+    /// Returns the stable operation identity bound to this request.
+    pub const fn operation_id(&self) -> &OperationIdentity {
+        &self.0.record_id
+    }
+
+    /// Returns the transition identity supplied by the authenticated caller.
+    pub const fn transition_id(&self) -> &OperationIdentity {
+        &self.0.subject_id
+    }
+
+    /// Returns the exact opaque request bytes supplied to ORS.
+    pub fn canonical_request_bytes(&self) -> Option<&[u8]> {
+        match &self.0.payload {
+            RecoveryPayload::CanonicalRequest { bytes, .. } => Some(bytes),
+            RecoveryPayload::Encrypted { .. } | RecoveryPayload::ImmutableLocator { .. } => None,
+        }
+    }
+
+    /// Returns the SHA-256 digest that ORS validated against the request bytes.
+    pub fn canonical_request_sha256(&self) -> &str {
+        &self.0.payload_sha256
+    }
+
+    /// Returns the exact metadata and opaque payload persisted for this commit.
+    pub const fn record(&self) -> &OperationalRecordInput {
+        &self.0
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        self.0.validate()?;
+        if !matches!(&self.0.payload, RecoveryPayload::CanonicalRequest { .. }) {
+            return Err(OrsError::InvalidField {
+                field: "root_transition_commit",
+                reason: "must contain canonical request bytes",
+            });
+        }
+        if self.0.cleanup_after_ms.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "root_transition_cleanup_after_ms",
+                reason: "committed root-transition results cannot expire",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exact owner readback of one immutable root-transition commit. The store
+/// receipt and ordering are operational evidence, not transition authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RootTransitionCommitProjection {
+    commit: RootTransitionCommit,
+    operation_order: u64,
+    receipt: OperationalMutationReceipt,
+}
+
+impl RootTransitionCommitProjection {
+    pub(crate) fn from_store(
+        commit: RootTransitionCommit,
+        operation_order: u64,
+        receipt: OperationalMutationReceipt,
+    ) -> Self {
+        Self {
+            commit,
+            operation_order,
+            receipt,
+        }
+    }
+
+    /// Returns the exact canonical commit read back from the durable owner.
+    pub const fn commit(&self) -> &RootTransitionCommit {
+        &self.commit
+    }
+
+    /// Returns the monotonic ORS order assigned to the committed row.
+    pub const fn operation_order(&self) -> u64 {
+        self.operation_order
+    }
+
+    /// Returns the store-issued integrity receipt for the persisted row.
+    pub const fn receipt(&self) -> &OperationalMutationReceipt {
+        &self.receipt
     }
 }
 
@@ -1849,6 +2017,12 @@ macro_rules! operational_input {
         impl $name {
             pub fn new(record: OperationalRecordInput) -> Result<Self, OrsError> {
                 record.validate()?;
+                if matches!(&record.payload, RecoveryPayload::CanonicalRequest { .. }) {
+                    return Err(OrsError::InvalidField {
+                        field: "operational_payload",
+                        reason: "canonical requests are reserved for root-transition commits",
+                    });
+                }
                 Ok(Self(record))
             }
 

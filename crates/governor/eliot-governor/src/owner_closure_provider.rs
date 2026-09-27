@@ -1510,9 +1510,11 @@ fn secret_reference_from_record(
 ) -> Result<SecretReference, CompositionError> {
     match &record.payload {
         RecoveryPayload::Encrypted { key, .. } => Ok(key.clone()),
-        RecoveryPayload::ImmutableLocator { .. } => Err(CompositionError::Recovery(
-            "durable hydration record has no admitting secret reference".to_owned(),
-        )),
+        RecoveryPayload::ImmutableLocator { .. } | RecoveryPayload::CanonicalRequest { .. } => {
+            Err(CompositionError::Recovery(
+                "durable hydration record has no admitting secret reference".to_owned(),
+            ))
+        }
     }
 }
 
