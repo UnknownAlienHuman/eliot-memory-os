@@ -1148,7 +1148,11 @@ pub enum HandoffAttemptIdentityRule {
 )]
 pub enum HandoffAttemptIdentity {
     /// The compatible native session continued under fresh authority.
-    NativeSessionContinued(NativeSessionContinuation),
+    ///
+    /// The evidence is boxed so this enum stays small next to its two unit
+    /// variants. `Box` is transparent to `serde`, so the wire shape is exactly
+    /// the shape of the unboxed evidence.
+    NativeSessionContinued(Box<NativeSessionContinuation>),
     /// A new ELIOT attempt was created for this transfer.
     NewAttemptCreated,
     /// No prior conversational state was transferred.
