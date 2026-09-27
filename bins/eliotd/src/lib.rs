@@ -134,8 +134,10 @@ pub use capability_evidence_wiring::{
     EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
 };
 pub use capability_outcome::{
-    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
-    FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
+    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
+    DegradationScope, FallbackOutcomeRequest, GenerationChallengeOutcomeRequest,
+    OutcomeDisposition, OutcomeError, SURVIVING_OPERATION_PREFIX, fallback_outcome,
+    generation_challenge_outcome, project_degradation, removed_promise, surviving_operation,
 };
 pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
