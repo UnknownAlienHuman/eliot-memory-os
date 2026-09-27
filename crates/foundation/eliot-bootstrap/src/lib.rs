@@ -1474,6 +1474,66 @@ pub enum DraftImportDisposition {
     Rejected,
 }
 
+/// Caller-attributed recovery finding carried by a candidate-only draft.
+///
+/// These fields describe an observation supplied to the bootstrap command.
+/// They do not establish runtime verification, implementation support, or
+/// canonical acceptance.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapRecoveryFinding {
+    /// Owning functional capability cell supplied by the finding owner.
+    pub owning_functional_cell: String,
+    /// Behavior observed by the caller on the bound source/runtime identity.
+    pub observed_behavior: String,
+    /// Caller-supplied discriminator for the finding.
+    pub discriminator: String,
+    /// Exact affected path supplied by the caller.
+    pub affected_path: String,
+    /// Attributed claim state; verifier-backed states are not accepted here.
+    pub claim_status: EvidenceEvaluation,
+    /// Explicit caller-attributed runtime identity observation, including an
+    /// UNKNOWN or UNAVAILABLE record when runtime identity was not observed.
+    pub runtime_identity: EvidenceRecord,
+}
+
+impl BootstrapRecoveryFinding {
+    pub fn validate(&self) -> Result<(), BootstrapCompileError> {
+        for (value, field) in [
+            (&self.owning_functional_cell, "owning_functional_cell"),
+            (&self.observed_behavior, "observed_behavior"),
+            (&self.discriminator, "discriminator"),
+            (&self.affected_path, "affected_path"),
+            (&self.runtime_identity.key, "runtime_identity.key"),
+            (&self.runtime_identity.value, "runtime_identity.value"),
+            (
+                &self.runtime_identity.evidence_ref,
+                "runtime_identity.evidence_ref",
+            ),
+        ] {
+            text(value, "bootstrap-recovery-finding".to_owned(), field)?;
+        }
+        let attributed_only = |status| {
+            matches!(
+                status,
+                EvidenceEvaluation::Raw
+                    | EvidenceEvaluation::Contested
+                    | EvidenceEvaluation::Stale
+                    | EvidenceEvaluation::Unknown
+                    | EvidenceEvaluation::Unavailable
+            )
+        };
+        if !attributed_only(self.claim_status) || !attributed_only(self.runtime_identity.evaluation)
+        {
+            return Err(BootstrapCompileError::ProviderValidation {
+                provider: "bootstrap-recovery-finding",
+                detail: "claim and runtime identity statuses must remain caller-attributed and unverified".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Provider-owned inputs shared by the candidate failure and improvement drafts.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1482,8 +1542,7 @@ pub struct BootstrapDraftInput {
     pub normative_pair: NormativePair,
     pub snapshot_ref: String,
     pub catalogue_ref: String,
-    pub owner: String,
-    pub discriminator: String,
+    pub finding: BootstrapRecoveryFinding,
     pub import_disposition: DraftImportDisposition,
 }
 
@@ -1495,8 +1554,7 @@ pub struct BootstrapFailureDraft {
     pub snapshot_ref: String,
     pub catalogue_ref: String,
     pub work_unit_id: String,
-    pub owner: String,
-    pub discriminator: String,
+    pub finding: BootstrapRecoveryFinding,
     pub import_disposition: DraftImportDisposition,
     pub canonical_digest: String,
 }
@@ -1509,8 +1567,7 @@ pub struct BootstrapImprovementDraft {
     pub snapshot_ref: String,
     pub catalogue_ref: String,
     pub work_unit_id: String,
-    pub owner: String,
-    pub discriminator: String,
+    pub finding: BootstrapRecoveryFinding,
     pub import_disposition: DraftImportDisposition,
     pub canonical_digest: String,
 }
@@ -1531,10 +1588,15 @@ macro_rules! draft_impl {
                     (&input.source_identity, "source_identity"),
                     (&input.snapshot_ref, "snapshot_ref"),
                     (&input.catalogue_ref, "catalogue_ref"),
-                    (&input.owner, "owner"),
-                    (&input.discriminator, "discriminator"),
                 ] {
                     text(value, "bootstrap-draft".to_owned(), field)?;
+                }
+                input.finding.validate()?;
+                if input.import_disposition != DraftImportDisposition::CandidateOnly {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft",
+                        detail: "draft intake must remain candidate-only until a canonical receipt exists".to_owned(),
+                    });
                 }
                 input.normative_pair.validate("bootstrap-draft")?;
                 digest(
@@ -1553,8 +1615,7 @@ macro_rules! draft_impl {
                     snapshot_ref: input.snapshot_ref,
                     catalogue_ref: input.catalogue_ref,
                     work_unit_id: seed.id.clone().into(),
-                    owner: input.owner,
-                    discriminator: input.discriminator,
+                    finding: input.finding,
                     import_disposition: input.import_disposition,
                     canonical_digest: String::new(),
                 };
@@ -1573,12 +1634,13 @@ macro_rules! draft_impl {
                     "bootstrap-draft".to_owned(),
                     "work_unit_id",
                 )?;
-                text(&self.owner, "bootstrap-draft".to_owned(), "owner")?;
-                text(
-                    &self.discriminator,
-                    "bootstrap-draft".to_owned(),
-                    "discriminator",
-                )?;
+                self.finding.validate()?;
+                if self.import_disposition != DraftImportDisposition::CandidateOnly {
+                    return Err(BootstrapCompileError::ProviderValidation {
+                        provider: "bootstrap-draft",
+                        detail: "draft intake must remain candidate-only until a canonical receipt exists".to_owned(),
+                    });
+                }
                 self.normative_pair.validate("bootstrap-draft")?;
                 digest(
                     &self.snapshot_ref,
@@ -2081,8 +2143,19 @@ mod tests {
                 normative_pair: pair.clone(),
                 snapshot_ref: snapshot_ref.clone(),
                 catalogue_ref: first.catalogue_sha256.clone(),
-                owner: "Luna-A".to_owned(),
-                discriminator: "missing-catalogue".to_owned(),
+                finding: BootstrapRecoveryFinding {
+                    owning_functional_cell: "foundation.bootstrap.work-unit-brief".to_owned(),
+                    observed_behavior: "normative catalogue was unavailable".to_owned(),
+                    discriminator: "missing-catalogue".to_owned(),
+                    affected_path: "docs/normative-pair.toml".to_owned(),
+                    claim_status: EvidenceEvaluation::Raw,
+                    runtime_identity: EvidenceRecord {
+                        key: "runtime_identity".to_owned(),
+                        value: "UNKNOWN".to_owned(),
+                        evidence_ref: "caller:unknown-runtime".to_owned(),
+                        evaluation: EvidenceEvaluation::Unknown,
+                    },
+                },
                 import_disposition: DraftImportDisposition::CandidateOnly,
             },
             &seed(),
@@ -2093,8 +2166,19 @@ mod tests {
                 normative_pair: pair,
                 snapshot_ref,
                 catalogue_ref: first.catalogue_sha256,
-                owner: "Luna-A".to_owned(),
-                discriminator: "activate-catalogue".to_owned(),
+                finding: BootstrapRecoveryFinding {
+                    owning_functional_cell: "foundation.bootstrap.work-unit-brief".to_owned(),
+                    observed_behavior: "catalogue activation remains a candidate".to_owned(),
+                    discriminator: "activate-catalogue".to_owned(),
+                    affected_path: "crates/foundation/eliot-bootstrap/src/lib.rs".to_owned(),
+                    claim_status: EvidenceEvaluation::Raw,
+                    runtime_identity: EvidenceRecord {
+                        key: "runtime_identity".to_owned(),
+                        value: "UNAVAILABLE".to_owned(),
+                        evidence_ref: "caller:unavailable-runtime".to_owned(),
+                        evaluation: EvidenceEvaluation::Unavailable,
+                    },
+                },
                 import_disposition: DraftImportDisposition::CandidateOnly,
             },
             &seed(),

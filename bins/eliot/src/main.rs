@@ -190,6 +190,9 @@ enum BootstrapCommand {
         /// Absolute repository root; never inferred from the current directory.
         #[arg(long)]
         repo_root: PathBuf,
+        /// Absolute path to the explicit caller-attributed recovery finding JSON.
+        #[arg(long)]
+        finding: PathBuf,
     },
 }
 
@@ -1216,7 +1219,8 @@ fn run_bootstrap(command: BootstrapCommand) -> i32 {
         BootstrapCommand::Brief {
             work_unit,
             repo_root,
-        } => match bootstrap_draft::execute(&work_unit, &repo_root) {
+            finding,
+        } => match bootstrap_draft::execute(&work_unit, &repo_root, &finding) {
             Ok(success) => {
                 println!(
                     "{}",
