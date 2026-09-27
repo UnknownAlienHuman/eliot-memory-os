@@ -3000,6 +3000,7 @@ dependencies = [
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-problem",
  "eliot-process",
  "eliot-protocol",
  "eliot-runtime-contracts",

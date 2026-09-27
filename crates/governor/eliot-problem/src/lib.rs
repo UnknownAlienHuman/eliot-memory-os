@@ -1356,6 +1356,27 @@ impl ImplementationDeviation {
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }
+
+    /// Expires an active deviation when its review condition triggers.
+    ///
+    /// The departure reason is recorded in `outcome_ref`; the reason,
+    /// evidence, hard-boundary checks, risk, rollback and review condition are
+    /// retained so a later reviewer can still read why the assumption lapsed.
+    pub fn expire(
+        &mut self,
+        expected_fence: &StateFence,
+        outcome_ref: &str,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        text(outcome_ref, "outcome_ref")?;
+        if self.state != DeviationState::Active {
+            return Err(ProblemError::ImmutableState);
+        }
+        self.outcome_ref = Some(outcome_ref.to_owned());
+        self.state = DeviationState::Expired;
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
 }
 
 /// Returns a deterministic schema/provenance identity for the public surface.
