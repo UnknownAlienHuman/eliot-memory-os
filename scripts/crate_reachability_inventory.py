@@ -999,12 +999,26 @@ def _package_rows(
                 raise InventoryError("MALFORMED_METADATA", f"target kind is malformed: {package_name}")
             has_binary = has_binary or "bin" in kinds
             src_path = target.get("src_path")
-            relative_src: str | None = None
-            if isinstance(src_path, str):
-                try:
-                    relative_src = _inside(root, Path(src_path)).relative_to(root).as_posix()
-                except InventoryError:
-                    relative_src = None
+            target_context = (
+                f"package {package_name!r} ({package.get('id')!r}), "
+                f"target {target.get('name')!r} (kind={kinds!r})"
+            )
+            if (
+                not isinstance(src_path, str)
+                or not src_path.strip()
+                or not Path(src_path).is_absolute()
+            ):
+                raise InventoryError(
+                    "MALFORMED_METADATA",
+                    f"{target_context}: src_path must be a non-empty absolute string",
+                )
+            try:
+                relative_src = _inside(root, Path(src_path)).relative_to(root).as_posix()
+            except InventoryError as exc:
+                raise InventoryError(
+                    exc.code,
+                    f"{target_context}: invalid src_path {src_path!r}: {exc.detail}",
+                ) from exc
             targets.append(
                 {
                     "name": _bounded_text(target.get("name", ""), 256),
@@ -1360,7 +1374,7 @@ def build_inventory(root: Path, runner: Runner | None = None, *, as_of: date | N
     decision_path = _inside(root, root / DECISION_DATA_RELPATH)
     decision_sha = _sha256(_read_bytes(root, decision_path, max_bytes=BOUNDS.max_source_file_bytes))
     _, decision_revision, records = load_decision_records(root)
-    as_of = as_of or datetime_now(timezone.utc).date()
+    as_of = as_of or datetime_now.now(timezone.utc).date()
     classifications, admission_defects, orphan_decisions = classify_unreachable_packages(
         packages,
         records,
