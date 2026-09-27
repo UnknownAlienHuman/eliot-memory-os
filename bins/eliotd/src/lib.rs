@@ -1905,6 +1905,45 @@ impl DaemonComposition {
         )
     }
 
+    /// Admits an observed Skill activation against the live catalogue and
+    /// recovered Governor lifecycle before it can report Material use.
+    ///
+    /// The catalogue checks structural validation and live tool-basis drift,
+    /// while the Governor owner binds the receipt to its exact
+    /// promoted revision and package digest. A wire receipt alone is never
+    /// enough to make an installed Skill usable.
+    #[allow(clippy::result_large_err)]
+    pub fn skill_admit_material_attempt(
+        &self,
+        receipt: &eliot_skill::SkillHarnessActivationReceipt,
+    ) -> Result<eliot_skill::AttemptLifecycleSummary, eliot_skill::SkillError> {
+        receipt.validate()?;
+        if receipt.state_fence != self.governor.kernel_snapshot().state_fence() {
+            return Err(eliot_skill::SkillError::FenceMismatch);
+        }
+        self.skill_reconcile_tool_basis()?;
+        {
+            let catalogue = self
+                .skill_catalogue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = catalogue
+                .get(&receipt.skill_id)
+                .ok_or(eliot_skill::SkillError::NotFound)?;
+            entry.validate()?;
+            if entry.body.body_version != receipt.skill_revision {
+                return Err(eliot_skill::SkillError::IdentityMismatch);
+            }
+            if !entry.is_usable() {
+                return Err(eliot_skill::SkillError::InvalidField {
+                    field: "entry.status",
+                    reason: "unvalidated, stale, or retired Skills are blocked from Material use",
+                });
+            }
+        }
+        self.governor.owners().skill.admit_material_attempt(receipt)
+    }
+
     /// Carries the receiver ack back to the display boundary under a fresh
     /// tool-owner read (issue #1882).
     ///

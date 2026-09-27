@@ -223,6 +223,7 @@ pub(crate) fn is_watchdog_intent_operation(operation: &str) -> bool {
 /// dedicated `Mutex<LocalReadPendingState>` once the composition root
 /// widens to initialize it; see HANDOFF). `local_read_envelope`/`local_read_tool`
 /// are `Some` only for admitted `eliot.query` invoke-reads whose selectors
+/// validated or exact Skill lifecycle invoke-reads whose tool linkage
 /// validated; ordinary indexed operations carry `None` and are never served
 /// to the daemon poller. `local_read_attempt` is the governed attempt
 /// ownership record for the pair: minted at enqueue as unclaimed
@@ -236,8 +237,8 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) request_digest: String,
     pub(crate) local_read_envelope: Option<HostRequestEnvelope>,
     pub(crate) local_read_tool: Option<serde_json::Value>,
-    /// Governed attempt ownership for an admitted `eliot.query` pair. This
-    /// queue is never used for campaign packets.
+    /// Governed attempt ownership for an admitted query or Skill lifecycle
+    /// pair. This queue is never used for campaign packets.
     pub(crate) local_read_attempt: LocalReadAttemptState,
     /// Queued observe pair for the daemon observe poller (issue #2565). Set
     /// only for admitted `eliot.observe` invocations whose tool bytes proved
@@ -377,7 +378,7 @@ pub(crate) enum LocalReadSubmitDisposition {
 
 #[derive(Clone, Copy)]
 enum DaemonReadQueue {
-    Query,
+    LocalRead,
     CampaignPacket,
 }
 
@@ -867,9 +868,10 @@ impl KernelComposition {
     /// stored bounded result with its revision without re-dispatch; a live
     /// operation returns its admission receipt honestly.
     ///
-    /// No semantic result is produced here: `eliot.query` is dispatched by
-    /// the authenticated query read leg, while `eliot.packet` is queued for
-    /// the production campaign compiler in `eliotd`. This entry owns
+    /// No semantic result is produced here: `eliot.query` and the exact Skill
+    /// lifecycle tools are queued for the authenticated daemon local-read
+    /// poller, while `eliot.packet` is queued for the production campaign
+    /// compiler in `eliotd`. This entry owns
     /// admission, linkage rejection, queueing, and exact readback; the
     /// `KernelHostRequestBinder::invoke_admitted` persist/readback pair owns
     /// the dispatch-then-store leg wherever a Governor is injected.
@@ -891,8 +893,9 @@ impl KernelComposition {
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
         let (receipt, record) = self.admit_host_request_envelope_under_transition(envelope)?;
-        // Queue each admitted shape in its own Kernel-owned lane. A packet is
-        // never handed to the query queue or selector derivation.
+        // Queue each admitted shape in its Kernel-owned lane. Query and Skill
+        // lifecycle pairs use the authenticated local-read poller; a packet is
+        // never handed to that queue or selector derivation.
         if record.result_digest.is_none() {
             let routed_lane = match check_local_read_admission(envelope, tool) {
                 Ok(LocalReadAdmission::Query(_)) => {
@@ -901,6 +904,10 @@ impl KernelComposition {
                     // query queue could not retain it.
                     self.enqueue_local_read_pair_under_transition(envelope, tool)?;
                     Some("query")
+                }
+                Ok(LocalReadAdmission::Skill) => {
+                    self.enqueue_local_read_pair_under_transition(envelope, tool)?;
+                    Some("skill")
                 }
                 Ok(LocalReadAdmission::CampaignPacket { .. }) => {
                     self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
@@ -1644,7 +1651,7 @@ impl KernelComposition {
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
         match check_local_read_admission(envelope, tool)? {
-            LocalReadAdmission::Query(_) => {}
+            LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {}
             LocalReadAdmission::CampaignPacket { .. } => {
                 return Err(TransportError::SessionFenced);
             }
@@ -1796,7 +1803,14 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if envelope.identity.capability != "eliot.query" {
+                // Revalidate the exact retained envelope/tool pair before a
+                // daemon claim. Skill lifecycle operations share this bounded
+                // local-read carrier, but packet admission stays isolated in
+                // its dedicated queue and no arbitrary tool becomes claimable.
+                if !matches!(
+                    check_local_read_admission(envelope, tool),
+                    Ok(LocalReadAdmission::Query(_) | LocalReadAdmission::Skill)
+                ) {
                     continue;
                 }
                 let previous_generation = candidate.local_read_attempt.generation;
@@ -2027,7 +2041,7 @@ impl KernelComposition {
         session: &Session,
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
-        self.submit_claimed_result(session, body, DaemonReadQueue::Query)
+        self.submit_claimed_result(session, body, DaemonReadQueue::LocalRead)
     }
 
     #[allow(
@@ -2041,10 +2055,6 @@ impl KernelComposition {
         queue: DaemonReadQueue,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
-        let lane = match queue {
-            DaemonReadQueue::Query => "query",
-            DaemonReadQueue::CampaignPacket => "campaign-packet",
-        };
         let _transition = self.agent_bridge_transition_read()?;
         let _admission_owner = self
             .agent_activation_pending
@@ -2058,16 +2068,24 @@ impl KernelComposition {
             .load_host_request(&operation_id, &body.request_sha256)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
+        let capability = stored.capability_ref.as_str();
+        let queue_matches_capability = match queue {
+            DaemonReadQueue::LocalRead => {
+                capability == "eliot.query" || is_skill_lifecycle_tool(capability)
+            }
+            DaemonReadQueue::CampaignPacket => capability == "eliot.packet",
+        };
         if stored.operation_id.as_str() != body.operation_id
             || stored.request_digest != body.request_sha256
-            || stored.capability_ref.as_str()
-                != match queue {
-                    DaemonReadQueue::Query => "eliot.query",
-                    DaemonReadQueue::CampaignPacket => "eliot.packet",
-                }
+            || !queue_matches_capability
         {
             return Err(TransportError::SessionFenced);
         }
+        let lane = match queue {
+            DaemonReadQueue::LocalRead if capability == "eliot.query" => "query",
+            DaemonReadQueue::LocalRead => "skill",
+            DaemonReadQueue::CampaignPacket => "campaign-packet",
+        };
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
@@ -2083,7 +2101,7 @@ impl KernelComposition {
         // Governed attempt currency: only the live (attempt_id, generation,
         // owner) triple completes.
         let live = match queue {
-            DaemonReadQueue::Query => self.live_local_read_attempt_under_transition(
+            DaemonReadQueue::LocalRead => self.live_local_read_attempt_under_transition(
                 &body.operation_id,
                 &body.request_sha256,
             )?,
@@ -2207,7 +2225,7 @@ impl KernelComposition {
                         && candidate.request_digest == body.request_sha256
                 })
                 .and_then(|candidate| match queue {
-                    DaemonReadQueue::Query => candidate.local_read_envelope.clone(),
+                    DaemonReadQueue::LocalRead => candidate.local_read_envelope.clone(),
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
@@ -2262,7 +2280,7 @@ impl KernelComposition {
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
         match queue {
-            DaemonReadQueue::Query => {
+            DaemonReadQueue::LocalRead => {
                 self.retire_local_read_pair_under_transition(
                     &body.operation_id,
                     &body.request_sha256,
@@ -5469,15 +5487,19 @@ pub(crate) struct LocalReadSelectors {
     pub(crate) intent_mode: String,
 }
 
-/// The two local-read shapes admitted by the authenticated daemon poller.
+/// Invoke-read shapes admitted to the authenticated daemon pollers.
 ///
 /// `eliot.query` is the bounded evidence query. `eliot.packet` is a distinct
 /// task-bound campaign compilation request; it must be queued and claimed just
 /// like a query, but it is never converted into an evidence-pack selector.
+/// The four exact Skill lifecycle tools use the local-read carrier while
+/// retaining their original tool bytes for the daemon Skill dispatcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LocalReadAdmission {
     /// A bounded evidence query.
     Query(LocalReadSelectors),
+    /// An exact Skill lifecycle tool with a digest-linked envelope.
+    Skill,
     /// A task-bound campaign packet with its trusted scope, task, and exact
     /// task revision admitted before it can enter the queue.
     CampaignPacket {
@@ -5485,6 +5507,13 @@ pub(crate) enum LocalReadAdmission {
         task_id: String,
         task_revision: u64,
     },
+}
+
+fn is_skill_lifecycle_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "skill.inject" | "skill.display" | "skill.activate" | "skill.execute"
+    )
 }
 
 /// Derives the closed query selectors from one linked envelope+tool pair.
@@ -5587,6 +5616,9 @@ pub(crate) fn local_read_admission_from_tool(
             .map_err(|_| TransportError::SessionFenced)?
             .map(LocalReadAdmission::Query)
             .ok_or(TransportError::SessionFenced),
+        name if is_skill_lifecycle_tool(name) && envelope.identity.capability == name => {
+            Ok(LocalReadAdmission::Skill)
+        }
         _ => Err(TransportError::SessionFenced),
     }
 }

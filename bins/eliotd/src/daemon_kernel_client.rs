@@ -756,7 +756,12 @@ pub fn parse_finish_submit_outcome(
 /// re-proved inside
 /// [`forward_admitted_local_read`](super::forward_admitted_local_read) before
 /// any read or submit touches them. A pair without an attempt fails closed:
-/// absent authority is never invented.
+/// absent authority is never invented. This shared parser preserves the
+/// decoded tool shape; [`DaemonKernelClient::claim_local_read_pair_async`]
+/// accepts `eliot.query` and exactly the Skill names recognized by
+/// `eliot_agent_bridge_core::skill_tool_kind`, each only when its name equals
+/// the envelope capability. `eliot.packet` remains on the separate campaign
+/// packet claim.
 pub fn parse_local_read_claimed_pair(
     value: &serde_json::Value,
 ) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
@@ -1887,8 +1892,11 @@ impl DaemonKernelClient {
         Ok(response)
     }
 
-    /// Claims one queued admitted `eliot.query` pair for the outbound-only
-    /// local-read poller (Implements #18).
+    /// Claims one queued admitted `eliot.query` or Skill pair for the
+    /// outbound local-read poller and local Skill dispatch (issue #1882).
+    /// Skill names are exactly those recognized by
+    /// `eliot_agent_bridge_core::skill_tool_kind`; every pair must have an
+    /// exact tool-name/envelope-capability match.
     ///
     /// Mirrors
     /// [`claim_agent_activation_ticket`](Self::claim_agent_activation_ticket):
@@ -1916,11 +1924,14 @@ impl DaemonKernelClient {
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
         if pair.as_ref().is_some_and(|(envelope, tool, _)| {
-            envelope.identity.capability != "eliot.query"
-                || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.query")
+            let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
+            !tool_name.is_some_and(|name| {
+                (name == "eliot.query" || eliot_agent_bridge_core::skill_tool_kind(name).is_some())
+                    && envelope.identity.capability == name
+            })
         }) {
             return Err(super::DaemonError::Kernel(
-                "Kernel local_read_claim returned a non-query pair".to_owned(),
+                "Kernel local_read_claim returned a pair outside the local-read tools".to_owned(),
             ));
         }
         if let Some((envelope, _, attempt)) = pair.as_ref() {

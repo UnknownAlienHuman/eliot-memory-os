@@ -43,7 +43,9 @@ impl KernelComposition {
     ) -> Result<(), TransportError> {
         match check_local_read_admission(envelope, tool)? {
             LocalReadAdmission::CampaignPacket { .. } => {}
-            LocalReadAdmission::Query(_) => return Err(TransportError::SessionFenced),
+            LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {
+                return Err(TransportError::SessionFenced);
+            }
         }
         let _admission_owner = self
             .agent_activation_pending
