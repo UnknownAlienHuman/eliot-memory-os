@@ -1173,7 +1173,7 @@ fn type_level_port_contract_is_object_safe() {
 
 use eliot_agent_bridge_core::{ProposeSkillRequest, SkillLifecyclePort};
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence,
+    ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence,
 };
 use eliot_skill::{
     ActivatedSkillDisplay, DependencyVersion, HotsetAckDisposition, HotsetDeliveryAck,
