@@ -182,8 +182,8 @@ pub struct TransportBindingObservation {
 
 /// One session-bound lease tracked by the application session authority.
 ///
-/// A lease is bound to the session for its whole lifetime; session revocation
-/// revokes every bound lease. The lease window is owner-observed and validated
+/// A lease is bound to the session for its whole lifetime; session loss revokes
+/// every bound lease. The lease window is owner-observed and validated
 /// fail-closed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionLease {
@@ -296,9 +296,10 @@ impl ApplicationSession {
     ///
     /// Returns [`SessionLifecycleError::IllegalTransition`] unless the current
     /// state is [`ApplicationSessionState::Active`] or
-    /// [`ApplicationSessionState::Suspended`].
-    pub fn detach(&mut self) -> Result<(), SessionLifecycleError> {
-        self.transition_to(ApplicationSessionState::Detached)
+    /// [`ApplicationSessionState::Suspended`]. `now_unix_ms` is the session
+    /// owner's observed detach time used for the durable checkpoint.
+    pub fn detach(&mut self, now_unix_ms: u64) -> Result<(), SessionLifecycleError> {
+        self.lose_session(ApplicationSessionState::Detached, now_unix_ms)
     }
 
     /// Applies an application-level expiry.
@@ -307,9 +308,10 @@ impl ApplicationSession {
     ///
     /// Returns [`SessionLifecycleError::IllegalTransition`] unless the current
     /// state is [`ApplicationSessionState::Active`] or
-    /// [`ApplicationSessionState::Suspended`].
-    pub fn expire(&mut self) -> Result<(), SessionLifecycleError> {
-        self.transition_to(ApplicationSessionState::Expired)
+    /// [`ApplicationSessionState::Suspended`]. `now_unix_ms` is the session
+    /// owner's observed expiry time used for the durable checkpoint.
+    pub fn expire(&mut self, now_unix_ms: u64) -> Result<(), SessionLifecycleError> {
+        self.lose_session(ApplicationSessionState::Expired, now_unix_ms)
     }
 
     /// Performs an explicit application revocation.
@@ -325,19 +327,13 @@ impl ApplicationSession {
     /// state is [`ApplicationSessionState::Active`] or
     /// [`ApplicationSessionState::Suspended`].
     pub fn revoke(&mut self, now_unix_ms: u64) -> Result<(), SessionLifecycleError> {
-        self.transition_to(ApplicationSessionState::Revoked)?;
-        for lease in self.bound_leases.values_mut() {
-            lease.revoked = true;
-        }
-        self.record_durable_checkpoint(self.session_id.clone(), now_unix_ms)?;
-        Ok(())
+        self.lose_session(ApplicationSessionState::Revoked, now_unix_ms)
     }
 
     /// Raises the authority epoch and prepares the session for reassignment.
     ///
-    /// Reassignment is blocked until a higher authority epoch is recorded: the
-    /// new epoch must be a same-lineage successor of the currently recorded
-    /// epoch. On success the session returns to
+    /// Reassignment is blocked until a higher same-lineage authority epoch is
+    /// provided. On success the session returns to
     /// [`ApplicationSessionState::Attaching`] under the new epoch, so a
     /// successor transport can bind without inheriting the revoked session's
     /// authority.
@@ -354,7 +350,10 @@ impl ApplicationSession {
                 to: ApplicationSessionState::Attaching,
             });
         }
-        if new_epoch.relation_to(&self.authority_epoch) != EpochRelation::SameLineageNewer {
+        if !matches!(
+            new_epoch.relation_to(&self.authority_epoch),
+            EpochRelation::DirectParent | EpochRelation::SameLineageNewer
+        ) {
             return Err(SessionLifecycleError::EpochNotAdvanced {
                 current: self.authority_epoch.clone(),
             });
@@ -553,6 +552,20 @@ impl ApplicationSession {
     ) -> Result<(), SessionLifecycleError> {
         self.state.transition_to(next)?;
         self.state = next;
+        Ok(())
+    }
+
+    fn lose_session(
+        &mut self,
+        terminal_state: ApplicationSessionState,
+        now_unix_ms: u64,
+    ) -> Result<(), SessionLifecycleError> {
+        self.state.transition_to(terminal_state)?;
+        self.record_durable_checkpoint(self.session_id.clone(), now_unix_ms)?;
+        self.state = terminal_state;
+        for lease in self.bound_leases.values_mut() {
+            lease.revoked = true;
+        }
         Ok(())
     }
 
