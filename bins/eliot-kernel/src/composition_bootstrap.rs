@@ -31,7 +31,7 @@ use super::{
     Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
     USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
     WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
-    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
+    owner_bundle_digest, sha256_hex, sha256_json, unix_ms, work_class_admission,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1452,12 +1452,20 @@ impl KernelComposition {
             "kernel.composition.constructed_not_ready",
         );
         observe_entrypoint(EntrypointStage::Composition);
+        // Issue #1920: construct the I14.1 work-class admission scheduler only
+        // from an injected operator budget profile. I14.2 keeps the per-pool
+        // numbers outside Architecture, so an absent profile is not replaced by
+        // a Kernel default; a profile with an unbounded dimension fails
+        // construction closed.
+        let work_class_admission = work_class_admission::admission_from_config(&config)
+            .map_err(KernelBuildError::Service)?;
         Ok(Self {
             p07_owner: Mutex::new(None),
             p07_owner_digest: Mutex::new(None),
             p07_owner_transition: std::sync::RwLock::new(()),
             p07_ors: Arc::clone(&ors),
             kernel_audit: Mutex::new(kernel_audit),
+            work_class_admission,
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
             runtime,

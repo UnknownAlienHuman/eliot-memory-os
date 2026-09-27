@@ -18,6 +18,7 @@ use super::SupervisionLeaseAuthorityConfig;
 use super::{
     AgentBridgeAdmissionDescriptor, AuditAnchorBinding, BlobStoreManifest, DEFAULT_PIPE_NAME,
     EliotdLaunchDescriptor, EliotdReceiptRootBinding, HostStoreBootstrapRequirement, PathBuf,
+    WorkClassBudgets,
 };
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 
@@ -85,6 +86,15 @@ pub struct KernelConfig {
     /// sink below the Kernel work root; the sink is always exactly one
     /// directory and the Kernel never creates the foreign one.
     pub audit_anchor_binding: Option<AuditAnchorBinding>,
+    /// Installed I14.1 work-class pool budget profile (issue #1920).
+    ///
+    /// I14.2 states the per-pool item, byte and concurrency numbers are
+    /// `runtime.toml` defaults, not Architecture, so the Kernel holds no
+    /// built-in profile. `None` keeps the admission scheduler unconstructed and
+    /// therefore closed: `admit_submitted_work` fails with an explicit
+    /// typed profile-absent refusal instead of admitting against a
+    /// Kernel-invented bound.
+    pub work_class_budgets: Option<WorkClassBudgets>,
     /// Production startup must opt into consuming the exact authority receipt
     /// from the already protected process handoff descriptor. Tests and
     /// library-only process-authority compositions do not silently synthesize
@@ -118,6 +128,7 @@ impl KernelConfig {
             #[cfg(windows)]
             supervision_lease_authority: None,
             audit_anchor_binding: None,
+            work_class_budgets: None,
             #[cfg(windows)]
             require_descriptor_supervision_authority: false,
         }
@@ -273,6 +284,23 @@ impl KernelConfig {
     #[must_use]
     pub fn with_audit_anchor_binding(mut self, binding: AuditAnchorBinding) -> Self {
         self.audit_anchor_binding = Some(binding);
+        self
+    }
+
+    /// Injects the installed I14.1 work-class pool budget profile
+    /// (issue #1920).
+    ///
+    /// The profile is the operator-declared bound set only. Construction
+    /// validates every bound and fails closed on a zero dimension, so no pool
+    /// can ever be unbounded in items, bytes, concurrency or its deadline
+    /// profile.
+    #[must_use]
+    pub fn with_work_class_budgets(mut self, budgets: WorkClassBudgets) -> Self {
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.config.work_class_budgets_injected",
+        );
+        self.work_class_budgets = Some(budgets);
         self
     }
 }

@@ -195,6 +195,14 @@ mod research_provider_route;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
+/// Kernel-owned I14.1 work-class admission seam (issue #1920).
+///
+/// The admission API and its frozen pool semantics live in
+/// `eliot-kernel-core::module::work_class_admission`; this module is the
+/// owner-local composition boundary that makes them reachable from the real
+/// submission path and binds an audit-critical event through the single
+/// Kernel audit chain.
+pub mod work_class_admission;
 mod wasm_runtime_port_grant;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
@@ -277,7 +285,7 @@ use eliot_ipc::{
 use eliot_kernel_core::{
     AuthoritySnapshotBinding, BoundCanonicalOwner, DispatchSnapshotCodec, GenerationRoute,
     GenerationRouter, GovernorClosureRestore, KernelError, ProcessDispatchAuthorityController,
-    RouteScope, bind_canonical_owner, owner_bundle_digest,
+    RouteScope, WorkClassScheduler, bind_canonical_owner, owner_bundle_digest,
 };
 #[cfg(windows)]
 pub use eliot_kernel_service::KernelStoreGateway;
@@ -430,6 +438,10 @@ use sha2::{Digest as _, Sha256};
 pub use wasm_runtime_port_grant::{
     HostBinaryFacts, KernelObservedGrantFacts, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
     WasmPortGrant, handle_wasm_port_grant, issue_wasm_port_grant, validate_wasm_port_grant,
+};
+pub use work_class_admission::{
+    AdmittedWork, AdmissionClass, CancellationState, ExecutionState, PoolLimit,
+    SHEDDING_ORDER, WorkAdmissionRefusal, WorkAdmissionRequest, WorkClassBudgets, WorkPoolBudget,
 };
 
 #[cfg(all(test, windows))]
@@ -657,6 +669,13 @@ pub struct KernelComposition {
     /// once at assembly below the canonical work root; every boundary
     /// appends through [`KernelComposition::audit_observe`].
     pub(crate) kernel_audit: Mutex<KernelAuditChain>,
+    /// The I14.1 work-class admission scheduler (issue #1920). One bounded
+    /// pool per work class, the reserved control partition, the documented
+    /// shedding order, and the admitted work record carrying retry budget and
+    /// cancellation state. `None` only while the operator budget profile is
+    /// absent, in which case the admission entrypoint refuses closed rather
+    /// than admitting against a Kernel-invented bound.
+    work_class_admission: Option<WorkClassScheduler>,
 }
 
 impl KernelComposition {

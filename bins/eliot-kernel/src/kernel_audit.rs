@@ -330,6 +330,11 @@ impl AuditEventKind {
     pub const SHUTDOWN_DRAIN_COMMITTED: &'static str = "shutdown.drain_committed";
     /// The shutdown terminal published.
     pub const SHUTDOWN_TERMINAL_PUBLISHED: &'static str = "shutdown.terminal_published";
+    /// One I14.1 work-class admission was refused by a bounded pool (#1920).
+    /// The overload disposition itself is the audit-critical event: it stays
+    /// recorded while lower-priority work is shed, and it names the exhausted
+    /// bound, the shed class and the documented shedding order.
+    pub const WORK_CLASS_ADMISSION_REFUSED: &'static str = "work_class.admission_refused";
 
     /// Every canonical kind, in schema order.
     pub const ALL: &'static [&'static str] = &[
@@ -364,6 +369,7 @@ impl AuditEventKind {
         Self::SHUTDOWN_DRAIN_REQUESTED,
         Self::SHUTDOWN_DRAIN_COMMITTED,
         Self::SHUTDOWN_TERMINAL_PUBLISHED,
+        Self::WORK_CLASS_ADMISSION_REFUSED,
     ];
 
     /// Returns whether `kind` is in the closed canonical set.
@@ -390,7 +396,8 @@ impl AuditEventKind {
             | Self::PROCESS_FAILED
             | Self::SHUTDOWN_DRAIN_REQUESTED
             | Self::SHUTDOWN_DRAIN_COMMITTED
-            | Self::SHUTDOWN_TERMINAL_PUBLISHED => AuditAssuranceClass::Critical,
+            | Self::SHUTDOWN_TERMINAL_PUBLISHED
+            | Self::WORK_CLASS_ADMISSION_REFUSED => AuditAssuranceClass::Critical,
             _ => AuditAssuranceClass::Material,
         }
     }
@@ -1206,6 +1213,64 @@ impl AuditEventDraft {
             body: serde_json::json!({
                 "terminal": terminal,
                 "pending_count": pending_count,
+            }),
+        }
+    }
+
+    /// Returns the I14.1 admission-refused draft for one overload disposition
+    /// (issue #1920).
+    ///
+    /// The body keeps the refusal typed on the wire: the requested class, the
+    /// exhausted declared bound, the frozen I14.3 bottleneck observation, the
+    /// I14.4 disposition, the I14.6 work outcome and the documented shedding
+    /// order are all recorded, so the record of what was shed survives the
+    /// overload that produced it.
+    #[must_use]
+    pub fn work_class_admission_refused(
+        class: eliot_kernel_core::AdmissionClass,
+        request: &eliot_kernel_core::WorkAdmissionRequest,
+        refusal: &eliot_kernel_core::WorkAdmissionRefusal,
+    ) -> Self {
+        let mut lineage = AuditLineage::empty();
+        lineage.controller = Some("kernel".to_owned());
+        Self::fill(&mut lineage.work_item, request.work_id.as_str());
+        let (bound, bottleneck, disposition, work_outcome, shedding_order) = match refusal {
+            eliot_kernel_core::WorkAdmissionRefusal::PoolExhausted {
+                limit,
+                bottleneck,
+                disposition,
+                work_outcome,
+                shedding_order,
+                ..
+            } => (
+                Some(format!("{limit:?}")),
+                bottleneck.clone(),
+                Some(*disposition),
+                Some(*work_outcome),
+                Some(
+                    shedding_order
+                        .iter()
+                        .map(|class| class.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            _ => (None, None, None, None, None),
+        };
+        Self {
+            kind: AuditEventKind::WORK_CLASS_ADMISSION_REFUSED,
+            lineage,
+            body: serde_json::json!({
+                "work_class": class.as_str(),
+                "work_class_sheddable": class.is_sheddable(),
+                "owner": request.owner,
+                "declared_bytes": request.bytes,
+                "declared_retry_budget": request.retry_budget,
+                "refusal": format!("{refusal:?}"),
+                "exhausted_bound": bound,
+                "bottleneck": bottleneck,
+                "disposition": disposition.map(|value| value.as_str()),
+                "work_outcome": work_outcome.map(|value| format!("{value:?}")),
+                "shedding_order": shedding_order,
             }),
         }
     }

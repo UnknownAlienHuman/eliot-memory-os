@@ -14,6 +14,9 @@
 //!   cutover state ([`ProcessHealthStatus`], [`CapabilityReadiness`]);
 //! - the bounded control reserve and synchronous front door
 //!   ([`ControlReserve`], [`FrontDoor`]);
+//! - the I14.1 work-class admission scheduler: one bounded pool per class,
+//!   the reserved control partition, the documented shedding order and the
+//!   admitted work record ([`WorkClassScheduler`], [`AdmittedWork`]);
 //! - the role-filtered recovery view ([`RecoveryViewBuilder`]).
 //!
 //! [`KernelAuthority`] and [`RouteFence`] are the existing P-07 control-plane
@@ -93,6 +96,11 @@ pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_s
 pub use module::runtime_health::{
     CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
     CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
+};
+pub use module::work_class_admission::{
+    AdmittedWork, AdmittedWorkRecord, AdmissionClass, CancellationState, ExecutionState,
+    PoolAvailability, PoolLimit, SHEDDING_ORDER, WorkAdmissionRefusal, WorkAdmissionRequest,
+    WorkClassBudgets, WorkClassScheduler, WorkPool, WorkPoolBudget,
 };
 pub use user_automation::{
     AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,

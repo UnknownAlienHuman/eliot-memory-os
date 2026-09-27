@@ -7,6 +7,10 @@
 //! - [`control_reserve_front_door`] — the bounded control reserve and the
 //!   synchronous front-door admission core;
 //! - [`recovery_state_view`] — the role-filtered, non-semantic recovery view;
+//! - [`work_class_admission`] — the I14.1 work-class admission scheduler with
+//!   one bounded pool per class, the reserved control partition, the documented
+//!   shedding order and the admitted work record carrying retry budget and
+//!   cancellation state;
 //! - [`notification_state`] — canonical persistent notification records;
 //! - [`compatibility_handshake`] — the versioned I1.12 process-handshake
 //!   compatibility envelope and rollback admission;
@@ -23,3 +27,4 @@ pub mod notification_state;
 pub mod process_health;
 pub mod recovery_state_view;
 pub mod runtime_health;
+pub mod work_class_admission;
