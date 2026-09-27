@@ -702,6 +702,10 @@ pub struct MaintenanceRecord {
     pub core: ObservationEventCore,
     pub maintenance_action: String,
     pub trigger_ref: String,
+    /// Versioned source outcome, observation delivery and utility evidence.
+    /// Omitted legacy payloads remain readable as an explicit absent result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Box<MaintenanceResultV1>>,
 }
 
 impl MaintenanceRecord {
@@ -709,8 +713,559 @@ impl MaintenanceRecord {
     pub fn validate(&self) -> Result<(), ObservationError> {
         text(&self.record_id, "record_id")?;
         self.core.validate()?;
+        if self.core.kind != ObservationKind::Maintenance {
+            return Err(ObservationError::InvalidField {
+                field: "core.kind",
+                reason: "maintenance records require MAINTENANCE event kind",
+            });
+        }
         text(&self.maintenance_action, "maintenance_action")?;
-        text(&self.trigger_ref, "trigger_ref")
+        text(&self.trigger_ref, "trigger_ref")?;
+        if let Some(result) = &self.result {
+            result.validate(&self.record_id, &self.trigger_ref, &self.core)?;
+        }
+        Ok(())
+    }
+}
+
+/// Version of the maintenance result and evaluation binding.
+pub const MAINTENANCE_RESULT_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+
+/// Execution result of the source maintenance work, independent from whether
+/// its observation was published and whether it produced utility.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceExecutionOutcome {
+    /// The decision did not begin an execution attempt.
+    NotAttempted,
+    /// The attempt completed; utility still requires separate evaluation.
+    Completed,
+    /// The attempt produced only a partial result.
+    Partial,
+    /// The attempt failed with an observed failure disposition.
+    Failed,
+    /// The attempt was cancelled.
+    Cancelled,
+    /// The execution/effect outcome remains unresolved.
+    Unknown,
+}
+
+/// State of publishing the source result into the observation path.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceDeliveryState {
+    /// The observation obligation is still pending publication.
+    Pending { obligation_ref: String },
+    /// Publication was confirmed by the exact canonical observation receipt.
+    Published { observation_receipt_ref: String },
+    /// Publication could not complete and an explicit gap was recorded.
+    Unavailable { coverage_gap_ref: String },
+}
+
+/// Utility conclusion for a maintenance source outcome.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceUtilityVerdict {
+    /// Delayed comparisons have not reached an evaluable window.
+    Pending,
+    /// Evidence is present but does not support a directional conclusion.
+    Inconclusive,
+    /// The supported comparisons show benefit under their declared method.
+    Beneficial,
+    /// The supported comparisons show harm under their declared method.
+    Harmful,
+}
+
+/// Provenance class for an explicitly valued metric.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceMetricValueBasis {
+    /// Value directly observed in the named evidence window.
+    DirectObservation,
+    /// Value from an actual billed-cost source.
+    BilledActual,
+    /// Value is an estimate and is not billed/actual cost.
+    Estimate,
+    /// Value is inferred rather than directly observed.
+    Inference,
+}
+
+/// Direction supplied by the named evaluation method, without hidden metric
+/// thresholds in this transport contract.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceMetricAssessment {
+    /// The measured delta supports the beneficial verdict.
+    SupportsBenefit,
+    /// The measured delta supports the harmful verdict.
+    SupportsHarm,
+    /// The measured delta is directionally neutral under the method.
+    NoMaterialChange,
+    /// Evidence or method does not support a directional assessment.
+    Unresolved,
+}
+
+/// Measured value or explicit reason that a metric cannot be concluded.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceMetricResult {
+    /// A value with units and evidence basis; consumers must not infer its basis.
+    Value {
+        /// Exact observed or estimated value in `MaintenanceMetricEvaluationV1::unit`.
+        value: String,
+        /// Distinguishes directly observed and billed values from estimates/inference.
+        basis: MaintenanceMetricValueBasis,
+    },
+    /// Required evidence is absent or insufficient for a value.
+    Unknown { reason_ref: String },
+    /// The metric does not apply to this source outcome.
+    NotApplicable { reason_ref: String },
+    /// A follow-up comparison is not yet available.
+    Pending { reason_ref: String },
+    /// A comparison was attempted but cannot be interpreted directionally.
+    Inconclusive { reason_ref: String },
+}
+
+/// Evidence for one named baseline/follow-up utility comparison.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceMetricEvaluationV1 {
+    /// Baseline observation when one is available.
+    pub baseline_observation_ref: Option<String>,
+    /// Evidence already observed before the delayed comparison is conclusive.
+    /// It remains attached even while the metric result is pending.
+    pub immediate_observation_refs: Vec<String>,
+    /// Follow-up observation; absent while a delayed window is pending.
+    pub follow_up_observation_ref: Option<String>,
+    /// Exact cursor/clock comparison interval.
+    pub comparison_window: CoverageInterval,
+    /// Unit identity for any explicit value.
+    pub unit: String,
+    /// Denominator, interval and blind coverage for this metric.
+    pub coverage: CoverageEvidence,
+    /// Explicit measured, unknown, inapplicable, pending or inconclusive result.
+    pub result: MaintenanceMetricResult,
+    /// Direction assigned by the versioned evaluation method.
+    pub directional_assessment: MaintenanceMetricAssessment,
+    /// Evaluator identity and revision used for this comparison.
+    pub evaluation_method_ref: String,
+    pub evaluation_method_revision: String,
+    /// Named workload/exposure changes relevant to attribution.
+    pub exposure_workload_change_refs: Vec<String>,
+    /// Named rival explanations that remain relevant to the comparison.
+    pub rival_explanation_refs: Vec<String>,
+}
+
+impl MaintenanceMetricEvaluationV1 {
+    fn validate(&self, is_cost: bool) -> Result<(), ObservationError> {
+        CoverageInterval::new(self.comparison_window.start, self.comparison_window.end)?;
+        text(&self.unit, "maintenance_metric.unit")?;
+        self.coverage.validate()?;
+        if self.coverage.interval != Some(self.comparison_window) {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_metric.coverage.interval",
+                reason: "must match comparison_window",
+            });
+        }
+        text(
+            &self.evaluation_method_ref,
+            "maintenance_metric.evaluation_method_ref",
+        )?;
+        text(
+            &self.evaluation_method_revision,
+            "maintenance_metric.evaluation_method_revision",
+        )?;
+        if let Some(reference) = &self.baseline_observation_ref {
+            text(reference, "maintenance_metric.baseline_observation_ref")?;
+        }
+        if let Some(reference) = &self.follow_up_observation_ref {
+            text(reference, "maintenance_metric.follow_up_observation_ref")?;
+        }
+        unique(
+            &self.immediate_observation_refs,
+            "maintenance_metric.immediate_observation_refs",
+        )?;
+        if self.baseline_observation_ref.is_some()
+            && self.baseline_observation_ref == self.follow_up_observation_ref
+        {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_metric.follow_up_observation_ref",
+                reason: "follow-up observation must differ from baseline",
+            });
+        }
+        unique(
+            &self.exposure_workload_change_refs,
+            "maintenance_metric.exposure_workload_change_refs",
+        )?;
+        unique(
+            &self.rival_explanation_refs,
+            "maintenance_metric.rival_explanation_refs",
+        )?;
+        match &self.result {
+            MaintenanceMetricResult::Value { value, basis } => {
+                text(value, "maintenance_metric.value")?;
+                if self.baseline_observation_ref.is_none()
+                    || self.follow_up_observation_ref.is_none()
+                {
+                    return Err(ObservationError::InvalidField {
+                        field: "maintenance_metric.observation_refs",
+                        reason: "a value requires baseline and follow-up observation refs",
+                    });
+                }
+                if !is_cost && *basis == MaintenanceMetricValueBasis::BilledActual {
+                    return Err(ObservationError::InvalidField {
+                        field: "maintenance_metric.basis",
+                        reason: "BILLED_ACTUAL applies only to the cost metric",
+                    });
+                }
+            }
+            MaintenanceMetricResult::Unknown { reason_ref }
+            | MaintenanceMetricResult::NotApplicable { reason_ref }
+            | MaintenanceMetricResult::Pending { reason_ref }
+            | MaintenanceMetricResult::Inconclusive { reason_ref } => {
+                text(reason_ref, "maintenance_metric.reason_ref")?;
+            }
+        }
+        if matches!(self.result, MaintenanceMetricResult::Pending { .. })
+            && (self.baseline_observation_ref.is_none() || self.follow_up_observation_ref.is_some())
+        {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_metric.observation_refs",
+                reason: "pending follow-up requires a baseline and no follow-up ref",
+            });
+        }
+        if !matches!(self.result, MaintenanceMetricResult::Value { .. })
+            && self.directional_assessment != MaintenanceMetricAssessment::Unresolved
+        {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_metric.directional_assessment",
+                reason: "a missing or inapplicable value cannot carry a directional assessment",
+            });
+        }
+        Ok(())
+    }
+
+    fn supports_benefit_claim(&self, is_cost: bool) -> bool {
+        let MaintenanceMetricResult::Value { basis, .. } = &self.result else {
+            return false;
+        };
+        let basis_is_sufficient = matches!(
+            (is_cost, *basis),
+            (true | false, MaintenanceMetricValueBasis::DirectObservation)
+                | (true, MaintenanceMetricValueBasis::BilledActual)
+        );
+        self.baseline_observation_ref.is_some()
+            && self.follow_up_observation_ref.is_some()
+            && self.coverage.disposition == CoverageDisposition::Complete
+            && self.coverage.blind_intervals.is_empty()
+            && matches!(
+                self.directional_assessment,
+                MaintenanceMetricAssessment::SupportsBenefit
+                    | MaintenanceMetricAssessment::NoMaterialChange
+            )
+            && basis_is_sufficient
+    }
+}
+
+/// The five required utility comparisons for a maintenance outcome.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceUtilityEvidenceV1 {
+    /// Recurrence during the named follow-up window.
+    pub recurrence: MaintenanceMetricEvaluationV1,
+    /// Product or recovery delta after the maintenance action.
+    pub product_recovery_delta: MaintenanceMetricEvaluationV1,
+    /// False changes introduced by the maintenance action.
+    pub false_changes: MaintenanceMetricEvaluationV1,
+    /// Actual or estimated cost, with value basis kept explicit.
+    pub cost: MaintenanceMetricEvaluationV1,
+    /// Operator time or burden, never inferred from absence of user response.
+    pub operator_burden: MaintenanceMetricEvaluationV1,
+}
+
+impl MaintenanceUtilityEvidenceV1 {
+    fn validate(&self) -> Result<(), ObservationError> {
+        self.recurrence.validate(false)?;
+        self.product_recovery_delta.validate(false)?;
+        self.false_changes.validate(false)?;
+        self.cost.validate(true)?;
+        self.operator_burden.validate(false)
+    }
+
+    fn supports_benefit_claim(&self) -> bool {
+        let metrics = [
+            (&self.recurrence, false),
+            (&self.product_recovery_delta, false),
+            (&self.false_changes, false),
+            (&self.cost, true),
+            (&self.operator_burden, false),
+        ];
+        metrics
+            .iter()
+            .all(|(metric, is_cost)| metric.supports_benefit_claim(*is_cost))
+            && metrics.iter().any(|(metric, _)| {
+                metric.directional_assessment == MaintenanceMetricAssessment::SupportsBenefit
+            })
+    }
+}
+
+/// Versioned, append-only result and utility evaluation for one maintenance
+/// decision. This remains data: validation does not publish it or claim that a
+/// referenced receipt exists.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceResultV1 {
+    /// Exact schema version for this result shape.
+    pub contract_version: ContractVersion,
+    /// Trigger event that caused the maintenance decision.
+    pub source_trigger_ref: String,
+    /// Actual source decision, including a no-attempt deferral decision.
+    pub decision_ref: String,
+    /// Registered maintenance family identity.
+    pub family: String,
+    /// Exact affected scope, kept coherent with the shared event envelope.
+    pub scope: ObservationScope,
+    /// Related problem, if the decision was problem-driven.
+    pub problem_ref: Option<String>,
+    /// Durable job identity when one was admitted.
+    pub job_ref: Option<String>,
+    /// Execution attempt identity when execution began.
+    pub attempt_ref: Option<String>,
+    /// Execution receipt when the source owner issued one.
+    pub execution_receipt_ref: Option<String>,
+    /// Policy revision governing the source decision.
+    pub policy_revision: String,
+    /// Repair recipe revision, when a recipe applied.
+    pub recipe_revision: Option<String>,
+    /// Execution route revision, when a route was selected.
+    pub route_revision: Option<String>,
+    /// Build revision of the maintenance executor, when execution occurred.
+    pub build_revision: Option<String>,
+    /// Exact state fence captured for the source decision/execution.
+    pub state_fence: StateFence,
+    /// Revision of the original source outcome; stable across retries.
+    pub source_outcome_revision: String,
+    /// Actual effect evidence; empty for a no-attempt decision.
+    pub actual_effect_refs: Vec<String>,
+    /// Durable execution checkpoints, if any.
+    pub checkpoint_refs: Vec<String>,
+    /// Reconciliation evidence, if any.
+    pub reconciliation_refs: Vec<String>,
+    /// Result-level observation coverage, bound to the shared event core.
+    pub observation_coverage: CoverageEvidence,
+    /// Stable publication identity derived from source outcome/evaluation revision.
+    pub publication_id: String,
+    /// Starts at one and advances for appended follow-up evaluations.
+    pub evaluation_revision: u64,
+    /// Prior evaluation identity; later assessments append instead of replacing history.
+    pub predecessor_evaluation_ref: Option<String>,
+    /// Execution outcome is independent from publication delivery and utility.
+    pub execution_outcome: MaintenanceExecutionOutcome,
+    /// Delivery of the result into the observation path.
+    pub delivery_state: MaintenanceDeliveryState,
+    /// Delayed utility conclusion.
+    pub utility_verdict: MaintenanceUtilityVerdict,
+    /// Required counter-metrics and their evidence windows.
+    pub utility: MaintenanceUtilityEvidenceV1,
+}
+
+impl MaintenanceResultV1 {
+    fn validate(
+        &self,
+        record_id: &str,
+        trigger_ref: &str,
+        core: &ObservationEventCore,
+    ) -> Result<(), ObservationError> {
+        self.validate_identity(record_id, trigger_ref, core)?;
+        self.state_fence.validate()?;
+        self.validate_references()?;
+        self.validate_coverage(core)?;
+        self.validate_revision()?;
+        self.validate_delivery()?;
+        self.validate_execution()?;
+        self.utility.validate()?;
+        self.validate_utility_verdict()
+    }
+
+    fn validate_identity(
+        &self,
+        record_id: &str,
+        trigger_ref: &str,
+        core: &ObservationEventCore,
+    ) -> Result<(), ObservationError> {
+        if self.contract_version != MAINTENANCE_RESULT_CONTRACT_VERSION {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.contract_version",
+                reason: "unsupported result contract version",
+            });
+        }
+        for (value, field) in [
+            (
+                &self.source_trigger_ref,
+                "maintenance_result.source_trigger_ref",
+            ),
+            (&self.decision_ref, "maintenance_result.decision_ref"),
+            (&self.family, "maintenance_result.family"),
+            (&self.policy_revision, "maintenance_result.policy_revision"),
+            (
+                &self.source_outcome_revision,
+                "maintenance_result.source_outcome_revision",
+            ),
+            (&self.publication_id, "maintenance_result.publication_id"),
+        ] {
+            text(value, field)?;
+        }
+        if self.publication_id != record_id {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.publication_id",
+                reason: "must match the observation record identity",
+            });
+        }
+        if self.source_trigger_ref != trigger_ref {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.source_trigger_ref",
+                reason: "must match the maintenance record trigger_ref",
+            });
+        }
+        self.scope.validate()?;
+        if self.scope != core.affected_scope {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.scope",
+                reason: "must match the shared observation event scope",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_references(&self) -> Result<(), ObservationError> {
+        for (value, field) in [
+            (&self.problem_ref, "maintenance_result.problem_ref"),
+            (&self.job_ref, "maintenance_result.job_ref"),
+            (&self.attempt_ref, "maintenance_result.attempt_ref"),
+            (
+                &self.execution_receipt_ref,
+                "maintenance_result.execution_receipt_ref",
+            ),
+            (&self.recipe_revision, "maintenance_result.recipe_revision"),
+            (&self.route_revision, "maintenance_result.route_revision"),
+            (&self.build_revision, "maintenance_result.build_revision"),
+            (
+                &self.predecessor_evaluation_ref,
+                "maintenance_result.predecessor_evaluation_ref",
+            ),
+        ] {
+            if let Some(value) = value {
+                text(value, field)?;
+            }
+        }
+        unique(
+            &self.actual_effect_refs,
+            "maintenance_result.actual_effect_refs",
+        )?;
+        unique(&self.checkpoint_refs, "maintenance_result.checkpoint_refs")?;
+        unique(
+            &self.reconciliation_refs,
+            "maintenance_result.reconciliation_refs",
+        )
+    }
+
+    fn validate_coverage(&self, core: &ObservationEventCore) -> Result<(), ObservationError> {
+        self.observation_coverage.validate()?;
+        if self.observation_coverage != core.coverage_and_blind_intervals {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.observation_coverage",
+                reason: "must match the shared observation event coverage",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_revision(&self) -> Result<(), ObservationError> {
+        if self.evaluation_revision == 0
+            || (self.evaluation_revision == 1 && self.predecessor_evaluation_ref.is_some())
+            || (self.evaluation_revision > 1 && self.predecessor_evaluation_ref.is_none())
+        {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.evaluation_revision",
+                reason: "revision one has no predecessor; later revisions require one",
+            });
+        }
+        if self.predecessor_evaluation_ref.as_deref() == Some(self.publication_id.as_str()) {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.predecessor_evaluation_ref",
+                reason: "must differ from publication_id",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_delivery(&self) -> Result<(), ObservationError> {
+        match &self.delivery_state {
+            MaintenanceDeliveryState::Pending { obligation_ref } => {
+                text(obligation_ref, "maintenance_result.delivery.obligation_ref")?;
+            }
+            MaintenanceDeliveryState::Published {
+                observation_receipt_ref,
+            } => {
+                text(
+                    observation_receipt_ref,
+                    "maintenance_result.delivery.observation_receipt_ref",
+                )?;
+            }
+            MaintenanceDeliveryState::Unavailable { coverage_gap_ref } => {
+                text(
+                    coverage_gap_ref,
+                    "maintenance_result.delivery.coverage_gap_ref",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_execution(&self) -> Result<(), ObservationError> {
+        match self.execution_outcome {
+            MaintenanceExecutionOutcome::NotAttempted => {
+                if self.attempt_ref.is_some()
+                    || self.execution_receipt_ref.is_some()
+                    || !self.actual_effect_refs.is_empty()
+                    || !self.checkpoint_refs.is_empty()
+                    || !self.reconciliation_refs.is_empty()
+                {
+                    return Err(ObservationError::InvalidField {
+                        field: "maintenance_result.execution_outcome",
+                        reason: "NOT_ATTEMPTED cannot carry attempt or execution evidence",
+                    });
+                }
+            }
+            _ if self.job_ref.is_none() || self.attempt_ref.is_none() => {
+                return Err(ObservationError::InvalidField {
+                    field: "maintenance_result.execution_outcome",
+                    reason: "an attempted outcome requires job_ref and attempt_ref",
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_utility_verdict(&self) -> Result<(), ObservationError> {
+        if self.utility_verdict == MaintenanceUtilityVerdict::Beneficial
+            && !self.utility.supports_benefit_claim()
+        {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.utility_verdict",
+                reason: "BENEFICIAL requires measured, complete, unblinded comparisons for every metric and actual cost",
+            });
+        }
+        if self.execution_outcome == MaintenanceExecutionOutcome::NotAttempted
+            && self.utility_verdict == MaintenanceUtilityVerdict::Beneficial
+        {
+            return Err(ObservationError::InvalidField {
+                field: "maintenance_result.utility_verdict",
+                reason: "a no-attempt decision cannot claim maintenance benefit",
+            });
+        }
+        Ok(())
     }
 }
 
