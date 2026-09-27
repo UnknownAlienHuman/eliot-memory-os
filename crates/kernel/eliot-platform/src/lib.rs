@@ -19,10 +19,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod guard_outcome;
 mod handle_nonce;
 mod port_contracts;
 mod work_scope_path;
 
+pub use guard_outcome::{
+    ContainmentObservation, ContainmentRecord, ContainmentRequest, EffectCertainty,
+    EffectDisposition, FailureRecord, GuardKind, GuardOutcomeError, GuardRevertOutcome,
+    OsErrorCode, RequiredNextAction, RestorationAttempt, RestorationRecord, RestorationStage,
+};
 pub use handle_nonce::{
     HostProcessNonce, KernelActivationNonce, NonceContractError, PlatformHandle,
 };

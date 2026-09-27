@@ -1252,38 +1252,20 @@ impl PrivilegeApi for NativePrivilegeApi {
 
 /// Bounded abort-boundary evidence record for issue #860 guard fail-stops.
 ///
-/// Writes one fixed-shape record to the existing process stderr handle:
-/// static site/detail bytes plus the decimal Win32 code. No heap allocation,
-/// no formatting machinery, no logging framework, no panic path; the write
-/// result is intentionally ignored because this runs on the emergency
-/// termination path. No secret, token, or principal value is ever emitted:
-/// only the static site identifier, the restoration stage name, and the
-/// numeric code.
+/// The write is delegated to the single terminal-containment owner
+/// ([`crate::terminal_containment`]), which fixes the record size, version,
+/// field encoding, and approved sink identity, and owns the prepared evidence
+/// resource acquired before a guarded mutation. That owner uses one fixed
+/// stack record and one lock-free `WriteFile` whose exact result is captured,
+/// with a nonblocking reentry guard, and performs the fail-stop fallback itself
+/// when no complete record was written. It is the replacement backing mechanism
+/// for the previous `std::io::stderr().lock()` emitter, not a second logger.
+///
+/// No secret, token, or principal value is ever emitted: only the static site
+/// identifier, the restoration stage name, and the numeric code.
 #[cfg(windows)]
 pub(crate) fn emit_abort_boundary_evidence(site: &'static str, detail: &'static str, code: u32) {
-    use std::io::Write as _;
-
-    let stderr = std::io::stderr();
-    let mut stderr = stderr.lock();
-    let _ = stderr.write_all(b"eliot-abort-boundary site=");
-    let _ = stderr.write_all(site.as_bytes());
-    let _ = stderr.write_all(b" detail=");
-    let _ = stderr.write_all(detail.as_bytes());
-    let _ = stderr.write_all(b" code=");
-    let mut digits = [b'0'; 10];
-    let mut remaining = code;
-    let mut start = digits.len();
-    if remaining == 0 {
-        start -= 1;
-    } else {
-        while remaining > 0 && start > 0 {
-            start -= 1;
-            digits[start] = b'0' + u8::try_from(remaining % 10).unwrap_or(9);
-            remaining /= 10;
-        }
-    }
-    let _ = stderr.write_all(&digits[start..]);
-    let _ = stderr.write_all(b"\n");
+    crate::terminal_containment::fail_stop_with_terminal_containment(site, detail, code);
 }
 
 /// Maps a typed restoration error to its bounded evidence detail without
