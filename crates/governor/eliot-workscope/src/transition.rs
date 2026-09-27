@@ -655,6 +655,7 @@ struct StepRunner {
     scope_ref: String,
     old_generation: u64,
     new_generation: u64,
+    revision: u64,
     proposal_fence: StateFence,
     receipt_ref: String,
     outcomes: Vec<TransitionStepOutcome>,
@@ -668,6 +669,7 @@ impl StepRunner {
             scope_ref: proposal.scope_ref.clone(),
             old_generation: proposal.old_generation,
             new_generation: proposal.new_generation,
+            revision: 1,
             proposal_fence: proposal.state_fence.clone(),
             receipt_ref,
             outcomes: Vec::new(),
@@ -682,7 +684,7 @@ impl StepRunner {
                 receipt_ref: self.receipt_ref,
                 transition_ref: self.transition_ref,
                 kind: self.kind,
-                revision: 1,
+                revision: self.revision,
                 scope_ref: self.scope_ref,
                 old_generation: self.old_generation,
                 new_generation: self.new_generation,
@@ -977,7 +979,9 @@ pub fn execute_transition(
 /// it, and fresh caller evidence is checked against the proposal exactly as in
 /// [`execute_transition`]. Outcomes already recorded are preserved verbatim
 /// and the revision advances by one. A committed receipt is never resumed: it
-/// is returned intact inside the failure.
+/// is returned intact inside the failure. Refusals before a matching valid
+/// proposal and partial receipt are admitted also return the input partial
+/// intact; the new revision begins only after resume admission.
 ///
 /// # Errors
 ///
@@ -989,22 +993,38 @@ pub fn resume_transition(
     partial: &ScopeTransitionReceipt,
     evidence: &TransitionStepEvidence,
 ) -> Result<ScopeTransitionReceipt, TransitionFailure> {
-    let receipt_ref = partial.receipt_ref.clone();
-    if let Err(reason) = proposal.validate() {
-        return Err(StepRunner::for_proposal(proposal, receipt_ref)
-            .fail(ScopeTransitionStep::Propose, reason));
+    if partial.committed {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::BindingReceiptMismatch,
+        });
     }
-    let mut runner = StepRunner::for_proposal(proposal, receipt_ref);
+    let Some(revision) = partial.revision.checked_add(1) else {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::InvalidCounter { field: "revision" },
+        });
+    };
+    if let Err(reason) = proposal.validate() {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::Propose,
+            reason,
+        });
+    }
     let belongs = partial.transition_ref == proposal.transition_ref
         && partial.kind == proposal.kind
         && partial.scope_ref == proposal.scope_ref
         && partial.old_generation == proposal.old_generation
         && partial.new_generation == proposal.new_generation;
-    if !belongs || partial.committed || partial.validate().is_err() {
-        return Err(runner.fail(
-            ScopeTransitionStep::CommitReceipt,
-            WorkScopeError::BindingReceiptMismatch,
-        ));
+    if !belongs || partial.validate().is_err() {
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::BindingReceiptMismatch,
+        });
     }
     let completed_prefix = partial
         .step_outcomes
@@ -1012,11 +1032,15 @@ pub fn resume_transition(
         .take_while(|outcome| outcome.completed)
         .count();
     if completed_prefix == 0 || completed_prefix >= TRANSITION_STEP_COUNT as usize {
-        return Err(runner.fail(
-            ScopeTransitionStep::CommitReceipt,
-            WorkScopeError::BindingReceiptMismatch,
-        ));
+        return Err(TransitionFailure {
+            partial: Box::new(partial.clone()),
+            failed_step: ScopeTransitionStep::CommitReceipt,
+            reason: WorkScopeError::BindingReceiptMismatch,
+        });
     }
+    let receipt_ref = partial.receipt_ref.clone();
+    let mut runner = StepRunner::for_proposal(proposal, receipt_ref);
+    runner.revision = revision;
     runner.outcomes = partial.step_outcomes[..completed_prefix].to_vec();
     if let Err(reason) = evidence.validate() {
         let next = ScopeTransitionStep::from_number(completed_prefix + 1)
@@ -1029,7 +1053,7 @@ pub fn resume_transition(
             return Err(runner.fail(failed_step, reason));
         }
     }
-    match assemble_committed(&runner, evidence, partial.revision + 1) {
+    match assemble_committed(&runner, evidence, runner.revision) {
         Ok(receipt) => Ok(receipt),
         Err(reason) => Err(runner.fail(ScopeTransitionStep::CommitReceipt, reason)),
     }
