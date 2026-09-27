@@ -180,9 +180,10 @@ pub use reactive_state::{
     handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
 };
 pub use storage_replacement::{
-    CANONICAL_STORE_CAPABILITY, IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT,
+    CANONICAL_STORE_CAPABILITY, CANONICAL_STORE_EFFECT_DOMAIN, CANONICAL_STORE_MODULE_ID,
+    CANONICAL_STORE_WORK_SCOPE, IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT,
     StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
-    StorageRollbackDisposition,
+    StorageReplacementTransfer, StorageRollbackDisposition, canonical_store_route_scope,
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
