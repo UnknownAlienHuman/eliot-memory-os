@@ -13481,6 +13481,42 @@ impl RedbRecoveryStore {
         Ok((positions, position_bytes))
     }
 
+    /// Counts only the owner namespace's bounded gap rows, rejecting a
+    /// mismatched key or legacy overflow rather than returning a partial
+    /// capacity denominator.
+    fn bridge_gap_accounting_for(
+        read: &redb::ReadTransaction,
+        namespace: &str,
+    ) -> Result<(u64, u64), OrsError> {
+        let stored = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+        let prefix = format!("{namespace}::");
+        let end = format!("{prefix}\u{10ffff}");
+        let mut gaps = 0_u64;
+        let mut gap_bytes = 0_u64;
+        for entry in stored
+            .range(prefix.as_str()..=end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let row: BridgeEventGapRow = decode(value.value())?;
+            row.validate()?;
+            if row.owner_namespace != namespace
+                || key.value() != format!("{namespace}::{}", row.gap_id)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_gap",
+                    reason: "gap key or owner does not match its indexed scope".to_owned(),
+                });
+            }
+            if gaps >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            gaps += 1;
+            gap_bytes += (key.value().len() + value.value().len()) as u64;
+        }
+        Ok((gaps, gap_bytes))
+    }
+
     /// Accounts one namespace's bridge-event capacity under its owner
     /// (issue #2731, item 4): pending live events, handoffs, retained replay
     /// commitments, the #2730 ordered position index, stream/cursor
@@ -13544,20 +13580,7 @@ impl RedbRecoveryStore {
                 }
             }
         }
-        let mut gaps = 0_u64;
-        let mut gap_bytes = 0_u64;
-        {
-            let stored = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
-            for entry in stored.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventGapRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace == namespace {
-                    gaps += 1;
-                    gap_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
+        let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace)?;
         let cursor_bytes = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
             cursors
