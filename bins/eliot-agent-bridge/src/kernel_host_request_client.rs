@@ -259,9 +259,10 @@ impl ParentLink {
 /// Derives the logical key for one invocation replay lookup.
 ///
 /// The occurrence is the request correlation; the bridge carries no
-/// task/scope authority of its own, so invocations are explicitly
-/// admitted-unbound and a future task-bound caller resolves under a
-/// different key rather than silently adopting this one.
+/// task/scope authority of its own. The logical key is scoped to the
+/// authenticated session and typed projection; task, scope, payload and
+/// parent are compared as the owner's durable commitment, so a changed
+/// binding conflicts instead of creating a second operation.
 fn logical_invocation_key(
     projection: &HostCorrelationProjection,
     session: &str,
@@ -275,15 +276,11 @@ fn logical_invocation_key(
 
 /// Derives the logical key for one cancellation intent.
 ///
-/// The cancellation binds its own stable identity — the cancel correlation
-/// occurrence — to the original parent handle plus the parent commitment
-/// the owner returned, so a repeated cancellation after restart or a lost
-/// acknowledgement resolves its retained intent instead of generating
-/// another effectful cancellation from a fresh timestamp.
+/// The cancellation's typed projection and session identify its retained
+/// intent. Its original parent handle and commitment are checked against the
+/// owner result; they do not alter the logical key.
 fn logical_cancellation_key(
-    _cancel_correlation: &str,
     projection: &HostCorrelationProjection,
-    _parent: &ParentLink,
     session: &str,
 ) -> Result<String, PortFailure> {
     projection_key(LOGICAL_KIND_CANCELLATION, session, projection)
@@ -1078,9 +1075,8 @@ impl KernelHostRequestClient {
             .as_ref()
             .ok_or_else(|| unknown_cancel_outcome(&parent.handle))?;
         reject_kernel_operational_correlation(projection)?;
-        let logical_key =
-            logical_cancellation_key(cancel_correlation, projection, parent, session_id)
-                .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
+        let logical_key = logical_cancellation_key(projection, session_id)
+            .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
         let resolve_label = resolve_request_label(cancel_correlation);
         let resolve_envelope = build_resolve_envelope(
             &resolve_label,
