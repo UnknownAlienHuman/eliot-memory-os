@@ -44,8 +44,8 @@ use crate::evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, ClaimVerdict, CoverageAccount, LineageTable,
     ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
     SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    check_precision, digest, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
-    text,
+    check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
+    push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -3437,10 +3437,10 @@ impl ResearchDebtRestriction {
 /// Claim-audit binding for one audited claim (I21.8).
 ///
 /// The audit itself is owned by [`crate::evidence_portfolio::audit_claim`]; this
-/// record binds its verdict to the inquiry profile, the frozen manifest and the
-/// State Fence, and states that the result is a non-canonical candidate. The
-/// reference firewall holds: no citation, source identity, URL, line range or
-/// support relation is minted here through prose.
+/// record binds its verdict to the inquiry profile, the run-bound reference
+/// manifest and the State Fence, and states that the result is a non-canonical
+/// candidate. The reference firewall holds: no citation, source identity, URL,
+/// line range or support relation is minted here through prose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimAuditRecord {
     /// Audited claim identity.
@@ -3451,13 +3451,26 @@ pub struct ClaimAuditRecord {
     pub profile_id_and_revision: String,
     /// Profile revision digest.
     pub profile_digest: String,
-    /// Manifest digest the claim was audited against.
-    pub manifest_digest: String,
+    /// Digest of the run-bound `AllowedReferenceManifest` the claim was audited
+    /// against.
+    ///
+    /// Sourced from the re-proved manifest itself rather than from a
+    /// caller-supplied string, so it cannot disagree with the manifest that
+    /// produced the verdict.
+    pub run_reference_manifest_digest: String,
+    /// Run identity the audit was bound to.
+    pub run_id: String,
+    /// Root context revision the audit was bound to.
+    pub root_context_revision: String,
     /// Evidence-set identity.
     pub evidence_set_id: String,
     /// Verdict produced by the existing claim-audit owner.
     pub verdict: ClaimVerdict,
     /// State Fence the audit ran under.
+    ///
+    /// The run-bound manifest's own fence, and proven equal to the profile's
+    /// when the record is bound, so a verdict cannot be filed under a fence that
+    /// is neither the run's nor the profile's.
     pub state_fence: StateFence,
     /// Always false: a claim audit never becomes canonical state by itself.
     pub canonical: bool,
@@ -3466,31 +3479,61 @@ pub struct ClaimAuditRecord {
 }
 
 impl ClaimAuditRecord {
-    /// Binds one claim verdict to the inquiry it was produced under.
+    /// Binds one claim verdict to the inquiry and run it was produced under.
+    ///
+    /// `run_manifest` is the re-proved [`AllowedReferenceManifest`] itself, not a
+    /// digest of one. It used to take a bare `manifest_digest: &str` that was
+    /// only shape-checked as 64 lowercase hex and never compared with any
+    /// manifest, so the binding proved nothing: a record could name a digest that
+    /// no manifest ever produced, and the field it filled had no `run_id`, no
+    /// `root_context_revision` and no fence of its own. I21.7 requires an audit
+    /// job to be bound to the exact run and State Fence, so the manifest is now
+    /// an input and the fence is taken from it.
+    ///
+    /// The profile's own State Fence must equal the manifest's. A profile
+    /// resolved under one fence and a manifest frozen under another describe two
+    /// different runs, and binding them together would produce a record whose two
+    /// halves disagree about which run it describes.
     ///
     /// # Errors
     ///
-    /// Returns a field error for a blank identity or a malformed manifest
-    /// digest.
+    /// Returns a field error for a blank identity, and
+    /// [`InquiryError::IntegrityMismatch`] when the run-bound manifest does not
+    /// re-prove its own digest or the profile's State Fence is not the manifest's.
     pub fn bind(
         inquiry_id: &str,
         profile: &InquiryProtocolProfile,
-        manifest_digest: &str,
+        run_manifest: &AllowedReferenceManifest,
         evidence_set_id: &str,
         verdict: ClaimVerdict,
     ) -> Result<Self, InquiryError> {
         require_text(inquiry_id, "claim_audit.inquiry_id")?;
         require_text(evidence_set_id, "claim_audit.evidence_set_id")?;
-        require_digest(manifest_digest, "claim_audit.manifest_digest")?;
+        // Re-prove the manifest rather than trusting a digest a caller could have
+        // typed: `validate` recomputes the digest over every field that can change
+        // what a citation is allowed to say, so a widened or edited manifest is
+        // refused here instead of being filed under its own stale identity.
+        run_manifest
+            .validate()
+            .map_err(|_| InquiryError::IntegrityMismatch {
+                field: "claim_audit.run_reference_manifest",
+            })?;
+        if profile.state_fence != run_manifest.state_fence {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "claim_audit.state_fence",
+            });
+        }
         let mut record = Self {
             claim_id: verdict.claim_id.clone(),
             inquiry_id: inquiry_id.to_owned(),
             profile_id_and_revision: profile.profile_id_and_revision(),
             profile_digest: profile.integrity_digest.clone(),
-            manifest_digest: manifest_digest.to_owned(),
+            run_reference_manifest_digest: run_manifest.digest.clone(),
+            run_id: run_manifest.run_id.clone(),
+            root_context_revision: run_manifest.root_context_revision.clone(),
             evidence_set_id: evidence_set_id.to_owned(),
             verdict,
-            state_fence: profile.state_fence.clone(),
+            state_fence: run_manifest.state_fence.clone(),
             canonical: false,
             digest: String::new(),
         };
@@ -3499,7 +3542,12 @@ impl ClaimAuditRecord {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("claim-audit-record/v1;");
+        // `v1` -> `v2`: the preimage now names the run identity and the root
+        // context revision, and takes its State Fence from the run-bound manifest
+        // rather than from the profile. A `v1` record could not be re-derived from
+        // its own bytes under one name, so the domain says so rather than letting
+        // one name cover two field sets.
+        let mut preimage = String::from("claim-audit-record/v2;");
         push_field(&mut preimage, "claim_id", &self.claim_id);
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(
@@ -3508,12 +3556,43 @@ impl ClaimAuditRecord {
             &self.profile_id_and_revision,
         );
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
-        push_field(&mut preimage, "manifest_digest", &self.manifest_digest);
+        push_field(
+            &mut preimage,
+            "run_reference_manifest_digest",
+            &self.run_reference_manifest_digest,
+        );
+        push_field(&mut preimage, "run_id", &self.run_id);
+        push_field(
+            &mut preimage,
+            "root_context_revision",
+            &self.root_context_revision,
+        );
         push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
         push_field(
             &mut preimage,
             "verdict_outcome",
             self.verdict.outcome.wire_name(),
+        );
+        // I21.7: the audit's own run binding is inside this record's identity, not
+        // only inside the manifest's, so a binding that covers this record cannot
+        // be re-pointed at another run's verdict.
+        for (tag, value) in [
+            (
+                "verdict_run_reference_manifest_digest",
+                self.verdict.run_reference_manifest_digest.as_str(),
+            ),
+            ("verdict_run_id", self.verdict.run_id.as_str()),
+            (
+                "verdict_root_context_revision",
+                self.verdict.root_context_revision.as_str(),
+            ),
+        ] {
+            push_field(&mut preimage, tag, value);
+        }
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
         );
         for (tag, values) in [
             ("residue", &self.verdict.residue),
@@ -3538,6 +3617,27 @@ impl ClaimAuditRecord {
             self.verdict.unsupported_precision.len(),
         );
         freeze(&preimage)
+    }
+
+    /// Re-proves this binding's own digest and its run binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one, when the record claims canonical state, or
+    /// when its verdict names a different run than the record does.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.canonical
+            || self.compute_digest() != self.digest
+            || self.verdict.run_reference_manifest_digest != self.run_reference_manifest_digest
+            || self.verdict.run_id != self.run_id
+            || self.verdict.root_context_revision != self.root_context_revision
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "claim_audit.digest",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -4162,12 +4262,16 @@ impl UnadmittedReference {
 
     /// I21.7 reference firewall: the fence is part of what this record means, so
     /// it is inside the preimage and not only cross-checked by the governance
-    /// record. No sibling record in this crate pushes a fence of its own, so the
-    /// encoding is the crate's single canonical one — `push_field` per fence
-    /// component, tagged with the `StateFence` field names that
-    /// `canonical_json_bytes` gives the same value inside the sealed
-    /// `AllowedReferenceManifest` — and an absent optional revision is spelled
-    /// `none` under its own tag, as everywhere else in these preimages.
+    /// record. The encoding is [`crate::evidence_portfolio::fence_preimage`],
+    /// the crate's single canonical one: `push_field` per fence component, tagged
+    /// with the `StateFence` field names that `canonical_json_bytes` gives the
+    /// same value inside the sealed `AllowedReferenceManifest`, with an absent
+    /// optional revision spelled `none` under its own tag, as everywhere else in
+    /// these preimages. It used to be spelled out inline here on the stated
+    /// ground that no sibling record in this crate pushed a fence; the audit
+    /// reference binding now does, so the encoding moved to the one owner rather
+    /// than being copied, and two spellings of a fence preimage would be two
+    /// identities for the same fence.
     fn compute_digest(&self) -> String {
         let mut preimage = String::from("unadmitted-reference/v1;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
@@ -4177,47 +4281,9 @@ impl UnadmittedReference {
         push_field(&mut preimage, "reason", &self.reason);
         push_field(
             &mut preimage,
-            "authority_epoch_lineage",
-            self.state_fence.authority_epoch.lineage_id.as_str(),
+            "state_fence",
+            &fence_preimage(&self.state_fence),
         );
-        push_field(
-            &mut preimage,
-            "authority_epoch_sequence",
-            &self.state_fence.authority_epoch.sequence.to_string(),
-        );
-        push_field(
-            &mut preimage,
-            "resource_generation",
-            &self.state_fence.resource_generation.value().to_string(),
-        );
-        // The three optional revisions have three DISTINCT types, so each is
-        // spelled out rather than iterated: an array would require one element
-        // type and would either coerce or fail to compile.
-        for (tag, revision) in [
-            (
-                "task_revision",
-                self.state_fence
-                    .task_revision
-                    .map(|value| value.value().to_string()),
-            ),
-            (
-                "policy_revision",
-                self.state_fence
-                    .policy_revision
-                    .map(|value| value.value().to_string()),
-            ),
-            (
-                "integration_revision",
-                self.state_fence
-                    .integration_revision
-                    .map(|value| value.value().to_string()),
-            ),
-        ] {
-            match revision {
-                Some(value) => push_field(&mut preimage, tag, &value),
-                None => push_field(&mut preimage, tag, "none"),
-            }
-        }
         push_field(&mut preimage, "trusted", bool_text(self.trusted));
         freeze(&preimage)
     }
