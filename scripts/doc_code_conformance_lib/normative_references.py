@@ -300,7 +300,7 @@ def _line(value: str, offset: int) -> int:
     return value.count("\n", 0, offset) + 1
 
 
-def reference_findings(
+def audit(
     root: Path,
     config_relative: Path = CONFIG_PATH,
 ) -> tuple[list[core.Finding], dict[str, int]]:
@@ -482,7 +482,7 @@ def self_test() -> None:
             encoding="utf-8",
             newline="",
         )
-        findings, metrics = reference_findings(root)
+        findings, metrics = audit(root)
         if findings:
             raise ReferenceAuditError(f"clean normative-reference fixture failed: {findings}")
         if metrics["numeric_reference_candidates"] != 3:
@@ -490,25 +490,25 @@ def self_test() -> None:
 
         # Negative fixture: `I2.2` is a nonexistent handle and must be rejected.
         sample.write_text("//! `I2.2`\n", encoding="utf-8", newline="")  # nonexistent
-        if DCC_NUMERIC not in _ids(reference_findings(root)[0]):
+        if DCC_NUMERIC not in _ids(audit(root)[0]):
             raise ReferenceAuditError("unknown exact numeric handle was accepted")
 
         sample.write_text("//! `I1.1..I1.9`\n", encoding="utf-8", newline="")
-        if DCC_NUMERIC not in _ids(reference_findings(root)[0]):
+        if DCC_NUMERIC not in _ids(audit(root)[0]):
             raise ReferenceAuditError("missing range endpoint was accepted")
 
         sample.write_text("//! `I3.*`\n", encoding="utf-8", newline="")
-        if DCC_NUMERIC not in _ids(reference_findings(root)[0]):
+        if DCC_NUMERIC not in _ids(audit(root)[0]):
             raise ReferenceAuditError("empty wildcard selector was accepted")
 
         sample.write_text("//! `ARCH-FAKE-99`\n", encoding="utf-8", newline="")
-        if DCC_DECISION not in _ids(reference_findings(root)[0]):
+        if DCC_DECISION not in _ids(audit(root)[0]):
             raise ReferenceAuditError("unknown Decision Anchor was accepted")
 
         numeric_path = root / "docs/architecture/handle-index.json"
         clean_numeric = numeric_path.read_text(encoding="utf-8")
         numeric_path.write_text('{"schema_version":"wrong","handles":{}}\n', encoding="utf-8")
-        if DCC_INDEX not in _ids(reference_findings(root)[0]):
+        if DCC_INDEX not in _ids(audit(root)[0]):
             raise ReferenceAuditError("wrong numeric-index schema did not fail closed")
         numeric_path.write_text(clean_numeric, encoding="utf-8", newline="")
 
@@ -517,7 +517,7 @@ def self_test() -> None:
         value = json.loads(clean_decision)
         value["anchors"]["ARCH-AUTH-01"]["decision"] = "Drifted"
         _write_json(decision_path, value)
-        if DCC_INDEX not in _ids(reference_findings(root)[0]):
+        if DCC_INDEX not in _ids(audit(root)[0]):
             raise ReferenceAuditError("Decision Anchor table/index drift was accepted")
         decision_path.write_text(clean_decision, encoding="utf-8", newline="")
 
@@ -530,7 +530,7 @@ def self_test() -> None:
             except OSError:
                 pass
             else:
-                if DCC_INDEX not in _ids(reference_findings(root)[0]):
+                if DCC_INDEX not in _ids(audit(root)[0]):
                     raise ReferenceAuditError("symlinked configured surface was accepted")
 
     print("NORMATIVE_REFERENCE_CONFORMANCE_SELF_TEST: PASS cases=8")
