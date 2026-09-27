@@ -2,7 +2,8 @@
 //!
 //! The compiler in `lib.rs` remains pure.  This module is the intentionally
 //! small execution boundary used by `eliot system snapshot`: it takes an
-//! explicit repository root, reads only Git evidence from that root, and
+//! explicit repository root, reads Git evidence, the lockfile, toolchain and
+//! workspace manifest files, and the `config/` policy tree from that root, and
 //! supplies unavailable runtime/store/integration domains as attributed
 //! observations rather than inventing support.
 
@@ -186,6 +187,85 @@ pub fn load_normative_pair(repository_root: &Path) -> Result<NormativePair, Capt
     })
 }
 
+/// I17.3 product-identity digests observable from one capture root.
+///
+/// Generated schemas, built binaries, and credential profiles have no
+/// observable artifact at a source root; they stay explicit absence (`None`,
+/// recorded as UNKNOWN) rather than inferred success.
+struct ProductIdentityDigests {
+    lockfile: Option<String>,
+    toolchain: Option<String>,
+    generated_schema: Option<String>,
+    binary_package: Option<String>,
+    manifest: Option<String>,
+    config_policy: Option<String>,
+    credential_profile: Option<String>,
+}
+
+/// Collects the product-identity digests observable from one capture root:
+/// the lockfile, toolchain, and workspace manifest files plus the
+/// config/policy tree.
+fn capture_product_identity_digests(
+    repository_root: &Path,
+) -> Result<ProductIdentityDigests, CaptureError> {
+    Ok(ProductIdentityDigests {
+        lockfile: file_digest(repository_root, "Cargo.lock")?,
+        toolchain: file_digest(repository_root, "rust-toolchain.toml")?,
+        generated_schema: None,
+        binary_package: None,
+        manifest: file_digest(repository_root, "Cargo.toml")?,
+        config_policy: dir_digest(repository_root, "config")?,
+        credential_profile: None,
+    })
+}
+
+/// Builds one record per product-identity hash: an observed digest carries
+/// its exact capture route, an unobservable artifact stays UNKNOWN.
+fn product_identity_records(identity: &ProductIdentityDigests) -> Vec<EvidenceRecord> {
+    let observed: [(&str, &Option<String>, &str); 7] = [
+        ("build.lockfile", &identity.lockfile, "file:Cargo.lock"),
+        (
+            "build.toolchain",
+            &identity.toolchain,
+            "file:rust-toolchain.toml",
+        ),
+        (
+            "build.generated_schema",
+            &identity.generated_schema,
+            "capture:unavailable",
+        ),
+        (
+            "build.binary_package",
+            &identity.binary_package,
+            "capture:unavailable",
+        ),
+        ("build.manifest", &identity.manifest, "file:Cargo.toml"),
+        ("config.policy", &identity.config_policy, "dir:config"),
+        (
+            "credential.profile",
+            &identity.credential_profile,
+            "capture:unavailable",
+        ),
+    ];
+    let mut records = Vec::with_capacity(observed.len());
+    for (key, digest, observed_ref) in observed {
+        let (value, evidence_ref, evaluation) = match digest {
+            Some(value) => (
+                value.clone(),
+                observed_ref.to_owned(),
+                EvidenceEvaluation::Screened,
+            ),
+            None => (
+                "UNKNOWN".to_owned(),
+                "capture:unavailable".to_owned(),
+                EvidenceEvaluation::Unknown,
+            ),
+        };
+        records.push(evidence(key, value, &evidence_ref, evaluation));
+    }
+    records
+}
+
 /// Capture and compile one immutable snapshot from an explicit repository root.
 pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtifact, CaptureError> {
     if !repository_root.is_absolute() {
@@ -218,6 +298,8 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
         .as_deref()
         .unwrap_or("CLEAN")
         .to_owned();
+    // I17.3 product-identity inputs observable from the same capture root.
+    let product_identity = capture_product_identity_digests(&discovered_root)?;
     // Anchor every coverage row to the exact HEAD commit time: the
     // deterministic evidence moment bound to the captured source identity.
     // Capture owns no wall-clock observation of build, runtime, store, or
@@ -227,7 +309,7 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
     let observed_at_ms = git_head_time_ms(&discovered_root)?;
     let domain_coverage = capture_domain_coverage(&source_head, observed_at_ms);
 
-    let records = vec![
+    let mut records = vec![
         evidence(
             "source.repository_root",
             discovered_root.display().to_string(),
@@ -246,31 +328,22 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
             "git:status+diff",
             EvidenceEvaluation::Screened,
         ),
-        evidence(
-            "build.status",
-            "UNKNOWN".to_owned(),
-            "capture:unavailable",
-            EvidenceEvaluation::Unknown,
-        ),
-        evidence(
+        unavailable_status_record("build.status", "UNKNOWN", EvidenceEvaluation::Unknown),
+        unavailable_status_record(
             "runtime.status",
-            "NOT_RUNNING".to_owned(),
-            "capture:unavailable",
+            "NOT_RUNNING",
             EvidenceEvaluation::Unavailable,
         ),
-        evidence(
-            "store.status",
-            "UNKNOWN".to_owned(),
-            "capture:unavailable",
-            EvidenceEvaluation::Unknown,
-        ),
-        evidence(
+        unavailable_status_record("store.status", "UNKNOWN", EvidenceEvaluation::Unknown),
+        unavailable_status_record(
             "integrations.status",
-            "UNKNOWN".to_owned(),
-            "capture:unavailable",
+            "UNKNOWN",
             EvidenceEvaluation::Unknown,
         ),
     ];
+    // One record per I17.3 product-identity hash, attributed to its exact
+    // capture route by the product-identity adapter below.
+    records.extend(product_identity_records(&product_identity));
     let source = SourceProjection::complete(
         "current-system",
         source_head.clone(),
@@ -279,6 +352,13 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
             selected_repository_root: discovered_root.display().to_string(),
             selected_source_head: source_head,
             dirty_delta_artifact_ref,
+            lockfile_digest: product_identity.lockfile,
+            toolchain_digest: product_identity.toolchain,
+            generated_schema_digest: product_identity.generated_schema,
+            binary_package_digest: product_identity.binary_package,
+            manifest_digest: product_identity.manifest,
+            config_policy_digest: product_identity.config_policy,
+            credential_profile_digest: product_identity.credential_profile,
             external_state_root: "UNKNOWN".to_owned(),
             records,
             unavailable_domains: vec![
@@ -466,6 +546,15 @@ fn evidence(
     }
 }
 
+/// Builds one explicit unavailable-domain status record for the capture adapter.
+fn unavailable_status_record(
+    key: &str,
+    value: &str,
+    evaluation: EvidenceEvaluation,
+) -> EvidenceRecord {
+    evidence(key, value.to_owned(), "capture:unavailable", evaluation)
+}
+
 fn coverage_row(
     domain: EvidenceDomain,
     state: SupportObservationState,
@@ -568,6 +657,77 @@ fn git_output<const N: usize>(
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Hashes one root-relative file as `sha256:<hex>`, or reports absence.
+///
+/// Only a missing file maps to `None`; any other I/O failure is a capture
+/// error rather than an invented observation.
+fn file_digest(repository_root: &Path, relative: &str) -> Result<Option<String>, CaptureError> {
+    match fs::read(repository_root.join(relative)) {
+        Ok(bytes) => Ok(Some(format!("sha256:{}", sha256_hex(&bytes)))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CaptureError::Io(error)),
+    }
+}
+
+/// Hashes one root-relative directory tree as `sha256:<hex>`, or reports absence.
+///
+/// Entries bind in sorted slash-joined relative-path order, each entry its
+/// path and exact bytes. Only a missing directory maps to `None`; any other
+/// I/O failure is a capture error rather than an invented observation.
+fn dir_digest(repository_root: &Path, relative: &str) -> Result<Option<String>, CaptureError> {
+    let root = repository_root.join(relative);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(CaptureError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("capture root entry is not a directory: {relative}"),
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CaptureError::Io(error)),
+    }
+    let mut entries = Vec::new();
+    collect_dir_entries(&root, &root, &mut entries)?;
+    entries.sort();
+    let mut binding = Vec::new();
+    for (relative_path, bytes) in entries {
+        binding.extend_from_slice(relative_path.as_bytes());
+        binding.push(0);
+        binding.extend_from_slice(&bytes);
+        binding.push(0);
+    }
+    Ok(Some(format!("sha256:{}", sha256_hex(&binding))))
+}
+
+fn collect_dir_entries(
+    directory: &Path,
+    base: &Path,
+    entries: &mut Vec<(String, Vec<u8>)>,
+) -> Result<(), CaptureError> {
+    let mut children = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    children.sort();
+    for child in children {
+        if fs::symlink_metadata(&child)?.is_dir() {
+            collect_dir_entries(&child, base, entries)?;
+        } else {
+            let relative = child.strip_prefix(base).map_err(|_| {
+                CaptureError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "capture entry escapes the capture root",
+                ))
+            })?;
+            entries.push((
+                relative.to_string_lossy().replace('\\', "/"),
+                fs::read(&child)?,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn dirty_delta_binding(repository_root: &Path) -> Result<Option<String>, CaptureError> {

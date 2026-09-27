@@ -339,6 +339,20 @@ pub struct CurrentSystemEvidenceSource {
     pub selected_source_head: String,
     /// Dirty-tree evidence artifact, if the source owner captured one.
     pub dirty_delta_artifact_ref: Option<String>,
+    /// Lockfile digest (`Cargo.lock`) observed at the capture root, if present.
+    pub lockfile_digest: Option<String>,
+    /// Toolchain digest (`rust-toolchain.toml`) observed at the capture root, if present.
+    pub toolchain_digest: Option<String>,
+    /// Generated-schema digest observed at the capture root, if present.
+    pub generated_schema_digest: Option<String>,
+    /// Binary/package digest observed at the capture root, if present.
+    pub binary_package_digest: Option<String>,
+    /// Workspace manifest digest (`Cargo.toml`) observed at the capture root, if present.
+    pub manifest_digest: Option<String>,
+    /// Config/policy digest (`config/`) observed at the capture root, if present.
+    pub config_policy_digest: Option<String>,
+    /// Credential-profile digest observed at the capture root, if present.
+    pub credential_profile_digest: Option<String>,
     /// External state root evidence.
     pub external_state_root: String,
     /// Exact source/runtime/data/integration observation records.
@@ -369,6 +383,20 @@ pub struct CurrentSystemEvidenceSnapshot {
     pub selected_source_head: String,
     /// Dirty-tree evidence artifact, if captured.
     pub dirty_delta_artifact_ref: Option<String>,
+    /// Lockfile digest (`Cargo.lock`) observed at the capture root, if present.
+    pub lockfile_digest: Option<String>,
+    /// Toolchain digest (`rust-toolchain.toml`) observed at the capture root, if present.
+    pub toolchain_digest: Option<String>,
+    /// Generated-schema digest observed at the capture root, if present.
+    pub generated_schema_digest: Option<String>,
+    /// Binary/package digest observed at the capture root, if present.
+    pub binary_package_digest: Option<String>,
+    /// Workspace manifest digest (`Cargo.toml`) observed at the capture root, if present.
+    pub manifest_digest: Option<String>,
+    /// Config/policy digest (`config/`) observed at the capture root, if present.
+    pub config_policy_digest: Option<String>,
+    /// Credential-profile digest observed at the capture root, if present.
+    pub credential_profile_digest: Option<String>,
     /// External state root evidence.
     pub external_state_root: String,
     /// Canonically ordered evidence records.
@@ -414,6 +442,19 @@ impl CurrentSystemEvidenceSnapshot {
             "snapshot".to_owned(),
             "external_state_root",
         )?;
+        for (digest, field) in [
+            (&self.lockfile_digest, "lockfile_digest"),
+            (&self.toolchain_digest, "toolchain_digest"),
+            (&self.generated_schema_digest, "generated_schema_digest"),
+            (&self.binary_package_digest, "binary_package_digest"),
+            (&self.manifest_digest, "manifest_digest"),
+            (&self.config_policy_digest, "config_policy_digest"),
+            (&self.credential_profile_digest, "credential_profile_digest"),
+        ] {
+            if let Some(value) = digest {
+                text(value, "snapshot".to_owned(), field)?;
+            }
+        }
         validate_records(&self.records, "snapshot")?;
         exact_strings(&self.unavailable_domains, "snapshot", "unavailable_domains")?;
         validate_conformance_coverage(&self.domain_coverage, "snapshot")?;
@@ -552,6 +593,22 @@ impl CurrentSystemEvidenceCompiler {
         if let Some(reference) = &input.dirty_delta_artifact_ref {
             text(reference, source_id.clone(), "dirty_delta_artifact_ref")?;
         }
+        for (digest, field) in [
+            (&input.lockfile_digest, "lockfile_digest"),
+            (&input.toolchain_digest, "toolchain_digest"),
+            (&input.generated_schema_digest, "generated_schema_digest"),
+            (&input.binary_package_digest, "binary_package_digest"),
+            (&input.manifest_digest, "manifest_digest"),
+            (&input.config_policy_digest, "config_policy_digest"),
+            (
+                &input.credential_profile_digest,
+                "credential_profile_digest",
+            ),
+        ] {
+            if let Some(value) = digest {
+                text(value, source_id.clone(), field)?;
+            }
+        }
         exact_strings(
             &input.unavailable_domains,
             &source_id,
@@ -575,6 +632,13 @@ impl CurrentSystemEvidenceCompiler {
             selected_repository_root: input.selected_repository_root,
             selected_source_head: input.selected_source_head,
             dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
+            lockfile_digest: input.lockfile_digest,
+            toolchain_digest: input.toolchain_digest,
+            generated_schema_digest: input.generated_schema_digest,
+            binary_package_digest: input.binary_package_digest,
+            manifest_digest: input.manifest_digest,
+            config_policy_digest: input.config_policy_digest,
+            credential_profile_digest: input.credential_profile_digest,
             external_state_root: input.external_state_root,
             records,
             unavailable_domains,
@@ -624,6 +688,13 @@ impl CurrentSystemEvidenceCompiler {
                 selected_repository_root: input.selected_repository_root,
                 selected_source_head: input.selected_source_head,
                 dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
+                lockfile_digest: None,
+                toolchain_digest: None,
+                generated_schema_digest: None,
+                binary_package_digest: None,
+                manifest_digest: None,
+                config_policy_digest: None,
+                credential_profile_digest: None,
                 external_state_root: input.external_state_root,
                 records: input.records,
                 unavailable_domains: input.unavailable_domains,
@@ -1724,6 +1795,13 @@ mod tests {
                 selected_repository_root: "repo-root".to_owned(),
                 selected_source_head: "head-1".to_owned(),
                 dirty_delta_artifact_ref: None,
+                lockfile_digest: None,
+                toolchain_digest: None,
+                generated_schema_digest: None,
+                binary_package_digest: None,
+                manifest_digest: None,
+                config_policy_digest: None,
+                credential_profile_digest: None,
                 external_state_root: "state-root".to_owned(),
                 records: vec![EvidenceRecord {
                     key: "source.head".to_owned(),
