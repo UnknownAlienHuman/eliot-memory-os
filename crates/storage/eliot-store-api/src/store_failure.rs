@@ -735,6 +735,14 @@ impl StoreFailure {
                     StoreRecoveryAction::ResolveWriteReceipt,
                     None,
                 ),
+                StoreError::StaleDisposition { .. } => (
+                    StoreFailureDisposition::DeterministicRejection,
+                    "SEQUENCE_DISPOSITION_STALE",
+                    StoreMutationDisposition::NotAttempted,
+                    StoreRetryDirective::DoNotRetry,
+                    StoreRecoveryAction::None,
+                    None,
+                ),
                 StoreError::SnapshotClosePending { .. } => (
                     StoreFailureDisposition::Unavailable,
                     "SNAPSHOT_CLOSE_PENDING",

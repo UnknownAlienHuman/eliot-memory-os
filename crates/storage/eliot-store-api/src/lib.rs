@@ -53,6 +53,7 @@ mod notification_state;
 mod payload_authority;
 mod reactive_state;
 mod request_hash;
+pub mod sequence_disposition;
 mod store_failure;
 mod swarm_owner_revisions;
 mod user_automation_state;
@@ -224,10 +225,11 @@ pub use wire::{
     CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
-    CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, EcxfExportReport,
-    EcxfExportRequest, ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus,
-    StoreBackupOperation, StoreBackupRequest, StoreBackupResponse, StoreBackupStatus,
-    StoreBackupStatusOutcome, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
+    CAPABILITY_SEQUENCE_DISPOSITION, CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT,
+    EFFECTS, EcxfExportReport, EcxfExportRequest, ErasureSurfaceRequest, ReadinessReceipt,
+    ReadinessStatus, StoreBackupOperation, StoreBackupRequest, StoreBackupResponse,
+    StoreBackupStatus, StoreBackupStatusOutcome, StoreRequest, StoreResponse, StoreWireError,
+    decode_request_frame,
     decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
     request_frame, request_frame_with_payload_authority, response_frame,
 };
@@ -299,6 +301,15 @@ pub use write_admission::{
     SplitDimension, SplitDirective, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
     WriteAdmissionProjection, WriteSubmission, WriteSubmissionState, WriterEpochBinding,
     admit_write_submission, derive_ors_stage_ref, derive_submission_id, prepared_transition_digest,
+};
+
+pub use sequence_disposition::{
+    AffectedScope, BoundedRetryPolicy, DeadLetterOperation, DependentDisposition, DependentOutcome,
+    MAX_NO_EFFECT_EVIDENCE_BYTES, MAX_SEQUENCE_DISPOSITION_DEPENDENTS, NoEffectEvidence,
+    NoEffectEvidenceKind, PoisonAttemptOutcome, PoisonOperationRecord, PoisonRefusalReason,
+    ReplacementLink, SEQUENCE_DISPOSITION_CONTRACT_VERSION, SequenceDispositionChoice,
+    SequenceDispositionRequest, SequenceGapIdentity, SequenceGapStatus,
+    poison_operation_record_digest,
 };
 
 pub use operation_catalogue::{
@@ -5679,6 +5690,14 @@ pub enum StoreError {
     },
     #[error("receipt not found")]
     ReceiptNotFound,
+    /// A sequence disposition named evidence that is stale, foreign, partial,
+    /// or changed since the decision was taken (issue #1684). The disposition
+    /// fails closed: no gap, head, or receipt is changed.
+    #[error("sequence disposition refused: {detail}")]
+    StaleDisposition {
+        /// Exact reason the disposition is not admissible.
+        detail: &'static str,
+    },
     /// A snapshot close could not observe its bound source point, so the live
     /// capture remains pending under this exact owner-issued identity. The
     /// served counters are recovery progress, not a terminal receipt or a
@@ -5936,6 +5955,37 @@ pub trait CanonicalStoreClient: Send + Sync {
     ) -> Result<StoreRecoverySnapshot, StoreError> {
         request.validate()?;
         Err(StoreError::Unavailable)
+    }
+
+    /// Commits the one named, authorized gap-control transition that resolves a
+    /// blocked reserved position (issue #1684, `I14.9` / `I5.19`).
+    ///
+    /// This is the ONLY operation that can disposition a dead-lettered
+    /// reserved position, and it is deliberately unreachable from an ordinary
+    /// write: the request carries no domain mutation and is admitted under its
+    /// own [`CAPABILITY_SEQUENCE_DISPOSITION`], which is not advertised to a
+    /// normal session. It must not deadlock behind the poisoned position it
+    /// resolves, so the receiving boundary admits it against the exact current
+    /// gap and head revisions rather than queueing behind the blocked
+    /// predecessor.
+    ///
+    /// The default body validates the closed request shape and then refuses
+    /// with [`StoreError::UnknownOperation`]. It does so without manufacturing
+    /// durable evidence, touching provider state, or delegating to
+    /// [`Self::apply_prepared`]: a disposition is a governed control
+    /// transition, not a domain mutation, and it can never be expressed as
+    /// one.
+    async fn apply_sequence_disposition(
+        &self,
+        context: &RequestMeta,
+        request: SequenceDispositionRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        context.validate().map_err(StoreError::Foundation)?;
+        request.validate()?;
+        if context.state_fence != request.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Err(StoreError::UnknownOperation)
     }
 
     /// Atomically seeds an all-absent store genesis state. Wave 1 only

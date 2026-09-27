@@ -76,17 +76,19 @@ use crate::{
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
     OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
     OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
-    ProcessEvidenceReadback, ProcessEvidenceRecord, ProcessStartReplayAbort,
-    ProcessStartReplayRecord, ProcessStartReplayState, ProcessStreamRecoveryFence,
-    ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    PoisonAttemptClassification, PoisonAttemptRecord, ProcessEvidenceReadback,
+    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
+    ProcessStartReplayState, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
+    ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
     RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
     RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
-    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, StreamRecoveryActivation, StreamRecoveryReconciliationState,
+    ScopeTerminalView, SequenceGapReconciliation, SessionBindingReceipt, SessionDetach,
+    StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
+    StreamRecoveryReconciliationState,
     SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
     SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
     SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
@@ -2924,6 +2926,37 @@ pub trait OperationalRecoveryStore: Send + Sync {
         recovery_owner: &crate::RecoveryOwner,
     ) -> Result<ReservationRecord, OrsError>;
     fn recover_page(&self, cursor: RecoveryCursor) -> Result<RecoveryPage, OrsError>;
+    /// Durably records one spent attempt on a reservation, before any possible
+    /// retry is admitted (issue #1684, `I14.9`).
+    ///
+    /// The count is committed in the same ORS transaction as the
+    /// classification, so a restart re-reads the spent count instead of
+    /// restarting the bounded budget. A `Retry` classification while the
+    /// budget is already exhausted is refused with
+    /// [`OrsError::InvalidTransition`]: a deterministic/corrupt failure cannot
+    /// loop forever. An `Unknown` classification is always accepted and is
+    /// never terminal — it leaves the reservation under reconciliation with
+    /// its original identity even when the budget is exhausted.
+    fn record_poison_attempt(
+        &self,
+        token: &WriterReservationToken,
+        attempt: PoisonAttemptRecord,
+    ) -> Result<ReservationRecord, OrsError>;
+    /// Reconciles one blocked reserved position from a canonical
+    /// `SequenceDisposition` receipt (issue #1684, `I14.9` / `I5.19`).
+    ///
+    /// The disposition is a canonical control transition, never a domain
+    /// mutation, so it must not deadlock behind the poisoned position it
+    /// resolves: the owner validates the exact token binding, the persisted
+    /// poison record and the receipt evidence in one write transaction and
+    /// advances every scope of the reservation atomically. Only a receipt whose
+    /// envelope proves the reserved position is dispositioned may do this; a
+    /// foreign, stale, partial, or duplicate-but-changed disposition is
+    /// refused and the reservation keeps its blocked position.
+    fn dispose_sequence_gap(
+        &self,
+        reconciliation: &SequenceGapReconciliation,
+    ) -> Result<ReservationRecord, OrsError>;
     fn get_envelope(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -20796,6 +20829,65 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Records the terminal position of every scope the `SequenceDisposition`
+    /// covers (issue #1684).
+    ///
+    /// A disposition does not advance a canonical head: the original mutation
+    /// was proven not applied, so the canonical head stays exactly where the
+    /// reservation found it. What advances is the *terminal* position — the
+    /// reserved sequence is now dispositioned — which is what lets a successor
+    /// on the same scope proceed without the gap blocking it forever. The
+    /// durable `ScopeTerminalReceipt` records the disposition receipt, so the
+    /// gap closure is itself auditable and the original `DEAD_LETTER` receipt
+    /// stays immutable beside it.
+    fn record_gap_disposition_terminals(
+        write: &redb::WriteTransaction,
+        reconciliation: &SequenceGapReconciliation,
+    ) -> Result<(), OrsError> {
+        let mut heads = write.open_table(SCOPE_HEADS).map_err(storage)?;
+        let mut terminals = write.open_table(SCOPE_TERMINALS).map_err(storage)?;
+        for reserved in &reconciliation.scopes {
+            let value = heads
+                .get(reserved.scope.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "scope_head",
+                    reason: "disposition scope has no durable head".to_owned(),
+                })?;
+            let mut head: ScopeReservationHead = decode_named(value.value(), "scope_head")?;
+            drop(value);
+            if head.canonical_head != reserved.expected_head
+                || reserved.reserved_sequence > head.last_reserved_sequence
+                || reserved.reserved_sequence <= head.last_terminal_sequence
+            {
+                return Err(OrsError::OrderingHeadMismatch);
+            }
+            head.last_terminal_sequence = reserved.reserved_sequence;
+            let terminal = ScopeTerminalReceipt {
+                scope: reserved.scope.clone(),
+                reserved_sequence: reserved.reserved_sequence,
+                disposition: CanonicalDisposition::Rejected,
+                gap: true,
+                receipt_id: OpaqueLabel::new(reconciliation.receipt.identity.receipt_id.as_str())?,
+                receipt_sha256: reconciliation.receipt.identity.canonical_sha256.clone(),
+            };
+            let head_payload = encode(&head)?;
+            heads
+                .insert(reserved.scope.as_str(), head_payload.as_str())
+                .map_err(storage)?;
+            let terminal_key = format!(
+                "{}:{:020}",
+                reserved.scope.as_str(),
+                reserved.reserved_sequence
+            );
+            let terminal_payload = encode(&terminal)?;
+            terminals
+                .insert(terminal_key.as_str(), terminal_payload.as_str())
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
     fn load_record(
         table: &impl ReadableTable<&'static str, &'static str>,
         reservation_id: &crate::OperationIdentity,
@@ -25288,6 +25380,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             state: ReservationState::Reserved,
             unknown_reason: None,
             terminal_receipt_id: None,
+            poison: None,
         };
         Self::persist_new_reservation(&write, &request.envelope, &record)?;
         write.commit().map_err(storage)?;
@@ -25507,6 +25600,142 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
 
     fn recover_page(&self, cursor: RecoveryCursor) -> Result<RecoveryPage, OrsError> {
         recovery_projection::recover_page(self, cursor)
+    }
+
+    fn record_poison_attempt(
+        &self,
+        token: &WriterReservationToken,
+        attempt: PoisonAttemptRecord,
+    ) -> Result<ReservationRecord, OrsError> {
+        attempt.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut record;
+        {
+            let mut table = write.open_table(RESERVATIONS).map_err(storage)?;
+            record = Self::load_record(&table, &token.reservation_id)?;
+            Self::validate_token(&record, token)?;
+            if record.state.is_terminal() {
+                return Err(OrsError::InvalidTransition);
+            }
+            // The first recorded attempt establishes the bounded policy for
+            // this reservation; later attempts must present the same policy
+            // revision and the same budget. A changed policy revision is a
+            // different policy, never a silently extended budget.
+            match &record.poison {
+                None => {
+                    if attempt.attempts != 1 {
+                        return Err(OrsError::InvalidField {
+                            field: "poison_attempts",
+                            reason: "the first recorded attempt must be the first spent attempt",
+                        });
+                    }
+                }
+                Some(current) => {
+                    if attempt.policy_revision != current.policy_revision
+                        || attempt.max_attempts != current.max_attempts
+                    {
+                        return Err(OrsError::InvalidField {
+                            field: "poison_policy_revision",
+                            reason: "retry policy revision and bound must not change mid-reservation",
+                        });
+                    }
+                    if attempt.attempts != current.attempts + 1 {
+                        return Err(OrsError::InvalidField {
+                            field: "poison_attempts",
+                            reason: "attempt accounting must advance by exactly one",
+                        });
+                    }
+                }
+            }
+            // A retry that has spent the whole budget can never be admitted
+            // again: a deterministic/corrupt failure cannot loop forever.
+            if attempt.last_classification == PoisonAttemptClassification::Retry
+                && attempt.is_exhausted()
+            {
+                return Err(OrsError::InvalidTransition);
+            }
+            record.poison = Some(attempt);
+            let payload = encode(&record)?;
+            table
+                .insert(token.reservation_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    fn dispose_sequence_gap(
+        &self,
+        reconciliation: &SequenceGapReconciliation,
+    ) -> Result<ReservationRecord, OrsError> {
+        crate::model::validate_digest(
+            &reconciliation.poison_record_sha256,
+            "sequence_gap_poison_record_sha256",
+        )?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut record;
+        {
+            let mut table = write.open_table(RESERVATIONS).map_err(storage)?;
+            record = Self::load_record(&table, &reconciliation.reservation_id)?;
+            // The exact binding the whole disposition rests on: the reservation
+            // being resolved, its operation identity (the ORIGINAL one), its
+            // coordinator precedence, its fence, its recovery owner, and its
+            // complete reserved scope set. A foreign, stale, or partial
+            // disposition fails here with the blocked position unchanged.
+            if record.token.reservation_id != reconciliation.reservation_id
+                || record.token.operation_id != reconciliation.operation_id
+                || record.token.reservation_order != reconciliation.reservation_order
+                || record.token.state_fence != reconciliation.state_fence
+                || record.token.recovery_owner != reconciliation.recovery_owner
+                || record.token.scopes != reconciliation.scopes
+            {
+                return Err(OrsError::ReconciliationMismatch);
+            }
+            // A disposition can only resolve a reservation whose gap is
+            // actually open: a position that was never dead-lettered, or whose
+            // proof of non-application is not on record, is not a gap to close.
+            let Some(poison) = record.poison.as_ref() else {
+                return Err(OrsError::InvalidTransition);
+            };
+            if !poison.is_proven_no_effect() {
+                return Err(OrsError::UnknownReceiptCannotResolve);
+            }
+            if record.state.is_terminal() {
+                // Replaying the exact same disposition after a crash between
+                // the control commit and the ORS reconciliation is idempotent;
+                // a different one is a conflict and never a rewrite.
+                if record.terminal_receipt_id.as_ref().map(OpaqueLabel::as_str)
+                    == Some(reconciliation.receipt.identity.receipt_id.as_str())
+                {
+                    return Ok(record);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+            if !matches!(
+                record.state,
+                ReservationState::Executing | ReservationState::Reconciling
+            ) {
+                return Err(OrsError::InvalidTransition);
+            }
+            sequence_gap_receipt_matches(&reconciliation.receipt, reconciliation)?;
+            record.state = ReservationState::Released;
+            record.unknown_reason = None;
+            record.terminal_receipt_id = Some(OpaqueLabel::new(
+                reconciliation.receipt.identity.receipt_id.as_str(),
+            )?);
+            let payload = encode(&record)?;
+            table
+                .insert(record.token.reservation_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        // The reserved position is closed, so the recovery block that paused
+        // these scopes is cleared and the successor can proceed. Only these
+        // scopes are touched: independent scopes were never paused and stay
+        // eligible.
+        Self::record_gap_disposition_terminals(&write, reconciliation)?;
+        Self::clear_recovery_blocks(&write, &record)?;
+        write.commit().map_err(storage)?;
+        Ok(record)
     }
 
     fn get_envelope(
@@ -26398,6 +26627,24 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.release(token, writer_epoch)
     }
 
+    /// Durably records one spent attempt before any possible retry is admitted.
+    pub fn record_attempt(
+        &self,
+        token: &WriterReservationToken,
+        attempt: PoisonAttemptRecord,
+    ) -> Result<ReservationRecord, OrsError> {
+        self.store.record_poison_attempt(token, attempt)
+    }
+
+    /// Resolves one blocked reserved position from a committed canonical
+    /// `SequenceDisposition` receipt.
+    pub fn dispose_gap(
+        &self,
+        reconciliation: &SequenceGapReconciliation,
+    ) -> Result<ReservationRecord, OrsError> {
+        self.store.dispose_sequence_gap(reconciliation)
+    }
+
     /// Durably stages one complete opaque operation and returns
     /// `ACCEPTED_PENDING` only after the commit, read-back, hash validation,
     /// and operation-identity indexing are proven (issue #1925).
@@ -26930,6 +27177,37 @@ fn shares_scope(left: &WriterReservationToken, right: &WriterReservationToken) -
             .iter()
             .any(|right_scope| left_scope.scope == right_scope.scope)
     })
+}
+
+/// Checks that a committed `SequenceDisposition` receipt genuinely resolves
+/// the reserved position it is presented against (issue #1684).
+///
+/// The envelope must be a valid, non-unknown receipt of the same authority
+/// epoch, and it must name the ORIGINAL operation identity — the disposition
+/// is a new governed control transition, so a receipt that reports the
+/// original operation as the actor is foreign to this transition and cannot
+/// close its gap.
+fn sequence_gap_receipt_matches(
+    receipt: &ReceiptEnvelope,
+    reconciliation: &SequenceGapReconciliation,
+) -> Result<(), OrsError> {
+    receipt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    let receipt_fence = crate::StateFenceSnapshot::capture(
+        &receipt.core.operation.state_fence,
+        receipt.core.authority.authority_epoch.sequence.get(),
+    )?;
+    if receipt_fence != reconciliation.state_fence {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    if receipt.core.operation.operation_id.as_str() == reconciliation.operation_id.as_str() {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    if receipt.core.disposition.kind() == ReceiptDispositionKind::Unknown {
+        return Err(OrsError::UnknownReceiptCannotResolve);
+    }
+    Ok(())
 }
 
 fn reconciliation_matches(
