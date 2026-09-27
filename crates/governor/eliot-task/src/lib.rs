@@ -19,9 +19,11 @@ mod professional_execution;
 
 pub use professional_execution::{
     PrematureAbandonmentSignal, ProfessionalAbandonmentDecision, ProfessionalApproachRevision,
-    ProfessionalAttempt, ProfessionalAttemptOutcome, ProfessionalExecutionContract,
-    ProfessionalExecutionError, ProfessionalExecutionState, ProfessionalRequirement,
-    ProfessionalRequirementKind, ProfessionalRoleOwners, TaskControllerDisposition,
+    ProfessionalArtifactEntry, ProfessionalArtifactManifest, ProfessionalAttempt,
+    ProfessionalAttemptOutcome, ProfessionalCompletionEvidence, ProfessionalEvaluationOutcome,
+    ProfessionalEvaluatorResult, ProfessionalExecutionContract, ProfessionalExecutionError,
+    ProfessionalExecutionState, ProfessionalRequirement, ProfessionalRequirementKind,
+    ProfessionalRoleOwners, TaskControllerDisposition,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.task_lifecycle";
@@ -142,6 +144,9 @@ pub enum TaskCommand {
     DecideProfessionalAbandonment {
         decision: Box<ProfessionalAbandonmentDecision>,
     },
+    RecordProfessionalCompletionEvidence {
+        evidence: Box<ProfessionalCompletionEvidence>,
+    },
 }
 
 impl TaskCommand {
@@ -172,7 +177,8 @@ impl TaskCommand {
             Self::SetProfessionalExecutionContract { .. }
             | Self::ReportProfessionalAttempt { .. }
             | Self::ChangeProfessionalApproach { .. }
-            | Self::DecideProfessionalAbandonment { .. } => current,
+            | Self::DecideProfessionalAbandonment { .. }
+            | Self::RecordProfessionalCompletionEvidence { .. } => current,
         }
     }
 
@@ -230,6 +236,9 @@ impl TaskCommand {
                     text(question, "question")
                 }
             },
+            Self::RecordProfessionalCompletionEvidence { evidence } => {
+                text(&evidence.artifact_manifest.manifest_ref, "manifest_ref")
+            }
             Self::Open
             | Self::RequireUnderstanding
             | Self::BeginExecution
@@ -385,6 +394,41 @@ impl TaskLifecycleOwner {
         owner.professional_execution = snapshot.professional_execution;
         owner.next_sequence = snapshot.next_sequence;
         owner.events = snapshot.events;
+        let mut event_completion_evidence: BTreeMap<TaskId, Vec<ProfessionalCompletionEvidence>> =
+            BTreeMap::new();
+        for event in &owner.events {
+            if let Some(TaskCommand::RecordProfessionalCompletionEvidence { evidence }) =
+                &event.command
+            {
+                let state = event
+                    .professional_execution
+                    .as_ref()
+                    .ok_or(TaskError::InvalidField("professional_completion_history"))?;
+                let mut checked = ProfessionalExecutionState::new(state.contract.clone())?;
+                checked.record_completion_evidence(*evidence.clone())?;
+                event_completion_evidence
+                    .entry(event.task_id.clone())
+                    .or_default()
+                    .push(*evidence.clone());
+            }
+            if let Some(state) = &event.professional_execution {
+                let recorded = event_completion_evidence
+                    .get(&event.task_id)
+                    .map_or(&[][..], Vec::as_slice);
+                if state.completion_evidence.as_slice() != recorded {
+                    return Err(TaskError::InvalidField("professional_completion_history"));
+                }
+            }
+        }
+        for (task_id, state) in &owner.professional_execution {
+            if !state.completion_evidence.is_empty()
+                && event_completion_evidence
+                    .get(task_id)
+                    .is_none_or(|recorded| *recorded != state.completion_evidence)
+            {
+                return Err(TaskError::InvalidField("professional_completion_history"));
+            }
+        }
         for event in &owner.events {
             if let Some(state) = &event.professional_execution {
                 owner
@@ -655,6 +699,12 @@ impl TaskLifecycleOwner {
                     .ok_or(ProfessionalExecutionError::ContractNotFound)?;
                 state.decide(*decision.clone())?;
             }
+            TaskCommand::RecordProfessionalCompletionEvidence { evidence } => {
+                let state = professional_execution
+                    .get_mut(task_id)
+                    .ok_or(ProfessionalExecutionError::ContractNotFound)?;
+                state.record_completion_evidence(*evidence.clone())?;
+            }
             _ => {}
         }
         Ok(())
@@ -669,7 +719,9 @@ fn allowed(from: TaskState, command: &TaskCommand) -> bool {
         TaskCommand::AuthorizeAction { .. } => from == TaskState::UnderstandingRequired,
         TaskCommand::BeginExecution => from == TaskState::ActionAuthorized,
         TaskCommand::BeginVerification => from == TaskState::Executing,
-        TaskCommand::Verify { .. } => from == TaskState::Verifying,
+        TaskCommand::Verify { .. } | TaskCommand::RecordProfessionalCompletionEvidence { .. } => {
+            from == TaskState::Verifying
+        }
         TaskCommand::Block { .. } | TaskCommand::Fail { .. } | TaskCommand::MarkPartial { .. } => {
             from.is_active()
         }

@@ -118,6 +118,20 @@ impl ProfessionalExecutionContract {
                 "evaluator_requirement",
             ));
         }
+        if self.expected_deliverable_manifest.is_empty() {
+            return Err(ProfessionalExecutionError::InvalidField(
+                "expected_deliverable_manifest",
+            ));
+        }
+        let mut deliverables = std::collections::BTreeSet::new();
+        for deliverable in &self.expected_deliverable_manifest {
+            required_text(deliverable, "expected_deliverable")?;
+            if !deliverables.insert(deliverable) {
+                return Err(ProfessionalExecutionError::InvalidField(
+                    "expected_deliverable_manifest",
+                ));
+            }
+        }
         let mut refs = std::collections::BTreeSet::new();
         for requirement in &self.requirements {
             required_text(&requirement.requirement_ref, "requirement_ref")?;
@@ -139,6 +153,57 @@ pub struct ProfessionalAttempt {
     pub parent_attempt_ref: Option<String>,
     pub partial_artifact_handles: Vec<String>,
     pub reason: String,
+}
+
+/// A caller-provided workspace observation. The Task domain validates its
+/// declared fields; it cannot verify filesystem presence or checksum bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalArtifactEntry {
+    pub deliverable_ref: String,
+    pub observed_presence_handle: String,
+    pub checksum_sha256: String,
+}
+
+/// Declared artifact evidence for one exact professional contract revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalArtifactManifest {
+    pub manifest_ref: String,
+    pub contract_ref: String,
+    pub contract_revision: u64,
+    pub output_workspace: String,
+    pub entries: Vec<ProfessionalArtifactEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfessionalEvaluationOutcome {
+    Accepted,
+    Rejected,
+    Inconclusive,
+}
+
+/// Caller-provided evaluator metadata linked to a manifest and contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalEvaluatorResult {
+    pub manifest_ref: String,
+    pub contract_ref: String,
+    pub contract_revision: u64,
+    pub evaluator_owner_ref: String,
+    pub evaluator_ref: String,
+    pub result_handle: String,
+    pub outcome: ProfessionalEvaluationOutcome,
+}
+
+/// Non-authoritative evidence retained in task snapshots until trusted bridge
+/// and evaluator provenance can be checked by the owning integration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfessionalCompletionEvidence {
+    pub artifact_manifest: ProfessionalArtifactManifest,
+    pub evaluator_result: Option<ProfessionalEvaluatorResult>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -198,6 +263,8 @@ pub struct ProfessionalAbandonmentDecision {
 #[serde(deny_unknown_fields)]
 pub struct ProfessionalExecutionState {
     pub contract: ProfessionalExecutionContract,
+    #[serde(default)]
+    pub completion_evidence: Vec<ProfessionalCompletionEvidence>,
     pub attempts: Vec<ProfessionalAttempt>,
     pub abandonment_signals: Vec<PrematureAbandonmentSignal>,
     pub approach_revisions: Vec<ProfessionalApproachRevision>,
@@ -235,6 +302,7 @@ impl ProfessionalExecutionState {
         contract.validate()?;
         Ok(Self {
             contract,
+            completion_evidence: Vec::new(),
             attempts: Vec::new(),
             abandonment_signals: Vec::new(),
             approach_revisions: Vec::new(),
@@ -408,6 +476,64 @@ impl ProfessionalExecutionState {
         {
             return Err(ProfessionalExecutionError::EvaluatorBoundaryUnresolved);
         }
+        Ok(())
+    }
+
+    /// Stores structurally valid evidence without treating caller claims as
+    /// proof of filesystem presence or independent evaluation.
+    pub fn record_completion_evidence(
+        &mut self,
+        evidence: ProfessionalCompletionEvidence,
+    ) -> Result<(), ProfessionalExecutionError> {
+        let manifest = &evidence.artifact_manifest;
+        required_text(&manifest.manifest_ref, "manifest_ref")?;
+        if manifest.contract_ref != self.contract.contract_ref
+            || manifest.contract_revision != self.contract.revision
+            || manifest.output_workspace != self.contract.output_workspace
+            || manifest.entries.is_empty()
+        {
+            return Err(ProfessionalExecutionError::InvalidField(
+                "artifact_manifest",
+            ));
+        }
+        let mut observed = std::collections::BTreeSet::new();
+        for entry in &manifest.entries {
+            required_text(&entry.deliverable_ref, "deliverable_ref")?;
+            required_text(&entry.observed_presence_handle, "observed_presence_handle")?;
+            if entry.checksum_sha256.len() != 64
+                || !entry
+                    .checksum_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !observed.insert(&entry.deliverable_ref)
+            {
+                return Err(ProfessionalExecutionError::InvalidField("artifact_entry"));
+            }
+        }
+        let expected: std::collections::BTreeSet<_> =
+            self.contract.expected_deliverable_manifest.iter().collect();
+        if observed != expected {
+            return Err(ProfessionalExecutionError::InvalidField(
+                "expected_deliverable_manifest",
+            ));
+        }
+        if let Some(result) = &evidence.evaluator_result {
+            required_text(&result.manifest_ref, "evaluator_manifest_ref")?;
+            required_text(&result.evaluator_owner_ref, "evaluator_owner_ref")?;
+            required_text(&result.evaluator_ref, "evaluator_ref")?;
+            required_text(&result.result_handle, "evaluator_result_handle")?;
+            if result.manifest_ref != manifest.manifest_ref
+                || result.contract_ref != self.contract.contract_ref
+                || result.contract_revision != self.contract.revision
+                || result.evaluator_owner_ref != self.contract.owners.evaluator_owner
+                || result.evaluator_ref != self.contract.artifact_evaluator
+            {
+                return Err(ProfessionalExecutionError::InvalidField(
+                    "evaluator_result_binding",
+                ));
+            }
+        }
+        self.completion_evidence.push(evidence);
         Ok(())
     }
 
