@@ -1,0 +1,489 @@
+# Issue #1143 work item 3 — one disposition per public item of `eliot-cues`.
+#
+# Companion record for the `SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE` donor row in
+# `crates/smart/cognitive-donor-map.toml` (same `disposition` vocabulary, same
+# `rejected_overgeneralization` field). It is the item-level ledger the donor
+# map does not have room for: the donor map records one decision per package,
+# the issue requires one decision per public item.
+#
+# This file is deliberately NOT named `module.toml`. A bare `module.toml` is
+# read by `scripts/code_navigation_lib/capsules.py` (`MODULE_MANIFEST`) as the
+# declaration of a `FunctionalCapabilityCell` via its `module_id`, and by
+# `scripts/work_unit_gate/__main__.py`. A retiring legacy facade must not mint a
+# cell id, so the per-package disposition record uses the same
+# `<name>.module.toml` form already used by
+# `crates/governor/eliot-observation/classifier.module.toml` and
+# `crates/meta/eliot-improvement/{learning-closure,promotion}.module.toml`.
+#
+# Nothing here deletes code. The issue's deletion step is a separate pass.
+
+schema_version = 1
+record_id = "eliot-cues.aggregate-disposition.1143"
+crate = "eliot-cues"
+package_path = "crates/smart/eliot-cues"
+issue = 1143
+recorded_at_base = "a318023b"
+disposition = "split"
+disposition_meaning = "Time-bounded migration facade. It is not a current FunctionalCapabilityCell and holds no cell id, lifecycle ownership, mutable canonical state, authority, admission or scheduling role."
+recorded_under_issue = 1143
+governing_anchors = [
+  "ARCH-DRM-01",
+  "ARCH-DRM-02",
+  "ARCH-DRM-03",
+  "ARCH-MOD-02",
+  "ARCH-MOD-03",
+  "ARCH-GROUND-01",
+  "ARCH-FIN-01",
+]
+proof_ceiling = "METADATA_DISPOSITION_ONLY"
+runtime_completion = false
+product_acceptance = false
+
+# ---------------------------------------------------------------- inventory --
+
+[measured_reverse_consumers]
+method = "cargo metadata --locked --format-version 1 reverse-dependency join, plus git grep -n for construction and call sites"
+cargo_reverse_dependents = []
+source_call_sites_outside_package = []
+in_package_consumers = ["crates/smart/eliot-cues/tests/integrity.rs", "crates/smart/eliot-cues/tests/legacy_facade.rs", "crates/smart/eliot-cues/tests/data/legacy_facade.json"]
+in_package_consumer_note = "Per the issue, the package itself, public type definitions without a call site, in-package unit tests and doc examples are NOT consumers. The three entries above are therefore excluded from the reverse-consumer set."
+conclusion = "Zero identified current consumers. Every item below is therefore either already owned one-for-one by a verified current cell (migrate) or has no consumer and no owner to preserve it (delete)."
+
+[counts]
+public_items = 38
+migrate = 8
+bounded_fixture = 0
+delete = 30
+denominator_basis = "Exhaustive enumeration of unrestricted `pub` items in crates/smart/eliot-cues/src/{lib.rs,legacy_adapter.rs}, excluding `pub(crate)` items, `#[cfg(test)]` modules and the package name itself, per the issue's non-consumer exclusions."
+bounded_fixture_zero_reason = "The issue defines a bounded fixture as retained 'only for an identified current consumer'. No current consumer was identified, so no item can honestly qualify. Recording a fixture row would be fabricated retention authority."
+
+[metadata_references_to_close_before_any_delete]
+# Work item 6 owns the actual removal. These are the exact references a delete
+# would leave dangling, measured 2026-09-27 at a318023b.
+root_workspace_member = "Cargo.toml:112"
+lockfile_entry = "Cargo.lock (package eliot-cues)"
+shipped_serde_boundary_rows = [
+  "eliot-cues:crates/smart/eliot-cues/src/legacy_adapter.rs:<inferred>@parse_bound_v1_row:155",
+  "eliot-cues:crates/smart/eliot-cues/src/legacy_adapter.rs:<inferred>@parse_bound_v1_snapshot:170",
+  "eliot-cues:crates/smart/eliot-cues/src/legacy_adapter.rs:LegacyCueIndexRowBytes:30",
+  "eliot-cues:crates/smart/eliot-cues/src/legacy_adapter.rs:Value@parse_legacy_index_row:51",
+  "eliot-cues:crates/smart/eliot-cues/src/legacy_adapter.rs:Value@parse_row_value:143",
+  "eliot-cues:crates/smart/eliot-cues/src/lib.rs:LegacyDeliveryHandoff:162",
+  "eliot-cues:crates/smart/eliot-cues/src/lib.rs:LegacyEliotCuesV1Row:98",
+  "eliot-cues:crates/smart/eliot-cues/src/lib.rs:V1MigrationRejection:326",
+  "eliot-cues:crates/smart/eliot-cues/src/lib.rs:V1PreservedRow:295",
+  "eliot-cues:crates/smart/eliot-cues/src/lib.rs:V1RowMigration:180",
+  "eliot-cues:crates/smart/eliot-cues/src/lib.rs:V1SnapshotMigration:196",
+  "eliot-cues:crates/smart/eliot-cues/tests/legacy_facade.rs:<inferred>@fixture_json:294",
+]
+cue_kind_migration_rows = [
+  "crates/eliot-types/tests/data/cue_kind_migration.toml:439 [type_row.\"crates/smart/eliot-cues/src/lib.rs\"] owner=#833",
+  "crates/eliot-types/tests/data/cue_kind_migration.toml:449 [type_row.\"crates/smart/eliot-cues/tests/integrity.rs\"] owner=#833",
+]
+donor_map_rows = [
+  "crates/smart/cognitive-donor-map.toml:31 [[donor]] crates/smart/eliot-cues",
+  "crates/smart/cognitive-donor-map.toml:122 [[topology_donor]] crates/smart/eliot-cues",
+]
+owner_donor_anchors = [
+  "crates/smart/eliot-cue-contracts/module.toml:40",
+  "crates/smart/eliot-cue-normalizer/module.toml:40",
+  "crates/smart/eliot-cue-binding/module.toml:44",
+  "crates/smart/eliot-cue-index/module.toml:40",
+  "crates/smart/eliot-cue-activation/module.toml:40",
+  "crates/smart/eliot-reactive-context-plan/module.toml:44",
+]
+in_package_fixtures = [
+  "crates/smart/eliot-cues/tests/integrity.rs",
+  "crates/smart/eliot-cues/tests/legacy_facade.rs",
+  "crates/smart/eliot-cues/tests/data/legacy_facade.json",
+]
+generated_doc_indexes = ["docs/code-navigation/PACKAGE_DOCS_INDEX.md", "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"]
+generated_serde_registry = "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
+
+[removal_precondition]
+statement = "No `delete` row may be executed in this pass. Before any future deletion, the #1143 differential proof that the migrated rows below are correct must be relocated into the owning cell's own suite, otherwise deletion would drop the only place the migrated edge is exercised."
+blocking_residue = "crates/smart/eliot-cues/tests/legacy_facade.rs:460-461 still asserts `MigrationRequired` from `require_reobservation`; this is the residue the 2026-09-23 audit recorded and the reason #1100/#11 cannot yet run with aggregate fallback disabled."
+separate_issues = "work items 4 (duplicate owners), 5 (consumer-edge migration) and 6 (residue removal) of #1143; #835/#246/#706 own the eliot-types CueKind alias and spelling denominator."
+
+# ------------------------------------------------- CrateExtractionDecision ---
+# I2.23 `CrateExtractionDecision` shape, all twelve fields.
+
+[extraction_decision]
+affected_functional_cells_and_lifecycle_owners = "None. The package declares no cell and owns no lifecycle. Its behaviour is owned by smart.cue.contracts (A-10), smart.cue.normalizer (A-11), smart.cue.binding (A-12), smart.cue.index (A-13), smart.cue.activation (A-14a) and smart.context.reactive_delivery_plan (A-19r / #612, B-RCTX/Host)."
+current_source_dependency_and_change_closure = "src/lib.rs (751 lines) and src/legacy_adapter.rs (741 lines). Depends on eliot-cue-{contracts,normalizer,binding,index,activation}, eliot-contracts, eliot-evidence, eliot-observation, blake3, schemars, serde, serde_json, thiserror. Change closure is the package plus the generated serde registry, the cue-kind migration denominator and six owner donor anchors."
+proposed_package_boundary = "None new. The boundary is already split across the five cue cells; the remaining body is a v1 replay/compatibility surface and a delivery handoff, not a capability."
+public_contract_and_independent_test_entrypoint = "tests/legacy_facade.rs (30-case facade matrix) and tests/integrity.rs. Both are in-package fixtures over frozen v1 bytes and are explicitly not consumers."
+first_real_consumer_or_time_bounded_migration_facade = "Time-bounded migration facade with no first real consumer. Measured reverse-dependency set is empty; the identified consumer set is therefore empty and the facade has no compatibility duty left to perform."
+source_maintenance_owner_and_vendor_type_boundary = "No vendor types. All identities, fences and handles come from eliot-contracts. Frozen v1 row bytes cross the boundary as `Vec<u8>` and are never aliased into an owner decoder."
+dependency_security_license_and_build_isolation = "No new dependency, no optional or vendor edge. License and advisory posture is inherited from the workspace. Removing the package removes one workspace member and one blake3/serde consumer."
+expected_agent_workset_context_and_reverse_fanout_delta = "Removing the package removes ~1492 source lines and the two in-package fixtures from the cue workset. Reverse fan-out is currently zero, so the fan-out delta is zero; the measured delta is workset size, not fan-in."
+expected_compile_test_integration_and_release_cost_delta = "Removes one workspace member, one `Cargo.lock` entry, two build targets (lib + two integration test binaries) and twelve shipped-serde-boundary rows. No integration or release cost is added."
+migration_reexport_rollback_removal_and_expiry = "Eight rows are already migrated (type-identity re-export or one-to-one delegation, byte-identical); the thirty `delete` rows require no migration because nothing consumes them. Expiry is the removal of the last `metadata_references_to_close_before_any_delete` entry. Rollback is a revert of the deletion commit; no data or state is involved."
+counter_risks_merge_or_rejoin_condition = "Rejoin is not proposed. Counter-risk: deleting the frozen v1 decoder would destroy the only machine-readable record of the #706 spelling denominator, so the denominator and the serde registry rows must be retired together or the migration becomes unprovable."
+evidence_status_and_review_owner = "Evidence is current Cargo metadata and current `git grep` call sites at a318023b, not a runtime observation. Review owner is the #1143 integration owner; I19 legacy owners are retained until a replacement is proved, so removal is deferred past OSP1."
+disposition = "split"
+
+[rejected_overgeneralization]
+text = "Destructive canonical-path lowercasing, candidate bindings bypassing Governor admission, session delivery state in the pure evaluator, or graph-edge minimums for exact firing."
+source = "crates/smart/cognitive-donor-map.toml [[donor]] crates/smart/eliot-cues"
+additions_from_this_ledger = [
+  "A second delivery-completion surface: `request_legacy_delivery` may name the #612 handoff but must never fabricate a receipt or completion.",
+  "A second row-identity computation: `legacy_row_id_v2` computes nothing; every v2 identity input comes from a fresh owner observation through `cue_row_id`.",
+  "A second snapshot construction owner: `adapt_rebuild_snapshot` may only echo `smart.cue.index`, never recompute membership.",
+  "A second activation evaluator: `adapt_activate` may only echo `smart.cue.activation`, never smooth over partial, truncated, stale or unavailable outcomes.",
+]
+
+# ------------------------------------------------------------- item ledger ---
+
+[[item_disposition]]
+item = "CueKind"
+kind = "type_reexport"
+disposition = "migrate"
+current_owner = "smart.cue.contracts"
+owner_package = "eliot-cue-contracts"
+owner_evidence = "crates/smart/eliot-cue-contracts/module.toml:2 module_id=smart.cue.contracts; re-exported at crates/smart/eliot-cues/src/lib.rs:73"
+basis = "Type-identity re-export. The facade defines no variant and constructs no value."
+removal_condition = "Delete the re-export line once #835/#246/#706 retire the eliot-types CueKind alias; the owner keeps the vocabulary."
+
+[[item_disposition]]
+item = "MatchMode"
+kind = "type_reexport"
+disposition = "migrate"
+current_owner = "smart.cue.contracts"
+owner_package = "eliot-cue-contracts"
+owner_evidence = "crates/smart/eliot-cue-contracts/module.toml:2 module_id=smart.cue.contracts; re-exported at crates/smart/eliot-cues/src/lib.rs:73"
+basis = "Type-identity re-export. The owner is the sole match-mode vocabulary owner; exact/prefix/signature are not merged or folded here."
+removal_condition = "Delete the re-export line once the owner is the only import path for every consumer."
+
+[[item_disposition]]
+item = "LEGACY_KIND_SPELLINGS"
+kind = "const"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "Frozen #706 denominator mirror, crates/smart/eliot-cues/src/lib.rs:79. Not an owner; it re-lists the denominator that crates/eliot-types/tests/data/cue_kind_migration.toml:439 freezes."
+basis = "No current consumer. Bound only by in-package fixtures, which the issue excludes from the consumer set. It duplicates the #706 denominator rather than owning it."
+removal_condition = "Remove together with the two cue_kind_migration.toml type_rows (owner #833) so the frozen denominator keeps exactly one home."
+
+[[item_disposition]]
+item = "LegacyEliotCuesV1Row"
+kind = "struct"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "Frozen v1 envelope, crates/smart/eliot-cues/src/lib.rs:100. The current envelope is eliot_cue_contracts::ObservedCue/NormalizedCue; legacy bytes are never aliased into an owner decoder."
+basis = "No current consumer. It is a deserialisation target for historical bytes only and is not the canonical-identity or comparison-key owner."
+removal_condition = "After the shipped-serde-boundary row eliot-cues:...lib.rs:LegacyEliotCuesV1Row:98 is retired and no historical byte source is declared."
+duplicate_owner_note = "None. The v1 shape is not a current contract; #246 owns canonical spelling."
+
+[[item_disposition]]
+item = "LegacyEliotCuesV1Row::validate"
+kind = "method"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:119"
+basis = "Envelope-shape validation only (non-blank, control-free, non-zero revision). Vocabulary membership is deliberately left to the decoder, so it does not duplicate an owner rule."
+removal_condition = "With LegacyEliotCuesV1Row."
+
+[[item_disposition]]
+item = "LegacyDeliveryHandoff"
+kind = "struct"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:164; names B-RCTX/Host (#612)"
+basis = "Inert handoff record. It carries no completion, receipt or effect claim and is constructed only by `request_legacy_delivery`."
+removal_condition = "With request_legacy_delivery, after the #612 reactive delivery handoff has a first real caller."
+
+[[item_disposition]]
+item = "V1RowMigration"
+kind = "struct"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:182; disposition vocabulary owned by eliot_cue_contracts::ConversionDisposition (crates/smart/eliot-cue-contracts/src/version.rs:934)"
+basis = "Replay envelope only. The conversion disposition vocabulary itself is already owned by smart.cue.contracts; this is the v1 byte-slot wrapper, not the owner."
+removal_condition = "After the serde-boundary row ...lib.rs:V1RowMigration:180 is retired."
+
+[[item_disposition]]
+item = "V1RowMigration::validate"
+kind = "method"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:212"
+basis = "Re-validates replay identity through the crate-private parser. No owner rule is duplicated; no consumer calls it."
+removal_condition = "With V1RowMigration."
+
+[[item_disposition]]
+item = "V1SnapshotMigration"
+kind = "struct"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:198; ceiling vocabulary owned by eliot_cue_contracts::ProofCeiling (crates/smart/eliot-cue-contracts/src/lib.rs:61 re-export of eliot-receipts)"
+basis = "Replay envelope that must carry ProofCeiling::CandidateArtifact. It never claims admission, publication or delivery."
+removal_condition = "After the serde-boundary row ...lib.rs:V1SnapshotMigration:196 is retired."
+
+[[item_disposition]]
+item = "V1SnapshotMigration::validate"
+kind = "method"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:243"
+basis = "Envelope and per-row byte closure check. No consumer; the snapshot owner is smart.cue.index and lives behind `adapt_rebuild_snapshot`."
+removal_condition = "With V1SnapshotMigration."
+
+[[item_disposition]]
+item = "V1PreservedRow"
+kind = "struct"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:297"
+basis = "Byte-preservation input record for the replay surface only."
+removal_condition = "After the serde-boundary row ...lib.rs:V1PreservedRow:295 is retired."
+
+[[item_disposition]]
+item = "V1PreservedRow::new"
+kind = "method"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:306"
+basis = "Constructor with a v1 parse guard; no consumer outside in-package fixtures."
+removal_condition = "With V1PreservedRow."
+
+[[item_disposition]]
+item = "V1MigrationRejection"
+kind = "enum"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:328"
+basis = "Closed four-reason conversion-refusal vocabulary. It duplicates no owner error; the owner rejection vocabulary is eliot_cue_contracts::CueContractError."
+removal_condition = "After the serde-boundary row ...lib.rs:V1MigrationRejection:326 is retired."
+
+[[item_disposition]]
+item = "V1MigrationRejection::as_str"
+kind = "method"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:342"
+basis = "Stable reason rendering for the closed vocabulary above; no consumer."
+removal_condition = "With V1MigrationRejection."
+
+[[item_disposition]]
+item = "V1MigrationRejection::from_reason"
+kind = "method"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:353"
+basis = "Inverse parse over the same four reasons; no consumer."
+removal_condition = "With V1MigrationRejection."
+
+[[item_disposition]]
+item = "preserve_v1_row"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:368; always returns FacadeError::MigrationRequired { owner: \"legacy-v1-replay\", revision: \"raw-bytes-required\" }"
+basis = "Always-fails identity-only migration refusal. A replay claim without the original bytes is not a closed migration, so it computes nothing. No current consumer."
+removal_condition = "With the v1 replay surface; the refusal must be re-expressed as an owner-path receipt first so the raw-bytes requirement is not silently dropped."
+
+[[item_disposition]]
+item = "preserve_v1_row_bytes"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:381; emits eliot_cue_contracts::ConversionDisposition::V1ReplayPreserved, vocabulary owned by crates/smart/eliot-cue-contracts/src/version.rs:934"
+basis = "Byte-preserving replay constructor. The disposition vocabulary is already owner-owned, so this is the v1 byte-slot wrapper, not a second owner. No current consumer."
+removal_condition = "After the serde-boundary rows for V1RowMigration and LegacyEliotCuesV1Row are retired."
+
+[[item_disposition]]
+item = "preserve_v1_snapshot"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:410; always returns FacadeError::MigrationRequired { revision: \"raw-bytes-required\" }"
+basis = "Always-fails snapshot replay refusal; the same argument as preserve_v1_row, applied to a snapshot id list."
+removal_condition = "With preserve_v1_row."
+
+[[item_disposition]]
+item = "preserve_v1_snapshot_bytes"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:431; always returns FacadeError::MigrationRequired { revision: \"row-bytes-required\" }"
+basis = "Always-fails refusal: snapshot-wide bytes alone cannot prove each retained row identity is paired with its original payload. No current consumer."
+removal_condition = "With preserve_v1_row."
+
+[[item_disposition]]
+item = "preserve_v1_snapshot_bytes_with_rows"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:457; joins preserve_v1_row_bytes per row and seals ProofCeiling::CandidateArtifact"
+basis = "Snapshot replay assembly over the byte-preservation surface. It creates a replay envelope only; it never selects membership, and the snapshot owner remains smart.cue.index. No current consumer."
+removal_condition = "With the v1 replay surface."
+
+[[item_disposition]]
+item = "preserve_v1_snapshot_conversion"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:492; joins already-validated V1RowMigration records"
+basis = "Row-disposition join over the replay surface; the rows may be replayed, converted or explicitly rejected and each still carries its original bytes. No current consumer."
+removal_condition = "With the v1 replay surface."
+
+[[item_disposition]]
+item = "reject_v1_row_conversion"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:509; emits eliot_cue_contracts::ConversionDisposition::V2Rejected"
+basis = "Typed rejection record that keeps the original row bytes and identity. Candidate-only; never an admission. No current consumer."
+removal_condition = "With the v1 replay surface, and only once the owner path can carry an equivalent typed refusal."
+
+[[item_disposition]]
+item = "FacadeError"
+kind = "enum"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:547; the four transparent variants wrap eliot_cue_contracts::CueContractError, eliot_cue_normalizer::NormalizationError, eliot_cue_binding::CueBindingError and eliot_cue_activation::ActivationError, which are the real owner errors."
+basis = "Closed refusal vocabulary over the replay surface. Owner errors already pass through untouched, so the enum adds no owner semantics."
+removal_condition = "After the last consumer of the replay surface is gone. It is the error type asserted by the residue at tests/legacy_facade.rs:460-461."
+
+[[item_disposition]]
+item = "FACADE_DISPOSITIONS"
+kind = "const"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:628; 30 rows asserted for exact count by tests/legacy_facade.rs"
+basis = "In-source mirror of the older facade decision. This file supersedes it at item granularity (38 rows, methods and the module surface separated), so keeping both would be two ledgers for one decision."
+removal_condition = "Remove together with tests/legacy_facade.rs, in the same pass that removes the last delete row."
+
+[[item_disposition]]
+item = "legacy_adapter"
+kind = "module"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/lib.rs:68"
+basis = "The module surface exists to host the v1 adapter. Once its rows are migrated or removed the module has no residual responsibility."
+removal_condition = "After the `delete` rows inside legacy_adapter.rs are removed and the `migrate` rows are re-pointed at the owner cells."
+
+[[item_disposition]]
+item = "decode_legacy_kind"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/legacy_adapter.rs:230. Owner vocabulary is eliot_cue_contracts::CueKind (crates/smart/eliot-cue-contracts, module_id smart.cue.contracts)."
+basis = "Frozen v1 spelling decoder plus a 40-entry alias-refusal table. It exists to refuse, not to translate, and it performs no normalization."
+removal_condition = "With LEGACY_KIND_SPELLINGS, after the #706 denominator and #835 alias work closes."
+
+[[item_disposition]]
+item = "decode_legacy_mode"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/legacy_adapter.rs:305. Owner vocabulary is eliot_cue_contracts::MatchMode."
+basis = "Frozen three-spelling decoder with no alias handling; every other spelling is refused."
+removal_condition = "With the v1 replay surface."
+
+[[item_disposition]]
+item = "require_reobservation"
+kind = "function"
+disposition = "delete"
+current_owner = "smart.cue.normalizer"
+owner_package = "eliot-cue-normalizer"
+owner_evidence = "crates/smart/eliot-cue-normalizer/src/lib.rs:17 A11_CONTRACT_REVISION=\"1.0.0\"; crates/smart/eliot-cue-normalizer/module.toml module_id=smart.cue.normalizer"
+basis = "Always-fails typed refusal naming the admitted owner and its exact contract revision. It carries no normalization behaviour of its own. No current consumer exists outside the fixture that asserts the refusal (tests/legacy_facade.rs:460-461), and that assertion is the recorded blocking residue."
+removal_condition = "Last row removed by this issue. The refusal must be re-expressed as an owner-path migration receipt before removal so the #706 re-observation duty is not silently dropped."
+
+[[item_disposition]]
+item = "adapt_normalize"
+kind = "function"
+disposition = "migrate"
+current_owner = "smart.cue.normalizer"
+owner_package = "eliot-cue-normalizer"
+owner_evidence = "crates/smart/eliot-cue-normalizer/src/lib.rs:29 pub fn normalize_cue; exactly one call at crates/smart/eliot-cues/src/legacy_adapter.rs:362"
+basis = "Migrated. The envelope must agree with the caller-supplied owner observation on kind, verbatim value, scope and target, then exactly one A-11 call runs and the returned observed_cue_id is echoed back. No folding, case policy or key comparison is recomputed here."
+removal_condition = "None for the behaviour. Delete the delegating shell once a consumer imports normalize_cue directly; the owner keeps the semantics."
+
+[[item_disposition]]
+item = "adapt_bind"
+kind = "function"
+disposition = "migrate"
+current_owner = "smart.cue.binding"
+owner_package = "eliot-cue-binding"
+owner_evidence = "crates/smart/eliot-cue-binding/src/derive.rs:683 pub fn derive_cue_binding_candidates; exactly one call at crates/smart/eliot-cues/src/legacy_adapter.rs:401"
+basis = "Migrated. Touched rows must already carry the decoded legacy kind, at least one touched target must equal the legacy target, and the returned profile_id and touched count are echoed back. Admission itself is never bypassed: the Governor admission receipt is a required argument."
+removal_condition = "None for the behaviour. Delete the delegating shell once a consumer imports derive_cue_binding_candidates directly."
+
+[[item_disposition]]
+item = "adapt_rebuild_snapshot"
+kind = "function"
+disposition = "migrate"
+current_owner = "smart.cue.index"
+owner_package = "eliot-cue-index"
+owner_evidence = "crates/smart/eliot-cue-index/src/build.rs:71 pub fn rebuild_cue_snapshot; exactly one call at crates/smart/eliot-cues/src/legacy_adapter.rs:425"
+basis = "Migrated. The legacy envelope only anchors the scope; membership and build_digest are computed by the owner and then compared for deterministic reconstruction. The facade cannot add or drop a member."
+removal_condition = "None for the behaviour. Delete the delegating shell once a consumer imports rebuild_cue_snapshot directly."
+
+[[item_disposition]]
+item = "adapt_activate"
+kind = "function"
+disposition = "migrate"
+current_owner = "smart.cue.activation"
+owner_package = "eliot-cue-activation"
+owner_evidence = "crates/smart/eliot-cue-activation/src/evaluate.rs:65 pub fn evaluate_activation; exactly one call at crates/smart/eliot-cues/src/legacy_adapter.rs:452"
+basis = "Migrated. The owner evaluation is returned verbatim after validate_against on the same (candidate, request, profile) triple, so partial, truncated, stale and unavailable outcomes survive unchanged."
+removal_condition = "None for the behaviour. Delete the delegating shell once a consumer imports evaluate_activation directly."
+
+[[item_disposition]]
+item = "legacy_row_id_v2"
+kind = "function"
+disposition = "delete"
+current_owner = "smart.cue.normalizer"
+owner_package = "eliot-cue-normalizer"
+owner_evidence = "crates/smart/eliot-cues/src/legacy_adapter.rs:465 always returns FacadeError::MigrationRequired naming eliot-cue-normalizer A11_CONTRACT_REVISION"
+basis = "Source-compatibility shell only: it binds all five parameters, computes nothing, and refuses. Legacy normalized values were folded under a retired policy and can never become an owner comparison key. No current consumer."
+removal_condition = "With the v1 replay surface. Removing it is a pure source-compatibility break for an already-refusing entrypoint, so the removal condition is the v1 surface removal, not a consumer migration."
+
+[[item_disposition]]
+item = "legacy_row_id_v2_from_fresh_observation"
+kind = "function"
+disposition = "migrate"
+current_owner = "smart.cue.contracts"
+owner_package = "eliot-cue-contracts"
+owner_evidence = "crates/smart/eliot-cue-contracts/src/version.rs:1060 pub fn cue_row_id; exactly one call at crates/smart/eliot-cues/src/legacy_adapter.rs:535"
+basis = "Migrated. Every semantic input to the v2 identity comes from the fresh owner observation and its normalized comparison key; the legacy envelope is a replay anchor only, the row id must carry the `cuev2:` namespace, and the source revision must match or be refused."
+removal_condition = "None for the behaviour. Delete the delegating shell once a consumer imports cue_row_id directly."
+
+[[item_disposition]]
+item = "convert_v1_row"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/legacy_adapter.rs:561"
+basis = "Fresh-observation-only v1-to-v2 conversion over the replay surface. It issues a v2 identity only when a caller supplies both owner values for the same observation; every other outcome is a bounded V2Rejected record. No current consumer."
+removal_condition = "With the v1 replay surface, and only after the owner comparison-key path is the single identity source."
+
+[[item_disposition]]
+item = "convert_v1_row_from_fresh_observation"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/legacy_adapter.rs:696; thin wrapper over convert_v1_row"
+basis = "Convenience overload over the same replay surface; no distinct behaviour and no consumer."
+removal_condition = "With convert_v1_row."
+
+[[item_disposition]]
+item = "frozen_spellings_round_trip"
+kind = "function"
+disposition = "delete"
+current_owner = "none"
+owner_evidence = "crates/smart/eliot-cues/src/legacy_adapter.rs:734"
+basis = "Self-check that the frozen spelling table and the decoder agree. Measured caller set is empty (`git grep -n frozen_spellings_round_trip -- crates bins` returns only the definition), so it is a public item with no call site."
+removal_condition = "With LEGACY_KIND_SPELLINGS and decode_legacy_kind."
+
+[[item_disposition]]
+item = "request_legacy_delivery"
+kind = "function"
+disposition = "migrate"
+current_owner = "smart.context.reactive_delivery_plan"
+owner_package = "eliot-reactive-context-plan"
+owner_evidence = "crates/smart/eliot-reactive-context-plan/module.toml module_id=smart.context.reactive_delivery_plan, donor row `crates/smart/eliot-reactive-context-plan/module.toml:44`, issue #612, next owner B-RCTX/Host"
+basis = "Migrated as an inert handoff. It validates the legacy envelope, decodes the kind, and returns a record naming the exact owner, issue and target. It fabricates no completion, receipt, effect or delivery claim, so it is not a second delivery owner."
+removal_condition = "None for the behaviour. Delete the handoff shell once the #612 reactive plan has a first real caller for legacy rows."
