@@ -17,6 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const OPERATOR_SCHEMA_VERSION: &str = "eliot-operator-contract-v1";
@@ -216,6 +217,308 @@ pub struct UnderstandingOutcomeRecord {
     /// A missing receipt stays absent; absence never authenticates canonical storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_receipt: Option<WriteReceiptRef>,
+}
+
+/// Epistemic state of a causal edge. An intervention outcome is recorded
+/// separately and does not itself choose a new status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CausalEdgeStatus {
+    Hypothetical,
+    Supported,
+    ObservedUnderIntervention,
+}
+
+/// The assigned next check for a causal candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "description")]
+pub enum CausalCheckAssignment {
+    VerifierWorkItem(WorkItemId),
+    BoundedInquiry(String),
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CausalCandidateValidationError {
+    #[error("material causal candidate is missing A6.5 field `{field}`")]
+    MissingA65Field { field: &'static str },
+    #[error("A6.5 field `{field}` contains a blank list entry")]
+    EmptyA65ListEntry { field: &'static str },
+    #[error("candidate requires a rival explanation or rationale for none")]
+    MissingRivalOrRationale,
+    #[error("candidate contains a blank no-plausible-rival rationale")]
+    EmptyNoPlausibleRivalRationale,
+    #[error("causal candidate calibration must be nonblank")]
+    MissingCalibration,
+    #[error("candidate contains an empty rival explanation")]
+    EmptyRivalExplanation,
+    #[error("candidate contains an empty assigned bounded inquiry")]
+    EmptyBoundedInquiry,
+    #[error("Critical-action candidate requires an assigned verifier or bounded inquiry")]
+    MissingCriticalCheck,
+    #[error("intervention outcome is linked to another candidate")]
+    OutcomeCandidateMismatch,
+    #[error("intervention outcome has an empty observation or verifier/artifact")]
+    EmptyOutcomeEvidence,
+    #[error("intervention outcome before-state does not match the candidate's current state")]
+    OutcomeBeforeStateMismatch,
+    #[error("intervention outcome contains an empty rival explanation")]
+    EmptyOutcomeRival,
+    #[error("rival removal requires explicit update evidence")]
+    MissingRivalUpdateEvidence,
+    #[error("intervention outcome assessment is incomplete")]
+    IncompleteOutcomeAssessment,
+    #[error("existing intervention outcome history is invalid or discontinuous")]
+    InvalidOutcomeHistory,
+}
+
+/// A causal outcome preserves both the previous and revised candidate state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CausalInterventionOutcomeRecord {
+    pub candidate_id: String,
+    pub observed_outcome: String,
+    pub verifier_or_artifact: String,
+    /// Explicit interpretation input, independent of recording the outcome.
+    pub assessment_basis: String,
+    pub status_before: CausalEdgeStatus,
+    pub status_after: CausalEdgeStatus,
+    pub rival_set_before: Vec<String>,
+    pub rival_set_after: Vec<String>,
+    pub no_plausible_rival_rationale_before: Option<String>,
+    pub no_plausible_rival_rationale_after: Option<String>,
+    /// Required when an assessment removes any previously recorded rival.
+    pub rival_update_evidence: Vec<String>,
+    pub calibration_before: String,
+    pub calibration_after: String,
+    pub transfer_boundary_before: String,
+    pub transfer_boundary_after: String,
+}
+
+/// Decision-material causal model with its intervention history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CausalCandidate {
+    pub candidate_id: String,
+    pub mechanism: String,
+    pub intervention: String,
+    pub predicted_observable: String,
+    pub counterfactual: String,
+    pub possible_confounders: Vec<String>,
+    pub interacting_causes: Vec<String>,
+    pub temporal_lag: String,
+    pub abstraction_level: String,
+    pub rival_explanations: Vec<String>,
+    pub no_plausible_rival_rationale: Option<String>,
+    pub transfer_boundary: String,
+    pub edge_status: CausalEdgeStatus,
+    pub calibration: String,
+    #[serde(default)]
+    pub assigned_check: Option<CausalCheckAssignment>,
+    #[serde(default)]
+    pub intervention_outcomes: Vec<CausalInterventionOutcomeRecord>,
+}
+
+impl CausalCandidate {
+    /// Check the complete A6.5 record and validate any assigned check.
+    pub fn validate_material(&self) -> Result<(), CausalCandidateValidationError> {
+        for (field, value) in [
+            ("candidate_id", self.candidate_id.as_str()),
+            ("mechanism", self.mechanism.as_str()),
+            ("intervention", self.intervention.as_str()),
+            ("predicted_observable", self.predicted_observable.as_str()),
+            ("counterfactual", self.counterfactual.as_str()),
+            ("temporal_lag", self.temporal_lag.as_str()),
+            ("abstraction_level", self.abstraction_level.as_str()),
+            ("transfer_boundary", self.transfer_boundary.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(CausalCandidateValidationError::MissingA65Field { field });
+            }
+        }
+        if self
+            .possible_confounders
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(CausalCandidateValidationError::EmptyA65ListEntry {
+                field: "possible_confounders",
+            });
+        }
+        if self
+            .interacting_causes
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(CausalCandidateValidationError::EmptyA65ListEntry {
+                field: "interacting_causes",
+            });
+        }
+
+        if self.rival_explanations.is_empty() {
+            if self
+                .no_plausible_rival_rationale
+                .as_deref()
+                .is_none_or(|rationale| rationale.trim().is_empty())
+            {
+                return Err(CausalCandidateValidationError::MissingRivalOrRationale);
+            }
+        } else if self
+            .rival_explanations
+            .iter()
+            .any(|rival| rival.trim().is_empty())
+        {
+            return Err(CausalCandidateValidationError::EmptyRivalExplanation);
+        }
+        if self
+            .no_plausible_rival_rationale
+            .as_deref()
+            .is_some_and(|rationale| rationale.trim().is_empty())
+        {
+            return Err(CausalCandidateValidationError::EmptyNoPlausibleRivalRationale);
+        }
+        if self.calibration.trim().is_empty() {
+            return Err(CausalCandidateValidationError::MissingCalibration);
+        }
+
+        if let Some(CausalCheckAssignment::BoundedInquiry(description)) = &self.assigned_check
+            && description.trim().is_empty()
+        {
+            return Err(CausalCandidateValidationError::EmptyBoundedInquiry);
+        }
+
+        self.validate_intervention_history()
+    }
+
+    /// Critical-action admission uses the same complete candidate prerequisites.
+    pub fn validate_for_critical_action(&self) -> Result<(), CausalCandidateValidationError> {
+        self.validate_material()?;
+        if self.assigned_check.is_none() {
+            return Err(CausalCandidateValidationError::MissingCriticalCheck);
+        }
+        Ok(())
+    }
+
+    /// Append an explicitly assessed intervention outcome and update current state atomically.
+    pub fn record_intervention_outcome(
+        &mut self,
+        outcome: CausalInterventionOutcomeRecord,
+    ) -> Result<(), CausalCandidateValidationError> {
+        self.validate_material()?;
+        if outcome.candidate_id != self.candidate_id {
+            return Err(CausalCandidateValidationError::OutcomeCandidateMismatch);
+        }
+        if outcome.status_before != self.edge_status
+            || outcome.rival_set_before != self.rival_explanations
+            || outcome.no_plausible_rival_rationale_before != self.no_plausible_rival_rationale
+            || outcome.calibration_before != self.calibration
+            || outcome.transfer_boundary_before != self.transfer_boundary
+        {
+            return Err(CausalCandidateValidationError::OutcomeBeforeStateMismatch);
+        }
+
+        let mut next = self.clone();
+        next.edge_status = outcome.status_after;
+        next.rival_explanations.clone_from(&outcome.rival_set_after);
+        next.no_plausible_rival_rationale
+            .clone_from(&outcome.no_plausible_rival_rationale_after);
+        next.calibration.clone_from(&outcome.calibration_after);
+        next.transfer_boundary
+            .clone_from(&outcome.transfer_boundary_after);
+        next.intervention_outcomes.push(outcome);
+        next.validate_material()?;
+        *self = next;
+        Ok(())
+    }
+
+    fn validate_intervention_history(&self) -> Result<(), CausalCandidateValidationError> {
+        for (index, outcome) in self.intervention_outcomes.iter().enumerate() {
+            if outcome.candidate_id != self.candidate_id {
+                return Err(CausalCandidateValidationError::OutcomeCandidateMismatch);
+            }
+            if outcome.observed_outcome.trim().is_empty()
+                || outcome.verifier_or_artifact.trim().is_empty()
+            {
+                return Err(CausalCandidateValidationError::EmptyOutcomeEvidence);
+            }
+            if outcome.assessment_basis.trim().is_empty()
+                || outcome.calibration_before.trim().is_empty()
+                || outcome.calibration_after.trim().is_empty()
+                || outcome.transfer_boundary_before.trim().is_empty()
+                || outcome.transfer_boundary_after.trim().is_empty()
+            {
+                return Err(CausalCandidateValidationError::IncompleteOutcomeAssessment);
+            }
+            if outcome
+                .no_plausible_rival_rationale_before
+                .as_deref()
+                .is_some_and(|rationale| rationale.trim().is_empty())
+                || outcome
+                    .no_plausible_rival_rationale_after
+                    .as_deref()
+                    .is_some_and(|rationale| rationale.trim().is_empty())
+            {
+                return Err(CausalCandidateValidationError::EmptyNoPlausibleRivalRationale);
+            }
+            if (outcome.rival_set_before.is_empty()
+                && outcome
+                    .no_plausible_rival_rationale_before
+                    .as_deref()
+                    .is_none_or(|rationale| rationale.trim().is_empty()))
+                || (outcome.rival_set_after.is_empty()
+                    && outcome
+                        .no_plausible_rival_rationale_after
+                        .as_deref()
+                        .is_none_or(|rationale| rationale.trim().is_empty()))
+            {
+                return Err(CausalCandidateValidationError::MissingRivalOrRationale);
+            }
+            if outcome
+                .rival_set_before
+                .iter()
+                .chain(outcome.rival_set_after.iter())
+                .any(|rival| rival.trim().is_empty())
+            {
+                return Err(CausalCandidateValidationError::EmptyOutcomeRival);
+            }
+            let removed_rival = outcome
+                .rival_set_before
+                .iter()
+                .any(|rival| !outcome.rival_set_after.contains(rival));
+            if removed_rival && outcome.rival_update_evidence.is_empty() {
+                return Err(CausalCandidateValidationError::MissingRivalUpdateEvidence);
+            }
+            if outcome
+                .rival_update_evidence
+                .iter()
+                .any(|evidence| evidence.trim().is_empty())
+            {
+                return Err(CausalCandidateValidationError::MissingRivalUpdateEvidence);
+            }
+            if let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|previous_index| self.intervention_outcomes.get(previous_index))
+                && (outcome.status_before != previous.status_after
+                    || outcome.rival_set_before != previous.rival_set_after
+                    || outcome.no_plausible_rival_rationale_before
+                        != previous.no_plausible_rival_rationale_after
+                    || outcome.calibration_before != previous.calibration_after
+                    || outcome.transfer_boundary_before != previous.transfer_boundary_after)
+            {
+                return Err(CausalCandidateValidationError::InvalidOutcomeHistory);
+            }
+        }
+
+        if let Some(last) = self.intervention_outcomes.last()
+            && (last.status_after != self.edge_status
+                || last.rival_set_after != self.rival_explanations
+                || last.no_plausible_rival_rationale_after != self.no_plausible_rival_rationale
+                || last.calibration_after != self.calibration
+                || last.transfer_boundary_after != self.transfer_boundary)
+        {
+            return Err(CausalCandidateValidationError::InvalidOutcomeHistory);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
