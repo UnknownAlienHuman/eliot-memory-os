@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_receipts::ReceiptDispositionKind;
 use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -211,6 +212,156 @@ impl InFlightDisposition {
     /// Validates the allowlist entry.
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_text(&self.operation_id, "cutover_in_flight_operation_id")?;
+        Ok(())
+    }
+}
+
+/// Durable, non-renewable, single-operation continuation permit (I14.14).
+///
+/// An external effect that the old generation had already issued at cutover
+/// may finish only through this permit, and only under the exact binding
+/// recorded here. Old general generation authority is not sufficient.
+///
+/// * **Single-operation** — the authorized operation identity is not a
+///   parameter of [`OperationContinuationPermit::issue`]: it is copied from
+///   the one `finish_exact_authorized_operation` entry of one committed
+///   cutover, and issuance is refused unless that cutover classifies exactly
+///   one such operation. The record holds a single operation identity, not a
+///   set, so a second operation is unrepresentable.
+/// * **Non-renewable** — `issue` is the only constructor, and it copies every
+///   binding except the deadline and the allowed completion messages out of
+///   one committed, linearized cutover record. The type declares no `&mut self`
+///   method, so there is no path that extends, re-points or reissues a permit;
+///   a later deadline can only come from a different committed cutover, and
+///   [`Self::validate`] refuses `Unknown` among the allowed messages because an
+///   unknown outcome is not final: the permit is consumed by the final
+///   `OutcomeReceipt` only and is never reissued after old-process loss.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationContinuationPermit {
+    /// Identity of the committed cutover that issued this permit.
+    pub cutover_id: String,
+    /// ORS linearization identity of that committed cutover. A permit exists
+    /// only after the commit that created it, so this is never absent.
+    pub linearization_record_id: String,
+    /// The one operation identity this permit may complete.
+    pub operation_id: String,
+    /// Hash of the one already-issued external effect.
+    pub effect_hash: String,
+    /// Fenced generation of the old process.
+    pub old_generation: ResourceGeneration,
+    /// Fenced authority epoch of the old process.
+    pub old_epoch: AuthorityEpoch,
+    /// Exact scope; the permit cannot widen it.
+    pub scope: CapabilityRouteScope,
+    /// Absolute deadline in Unix milliseconds, fixed at issuance.
+    pub deadline_unix_ms: u64,
+    /// The only completion messages this permit accepts.
+    pub allowed_completion_messages: Vec<ReceiptDispositionKind>,
+}
+
+impl OperationContinuationPermit {
+    /// Issues the one permit a committed cutover may create for its single
+    /// authorized operation.
+    ///
+    /// Refuses a staged or unlinearized cutover, a cutover with no fenced old
+    /// generation, and a cutover that classifies zero or several
+    /// `finish_exact_authorized_operation` operations. The authorized
+    /// operation, the effect scope, the fenced generation and the fenced epoch
+    /// are taken from that cutover rather than from the caller, so they cannot
+    /// be retargeted, widened or transferred at issuance.
+    pub fn issue(
+        cutover: &GenerationCutoverOwnership,
+        effect_hash: impl Into<String>,
+        deadline_unix_ms: u64,
+        allowed_completion_messages: Vec<ReceiptDispositionKind>,
+    ) -> Result<Self, OrsError> {
+        cutover.validate()?;
+        if cutover.state != GenerationCutoverState::Committed {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(linearization_record_id) = cutover.linearization_record_id.clone() else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "continuation_permit",
+                reason: "committed cutover has no linearization identity".to_owned(),
+            });
+        };
+        let Some(old_generation) = cutover.old_generation else {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_old_generation",
+                reason: "a continuation permit requires a fenced old generation",
+            });
+        };
+        let mut authorized = cutover
+            .in_flight
+            .iter()
+            .filter(|entry| entry.kind == InFlightDispositionKind::FinishExactAuthorizedOperation);
+        let Some(entry) = authorized.next() else {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_operation",
+                reason: "the committed cutover authorizes no operation to continue",
+            });
+        };
+        if authorized.next().is_some() {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_operation",
+                reason: "one operation must receive exactly one continuation permit",
+            });
+        }
+        let permit = Self {
+            cutover_id: cutover.cutover_id.clone(),
+            linearization_record_id,
+            operation_id: entry.operation_id.clone(),
+            effect_hash: effect_hash.into(),
+            old_generation,
+            old_epoch: cutover.old_epoch,
+            scope: cutover.scope.clone(),
+            deadline_unix_ms,
+            allowed_completion_messages,
+        };
+        permit.validate()?;
+        Ok(permit)
+    }
+
+    /// Returns the stable hash of the exact scope the permit cannot widen.
+    #[must_use]
+    pub fn scope_hash(&self) -> &str {
+        &self.scope.route_scope_hash
+    }
+
+    /// Validates the permit binding. An unknown outcome is not a final
+    /// outcome, so it is refused here: a permit is completed by the final
+    /// `OutcomeReceipt` only and is never reissued.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.cutover_id, "continuation_permit_cutover_id")?;
+        validate_text(
+            &self.linearization_record_id,
+            "continuation_permit_linearization",
+        )?;
+        validate_text(&self.operation_id, "continuation_permit_operation_id")?;
+        validate_digest(&self.effect_hash, "continuation_permit_effect_hash")?;
+        self.scope.validate()?;
+        if self.deadline_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_deadline",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.allowed_completion_messages.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_allowed_completion_messages",
+                reason: "must allow at least one final completion message",
+            });
+        }
+        if self
+            .allowed_completion_messages
+            .contains(&ReceiptDispositionKind::Unknown)
+        {
+            return Err(OrsError::InvalidField {
+                field: "continuation_permit_allowed_completion_messages",
+                reason: "an unknown outcome is not final and cannot complete a permit",
+            });
+        }
         Ok(())
     }
 }

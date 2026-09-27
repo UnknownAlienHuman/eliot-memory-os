@@ -43,7 +43,8 @@ pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
     CutoverRouteTable, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt,
     InFlightDisposition, InFlightDispositionKind, MAX_CUTOVER_IN_FLIGHT,
-    MAX_CUTOVER_UNRESOLVED_SCOPES, ModuleArtifactIdentity, StateMigrationDecision,
+    MAX_CUTOVER_UNRESOLVED_SCOPES, ModuleArtifactIdentity, OperationContinuationPermit,
+    StateMigrationDecision,
 };
 pub use doctor::*;
 pub use model::ProviderCapabilityLookup;
