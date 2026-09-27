@@ -854,6 +854,33 @@ impl KernelBackupCapture {
         })
     }
 
+    /// Returns the archive format's own content digest of the PRESENTED bytes, or
+    /// `None` when those bytes are not a decodable, internally valid ECXF bundle.
+    ///
+    /// This exists for one caller: `request_dispatch.rs` must decide whether bytes
+    /// presented under an already-bound verification key are the archive that key is
+    /// bound to (#2802 Work 3, "changed bytes under the same identity conflict"), and
+    /// on the path where [`Self::verify_only`] returns `Err` there is no
+    /// [`CaptureReport`] to read an `archive_sha256` from. The digest is computed HERE
+    /// rather than in the route because this module is the one that owns the
+    /// `BackupBundle` API; the route holds presented bytes and nothing else.
+    ///
+    /// It is the decoded bundle's digest, never a digest of the presented bytes, and
+    /// that is load-bearing: a durable row stores `BackupBundle::bundle_sha256`, which
+    /// is a digest of the canonical encoding of the DECODED bundle, so comparing
+    /// caller bytes would refuse a re-spelled copy of the very archive the key is
+    /// bound to. The route must be able to say "same archive" as well as "changed
+    /// archive", and only the format's own digest can say it.
+    ///
+    /// `None` is the honest answer for bytes that are not an archive at all: there is
+    /// no canonical archive identity to compare, and inventing a raw-bytes digest
+    /// domain here would create a second, caller-movable notion of archive identity.
+    /// The caller keeps its own structural refusal on that path.
+    pub fn presented_archive_digest(bytes: &[u8]) -> Option<String> {
+        let bundle = BackupBundle::decode(bytes).ok()?;
+        bundle.bundle_sha256().ok()
+    }
+
     /// Validates one recorded snapshot relation for tests and the coordinator:
     /// timestamps alone fail, and empty cursors or lineage refuse as
     /// incoherent. No global transaction is assumed.
