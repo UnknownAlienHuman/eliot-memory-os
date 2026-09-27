@@ -390,6 +390,8 @@ pub enum LearningClosureError {
     ConflictingRecord { id: String },
     #[error("evidence-free NoChange is rejected for delta: {delta_id}")]
     EvidenceFreeNoChange { delta_id: String },
+    #[error("canonical closure evidence is incomplete, empty groups: {groups:?}")]
+    IncompleteCanonicalEvidence { groups: Vec<String> },
     #[error("stale base for delta: {delta_id}")]
     StaleDelta { delta_id: String },
     #[error("wrong-target delta: {delta_id}")]
@@ -413,6 +415,11 @@ pub enum LearningClosureError {
 /// complete and justified, a [`ClosureAssembly::Disposition`] when bounded
 /// further evidence/retention/debt applies, or a [`LearningClosureError`]
 /// for typed schema/identity/evidence/lineage/bound failures.
+///
+/// The returned candidate is a proposal, not a closure: the durable
+/// [`CampaignLearningClosure`] record that stores the canonical evidence
+/// references is assembled by
+/// [`assemble_campaign_learning_closure_with_evidence`].
 pub fn assemble_campaign_learning_closure(
     exact_campaign_and_target: CampaignAndTarget,
     exact_attempt_outcomes_and_deltas: AttemptOutcomesAndDeltas,
@@ -1663,24 +1670,124 @@ pub fn trigger_closure_due(event: ClosureLifecycleEvent, policy: &ClosurePolicy)
 /// Visible learning debt while closure completes out of band.
 ///
 /// Raw evidence must already be durable; the next task cannot silently use
-/// an unclosed candidate until this debt resolves to a disposition.
+/// an unclosed candidate until this debt resolves to a disposition. Closure
+/// never blocks the finish ceremony: the debt is opened FROM a finish that has
+/// already been decided, so its presence is visible evidence, never a veto.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearningDebt {
     pub campaign_id: String,
+    pub task_id: String,
+    pub scope_ref: String,
+    pub state_fence_ref: String,
     pub closure_owner: String,
     pub review_condition: String,
     pub missing_evidence: Vec<String>,
     pub created_at_finish_id: String,
 }
 
+/// Durable, owner-addressable projection of one open [`LearningDebt`].
+///
+/// This is the record a status surface lists: it names the closure owner, the
+/// review condition and the exact missing evidence, so outstanding learning
+/// debt is visible and never ownerless. This module owns no store and performs
+/// no write; the projection is the durable artifact a caller persists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningDebtProjection {
+    pub debt_id: String,
+    pub campaign_id: String,
+    pub task_id: String,
+    pub scope_ref: String,
+    pub state_fence_ref: String,
+    pub closure_owner: String,
+    pub review_condition: String,
+    pub missing_evidence: Vec<String>,
+    pub opened_at_finish_id: String,
+    pub digest: String,
+}
+
 impl LearningDebt {
     /// Require an identifiable campaign, owner, and review condition.
     pub fn validate(&self) -> Result<(), LearningClosureError> {
         non_empty(&self.campaign_id, "campaign_id")?;
+        non_empty(&self.task_id, "task_id")?;
+        non_empty(&self.scope_ref, "scope_ref")?;
+        non_empty(&self.state_fence_ref, "state_fence_ref")?;
         non_empty(&self.closure_owner, "closure_owner")?;
         non_empty(&self.review_condition, "review_condition")?;
+        non_empty(&self.created_at_finish_id, "created_at_finish_id")?;
         Ok(())
     }
+
+    /// Open visible learning debt for a finish that precedes closure.
+    ///
+    /// `closure_owner` and `review_condition` are caller-supplied authority
+    /// values. A blank or ownerless one is refused with
+    /// [`LearningClosureError::MissingField`]; no owner name, review trigger
+    /// or condition is ever invented here. `finish_id` is an input, not an
+    /// outcome, so this constructor cannot block, delay or veto a finish and
+    /// decides nothing about the episode's disposition: it only makes the
+    /// outstanding debt nameable.
+    pub fn open_after_finish(
+        campaign: &CampaignAndTarget,
+        closure_owner: &str,
+        review_condition: &str,
+        missing_evidence: Vec<String>,
+        finish_id: &str,
+    ) -> Result<Self, LearningClosureError> {
+        validate_campaign(campaign)?;
+        let debt = Self {
+            campaign_id: campaign.campaign_id.clone(),
+            task_id: campaign.task_id.clone(),
+            scope_ref: campaign.scope_ref.clone(),
+            state_fence_ref: campaign.fence_ref.clone(),
+            closure_owner: closure_owner.to_string(),
+            review_condition: review_condition.to_string(),
+            missing_evidence,
+            created_at_finish_id: finish_id.to_string(),
+        };
+        debt.validate()?;
+        Ok(debt)
+    }
+
+    /// Project this debt into its durable, owner-addressable record.
+    ///
+    /// An ownerless or unreviewable debt is refused rather than projected, so
+    /// no visible record can exist without a named closure owner and a review
+    /// condition.
+    pub fn project(&self) -> Result<LearningDebtProjection, LearningClosureError> {
+        self.validate()?;
+        let digest = learning_debt_digest(self);
+        Ok(LearningDebtProjection {
+            debt_id: format!("learning-debt-{}-{}", self.campaign_id, &digest[..16]),
+            campaign_id: self.campaign_id.clone(),
+            task_id: self.task_id.clone(),
+            scope_ref: self.scope_ref.clone(),
+            state_fence_ref: self.state_fence_ref.clone(),
+            closure_owner: self.closure_owner.clone(),
+            review_condition: self.review_condition.clone(),
+            missing_evidence: self.missing_evidence.clone(),
+            opened_at_finish_id: self.created_at_finish_id.clone(),
+            digest,
+        })
+    }
+}
+
+/// Fingerprint of one durable learning-debt record: any changed owner,
+/// review condition, missing-evidence entry or finish binding changes it.
+fn learning_debt_digest(debt: &LearningDebt) -> String {
+    let mut hasher = Hasher::new();
+    field(&mut hasher, &debt.campaign_id);
+    field(&mut hasher, &debt.task_id);
+    field(&mut hasher, &debt.scope_ref);
+    field(&mut hasher, &debt.state_fence_ref);
+    field(&mut hasher, &debt.closure_owner);
+    field(&mut hasher, &debt.review_condition);
+    field(&mut hasher, &debt.missing_evidence.len().to_string());
+    for missing in &debt.missing_evidence {
+        field(&mut hasher, missing);
+    }
+    field(&mut hasher, &debt.created_at_finish_id);
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Canonical evidence reference groups assembled through existing Meta,
@@ -1708,64 +1815,159 @@ pub struct ClosureEvidenceRefs {
     pub expiry_ref: Vec<String>,
 }
 
+/// Every required evidence group, in canonical order, paired with its field
+/// name. [`evidence_refs_complete`] and [`evidence_refs_digest`] both walk this
+/// one list, so a required group can never be left out of the stored digest.
+fn evidence_groups(refs: &ClosureEvidenceRefs) -> [(&'static str, &[String]); 18] {
+    [
+        ("starting_harness_stack", &refs.starting_harness_stack),
+        ("final_harness_stack", &refs.final_harness_stack),
+        ("outcome_refs", &refs.outcome_refs),
+        ("economics_refs", &refs.economics_refs),
+        ("validated_updates", &refs.validated_updates),
+        ("rejected_updates", &refs.rejected_updates),
+        ("failure_mechanisms", &refs.failure_mechanisms),
+        ("preserved_success", &refs.preserved_success),
+        ("regression_results", &refs.regression_results),
+        ("activation_findings", &refs.activation_findings),
+        ("adherence_findings", &refs.adherence_findings),
+        ("confounders", &refs.confounders),
+        ("inheritance_actions", &refs.inheritance_actions),
+        ("future_scope", &refs.future_scope),
+        ("retention_refs", &refs.retention_refs),
+        ("revalidation_refs", &refs.revalidation_refs),
+        ("owner_receipts", &refs.owner_receipts),
+        ("expiry_ref", &refs.expiry_ref),
+    ]
+}
+
 /// List every empty evidence group by field name.
 pub fn evidence_refs_complete(refs: &ClosureEvidenceRefs) -> Vec<String> {
-    let mut missing = Vec::new();
-    if refs.starting_harness_stack.is_empty() {
-        missing.push("starting_harness_stack".to_string());
+    evidence_groups(refs)
+        .into_iter()
+        .filter(|(_, group)| group.is_empty())
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Fingerprint of the stored canonical evidence references.
+///
+/// Covers every group named by [`evidence_refs_complete`] under its own field
+/// name, in the order the record stores them, so a ref moved between groups,
+/// added or removed changes the closure digest.
+fn evidence_refs_digest(refs: &ClosureEvidenceRefs) -> String {
+    let mut hasher = Hasher::new();
+    for (name, group) in evidence_groups(refs) {
+        field(&mut hasher, name);
+        field(&mut hasher, &group.len().to_string());
+        for value in group {
+            field(&mut hasher, value);
+        }
     }
-    if refs.final_harness_stack.is_empty() {
-        missing.push("final_harness_stack".to_string());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Durable campaign closure record: the assembled closure candidate together
+/// with the canonical evidence references it is required to store (I12.24
+/// `CampaignLearningClosure`).
+///
+/// The record is produced only by
+/// [`assemble_campaign_learning_closure_with_evidence`], so a closure cannot be
+/// recorded without all eighteen evidence groups bound to canonical refs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignLearningClosure {
+    pub closure_id: String,
+    pub campaign_id: String,
+    pub target_id: String,
+    pub task_id: String,
+    pub state_fence_ref: String,
+    pub candidate: Box<CampaignLearningClosureCandidate>,
+    pub evidence: ClosureEvidenceRefs,
+    pub evidence_digest: String,
+    pub digest: String,
+}
+
+/// Outcome of evidence-bearing closure assembly: the closed record, or the
+/// bounded further-evidence disposition the decision core returned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClosureRecordAssembly {
+    Closed(CampaignLearningClosure),
+    Disposition(LearningClosureDisposition),
+}
+
+/// Assemble the durable closure record with the canonical evidence it stores.
+///
+/// The same six typed evidence inputs and the same pure decision core as
+/// [`assemble_campaign_learning_closure`], plus the canonical evidence reference
+/// groups the closure is required to store. This entry REFUSES to produce a
+/// closure whose evidence is incomplete: every empty group is named in
+/// [`LearningClosureError::IncompleteCanonicalEvidence`] instead of being
+/// dropped, because an unnamed empty group hides lost learning exactly as
+/// silence does.
+///
+/// Returns [`ClosureRecordAssembly::Closed`] with the evidence stored on the
+/// record and bound into both `evidence_digest` and the record `digest`, or the
+/// bounded [`LearningClosureDisposition`] the decision core produced.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_campaign_learning_closure_with_evidence(
+    exact_campaign_and_target: CampaignAndTarget,
+    exact_attempt_outcomes_and_deltas: AttemptOutcomesAndDeltas,
+    exact_overlay_and_activation_assessments: OverlayAndActivationAssessments,
+    exact_outcome_harm_and_economics_evidence: OutcomeHarmAndEconomicsEvidence,
+    prior_closure_history: PriorClosureHistory,
+    closure_policy: ClosurePolicy,
+    canonical_evidence_refs: ClosureEvidenceRefs,
+) -> Result<ClosureRecordAssembly, LearningClosureError> {
+    let missing_groups = evidence_refs_complete(&canonical_evidence_refs);
+    if !missing_groups.is_empty() {
+        return Err(LearningClosureError::IncompleteCanonicalEvidence {
+            groups: missing_groups,
+        });
     }
-    if refs.outcome_refs.is_empty() {
-        missing.push("outcome_refs".to_string());
-    }
-    if refs.economics_refs.is_empty() {
-        missing.push("economics_refs".to_string());
-    }
-    if refs.validated_updates.is_empty() {
-        missing.push("validated_updates".to_string());
-    }
-    if refs.rejected_updates.is_empty() {
-        missing.push("rejected_updates".to_string());
-    }
-    if refs.failure_mechanisms.is_empty() {
-        missing.push("failure_mechanisms".to_string());
-    }
-    if refs.preserved_success.is_empty() {
-        missing.push("preserved_success".to_string());
-    }
-    if refs.regression_results.is_empty() {
-        missing.push("regression_results".to_string());
-    }
-    if refs.activation_findings.is_empty() {
-        missing.push("activation_findings".to_string());
-    }
-    if refs.adherence_findings.is_empty() {
-        missing.push("adherence_findings".to_string());
-    }
-    if refs.confounders.is_empty() {
-        missing.push("confounders".to_string());
-    }
-    if refs.inheritance_actions.is_empty() {
-        missing.push("inheritance_actions".to_string());
-    }
-    if refs.future_scope.is_empty() {
-        missing.push("future_scope".to_string());
-    }
-    if refs.retention_refs.is_empty() {
-        missing.push("retention_refs".to_string());
-    }
-    if refs.revalidation_refs.is_empty() {
-        missing.push("revalidation_refs".to_string());
-    }
-    if refs.owner_receipts.is_empty() {
-        missing.push("owner_receipts".to_string());
-    }
-    if refs.expiry_ref.is_empty() {
-        missing.push("expiry_ref".to_string());
-    }
-    missing
+    let task_id = exact_campaign_and_target.task_id.clone();
+    let state_fence_ref = exact_campaign_and_target.fence_ref.clone();
+    let candidate = match assemble_campaign_learning_closure(
+        exact_campaign_and_target,
+        exact_attempt_outcomes_and_deltas,
+        exact_overlay_and_activation_assessments,
+        exact_outcome_harm_and_economics_evidence,
+        prior_closure_history,
+        closure_policy,
+    )? {
+        ClosureAssembly::Disposition(disposition) => {
+            return Ok(ClosureRecordAssembly::Disposition(disposition));
+        }
+        ClosureAssembly::Candidate(candidate) => candidate,
+    };
+    let evidence_digest = evidence_refs_digest(&canonical_evidence_refs);
+    let digest = closure_record_digest(&candidate, &evidence_digest);
+    Ok(ClosureRecordAssembly::Closed(CampaignLearningClosure {
+        closure_id: format!("closure-{}-{}", candidate.campaign_id, &digest[..16]),
+        campaign_id: candidate.campaign_id.clone(),
+        target_id: candidate.target_id.clone(),
+        task_id,
+        state_fence_ref,
+        candidate,
+        evidence: canonical_evidence_refs,
+        evidence_digest,
+        digest,
+    }))
+}
+
+/// Full closure-record digest: the candidate digest (already bound to the four
+/// evidence inputs, prior history and policy) plus the stored canonical
+/// evidence references. Removing any load-bearing group or ref changes it.
+fn closure_record_digest(
+    candidate: &CampaignLearningClosureCandidate,
+    evidence_digest: &str,
+) -> String {
+    let mut hasher = Hasher::new();
+    field(&mut hasher, &candidate.candidate_id);
+    field(&mut hasher, &candidate.campaign_id);
+    field(&mut hasher, &candidate.target_id);
+    field(&mut hasher, &candidate.digest);
+    field(&mut hasher, evidence_digest);
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Build an explicit [`LearningClosureDisposition`] from an allowed
